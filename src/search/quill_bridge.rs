@@ -29,6 +29,21 @@ use frankensearch::quill::cass::{
 use frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA;
 use frankensearch::quill::{QuillConfig, QuillIndex, QuillSearchIndex, SchemaDocument};
 
+/// CASS's large historical corpus needs a larger bounded query-work budget
+/// than Quill's fixture-oriented default. The published production snapshot
+/// currently has 1,157 immutable segments; the 10M default can spend the
+/// entire budget walking term dictionaries before reaching a valid query hit.
+/// Keep the bound finite and apply it at every CASS reader/writer boundary so
+/// search and indexing observe the same admission policy.
+const CASS_QUERY_FUEL_BUDGET: u64 = 64_000_000;
+
+fn cass_quill_config() -> QuillConfig {
+    QuillConfig {
+        query_fuel_budget: CASS_QUERY_FUEL_BUDGET,
+        ..QuillConfig::default()
+    }
+}
+
 /// Filename that marks a directory as a published Quill index.
 ///
 /// Verified empirically rather than assumed: a freshly created CASS index
@@ -317,7 +332,7 @@ pub fn open_cass_reader(path: &Path) -> Result<QuillSearchIndex> {
                 &cx,
                 path,
                 CASS_SEMANTIC_SCHEMA,
-                QuillConfig::default(),
+                cass_quill_config(),
             )
             .await
         }
@@ -426,7 +441,7 @@ impl QuillCassIndex {
                         &cx,
                         directory,
                         CASS_SEMANTIC_SCHEMA,
-                        QuillConfig::default(),
+                        cass_quill_config(),
                     )
                     .await
                 } else {
@@ -434,7 +449,7 @@ impl QuillCassIndex {
                         &cx,
                         directory,
                         CASS_SEMANTIC_SCHEMA,
-                        QuillConfig::default(),
+                        cass_quill_config(),
                     )
                     .await
                 }
@@ -525,7 +540,7 @@ impl QuillCassIndex {
                     &cx,
                     directory,
                     CASS_SEMANTIC_SCHEMA,
-                    QuillConfig::default(),
+                    cass_quill_config(),
                 )
                 .await
             }
