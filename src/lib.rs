@@ -20963,6 +20963,14 @@ fn state_meta_json_inner(
             .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64);
     }
+    if lexical_index_initialized
+        && let Some(manifest_watermark) = lexical_manifest_watermark_ms(&index_path)
+        && last_indexed_at
+            .map(|indexed_at| manifest_watermark > indexed_at)
+            .unwrap_or(true)
+    {
+        last_indexed_at = Some(manifest_watermark);
+    }
     let status_semantic_policy = crate::search::policy::SemanticPolicy::resolve(
         &crate::search::policy::CliSemanticOverrides::default(),
     );
@@ -21528,6 +21536,32 @@ fn lexical_manifest_indexed_doc_count(index_path: &Path) -> Option<u64> {
         {
             Some(manifest.indexed_doc_count)
         }
+        _ => None,
+    }
+}
+
+/// Return the durable publication watermark for a completed lexical
+/// generation. A canonical DB rebuild intentionally uses a read-only DB
+/// projection path; if its separate status-watermark write loses a writer
+/// race, the DB's older `last_indexed_at` must not make a freshly published,
+/// fingerprinted generation appear stale forever. The normal asset inspection
+/// below still validates the checkpoint and DB fingerprint, so this is only a
+/// timestamp provenance repair, never an assertion that an arbitrary manifest
+/// is searchable.
+fn lexical_manifest_watermark_ms(index_path: &Path) -> Option<i64> {
+    use crate::indexer::lexical_generation::{
+        LexicalGenerationBuildState, LexicalGenerationPublishState, load_manifest,
+    };
+
+    match load_manifest(index_path) {
+        Ok(Some(manifest))
+            if matches!(manifest.build_state, LexicalGenerationBuildState::Validated)
+                && matches!(
+                    manifest.publish_state,
+                    LexicalGenerationPublishState::Published
+                )
+                && manifest.updated_at_ms > 0
+                && manifest.indexed_doc_count > 0 => Some(manifest.updated_at_ms),
         _ => None,
     }
 }
