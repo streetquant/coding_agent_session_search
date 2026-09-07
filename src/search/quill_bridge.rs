@@ -700,6 +700,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cass_quill_config_uses_the_bounded_large_corpus_budget() {
+        let config = cass_quill_config();
+        let default_budget = QuillConfig::default().query_fuel_budget;
+        assert_eq!(config.query_fuel_budget, CASS_QUERY_FUEL_BUDGET);
+        assert!(config.query_fuel_budget > 0);
+        assert!(
+            config.query_fuel_budget > default_budget,
+            "CASS needs more bounded query work than Quill's fixture default"
+        );
+    }
+
     /// The bridge must drive a full write/commit/read cycle from sync code.
     ///
     /// This is the claim the whole module exists to support: cass's

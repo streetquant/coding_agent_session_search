@@ -7135,13 +7135,12 @@ impl SearchClient {
             return Ok((HashMap::new(), HashMap::new()));
         }
 
-        let sqlite_guard = match self.sqlite_guard() {
-            Ok(guard) => guard,
-            Err(_) => return Ok((HashMap::new(), HashMap::new())),
-        };
-        let Some(conn) = sqlite_guard.as_ref() else {
-            return Ok((HashMap::new(), HashMap::new()));
-        };
+        let sqlite_guard = self
+            .sqlite_guard()
+            .context("opening SQLite for Tantivy content hydration")?;
+        let conn = sqlite_guard.as_ref().ok_or_else(|| {
+            anyhow!("Tantivy content hydration requires a SQLite connection")
+        })?;
 
         let mut hydrated_exact = HashMap::new();
         let mut hydrated_fallback = HashMap::new();
@@ -7257,6 +7256,33 @@ impl SearchClient {
                     }
                 }
             }
+        }
+
+        // A Tantivy hit that asked for full content must have a canonical row
+        // behind it. Returning an empty map here used to make the caller fall
+        // back to an empty or truncated stored preview after a transient
+        // SQLite-open/read failure, which silently violated full-content
+        // semantics. Treat every requested key as a required projection.
+        if let Some(missing) = exact_keys
+            .iter()
+            .find(|key| !hydrated_exact.contains_key(key))
+        {
+            return Err(anyhow!(
+                "Tantivy exact content hydration returned no canonical row for conversation {} line {}",
+                missing.0,
+                missing.1
+            ));
+        }
+        if let Some(missing) = fallback_keys
+            .iter()
+            .find(|key| !hydrated_fallback.contains_key(key))
+        {
+            return Err(anyhow!(
+                "Tantivy fallback content hydration returned no canonical row for source {} path {} line {}",
+                missing.0,
+                missing.1,
+                missing.2
+            ));
         }
 
         Ok((hydrated_exact, hydrated_fallback))
@@ -14290,6 +14316,49 @@ mod tests {
             Some("remote fallback content")
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn tantivy_hydration_fails_closed_when_exact_row_is_missing() -> Result<()> {
+        let conn = SearchSqliteFixture::in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                UNIQUE(conversation_id, idx)
+             );",
+        )?;
+
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(Some(conn.into_connection())),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            strict_read_only: false,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
+        };
+
+        let error = client
+            .hydrate_tantivy_hit_contents(&[(41, 7)], &[])
+            .expect_err("missing canonical content must not degrade to preview fallback");
+        assert!(
+            error
+                .to_string()
+                .contains("Tantivy exact content hydration returned no canonical row"),
+            "unexpected hydration error: {error:#}"
+        );
         Ok(())
     }
 
