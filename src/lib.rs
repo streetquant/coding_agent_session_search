@@ -21082,6 +21082,34 @@ fn state_meta_json_inner(
             },
         }
     });
+    // The fast health lane intentionally skips the expensive DB fingerprint
+    // read. A validated/published lexical generation plus its completed,
+    // path-matching checkpoint and a scan watermark no newer than publication
+    // is sufficient bounded evidence to avoid re-reporting age-only staleness;
+    // a later status/doctor probe still supplies the current fingerprint.
+    if open_skipped
+        && assets.lexical.fingerprint.current_db_fingerprint.is_none()
+        && assets.lexical.exists
+        && !assets.lexical.engine_incompatible
+        && assets.lexical.checkpoint.present
+        && assets.lexical.checkpoint.completed == Some(true)
+        && assets.lexical.checkpoint.db_matches == Some(true)
+        && assets.lexical.checkpoint.schema_matches == Some(true)
+        && assets.lexical.checkpoint.page_size_compatible == Some(true)
+        && let Some(manifest_watermark) = lexical_manifest_watermark_ms(&index_path)
+        && last_scan_ts
+            .map(|scan_ts| scan_ts <= manifest_watermark.saturating_add(1_000))
+            .unwrap_or(true)
+    {
+        assets.lexical.status = "ready";
+        assets.lexical.fresh = true;
+        assets.lexical.stale = false;
+        assets.lexical.last_indexed_at_ms = Some(manifest_watermark);
+        assets.lexical.age_seconds = Some(
+            now_secs.saturating_sub((manifest_watermark.max(0) as u64) / 1000),
+        );
+        assets.lexical.status_reason = None;
+    }
     if !assets.lexical.rebuilding
         && last_scan_ts.is_some_and(|scan_ts| {
             last_indexed_at

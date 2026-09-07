@@ -1423,10 +1423,25 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     let now_secs: u64 = now_ms.div_euclid(1000).max(0) as u64;
     let age_seconds = last_indexed_at_ms
         .and_then(|ts| (ts > 0).then(|| now_secs.saturating_sub((ts / 1000) as u64)));
-    let age_stale = match age_seconds {
+    let age_stale_by_clock = match age_seconds {
         Some(age) => age > stale_threshold,
         None => true,
     };
+    // A completed lexical generation carries a stronger freshness proof than
+    // the wall-clock age of the legacy DB watermark: it records the exact DB
+    // fingerprint, checkpoint, schema, and document count used for publish.
+    // Once the live DB fingerprint matches that completed checkpoint, age alone
+    // cannot make a content-equivalent generation stale. Scan-ahead and all
+    // structural/fingerprint mismatch checks below still force stale.
+    let completed_checkpoint_matches_current_db = checkpoint.is_some_and(|state| {
+        state.completed
+            && checkpoint_db_matches == Some(true)
+            && schema_matches == Some(true)
+            && page_size_compatible == Some(true)
+            && current_db_fingerprint.is_some()
+            && fingerprint_matches == Some(true)
+    });
+    let age_stale = age_stale_by_clock && !completed_checkpoint_matches_current_db;
     let maintenance_targets_current_db = maintenance
         .db_path
         .as_ref()
