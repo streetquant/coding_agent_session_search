@@ -3,8 +3,8 @@
 //! Bead: coding_agent_session_search-cass-fleet-resilience-20260608-uojcg.9.4
 //! ("Track dependency pins and upstream fix correlation in diagnostics").
 //!
-//! CASS pins sibling crates (frankensqlite, frankensearch, asupersync, …) by git
-//! revision. When a symptom shows up — e.g. a frankensqlite FTS/`OpenRead`
+//! CASS pins ecosystem crates (frankensqlite, frankensearch, asupersync, …) by
+//! exact registry requirement or git revision. When a symptom shows up — e.g. a frankensqlite FTS/`OpenRead`
 //! failure — the right diagnostic answer is often "this is already fixed upstream
 //! in rev X; your pin is behind" or "your local checkout is dirty/patched, so the
 //! pinned rev is not what is actually running". This module makes that correlation

@@ -49,6 +49,11 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ### Changed
 
+- Moved the FrankenSQLite family from the CASS 0.7.1 `0.3.13` git pin to the
+  exact `0.3.17` registry release after the large-WAL production-manager
+  archive open/rollback probe failed during doctor post-repair verification.
+  The build contract and compatibility gate now require one converged registry
+  family and reject git or family-specific patch overrides.
 - Advanced the FrankenSQLite engine pin to `0.3.13` (rev `2d8a68b9`), which
   carries the autoindex-vanish corruption-writer fixes — the writer-side class
   behind the FTS5-corrupt-archive refusals tracked in

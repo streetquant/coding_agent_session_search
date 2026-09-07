@@ -47,22 +47,13 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensqlite",
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
-        // Exact upstream source pin (established with the fsqlite 0.2.1
-        // migration, bead bo000; now at 0.3.13, which carries the asupersync
-        // 0.4.3 runtime migration, the GH#333/GH#334 bug-fix wave, the
-        // cass#393 namespace-sidecar st_dev repair, the 0.3.1
-        // allocator/freelist/concurrent-writer correctness wave, and the
-        // later FTS5 correctness fixes plus the GH#438 Windows sidecar-less
-        // read-only close repair shipped in 0.3.9). Revisions 22af0753 and
-        // 027f62f2 admit the semantically read-only FTS5 integrity command
-        // through both the physically read-only pager and `PRAGMA query_only`
-        // guards, which CASS's full-rebuild preflight requires on Windows
-        // without weakening its corruption gate. 0.3.13 adds the
-        // autoindex-vanish corruption-writer fixes (the cass#434 writer
-        // class).
-        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4",
-        expected_version: "0.3.13",
+        // Registry pin selected after the CASS 0.7.1 production manager
+        // failed its large-WAL archive open/rollback post-repair probe on
+        // fsqlite 0.3.13. The 0.3.17 family is intentionally registry-only
+        // so every transitive fsqlite consumer converges without a patch.
+        expected_git: "",
+        expected_rev: "",
+        expected_version: "0.3.17",
         // `async-api` exposes frankensqlite::AsyncConnection, which
         // src/search/query.rs uses (as SearchSqliteConnection) for the
         // no-hit alternate-agent suggestions without a full storage open.
@@ -80,10 +71,10 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        // Keep shared types on the identical source revision as the facade.
-        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4",
-        expected_version: "0.3.13",
+        // Keep shared types on the identical registry release as the facade.
+        expected_git: "",
+        expected_rev: "",
+        expected_version: "0.3.17",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -98,10 +89,10 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        // Keep shared types on the identical source revision as the facade.
-        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4",
-        expected_version: "0.3.13",
+        // Keep shared types on the identical registry release as the facade.
+        expected_git: "",
+        expected_rev: "",
+        expected_version: "0.3.17",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -431,58 +422,34 @@ fn validate_path_dependency_contracts(
 }
 
 fn validate_fsqlite_source_pin(manifest_dir: &Path, manifest: &Value, packaged_manifest: bool) {
-    // The fsqlite engine family must resolve exclusively from one immutable
-    // upstream revision. The exact source is load-bearing for the read-only
-    // FTS5 integrity preflight used by CASS on Windows.
-    const EXPECTED_VERSION: &str = "0.3.13";
-    const EXPECTED_GIT: &str = "https://github.com/Dicklesworthstone/frankensqlite";
-    const EXPECTED_REV: &str = "2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4";
+    // The fsqlite engine family must resolve exclusively from one exact
+    // registry release. A mixed git/registry family can compile while loading
+    // incompatible manager and type implementations at runtime.
+    const EXPECTED_VERSION: &str = "0.3.17";
+    const EXPECTED_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
-    // 1. franken-agent-detection names the crates.io facade. Require one
-    //    narrowly scoped source replacement so that entry point resolves to
-    //    the same reviewed git universe as CASS's direct dependencies.
+    // franken-agent-detection names the crates.io facade directly. No
+    // fsqlite-family patch is permitted to redirect it to another source.
     if !packaged_manifest {
-        let patch_tables = table(manifest, "patch", "manifest root");
-        let crates_io = table_value(Some(patch_tables), "crates-io", "[patch]");
-        let Some(crates_io) = crates_io.as_table() else {
-            fatal("dependency source contract: [patch.crates-io] must be a TOML table");
-        };
-        for dependency in crates_io.keys() {
-            if dependency.starts_with("fsqlite-") {
-                fatal(format!(
-                    "dependency source contract violation for {dependency}: only the \
-                     registry facade entry [patch.crates-io].fsqlite may redirect the \
-                     family to {EXPECTED_GIT}@{EXPECTED_REV}"
-                ));
+        if let Some(crates_io) = manifest
+            .get("patch")
+            .and_then(Value::as_table)
+            .and_then(|patch| patch.get("crates-io"))
+            .and_then(Value::as_table)
+        {
+            for dependency in crates_io.keys() {
+                if dependency == "fsqlite" || dependency.starts_with("fsqlite-") {
+                    fatal(format!(
+                        "dependency source contract violation for [patch.crates-io].{dependency}: \
+                         fsqlite-family patches are forbidden; use registry =0.3.17"
+                    ));
+                }
             }
-        }
-        let patch_entry = inline_table(crates_io, "fsqlite", "[patch.crates-io]");
-        let actual_version = string_value(patch_entry, "version", "fsqlite");
-        let expected_version = format!("={EXPECTED_VERSION}");
-        if actual_version != expected_version {
-            fatal(format!(
-                "dependency source contract violation for [patch.crates-io].fsqlite: \
-                 version must be `{expected_version}`, found `{actual_version}`"
-            ));
-        }
-        let actual_git = string_value(patch_entry, "git", "fsqlite");
-        if actual_git != EXPECTED_GIT {
-            fatal(format!(
-                "dependency source contract violation for [patch.crates-io].fsqlite: \
-                 git must be `{EXPECTED_GIT}`, found `{actual_git}`"
-            ));
-        }
-        let actual_rev = string_value(patch_entry, "rev", "fsqlite");
-        if actual_rev != EXPECTED_REV {
-            fatal(format!(
-                "dependency source contract violation for [patch.crates-io].fsqlite: \
-                 rev must be `{EXPECTED_REV}`, found `{actual_rev}`"
-            ));
         }
     }
 
-    // 2. Lockfile convergence: every resolved fsqlite-family package must be
-    //    the pinned source revision, with exactly one version per crate.
+    // Lockfile convergence: every resolved fsqlite-family package must be the
+    // pinned registry release, with exactly one version per crate.
     //    Cargo resolves the lockfile before running build scripts, so the
     //    lockfile is authoritative here. Packaged manifests (`cargo package`
     //    verification builds) re-resolve into a fresh lockfile that inherits
@@ -543,11 +510,9 @@ fn validate_fsqlite_source_pin(manifest_dir: &Path, manifest: &Value, packaged_m
             ));
         }
         let source = package.get("source").and_then(Value::as_str).unwrap_or("");
-        let expected_source_prefix = format!("git+{EXPECTED_GIT}?rev={EXPECTED_REV}#");
-        if !source.starts_with(&expected_source_prefix) || !source.ends_with(EXPECTED_REV) {
+        if source != EXPECTED_REGISTRY_SOURCE {
             violations.push(format!(
-                "`{name}` resolves from `{source}`, expected `{EXPECTED_GIT}` at \
-                 revision `{EXPECTED_REV}`"
+                "`{name}` resolves from `{source}`, expected the crates.io registry"
             ));
         }
     }
