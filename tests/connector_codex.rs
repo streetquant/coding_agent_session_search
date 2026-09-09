@@ -318,6 +318,61 @@ fn codex_connector_scans_explicit_rollout_file_root() {
 }
 
 #[test]
+fn codex_connector_scans_relocated_rollout_file_root() {
+    let dir = TempDir::new().unwrap();
+    let sessions = dir.path().join("archived_sessions/2026/09/09");
+    fs::create_dir_all(&sessions).unwrap();
+    let file = sessions.join("rollout-relocated.jsonl");
+
+    let sample = r#"{"timestamp":"2026-09-09T03:00:00.000Z","type":"session_meta","payload":{"id":"relocated-id","cwd":"/data/projects/scope","cli_version":"0.49.0"}}
+{"timestamp":"2026-09-09T03:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"relocated source user"}]}}
+{"timestamp":"2026-09-09T03:00:02.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"printf relocated\"}","call_id":"relocated-call"}}
+{"timestamp":"2026-09-09T03:00:03.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"relocated-call","output":"relocated result"}}
+{"timestamp":"2026-09-09T03:00:04.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"relocated source assistant"}]}}
+{"timestamp":"2026-09-09T03:00:05.000Z","type":"turn_context","payload":{"turn_id":"relocated-turn-2","continuation_of":"relocated-id"}}
+"#;
+    fs::write(&file, sample).unwrap();
+
+    let connector = CodexConnector::new();
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: vec![ScanRoot::local(file.clone())],
+        since_ts: None,
+        progress_tick: None,
+    };
+    let convs = connector.scan(&ctx).unwrap();
+    assert_eq!(convs.len(), 1);
+
+    let conv = &convs[0];
+    assert_eq!(conv.source_path, file);
+    assert_eq!(conv.workspace, Some(PathBuf::from("/data/projects/scope")));
+    assert!(
+        conv.messages
+            .iter()
+            .any(|message| message.role == "user"
+                && message.content.contains("relocated source user"))
+    );
+    let invocation = conv
+        .messages
+        .iter()
+        .flat_map(|message| message.invocations.iter())
+        .find(|invocation| invocation.call_id.as_deref() == Some("relocated-call"))
+        .expect("relocated function call should be preserved");
+    assert_eq!(invocation.name, "exec_command");
+    assert!(
+        conv.messages
+            .iter()
+            .any(|message| message.role == "tool" && message.content.contains("relocated result"))
+    );
+    assert!(
+        conv.messages
+            .iter()
+            .any(|message| message.role == "assistant"
+                && message.content.contains("relocated source assistant"))
+    );
+}
+
+#[test]
 fn codex_connector_ignores_unmatched_token_count() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/11/23");

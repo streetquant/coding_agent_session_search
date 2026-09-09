@@ -910,9 +910,13 @@ mod tests {
         ] {
             let fixture = json!({"next_proof_command": safe_command});
             let dashboard = render_operations_dashboard_fixture("safe-proof", Some(&fixture));
+            // The raw command is checked by is_robot_safe_command first, then
+            // rendered through the strict redactor. Keep this assertion tied
+            // to the same output contract, including /data/tmp build paths.
+            let expected_command = safe_text(safe_command);
             verify_eq!(
                 dashboard["cards"]["next_proof"]["command"],
-                safe_command,
+                expected_command,
                 "safe command was rejected: {safe_command}"
             );
         }

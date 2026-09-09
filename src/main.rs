@@ -256,6 +256,26 @@ fn main() -> anyhow::Result<()> {
     apply_default_fsqlite_read_witness_cap();
 
     let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.get(1).map(String::as_str)
+        == Some(coding_agent_search::indexer::FINAL_WAL_CHECKPOINT_WORKER_ARG)
+    {
+        if raw_args.len() != 4 {
+            anyhow::bail!(
+                "{} requires exactly a database path and checkpoint context",
+                coding_agent_search::indexer::FINAL_WAL_CHECKPOINT_WORKER_ARG
+            );
+        }
+        let db_path = std::path::Path::new(&raw_args[2]);
+        let worker_result =
+            coding_agent_search::indexer::run_final_wal_checkpoint_worker(db_path, &raw_args[3]);
+        // Release any cached synchronous bridge runtimes even when opening or
+        // checkpointing the worker DB fails, before the process tears down.
+        let _ = coding_agent_search::shutdown_thread_local_bridge_runtimes();
+        let outcome = worker_result?;
+        println!("{}", serde_json::to_string(&outcome)?);
+        return Ok(());
+    }
+
     let parsed = match coding_agent_search::parse_cli(raw_args) {
         Ok(parsed) => parsed,
         Err(err) => handle_fatal_error(err),

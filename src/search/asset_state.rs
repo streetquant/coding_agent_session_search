@@ -186,7 +186,18 @@ pub(crate) fn clear_index_run_lock_metadata_sidecar(lock_path: &Path) -> Result<
             "syncing cleared index-run lock metadata sidecar {}",
             sidecar_path.display()
         )
-    })
+    })?;
+    drop(sidecar);
+    match std::fs::remove_file(&sidecar_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "removing cleared index-run lock metadata sidecar {}",
+                sidecar_path.display()
+            )
+        }),
+    }
 }
 
 fn read_capped_metadata_from_path(path: &Path, max_len: u64) -> std::io::Result<String> {
@@ -2882,6 +2893,55 @@ mod tests {
         let reason = state.status_reason.as_deref().unwrap_or_default();
         assert!(reason.contains("cass index --full"));
         assert!(reason.contains("Tantivy"));
+    }
+
+    #[test]
+    fn lexical_state_accepts_old_age_for_completed_matching_generation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v4");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+        let checkpoint = LexicalRebuildCheckpoint {
+            db_path: db_path.display().to_string(),
+            total_conversations: 10,
+            storage_fingerprint: "content-v1:10:20:30".to_string(),
+            committed_offset: 10,
+            committed_conversation_id: Some(20),
+            processed_conversations: 10,
+            indexed_docs: 100,
+            schema_hash: SCHEMA_HASH.to_string(),
+            page_size: LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
+            completed: true,
+            updated_at_ms: 1_733_000_000_000,
+        };
+
+        let state = lexical_state_from_observations(LexicalObservationInput {
+            index_path: &index_path,
+            db_path: &db_path,
+            stale_threshold: 60,
+            // The generation is deliberately older than the wall-clock
+            // threshold. Matching DB/checkpoint identity is the stronger
+            // publication proof for an unchanged canonical archive.
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_ms: 1_733_000_600_000,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            checkpoint: Some(&checkpoint),
+            current_db_fingerprint: Some("content-v1:10:20:30"),
+            live_docs: None,
+        });
+
+        assert_eq!(state.status, "ready");
+        assert!(state.fresh);
+        assert!(!state.stale);
+        assert_eq!(state.fingerprint.matches_current_db_fingerprint, Some(true));
+        assert_eq!(state.checkpoint.completed, Some(true));
+        assert_eq!(state.checkpoint.db_matches, Some(true));
     }
 
     #[test]

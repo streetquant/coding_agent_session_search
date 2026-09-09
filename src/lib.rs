@@ -21344,6 +21344,14 @@ fn state_meta_json_inner(
             .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64);
     }
+    if lexical_index_initialized
+        && let Some(manifest_watermark) = lexical_manifest_watermark_ms(&index_path)
+        && last_indexed_at
+            .map(|indexed_at| manifest_watermark > indexed_at)
+            .unwrap_or(true)
+    {
+        last_indexed_at = Some(manifest_watermark);
+    }
     let status_semantic_policy = crate::search::policy::SemanticPolicy::resolve(
         &crate::search::policy::CliSemanticOverrides::default(),
     );
@@ -21939,6 +21947,82 @@ fn lexical_manifest_indexed_doc_count(index_path: &Path) -> Option<u64> {
         }
         _ => None,
     }
+}
+
+/// Return the durable publication watermark for a completed lexical
+/// generation. A canonical DB rebuild intentionally uses a read-only DB
+/// projection path; if its separate status-watermark write loses a writer
+/// race, the DB's older `last_indexed_at` must not make a freshly published,
+/// fingerprinted generation appear stale forever. The normal asset inspection
+/// below still validates the checkpoint and DB fingerprint, so this is only a
+/// timestamp provenance repair, never an assertion that an arbitrary manifest
+/// is searchable.
+fn lexical_manifest_watermark_ms(index_path: &Path) -> Option<i64> {
+    use crate::indexer::lexical_generation::{
+        LexicalGenerationBuildState, LexicalGenerationPublishState, load_manifest,
+    };
+
+    match load_manifest(index_path) {
+        Ok(Some(manifest))
+            if matches!(manifest.build_state, LexicalGenerationBuildState::Validated)
+                && matches!(
+                    manifest.publish_state,
+                    LexicalGenerationPublishState::Published
+                )
+                && manifest.updated_at_ms > 0
+                && manifest.indexed_doc_count > 0 =>
+        {
+            Some(manifest.updated_at_ms)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn lexical_manifest_watermark_requires_validated_published_nonempty_generation() {
+    use crate::indexer::lexical_generation::{
+        LexicalGenerationBuildState, LexicalGenerationManifest, LexicalGenerationPublishState,
+        store_manifest,
+    };
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let index_path = temp.path().join("index").join("v4");
+    let read_watermark = |manifest: &LexicalGenerationManifest| {
+        store_manifest(&index_path, manifest).expect("store manifest");
+        lexical_manifest_watermark_ms(&index_path)
+    };
+
+    let mut manifest = LexicalGenerationManifest::new_scratch(
+        "generation-watermark",
+        "attempt-watermark",
+        "fp-current",
+        1_733_000_000_000,
+    );
+    manifest.indexed_doc_count = 3;
+    manifest.transition_build(LexicalGenerationBuildState::Validated, 1_733_000_000_100);
+    manifest.transition_publish(LexicalGenerationPublishState::Published, 1_733_000_000_200);
+    assert_eq!(read_watermark(&manifest), Some(1_733_000_000_200));
+
+    let mut staged = LexicalGenerationManifest::new_scratch(
+        "generation-staged",
+        "attempt-staged",
+        "fp-current",
+        1_733_000_000_300,
+    );
+    staged.indexed_doc_count = 3;
+    staged.transition_build(LexicalGenerationBuildState::Validated, 1_733_000_000_400);
+    assert_eq!(read_watermark(&staged), None);
+
+    let mut empty = LexicalGenerationManifest::new_scratch(
+        "generation-empty",
+        "attempt-empty",
+        "fp-current",
+        1_733_000_000_500,
+    );
+    empty.transition_build(LexicalGenerationBuildState::Validated, 1_733_000_000_600);
+    empty.transition_publish(LexicalGenerationPublishState::Published, 1_733_000_000_700);
+    assert_eq!(read_watermark(&empty), None);
 }
 
 /// Stale-on-read catch-up (see `indexer::background_refresh`).
@@ -86088,6 +86172,25 @@ mod cli_read_db_tests {
         )
         .expect("write rebuild state");
 
+        let mut manifest =
+            crate::indexer::lexical_generation::LexicalGenerationManifest::new_scratch(
+                "generation-mismatch",
+                "attempt-mismatch",
+                "stale-fingerprint",
+                1_733_000_122_000,
+            );
+        manifest.indexed_doc_count = 20;
+        manifest.transition_build(
+            crate::indexer::lexical_generation::LexicalGenerationBuildState::Validated,
+            1_733_000_123_000,
+        );
+        manifest.transition_publish(
+            crate::indexer::lexical_generation::LexicalGenerationPublishState::Published,
+            1_733_000_124_000,
+        );
+        crate::indexer::lexical_generation::store_manifest(&index_path, &manifest)
+            .expect("write published lexical generation manifest");
+
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["index"]["status"].as_str(), Some("stale"));
         assert_eq!(state["index"]["stale"].as_bool(), Some(true));
@@ -86111,6 +86214,91 @@ mod cli_read_db_tests {
         );
         assert_eq!(state["rebuild"]["indexed_docs"], serde_json::Value::Null);
         assert_eq!(state["semantic"]["fallback_mode"].as_str(), Some("lexical"));
+    }
+
+    #[test]
+    fn state_meta_json_uses_published_manifest_watermark_for_old_db_timestamp() {
+        let (temp, db_path) = seed_cli_db();
+        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
+
+        let storage_fingerprint = crate::indexer::lexical_storage_fingerprint_for_db(&db_path)
+            .expect("compute fixture database fingerprint");
+        let published_at_ms = 1_733_000_600_000_i64;
+        std::fs::write(
+            index_path.join(".lexical-rebuild-state.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 2,
+                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
+                "db": {
+                    "db_path": db_path.display().to_string(),
+                    "total_conversations": 0,
+                    "storage_fingerprint": storage_fingerprint.clone()
+                },
+                "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
+                "committed_offset": 0,
+                "committed_conversation_id": null,
+                "processed_conversations": 0,
+                "indexed_docs": 1,
+                "committed_meta_fingerprint": null,
+                "pending": null,
+                "completed": true,
+                "updated_at_ms": published_at_ms
+            }))
+            .expect("serialize completed lexical checkpoint"),
+        )
+        .expect("write completed lexical checkpoint");
+
+        let mut manifest =
+            crate::indexer::lexical_generation::LexicalGenerationManifest::new_scratch(
+                "generation-watermark-public",
+                "attempt-watermark-public",
+                storage_fingerprint.as_str(),
+                published_at_ms.saturating_sub(1_000),
+            );
+        manifest.indexed_doc_count = 1;
+        manifest.transition_build(
+            crate::indexer::lexical_generation::LexicalGenerationBuildState::Validated,
+            published_at_ms.saturating_sub(100),
+        );
+        manifest.transition_publish(
+            crate::indexer::lexical_generation::LexicalGenerationPublishState::Published,
+            published_at_ms,
+        );
+        crate::indexer::lexical_generation::store_manifest(&index_path, &manifest)
+            .expect("write published lexical generation manifest");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        assert_eq!(state["index"]["status"].as_str(), Some("ready"));
+        assert_eq!(state["index"]["fresh"].as_bool(), Some(true));
+        assert_eq!(state["index"]["stale"].as_bool(), Some(false));
+        let observed_last_indexed_at = state["index"]["last_indexed_at"]
+            .as_str()
+            .expect("published manifest watermark should surface as last_indexed_at");
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(observed_last_indexed_at)
+                .expect("parse public last_indexed_at")
+                .timestamp_millis(),
+            published_at_ms,
+            "published generation watermark must replace the older DB watermark"
+        );
+        assert_eq!(
+            state["index"]["fingerprint"]["matches_current_db_fingerprint"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            state["index"]["checkpoint"]["completed"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            state["index"]["checkpoint"]["db_matches"].as_bool(),
+            Some(true)
+        );
     }
 
     #[test]

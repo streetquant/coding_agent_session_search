@@ -23,12 +23,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Seek, Write};
+use std::io::{BufWriter, Read, Seek, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -75,6 +74,7 @@ use crate::search::tantivy::{
 use crate::search::vector_index::{
     ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER, vector_index_path,
 };
+use wait_timeout::ChildExt;
 
 use crate::sources::config::{Platform, SourcesConfig};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceKind};
@@ -17519,10 +17519,7 @@ fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &
     // opener a replay, never data — so a checkpoint that outlives its budget is
     // reported and skipped rather than waited on forever.
     let timeout = final_wal_checkpoint_timeout();
-    let worker_context = context.to_string();
-    match run_bounded_abort_wal_checkpoint(db_path.to_path_buf(), timeout, move |path| {
-        run_final_wal_checkpoint(path, &worker_context)
-    }) {
+    match run_bounded_native_wal_checkpoint(db_path.to_path_buf(), timeout, context) {
         AbortWalCheckpointAttempt::Finished(Ok(_outcome)) => Ok(()),
         AbortWalCheckpointAttempt::Finished(Err(error)) => Err(anyhow::anyhow!(
             "final WAL checkpoint after {context} failed: {error}"
@@ -17580,6 +17577,7 @@ fn prepare_storage_for_final_checkpoint(storage: &FrankenStorage, db_path: &Path
     }
 }
 
+pub const FINAL_WAL_CHECKPOINT_WORKER_ARG: &str = "__cass-finalize-wal-checkpoint";
 /// Result of a `PRAGMA wal_checkpoint(TRUNCATE)` issued during index finalize
 /// or the bounded stall-abort path.
 ///
@@ -17588,8 +17586,8 @@ fn prepare_storage_for_final_checkpoint(storage: &FrankenStorage, db_path: &Path
 /// truncate the WAL, so the canonical DB is still a replay dependency on a
 /// large `*.db-wal` and stock `PRAGMA integrity_check` will fail. Callers must
 /// not report such a checkpoint as success.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FinalWalCheckpointOutcome {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FinalWalCheckpointOutcome {
     /// The WAL was fully checkpointed and truncated (`busy == 0` and every
     /// logged frame was backfilled).
     Completed,
@@ -17613,24 +17611,55 @@ enum AbortWalCheckpointAttempt {
 
 const ABORT_WAL_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Run the pre-abort checkpoint on a disposable worker and wait only for the
-/// supplied deadline. The watchdog is supervising a process whose indexer
-/// thread is already proven wedged; running another database open/checkpoint
-/// synchronously on the watchdog thread can block behind that same owner and
-/// defeat the promised bounded exit.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug)]
+struct WalCheckpointCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl WalCheckpointCancellation {
+    fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+/// Run a bounded, cooperative finalization callback and always join its worker.
+///
+/// The callback receives a cancellation token and must poll it at every
+/// potentially blocking step. Native fsqlite finalization is not
+/// cancellable, so production callers use the process-contained helper below;
+/// this thread helper is reserved for cooperative work and deterministic tests.
+/// No return path detaches a worker that may still hold the database or WAL.
 fn run_bounded_abort_wal_checkpoint<F>(
     db_path: PathBuf,
     timeout: Duration,
     checkpoint: F,
 ) -> AbortWalCheckpointAttempt
 where
-    F: FnOnce(&Path) -> Result<FinalWalCheckpointOutcome> + Send + 'static,
+    F: FnOnce(&Path, &WalCheckpointCancellation) -> Result<FinalWalCheckpointOutcome>
+        + Send
+        + 'static,
 {
+    let cancellation = WalCheckpointCancellation::new();
+    let worker_cancellation = cancellation.clone();
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
-    let _worker = match std::thread::Builder::new()
+    let worker = match std::thread::Builder::new()
         .name("cass-abort-wal-checkpoint".to_string())
         .spawn(move || {
-            let result = checkpoint(&db_path).map_err(|err| format!("{err:#}"));
+            let result =
+                checkpoint(&db_path, &worker_cancellation).map_err(|err| format!("{err:#}"));
             let _ = result_tx.send(result);
         }) {
         Ok(worker) => worker,
@@ -17638,14 +17667,172 @@ where
     };
 
     match result_rx.recv_timeout(timeout) {
-        Ok(result) => AbortWalCheckpointAttempt::Finished(result),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => AbortWalCheckpointAttempt::TimedOut,
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            AbortWalCheckpointAttempt::WorkerUnavailable(
-                "checkpoint worker exited without reporting an outcome".to_string(),
-            )
+        Ok(result) => match worker.join() {
+            Ok(()) => AbortWalCheckpointAttempt::Finished(result),
+            Err(payload) => AbortWalCheckpointAttempt::WorkerUnavailable(format!(
+                "checkpoint worker panicked after reporting an outcome: {}",
+                panic_payload_message(payload)
+            )),
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            cancellation.cancel();
+            match worker.join() {
+                Ok(()) => AbortWalCheckpointAttempt::TimedOut,
+                Err(payload) => AbortWalCheckpointAttempt::WorkerUnavailable(format!(
+                    "checkpoint worker panicked while joining after cancellation: {}",
+                    panic_payload_message(payload)
+                )),
+            }
         }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match worker.join() {
+            Ok(()) => AbortWalCheckpointAttempt::WorkerUnavailable(
+                "checkpoint worker exited without reporting an outcome".to_string(),
+            ),
+            Err(payload) => AbortWalCheckpointAttempt::WorkerUnavailable(format!(
+                "checkpoint worker panicked without reporting an outcome: {}",
+                panic_payload_message(payload)
+            )),
+        },
     }
+}
+
+#[cfg(test)]
+fn run_bounded_native_wal_checkpoint(
+    db_path: PathBuf,
+    timeout: Duration,
+    context: &str,
+) -> AbortWalCheckpointAttempt {
+    let worker_context = context.to_string();
+    run_bounded_abort_wal_checkpoint(db_path, timeout, move |path, cancellation| {
+        run_final_wal_checkpoint_with_cancellation(path, &worker_context, cancellation)
+    })
+}
+
+#[cfg(not(test))]
+fn run_bounded_native_wal_checkpoint(
+    db_path: PathBuf,
+    timeout: Duration,
+    context: &str,
+) -> AbortWalCheckpointAttempt {
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(error) => {
+            return AbortWalCheckpointAttempt::WorkerUnavailable(format!(
+                "resolving cass executable for final WAL checkpoint worker: {error}"
+            ));
+        }
+    };
+    run_bounded_native_wal_checkpoint_with_executable(&executable, db_path, timeout, context)
+}
+
+fn run_bounded_native_wal_checkpoint_with_executable(
+    executable: &Path,
+    db_path: PathBuf,
+    timeout: Duration,
+    context: &str,
+) -> AbortWalCheckpointAttempt {
+    let mut child = match Command::new(executable)
+        .arg(FINAL_WAL_CHECKPOINT_WORKER_ARG)
+        .arg(&db_path)
+        .arg(context)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return AbortWalCheckpointAttempt::WorkerUnavailable(format!(
+                "spawning final WAL checkpoint worker {}: {error}",
+                executable.display()
+            ));
+        }
+    };
+
+    let status = match child.wait_timeout(timeout) {
+        Ok(status) => status,
+        Err(error) => {
+            return match terminate_and_reap_wal_checkpoint_child(&mut child) {
+                Ok(()) => AbortWalCheckpointAttempt::WorkerUnavailable(format!(
+                    "waiting for final WAL checkpoint worker failed: {error}"
+                )),
+                Err(reap_error) => AbortWalCheckpointAttempt::WorkerUnavailable(format!(
+                    "waiting for final WAL checkpoint worker failed: {error}; \
+                     terminating and reaping it also failed: {reap_error}"
+                )),
+            };
+        }
+    };
+    let Some(status) = status else {
+        return match terminate_and_reap_wal_checkpoint_child(&mut child) {
+            Ok(()) => AbortWalCheckpointAttempt::TimedOut,
+            Err(error) => AbortWalCheckpointAttempt::WorkerUnavailable(format!(
+                "final WAL checkpoint worker exceeded {} ms and could not be terminated and \
+                 reaped: {error}",
+                timeout.as_millis()
+            )),
+        };
+    };
+
+    let mut stdout = Vec::new();
+    if let Some(mut pipe) = child.stdout.take()
+        && let Err(error) = pipe.read_to_end(&mut stdout)
+    {
+        return AbortWalCheckpointAttempt::WorkerUnavailable(format!(
+            "reading final WAL checkpoint worker stdout failed: {error}"
+        ));
+    }
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stderr.take()
+        && let Err(error) = pipe.read_to_end(&mut stderr)
+    {
+        return AbortWalCheckpointAttempt::WorkerUnavailable(format!(
+            "reading final WAL checkpoint worker stderr failed: {error}"
+        ));
+    }
+
+    if !status.success() {
+        return AbortWalCheckpointAttempt::Finished(Err(format!(
+            "final WAL checkpoint worker exited with {status}: {}",
+            summarize_wal_checkpoint_child_output(&stderr)
+        )));
+    }
+
+    match serde_json::from_slice::<FinalWalCheckpointOutcome>(&stdout) {
+        Ok(outcome) => AbortWalCheckpointAttempt::Finished(Ok(outcome)),
+        Err(error) => AbortWalCheckpointAttempt::WorkerUnavailable(format!(
+            "final WAL checkpoint worker exited successfully without a valid outcome: {error}; \
+             stdout={}; stderr={}",
+            summarize_wal_checkpoint_child_output(&stdout),
+            summarize_wal_checkpoint_child_output(&stderr)
+        )),
+    }
+}
+
+fn terminate_and_reap_wal_checkpoint_child(child: &mut Child) -> std::io::Result<()> {
+    let kill_error = child.kill().err();
+    match child.wait() {
+        Ok(_) => Ok(()),
+        Err(wait_error) => match kill_error {
+            Some(kill_error) => Err(std::io::Error::other(format!(
+                "kill failed: {kill_error}; wait failed: {wait_error}"
+            ))),
+            None => Err(wait_error),
+        },
+    }
+}
+
+fn summarize_wal_checkpoint_child_output(output: &[u8]) -> String {
+    const MAX_OUTPUT_CHARS: usize = 1024;
+    let output = String::from_utf8_lossy(output).trim().to_string();
+    if output.is_empty() {
+        return "<empty>".to_string();
+    }
+    let mut summary = output.chars().take(MAX_OUTPUT_CHARS).collect::<String>();
+    if output.chars().count() > MAX_OUTPUT_CHARS {
+        summary.push_str("...");
+    }
+    summary
 }
 
 /// Classify a `wal_checkpoint` status row `(busy, log_frames, checkpointed)`.
@@ -17661,8 +17848,9 @@ fn classify_final_wal_checkpoint(
     log_frames: i64,
     checkpointed_frames: i64,
 ) -> FinalWalCheckpointOutcome {
+    let invalid_status = busy < 0 || log_frames < 0 || checkpointed_frames < 0;
     let left_frames_uncheckpointed = log_frames > 0 && checkpointed_frames < log_frames;
-    if busy > 0 || left_frames_uncheckpointed {
+    if busy != 0 || invalid_status || left_frames_uncheckpointed {
         FinalWalCheckpointOutcome::Blocked {
             busy,
             log_frames,
@@ -17682,7 +17870,7 @@ fn classify_final_wal_checkpoint(
 /// canonical DB file (the wedged storage handle's workers are parked, but the
 /// file itself is checkpointable through a new connection) and runs
 /// `wal_checkpoint(TRUNCATE)` so the post-abort DB is recoverable by stock
-/// SQLite. The fresh checkpoint itself is supervised from a disposable thread
+/// SQLite. The fresh checkpoint itself is supervised by a child cass process
 /// and gets only [`ABORT_WAL_CHECKPOINT_TIMEOUT`]: the still-live wedged writer
 /// can otherwise block the fresh open/checkpoint indefinitely and turn the
 /// watchdog's promised exit into another hang. Everything is best-effort; a
@@ -17703,9 +17891,11 @@ pub fn best_effort_abort_wal_checkpoint(data_dir: &Path) {
     if !db_path.exists() {
         return;
     }
-    match run_bounded_abort_wal_checkpoint(db_path.clone(), ABORT_WAL_CHECKPOINT_TIMEOUT, |path| {
-        run_final_wal_checkpoint(path, "stall abort")
-    }) {
+    match run_bounded_native_wal_checkpoint(
+        db_path.clone(),
+        ABORT_WAL_CHECKPOINT_TIMEOUT,
+        "stall abort",
+    ) {
         AbortWalCheckpointAttempt::Finished(Ok(FinalWalCheckpointOutcome::Completed)) => {
             tracing::info!(
                 db_path = %db_path.display(),
@@ -17768,19 +17958,17 @@ pub(crate) const CASS_TEST_WAL_CHECKPOINT_PARK_MS_ENV: &str = "CASS_TEST_WAL_CHE
 /// g3zyo). On the owner-scale archive with a 200 MB WAL, frankensqlite's
 /// writable open never returns, which turned `cass doctor --fix` into an
 /// infinite hang. The checkpoint runs on the same disposable worker as the
-/// stall-abort checkpoint; if it has not finished by `deadline`, the caller
-/// gets an error that names the shape and the out-of-band remedy instead of
-/// waiting forever. The worker is left to finish or die with the process — it
-/// cannot be cancelled, and the callers are short-lived CLI commands.
+/// stall-abort checkpoint; if it has not finished by `deadline`, the child is
+/// killed and reaped before the caller receives a timeout and its out-of-band
+/// remedy. No DB/WAL-holding worker survives that deadline, and the caller
+/// receives a truthful terminal state even when the native operation cannot be
+/// cancelled.
 pub(crate) fn checkpoint_wal_truncate_with_deadline(
     db_path: &Path,
     context: &str,
     deadline: Duration,
 ) -> Result<bool> {
-    let worker_context = context.to_string();
-    match run_bounded_abort_wal_checkpoint(db_path.to_path_buf(), deadline, move |path| {
-        run_final_wal_checkpoint(path, &worker_context)
-    }) {
+    match run_bounded_native_wal_checkpoint(db_path.to_path_buf(), deadline, context) {
         AbortWalCheckpointAttempt::Finished(Ok(outcome)) => {
             Ok(matches!(outcome, FinalWalCheckpointOutcome::Completed))
         }
@@ -17798,13 +17986,59 @@ pub(crate) fn checkpoint_wal_truncate_with_deadline(
     }
 }
 
+#[doc(hidden)]
+pub fn run_final_wal_checkpoint_worker(
+    db_path: &Path,
+    context: &str,
+) -> Result<FinalWalCheckpointOutcome> {
+    run_final_wal_checkpoint(db_path, context)
+}
+
+#[cfg(test)]
+fn run_final_wal_checkpoint_with_cancellation(
+    db_path: &Path,
+    context: &str,
+    cancellation: &WalCheckpointCancellation,
+) -> Result<FinalWalCheckpointOutcome> {
+    run_final_wal_checkpoint_inner(db_path, context, Some(cancellation))
+}
+
 fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<FinalWalCheckpointOutcome> {
+    run_final_wal_checkpoint_inner(db_path, context, None)
+}
+
+fn run_final_wal_checkpoint_inner(
+    db_path: &Path,
+    context: &str,
+    cancellation: Option<&WalCheckpointCancellation>,
+) -> Result<FinalWalCheckpointOutcome> {
     if let Some(park_ms) = dotenvy::var(CASS_TEST_WAL_CHECKPOINT_PARK_MS_ENV)
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|ms| *ms > 0)
     {
-        std::thread::sleep(Duration::from_millis(park_ms));
+        let deadline = Instant::now() + Duration::from_millis(park_ms);
+        loop {
+            if cancellation.is_some_and(|cancellation| cancellation.is_cancelled()) {
+                anyhow::bail!(
+                    "final WAL checkpoint canceled before opening {}",
+                    db_path.display()
+                );
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            if remaining.is_zero() {
+                break;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        }
+    }
+    if cancellation.is_some_and(|cancellation| cancellation.is_cancelled()) {
+        anyhow::bail!(
+            "final WAL checkpoint canceled before opening {}",
+            db_path.display()
+        );
     }
     // Run this after closing the indexing storage handle: frankensqlite flushes
     // retained autocommit writes during close, and TRUNCATE avoids leaving the
@@ -17824,9 +18058,14 @@ fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<FinalWalChe
             db_path.display()
         )
     });
-    let outcome = checkpoint_result?;
-    close_result?;
-    Ok(outcome)
+    match (checkpoint_result, close_result) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Err(checkpoint_error), Ok(())) => Err(checkpoint_error),
+        (Ok(_), Err(close_error)) => Err(close_error),
+        (Err(checkpoint_error), Err(close_error)) => Err(anyhow::anyhow!(
+            "final WAL checkpoint failed: {checkpoint_error:#}; closing its connection also failed: {close_error:#}"
+        )),
+    }
 }
 
 fn query_final_wal_checkpoint(
@@ -28704,6 +28943,30 @@ fn explicit_watch_once_connector_hint(path: &Path) -> Option<ConnectorKind> {
         Some(ConnectorKind::Claude)
     } else if has_pair(".gemini", "tmp") {
         Some(ConnectorKind::Gemini)
+    } else if components
+        .iter()
+        .any(|component| component == "com.openai.chat")
+    {
+        Some(ConnectorKind::ChatGpt)
+    } else if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.starts_with("rollout-")
+                && path.extension().is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("jsonl")
+                        || extension.eq_ignore_ascii_case("json")
+                })
+        })
+    {
+        // Explicitly enrolled rollout files may live in a relocated Codex
+        // home, an archive/cold-rollout root, or the CloudMCP projection
+        // root. Those paths do not necessarily contain the conventional
+        // `.codex/sessions` marker, but the filename contract is the same
+        // one enforced by the Codex connector. Treat the typed file as a
+        // Codex target so `--watch-once` remains targeted and cannot fall
+        // back to a broad connector scan.
+        Some(ConnectorKind::Codex)
     } else if crate::connectors::omp::owns_session_path(path) {
         Some(ConnectorKind::Omp)
     } else {
@@ -36473,6 +36736,38 @@ mod tests {
         );
 
         drop(guard);
+        Ok(())
+    }
+
+    #[test]
+    fn index_run_lock_guard_drop_releases_lock_for_immediate_reacquire() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"placeholder")?;
+
+        let first = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)?;
+        assert!(
+            acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index).is_err(),
+            "a second owner must not acquire the lock while the first guard is alive"
+        );
+
+        drop(first);
+        let second = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)?;
+        drop(second);
+
+        let lock_path = tmp.path().join("index-run.lock");
+        assert!(
+            read_index_run_lock_metadata_for_test(&lock_path)?
+                .trim()
+                .is_empty(),
+            "dropping the guard must clear the lock metadata before reacquire"
+        );
+        let sidecar_path =
+            crate::search::asset_state::index_run_lock_metadata_sidecar_path(&lock_path);
+        assert!(
+            !sidecar_path.exists(),
+            "dropping the guard must remove the metadata sidecar before reacquire"
+        );
         Ok(())
     }
 
@@ -45485,27 +45780,160 @@ mod tests {
         Ok(())
     }
 
-    /// #422: a watchdog-confirmed wedge must still terminate even when the
-    /// fresh checkpoint attempt blocks behind the wedged writer. Before the
-    /// checkpoint was separately supervised, this pre-exit cleanup could
-    /// itself hang forever and nullify the watchdog's abort guarantee.
+    /// #422: a watchdog-confirmed wedge must terminate the checkpoint
+    /// attempt without leaving a DB/WAL-holding worker behind. The cooperative
+    /// test callback observes cancellation, exits, and is joined before the
+    /// timeout result is returned; the next attempt can start immediately.
     #[test]
-    fn abort_wal_checkpoint_wait_is_bounded_when_the_worker_blocks() {
-        let started = Instant::now();
+    fn abort_wal_checkpoint_timeout_cancels_and_joins_before_immediate_rerun() {
+        let worker_started = Arc::new(AtomicBool::new(false));
+        let worker_finished = Arc::new(AtomicBool::new(false));
+        let started = Arc::clone(&worker_started);
+        let finished = Arc::clone(&worker_finished);
+        let started_at = Instant::now();
+
         let attempt = run_bounded_abort_wal_checkpoint(
-            PathBuf::from("unused-by-planted-blocking-checkpoint"),
+            PathBuf::from("unused-by-cooperative-checkpoint"),
             Duration::from_millis(5),
-            |_| {
-                std::thread::sleep(Duration::from_secs(1));
+            move |_, cancellation| {
+                started.store(true, Ordering::Release);
+                while !cancellation.is_cancelled() {
+                    std::thread::yield_now();
+                }
+                finished.store(true, Ordering::Release);
                 Ok(FinalWalCheckpointOutcome::Completed)
             },
         );
 
         assert!(matches!(attempt, AbortWalCheckpointAttempt::TimedOut));
         assert!(
-            started.elapsed() < Duration::from_millis(500),
-            "checkpoint supervision must return at its own deadline, not wait for the blocked worker"
+            started_at.elapsed() < Duration::from_millis(500),
+            "checkpoint supervision must return promptly after cancellation"
         );
+        assert!(
+            worker_started.load(Ordering::Acquire),
+            "the worker should have started before the timeout result"
+        );
+        assert!(
+            worker_finished.load(Ordering::Acquire),
+            "timeout must join the canceled worker before returning"
+        );
+
+        let rerun = run_bounded_abort_wal_checkpoint(
+            PathBuf::from("immediate-rerun"),
+            Duration::from_secs(1),
+            move |_, cancellation| {
+                assert!(
+                    !cancellation.is_cancelled(),
+                    "each finalization attempt must receive a fresh cancellation token"
+                );
+                Ok(FinalWalCheckpointOutcome::Completed)
+            },
+        );
+        assert!(matches!(
+            rerun,
+            AbortWalCheckpointAttempt::Finished(Ok(FinalWalCheckpointOutcome::Completed))
+        ));
+    }
+
+    #[test]
+    fn bounded_native_wal_checkpoint_reports_worker_unavailable_without_spawned_worker() {
+        let attempt = run_bounded_native_wal_checkpoint_with_executable(
+            Path::new("/cass/does/not/exist/final-wal-worker"),
+            PathBuf::from("missing-worker"),
+            Duration::from_millis(5),
+            "spawn failure",
+        );
+
+        match attempt {
+            AbortWalCheckpointAttempt::WorkerUnavailable(error) => {
+                assert!(
+                    error.contains("spawning final WAL checkpoint worker"),
+                    "spawn failures must be reported as WorkerUnavailable: {error}"
+                );
+            }
+            other => panic!("expected WorkerUnavailable, got {other:?}"),
+        }
+    }
+
+    /// A native checkpoint worker is a separate process because fsqlite does
+    /// not expose a cancellation hook for a blocked WAL checkpoint. Exercise
+    /// the timeout path with a deliberately sleeping worker and verify that
+    /// the child has been killed and reaped before the timeout result returns.
+    #[cfg(unix)]
+    #[test]
+    fn bounded_native_wal_checkpoint_timeout_kills_and_reaps_worker() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new()?;
+        let worker = temp.path().join("sleeping-wal-worker.sh");
+        let pid_file = temp.path().join("worker.pid");
+        std::fs::write(
+            &worker,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{}'\nexec /bin/sleep 60\n",
+                pid_file.display()
+            ),
+        )?;
+        let mut permissions = std::fs::metadata(&worker)?.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&worker, permissions)?;
+
+        let started_at = Instant::now();
+        let attempt = run_bounded_native_wal_checkpoint_with_executable(
+            &worker,
+            temp.path().join("unused.sqlite"),
+            Duration::from_secs(1),
+            "child timeout test",
+        );
+        assert!(matches!(attempt, AbortWalCheckpointAttempt::TimedOut));
+        assert!(
+            started_at.elapsed() < Duration::from_secs(5),
+            "timed-out child must be terminated promptly"
+        );
+
+        let pid_deadline = Instant::now() + Duration::from_secs(1);
+        let pid = loop {
+            if let Ok(raw_pid) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = raw_pid.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < pid_deadline,
+                "sleeping worker did not record its pid"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let status = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()?;
+        assert!(
+            !status.success(),
+            "timed-out worker pid {pid} is still alive; timeout detached the DB owner"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_abort_wal_checkpoint_joins_worker_without_an_outcome() {
+        let attempt = run_bounded_abort_wal_checkpoint(
+            PathBuf::from("panic-without-outcome"),
+            Duration::from_secs(1),
+            |_, _| -> Result<FinalWalCheckpointOutcome> {
+                panic!("planted checkpoint worker panic")
+            },
+        );
+
+        match attempt {
+            AbortWalCheckpointAttempt::WorkerUnavailable(error) => {
+                assert!(
+                    error.contains("planted checkpoint worker panic"),
+                    "worker panic must be surfaced after join: {error}"
+                );
+            }
+            other => panic!("expected WorkerUnavailable, got {other:?}"),
+        }
     }
 
     /// #321: a `wal_checkpoint(TRUNCATE)` that SQLite reports as blocked
@@ -45526,6 +45954,19 @@ mod tests {
                 checkpointed_frames: 0,
             },
             "busy=1 checkpoint must classify as Blocked, never Completed"
+        );
+
+        // Unexpected negative counters are malformed engine output. They are
+        // not evidence that the WAL was truncated, so preserve a blocked
+        // terminal state rather than reporting a false success.
+        assert_eq!(
+            classify_final_wal_checkpoint(0, -1, -1),
+            FinalWalCheckpointOutcome::Blocked {
+                busy: 0,
+                log_frames: -1,
+                checkpointed_frames: -1,
+            },
+            "invalid checkpoint counters must not be reported as completed"
         );
 
         // A clean TRUNCATE: not busy, every logged frame backfilled.
@@ -53648,6 +54089,60 @@ mod tests {
     }
 
     #[test]
+    fn classify_paths_hints_codex_for_relocated_rollout_file_without_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp
+            .path()
+            .join("archived_sessions/2026/09/09/rollout-relocated.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(&session, b"{}\n").unwrap();
+
+        let classified = classify_paths(vec![session.clone()], &[], true);
+
+        assert_eq!(classified.len(), 1);
+        assert_eq!(classified[0].0, ConnectorKind::Codex);
+        assert_eq!(classified[0].1.path, session);
+        assert!(classified[0].2.is_some());
+        assert!(classified[0].3.is_some());
+    }
+
+    #[test]
+    fn classify_paths_hints_codex_for_relocated_rollout_json_file_without_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp
+            .path()
+            .join("archived_sessions/2026/09/09/rollout-relocated.json");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(&session, b"{}\n").unwrap();
+
+        let classified = classify_paths(vec![session.clone()], &[], true);
+
+        assert_eq!(classified.len(), 1);
+        assert_eq!(classified[0].0, ConnectorKind::Codex);
+        assert_eq!(classified[0].1.path, session);
+        assert!(classified[0].2.is_some());
+        assert!(classified[0].3.is_some());
+    }
+
+    #[test]
+    fn classify_paths_hints_chatgpt_for_explicit_app_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp
+            .path()
+            .join("Library/Application Support/com.openai.chat/v1/conversation.json");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"{}\n").unwrap();
+
+        let classified = classify_paths(vec![file.clone()], &[], true);
+
+        assert_eq!(classified.len(), 1);
+        assert_eq!(classified[0].0, ConnectorKind::ChatGpt);
+        assert_eq!(classified[0].1.path, file);
+        assert!(classified[0].2.is_some());
+        assert!(classified[0].3.is_some());
+    }
+
+    #[test]
     fn classify_paths_keeps_omp_xdg_sessions_root_for_watch_once() {
         let tmp = tempfile::tempdir().unwrap();
         let sessions_root = tmp.path().join("share/omp/sessions");
@@ -53751,6 +54246,121 @@ mod tests {
         assert_eq!(conversations.len(), 1);
         assert_eq!(conversations[0].agent_slug, "omp");
         assert_eq!(conversations[0].metadata_json["profile"], "review");
+    }
+
+    #[test]
+    #[serial]
+    fn reindex_paths_watch_once_indexes_relocated_rollout_and_chatgpt_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let codex_session = tmp
+            .path()
+            .join("relocated-home/archived-rollouts/2026/09/09/rollout-relocated-watch-once.jsonl");
+        std::fs::create_dir_all(codex_session.parent().unwrap()).unwrap();
+        std::fs::write(
+            &codex_session,
+            r#"{"timestamp":"2026-09-09T06:00:00.000Z","type":"session_meta","payload":{"id":"relocated-rollout-watch-once","cwd":"/workspace/relocated"}}
+{"timestamp":"2026-09-09T06:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"relocated rollout watch once"}]}}
+{"timestamp":"2026-09-09T06:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"codex relocation indexed"}]}}
+"#,
+        )
+        .unwrap();
+
+        let chatgpt_root = tmp
+            .path()
+            .join("relocated-home/Library/Application Support/com.openai.chat");
+        let chatgpt_dir = chatgpt_root.join("conversations-relocated");
+        let chatgpt_file = chatgpt_dir.join("chatgpt-relocated.json");
+        std::fs::create_dir_all(&chatgpt_dir).unwrap();
+        std::fs::write(
+            &chatgpt_file,
+            r#"{
+  "id": "chatgpt-relocated-watch-once",
+  "title": "Relocated ChatGPT watch once",
+  "mapping": {
+    "user": {
+      "parent": null,
+      "message": {
+        "author": {"role": "user"},
+        "content": {"parts": ["chatgpt relocated watch once"]},
+        "create_time": 1788900000.0
+      }
+    },
+    "assistant": {
+      "parent": "user",
+      "message": {
+        "author": {"role": "assistant"},
+        "content": {"parts": ["chatgpt relocation indexed"]},
+        "create_time": 1788900001.0
+      }
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let opts = super::IndexOptions {
+            full: false,
+            watch: false,
+            force_rebuild: false,
+            watch_once_paths: Some(vec![codex_session.clone(), chatgpt_root.clone()]),
+            db_path: data_dir.join("db.sqlite"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        };
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let state = Mutex::new(HashMap::new());
+        let storage = Mutex::new(storage);
+        let t_index = Mutex::new(None);
+
+        let indexed = reindex_paths(
+            &opts,
+            vec![codex_session.clone(), chatgpt_root],
+            &[],
+            &state,
+            &storage,
+            &t_index,
+            &index_path,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(indexed, 2);
+        let conversations = storage.lock().unwrap().list_conversations(10, 0).unwrap();
+        assert_eq!(conversations.len(), 2);
+        let mut agents: Vec<&str> = conversations
+            .iter()
+            .map(|conversation| conversation.agent_slug.as_str())
+            .collect();
+        agents.sort_unstable();
+        assert_eq!(agents, vec!["chatgpt", "codex"]);
+        assert!(
+            conversations.iter().any(|conversation| {
+                conversation.agent_slug == "codex" && conversation.source_path == codex_session
+            }),
+            "relocated rollout should be persisted through the watch-once path"
+        );
+        assert!(
+            conversations.iter().any(|conversation| {
+                conversation.agent_slug == "chatgpt" && conversation.source_path == chatgpt_file
+            }),
+            "relocated ChatGPT root should be persisted through the watch-once path"
+        );
+
+        let message_count: i64 = storage
+            .lock()
+            .unwrap()
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(message_count, 4);
     }
 
     #[test]
