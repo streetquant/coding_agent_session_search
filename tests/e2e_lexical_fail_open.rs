@@ -68,6 +68,344 @@ fn seed_codex_session(codex_home: &std::path::Path, filename: &str, keyword: &st
     util::seed_codex_session(codex_home, filename, keyword, true);
 }
 
+/// GH422's original route is a worker inside ordinary search, not the detached
+/// background indexer. Reuse the existing post-commit pause to freeze that
+/// worker while its real heartbeat and watchdog continue. This tiny corpus
+/// proves containment and cold recovery, not reporter-scale rebuild latency.
+#[cfg(unix)]
+#[test]
+fn gh422_search_refresh_stall_releases_lock_and_recovers_cold_query() {
+    use coding_agent_search::model::types::{Agent, AgentKind};
+    use fs2::FileExt;
+    use std::process::{Child, Stdio};
+    use std::time::Instant;
+
+    // A harness deadline is a failure. Reap the child on every unwind and put
+    // both captured streams in the test output before the fixture is dropped.
+    struct SearchChild {
+        child: Child,
+        stdout: PathBuf,
+        stderr: PathBuf,
+    }
+    impl Drop for SearchChild {
+        fn drop(&mut self) {
+            if !matches!(self.child.try_wait(), Ok(Some(_))) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+            if std::thread::panicking() {
+                eprintln!(
+                    "search stdout: {}",
+                    fs::read_to_string(&self.stdout).unwrap_or_default()
+                );
+                eprintln!(
+                    "search stderr: {}",
+                    fs::read_to_string(&self.stderr).unwrap_or_default()
+                );
+            }
+        }
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    // dotenvy must not discover an ancestor's real configuration.
+    fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(home.join(".env"))
+        .unwrap();
+    let data_dir = home.join("cass_data");
+    fs::create_dir(&data_dir).unwrap();
+    let db_path = data_dir.join("agent_search.db");
+    let storage = FrankenStorage::open(&db_path).unwrap();
+    let agent = storage
+        .ensure_agent(&Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })
+        .unwrap();
+    let mut canonical = Vec::new();
+    let mut expected_hits = std::collections::BTreeSet::new();
+    for ordinal in 0..2 {
+        let path = home.join(format!("retained-{ordinal}.jsonl"));
+        let conversation = util::ConversationFixtureBuilder::new("codex")
+            .external_id(format!("gh422-{ordinal}"))
+            .source_path(&path)
+            .messages(1)
+            .with_content(
+                0,
+                format!("gh422stalledneedle retained conversation {ordinal}"),
+            )
+            .build_conversation();
+        let inserted = storage
+            .insert_conversation_tree(agent, None, &conversation)
+            .unwrap();
+        assert_eq!(inserted.inserted_indices, vec![0]);
+        canonical.push((
+            inserted.conversation_id,
+            serde_json::to_value(storage.fetch_messages(inserted.conversation_id).unwrap())
+                .unwrap(),
+        ));
+        expected_hits.insert((path.to_string_lossy().into_owned(), 1_u64));
+    }
+    storage.close().unwrap();
+    let index_path = coding_agent_search::search::tantivy::expected_index_dir(&data_dir);
+    assert!(!coding_agent_search::search::tantivy::searchable_index_exists(&index_path));
+
+    let sentinel = home.join("committed-before-checkpoint.json");
+    let stdout_path = home.join("stalled-search.stdout");
+    let stderr_path = home.join("stalled-search.stderr");
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+    command
+        .current_dir(home)
+        .env_clear()
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("RUST_MIN_STACK", "134217728")
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("CASS_DATA_DIR", &data_dir)
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_INDEX_STALL_DETECT_SECS", "5")
+        .env("CASS_INDEX_STALL_ABORT_SECS", "20")
+        .env("CASS_INDEX_FINALIZE_ABORT_SECS", "20")
+        .env("CASS_INDEX_STALL_ABORT_ALL_PHASES", "0")
+        .env(
+            "CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMIT_SENTINEL",
+            &sentinel,
+        )
+        .env("CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMITS", "1")
+        .env(
+            "CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMIT_SLEEP_MS",
+            "60000",
+        )
+        .env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "1")
+        .env(
+            "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
+            "1",
+        )
+        .env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS", "1")
+        .env(
+            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS",
+            "1",
+        )
+        .args([
+            "search",
+            "gh422stalledneedle",
+            "--json",
+            "--no-daemon",
+            "--mode",
+            "lexical",
+            "--timeout",
+            "120000",
+            "--limit",
+            "10",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .stdout(Stdio::from(fs::File::create(&stdout_path).unwrap()))
+        .stderr(Stdio::from(fs::File::create(&stderr_path).unwrap()));
+    let mut search = SearchChild {
+        child: command.spawn().expect("spawn ordinary search"),
+        stdout: stdout_path,
+        stderr: stderr_path,
+    };
+    let startup_deadline = Instant::now() + Duration::from_secs(60);
+    let committed: Value = loop {
+        if let Ok(bytes) = fs::read(&sentinel)
+            && let Ok(value) = serde_json::from_slice(&bytes)
+        {
+            break value;
+        }
+        assert!(
+            search.child.try_wait().unwrap().is_none(),
+            "search exited before a real commit"
+        );
+        assert!(
+            Instant::now() < startup_deadline,
+            "search never reached the commit pause"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let paused_at = Instant::now();
+    let paused_wall_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert_eq!(committed["pid"], search.child.id());
+    assert_eq!(
+        committed["stage"],
+        "staged_commit_published_checkpoint_not_yet_written"
+    );
+    assert!(committed["committed_indexed_docs"].as_u64().unwrap() > 0);
+    assert!(
+        committed["committed_indexed_docs"].as_u64().unwrap()
+            > committed["checkpoint_indexed_docs"].as_u64().unwrap()
+    );
+    assert_eq!(
+        Path::new(committed["state_path"].as_str().unwrap()),
+        index_path
+    );
+    let paused_checkpoint = lexical_checkpoint(&data_dir);
+    assert_eq!(paused_checkpoint["completed"], false);
+    assert_eq!(
+        paused_checkpoint["indexed_docs"],
+        committed["checkpoint_indexed_docs"]
+    );
+    assert_eq!(
+        paused_checkpoint["pending"]["indexed_docs"],
+        committed["committed_indexed_docs"]
+    );
+
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(data_dir.join("index-run.lock"))
+        .unwrap();
+    assert_eq!(
+        FileExt::try_lock_exclusive(&lock).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    let mut first_heartbeat = None;
+    let mut heartbeat_advanced_without_progress = false;
+    let exit = loop {
+        if let Some(status) = search.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            paused_at.elapsed() < Duration::from_secs(35),
+            "watchdog did not exit before the 60-second pause; harness cleanup is not a pass"
+        );
+        if let Ok(metadata) = fs::read_to_string(data_dir.join("index-run.lock.meta")) {
+            let fields: BTreeMap<_, _> = metadata
+                .lines()
+                .filter_map(|line| line.split_once('='))
+                .collect();
+            if let (Some(pid), Some(kind), Some(updated), Some(progress)) = (
+                fields.get("pid"),
+                fields.get("job_kind"),
+                fields.get("updated_at_ms"),
+                fields.get("last_progress_at_ms"),
+            ) {
+                assert_eq!(pid.parse::<u32>().unwrap(), search.child.id());
+                assert_eq!(*kind, "lexical_refresh");
+                let sample = (
+                    updated.parse::<u64>().unwrap(),
+                    progress.parse::<u64>().unwrap(),
+                );
+                // The first post-pause heartbeat incorporates the worker's
+                // last pre-pause atomic bump; older metadata can still lag it.
+                if sample.0 < paused_wall_ms {
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                if let Some((old_updated, old_progress)) = first_heartbeat {
+                    assert_eq!(
+                        sample.1, old_progress,
+                        "real progress advanced during the commit pause"
+                    );
+                    heartbeat_advanced_without_progress |= sample.0 >= old_updated + 2_000;
+                } else {
+                    first_heartbeat = Some(sample);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(
+        heartbeat_advanced_without_progress,
+        "must observe a live heartbeat with frozen real progress"
+    );
+    assert_eq!(
+        exit.code(),
+        Some(70),
+        "only the watchdog's actual process exit satisfies this test"
+    );
+    assert!(paused_at.elapsed() < Duration::from_secs(35));
+    let stderr = fs::read_to_string(&search.stderr).unwrap();
+    let envelope = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| value["kind"] == "index-stalled")
+        .expect("watchdog error envelope");
+    assert_eq!(envelope["code"], 70);
+    assert_eq!(envelope["success"], false);
+    assert_eq!(envelope["retryable"], true);
+    assert_eq!(envelope["abort_threshold_secs"], 20);
+    assert!(envelope["stall_elapsed_ms"].as_u64().unwrap() >= 20_000);
+    FileExt::try_lock_exclusive(&lock).expect("watchdog exit must release the real flock");
+    FileExt::unlock(&lock).unwrap();
+    let interrupted_checkpoint = lexical_checkpoint(&data_dir);
+    assert_eq!(interrupted_checkpoint["completed"], false);
+    assert_eq!(
+        interrupted_checkpoint["indexed_docs"],
+        paused_checkpoint["indexed_docs"]
+    );
+    assert_eq!(
+        interrupted_checkpoint["pending"], paused_checkpoint["pending"],
+        "the watchdog must leave the interrupted durable commit recoverable"
+    );
+
+    // A fresh process gets no pause settings and must repair/search the same
+    // canonical rows. Its normal partial-timeout contract remains unchanged:
+    // a timed-out empty response cannot satisfy this positive recovery check.
+    command
+        .env_remove("CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMIT_SENTINEL")
+        .env_remove("CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMITS")
+        .env_remove("CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMIT_SLEEP_MS")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = Command::from_std(command)
+        .timeout(Duration::from_secs(135))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "cold search failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_ne!(payload["budget"]["timed_out"], true, "{payload}");
+    let hits = payload["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 2, "{payload}");
+    let actual_hits = hits
+        .iter()
+        .map(|hit| {
+            (
+                hit["source_path"].as_str().unwrap().to_string(),
+                hit["line_number"].as_u64().unwrap(),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        actual_hits, expected_hits,
+        "cold repair must retain both identities exactly once"
+    );
+    let repaired_checkpoint = lexical_checkpoint(&data_dir);
+    assert_eq!(repaired_checkpoint["completed"], true);
+    assert_eq!(repaired_checkpoint["indexed_docs"], 2);
+    assert!(repaired_checkpoint["pending"].is_null());
+    assert!(
+        coding_agent_search::search::tantivy::searchable_index_exists(&index_path),
+        "cold recovery must publish readable lexical assets, not only serve a SQLite fallback"
+    );
+    let storage = FrankenStorage::open_readonly(&db_path).unwrap();
+    assert_eq!(storage.list_conversations(10, 0).unwrap().len(), 2);
+    for (id, messages) in canonical {
+        assert_eq!(
+            serde_json::to_value(storage.fetch_messages(id).unwrap()).unwrap(),
+            messages
+        );
+    }
+    storage.close().unwrap();
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum DataTreeEntry {
     Directory,
@@ -581,6 +919,193 @@ fn no_maintenance_lexical_search_is_byte_stable_across_the_real_cli_path() {
         data_tree_snapshot(&data_dir),
         "search --no-maintenance must not add, remove, or change any data-dir directory, file, symlink, SQLite sidecar, checkpoint, lock, or search artifact"
     );
+}
+
+#[test]
+fn gh422_timeout_retry_preserves_scoped_read_only_search() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("retry's isolated home");
+    fs::create_dir(&home).unwrap();
+    fs::write(home.join(".env"), "").unwrap();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("archive");
+    fs::create_dir(&data_dir).unwrap();
+    let db = data_dir.join("non-default archive.db");
+    for name in ["rollout-selected.jsonl", "rollout-excluded.jsonl"] {
+        seed_codex_session(&codex_home, name, "scopedretryneedle");
+    }
+    let selected = codex_home.join("sessions/2026/04/23/rollout-selected.jsonl");
+    let scope = home.join("selected sessions.txt");
+    fs::write(&scope, format!("{}\n", selected.display())).unwrap();
+    let indexed = cass_cmd(&home)
+        .arg("--db")
+        .arg(&db)
+        .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .timeout(Duration::from_secs(120))
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    assert!(!data_dir.join("agent_search.db").exists());
+
+    // The excluded session really matches the query without the session scope.
+    let unscoped = cass_cmd(&home)
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "search",
+            "scopedretryneedle",
+            "--robot",
+            "--mode",
+            "lexical",
+            "--no-maintenance",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .timeout(Duration::from_secs(20))
+        .output()
+        .unwrap();
+    assert!(
+        unscoped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unscoped.stderr)
+    );
+    let unscoped: Value = serde_json::from_slice(&unscoped.stdout).unwrap();
+    assert_eq!(unscoped["hits"].as_array().unwrap().len(), 4, "{unscoped}");
+    let before = data_tree_snapshot(&data_dir);
+
+    for (delay, agent, expected_hits) in [
+        ("CASS_TEST_SEARCH_SETUP_SLOW_MS", "codex", 1),
+        ("CASS_TEST_SEARCH_META_SLOW_MS", "codex", 1),
+        ("CASS_TEST_SEARCH_SETUP_SLOW_MS", "not-a-real-agent", 0),
+    ] {
+        let output = cass_cmd(&home)
+            .env(delay, "6000")
+            .arg("--db")
+            .arg(&db)
+            .args([
+                "search",
+                "scopedretryneedle",
+                "--robot",
+                "--robot-meta",
+                "--mode",
+                "lexical",
+                "--no-maintenance",
+                "--no-daemon",
+                "--timeout",
+                "3000",
+                "--agent",
+                agent,
+                "--workspace",
+            ])
+            .arg(&codex_home)
+            .args(["--sessions-from"])
+            .arg(&scope)
+            .args([
+                "--source",
+                "local",
+                "--since",
+                "2024-01-01T00:00:00+00:00",
+                "--until",
+                "2025-01-01T00:00:00+00:00",
+                "--cursor",
+                "eyJvZmZzZXQiOjEsImxpbWl0IjoxfQ==",
+                "--fields",
+                "source_path,line_number,agent",
+                "--max-content-length",
+                "40",
+                "--max-tokens",
+                "512",
+                "--request-id",
+                "retry's request $(literal)",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .timeout(Duration::from_secs(15))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(payload["budget"]["timed_out"], true, "{payload}");
+        let retry = payload["budget"]["recommended_next_probe"]
+            .as_str()
+            .unwrap();
+        let args = shell_words::split(retry).unwrap();
+        assert_eq!(args.first().map(String::as_str), Some("cass"));
+        assert_eq!(&args[1..4], &["--db", db.to_str().unwrap(), "search"]);
+        for arg in [
+            "--no-maintenance",
+            "--no-daemon",
+            "--robot-meta",
+            "--limit=1",
+            "--offset=1",
+            "--source=local",
+            "--fields=source_path,line_number,agent",
+            "--max-content-length=40",
+            "--max-tokens=512",
+            "--request-id=retry's request $(literal)",
+        ] {
+            assert!(
+                args.iter().any(|actual| actual == arg),
+                "missing {arg}: {retry}"
+            );
+        }
+        assert!(
+            args.iter().any(|arg| arg == &format!("--agent={agent}")),
+            "{retry}"
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg == &format!("--workspace={}", codex_home.display())),
+            "{retry}"
+        );
+        for (flag, expected) in [
+            ("--since=", 1_704_067_200_000_i64),
+            ("--until=", 1_735_689_600_000_i64),
+        ] {
+            let bound = args.iter().find_map(|arg| arg.strip_prefix(flag)).unwrap();
+            assert_eq!(
+                chrono::DateTime::parse_from_rfc3339(bound)
+                    .unwrap()
+                    .timestamp_millis(),
+                expected
+            );
+        }
+        // Parse the advertised shell command, but execute cass directly: quoted
+        // paths/request IDs must round-trip without invoking a shell.
+        let retried = cass_cmd(&home)
+            .args(&args[1..])
+            .timeout(Duration::from_secs(15))
+            .output()
+            .unwrap();
+        assert!(
+            retried.status.success(),
+            "retry {retry}: {}",
+            String::from_utf8_lossy(&retried.stderr)
+        );
+        let result: Value = serde_json::from_slice(&retried.stdout).unwrap();
+        assert_eq!(result["budget"]["timed_out"], false, "{result}");
+        let hits = result["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), expected_hits, "{result}");
+        for hit in hits {
+            assert_eq!(hit["source_path"].as_str(), selected.to_str(), "{result}");
+            assert_eq!(hit["agent"], "codex", "{result}");
+        }
+        assert_eq!(
+            before,
+            data_tree_snapshot(&data_dir),
+            "retry changed archive: {retry}"
+        );
+        assert!(!data_dir.join("agent_search.db").exists());
+    }
 }
 
 #[test]

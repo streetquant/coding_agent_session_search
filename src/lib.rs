@@ -2368,6 +2368,9 @@ pub enum SourcesCommand {
         /// Skip hosts that are already configured as sources
         #[arg(long)]
         skip_existing: bool,
+        /// Also discover online peers using local `tailscale status --json`
+        #[arg(long)]
+        tailscale: bool,
         /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
@@ -2435,6 +2438,9 @@ pub enum SourcesCommand {
         /// Configure only these hosts (comma-separated SSH aliases, skips discovery/selection)
         #[arg(long, value_delimiter = ',')]
         hosts: Option<Vec<String>>,
+        /// Also discover online Tailscale peers (explicit --hosts skips discovery)
+        #[arg(long)]
+        tailscale: bool,
         /// Skip cass installation on remotes that don't have it
         #[arg(long)]
         skip_install: bool,
@@ -7304,6 +7310,7 @@ async fn execute_cli(
                         no_progress_events,
                         robot_trace_ingest,
                         background,
+                        None,
                     )?;
                 }
                 Commands::Search {
@@ -29057,17 +29064,20 @@ fn search_budget_retry_command(
     query: &str,
     format: RobotFormat,
     budget_ms: u64,
-    data_dir: &Path,
+    dataset: (&Path, &Path),
     sessions_from: Option<&str>,
     mode: Option<crate::search::query::SearchMode>,
+    request_args: &[String],
 ) -> Option<String> {
     if sessions_from == Some("-") {
         return None;
     }
+    let (data_dir, db_path) = dataset;
     let mut command = vec![
         "cass".to_string(),
+        "--db".to_string(),
+        shell_quote_arg(db_path.to_str()?),
         "search".to_string(),
-        shell_quote_arg(query),
     ];
     match format {
         RobotFormat::Json => command.push("--robot".to_string()),
@@ -29092,8 +29102,7 @@ fn search_budget_retry_command(
             .to_string(),
     ]);
     if let Some(sessions_from) = sessions_from {
-        command.push("--sessions-from".to_string());
-        command.push(shell_quote_arg(sessions_from));
+        command.push(shell_quote_arg(&format!("--sessions-from={sessions_from}")));
     }
     if let Some(mode) = mode {
         let mode = match mode {
@@ -29104,7 +29113,9 @@ fn search_budget_retry_command(
         command.extend(["--mode".to_string(), mode.to_string()]);
     }
     command.push("--data-dir".to_string());
-    command.push(shell_quote_arg(&data_dir.display().to_string()));
+    command.push(shell_quote_arg(data_dir.to_str()?));
+    command.extend(request_args.iter().map(|arg| shell_quote_arg(arg)));
+    command.extend(["--".to_string(), shell_quote_arg(query)]);
     Some(command.join(" "))
 }
 
@@ -29113,19 +29124,10 @@ fn output_search_budget_partial(
     format: RobotFormat,
     budget: &crate::robot_budget_envelope::RobotBudget,
     skipped_sections: Vec<String>,
-    data_dir: &Path,
-    sessions_from: Option<&str>,
+    retry: Option<String>,
     mode_meta: (SearchModeMeta, bool),
 ) -> CliResult<()> {
     let (mode_meta, include_meta) = mode_meta;
-    let retry = search_budget_retry_command(
-        query,
-        format,
-        budget.total_ms(),
-        data_dir,
-        sessions_from,
-        (!mode_meta.defaulted).then_some(mode_meta.requested),
-    );
     let mut budget_block = crate::robot_budget_envelope::BudgetBlock::from_budget(
         budget,
         skipped_sections,
@@ -29872,6 +29874,83 @@ fn run_cli_search(
         .unwrap_or_default();
     let has_aggregation = !agg_fields.is_empty();
 
+    // A timeout retry is the same parsed request with a larger budget, not a
+    // fresh unfiltered query. Freeze relative time bounds and cursor pagination
+    // so following the advice cannot silently broaden the original scope.
+    let search_retry = effective_robot.and_then(|format| {
+        let mut args = vec![
+            format!("--limit={limit_val}"),
+            format!("--offset={offset_val}"),
+        ];
+        for (flag, values) in [("agent", agents), ("workspace", workspaces)] {
+            args.extend(values.iter().map(|value| format!("--{flag}={value}")));
+        }
+        for (flag, bound) in [("since", time_filter.since), ("until", time_filter.until)] {
+            if let Some(bound) = bound {
+                let date = chrono::DateTime::from_timestamp_millis(bound)?;
+                args.push(format!("--{flag}={}", date.to_rfc3339()));
+            }
+        }
+        for (flag, value) in [
+            ("source", source.as_deref()),
+            ("request-id", request_id.as_deref()),
+            ("model", semantic_opts.model.as_deref()),
+            ("reranker", semantic_opts.reranker.as_deref()),
+        ] {
+            if let Some(value) = value {
+                args.push(format!("--{flag}={value}"));
+            }
+        }
+        for (flag, values) in [
+            ("fields", fields.as_ref()),
+            ("aggregate", aggregate.as_ref()),
+        ] {
+            if let Some(values) = values {
+                args.push(format!("--{flag}={}", values.join(",")));
+            }
+        }
+        for (flag, value) in [
+            ("max-content-length", max_content_length),
+            ("max-tokens", max_tokens),
+        ] {
+            if let Some(value) = value {
+                args.push(format!("--{flag}={value}"));
+            }
+        }
+        for (flag, enabled) in [
+            ("no-maintenance", no_maintenance),
+            ("robot-meta", robot_meta),
+            ("explain", explain),
+            ("dry-run", dry_run),
+            ("highlight", highlight),
+            ("refresh", refresh),
+            ("approximate", semantic_opts.approximate),
+            ("rerank", semantic_opts.rerank),
+            ("daemon", semantic_opts.auto_spawn_daemon),
+            ("no-daemon", !semantic_opts.use_daemon),
+        ] {
+            if enabled {
+                args.push(format!("--{flag}"));
+            }
+        }
+        use crate::search::query::SemanticTierMode;
+        match semantic_opts.tier_mode {
+            SemanticTierMode::Single => {}
+            SemanticTierMode::Progressive => args.push("--two-tier".to_string()),
+            SemanticTierMode::FastOnly => args.push("--fast-only".to_string()),
+            SemanticTierMode::QualityOnly => args.push("--quality-only".to_string()),
+        }
+        search_budget_retry_command(
+            query,
+            format,
+            search_budget.as_ref()?.total_ms(),
+            (&data_dir, &db_path),
+            sessions_from.as_deref(),
+            mode,
+            &args,
+        )
+    });
+
     let output_early_timeout = |mut skipped_sections: Vec<String>| {
         for (requested, section) in [
             (semantic_opts.rerank, "reranking"),
@@ -29888,8 +29967,7 @@ fn run_cli_search(
             effective_robot.expect("bounded search is robot-only"),
             search_budget.as_ref().expect("robot search has a budget"),
             skipped_sections,
-            &data_dir,
-            sessions_from.as_deref(),
+            search_retry.clone(),
             (
                 SearchModeMeta::new(mode.unwrap_or_default(), mode.is_none()),
                 robot_meta,
@@ -31112,17 +31190,7 @@ fn run_cli_search(
                 &["index", "--json"],
             ))
         } else {
-            search_budget_retry_command(
-                query,
-                format,
-                search_budget
-                    .as_ref()
-                    .expect("robot output always establishes a search budget")
-                    .total_ms(),
-                &data_dir,
-                sessions_from.as_deref(),
-                mode,
-            )
+            search_retry.clone()
         };
         let budget = crate::robot_budget_envelope::BudgetBlock::from_budget(
             search_budget
@@ -37108,6 +37176,83 @@ impl DoctorArchiveReadConnection for crate::storage::sqlite::FrankenOwnerConnect
     }
 }
 
+fn doctor_quick_check_status(rows: Vec<crate::franken_sync::Row>) -> Result<String, String> {
+    use crate::franken_sync::compat::RowExt as _;
+
+    if rows.is_empty() {
+        return Err("PRAGMA quick_check(1) returned no diagnostic rows".to_string());
+    }
+    let mut diagnostics = Vec::new();
+    let mut omitted = 0;
+    for row in rows {
+        let detail: String = row
+            .get_typed(0)
+            .map_err(|err| format!("reading PRAGMA quick_check output: {err}"))?;
+        let detail = detail.trim();
+        if detail.is_empty() {
+            return Err("PRAGMA quick_check(1) returned an empty diagnostic".to_string());
+        }
+        if detail.eq_ignore_ascii_case("ok") {
+            continue;
+        }
+        if diagnostics.len() < DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT {
+            diagnostics.push(detail.to_string());
+        } else {
+            omitted += 1;
+        }
+    }
+    if diagnostics.is_empty() {
+        return Ok("ok".to_string());
+    }
+    if omitted > 0 {
+        diagnostics.push(format!("{omitted} additional diagnostic row(s) omitted"));
+    }
+    Ok(diagnostics.join("; "))
+}
+
+fn doctor_database_quick_check<C: DoctorArchiveReadConnection>(conn: &C) -> Result<String, String> {
+    // Some engine versions return multiple findings despite the requested
+    // limit. Preserve those findings instead of replacing them with a row-count
+    // error. Inspect every row before declaring health; bound only the output.
+    let rows = conn
+        .doctor_query("PRAGMA quick_check(1)")
+        .map_err(|err| format!("running PRAGMA quick_check(1): {err}"))?;
+    doctor_quick_check_status(rows)
+}
+
+#[test]
+fn doctor_quick_check_preserves_multiple_findings_and_bounds_output() {
+    let conn = crate::franken_sync::Connection::open(":memory:").unwrap();
+    assert_eq!(doctor_database_quick_check(&conn).unwrap(), "ok");
+    // Actual engine rows exercise the diagnostic decoder; these SELECTs model
+    // the response protocol, not a claim that this database is corrupt.
+    let rows = conn
+        .query(
+            "SELECT 'ok' UNION ALL SELECT 'page 7 never used' UNION ALL SELECT 'page 9 never used'",
+        )
+        .unwrap();
+    assert_eq!(
+        doctor_quick_check_status(rows).unwrap(),
+        "page 7 never used; page 9 never used"
+    );
+    let mut terms = vec!["SELECT 'ok'"; DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT + 1];
+    terms.push("SELECT 'late failure'");
+    assert_eq!(
+        doctor_quick_check_status(conn.query(&terms.join(" UNION ALL ")).unwrap()).unwrap(),
+        "late failure"
+    );
+    let terms = vec!["SELECT 'page failure'"; DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT + 2];
+    let status =
+        doctor_quick_check_status(conn.query(&terms.join(" UNION ALL ")).unwrap()).unwrap();
+    assert_eq!(
+        status.matches("page failure").count(),
+        DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT
+    );
+    assert!(status.ends_with("2 additional diagnostic row(s) omitted"));
+    assert!(doctor_quick_check_status(conn.query("SELECT 'ok' WHERE 0").unwrap()).is_err());
+    assert!(doctor_quick_check_status(conn.query("SELECT ''").unwrap()).is_err());
+}
+
 fn doctor_database_integrity_probe<C: DoctorArchiveReadConnection>(
     conn: &C,
     set_phase: impl Fn(&'static str),
@@ -37115,13 +37260,7 @@ fn doctor_database_integrity_probe<C: DoctorArchiveReadConnection>(
     use crate::franken_sync::compat::RowExt as _;
 
     set_phase("quick_check");
-    let quick_check_status: String = conn
-        .doctor_query_row_map(
-            "PRAGMA quick_check(1)",
-            &[],
-            |row: &crate::franken_sync::Row| row.get_typed(0),
-        )
-        .map_err(|err| format!("running PRAGMA quick_check(1): {err}"))?;
+    let quick_check_status = doctor_database_quick_check(conn)?;
 
     let quick_check_ok = quick_check_status.trim().eq_ignore_ascii_case("ok");
     let integrity_check_diagnostics = if quick_check_ok {
@@ -90109,13 +90248,7 @@ pub(crate) fn run_doctor_impl(
                                     |r: &crate::franken_sync::Row| r.get_typed(0),
                                 )
                                 .ok();
-                            let quick_check_status: Option<String> = conn
-                                .query_row_map(
-                                    "PRAGMA quick_check(1)",
-                                    &[],
-                                    |r: &crate::franken_sync::Row| r.get_typed(0),
-                                )
-                                .ok();
+                            let quick_check_status = doctor_database_quick_check(&conn).ok();
 
                             if let (Some(conv_count), Some(msg_count), Some(status)) =
                                 (conv_count, msg_count, quick_check_status)
@@ -104851,6 +104984,7 @@ fn run_index_with_data(
     no_progress_events: bool,
     robot_trace_ingest: bool,
     background: bool,
+    mut captured_result: Option<&mut Option<serde_json::Value>>,
 ) -> CliResult<()> {
     use crate::franken_sync::compat::{ConnectionExt, RowExt};
     use std::time::Instant;
@@ -104878,6 +105012,15 @@ fn run_index_with_data(
         }
     });
     let structured_output = structured_format.is_some();
+    let capture_output = captured_result.is_some();
+    let mut emit_result = |payload: serde_json::Value, format: RobotFormat| {
+        if let Some(result) = captured_result.as_deref_mut() {
+            *result = Some(payload);
+            Ok(())
+        } else {
+            output_structured_value(payload, format)
+        }
+    };
     let indexing_exclusion_notice = active_indexing_exclusion_notice();
 
     // Generate params hash for idempotency validation
@@ -104938,7 +105081,7 @@ fn run_index_with_data(
                     if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&result_json) {
                         val["cached"] = serde_json::json!(true);
                         val["idempotency_key"] = serde_json::json!(key);
-                        output_structured_value(val, fmt)?;
+                        emit_result(val, fmt)?;
                         return Ok(());
                     }
                 } else {
@@ -105010,7 +105153,8 @@ fn run_index_with_data(
     // case the caller kills us next) so the agent can distinguish "wedged
     // indexer" from "slow command" before its deadline.
     let emit_robot_stall_event_on_stdout = |payload: &serde_json::Value| {
-        if structured_format.is_some()
+        if !capture_output
+            && structured_format.is_some()
             && let Ok(line) = serde_json::to_string(payload)
         {
             use std::io::Write as _;
@@ -105061,7 +105205,7 @@ fn run_index_with_data(
                 }
                 emit_event(event);
             }
-            output_structured_value(payload, fmt)?;
+            emit_result(payload, fmt)?;
             return Err(CliError::already_reported_from(&err));
         }
         return Err(err);
@@ -105557,7 +105701,7 @@ fn run_index_with_data(
                 }
                 emit_event(event);
             }
-            output_structured_value(payload, fmt)?;
+            emit_result(payload, fmt)?;
         }
     } else if let Some(fmt) = structured_format {
         // Derive result counts from the indexer's own progress tracking rather
@@ -105652,7 +105796,7 @@ fn run_index_with_data(
             emit_event(event);
         }
 
-        output_structured_value(payload, fmt)?;
+        emit_result(payload, fmt)?;
     }
 
     // gh359: `res.is_ok()` — the plain completion line used to print even
@@ -114331,15 +114475,17 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
         SourcesCommand::Discover {
             preset,
             skip_existing,
+            tailscale,
             json,
         } => {
             let structured_format = resolve_subcommand_structured_format(cli, json);
-            run_sources_discover(&preset, skip_existing, structured_format)
+            run_sources_discover(&preset, skip_existing, tailscale, structured_format)
         }
         SourcesCommand::Setup {
             dry_run,
             non_interactive,
             hosts,
+            tailscale,
             skip_install,
             skip_index,
             skip_sync,
@@ -114354,6 +114500,7 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
                 dry_run,
                 non_interactive: non_interactive || is_robot,
                 hosts,
+                tailscale,
                 skip_install,
                 skip_index,
                 skip_sync,
@@ -116729,23 +116876,7 @@ fn run_sources_sync(
         "complete"
     };
 
-    if let Some(_fmt) = structured_format {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "status": overall_status,
-                "dry_run": dry_run,
-                "sources": all_reports,
-                "sources_attempted": attempted_sources,
-                "sources_with_failures": sources_with_failures,
-                "sources_fully_failed": sources_fully_failed,
-                "total_files": total_files,
-                "total_bytes": total_bytes,
-                "will_reindex": !no_index && !dry_run,
-            }))
-            .unwrap_or_default()
-        );
-    } else if sources_with_failures > 0 {
+    if structured_format.is_none() && sources_with_failures > 0 {
         println!(
             "{} {} of {} synced source(s) had failures{}",
             "Warning:".yellow().bold(),
@@ -116759,8 +116890,10 @@ fn run_sources_sync(
         );
     }
 
-    // Trigger re-index if requested
-    if !no_index && !dry_run && total_files > 0 {
+    // Capture nested indexing so structured sync emits one final document,
+    // including failure, rather than a premature success plus a second JSON.
+    let mut indexing_result = None;
+    let indexing = if !no_index && !dry_run && total_files > 0 {
         if !is_robot {
             println!(
                 "{} {} new files...",
@@ -116796,8 +116929,32 @@ fn run_sources_sync(
             false, // no_progress_events
             false, // robot_trace_ingest
             false, // background
-        )?;
+            is_robot.then_some(&mut indexing_result),
+        )
+    } else {
+        Ok(())
+    };
+
+    if let Some(format) = structured_format {
+        let mut payload = serde_json::json!({
+            "status": if indexing.is_err() { "index_failed" } else { overall_status },
+            "dry_run": dry_run,
+            "sources": all_reports,
+            "sources_attempted": attempted_sources,
+            "sources_with_failures": sources_with_failures,
+            "sources_fully_failed": sources_fully_failed,
+            "total_files": total_files,
+            "total_bytes": total_bytes,
+            "will_reindex": !no_index && !dry_run,
+        });
+        if let Some(result) = indexing_result {
+            payload["indexing"] = result;
+        } else if let Err(error) = &indexing {
+            payload["indexing"] = cli_error_json_payload(error, 0);
+        }
+        output_structured_value(payload, format)?;
     }
+    indexing?;
 
     // #392: exit nonzero when the sync did not fully succeed. The summary JSON
     // above is the data surface (stdout); this error envelope is the
@@ -116967,7 +117124,8 @@ fn run_sources_reingest(
         ProgressResolved::Plain
     };
 
-    run_index_with_data(
+    let mut indexing_result = None;
+    let indexing = run_index_with_data(
         None,                   // db_override (uses data_dir default)
         full,                   // full rebuild if requested
         false,                  // force_rebuild
@@ -116985,14 +117143,16 @@ fn run_sources_reingest(
         false, // no_progress_events
         false, // robot_trace_ingest
         false, // background
-    )?;
+        is_robot.then_some(&mut indexing_result),
+    );
 
     if is_robot {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "status": "complete",
+                "status": if indexing.is_err() { "index_failed" } else { "complete" },
                 "kind": "sources_reingest",
+                "indexing": indexing_result.or_else(|| indexing.as_ref().err().map(|error| cli_error_json_payload(error, 0))),
                 "from_mirror": true,
                 "full": full,
                 "sources": selected.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
@@ -117005,16 +117165,17 @@ fn run_sources_reingest(
         );
     }
 
-    Ok(())
+    indexing
 }
 
 /// Auto-discover SSH hosts from ~/.ssh/config (P5.6)
 fn run_sources_discover(
     preset: &str,
     skip_existing: bool,
+    tailscale: bool,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
-    use crate::sources::config::{SourcesConfig, discover_ssh_hosts, get_preset_paths};
+    use crate::sources::config::{SourcesConfig, discover_fleet_hosts, get_preset_paths};
     use colored::Colorize;
 
     // Get preset paths
@@ -117027,7 +117188,10 @@ fn run_sources_discover(
     })?;
 
     // Discover SSH hosts
-    let discovered = discover_ssh_hosts();
+    let (discovered, discovery_warning) = discover_fleet_hosts(tailscale);
+    if let Some(warning) = &discovery_warning {
+        eprintln!("{warning}");
+    }
 
     if discovered.is_empty() {
         let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
@@ -117043,11 +117207,15 @@ fn run_sources_discover(
                 "{}",
                 serde_json::json!({
                     "status": "no_hosts",
-                    "message": "No SSH hosts found in ~/.ssh/config"
+                    "message": "No hosts found in the enabled discovery providers",
+                    "discovery_warning": discovery_warning,
                 })
             );
         } else {
-            println!("{}", "No SSH hosts found in ~/.ssh/config".yellow());
+            println!(
+                "{}",
+                "No hosts found in the enabled discovery providers".yellow()
+            );
         }
         return Ok(());
     }
@@ -117083,7 +117251,8 @@ fn run_sources_discover(
                 "{}",
                 serde_json::json!({
                     "status": "all_existing",
-                    "message": "All discovered hosts are already configured"
+                    "message": "All discovered hosts are already configured",
+                    "discovery_warning": discovery_warning,
                 })
             );
         } else {
@@ -117127,12 +117296,13 @@ fn run_sources_discover(
                 "preset_paths": preset_paths,
                 "hosts": hosts_json,
                 "count": hosts_to_add.len(),
+                "discovery_warning": discovery_warning,
             }))
             .unwrap_or_default()
         );
     } else {
         println!(
-            "{} {} SSH hosts from ~/.ssh/config:\n",
+            "{} {} SSH hosts from enabled discovery providers:\n",
             "Discovered".cyan().bold(),
             hosts_to_add.len()
         );

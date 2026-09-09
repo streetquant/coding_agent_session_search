@@ -1,5 +1,211 @@
 # CASS 0.8.0 changelog research
 
+Optional Tailscale discovery (2026-09-09, original bead `av59c`): owner-requested
+`--tailscale` is wired through both discovery and setup. Local status is bounded
+to five seconds; online peer IPv4 addresses merge with configured SSH aliases,
+without changing authentication or host-key policy. Offline peers, the local
+node and IPv6-only peers are omitted. Parser and real missing-executable CLI
+tests are authored. The new frozen remote gate and private live tailnet test
+are pending; the earlier 86-test/nine-host evidence below does not validate this
+new capability. Source snapshot also retains a concurrent answer-pack command
+change to always include its database argument; it is not a Tailscale fix.
+
+Fleet investigation (2026-09-09, bead `av59c`): live SSH testing exposed two
+source defects. Discovery ignored the SSH configuration override used by
+transport and did not read Include files. Sync/reingest printed the nested
+indexing result as a separate JSON document. The fixes use the same configuration
+for discovery, enumerate included aliases with bounded recursion, and capture
+indexing output inside one final response with truthful failure status.
+
+The frozen remote gate passed formatting, all-target Clippy, six library tests,
+six sources CLI tests, six ordinary index JSON tests, and 68 goldens (86 total).
+The new CLI cases exercise real configuration files, an actual held indexing
+lock, real mirror ingestion, and a source-filtered search. The live SSH harness
+then ran with all ten entries in an external private inventory: nine machines
+passed, and one required human authentication. The overall result is failed,
+not an all-ten pass. No machine identities or raw receipts are included here.
+
+On the nine reachable machines: initial ingestion returned 18 hits; replay kept
+the same 18 identities; a busy-index sync returned exit 7 while search retained
+18; mirror recovery returned 27; a second append returned 36; a genuinely refused
+SSH connection produced exit 8/partial while all 36 remained searchable. Exact
+origin-host/source provenance and local/unknown-source negatives passed. Default
+hybrid matched lexical results without a model download; this does not validate
+neural semantic retrieval or archive-scale performance. Every sync/reingest
+response parsed as one JSON document. Existing user archives were untouched.
+
+Executable SHA256:
+`8e30a55278a9823f7cd292bf60d45e8e949f2a14eb713acf5d0c86ff4973d822`.
+Live harness SHA256:
+`467e7d340013f81815749aa2da887e709d12f70eece6a33aa55939b49688f36c`.
+Ordinal summary SHA256:
+`87d69215795f6ab8d3d52d843a5e64d121a6951c80ae3b18acce8daa61ee325a`.
+The initial harness missed the two-document bug because it checked exit codes
+and search results; strict parsing was added after inspecting that retained
+output. An earlier installed 0.7.1 run also rejected `sources sync --all`, an
+already-fixed unreleased CLI incompatibility rather than a new repair here.
+Setup still drops slow deep probes: the default timeout selected six of nine
+SSH-reachable machines, and 30 seconds selected eight. That separate problem,
+the authentication-blocked host, and strict release gates remain open.
+
+The fleet gate ended at 22:26 UTC with UBS `MODULE_TIMEOUT` after 300 seconds,
+zero completed files, and exit 1. All 1040 frozen CASS inputs and 77 FAD overlay
+inputs still matched after the gate; the final executable matches the live
+run's checksum above. Canonical differences are the declared dependency
+overlay config/lock and the subsequently edited README; the three changed Rust
+source/test files match the validated snapshot exactly. Gate-log SHA256:
+`ef8a51b751fa2db6d7e96e983af6726563b651e2f2f643f8d8e2b28d13b9a5c6`.
+No UBS waiver, parent push, or release was performed.
+
+Doctor multi-row diagnostics (2026-09-09, bead `9lz4y`): both the initial
+integrity probe and the post-promotion probe now use the same row collector.
+The old single-row API replaced real multiple findings with a row-count error.
+The collector inspects all rows, retains up to 20 diagnostics with an omitted
+count, and rejects empty or blank output. SQL-produced diagnostic rows test
+the response decoder; they do not purport to reproduce the owner's corrupt
+archive. An actual healthy PRAGMA and the existing damaged-archive CLI test
+cover real database behavior.
+
+The frozen remote gate passed formatting, all-target Clippy, 13 library tests,
+one damaged-archive CLI test, and 68 goldens (82 total). UBS timed out after
+300 seconds with zero completed files; its one critical marker denotes that
+timeout. The RCH transport ended with exit 143 before the outer receipt; the
+terminal gate log was recovered directly, and all 1040 CASS plus 77 frozen FAD
+inputs were checked before the worker was reused. Log SHA256:
+`b732f710d7ac79a1eaebcbf220275c81b03645594d1a8efa961dc34779c1fe7f`.
+Executable SHA256:
+`eee469a5de9063f7094213f0406e372869623410a8c0ae0fe2a80394530307de`.
+This validates diagnostic handling, not original-archive repair or release
+clearance. The strict gate and original bead remain open.
+
+GH422 scoped retry continuation (2026-09-09): the old helper copied only query,
+format, timeout, data-dir, session-file and explicit mode. Both timeout call
+sites now share a retry assembled from the parsed request, including explicit
+non-default `--db` before the subcommand, strict read-only policy, scope,
+cursor-resolved pagination, semantic options and output budgets. Relative time
+bounds are emitted as absolute RFC3339 instants; options and query use existing
+shell quoting and the query follows `--`. Non-UTF8 dataset paths and stdin
+scope omit retry advice rather than advertising a different request.
+
+Validation completed on vmi1264463 at 18:52 UTC:
+`/data/projects/cass-gh422-retry-fixture-20260909/results/` contains the passing
+real-process retry journey (1 passed, 0 failed/ignored, 13.61 seconds), actual
+formatter and all-target Clippy results. It exercises setup and metadata
+timeouts against two matching sessions, a non-default DB, quoted paths, exact
+selected-hit and nonexistent-agent controls, and byte-stable archive checks.
+The prior batched gate in `cass-gh422-retry-corrected-20260909/results/`
+passed 27 library controls, all 13 search-format contracts and 68 goldens:
+109 passing tests across the two runs. This is a small isolated archive,
+not reporter-scale performance or independent review.
+
+Both failed attempts remain in the record: `cass-gh422-retry-lld839u6`
+stopped before compilation/tests because the parent supplied space-separated
+UBS paths instead of the required comma-separated list. The corrected full
+gate then exposed a test fixture error: filenames lacked Codex's required
+`rollout-` prefix, so discovery produced zero hits before retry assertions.
+Only those names were corrected; the original exact assertions still pass.
+The full gate's UBS module timed out at 300 seconds with zero completed files;
+its synthetic critical count of one is the timeout marker, not a completed
+source finding. No waiver, suppression or release clearance follows.
+
+Final production `src/lib.rs` SHA256 is
+`ea2941bb1958e5091f24b2fc05823cb8d08e16d69a11c9a4ea0a80bdf52da57b`;
+test SHA256 is `5dda6450c3d0268b2d9b58ad69b7c8083aaf0e7a5e6e6b16c791a39ff938ed52`.
+The same production ELF was used in both runtime runs:
+`62e27a5b3ff52940f62a59d1ec595e974328049fd4970078ea5d5312388c2367`.
+All 1040 CASS inputs and 77 frozen unpublished FAD inputs were checked before
+and after; only the declared overlay config/lock differ from canonical CASS.
+Peer commits `e77f5910`/`fb84420d` captured WIP before validation. Original
+`u3vho`, reporter-scale acceptance and release gates remain open; the exit-zero
+partial-response contract is unchanged.
+
+GH426 continuation: single-conversation NoMem deferral/quarantine previously
+returned `scan_had_errors=false` despite saving no canonical rows. Both paths
+now retain the deferred source and mark ingestion incomplete. Streaming maps
+those source paths to actual connector names across combined batch ranges;
+batch indexing also requires persistence completion before advancing its
+connector watermark. Existing global scan and mirror-fingerprint gates consume
+the incomplete outcome. Provider aliases are not used as connector identity.
+Original bead `fyepq` still carries the full per-source observation ledger and
+graceful-stop acceptance; this correction does not complete those requirements.
+
+The remote gate in `/data/projects/cass-gh426-qtehoevg/results/` passed 118
+selected tests: 11 library tests, 39 storage parity tests and 68 goldens, with
+zero failed or ignored tests. Formatting and all-target Clippy passed. The
+extended real storage tests cover retained watermarks during induced NoMem,
+unrelated completed-connector progress, successful retry, duplicate-free replay,
+and quarantine. Fault injection uses existing test hooks; this is controlled
+failure-path evidence, not a reporter-sized interrupted scan. The declared
+source digest is e9523fdaa95fde0c3ef27f79923fbade94ae15ee87c96fd6b5bf5c77cf11e6d1;
+the reviewed formatted indexer SHA256 is
+ce996e8a3dbcb86c946362605fb2feacfa58de0fb9008e0493e881d669e265ff.
+RCH job 30013452823036020 on vmi1264463 completed at 17:29 UTC. Final identity
+verification passed for all 1,040 CASS inputs and 77 declared connector-overlay
+files. UBS completed, rather than timing out: one file, 249 critical labels,
+8,581 warnings and 2,653 informational findings, exit 1. These classifications
+remain unresolved; no blanket false-positive disposition or suppression was
+applied. Gate log SHA256:
+1898aa8f2216cfd0255e9d244d3f6ba4f2fc9d377d41898410e9eaebfb8267e6.
+Tested executable SHA256:
+4c169b7d9f821e9c7808f5dd2ddf1d4a34f1dd53c243321b6fbc334001ecf654.
+No release clearance follows from the targeted passes. The original bead
+retains both the positive runtime result and the red gate.
+
+September 9 field-evidence update: the GH458 reporter confirmed quality
+backfill reuse and publication on the original roughly 547,000-message,
+4,054-conversation archive using commit
+000301c949df5180c0023ef7f6b19767a0cf9fbc (verified as a local ancestor).
+Offsets continued 64 to 96 to 128 across ingest; the completed quality tier
+contained 425,762 documents and reported current archive identity while
+serving semantic queries. This is reporter-provided evidence, not our own
+archive-scale benchmark. The reported approximately five-minute canonical
+walk per maintenance batch and lock-held serving interruption remain costs;
+the legacy fast-tier vector-space refusal remains a separate unresolved
+admission/rebuild problem. See the
+[reporter's full measurements](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/458#issuecomment-5604445676).
+
+The new GH390 report concerns a different 3.19 GB archive where both CASS
+and stock SQLite report orphan pages. It does not establish another checker
+false positive or resolve the older archive's disagreement. No compaction,
+integrity-grade downgrade, or normalization override was performed; original
+bead `rvbsf` retains the distinction and
+[the new report](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/390#issuecomment-5605127509)
+must be treated as reporter evidence until an unchanged bundle is reproduced.
+
+September 9 follow-up, original bead `coding_agent_session_search-igh4d`:
+the primary writer's catalog probe required `rootpage > 0`, excluding the
+actual FTS virtual table, whose root page is zero. The correction uses
+`type = 'table'` and leaves all shadow admission/suspension limits unchanged.
+The real FrankenSQLite regression starts with an unknown presence cache,
+inserts and appends through the primary writer, and checks exact MATCH rowids
+and replay conservation without an intervening rebuild. Peer commit
+ca621f9d2a3d48ffcc18447132ee4e15787ef61a captured the same reviewed source.
+
+RCH job 30013452823035932 on vmi1264463 completed at 13:37 UTC. Formatting,
+all-target Clippy, both the new regression and existing shadow-bound control,
+and all 68 goldens passed (70 passing tests). The requested integration target
+`storage_parity` does not exist: that stage exited 101 and ran zero tests.
+The unchanged-source follow-up, RCH job 30013452823035944, ran the correct
+`storage_frankensqlite_parity` target: all 39 tests passed in 19.98 seconds at
+13:38 UTC. Both source and all 77 overlay inputs matched before and after;
+the production executable remained unchanged. Combined selected coverage is
+109 passing tests, with the original target-selection failure retained.
+Parity log `/data/projects/cass-igh4d-parity-eu_edv4n/results/parity.log` has
+SHA256 460deaa6b6be2cd05b6178f93986da13ba22abe24f620e73ea4bb4efacd6de1b.
+UBS completed with 28 critical
+labels, 6,851 warnings and 1,132 informational findings, exit 1. These are
+scanner classifications, not independently confirmed defects or clearance.
+
+Retained results: `/data/projects/cass-igh4d-9c4zdq75/results/`;
+gate log SHA256 8de31c4170e6455797475139d253c9fd43f5f6b200e61a145d5b35a421a410e7.
+All 1,040 CASS inputs were stable; the declared 77-file unpublished connector
+overlay was verified before execution. Formatted storage SHA256:
+dced71065c966c17828cb60a1e3a2e21c75b5f84df39b2566d98775d23bad88d.
+Actual executable SHA256:
+6c1519374d36301aeb0aec8ccb0818d22b68ec7fa7acd0c6dae3210315e86a90.
+This proves controlled storage behavior, not large-archive performance or
+release readiness; the required scanner gate remains red.
+
 Scope window: `v0.7.1..6b2ab22d30892fe6f7762d851477feea0e6f80f8`, plus
 the local 0.8.0 preparation through da1930c0 and reviewed working-tree repairs on
 September 9. This is a release-window update, not a reconstruction of older
@@ -34,7 +240,8 @@ status; they are not counted as product features.
 | Merge reconciliation | five merges in the original range | validated | combined-diff review; dependency, pack, recovery and refresh changes retained |
 | E | local issue-fix commits through c865ebc4 and reviewed working-tree fixes, 2026-09-08 | distilled; runtime validation pending | Devin parser/WAL watch, Prime presets/probe, active-source watch retries, legacy FTS preflight, exact resume metadata, resumable semantic reconciliation, doctor truth, schema goldens |
 | F | reviewed changes through e3c76fa7, 2026-09-09 | full-suite failures diagnosed; corrected schema verified; remaining fixes under validation | Cursor canonical/search repair, temp-path trace privacy, connector fixtures, backfill process helper, exact connector enumeration |
-| G | working-tree analytics and upstream connector follow-through, 2026-09-09 | 127 targeted CASS tests passed; formatting and scanner gate still pending | stored workspace analytics conservation, replay and rollback; Copilot workspacePath alias |
+| G | analytics through e93659e3 plus reviewed formatter follow-up and unpublished upstream connector source, 2026-09-09 | 127 targeted CASS tests passed; Clippy and subsequent formatting passed; completed UBS scan remains red | stored workspace analytics conservation, replay and rollback; Copilot workspacePath alias |
+| H | reviewed GH422 process regression on c74277eb and the same connector overlay, 2026-09-09 | corrected regression passed in 22.93 seconds; formatting and all-target Clippy passed; prior UBS failure retained | search-triggered stall containment, lock release, durable checkpoint and cold lexical recovery |
 
 ## Publication follow-through
 
@@ -324,13 +531,13 @@ The correction retains the content-bearing stale-workspace precondition and
 every actual search/filter assertion. Copilot passed 11 tests and failed one
 real legacy-history workspace assertion. Its parser omits the top-level
 `workspacePath` alias; a one-line upstream fallback and three real scan tests
-are prepared without changing the original CASS assertion. Both corrections
-still need execution. The earlier upstream Cursor gate separately completed
-79 parser tests and one registry test successfully; those results do not
+were prepared without changing the original CASS assertion. Both corrections
+passed in the subsequent 127-test run below. The earlier upstream Cursor gate
+separately completed 79 parser tests and one registry test successfully; those results do not
 include the later Windows fixture escaping or Copilot change.
 
-CASS analytics reassociation is now implemented and reviewed, with runtime
-validation pending. It moves stored workspace contributions in the same
+CASS analytics reassociation is implemented and reviewed, with runtime
+validation recorded below. It moves stored workspace contributions in the same
 transaction as canonical attribution, preserves measured token/cost values,
 repairs canonical no-op replays, and rolls back on missing or underfilled
 rollup buckets. Three storage regressions and the expanded real CLI journey
@@ -361,6 +568,76 @@ No scanner waiver, dependency publication, or issue closure was made.
 The CASS follow-up's first formatting check reported one array/iterator layout
 in a new storage test. The earlier pinned formatter emitted source through stdin
 but did not run a subsequent Cargo formatting check; its successful process
-exit was insufficient. A formatting-only follow-up is prepared after runtime
-completion. The mandatory scanner is still running at this checkpoint, so the
-127 passing tests do not establish an overall green gate.
+exit was insufficient. After preserving the completed runtime receipt, remote
+formatting-only job 30012625538515432 passed at 04:20 UTC. The complete returned
+patch changes only that test's layout and trailing comma; it was reviewed and
+applied to the identical canonical input. All 1,039 other source inputs and the
+tested executable remained unchanged. Formatted storage SHA256 is
+3ac735a21b84fb85a88dd9ef8ea93db62e22055d308fcc731b361cea2556a459;
+the runtime used the pre-format storage source
+7b1084f03bcd9771560c5ca0174c9956b90db08f71fe81f60e0f24791cddb8d2.
+
+The analytics gate, job 30012625538515403, completed at 04:12 UTC. Unlike F9's
+timeout, its strict UBS scan finished: three files, 108 critical findings,
+9,591 warnings and 1,818 informational findings, exit 1. Independent review
+of every displayed critical location found test assertions, fixed executable
+paths, query syntax, cache hashes, and internal table/metadata names. The report
+only displays capped samples; unshown findings remain unclassified. No blanket
+suppression or scanner clearance follows from that review. Source inspection
+also found an unquoted argument-array expansion in the scanner's Cargo wrapper
+that explains its misleading build-clean labels; the separately executed
+Clippy and formatting receipts remain the actual compiler evidence.
+
+The retained gate and formatter results live under
+`/data/projects/cass-gh459-analytics-followup-e4o6via2/results/` and
+`/data/projects/cass-gh459-final-format-ktnc0se0/results/`. The tested executable
+SHA256 is 1fe22d59a1c4e21a315253c1ec6e377f59a6a68449422672701c4ba6936e10ea.
+Peer commits e93659e3 and c74277eb captured the existing source and documentation;
+their presence is not a green gate. UBS remains blocking, the upstream connector
+candidate remains unpublished, and the issues and release remain open.
+
+## GH422 search-triggered watchdog verification
+
+The new Unix regression in `tests/e2e_lexical_fail_open.rs` exercises the
+ordinary search process's supervised, in-process lexical refresh. It reuses
+the existing post-commit pause hook; no production code or new hook was added.
+After a real scratch-index commit, it checks the same search PID holds the
+index lock, durable checkpoint progress remains incomplete, and metadata
+heartbeats advance while forward progress stays frozen. The process must
+itself exit 70 with the structured `index-stalled` error before the artificial
+pause finishes. A harness timeout or cleanup kill cannot satisfy that assertion.
+The next cold query must publish complete lexical assets, return both expected
+message identities exactly once, and preserve canonical IDs and message data.
+
+The first remote gate, job 30012625538515443, completed at 04:52 UTC with
+84 tests passing and this new test failing before its watchdog assertions.
+The parent-added sentinel precondition incorrectly expected a checkpoint file
+path where the hook records the index directory. The child guard reaped the
+process; that run proves neither watchdog exit nor recovery. Formatting,
+all-target Clippy, 13 library controls, three other CLI controls, and 68 goldens
+passed. UBS completed with 98 critical findings, 859 warnings and 121
+informational findings, exit 1. Its failure remains blocking.
+
+Only the mistaken path assertion was corrected. Follow-up job
+30012625538515448 completed at 04:59 UTC with formatting, all-target Clippy,
+and the exact new regression passing: one passed, zero failed, zero ignored,
+22.93 seconds. All checkpoint, heartbeat, exit, lock, deadline, asset and
+conservation assertions remained intact. The formatter's complete returned
+diff was reviewed and applied manually. Final test SHA256 is
+3497dea3230c3be4a5313a61eaf45d471fc518f20bd18047b5caf686e3ea9774.
+All 1,040 CASS inputs and 77 declared connector-overlay inputs were verified
+before and after execution. Against the canonical checkout, only the declared
+connector-overlay Cargo configuration and lock differ; production executable
+SHA256 remains 1fe22d59a1c4e21a315253c1ec6e377f59a6a68449422672701c4ba6936e10ea.
+
+Both runs are retained under
+`/data/projects/cass-gh422-inline-watchdog-39_y0xyi/results/` and
+`/data/projects/cass-gh422-sentinel-fix-bnxlkyrs/results/`.
+The corrected `gh422-runtime.log` SHA256 is
+960da60a1e6803b5e3d2d5818b1ebc97e8a089c3bcb78ec64073bce2d345d2ba.
+The original bead `coding_agent_session_search-u3vho` and
+[GH422 progress comment](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/422#issuecomment-5596078395)
+record the positive result and its limits. This is controlled-fixture evidence
+for existing containment behavior, not reporter-sized archive acceptance or
+a change to the separately reported empty-success `--timeout` response.
+The issue and release remain open; the focused follow-up does not clear UBS.

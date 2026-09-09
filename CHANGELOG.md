@@ -113,6 +113,15 @@ remain open at this research snapshot. Landed code and targeted tests do not
 mean that every acceptance row, platform, or reporter archive has been verified.
 
 ### Added
+
+- `sources discover --tailscale` and `sources setup --tailscale` optionally add
+  online tailnet peers using their IPv4 addresses. Matching SSH aliases retain
+  their configuration; unavailable Tailscale produces a warning and falls back
+  to SSH-config discovery. SSH authentication and host-key checks still apply.
+- An opt-in real-SSH fleet test harness accepts an external private inventory
+  and exercises discovery, sync, indexing, source-scoped search, replay,
+  incremental append, busy-index recovery, and an unavailable source. Raw
+  receipts stay outside git; unreachable hosts keep the overall result failed.
 - Muse AI sessions can be discovered and indexed through the connector registry.
 - Local Devin `sessions.db` ingestion is enabled through FAD's SQLite parser,
   preserving the selected message chain and the `devin` identity. Cloud session
@@ -182,6 +191,34 @@ mean that every acceptance row, platform, or reporter archive has been verified.
   40-segment generation is folded by a plain `cass index`).
 
 ### Fixed
+
+- SSH host discovery uses `CASS_SSH_CONFIG`, matching the transport commands,
+  and follows included configuration files with bounded recursion and duplicate
+  alias handling. A private configuration no longer yields an empty discovery
+  result while direct connections through the same file work (bead `av59c`).
+- `sources sync --json` and `sources reingest --json` return one document with
+  the nested indexing result. Indexing failures report `status: "index_failed"`
+  and retain the nonzero exit code, rather than printing a premature sync
+  success and a second JSON document (bead `av59c`).
+- Doctor preserves multiple `quick_check` findings instead of replacing them
+  with a single-row query error. It inspects every returned row before declaring
+  health, bounds displayed diagnostics, and rejects empty or malformed results.
+  The same check runs after candidate promotion (bead `9lz4y`).
+- Search timeout retry commands retain the selected database, read-only policy,
+  agent/workspace/source/session filters, resolved time bounds, pagination,
+  semantic options and robot output limits. Both setup and metadata timeouts
+  use the same scoped retry; stdin-scoped searches still omit replay advice
+  ([GH #422](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/422)).
+- Incremental indexing no longer advances a connector's scan watermark after
+  a conversation is deferred or quarantined without being persisted. Unrelated
+  completed connectors can still advance; a later successful retry saves the
+  missing messages without duplicating them. Streaming and batch paths share
+  this rule (GH #426). The full per-source resume ledger remains unfinished.
+- The primary database writer recognizes the FTS virtual table by catalog
+  type instead of requiring a positive B-tree root page. New and appended
+  messages now reach an existing fallback search shadow without a rebuild;
+  replay remains deduplicated and shadow-size limits still apply
+  ([`ca621f9d`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ca621f9d2a3d48ffcc18447132ee4e15787ef61a), bead `igh4d`).
 - Semantic backfill reuses compatible vectors across intervening ingest and
   compares current document content and provenance before retaining them.
   Missing checkpoint files restart coverage safely; partial repairs revoke
@@ -190,7 +227,11 @@ mean that every acceptance row, platform, or reporter archive has been verified.
   Seven storage/vector regressions and a native MiniLM lifecycle pass. The
   native probe covers six documents across seven bounded quality batches,
   intervening ingest, and exact lexical/semantic source identity agreement.
-  Process-lock validation remains pending; large-archive throughput is unproven.
+  The reporter subsequently confirmed progress surviving ingest and publication
+  of 425,762 quality vectors on the original roughly 547,000-message archive.
+  Their maintenance batches still spend about five minutes walking canonical
+  identities; this is field-reported correctness evidence, not a throughput win.
+  See [the field results](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/458#issuecomment-5604445676).
   See [#458](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/458).
 - Watches of an explicit Devin database follow its WAL/SHM events without
   ingesting neighboring databases. Provider timestamps older than filesystem
@@ -220,7 +261,7 @@ mean that every acceptance row, platform, or reporter archive has been verified.
   It applies full-path redaction before home-prefix shortening. This corrects
   a path leak found by the full suite; the unchanged CLI privacy regression
   and new path cases pass remotely, along with all 64 trace CLI tests. The
-  mandatory scanner remains incomplete, so this is not release clearance.
+  mandatory scanner gate remains unresolved, so this is not release clearance.
 - Cursor workspace repair preserves session/message identity and stored token
   and cost amounts while correcting canonical attribution and analytics totals.
   Replay repairs stale analytics without inserting duplicate messages; inconsistent
@@ -472,6 +513,12 @@ mean that every acceptance row, platform, or reporter archive has been verified.
   Docker or failed setup cannot count as a successful transfer.
 - Rust tests use the repository's 128 MiB stack reservation. The gate rejects
   rustfmt termination, missing terminal receipts, and zero-test selections.
+- A real-process regression covers a search-triggered lexical refresh that
+  stalls after committing a batch while its heartbeat continues (GH #422).
+  It verifies exit 70, lock release, and a subsequent cold query rebuilding
+  complete search assets without losing or duplicating canonical messages.
+  This validates the existing watchdog on a controlled fixture; acceptance
+  on the reporter's large archive remains open.
 - Release validation is still in progress. Existing targeted passes do not
   constitute a full-suite or four-platform release verdict; strict UBS remains
   blocking, and full-history pack latency has not met its unchanged SLO on the
@@ -539,7 +586,6 @@ mean that every acceptance row, platform, or reporter archive has been verified.
   [`ac49507d`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ac49507d)).
 
 ### Fixed
-
 - Fixed the GH#413 index-wedge class: the lexical-rebuild sink now flushes on
   starvation so retained byte reservations cannot deadlock the pipeline
   ([`424765b3`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/424765b3)),
