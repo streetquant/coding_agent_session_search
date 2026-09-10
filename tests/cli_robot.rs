@@ -55,6 +55,11 @@ fn is_transient_lexical_build_path(path: &Path) -> bool {
     path.components().any(|component| {
         component.as_os_str().to_str().is_some_and(|name| {
             name.starts_with("cass-lexical-shards.")
+                // Published generations are immutable inputs for these robot
+                // fixtures. The backup tree is created while a concurrent
+                // shared-fixture consumer is publishing a replacement and
+                // must not become part of a copied test namespace.
+                || name == ".lexical-publish-backups"
                 // The lexical self-heal's archive-fingerprint sidecar is a
                 // derived cache written next to the index through a
                 // `.<pid>.tmp` file and a rename. In-place robot tests running
@@ -77,6 +82,22 @@ fn is_fsqlite_runtime_lock_sidecar_path(path: &Path) -> bool {
         .is_some_and(|name| name.ends_with("-fsqlite-ns-gate") || name.ends_with("-fsqlite-ns-use"))
 }
 
+/// Lock files are process-local coordination state, even when they are
+/// zero-byte placeholders after their owner exits. Copying one into a
+/// fixture gives a child command a namespace it did not acquire and lets a
+/// stale shared-fixture owner affect an otherwise isolated test.
+fn is_fixture_runtime_lock_path(path: &Path) -> bool {
+    if is_fsqlite_runtime_lock_sidecar_path(path) {
+        return true;
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            matches!(name, "index-run.lock" | "index-run.lock.meta" | "LOCK")
+                || name.ends_with(".lock")
+        })
+}
+
 fn safe_fixture_destination(dst_root: &Path, rel: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let mut dst = dst_root.to_path_buf();
     for component in rel.components() {
@@ -97,6 +118,19 @@ fn safe_fixture_destination(dst_root: &Path, rel: &Path) -> Result<PathBuf, Box<
 fn isolated_search_demo_data() -> Result<TempDir, Box<dyn Error>> {
     let tmp = TempDir::new()?;
     let src = Path::new(SEARCH_DEMO_DATA_DIR);
+
+    // Take a shared snapshot lease while copying. Index/self-heal publishers
+    // hold this same data-dir lock exclusively, so a clone cannot observe a
+    // half-published generation or a database being replaced underneath it.
+    // The lease is dropped before the TempDir is returned.
+    let snapshot_lock_path = src.join("index-run.lock");
+    let snapshot_lock = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&snapshot_lock_path)?;
+    snapshot_lock.lock_shared()?;
+
     for entry in WalkDir::new(src) {
         let entry = match entry {
             Ok(entry) => entry,
@@ -110,7 +144,9 @@ fn isolated_search_demo_data() -> Result<TempDir, Box<dyn Error>> {
             }
             Err(err) => return Err(Box::new(err)),
         };
-        if is_fsqlite_runtime_lock_sidecar_path(entry.path()) {
+        if is_transient_lexical_build_path(entry.path())
+            || is_fixture_runtime_lock_path(entry.path())
+        {
             continue;
         }
         let rel = entry.path().strip_prefix(src)?;
@@ -294,6 +330,32 @@ fn hold_active_lexical_rebuild_lock(
     .expect("write lock metadata");
     lock_file.flush().expect("flush lock metadata");
     lock_file
+}
+
+#[test]
+fn isolated_search_demo_data_excludes_runtime_lock_namespace() -> Result<(), Box<dyn Error>> {
+    let fixture = isolated_search_demo_data()?;
+
+    let leaked_locks: Vec<PathBuf> = WalkDir::new(fixture.path())
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| is_fixture_runtime_lock_path(entry.path()))
+        .map(|entry| entry.path().to_path_buf())
+        .collect();
+    assert!(
+        leaked_locks.is_empty(),
+        "isolated fixture must not inherit coordination locks: {leaked_locks:?}"
+    );
+    assert!(
+        !fixture
+            .path()
+            .join("index")
+            .join(".lexical-publish-backups")
+            .exists(),
+        "isolated fixture must not inherit a concurrent publish backup namespace"
+    );
+
+    Ok(())
 }
 
 #[test]
