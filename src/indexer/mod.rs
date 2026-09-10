@@ -1080,6 +1080,8 @@ pub struct IndexingProgress {
     pub discovered_agent_names: Mutex<Vec<String>>,
     /// Last error message from background indexer, if any
     pub last_error: Mutex<Option<String>>,
+    /// Final WAL checkpoint result for the current index invocation.
+    pub(crate) final_wal_checkpoint: Mutex<Option<FinalWalCheckpointReport>>,
     /// Structured stats for JSON output (T7.4)
     pub stats: Mutex<IndexingStats>,
     /// Live authoritative rebuild queue depth for same-process progress output.
@@ -1219,9 +1221,16 @@ impl IndexingProgress {
     }
 
     /// Human-readable label for the current phase.
-    /// See the `INDEX_PHASE_*` constants for the canonical phase taxonomy.
+    /// See the INDEX_PHASE_* constants for the canonical phase taxonomy.
     pub fn phase_label(&self) -> &'static str {
         Self::phase_label_for(self.phase.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn final_wal_checkpoint_report(&self) -> Option<FinalWalCheckpointReport> {
+        self.final_wal_checkpoint
+            .lock()
+            .map(|report| report.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
     }
 
     /// True when the authoritative lexical rebuild pipeline holds no
@@ -13230,7 +13239,8 @@ fn spawn_connector_producer(
                 .get(name)
                 .copied()
                 .unwrap_or(config.since_ts);
-            let root_since_ts = explicit_scan_root_since_ts(root, &config.data_dir, local_since_ts);
+            let root_since_ts =
+                connector_explicit_scan_root_since_ts(name, root, &config.data_dir, local_since_ts);
             if config.since_ts.is_some() && root_since_ts.is_none() {
                 tracing::debug!(
                     connector = name,
@@ -14305,8 +14315,12 @@ fn run_batch_index_with_connector_factories(
                             .get(name)
                             .copied()
                             .unwrap_or(since_ts);
-                        let root_since_ts =
-                            explicit_scan_root_since_ts(root, &data_dir, local_since_ts);
+                        let root_since_ts = connector_explicit_scan_root_since_ts(
+                            name,
+                            root,
+                            &data_dir,
+                            local_since_ts,
+                        );
                         if since_ts.is_some() && root_since_ts.is_none() {
                             tracing::debug!(
                                 connector = name,
@@ -14604,7 +14618,15 @@ fn connector_local_scan_since_ts_map(
             // dedicated connector has ever completed a scan; do one full OMP
             // scan until its own watermark exists so older profile/XDG roots
             // are not skipped by the global Pi-era cutoff.
-            let local_since_ts = if *name == "omp" && connector_last_scan_ts.is_none() {
+            let local_since_ts = if *name == "devin" {
+                // Devin stores provider activity at whole-second precision while
+                // CASS scan watermarks are millisecond timestamps. A commit made
+                // after the previous scan can therefore carry an activity value
+                // that sorts before that scan's watermark. The provider can also
+                // commit only to its WAL. Re-read this connector without a time
+                // cutoff and let canonical idempotency discard unchanged rows.
+                None
+            } else if *name == "omp" && connector_last_scan_ts.is_none() {
                 None
             } else {
                 connector_local_scan_since_ts_from_state(
@@ -14616,6 +14638,15 @@ fn connector_local_scan_since_ts_map(
             Ok((*name, local_since_ts))
         })
         .collect()
+}
+
+fn connector_explicit_scan_root_since_ts(
+    _connector_name: &str,
+    root: &ScanRoot,
+    built_in_local_root: &Path,
+    fallback_since_ts: Option<i64>,
+) -> Option<i64> {
+    explicit_scan_root_since_ts(root, built_in_local_root, fallback_since_ts)
 }
 
 fn explicit_scan_root_since_ts(
@@ -14675,6 +14706,7 @@ fn run_index_inner(
 ) -> Result<()> {
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
+    set_progress_final_wal_checkpoint(opts.progress.as_ref(), None);
     // Analytics tables are derived assets and can be rebuilt by doctor/rebuild
     // flows. Keep routine indexing focused on the canonical conversation store
     // and lexical assets; set CASS_INLINE_ANALYTICS_UPDATES=1 to restore the
@@ -14757,6 +14789,12 @@ fn run_index_inner(
             data_dir = %opts.data_dir.display(),
             path_count,
             "skipping watch-once index because all explicit paths are absent"
+        );
+        set_progress_final_wal_checkpoint(
+            opts.progress.as_ref(),
+            Some(FinalWalCheckpointReport::NotNeeded {
+                reason: "absent_explicit_watch_once_paths".to_string(),
+            }),
         );
         return Ok(());
     }
@@ -14914,6 +14952,12 @@ fn run_index_inner(
                         observed_messages,
                     );
                 }
+                set_progress_final_wal_checkpoint(
+                    opts.progress.as_ref(),
+                    Some(FinalWalCheckpointReport::NotNeeded {
+                        reason: "readonly_lexical_resume".to_string(),
+                    }),
+                );
                 return Ok(());
             }
             Ok(None) => {}
@@ -14927,6 +14971,12 @@ fn run_index_inner(
         }
     }
     if try_readonly_canonical_force_rebuild(&opts, &progress_bump)? {
+        set_progress_final_wal_checkpoint(
+            opts.progress.as_ref(),
+            Some(FinalWalCheckpointReport::NotNeeded {
+                reason: "readonly_canonical_force_rebuild".to_string(),
+            }),
+        );
         return Ok(());
     }
 
@@ -15196,7 +15246,12 @@ fn run_index_inner(
             path_count,
             "skipping unchanged explicit watch-once index run before startup maintenance"
         );
-        return close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run");
+        return close_storage_after_index(
+            storage,
+            &opts.db_path,
+            "watch-once no-op index run",
+            opts.progress.as_ref(),
+        );
     }
 
     preflight_phase!("watch_startup:cleanup_orphan_fk_rows");
@@ -17165,7 +17220,12 @@ fn run_index_inner(
                 path_count,
                 "skipping unchanged explicit watch-once paths before opening Tantivy"
             );
-            return close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run");
+            return close_storage_after_index(
+                storage,
+                &opts.db_path,
+                "watch-once no-op index run",
+                opts.progress.as_ref(),
+            );
         }
 
         // Startup watch ingest defers WAL auto-checkpoints for bulk import.
@@ -17460,8 +17520,12 @@ fn run_index_inner(
             },
         );
 
-        let close_result =
-            release_watch_storage_after_index(storage, &opts.db_path, "watch indexing session");
+        let close_result = release_watch_storage_after_index(
+            storage,
+            &opts.db_path,
+            "watch indexing session",
+            opts.progress.as_ref(),
+        );
         if let Err(err) = watch_result {
             if let Err(close_err) = close_result {
                 tracing::warn!(
@@ -17476,21 +17540,18 @@ fn run_index_inner(
         return Ok(());
     }
 
-    // #319/#321: `close_storage_after_index` runs the final WAL checkpoint of
-    // the deferred bulk-ingest WAL — a synchronous, `!Send` frankensqlite
-    // `conn.close()` + `wal_checkpoint(TRUNCATE)` that executes on THIS thread
-    // and cannot report progress. On a large corpus (the report: ~1.1 GB /
-    // ~290k-frame WAL) it legitimately takes minutes, especially on macOS.
-    // Signal the stall watchdog that we have entered that finalize window so it
-    // does not misread the quiescent, phase-0, current==total state as a #297
-    // finalize wedge and kill the process (exit 70) mid-checkpoint — which would
-    // strand the un-truncated WAL and leave the DB malformed (#296/#321). The
-    // watchdog still bounds this window (see `index_finalize_abort_threshold`),
+    // #319/#321: close_storage_after_index enters the post-publish finalize
+    // window. Closing the storage handle and supervising the native WAL
+    // checkpoint are heavy operations on large archives. The checkpoint runs
+    // in a disposable worker so a deadline can kill and reap any DB-owning
+    // child without detaching it, while the watchdog recognizes this window
+    // instead of treating its parked counters as a finalize wedge.
+    // The watchdog still bounds this window (see index_finalize_abort_threshold),
     // so a genuinely stuck finalize is still aborted.
     if let Some(progress) = opts.progress.as_ref() {
         progress.finalizing.store(true, Ordering::Relaxed);
     }
-    close_storage_after_index(storage, &opts.db_path, "index run")
+    close_storage_after_index(storage, &opts.db_path, "index run", opts.progress.as_ref())
 }
 
 /// Close a write handle the way `cass index` closes its own: restore the
@@ -17501,18 +17562,22 @@ fn run_index_inner(
 /// analytics rebuilds, doctor repairs, quarantine retries — used to drop its
 /// handle and leave the WAL for the next opener to replay. The owner's archive
 /// carried a 200 MB WAL for 18 days that way, and every default search paid
-/// for it. A blocked checkpoint (a concurrent reader pinning the WAL) is not
-/// an error here; it is logged by `query_final_wal_checkpoint` and the caller
-/// reports it truthfully.
+/// for it. A blocked, timed-out, unavailable, or failed checkpoint is an error;
+/// callers must retain the failure state and retry on a later invocation.
 pub(crate) fn close_storage_with_wal_checkpoint(
     storage: FrankenStorage,
     db_path: &Path,
     context: &str,
 ) -> Result<()> {
-    close_storage_after_index(storage, db_path, context)
+    close_storage_after_index(storage, db_path, context, None)
 }
 
-fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &str) -> Result<()> {
+fn close_storage_after_index(
+    storage: FrankenStorage,
+    db_path: &Path,
+    context: &str,
+    progress: Option<&Arc<IndexingProgress>>,
+) -> Result<()> {
     prepare_storage_for_final_checkpoint(&storage, db_path, context);
     storage.close().with_context(|| {
         format!(
@@ -17520,55 +17585,50 @@ fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &
             db_path.display()
         )
     })?;
-    // The storage handle is already closed here, so the checkpoint should not be
-    // blocked; a `Blocked` outcome (e.g. another cass process holds a reader) is
-    // already surfaced via the WARN inside `query_final_wal_checkpoint`. Preserve
-    // the historically-lenient contract of this normal-close path (Ok even if the
-    // checkpoint could not fully truncate) — the abort path (#321) is the one that
-    // must branch on the outcome.
-    //
+    // The storage handle is already closed here, but another reader or a
+    // worker failure can still prevent the bounded checkpoint from completing.
+    // Keep that outcome attached to the index progress and propagate it so the
+    // caller never publishes a false success.
     // GH #382 / g3zyo: bounded. On an archive whose frankensqlite writable path
     // loops (the disowned-page reclaim sweep rescans the WAL per ledger page)
     // this checkpoint never returned, so every index run hung *after* a
     // successful publish and every stale-on-read refresh died here. The publish
     // is durable before this point and an un-truncated WAL costs the next
     // opener a replay, never data — so a checkpoint that outlives its budget is
-    // reported and skipped rather than waited on forever.
+    // reported as a failure and retried by the next invocation.
     let timeout = final_wal_checkpoint_timeout();
-    match run_bounded_native_wal_checkpoint(db_path.to_path_buf(), timeout, context) {
-        AbortWalCheckpointAttempt::Finished(Ok(_outcome)) => Ok(()),
-        AbortWalCheckpointAttempt::Finished(Err(error)) => Err(anyhow::anyhow!(
-            "final WAL checkpoint after {context} failed: {error}"
-        )),
-        AbortWalCheckpointAttempt::TimedOut => {
+    let report = FinalWalCheckpointReport::from_attempt(
+        run_bounded_native_wal_checkpoint(db_path.to_path_buf(), timeout, context),
+        timeout,
+    );
+    match &report {
+        FinalWalCheckpointReport::TimedOut { timeout_secs } => {
             tracing::warn!(
                 db_path = %db_path.display(),
                 context,
-                timeout_secs = timeout.as_secs(),
-                "final WAL checkpoint exceeded its budget and was left for the next opener; \
-                 if this repeats on a large archive the writable open is looping on the WAL \
-                 (GH #382): back up the archive and its sidecars, then checkpoint it with \
-                 stock sqlite3 (`PRAGMA wal_checkpoint(TRUNCATE)`)"
+                timeout_secs,
+                "final WAL checkpoint exceeded its budget; index finalization failed and the WAL was left for the next opener"
             );
-            Ok(())
         }
-        AbortWalCheckpointAttempt::WorkerUnavailable(error) => {
+        FinalWalCheckpointReport::WorkerUnavailable { error } => {
             tracing::warn!(
                 db_path = %db_path.display(),
                 context,
                 %error,
-                "final WAL checkpoint worker was unavailable; the WAL is left for the next opener"
+                "final WAL checkpoint worker was unavailable; index finalization failed and the WAL was left for the next opener"
             );
-            Ok(())
         }
+        _ => {}
     }
+    set_progress_final_wal_checkpoint(progress, Some(report.clone()));
+    report.require_success(context)
 }
 
-/// Wall-clock budget for the index run's final `wal_checkpoint(TRUNCATE)`
-/// (GH #382 / g3zyo). `CASS_INDEX_FINAL_WAL_CHECKPOINT_TIMEOUT_SECS` overrides
-/// the 900 s default, which stays below the finalize stall abort (1800 s) so
-/// a looping checkpoint is skipped truthfully instead of turning into an
-/// exit-70 abort; `0` falls back to the default rather than disabling the bound.
+/// Wall-clock budget for the index run's final WAL checkpoint.
+/// (GH #382 / g3zyo). The 900 s default stays below the finalize stall abort
+/// (1800 s), so a looping checkpoint is terminated, reaped, and reported as a
+/// failure instead of leaving an orphan worker or turning into an exit-70 abort.
+/// A value of zero falls back to the default rather than disabling the bound.
 fn final_wal_checkpoint_timeout() -> Duration {
     const DEFAULT_SECS: u64 = 900;
     let secs = dotenvy::var("CASS_INDEX_FINAL_WAL_CHECKPOINT_TIMEOUT_SECS")
@@ -17614,6 +17674,78 @@ pub enum FinalWalCheckpointOutcome {
         log_frames: i64,
         checkpointed_frames: i64,
     },
+}
+
+/// Structured finalization result exposed by the index JSON summary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum FinalWalCheckpointReport {
+    Completed,
+    NotNeeded {
+        reason: String,
+    },
+    Blocked {
+        busy: i64,
+        log_frames: i64,
+        checkpointed_frames: i64,
+    },
+    TimedOut {
+        timeout_secs: u64,
+    },
+    WorkerUnavailable {
+        error: String,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+impl FinalWalCheckpointReport {
+    fn from_attempt(attempt: AbortWalCheckpointAttempt, timeout: Duration) -> Self {
+        match attempt {
+            AbortWalCheckpointAttempt::Finished(Ok(outcome)) => match outcome {
+                FinalWalCheckpointOutcome::Completed => Self::Completed,
+                FinalWalCheckpointOutcome::Blocked {
+                    busy,
+                    log_frames,
+                    checkpointed_frames,
+                } => Self::Blocked {
+                    busy,
+                    log_frames,
+                    checkpointed_frames,
+                },
+            },
+            AbortWalCheckpointAttempt::Finished(Err(error)) => Self::Failed { error },
+            AbortWalCheckpointAttempt::TimedOut => Self::TimedOut {
+                timeout_secs: timeout.as_secs(),
+            },
+            AbortWalCheckpointAttempt::WorkerUnavailable(error) => {
+                Self::WorkerUnavailable { error }
+            }
+        }
+    }
+
+    fn require_success(&self, context: &str) -> Result<()> {
+        match self {
+            Self::Completed | Self::NotNeeded { .. } => Ok(()),
+            Self::Blocked {
+                busy,
+                log_frames,
+                checkpointed_frames,
+            } => Err(anyhow::anyhow!(
+                "final WAL checkpoint after {context} did not complete: blocked (busy={busy}, log_frames={log_frames}, checkpointed_frames={checkpointed_frames})"
+            )),
+            Self::TimedOut { timeout_secs } => Err(anyhow::anyhow!(
+                "final WAL checkpoint after {context} timed out after {timeout_secs}s; the WAL was left for the next opener"
+            )),
+            Self::WorkerUnavailable { error } => Err(anyhow::anyhow!(
+                "final WAL checkpoint after {context} worker was unavailable: {error}; the WAL was left for the next opener"
+            )),
+            Self::Failed { error } => Err(anyhow::anyhow!(
+                "final WAL checkpoint after {context} failed: {error}"
+            )),
+        }
+    }
 }
 
 /// Outcome of the separately supervised checkpoint attempted immediately
@@ -18151,6 +18283,7 @@ fn release_watch_storage_after_index(
     storage: Rc<Mutex<FrankenStorage>>,
     db_path: &Path,
     context: &str,
+    progress: Option<&Arc<IndexingProgress>>,
 ) -> Result<()> {
     let storage = Rc::try_unwrap(storage).map_err(|_| {
         anyhow::anyhow!(
@@ -18159,7 +18292,7 @@ fn release_watch_storage_after_index(
         )
     })?;
     match storage.into_inner() {
-        Ok(storage) => close_storage_after_index(storage, db_path, context),
+        Ok(storage) => close_storage_after_index(storage, db_path, context, progress),
         Err(poisoned) => {
             let mut storage = poisoned.into_inner();
             storage.close_best_effort_in_place();
@@ -27550,7 +27683,12 @@ fn is_devin_database_watch_root(kind: ConnectorKind, root: &ScanRoot) -> bool {
 }
 
 fn watch_scan_lower_bound(kind: ConnectorKind, since_ts: Option<i64>) -> Option<i64> {
-    if kind == ConnectorKind::Devin {
+    if kind == ConnectorKind::Cursor && since_ts == Some(WATCH_FORCE_FULL_SCAN_TS) {
+        // A removed .workspace-trusted file has no mtime. The classifier uses
+        // a private sentinel so deletion clears authority without disabling
+        // ordinary Cursor incremental scans.
+        None
+    } else if kind == ConnectorKind::Devin {
         // Devin filters sessions by provider activity time, which can precede
         // the WAL commit that triggered this scan. Filesystem event times cannot
         // bound it, even after rounding to seconds. Re-read the changed store and
@@ -28868,6 +29006,20 @@ fn save_watch_state(data_dir: &Path, state: &HashMap<ConnectorKind, i64>) -> Res
     Ok(())
 }
 
+fn set_progress_final_wal_checkpoint(
+    progress: Option<&Arc<IndexingProgress>>,
+    report: Option<FinalWalCheckpointReport>,
+) {
+    let Some(progress) = progress else {
+        return;
+    };
+
+    match progress.final_wal_checkpoint.lock() {
+        Ok(mut guard) => *guard = report,
+        Err(poisoned) => *poisoned.into_inner() = report,
+    }
+}
+
 fn set_progress_last_error(progress: Option<&Arc<IndexingProgress>>, error: Option<String>) {
     let Some(progress) = progress else {
         return;
@@ -29012,6 +29164,13 @@ fn explicit_watch_once_scan_path(kind: ConnectorKind, path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+const WATCH_FORCE_FULL_SCAN_TS: i64 = i64::MIN;
+
+fn is_workspace_trust_sidecar(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name == ".workspace-trusted")
+}
+
 fn classify_paths(
     paths: Vec<PathBuf>,
     roots: &[(ConnectorKind, ScanRoot)],
@@ -29024,103 +29183,110 @@ fn classify_paths(
         let hinted_kind = prefer_explicit_paths
             .then(|| explicit_watch_once_connector_hint(&p))
             .flatten();
-        if let Ok(meta) = std::fs::metadata(&p)
-            && let Ok(time) = meta.modified()
-            && let Ok(dur) = time.duration_since(std::time::UNIX_EPOCH)
-        {
-            let ts = Some(i64::try_from(dur.as_millis()).unwrap_or(i64::MAX));
+        let removed_workspace_sidecar = is_workspace_trust_sidecar(&p) && !p.exists();
+        let ts = if removed_workspace_sidecar {
+            // The file no longer has an mtime, but its removal still invalidates
+            // every transcript in the enclosing Cursor project. A sentinel keeps
+            // the ordinary event watermark separate while requesting a full
+            // Cursor reconstruction scan below.
+            WATCH_FORCE_FULL_SCAN_TS
+        } else {
+            let Ok(meta) = std::fs::metadata(&p) else {
+                continue;
+            };
+            let Ok(time) = meta.modified() else {
+                continue;
+            };
+            let Ok(dur) = time.duration_since(std::time::UNIX_EPOCH) else {
+                continue;
+            };
+            i64::try_from(dur.as_millis()).unwrap_or(i64::MAX)
+        };
 
-            // A connector can report nested roots for one physical store (OMP
-            // profiles are the motivating example). Scanning every containing
-            // root derives different root-relative external IDs for the same
-            // transcript, so retain only the deepest root per connector and
-            // source provenance. Distinct sources remain distinct scans.
-            let mut matching_roots: Vec<(ConnectorKind, &ScanRoot)> = Vec::new();
-            for (kind, root) in roots {
-                if let Some(hinted_kind) = hinted_kind
-                    && *kind != hinted_kind
+        // A connector can report nested roots for one physical store (OMP
+        // profiles are the motivating example). Scanning every containing
+        // root derives different root-relative external IDs for the same
+        // transcript, so retain only the deepest root per connector and
+        // source provenance. Distinct sources remain distinct scans.
+        let mut matching_roots: Vec<(ConnectorKind, &ScanRoot)> = Vec::new();
+        for (kind, root) in roots {
+            if let Some(hinted_kind) = hinted_kind
+                && *kind != hinted_kind
+            {
+                continue;
+            }
+            // A removed Cursor reconstruction sidecar belongs only to Cursor;
+            // otherwise a shared mirror root would wake every connector.
+            if removed_workspace_sidecar && *kind != ConnectorKind::Cursor {
+                continue;
+            }
+            if p.starts_with(&root.path)
+                || (is_devin_database_watch_root(*kind, root)
+                    && database_sidecar_paths(&root.path).contains(&p))
+            {
+                if let Some(index) =
+                    matching_roots
+                        .iter()
+                        .position(|(selected_kind, selected_root)| {
+                            *selected_kind == *kind && selected_root.origin == root.origin
+                        })
                 {
-                    continue;
-                }
-                if p.starts_with(&root.path)
-                    || (is_devin_database_watch_root(*kind, root)
-                        && database_sidecar_paths(&root.path).contains(&p))
-                {
-                    if let Some(index) =
-                        matching_roots
-                            .iter()
-                            .position(|(selected_kind, selected_root)| {
-                                *selected_kind == *kind && selected_root.origin == root.origin
-                            })
+                    if root.path.components().count()
+                        > matching_roots[index].1.path.components().count()
                     {
-                        if root.path.components().count()
-                            > matching_roots[index].1.path.components().count()
-                        {
-                            matching_roots[index].1 = root;
-                        }
-                    } else {
-                        matching_roots.push((*kind, root));
+                        matching_roots[index].1 = root;
                     }
+                } else {
+                    matching_roots.push((*kind, root));
                 }
             }
-            let matched_root = !matching_roots.is_empty();
-            for (kind, root) in matching_roots {
-                let scan_path =
-                    if prefer_explicit_paths && !is_devin_database_watch_root(kind, root) {
-                        explicit_watch_once_scan_path(kind, &p)
-                    } else {
-                        root.path.clone()
-                    };
-                let mut scan_root = root.clone();
-                scan_root.path = scan_path.clone();
-                let key = (
-                    kind,
+        }
+        let matched_root = !matching_roots.is_empty();
+        for (kind, root) in matching_roots {
+            let scan_path = if prefer_explicit_paths && !is_devin_database_watch_root(kind, root) {
+                explicit_watch_once_scan_path(kind, &p)
+            } else {
+                root.path.clone()
+            };
+            let mut scan_root = root.clone();
+            scan_root.path = scan_path.clone();
+            let key = (
+                kind,
+                scan_root.origin.kind,
+                scan_root.origin.source_id.clone(),
+                scan_root.origin.host.clone(),
+                scan_path,
+            );
+            let entry = batch_map.entry(key).or_insert((scan_root, None, None));
+
+            // Update MinTS (for scan window start). A removed sidecar uses the
+            // sentinel so watch_scan_lower_bound can request an uncapped scan.
+            entry.1 = Some(entry.1.map_or(ts, |prev| prev.min(ts)));
+
+            // Update MaxTS (for state high-water mark). A removal has no
+            // meaningful mtime, so leave the persistent event watermark alone.
+            if !removed_workspace_sidecar {
+                entry.2 = Some(entry.2.map_or(ts, |prev| prev.max(ts)));
+            }
+        }
+        if prefer_explicit_paths
+            && !matched_root
+            && let Some(hinted_kind) = hinted_kind
+        {
+            let scan_path = explicit_watch_once_scan_path(hinted_kind, &p);
+            let scan_root = ScanRoot::local(scan_path.clone());
+            let entry = batch_map
+                .entry((
+                    hinted_kind,
                     scan_root.origin.kind,
                     scan_root.origin.source_id.clone(),
                     scan_root.origin.host.clone(),
                     scan_path,
-                );
-                let entry = batch_map.entry(key).or_insert((scan_root, None, None));
-
-                // Update MinTS (for scan window start)
-                entry.1 = match (entry.1, ts) {
-                    (Some(prev), Some(cur)) => Some(prev.min(cur)),
-                    (None, Some(cur)) => Some(cur),
-                    _ => entry.1,
-                };
-
-                // Update MaxTS (for state high-water mark)
-                entry.2 = match (entry.2, ts) {
-                    (Some(prev), Some(cur)) => Some(prev.max(cur)),
-                    (None, Some(cur)) => Some(cur),
-                    _ => entry.2,
-                };
-            }
-            if prefer_explicit_paths
-                && !matched_root
-                && let Some(hinted_kind) = hinted_kind
-            {
-                let scan_path = explicit_watch_once_scan_path(hinted_kind, &p);
-                let scan_root = ScanRoot::local(scan_path.clone());
-                let entry = batch_map
-                    .entry((
-                        hinted_kind,
-                        scan_root.origin.kind,
-                        scan_root.origin.source_id.clone(),
-                        scan_root.origin.host.clone(),
-                        scan_path,
-                    ))
-                    .or_insert((scan_root, None, None));
-                entry.1 = match (entry.1, ts) {
-                    (Some(prev), Some(cur)) => Some(prev.min(cur)),
-                    (None, Some(cur)) => Some(cur),
-                    _ => entry.1,
-                };
-                entry.2 = match (entry.2, ts) {
-                    (Some(prev), Some(cur)) => Some(prev.max(cur)),
-                    (None, Some(cur)) => Some(cur),
-                    _ => entry.2,
-                };
+                ))
+                .or_insert((scan_root, None, None));
+            entry.1 = Some(entry.1.map_or(ts, |prev| prev.min(ts)));
+            if !removed_workspace_sidecar {
+                entry.2 = Some(entry.2.map_or(ts, |prev| prev.max(ts)));
             }
         }
     }
@@ -29138,11 +29304,13 @@ fn watch_event_should_trigger_reindex(event: &notify::Event) -> bool {
         notify::event::EventKind::Create(_)
         | notify::event::EventKind::Any
         | notify::event::EventKind::Other => true,
-        // Incremental watch indexing is append-only today: once a path is gone,
-        // classify_paths() cannot derive a scan window from it and the ingest
-        // path cannot delete the stale conversation rows it previously indexed.
-        // Treat remove events as noise until delete-aware rebuilds exist.
-        notify::event::EventKind::Remove(_) => false,
+        // Conversation sources remain append-only, but a removed Cursor
+        // reconstruction sidecar changes the authority of existing transcripts
+        // and must trigger a Cursor rescan so attribution can become unresolved.
+        notify::event::EventKind::Remove(_) => event
+            .paths
+            .iter()
+            .any(|path| is_workspace_trust_sidecar(path)),
         notify::event::EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)) => false,
         notify::event::EventKind::Modify(_) => true,
     }
@@ -46068,6 +46236,64 @@ mod tests {
     }
 
     #[test]
+    fn final_wal_checkpoint_report_is_structured_and_fail_closed() {
+        assert!(
+            FinalWalCheckpointReport::Completed
+                .require_success("report test")
+                .is_ok()
+        );
+        assert!(
+            FinalWalCheckpointReport::NotNeeded {
+                reason: "empty input".to_string(),
+            }
+            .require_success("report test")
+            .is_ok()
+        );
+
+        let blocked = FinalWalCheckpointReport::from_attempt(
+            AbortWalCheckpointAttempt::Finished(Ok(FinalWalCheckpointOutcome::Blocked {
+                busy: 1,
+                log_frames: 289_842,
+                checkpointed_frames: 0,
+            })),
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            blocked,
+            FinalWalCheckpointReport::Blocked {
+                busy: 1,
+                log_frames: 289_842,
+                checkpointed_frames: 0,
+            }
+        );
+        assert!(blocked.require_success("report test").is_err());
+        assert_eq!(
+            serde_json::to_value(&blocked).unwrap(),
+            serde_json::json!({
+                "status": "blocked",
+                "busy": 1,
+                "log_frames": 289842,
+                "checkpointed_frames": 0,
+            })
+        );
+
+        for report in [
+            FinalWalCheckpointReport::TimedOut { timeout_secs: 1 },
+            FinalWalCheckpointReport::WorkerUnavailable {
+                error: "spawn failed".to_string(),
+            },
+            FinalWalCheckpointReport::Failed {
+                error: "checkpoint failed".to_string(),
+            },
+        ] {
+            assert!(
+                report.require_success("report test").is_err(),
+                "{report:?} must not be accepted as a successful close"
+            );
+        }
+    }
+
+    #[test]
     #[serial]
     fn non_watch_ingest_chunk_size_defaults_and_clamps() -> Result<()> {
         {
@@ -46625,6 +46851,66 @@ mod tests {
     }
 
     #[test]
+    fn devin_non_watch_scan_ignores_lossy_provider_timestamp_watermarks() -> Result<()> {
+        let temp = TempDir::new()?;
+        let storage = FrankenStorage::open(&temp.path().join("cass.db"))?;
+        storage.set_connector_last_scan_ts("devin", i64::MAX)?;
+        let factories = get_connector_factories();
+        let local_since_by_connector =
+            connector_local_scan_since_ts_map(&storage, Some(1234), &factories)?;
+
+        assert_eq!(
+            local_since_by_connector.get("devin").copied().flatten(),
+            None,
+            "Devin must re-read its SQLite/WAL source because whole-second provider timestamps cannot be bounded by millisecond scan watermarks"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_configured_roots_retain_incremental_watermarks() -> Result<()> {
+        let temp = TempDir::new()?;
+        let storage = FrankenStorage::open(&temp.path().join("cass.db"))?;
+        storage.set_connector_last_scan_ts("cursor", 9876)?;
+        let local_since_by_connector = connector_local_scan_since_ts_map(
+            &storage,
+            Some(1234),
+            &[(
+                "cursor",
+                never_constructed_connector_factory as ConnectorFactory,
+            )],
+        )?;
+        assert_eq!(
+            local_since_by_connector.get("cursor").copied().flatten(),
+            Some(9875),
+            "a saved Cursor watermark must bound the next connector scan"
+        );
+
+        let root = ScanRoot::local(PathBuf::from("/tmp/cursor-history"));
+        assert_eq!(
+            connector_explicit_scan_root_since_ts(
+                "cursor",
+                &root,
+                Path::new("/tmp/cass-data"),
+                local_since_by_connector.get("cursor").copied().flatten(),
+            ),
+            Some(9875),
+            "Cursor adapter handles sidecar-only changes without disabling root cutoffs"
+        );
+        assert_eq!(
+            connector_explicit_scan_root_since_ts(
+                "claude",
+                &root,
+                Path::new("/tmp/cass-data"),
+                Some(1234),
+            ),
+            Some(1234),
+            "other configured local connectors retain their incremental cutoff"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn configured_scan_root_watermark_policy_matches_source_kind() -> Result<()> {
         ensure_since_ts_matches(
             explicit_scan_root_since_ts(
@@ -46895,7 +47181,7 @@ mod tests {
             .execute("INSERT INTO checkpoint_probe VALUES (42);")
             .unwrap();
 
-        close_storage_after_index(storage, &db_path, "test index run").unwrap();
+        close_storage_after_index(storage, &db_path, "test index run", None).unwrap();
 
         let conn = crate::franken_sync::Connection::open(db_path_str).unwrap();
         let rows = conn.query("PRAGMA wal_checkpoint(FULL);").unwrap();
@@ -55381,6 +55667,42 @@ mod tests {
     }
 
     #[test]
+    fn classify_removed_cursor_workspace_sidecar_forces_cursor_rescan() {
+        let tmp = TempDir::new().unwrap();
+        let projects = tmp.path().join("projects");
+        let sidecar = projects.join("project/.workspace-trusted");
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+
+        let roots = vec![
+            (ConnectorKind::Cursor, ScanRoot::local(projects.clone())),
+            (
+                ConnectorKind::Claude,
+                ScanRoot::local(tmp.path().join("other")),
+            ),
+        ];
+        let classified = classify_paths(vec![sidecar], &roots, false);
+
+        assert_eq!(classified.len(), 1);
+        assert_eq!(classified[0].0, ConnectorKind::Cursor);
+        assert_eq!(classified[0].1.path, projects);
+        assert_eq!(classified[0].2, Some(WATCH_FORCE_FULL_SCAN_TS));
+        assert_eq!(
+            classified[0].3, None,
+            "a removed sidecar has no event mtime to persist"
+        );
+        assert_eq!(
+            watch_scan_lower_bound(ConnectorKind::Cursor, Some(WATCH_FORCE_FULL_SCAN_TS)),
+            None,
+            "sidecar deletion must force reconstruction of old transcripts"
+        );
+        assert_eq!(
+            watch_scan_lower_bound(ConnectorKind::Cursor, Some(1234)),
+            Some(1234),
+            "ordinary Cursor events retain their incremental cutoff"
+        );
+    }
+
+    #[test]
     fn watch_event_filter_ignores_remove_events_without_delete_support() {
         let event = notify::Event::new(notify::event::EventKind::Remove(
             notify::event::RemoveKind::File,
@@ -55389,6 +55711,20 @@ mod tests {
         assert!(
             !watch_event_should_trigger_reindex(&event),
             "remove events should be ignored until watch mode can remove stale indexed rows"
+        );
+    }
+
+    #[test]
+    fn watch_event_filter_keeps_cursor_workspace_sidecar_removals() {
+        let event = notify::Event::new(notify::event::EventKind::Remove(
+            notify::event::RemoveKind::File,
+        ))
+        .add_path(PathBuf::from(
+            "/tmp/.cursor/projects/project/.workspace-trusted",
+        ));
+        assert!(
+            watch_event_should_trigger_reindex(&event),
+            "removing a Cursor workspace sidecar changes existing attribution"
         );
     }
 

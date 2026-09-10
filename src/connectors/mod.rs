@@ -269,6 +269,10 @@ fn codex_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(codex::CodexConnector::new())
 }
 
+fn cursor_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(cursor::CursorConnector::new())
+}
+
 fn omp_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(omp::OmpConnector::new())
 }
@@ -280,7 +284,9 @@ fn pi_agent_connector_factory() -> Box<dyn Connector + Send> {
 /// Return connector factories with CASS-specific wrappers applied.
 ///
 /// Codex passes through CASS's enrichment wrapper so modern `function_call`
-/// arguments reach the production indexer. OMP passes through its profile
+/// arguments reach the production indexer. Cursor passes through the
+/// `.workspace-trusted` authority adapter while registry 0.2.3 remains pinned.
+/// OMP passes through its profile
 /// provenance adapter, and Pi Agent passes through the OMP identity boundary
 /// that prevents broad explicit roots from indexing the same store twice.
 #[must_use]
@@ -291,6 +297,7 @@ pub fn get_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
             let factory = match name {
                 "claude" => claude_connector_factory as ConnectorFactory,
                 "codex" => codex_connector_factory as ConnectorFactory,
+                "cursor" => cursor_connector_factory as ConnectorFactory,
                 "omp" => omp_connector_factory as ConnectorFactory,
                 "pi_agent" => pi_agent_connector_factory as ConnectorFactory,
                 _ => factory,

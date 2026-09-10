@@ -20859,6 +20859,16 @@ mod index_error_mapping_tests {
     }
 }
 
+fn add_index_final_wal_checkpoint_payload(
+    payload: &mut serde_json::Value,
+    progress: &indexer::IndexingProgress,
+) {
+    payload["final_wal_checkpoint"] = progress
+        .final_wal_checkpoint_report()
+        .and_then(|report| serde_json::to_value(report).ok())
+        .unwrap_or_else(|| serde_json::json!({"status": "not_reported"}));
+}
+
 fn cli_error_json_payload(err: &CliError, elapsed_ms: u128) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "success": false,
@@ -105687,6 +105697,7 @@ fn run_index_with_data(
         );
         if let Some(fmt) = structured_format {
             let mut payload = cli_error_json_payload(err, elapsed_ms);
+            add_index_final_wal_checkpoint_payload(&mut payload, &index_progress);
             if let Some(active_index) = &active_index_error {
                 payload["active_index"] = active_index.to_json();
             }
@@ -105749,6 +105760,7 @@ fn run_index_with_data(
             "quarantined_conversations": quarantined_conversations,
             "lexical_update_deferred": lexical_update_deferred,
         });
+        add_index_final_wal_checkpoint_payload(&mut payload, &index_progress);
 
         // Add structured indexing stats if available (T7.4)
         if let Ok(stats) = index_progress.stats.lock()

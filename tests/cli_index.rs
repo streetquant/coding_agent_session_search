@@ -106,8 +106,8 @@ fn index_creates_db_and_index() {
     assert!(index_path.exists(), "index dir created");
 }
 
-/// Requires the GH459 FAD parser revision. A registry-0.2.3 run must fail this
-/// acceptance check; an unpublished dependency overlay is not release proof.
+/// Requires `.workspace-trusted` authority semantics. The CASS adapter must
+/// preserve this contract while the upstream parser fix awaits a registry release.
 #[test]
 fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
     use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
@@ -1282,6 +1282,11 @@ fn index_json_reports_full_refresh_lexical_strategy() {
 
     let payload: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("valid JSON output");
+    assert_eq!(
+        payload["final_wal_checkpoint"]["status"].as_str(),
+        Some("completed"),
+        "successful index JSON must report completed final WAL checkpoint: {payload}"
+    );
     let stats = payload
         .get("indexing_stats")
         .and_then(|value| value.as_object())
@@ -1346,6 +1351,11 @@ fn index_json_reports_repeat_full_refresh_strategy_on_populated_canonical_db() {
 
     let payload: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("valid JSON output");
+    assert_eq!(
+        payload["final_wal_checkpoint"]["status"].as_str(),
+        Some("completed"),
+        "successful index JSON must report completed final WAL checkpoint: {payload}"
+    );
     let stats = payload
         .get("indexing_stats")
         .and_then(|value| value.as_object())
@@ -1441,6 +1451,11 @@ fn repeat_full_json_preserves_exact_totals_when_noop_scan_underreports() {
 
     let payload: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("valid JSON output");
+    assert_eq!(
+        payload["final_wal_checkpoint"]["status"].as_str(),
+        Some("completed"),
+        "successful repeat full index JSON must report completed final WAL checkpoint: {payload}"
+    );
     let stats = payload
         .get("indexing_stats")
         .and_then(|value| value.as_object())
@@ -1664,6 +1679,11 @@ fn index_json_reports_incremental_lexical_strategy() {
 
     let payload: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("valid JSON output");
+    assert_eq!(
+        payload["final_wal_checkpoint"]["status"].as_str(),
+        Some("completed"),
+        "successful incremental index JSON must report completed final WAL checkpoint: {payload}"
+    );
     let stats = payload
         .get("indexing_stats")
         .and_then(|value| value.as_object())
@@ -2967,18 +2987,18 @@ fn gh439_slow_post_publish_fts_repair_is_not_aborted_while_it_heartbeats() {
     );
 }
 
-/// GH #382 / g3zyo: the index run's final `wal_checkpoint(TRUNCATE)` is bounded.
+/// GH #382 / g3zyo: the index run's final WAL checkpoint is bounded.
 /// On an archive whose frankensqlite writable path loops, that checkpoint never
-/// returned and every run hung after a successful publish. Positive observable:
-/// with the checkpoint parked past a 1 s budget the run still exits 0 within
-/// seconds and leaves the WAL sidecar in place (non-empty) for the next opener;
-/// a plain `cass index` afterwards, unparked, truncates it. Planted negative:
-/// the unparked run truncating the sidecar is what proves the parked run really
-/// skipped the checkpoint rather than never issuing one. No-claim: this proves
-/// the bound, not that the engine no longer loops (that is frankensqlite
-/// 8d012706a, consumed with its release).
+/// returned and every run hung after a successful publish. With the checkpoint
+/// parked past a 1 s budget, the run must fail truthfully within seconds, emit a
+/// timed-out final-WAL result, and leave the WAL sidecar in place for the next
+/// opener. A plain cass index afterwards, unparked, succeeds and truncates it.
+/// Planted negative: the unparked run truncating the sidecar proves the parked
+/// run really issued the checkpoint and left its failure state retryable. No-claim:
+/// this proves the bound, not that the engine no longer loops (that is
+/// frankensqlite 8d012706a, consumed with its release).
 #[test]
-fn gh382_final_wal_checkpoint_is_bounded_and_leaves_the_wal_for_the_next_run() {
+fn gh382_final_wal_checkpoint_is_bounded_and_reported_without_success() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path();
     let data_dir = home.join("cass_data");
@@ -3011,10 +3031,26 @@ fn gh382_final_wal_checkpoint_is_bounded_and_leaves_the_wal_for_the_next_run() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        output.status.success(),
-        "a final checkpoint that outlives its budget must not fail the run (GH #382); \
-         status={:?}\nstdout={stdout}\nstderr={stderr}",
+        !output.status.success(),
+        "a final checkpoint that outlives its budget must fail truthfully (GH #382); status={:?}\nstdout={stdout}\nstderr={stderr}",
         output.status
+    );
+    let parked_payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("timed-out index must emit JSON");
+    assert_eq!(
+        parked_payload["success"].as_bool(),
+        Some(false),
+        "timed-out index JSON must report failure: {parked_payload}"
+    );
+    assert_eq!(
+        parked_payload["final_wal_checkpoint"]["status"].as_str(),
+        Some("timed_out"),
+        "timed-out index JSON must expose the final-WAL outcome: {parked_payload}"
+    );
+    assert_eq!(
+        parked_payload["final_wal_checkpoint"]["timeout_secs"].as_u64(),
+        Some(1),
+        "timed-out index JSON must expose its configured budget: {parked_payload}"
     );
     let parked_elapsed = elapsed;
     // A WAL that still carries frames is larger than its 32-byte header; a
@@ -3040,6 +3076,18 @@ fn gh382_final_wal_checkpoint_is_bounded_and_leaves_the_wal_for_the_next_run() {
         output.status.success(),
         "the next plain run must succeed: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    let plain_payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("plain index must emit JSON");
+    assert_eq!(
+        plain_payload["success"].as_bool(),
+        Some(true),
+        "the retrying index must report success: {plain_payload}"
+    );
+    assert_eq!(
+        plain_payload["final_wal_checkpoint"]["status"].as_str(),
+        Some("completed"),
+        "the retrying index must report completed final WAL checkpoint: {plain_payload}"
     );
     // The bound, measured against the same worker's load: a run that waited
     // for the 60 s park would take at least the plain run plus 60 s; a
