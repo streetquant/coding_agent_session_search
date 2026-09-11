@@ -106317,6 +106317,39 @@ fn path_exists_or_virtual_opencode_sqlite_session(path: &Path, allow_direct_file
     path.exists() || (allow_direct_file && detect_opencode_sqlite_session(path))
 }
 
+fn validate_opencode_sqlite_db_header(path: &Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+
+    let metadata = path
+        .metadata()
+        .with_context(|| format!("inspect OpenCode database {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "OpenCode database {} is not a regular file",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() >= SQLITE_HEADER.len() as u64,
+        "OpenCode database {} is too small to contain a SQLite header",
+        path.display()
+    );
+
+    let mut file =
+        File::open(path).with_context(|| format!("open OpenCode database {}", path.display()))?;
+    let mut header = [0_u8; SQLITE_HEADER.len()];
+    file.read_exact(&mut header)
+        .with_context(|| format!("read OpenCode database header {}", path.display()))?;
+    anyhow::ensure!(
+        &header == SQLITE_HEADER,
+        "OpenCode database {} has an invalid SQLite header",
+        path.display()
+    );
+
+    Ok(())
+}
+
 /// Load an OpenCode session from the SQLite database for export.
 ///
 /// `path` is expected to be `<dir>/opencode.db/<url-encoded-session-id>`.
@@ -106339,6 +106372,7 @@ fn load_opencode_sqlite_session_for_export(
     let session_id =
         urlencoding::decode(&session_id_encoded).unwrap_or_else(|_| session_id_encoded.clone());
     let db_path = path.parent().context("missing parent db path")?;
+    validate_opencode_sqlite_db_header(db_path)?;
 
     use franken_agent_detection::connectors::Connector;
     let connector = franken_agent_detection::OpenCodeConnector::new();
@@ -109788,12 +109822,100 @@ mod opencode_export_tests {
 mod export_timestamp_tests {
     use super::{
         extract_message_timestamp, format_export_duration, publish_unique_export_output_file,
-        run_export_html, write_unique_export_output_file,
+        run_export_html, validate_opencode_sqlite_db_header, write_unique_export_output_file,
     };
     use serde_json::json;
+    #[cfg(unix)]
+    use serial_test::serial;
+    #[cfg(unix)]
+    use std::ffi::OsString;
     use std::fs;
     use std::io::Write;
+    #[cfg(unix)]
+    use std::path::Path;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    struct TestEnvironmentGuard {
+        previous: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    #[cfg(unix)]
+    impl TestEnvironmentGuard {
+        fn new(keys: &[&'static str]) -> Self {
+            Self {
+                previous: keys
+                    .iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            }
+        }
+
+        fn set(&self, key: &'static str, value: &std::ffi::OsStr) {
+            // SAFETY: callers hold the serial-test lock for the duration of the
+            // environment-sensitive test, so no sibling test observes a
+            // partially modified process environment.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TestEnvironmentGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.previous {
+                match value {
+                    Some(value) => {
+                        // SAFETY: restoration runs while the serial test
+                        // is still held.
+                        unsafe {
+                            std::env::set_var(key, value);
+                        }
+                    }
+                    None => {
+                        // SAFETY: restoration runs while the serial test
+                        // is still held.
+                        unsafe {
+                            std::env::remove_var(key);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn set_access_time_to_epoch(path: &Path) {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = fs::metadata(path).expect("read probe database metadata");
+        let file = fs::File::open(path).expect("open probe database for timestamp setup");
+        let times = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: metadata.mtime() as libc::time_t,
+                tv_nsec: metadata.mtime_nsec() as libc::c_long,
+            },
+        ];
+        // SAFETY: file is an open descriptor for path, and times points to two
+        // valid timespec values for the duration of this call.
+        let rc = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
+        assert_eq!(rc, 0, "reset access time for {}", path.display());
+    }
+
+    #[cfg(unix)]
+    fn create_probe_sqlite_db(path: &Path) {
+        let conn = rusqlite::Connection::open(path).expect("create probe SQLite database");
+        conn.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY);")
+            .expect("create probe SQLite schema");
+        drop(conn);
+        set_access_time_to_epoch(path);
+    }
 
     #[test]
     fn extract_message_timestamp_parses_multiple_shapes() {
@@ -110037,6 +110159,162 @@ mod export_timestamp_tests {
         .expect_err("invalid virtual sqlite session should fail after path acceptance");
 
         assert_eq!(err.kind, "opencode-sqlite-parse");
+        assert!(
+            err.message.contains("too small to contain a SQLite header"),
+            "expected header preflight error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn export_html_maps_short_or_mismatched_opencode_db_to_parse_error() {
+        let temp = TempDir::new().expect("temp dir");
+
+        for (name, bytes, expected_message) in [
+            (
+                "short",
+                b"".as_slice(),
+                "too small to contain a SQLite header",
+            ),
+            (
+                "mismatch",
+                b"not a sqlite database".as_slice(),
+                "invalid SQLite header",
+            ),
+        ] {
+            let db_path = temp.path().join(format!("{name}.db"));
+            fs::write(&db_path, bytes).expect("write malformed database");
+            let session_path = db_path.join("session-1");
+
+            let err = run_export_html(
+                &session_path,
+                None,
+                None,
+                Some(temp.path()),
+                Some("out.html"),
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                "system",
+                false,
+                false,
+                false,
+                None,
+            )
+            .expect_err("malformed virtual SQLite session should fail");
+
+            assert_eq!(err.kind, "opencode-sqlite-parse");
+            assert!(
+                err.message.contains(expected_message),
+                "unexpected malformed-database error: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_sqlite_header_preflight_accepts_live_wal_database() {
+        let temp = TempDir::new().expect("temp dir");
+        let db_path = temp.path().join("opencode.db");
+        let conn = rusqlite::Connection::open(&db_path).expect("create WAL database");
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .expect("enable WAL mode");
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY);
+             INSERT INTO session (id) VALUES ('wal-session');",
+        )
+        .expect("write WAL-backed database");
+
+        let wal_path = db_path.with_extension("db-wal");
+        assert!(
+            wal_path.is_file(),
+            "SQLite should retain a live WAL sidecar while the connection is open"
+        );
+        validate_opencode_sqlite_db_header(&db_path)
+            .expect("valid SQLite main header should pass with a live WAL sidecar");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn invalid_explicit_opencode_db_skips_home_and_xdg_database_discovery() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = TempDir::new().expect("temp dir");
+        let home = temp.path().join("home");
+        let xdg_data = temp.path().join("xdg-data");
+        let xdg_config = temp.path().join("xdg-config");
+
+        let default_db_paths = [
+            home.join(".local/share/opencode/opencode.db"),
+            home.join(".config/opencode/opencode.db"),
+            xdg_data.join("opencode/opencode.db"),
+            xdg_config.join("opencode/opencode.db"),
+        ];
+        for db_path in &default_db_paths {
+            if let Some(parent) = db_path.parent() {
+                fs::create_dir_all(parent).expect("create default database directory");
+            }
+            create_probe_sqlite_db(db_path);
+        }
+
+        let explicit_db = temp.path().join("explicit/opencode.db");
+        fs::create_dir_all(explicit_db.parent().expect("explicit database parent"))
+            .expect("create explicit database directory");
+        fs::write(&explicit_db, b"not a sqlite db").expect("write invalid explicit database");
+        let session_path = explicit_db.join("session-1");
+
+        let environment = TestEnvironmentGuard::new(&[
+            "HOME",
+            "XDG_DATA_HOME",
+            "XDG_CONFIG_HOME",
+            "OPENCODE_SQLITE_DB",
+        ]);
+        environment.set("HOME", home.as_os_str());
+        environment.set("XDG_DATA_HOME", xdg_data.as_os_str());
+        environment.set("XDG_CONFIG_HOME", xdg_config.as_os_str());
+        environment.set("OPENCODE_SQLITE_DB", std::ffi::OsStr::new(""));
+
+        let err = run_export_html(
+            &session_path,
+            None,
+            None,
+            Some(temp.path()),
+            Some("out.html"),
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            "system",
+            false,
+            false,
+            false,
+            None,
+        )
+        .expect_err("invalid explicit SQLite database should fail before discovery");
+
+        assert_eq!(err.kind, "opencode-sqlite-parse");
+        assert!(
+            err.message.contains("too small to contain a SQLite header"),
+            "expected invalid-header error, got: {}",
+            err.message
+        );
+
+        for db_path in &default_db_paths {
+            assert_eq!(
+                fs::metadata(db_path)
+                    .expect("read default database metadata")
+                    .atime(),
+                0,
+                "default database was read despite invalid explicit database: {}",
+                db_path.display()
+            );
+        }
     }
 }
 
