@@ -1,7 +1,7 @@
 //! Tests for the OpenCode connector (JSON file-based storage)
 
 use coding_agent_search::connectors::opencode::OpenCodeConnector;
-use coding_agent_search::connectors::{Connector, ScanContext, ScanRoot};
+use coding_agent_search::connectors::{Connector, Origin, ScanContext, ScanRoot};
 use coding_agent_search::franken_sync::Connection;
 use coding_agent_search::franken_sync::compat::ConnectionExt;
 use coding_agent_search::franken_sync::params;
@@ -83,10 +83,19 @@ fn create_test_storage(dir: &std::path::Path, sessions: &[TestSession]) -> std::
 }
 
 /// Build a fixture-only context so connector tests never fall back to the host's
-/// default OpenCode database. An explicit root keeps each test hermetic even
-/// when the test runner inherits a populated HOME/XDG profile.
+/// default OpenCode database. The remote fixture origin suppresses the
+/// connector's intentional local default-database fallback, keeping each test
+/// hermetic even when the runner inherits a populated HOME/XDG profile.
 fn fixture_context(data_dir: PathBuf) -> ScanContext {
-    ScanContext::with_roots(data_dir.clone(), vec![ScanRoot::local(data_dir)], None)
+    ScanContext::with_roots(
+        data_dir.clone(),
+        vec![ScanRoot::remote(
+            data_dir,
+            Origin::remote("cass-test-fixture"),
+            None,
+        )],
+        None,
+    )
 }
 
 struct TestSession {
