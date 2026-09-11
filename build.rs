@@ -128,7 +128,7 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "franken-agent-detection",
         crate_package_name: "franken-agent-detection",
         manifest_package_field: None,
-        // GH#416: registry pin. crates.io 0.2.3 (2026-09-07) probes the
+        // GH#416: registry pin. crates.io 0.2.4 retains the 0.2.3 fixes and
         // Antigravity IDE store as well as the agy CLI store (cass#454),
         // honors CLAUDE_CONFIG_DIR/XDG_CONFIG_HOME for Claude Code (cass#448),
         // and carries the Codex token-usage, Claude tool-result, Cursor/OpenCode
@@ -136,11 +136,12 @@ const CONTRACTS: &[DependencyContract] = &[
         // (upstream tag f19e7e0) cursor/antigravity/grok scan-root scoping and
         // aider/copilot-cli/amp/opencode/clawdbot/muse session-loss fixes.
         // The Shelley connector, FAD#22 source-boundary seam, and the
-        // chatgpt/omp injection seams are published in 0.2.3.
+        // chatgpt/omp injection seams are published in 0.2.3; 0.2.4 adds the
+        // legacy Copilot CLI workspacePath alias needed by history JSON.
         // crates.io refuses git dependencies, hence version-only.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.2.3",
+        expected_version: "0.2.4",
         expected_features: &[
             "chatgpt",
             "connectors",
