@@ -128,6 +128,7 @@ fn isolated_search_demo_data() -> Result<TempDir, Box<dyn Error>> {
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(&snapshot_lock_path)?;
     snapshot_lock.lock_shared()?;
 
