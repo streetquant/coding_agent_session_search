@@ -28,20 +28,13 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ---
 
-## Git Branch: ONLY Use `main`, NEVER `master`
+## Git Branch: ONLY Use `main`
 
-**The default branch is `main`. The `master` branch exists only for legacy URL compatibility.**
+**The default and only supported branch is `main`; this repository has no legacy `master` branch or mirror.**
 
-- **All work happens on `main`** — commits, PRs, feature branches all merge to `main`
-- **Never reference `master` in code or docs** — if you see `master` anywhere, it's a bug that needs fixing
-- **The `master` branch must stay synchronized with `main`** — after pushing to `main`, also push to `master`:
-  ```bash
-  git push origin main:master
-  ```
-
-**If you see `master` referenced anywhere:**
-1. Update it to `main`
-2. Ensure `master` is synchronized: `git push origin main:master`
+- **All work happens on `main`** — commits, PRs, and feature branches merge to `main`.
+- **Use `main` on both remotes** — `origin/main` is the upstream ref and `fork/main` is the fork ref; fetch, track, and push `main` only.
+- **Do not create, push, or synchronize a legacy `master` ref.** If an old `master` reference appears in code or docs, replace it with `main`.
 
 ---
 
