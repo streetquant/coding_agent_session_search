@@ -21674,6 +21674,31 @@ fn state_meta_json_inner(
     } else {
         None
     };
+    // #441: the published MANIFEST is the cheap, query-facing segment count;
+    // unlike the disk-file upper bound above it excludes merge-retired inputs
+    // that are still inside Quill's grace period.  The merge receipt is
+    // likewise metadata-only and survives the writer process, so status and
+    // health can report the last CASS-owned consolidation without opening the
+    // engine or inventing a timestamp for an older index.
+    let lexical_segment_count: Option<u64> = if lexical.exists {
+        crate::search::quill_bridge::manifest_live_doc_count(&index_path)
+            .map(|manifest| u64::try_from(manifest.segments).unwrap_or(u64::MAX))
+    } else {
+        None
+    };
+    let lexical_last_merge_at = if lexical.exists {
+        crate::search::quill_bridge::last_merge_timestamp(&index_path)
+            .and_then(format_timestamp_millis_rfc3339)
+    } else {
+        None
+    };
+    let lexical_segment_pressure = lexical_segment_count.map(|count| {
+        serde_json::json!({
+            "active": count > crate::search::quill_bridge::CASS_SEGMENT_PRESSURE_FILES as u64,
+            "count": count,
+            "threshold": crate::search::quill_bridge::CASS_SEGMENT_PRESSURE_FILES,
+        })
+    });
     let index_empty_with_messages = index_doc_count
         .map(|docs| docs == 0 && message_count > 0)
         .unwrap_or(false);
@@ -21945,6 +21970,29 @@ fn state_meta_json_inner(
                 "consecutive_runs": runs,
                 "reason": lexical_repair_deferred_reason,
             }),
+        );
+    }
+    // #441: expose the live segment and merge-pressure evidence once a
+    // published Quill index exists.  Keeping these fields absent for an
+    // uninitialized archive preserves the compact no-index status/health
+    // shape, while every initialized archive gets the query-facing count,
+    // durable last-merge timestamp, and threshold verdict.
+    if lexical.exists
+        && let Some(index) = state
+            .get_mut("index")
+            .and_then(|value| value.as_object_mut())
+    {
+        index.insert(
+            "lexical_segment_count".to_string(),
+            serde_json::to_value(lexical_segment_count).unwrap_or(serde_json::Value::Null),
+        );
+        index.insert(
+            "lexical_last_merge_at".to_string(),
+            serde_json::to_value(lexical_last_merge_at).unwrap_or(serde_json::Value::Null),
+        );
+        index.insert(
+            "segment_pressure".to_string(),
+            serde_json::to_value(lexical_segment_pressure).unwrap_or(serde_json::Value::Null),
         );
     }
     state
@@ -88955,6 +89003,21 @@ pub(crate) fn run_doctor_impl(
                             ),
                             true
                         );
+                        // Retain the established `index_segments` check for
+                        // compatibility while exposing the explicit #441
+                        // pressure finding requested by the observation
+                        // contract.  It is emitted only when the live (or
+                        // conservative file-count fallback) is over the
+                        // threshold, so bounded indexes do not gain a noisy
+                        // second pass row.
+                        add_check!(
+                            "segment_pressure",
+                            "warn",
+                            format!(
+                                "Lexical segment pressure is active: {segments} {unit} exceeds the pressure threshold {pressure}; run `cass index` for incremental consolidation"
+                            ),
+                            true
+                        );
                     } else {
                         add_check!(
                             "index_segments",
@@ -94611,6 +94674,16 @@ fn response_schema_index_state() -> serde_json::Value {
             "live_documents": { "type": ["integer", "null"] },
             "hollow": { "type": "boolean" },
             "segment_files": { "type": ["integer", "null"] },
+            "lexical_segment_count": { "type": ["integer", "null"] },
+            "lexical_last_merge_at": { "type": ["string", "null"] },
+            "segment_pressure": {
+                "type": ["object", "null"],
+                "properties": {
+                    "active": { "type": "boolean" },
+                    "count": { "type": "integer" },
+                    "threshold": { "type": "integer" }
+                }
+            },
             "empty_with_messages": { "type": "boolean" },
             "quarantined_conversations": { "type": "integer" },
             "fingerprint": {

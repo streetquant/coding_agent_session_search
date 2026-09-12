@@ -3612,6 +3612,289 @@ fn gh441_plain_index_consolidates_a_fragmented_generation_and_doctor_reports_it(
     );
 }
 
+/// GH #441 acceptance: exercise the reporter-shaped fuel boundary with a
+/// disposable 801-segment generation, then prove the ordinary incremental
+/// maintenance path removes the pressure without a destructive rebuild.
+///
+/// The negative query is intentionally the seven-word stopword-heavy query
+/// from the issue.  It must fail truthfully while maintenance is disabled,
+/// including the operator hint and the configured fuel variable.  After one
+/// ordinary `cass index` run, the same query must succeed under the default
+/// fuel budget; a high process-level override is also checked before that
+/// maintenance run to prove the new binary reads `CASS_QUILL_QUERY_FUEL_BUDGET`.
+#[test]
+fn gh441_801_segment_query_fuel_boundary_and_incremental_repair() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let codex_root = home.join(".codex");
+    let fragmented_sessions = 801_usize;
+    let query = "how did we fix the studio slack attachments";
+
+    for n in 0..fragmented_sessions {
+        make_codex_session(
+            &codex_root,
+            "2026/09/02",
+            &format!("rollout-fuel-{n}.jsonl"),
+            &format!("{query} fragmentprobe session {n}"),
+        );
+    }
+
+    let fragment = base_cmd(home)
+        .current_dir(home)
+        .args([
+            "index",
+            "--full",
+            "--json",
+            "--no-progress-events",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_TEST_SKIP_POST_RUN_LEXICAL_MAINTENANCE", "1")
+        .env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "1")
+        .env(
+            "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
+            "1",
+        )
+        .env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS", "1")
+        .env(
+            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS",
+            "1",
+        )
+        .output()
+        .expect("801-segment fragmenting full index");
+    assert!(
+        fragment.status.success(),
+        "fragmenting build failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&fragment.stdout),
+        String::from_utf8_lossy(&fragment.stderr)
+    );
+
+    let status = base_cmd(home)
+        .current_dir(home)
+        .args(["status", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .output()
+        .expect("status after fragmenting build");
+    assert!(status.status.success(), "status failed: {status:?}");
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).unwrap_or_else(|err| {
+            panic!(
+                "status json: {err}\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&status.stdout),
+                String::from_utf8_lossy(&status.stderr)
+            )
+        });
+    let segment_count = status_json["index"]["lexical_segment_count"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("live lexical segment count missing: {status_json}"));
+    assert!(
+        segment_count > 32,
+        "fixture must remain above the pressure threshold: {status_json}"
+    );
+    assert_eq!(status_json["index"]["segment_pressure"]["active"], true);
+    assert_eq!(
+        status_json["index"]["lexical_last_merge_at"],
+        serde_json::Value::Null
+    );
+
+    let health = base_cmd(home)
+        .current_dir(home)
+        .args(["health", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .output()
+        .expect("health after fragmenting build");
+    assert!(health.status.success(), "health failed: {health:?}");
+    let health_json: serde_json::Value =
+        serde_json::from_slice(&health.stdout).unwrap_or_else(|err| {
+            panic!(
+                "health json: {err}\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&health.stdout),
+                String::from_utf8_lossy(&health.stderr)
+            )
+        });
+    assert_eq!(
+        health_json["index"]["lexical_segment_count"],
+        serde_json::json!(segment_count)
+    );
+    assert_eq!(health_json["index"]["segment_pressure"]["active"], true);
+
+    let doctor = base_cmd(home)
+        .current_dir(home)
+        .args(["doctor", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .output()
+        .expect("doctor after fragmenting build");
+    let doctor_json: serde_json::Value =
+        serde_json::from_slice(&doctor.stdout).unwrap_or_else(|err| {
+            panic!(
+                "doctor json: {err}\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&doctor.stdout),
+                String::from_utf8_lossy(&doctor.stderr)
+            )
+        });
+    let pressure_check = doctor_json["checks"]
+        .as_array()
+        .and_then(|checks| {
+            checks
+                .iter()
+                .find(|check| check["name"].as_str() == Some("segment_pressure"))
+        })
+        .unwrap_or_else(|| panic!("segment_pressure check missing: {doctor_json}"));
+    assert_eq!(pressure_check["status"], "warn");
+    assert_eq!(pressure_check["fix_available"], true);
+
+    let exhausted = base_cmd(home)
+        .current_dir(home)
+        .args([
+            "search",
+            query,
+            "--json",
+            "--limit",
+            "3",
+            "--mode",
+            "lexical",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .output()
+        .expect("fuel-bound lexical query");
+    assert!(
+        !exhausted.status.success(),
+        "fragmented fixture unexpectedly answered under default fuel: stdout={} stderr={}",
+        String::from_utf8_lossy(&exhausted.stdout),
+        String::from_utf8_lossy(&exhausted.stderr)
+    );
+    let exhausted_output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&exhausted.stdout),
+        String::from_utf8_lossy(&exhausted.stderr)
+    );
+    assert!(
+        exhausted_output.contains("query fuel exhausted"),
+        "fuel exhaustion must remain typed and visible: {exhausted_output}"
+    );
+    assert!(
+        exhausted_output.contains("CASS_QUILL_QUERY_FUEL_BUDGET"),
+        "fuel exhaustion must name the configured override: {exhausted_output}"
+    );
+
+    let override_query = base_cmd(home)
+        .current_dir(home)
+        .args([
+            "search",
+            query,
+            "--json",
+            "--limit",
+            "3",
+            "--mode",
+            "lexical",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_QUILL_QUERY_FUEL_BUDGET", "100_000_000")
+        .output()
+        .expect("fuel override lexical query");
+    assert!(
+        override_query.status.success(),
+        "fuel override must be honored by the binary: stdout={} stderr={}",
+        String::from_utf8_lossy(&override_query.stdout),
+        String::from_utf8_lossy(&override_query.stderr)
+    );
+    let override_json: serde_json::Value = serde_json::from_slice(&override_query.stdout)
+        .unwrap_or_else(|err| panic!("override search json: {err}: {override_query:?}"));
+    assert!(
+        override_json["hits"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty()),
+        "fuel override should return lexical hits: {override_json}"
+    );
+
+    // Add one late source so the ordinary incremental path definitely runs
+    // post-run maintenance; no full rebuild or destructive replacement is
+    // involved in this repair.
+    make_codex_session(
+        &codex_root,
+        "2026/09/02",
+        "rollout-fuel-late.jsonl",
+        &format!("{query} fragmentprobe late"),
+    );
+    let consolidate = base_cmd(home)
+        .current_dir(home)
+        .args(["index", "--json", "--no-progress-events", "--data-dir"])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .output()
+        .expect("incremental consolidation");
+    assert!(
+        consolidate.status.success(),
+        "incremental consolidation failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&consolidate.stdout),
+        String::from_utf8_lossy(&consolidate.stderr)
+    );
+
+    let repaired_status = base_cmd(home)
+        .current_dir(home)
+        .args(["status", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .output()
+        .expect("status after incremental consolidation");
+    let repaired_json: serde_json::Value = serde_json::from_slice(&repaired_status.stdout)
+        .unwrap_or_else(|err| panic!("repaired status json: {err}: {repaired_status:?}"));
+    let repaired_count = repaired_json["index"]["lexical_segment_count"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("repaired live segment count missing: {repaired_json}"));
+    assert!(
+        repaired_count <= 32,
+        "incremental maintenance must consolidate live segments: {repaired_json}"
+    );
+    assert_eq!(repaired_json["index"]["segment_pressure"]["active"], false);
+    assert!(
+        repaired_json["index"]["lexical_last_merge_at"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "successful maintenance must leave durable merge evidence: {repaired_json}"
+    );
+
+    let repaired_query = base_cmd(home)
+        .current_dir(home)
+        .args([
+            "search",
+            query,
+            "--json",
+            "--limit",
+            "3",
+            "--mode",
+            "lexical",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .output()
+        .expect("consolidated lexical query");
+    assert!(
+        repaired_query.status.success(),
+        "consolidated query must succeed under default fuel: stdout={} stderr={}",
+        String::from_utf8_lossy(&repaired_query.stdout),
+        String::from_utf8_lossy(&repaired_query.stderr)
+    );
+    let repaired_query_json: serde_json::Value = serde_json::from_slice(&repaired_query.stdout)
+        .unwrap_or_else(|err| panic!("repaired query json: {err}: {repaired_query:?}"));
+    assert!(
+        repaired_query_json["hits"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty()),
+        "consolidated query should return hits: {repaired_query_json}"
+    );
+}
+
 /// GH #453: after the maintenance merge folds a generation, the folded
 /// segment files stay on disk until the engine's grace-period sweep has seen
 /// them unreferenced by both MANIFEST slots; back-to-back incremental runs

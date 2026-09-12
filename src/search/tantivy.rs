@@ -1612,9 +1612,7 @@ impl TantivyIndex {
     /// Force immediate segment merge and wait for completion.
     /// Use sparingly - blocks until merge finishes.
     pub fn force_merge(&mut self) -> Result<()> {
-        self.inner.force_merge()?;
-        self.inner.note_merged(now_unix_millis());
-        Ok(())
+        self.inner.force_merge()
     }
 
     pub fn merge_compatible_index_directories<P: AsRef<Path>>(

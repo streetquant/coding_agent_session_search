@@ -404,11 +404,71 @@ pub fn open_cass_reader(path: &Path) -> Result<QuillSearchIndex> {
 const QUILL_SEGMENT_FILE_PREFIX: &str = "seg-";
 const QUILL_SEGMENT_FILE_SUFFIX: &str = ".fslx";
 
+/// Durable receipt written after a successful CASS-owned merge.
+///
+/// Quill's MANIFEST records publication time, but a publication can be a
+/// normal ingest commit as well as a merge.  Keeping the merge timestamp in a
+/// tiny sidecar lets the observation surfaces distinguish those events after
+/// the writer process exits.  The receipt is deliberately outside the engine
+/// manifest: older indexes remain readable and report `null` until this
+/// binary performs a merge.
+pub const QUILL_MERGE_RECEIPT: &str = ".cass-lexical-merge.json";
+const QUILL_MERGE_RECEIPT_VERSION: u32 = 1;
+
+/// Read the timestamp of the last CASS-owned lexical merge.
+///
+/// A missing, malformed, or non-positive receipt is unknown rather than an
+/// invented epoch.  Status and health therefore remain truthful for indexes
+/// created by an older binary or for a merge whose process died before the
+/// receipt could be published.
+#[must_use]
+pub fn last_merge_timestamp(path: &Path) -> Option<i64> {
+    let bytes = std::fs::read(path.join(QUILL_MERGE_RECEIPT)).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    (value.get("version").and_then(serde_json::Value::as_u64)
+        == Some(u64::from(QUILL_MERGE_RECEIPT_VERSION)))
+    .then(|| {
+        value
+            .get("last_merge_at_ms")
+            .and_then(serde_json::Value::as_i64)
+    })
+    .flatten()
+    .filter(|timestamp| *timestamp > 0)
+}
+
+fn write_last_merge_timestamp(path: &Path, timestamp: i64) -> Result<()> {
+    if timestamp <= 0 {
+        return Ok(());
+    }
+    let receipt = path.join(QUILL_MERGE_RECEIPT);
+    let temporary = path.join(format!("{QUILL_MERGE_RECEIPT}.tmp-{}", std::process::id()));
+    let payload = serde_json::json!({
+        "version": QUILL_MERGE_RECEIPT_VERSION,
+        "last_merge_at_ms": timestamp,
+    });
+    // Rename is atomic on the same filesystem.  A reader either sees the
+    // previous complete receipt or the new complete receipt, never a partial
+    // JSON document; an abandoned `.tmp-*` is ignored by all observation
+    // surfaces and overwritten by the next writer in this process.
+    std::fs::write(&temporary, serde_json::to_vec(&payload)?)?;
+    std::fs::rename(&temporary, &receipt)?;
+    Ok(())
+}
+
+fn current_unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
 /// Live segment count of a published Quill index, from the engine's own
 /// reader — the number a query actually pays for. Costs an engine open, so
 /// it belongs on surfaces that may spend (`doctor`, tests), not on
-/// `status`/`health`, which report [`segment_file_count`] instead. Folded
-/// inputs stay on disk for a while after a merge, so the two can differ.
+/// `status`/`health`, which report the metadata-only [`manifest_live_doc_count`]
+/// value instead. Folded inputs stay on disk for a while after a merge, so the
+/// manifest count and [`segment_file_count`] can differ.
 #[must_use]
 pub fn live_segment_count(path: &Path) -> Option<usize> {
     if !path.join(QUILL_INDEX_MARKER).is_file() {
@@ -982,7 +1042,7 @@ impl QuillCassIndex {
         let mut index = Self {
             index,
             directory: path.to_path_buf(),
-            last_merge_ts: 0,
+            last_merge_ts: last_merge_timestamp(path).unwrap_or(0),
             liveness: None,
         };
         // A freshly created index has a writer but no published manifest, so
@@ -1167,6 +1227,17 @@ impl QuillCassIndex {
     /// Record that a compaction completed at `now_ms`.
     pub fn note_merged(&mut self, now_ms: i64) {
         self.last_merge_ts = now_ms;
+        if let Err(error) = write_last_merge_timestamp(&self.directory, now_ms) {
+            // The merge itself has completed and remains queryable.  A receipt
+            // write failure must not turn a successful consolidation into a
+            // false index failure; status will truthfully report an unknown
+            // last-merge timestamp if no prior receipt exists.
+            tracing::warn!(
+                error = %error,
+                path = %self.directory.display(),
+                "could not persist the lexical merge receipt"
+            );
+        }
     }
 
     /// Index one batch of borrowed CASS documents.
@@ -1314,10 +1385,14 @@ impl QuillCassIndex {
     pub fn force_merge_with_output_cap(&mut self, max_output_bytes: u64) -> Result<()> {
         let runs =
             plan_capped_merge_runs(&self.published_segment_fold_profile()?, max_output_bytes);
+        let merged = !runs.is_empty();
         for run in runs {
             self.concat_merge_run(&run)?;
         }
-        self.compact_tombstones()?;
+        let compacted = self.compact_tombstones()?;
+        if merged || compacted {
+            self.note_merged(current_unix_millis());
+        }
         Ok(())
     }
 
@@ -2298,6 +2373,57 @@ mod tests {
         assert!(!is_query_fuel_exhausted(&anyhow!(
             "opening the Quill CASS reader: manifest missing"
         )));
+    }
+
+    #[test]
+    fn merge_receipt_survives_reopen_and_rejects_unknown_contents() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        assert_eq!(last_merge_timestamp(directory.path()), None);
+
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open");
+        for session in 0..4_u64 {
+            index
+                .add_cass_documents(&[sample(
+                    &format!("receipt-{session}"),
+                    0,
+                    "merge receipt fixture",
+                )])
+                .expect("index session");
+            index.commit().expect("commit session");
+        }
+        index
+            .force_merge_with_output_cap(u64::MAX)
+            .expect("force merge");
+
+        let receipt_timestamp = last_merge_timestamp(directory.path())
+            .expect("successful merge must leave a durable receipt");
+        assert!(receipt_timestamp > 0);
+        assert_eq!(
+            index
+                .merge_status(index.segment_count(), receipt_timestamp)
+                .last_merge_ts,
+            receipt_timestamp
+        );
+
+        let reopened = QuillCassIndex::open_or_create(directory.path()).expect("reopen");
+        assert_eq!(
+            reopened
+                .merge_status(reopened.segment_count(), receipt_timestamp)
+                .last_merge_ts,
+            receipt_timestamp,
+            "a new process must retain the merge cooldown evidence"
+        );
+
+        std::fs::write(
+            directory.path().join(QUILL_MERGE_RECEIPT),
+            br#"{"version":1,"last_merge_at_ms":"unknown"}"#,
+        )
+        .expect("corrupt receipt");
+        assert_eq!(
+            last_merge_timestamp(directory.path()),
+            None,
+            "malformed evidence must be reported as unknown"
+        );
     }
 
     /// GH #441: an archive only ever appends, so tombstone-driven compaction
