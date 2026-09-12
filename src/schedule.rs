@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -770,7 +771,40 @@ pub fn load_state(data_dir: &Path) -> ScheduleState {
         .unwrap_or_default()
 }
 
-fn save_state(data_dir: &Path, state: &ScheduleState) -> std::io::Result<()> {
+fn state_lock_path(data_dir: &Path) -> PathBuf {
+    schedule_dir(data_dir).join("state.lock")
+}
+
+/// Serialize updates to the scheduler's state and history.
+///
+/// Incremental and nightly timers can fire concurrently (and a manual
+/// scheduled run can overlap either one). The index lock protects the
+/// expensive index itself, but it does not protect schedule/state.json.
+/// Holding this small per-data-dir lock across the load/modify/publish
+/// sequence prevents one job from overwriting the other job's last report or
+/// racing the shared temporary state file.
+fn with_state_lock<T>(
+    data_dir: &Path,
+    operation: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let dir = schedule_dir(data_dir);
+    std::fs::create_dir_all(&dir)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(state_lock_path(data_dir))?;
+    lock.lock_exclusive()?;
+    let result = operation();
+    let unlock = FileExt::unlock(&lock);
+    match (result, unlock) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn save_state_unlocked(data_dir: &Path, state: &ScheduleState) -> std::io::Result<()> {
     let path = state_path(data_dir);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -783,6 +817,10 @@ fn save_state(data_dir: &Path, state: &ScheduleState) -> std::io::Result<()> {
     std::fs::rename(&tmp, &path)
 }
 
+fn save_state(data_dir: &Path, state: &ScheduleState) -> std::io::Result<()> {
+    with_state_lock(data_dir, || save_state_unlocked(data_dir, state))
+}
+
 fn append_run(data_dir: &Path, report: &JobReport) -> std::io::Result<()> {
     let path = runs_log_path(data_dir);
     if let Some(parent) = path.parent() {
@@ -790,7 +828,20 @@ fn append_run(data_dir: &Path, report: &JobReport) -> std::io::Result<()> {
     }
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     let line = serde_json::to_string(report).map_err(std::io::Error::other)?;
-    writeln!(file, "{line}")
+    writeln!(file, "{line}")?;
+    file.sync_data()
+}
+
+fn persist_job_report(data_dir: &Path, report: &JobReport) -> std::io::Result<()> {
+    with_state_lock(data_dir, || {
+        let mut state = load_state(data_dir);
+        match report.job {
+            ScheduleJob::Incremental => state.last_incremental = Some(report.clone()),
+            ScheduleJob::Nightly => state.last_nightly = Some(report.clone()),
+        }
+        save_state_unlocked(data_dir, &state)?;
+        append_run(data_dir, report)
+    })
 }
 
 fn now_ms() -> i64 {
@@ -1105,16 +1156,8 @@ fn run_job_with_gate(
         pressure,
         user_idle,
     };
-    let mut state = load_state(&cfg.data_dir);
-    match job {
-        ScheduleJob::Incremental => state.last_incremental = Some(report.clone()),
-        ScheduleJob::Nightly => state.last_nightly = Some(report.clone()),
-    }
-    if let Err(error) = save_state(&cfg.data_dir, &state) {
-        warn!(error = %error, "failed to persist schedule state");
-    }
-    if let Err(error) = append_run(&cfg.data_dir, &report) {
-        warn!(error = %error, "failed to append schedule run history");
+    if let Err(error) = persist_job_report(&cfg.data_dir, &report) {
+        warn!(error = %error, "failed to persist schedule state and run history");
     }
     report
 }
@@ -1553,6 +1596,69 @@ mod tests {
         assert!(loaded.last_nightly.is_none());
         let history = std::fs::read_to_string(runs_log_path(dir.path())).unwrap();
         assert_eq!(history.lines().count(), 2);
+    }
+
+    #[test]
+    fn concurrent_job_reports_retain_both_state_slots_and_history() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let make_report = |job, started_ms| JobReport {
+            job,
+            started_ms,
+            finished_ms: started_ms + 1,
+            ok: true,
+            skipped_reason: None,
+            steps: vec![skipped_step("index", "fixture")],
+            pressure: None,
+            user_idle: None,
+        };
+
+        let incremental_dir = dir.path().to_path_buf();
+        let incremental_barrier = Arc::clone(&barrier);
+        let incremental = std::thread::spawn(move || {
+            incremental_barrier.wait();
+            persist_job_report(&incremental_dir, &make_report(ScheduleJob::Incremental, 1))
+                .unwrap();
+        });
+        let nightly_dir = dir.path().to_path_buf();
+        let nightly_barrier = Arc::clone(&barrier);
+        let nightly = std::thread::spawn(move || {
+            nightly_barrier.wait();
+            persist_job_report(&nightly_dir, &make_report(ScheduleJob::Nightly, 2)).unwrap();
+        });
+        incremental.join().unwrap();
+        nightly.join().unwrap();
+
+        let state = load_state(dir.path());
+        assert_eq!(
+            state
+                .last_incremental
+                .as_ref()
+                .map(|report| report.started_ms),
+            Some(1)
+        );
+        assert_eq!(
+            state.last_nightly.as_ref().map(|report| report.started_ms),
+            Some(2)
+        );
+        let history = std::fs::read_to_string(runs_log_path(dir.path())).unwrap();
+        let records: Vec<JobReport> = history
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert!(
+            records
+                .iter()
+                .any(|report| report.job == ScheduleJob::Incremental)
+        );
+        assert!(
+            records
+                .iter()
+                .any(|report| report.job == ScheduleJob::Nightly)
+        );
     }
 
     #[test]
