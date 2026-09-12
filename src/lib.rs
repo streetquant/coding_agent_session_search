@@ -103307,6 +103307,24 @@ impl IndexStallWatchdog {
             && total > 0
             && current >= total
             && index_progress.rebuild_pipeline_is_quiescent();
+        let finalizing = index_progress
+            .finalizing
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let rebuilding = index_progress
+            .is_rebuilding
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // Empty scheduled runs can reach the final WAL checkpoint before any
+        // source is discovered, so both progress counters remain zero. Only
+        // the explicit finalizing marker earns the larger grace in that shape:
+        // an unmarked 0/0 lexical state must retain the ordinary bounded
+        // abort threshold.
+        let zero_work_finalize_wedge = !self.is_watch
+            && !self.semantic_build
+            && phase_code <= indexer::INDEX_PHASE_LEXICAL_INDEXING
+            && finalizing
+            && total == 0
+            && current == 0
+            && index_progress.rebuild_pipeline_is_quiescent();
         // #422: a search-triggered lexical refresh can wedge before phase 2,
         // notably in preparing while opening/counting the canonical DB. A
         // phase-2-only policy merely warned and then let the live process hold
@@ -103388,13 +103406,8 @@ impl IndexStallWatchdog {
         let preparing_io_grace = pre_index_lexical_wedge
             && self.last_io_bytes.is_some()
             && self.last_io_advance.elapsed() < threshold;
-        let effective_abort_threshold = if (finalize_wedge
-            && (index_progress
-                .finalizing
-                .load(std::sync::atomic::Ordering::Relaxed)
-                || index_progress
-                    .is_rebuilding
-                    .load(std::sync::atomic::Ordering::Relaxed)))
+        let effective_abort_threshold = if (finalize_wedge && (finalizing || rebuilding))
+            || zero_work_finalize_wedge
             || persist_grace
             || preparing_io_grace
         {
@@ -104709,6 +104722,81 @@ mod stall_diagnostics_tests {
         assert_eq!(detected["event"], serde_json::json!("stall_detected"));
         let abort = wedge_watchdog.observe(&progress, 200).ok_or_else(|| {
             anyhow::anyhow!("non-finalizing wedge did not abort at the ordinary threshold")
+        })?;
+        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
+        assert_eq!(abort["exit_code"], serde_json::json!(70));
+        Ok(())
+    }
+
+    /// Empty scheduled runs can still enter the final WAL checkpoint before
+    /// discovering a source, leaving both progress counters at zero. That
+    /// explicit finalization marker must receive the same bounded grace as a
+    /// non-empty finalize window, while an unmarked 0/0 state remains an
+    /// ordinary lexical wedge.
+    #[test]
+    fn watchdog_defers_zero_work_finalize_only_while_finalizing() -> anyhow::Result<()> {
+        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
+        use crate::indexer::IndexingProgress;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let tmp = TempDir::new()?;
+        let mut watchdog = IndexStallWatchdog::with_abort_policy(
+            tmp.path().to_path_buf(),
+            Duration::from_millis(50),
+            IndexStallAbortPolicy::AbortLexicalPhases,
+        );
+        watchdog.threshold = Some(Duration::from_millis(1));
+        watchdog.abort_threshold = Some(Duration::from_millis(2));
+        watchdog.finalize_abort_threshold = Some(Duration::from_millis(500));
+        watchdog.last_phase = 0;
+        watchdog.last_current = 0;
+        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
+
+        let progress = Arc::new(IndexingProgress::default());
+        progress.phase.store(0, Ordering::Relaxed);
+        progress.total.store(0, Ordering::Relaxed);
+        progress.current.store(0, Ordering::Relaxed);
+        progress.finalizing.store(true, Ordering::Relaxed);
+        assert!(progress.rebuild_pipeline_is_quiescent());
+
+        let detected = watchdog
+            .observe(&progress, 100)
+            .ok_or_else(|| anyhow::anyhow!("zero-work finalize stall did not report"))?;
+        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
+        assert_eq!(detected["finalizing"], serde_json::json!(true));
+        assert!(
+            watchdog.observe(&progress, 200).is_none(),
+            "a finalizing 0/0 run must use the finalize grace, not the ordinary abort threshold"
+        );
+
+        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(600);
+        let abort = watchdog.observe(&progress, 300).ok_or_else(|| {
+            anyhow::anyhow!("zero-work finalize wedge did not abort after its grace")
+        })?;
+        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
+        assert_eq!(abort["exit_code"], serde_json::json!(70));
+
+        let mut ordinary = IndexStallWatchdog::with_abort_policy(
+            tmp.path().to_path_buf(),
+            Duration::from_millis(50),
+            IndexStallAbortPolicy::AbortLexicalPhases,
+        );
+        ordinary.threshold = Some(Duration::from_millis(1));
+        ordinary.abort_threshold = Some(Duration::from_millis(2));
+        ordinary.finalize_abort_threshold = Some(Duration::from_millis(500));
+        ordinary.last_phase = 0;
+        ordinary.last_current = 0;
+        ordinary.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
+        progress.finalizing.store(false, Ordering::Relaxed);
+
+        let detected = ordinary
+            .observe(&progress, 400)
+            .ok_or_else(|| anyhow::anyhow!("unmarked zero-work wedge did not report"))?;
+        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
+        let abort = ordinary.observe(&progress, 500).ok_or_else(|| {
+            anyhow::anyhow!("unmarked zero-work wedge did not use the ordinary abort threshold")
         })?;
         assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
         assert_eq!(abort["exit_code"], serde_json::json!(70));

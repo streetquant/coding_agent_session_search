@@ -220,6 +220,67 @@ fn schedule_run_incremental_force_records_state_and_history() {
 }
 
 #[test]
+fn schedule_run_empty_incremental_and_nightly_keep_zero_work_truthful() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data_dir = tmp.path().join("dd");
+    std::fs::create_dir_all(&home).unwrap();
+
+    for (job, index_step_name) in [("incremental", "index"), ("nightly", "index-full")] {
+        let output = cass_cmd(&home)
+            .env("CASS_INDEX_STALL_DETECT_SECS", "1")
+            .env("CASS_INDEX_STALL_ABORT_SECS", "2")
+            .env("CASS_INDEX_FINALIZE_ABORT_SECS", "5")
+            .args([
+                "schedule",
+                "run",
+                "--job",
+                job,
+                "--no-semantic",
+                "--force",
+                "--json",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .output()
+            .expect("run empty scheduled job");
+        assert!(
+            output.status.success(),
+            "{job}: empty scheduled job must succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let report = parse_single_json_document(&output.stdout);
+        assert_eq!(report["job"], job);
+        assert_eq!(report["ok"], Value::Bool(true));
+        let index_step = report["steps"]
+            .as_array()
+            .expect("steps")
+            .iter()
+            .find(|step| step["name"] == index_step_name)
+            .unwrap_or_else(|| panic!("{job}: missing {index_step_name} step"));
+        assert_eq!(index_step["ok"], Value::Bool(true));
+        assert_eq!(index_step["exit_code"], Value::from(0));
+        assert_eq!(index_step["result"]["conversations"], Value::from(0));
+        assert_eq!(index_step["result"]["messages"], Value::from(0));
+        assert_eq!(
+            index_step["result"]["final_wal_checkpoint"]["status"],
+            Value::from("completed")
+        );
+    }
+
+    let state_path = data_dir.join("schedule").join("state.json");
+    let runs_path = data_dir.join("schedule").join("runs.jsonl");
+    let state: Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).expect("state.json"))
+            .expect("state.json parses");
+    assert_eq!(state["last_incremental"]["ok"], Value::Bool(true));
+    assert_eq!(state["last_nightly"]["ok"], Value::Bool(true));
+    let history = std::fs::read_to_string(&runs_path).expect("runs.jsonl");
+    assert_eq!(history.lines().count(), 2);
+}
+
+#[test]
 fn schedule_run_nightly_skips_semantic_tiers_it_cannot_serve() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
