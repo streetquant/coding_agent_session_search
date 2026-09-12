@@ -3717,10 +3717,10 @@ fn gh441_801_segment_query_fuel_boundary_and_incremental_repair() {
             )
         });
     assert_eq!(
-        health_json["index"]["lexical_segment_count"],
+        health_json["state"]["index"]["lexical_segment_count"],
         serde_json::json!(segment_count)
     );
-    assert_eq!(health_json["index"]["segment_pressure"]["active"], true);
+    assert_eq!(health_json["state"]["index"]["segment_pressure"]["active"], true);
 
     let doctor = base_cmd(home)
         .current_dir(home)
