@@ -19404,6 +19404,43 @@ fn canonical_fts_segment_integrity_problem(storage: &FrankenStorage) -> Result<O
     }
 }
 
+/// Return whether a database is the marker-only state left by an interrupted
+/// first schema migration.
+///
+/// `MigrationRunner` creates `_schema_migrations` before running the first
+/// migration transaction. If the process is SIGKILLed while that transaction
+/// is still creating the fresh schema, the marker table survives while the
+/// transaction's `meta` and canonical tables correctly roll back. This is a
+/// resumable empty database, not an existing archive whose canonical rows may
+/// be discarded. Keep the classification deliberately exact: any additional
+/// schema object, or any recorded migration, remains on the fail-closed
+/// archive-health path below.
+fn is_interrupted_fresh_schema_archive(storage: &FrankenStorage) -> Result<bool> {
+    let objects = storage.raw().query_map_collect(
+        "SELECT type, name
+         FROM sqlite_master
+         WHERE name NOT LIKE 'sqlite_%'
+         ORDER BY type, name",
+        &[] as &[ParamValue],
+        |row| {
+            Ok((
+                row.get_typed::<String>(0)?,
+                row.get_typed::<String>(1)?,
+            ))
+        },
+    )?;
+    if objects != vec![("table".to_string(), "_schema_migrations".to_string())] {
+        return Ok(false);
+    }
+
+    let applied_migrations = storage.raw().query_row_map(
+        "SELECT COUNT(*) FROM _schema_migrations",
+        &[] as &[ParamValue],
+        |row| row.get_typed::<i64>(0),
+    )?;
+    Ok(applied_migrations == 0)
+}
+
 fn full_rebuild_existing_storage_integrity_problem(
     storage: &FrankenStorage,
 ) -> Result<Option<String>> {
@@ -19414,6 +19451,13 @@ fn full_rebuild_existing_storage_integrity_problem(
             bundle_bytes = bundle_bytes.unwrap_or_default(),
             max_bytes,
             "skipping every fsqlite-backed integrity query before a large full rebuild; the fixed-size SQLite header guard already ran, and later rebuild phases provide named progress. Use 'cass doctor check --json' for the exhaustive scan, or set CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES=0 to force it here"
+        );
+        return Ok(None);
+    }
+
+    if is_interrupted_fresh_schema_archive(storage)? {
+        tracing::info!(
+            "full rebuild found an empty interrupted schema bootstrap; allowing the normal migration path to resume it"
         );
         return Ok(None);
     }
@@ -48902,6 +48946,42 @@ mod tests {
             None
         );
         storage.close_best_effort_in_place();
+    }
+
+    #[test]
+    fn full_rebuild_integrity_preflight_allows_interrupted_fresh_schema_bootstrap() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("interrupted-fresh-schema.db");
+        let conn = crate::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE _schema_migrations (
+                 version INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+             )",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            full_rebuild_existing_archive_integrity_preflight(&db_path).unwrap(),
+            None,
+            "an empty migration marker must be resumable after SIGKILL"
+        );
+
+        let (storage, rebuilt, opened_fresh_for_full) =
+            open_storage_for_index(&db_path, true).unwrap();
+        assert!(!rebuilt);
+        assert!(!opened_fresh_for_full);
+        assert!(
+            storage
+                .raw()
+                .query("SELECT id FROM conversations LIMIT 1")
+                .is_ok(),
+            "resumed migration must restore the canonical conversations table"
+        );
+        storage.close().unwrap();
     }
 
     #[test]
