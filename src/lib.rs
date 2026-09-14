@@ -50576,22 +50576,23 @@ fn doctor_summary_failure_marker_path(data_dir: &Path) -> Option<String> {
 fn build_doctor_runtime_summary(input: DoctorRuntimeSummaryInput<'_>) -> serde_json::Value {
     let fallback_mode = doctor_fallback_mode_from_state(input.state);
     let doctor_lock = doctor_probe_mutation_lock(input.data_dir);
-    let active_doctor_repair = matches!(
-        doctor_lock,
-        DoctorMutationLockObservation::Active { .. }
-            | DoctorMutationLockObservation::Unavailable { .. }
-    );
+    let active_doctor_repair = matches!(&doctor_lock, DoctorMutationLockObservation::Active { .. });
     let active_index_maintenance = input
         .state
         .pointer("/rebuild/active")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(input.rebuild_active);
-    let repair_blocked_reason = if active_doctor_repair {
-        Some("another doctor repair appears to hold the mutation lock".to_string())
-    } else if active_index_maintenance {
-        Some("index maintenance is active; mutating doctor repair should wait".to_string())
-    } else {
-        None
+    let repair_blocked_reason = match &doctor_lock {
+        DoctorMutationLockObservation::Active { .. } => {
+            Some("another doctor repair appears to hold the mutation lock".to_string())
+        }
+        DoctorMutationLockObservation::Unavailable { .. } => {
+            Some("doctor mutation lock could not be inspected or acquired safely".to_string())
+        }
+        _ if active_index_maintenance => {
+            Some("index maintenance is active; mutating doctor repair should wait".to_string())
+        }
+        _ => None,
     };
     let failure_marker_path = doctor_summary_failure_marker_path(input.data_dir);
     let repair_previously_failed = failure_marker_path.is_some();
@@ -50617,6 +50618,9 @@ fn build_doctor_runtime_summary(input: DoctorRuntimeSummaryInput<'_>) -> serde_j
     let recommended_action = if let Some(reason) = repair_blocked_reason.as_ref() {
         if reason.contains("index maintenance") {
             "Wait for the active index operation to finish, then run 'cass doctor check --json'."
+                .to_string()
+        } else if reason.contains("could not be inspected") {
+            "Inspect the doctor mutation lock path before attempting a mutating repair, then run 'cass doctor check --json'."
                 .to_string()
         } else {
             "Wait for the active doctor owner to finish, then run 'cass doctor check --json'."
@@ -50721,7 +50725,11 @@ fn build_doctor_runtime_summary(input: DoctorRuntimeSummaryInput<'_>) -> serde_j
         "operation_outcome": {
             "kind": operation_outcome_kind,
             "reason": if repair_blocked_reason.is_some() {
-                "repair readiness is blocked by active work"
+                if matches!(&doctor_lock, DoctorMutationLockObservation::Unavailable { .. }) {
+                    "repair readiness is blocked because the doctor mutation lock could not be inspected safely"
+                } else {
+                    "repair readiness is blocked by active work"
+                }
             } else if !archive_initialized {
                 "archive database is not initialized yet, so doctor coverage cannot be checked"
             } else if doctor_check_recommended {
@@ -82524,6 +82532,11 @@ fn run_status(
         .and_then(|q| q.get("circuit_breaker_active"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    let ingest_quarantine_state_error = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("state_error"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
     let ingest_quarantine_recommended_action = state
         .get("ingest_quarantine")
         .and_then(|q| q.get("recommended_action"))
@@ -82544,6 +82557,11 @@ fn run_status(
         .map(str::to_string);
     let live_integrity_corrupt = db_integrity == "corrupt";
     let mut warnings = Vec::<String>::new();
+    if let Some(error) = &ingest_quarantine_state_error {
+        warnings.push(format!(
+            "the structured ingest quarantine checkpoint is malformed or unreadable: {error}"
+        ));
+    }
     if live_integrity_corrupt {
         warnings.push(db_integrity_hint.clone().unwrap_or_else(|| {
             "the canonical archive's stored pages are malformed (bounded real-column probe); do NOT run 'cass index' — run 'cass doctor --check' and recover first".to_string()
@@ -82588,6 +82606,7 @@ fn run_status(
         && !rebuild_active
         && !index_empty_with_messages
         && !ingest_quarantine_critical
+        && ingest_quarantine_state_error.is_none()
         && !attested_integrity_failure
         && !live_integrity_corrupt;
     // Stalled rebuilds are reported as a distinct status so operators
@@ -82599,7 +82618,10 @@ fn run_status(
         "stalled"
     } else if rebuild_active {
         "rebuilding"
-    } else if ingest_quarantine_critical || live_integrity_corrupt {
+    } else if ingest_quarantine_state_error.is_some()
+        || ingest_quarantine_critical
+        || live_integrity_corrupt
+    {
         "unhealthy"
     } else if healthy {
         "healthy"
@@ -82616,8 +82638,10 @@ fn run_status(
         None
     };
 
-    let recommended_action = if rebuild_stalled {
-        Some("Index rebuild is wedged; see `cass status --json | jq .rebuild` for the stall age and capture a stack trace with `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` for a bug report".to_string())
+    let recommended_action = if ingest_quarantine_state_error.is_some() {
+        Some("The structured ingest quarantine checkpoint is malformed or unreadable; preserve it, inspect the reported error, and repair or restore it before trusting quarantine counts or search completeness.".to_string())
+    } else if rebuild_stalled {
+        Some("Index rebuild is wedged; see `cass status --json | jq .rebuild` for the stall age and capture a stack trace with `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` for issue #258".to_string())
     } else if rebuild_active {
         Some("Index rebuild is already in progress".to_string())
     } else if live_integrity_corrupt {
@@ -82760,7 +82784,7 @@ fn run_status(
         let payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
-            "health_level": if ingest_quarantine_critical { "critical" } else if healthy && quarantined_conversations > 0 { "degraded" } else { status },
+            "health_level": if ingest_quarantine_state_error.is_some() || ingest_quarantine_critical { "critical" } else if healthy && quarantined_conversations > 0 { "degraded" } else { status },
             "initialized": !not_initialized,
             "explanation": explanation,
             "warnings": warnings,
@@ -83961,12 +83985,22 @@ fn run_health(
         .and_then(|q| q.get("circuit_breaker_active"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    let ingest_quarantine_state_error = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("state_error"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
     let ingest_quarantine_recommended_action = state
         .get("ingest_quarantine")
         .and_then(|q| q.get("recommended_action"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
     let mut warnings = Vec::<String>::new();
+    if let Some(error) = &ingest_quarantine_state_error {
+        warnings.push(format!(
+            "the structured ingest quarantine checkpoint is malformed or unreadable: {error}"
+        ));
+    }
     if ingest_quarantine_critical {
         warnings.push(format!(
             "{recent_quarantined_conversations} recent conversation quarantine(s) triggered the ingest quarantine circuit breaker; lexical search coverage is suspect until the watcher/source path is inspected"
@@ -83987,13 +84021,16 @@ fn run_health(
         && index_fresh
         && !rebuild_active
         && !index_empty_with_messages
-        && !ingest_quarantine_critical;
+        && !ingest_quarantine_critical
+        && ingest_quarantine_state_error.is_none();
     let explanation = if not_initialized {
         Some(cass_not_initialized_explanation(&data_dir))
     } else {
         None
     };
-    let recommended_action = if rebuild_active {
+    let recommended_action = if ingest_quarantine_state_error.is_some() {
+        Some("The structured ingest quarantine checkpoint is malformed or unreadable; preserve it, inspect the reported error, and repair or restore it before trusting quarantine counts or search completeness.".to_string())
+    } else if rebuild_active {
         // [coding_agent_session_search-k0bzk] An active rebuild MUST short-circuit
         // before the !healthy stampede branch fires: previously, this selector
         // told polling agents to run `cass index --full` while a rebuild was
@@ -84060,13 +84097,18 @@ fn run_health(
     if ingest_quarantine_critical {
         errors.push("ingest quarantine circuit breaker active".to_string());
     }
+    if let Some(error) = &ingest_quarantine_state_error {
+        errors.push(format!(
+            "structured ingest quarantine checkpoint is malformed or unreadable: {error}"
+        ));
+    }
 
     // Determine status string for structured output.
     let status = if rebuild_stalled {
         "stalled"
     } else if rebuild_active {
         "rebuilding"
-    } else if ingest_quarantine_critical {
+    } else if ingest_quarantine_state_error.is_some() || ingest_quarantine_critical {
         "unhealthy"
     } else if healthy {
         "healthy"
@@ -84152,7 +84194,7 @@ fn run_health(
             // "binary-only" reports the same readiness verdict but exits 0
             // unless the executable itself malfunctions.
             "exit_policy": if binary_only { "binary-only" } else { "archive" },
-            "health_level": if ingest_quarantine_critical { "critical" } else if healthy && quarantined_conversations > 0 { "degraded" } else { status },
+            "health_level": if ingest_quarantine_state_error.is_some() || ingest_quarantine_critical { "critical" } else if healthy && quarantined_conversations > 0 { "degraded" } else { status },
             "initialized": !not_initialized,
             "explanation": explanation,
             "warnings": warnings,
@@ -85319,6 +85361,30 @@ mod cli_read_db_tests {
         assert_eq!(
             state["ingest_quarantine"]["quarantined_conversations"],
             serde_json::json!(1)
+        );
+    }
+
+    #[test]
+    fn health_state_surfaces_malformed_structured_quarantine() {
+        let temp = TempDir::new().expect("tempdir");
+        let quarantine_path = temp
+            .path()
+            .join(crate::indexer::quarantine::QuarantineState::FILENAME);
+        std::fs::write(&quarantine_path, "{ malformed quarantine checkpoint")
+            .expect("write malformed quarantine state");
+
+        let db_path = temp.path().join("agent_search.db");
+        let state = state_meta_json_for_health(temp.path(), &db_path, 60);
+
+        assert_eq!(
+            state["ingest_quarantine"]["status"],
+            serde_json::json!("unhealthy")
+        );
+        assert!(
+            state["ingest_quarantine"]["state_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("invalid quarantine state")),
+            "health state must retain the malformed-checkpoint diagnostic"
         );
     }
 
@@ -94715,6 +94781,7 @@ fn response_schema_ingest_quarantine() -> serde_json::Value {
         "properties": {
             "schema_version": { "type": "integer" },
             "status": { "type": "string" },
+            "state_error": { "type": ["string", "null"] },
             "quarantined_conversations": { "type": "integer" },
             "recent_quarantined_conversations": { "type": "integer" },
             "recent_window_seconds": { "type": "integer" },
@@ -100332,6 +100399,74 @@ mod response_schema_tests {
         assert_eq!(
             summary["operation_outcome"]["action_not_taken"],
             "did not run deep doctor collectors, source sync, rebuild, model verification, or filesystem-wide repair work"
+        );
+    }
+
+    #[test]
+    fn doctor_runtime_summary_does_not_call_unavailable_lock_an_active_owner() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lock_path = temp.path().join("doctor/locks/doctor-repair.lock");
+        std::fs::create_dir_all(&lock_path).expect("create unusable lock path");
+
+        let observation = doctor_probe_mutation_lock(temp.path());
+        assert!(
+            matches!(
+                &observation,
+                DoctorMutationLockObservation::Unavailable { .. }
+            ),
+            "a non-openable lock path must be reported as unavailable"
+        );
+        let db_path = temp.path().join("agent_search.db");
+        let owner = doctor_operation_owner_from_doctor_lock(temp.path(), &db_path, &observation)
+            .expect("unavailable lock should still produce an owner diagnostic");
+        assert!(!owner.active);
+        assert_eq!(
+            owner.owner_confidence,
+            DoctorOperationOwnerConfidence::Unavailable
+        );
+
+        let state = serde_json::json!({
+            "semantic": { "fallback_mode": "lexical" },
+            "rebuild": { "active": false },
+        });
+        let coverage_risk = doctor_fast_coverage_risk_unchecked(false);
+        let summary = build_doctor_runtime_summary(DoctorRuntimeSummaryInput {
+            surface: "health-summary",
+            state: &state,
+            status: "not_initialized",
+            healthy: false,
+            initialized: false,
+            db_exists: false,
+            rebuild_active: false,
+            coverage_risk: &coverage_risk,
+            coverage_source: "health-fast-state",
+            coverage_checked: false,
+            remote_source_sync_summary: None,
+            quarantine_summary: None,
+            recommended_action: None,
+            data_dir: temp.path(),
+        });
+
+        assert_eq!(summary["active_repair"]["active"], false);
+        assert_eq!(
+            summary["active_repair"]["repair_blocked_reason"],
+            "doctor mutation lock could not be inspected or acquired safely"
+        );
+        assert_eq!(
+            summary["repair_blocked_reason"],
+            "doctor mutation lock could not be inspected or acquired safely"
+        );
+        assert_eq!(summary["status"], "blocked");
+        assert_eq!(summary["health_class"], "repair-blocked");
+        assert!(
+            summary["recommended_action"]
+                .as_str()
+                .is_some_and(|action| action.contains("Inspect the doctor mutation lock path")),
+            "unavailable lock must not route operators to wait for an owner"
+        );
+        assert_eq!(
+            summary["operation_outcome"]["reason"],
+            "repair readiness is blocked because the doctor mutation lock could not be inspected safely"
         );
     }
 

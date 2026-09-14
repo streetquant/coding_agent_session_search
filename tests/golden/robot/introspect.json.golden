@@ -29284,6 +29284,12 @@
             "status": {
               "type": "string"
             },
+            "state_error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "quarantined_conversations": {
               "type": "integer"
             },
@@ -30088,6 +30094,12 @@
                 },
                 "status": {
                   "type": "string"
+                },
+                "state_error": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "quarantined_conversations": {
                   "type": "integer"
@@ -32616,6 +32628,12 @@
                     "status": {
                       "type": "string"
                     },
+                    "state_error": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
                     "quarantined_conversations": {
                       "type": "integer"
                     },
@@ -33988,6 +34006,12 @@
             },
             "status": {
               "type": "string"
+            },
+            "state_error": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "quarantined_conversations": {
               "type": "integer"
@@ -36077,6 +36101,12 @@
             },
             "status": {
               "type": "string"
+            },
+            "state_error": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "quarantined_conversations": {
               "type": "integer"
@@ -38185,6 +38215,12 @@
                 },
                 "status": {
                   "type": "string"
+                },
+                "state_error": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "quarantined_conversations": {
                   "type": "integer"

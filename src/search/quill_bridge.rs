@@ -40,11 +40,13 @@ use frankensearch::quill::{QuillConfig, QuillIndex, QuillSearchIndex, SchemaDocu
 pub const QUILL_INDEX_MARKER: &str = "MANIFEST";
 
 /// Operator override for Quill's deterministic per-query work budget
-/// (`QuillConfig::query_fuel_budget`, default 10,000,000 units). The budget is
+/// (`QuillConfig::query_fuel_budget`, default 64,000,000 units). The budget is
 /// what turns a pathological query into a fast typed refusal instead of an
 /// unbounded scan, so raising it is a diagnostic/escape hatch, not a tuning
 /// knob; the durable fix for fuel exhaustion is a compacted index (#441).
 pub const CASS_QUILL_QUERY_FUEL_BUDGET_ENV: &str = "CASS_QUILL_QUERY_FUEL_BUDGET";
+
+const CASS_QUERY_FUEL_BUDGET: u64 = 64_000_000;
 
 /// Whether `error` is Quill's typed query-fuel refusal (#441), anywhere in
 /// its context chain. The engine reports it as `... query fuel exhausted after
@@ -84,6 +86,7 @@ pub fn is_query_fuel_exhausted(error: &anyhow::Error) -> bool {
 pub fn cass_quill_config() -> QuillConfig {
     let mut config = QuillConfig {
         max_visibility_lag_ms: u64::MAX,
+        query_fuel_budget: CASS_QUERY_FUEL_BUDGET,
         ..QuillConfig::default()
     };
     if let Some(budget) = query_fuel_budget_override(
@@ -97,8 +100,8 @@ pub fn cass_quill_config() -> QuillConfig {
 }
 
 /// Parse the fuel-budget override. Zero, garbage, and absent all mean "keep
-/// the engine default" — a zero budget would refuse every query, which is
-/// never what an operator setting this variable wants.
+/// CASS's default" — a zero budget would refuse every query, which is never
+/// what an operator setting this variable wants.
 fn query_fuel_budget_override(raw: Option<&str>) -> Option<u64> {
     raw.and_then(|value| value.trim().replace('_', "").parse::<u64>().ok())
         .filter(|budget| *budget > 0)
@@ -1783,7 +1786,7 @@ mod tests {
             config.scribe_shard_budget_bytes,
             default.scribe_shard_budget_bytes
         );
-        assert_eq!(config.query_fuel_budget, default.query_fuel_budget);
+        assert_eq!(config.query_fuel_budget, CASS_QUERY_FUEL_BUDGET);
     }
 
     #[test]
