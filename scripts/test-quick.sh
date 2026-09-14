@@ -13,6 +13,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RCH_BIN="${RCH_BIN:-rch}"
 RCH_TARGET_DIR="${RCH_TARGET_DIR:-/tmp/rch_target_cass_test_quick}"
+# Keep test-created Unix-domain socket paths below the platform SUN_LEN limit.
+# tempfile still gives each fixture an isolated directory below this short base.
+CASS_TEST_TMPDIR="${CASS_TEST_TMPDIR:-/tmp}"
 
 # Colors
 if [[ -t 1 ]]; then
@@ -33,7 +36,10 @@ run_cargo_test() {
         return 127
     fi
 
-    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo test "$@"
+    "$RCH_BIN" exec -- env \
+        CARGO_TARGET_DIR="$RCH_TARGET_DIR" \
+        TMPDIR="$CASS_TEST_TMPDIR" \
+        cargo test "$@"
 }
 
 run_lib_tests() {

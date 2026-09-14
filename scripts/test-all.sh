@@ -43,6 +43,9 @@ FAIL_FAST=${FAIL_FAST:-0}
 QUICK_MODE=${QUICK_MODE:-0}
 RCH_BIN=${RCH_BIN:-rch}
 RCH_TARGET_DIR=${RCH_TARGET_DIR:-${TMPDIR:-/tmp}/rch_target_cass_test_all}
+# Keep test-created Unix-domain socket paths below the platform SUN_LEN limit.
+# tempfile still gives each fixture an isolated directory below this short base.
+CASS_TEST_TMPDIR=${CASS_TEST_TMPDIR:-/tmp}
 
 # Results tracking
 declare -A TIMINGS
@@ -129,7 +132,10 @@ ensure_rch() {
 }
 
 run_cargo() {
-    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo "$@"
+    "$RCH_BIN" exec -- env \
+        CARGO_TARGET_DIR="$RCH_TARGET_DIR" \
+        TMPDIR="$CASS_TEST_TMPDIR" \
+        cargo "$@"
 }
 
 check_nextest() {

@@ -267,6 +267,7 @@ fn build_probe_script() -> String {
     build_probe_script_for_dir_modes(&dir_list, &recursive_dirs)
 }
 
+#[cfg(test)]
 fn build_probe_script_for_dirs(dir_list: &[String]) -> String {
     // This helper is used by focused tests with an explicit path list. Treat
     // those paths as source roots so the tests exercise the same bounded

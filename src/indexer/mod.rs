@@ -19538,9 +19538,17 @@ fn full_rebuild_existing_archive_integrity_preflight_with_max_bytes(
             ));
         }
         Err(err) => {
-            return Ok(Some(format!(
-                "read-only full-rebuild integrity preflight could not open the canonical archive: {err:#}"
-            )));
+            let detail = format!("{err:#}");
+            let reason = if detail.to_ascii_lowercase().contains("fts5: corrupt") {
+                format!(
+                    "FTS5 segment integrity-check failed while opening the canonical archive: {detail}"
+                )
+            } else {
+                format!(
+                    "read-only full-rebuild integrity preflight could not open the canonical archive: {detail}"
+                )
+            };
+            return Ok(Some(reason));
         }
     };
     let result = full_rebuild_existing_storage_integrity_problem(&storage);
@@ -26707,6 +26715,11 @@ fn poison_record_first_quarantined_at_ms(value: &serde_json::Value) -> Option<i6
 pub struct ConversationIngestQuarantineSummary {
     pub schema_version: i64,
     pub status: String,
+    /// Error loading the structured quarantine checkpoint, if one exists.
+    /// A malformed or unreadable checkpoint must not be treated as an empty
+    /// quarantine because that would make search health falsely optimistic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_error: Option<String>,
     pub quarantined_conversations: usize,
     pub recent_quarantined_conversations: usize,
     pub recent_window_seconds: i64,
@@ -26739,25 +26752,32 @@ pub fn conversation_ingest_quarantine_summary(
     let recent_cutoff_ms =
         FrankenStorage::now_millis().saturating_sub(recent_window_seconds.saturating_mul(1_000));
     let circuit_breaker_limit = ingest_quarantine_circuit_limit();
+    let mut state_error = None;
 
     let state_path = QuarantineState::path(data_dir);
     if state_path.exists() {
         quarantine_files.push(state_path.display().to_string());
-        let state = QuarantineState::load(data_dir);
-        for (key, record) in state.iter() {
-            let last_attempt_at_ms = record.last_attempt_at.timestamp_millis();
-            let summary_key = (key.conversation_id, i64::from(key.schema_version));
-            keys.insert(summary_key.clone());
-            if last_attempt_at_ms >= recent_cutoff_ms
-                && record.is_version_stale_for_retry(current_version)
-            {
-                recent_keys.insert(summary_key);
+        match QuarantineState::load_for_operator(data_dir) {
+            Ok(state) => {
+                for (key, record) in state.iter() {
+                    let last_attempt_at_ms = record.last_attempt_at.timestamp_millis();
+                    let summary_key = (key.conversation_id, i64::from(key.schema_version));
+                    keys.insert(summary_key.clone());
+                    if last_attempt_at_ms >= recent_cutoff_ms
+                        && record.is_version_stale_for_retry(current_version)
+                    {
+                        recent_keys.insert(summary_key);
+                    }
+                    newest_last_attempt_at_ms = Some(
+                        newest_last_attempt_at_ms.map_or(last_attempt_at_ms, |current| {
+                            current.max(last_attempt_at_ms)
+                        }),
+                    );
+                }
             }
-            newest_last_attempt_at_ms = Some(
-                newest_last_attempt_at_ms.map_or(last_attempt_at_ms, |current| {
-                    current.max(last_attempt_at_ms)
-                }),
-            );
+            Err(error) => {
+                state_error = Some(error.to_string());
+            }
         }
     }
 
@@ -26767,16 +26787,34 @@ pub fn conversation_ingest_quarantine_summary(
             continue;
         }
         quarantine_files.push(path.display().to_string());
-        let Ok(contents) = fs::read_to_string(&path) else {
-            continue;
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                if state_error.is_none() {
+                    state_error = Some(format!(
+                        "reading quarantine file {}: {error}",
+                        path.display()
+                    ));
+                }
+                continue;
+            }
         };
         for line in contents.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-                continue;
+            let value = match serde_json::from_str::<serde_json::Value>(trimmed) {
+                Ok(value) => value,
+                Err(error) => {
+                    if state_error.is_none() {
+                        state_error = Some(format!(
+                            "malformed quarantine record in {}: {error}",
+                            path.display()
+                        ));
+                    }
+                    continue;
+                }
             };
             let key = poison_record_key_from_value(&value);
             let is_fresh_quarantine = poison_record_version_needs_retry(
@@ -26814,15 +26852,19 @@ pub fn conversation_ingest_quarantine_summary(
     let recent_quarantined_conversations = recent_keys.len();
     let circuit_breaker_active =
         circuit_breaker_limit > 0 && recent_quarantined_conversations >= circuit_breaker_limit;
+    let state_error_present = state_error.is_some();
     ConversationIngestQuarantineSummary {
         schema_version: POISON_CONVERSATION_QUARANTINE_SCHEMA_VERSION,
-        status: if circuit_breaker_active {
+        status: if state_error_present {
+            "unhealthy".to_string()
+        } else if circuit_breaker_active {
             "critical".to_string()
         } else if quarantined_conversations > 0 {
             "degraded".to_string()
         } else {
             "ok".to_string()
         },
+        state_error,
         quarantined_conversations,
         recent_quarantined_conversations,
         recent_window_seconds,
@@ -26830,7 +26872,12 @@ pub fn conversation_ingest_quarantine_summary(
         circuit_breaker_active,
         quarantine_files,
         newest_last_attempt_at_ms,
-        recommended_action: if circuit_breaker_active {
+        recommended_action: if state_error_present {
+            Some(
+                "The structured quarantine checkpoint is malformed or unreadable; preserve it, inspect the reported error, and repair or restore it before trusting quarantine counts or search completeness."
+                    .to_string(),
+            )
+        } else if circuit_breaker_active {
             Some(
                 "Quarantine volume exceeded the recent circuit-breaker threshold; pause the watcher, inspect the listed quarantine file(s), then retry repaired source paths with `cass index --watch-once <path> --json --no-progress-events` before resuming watch."
                     .to_string(),
@@ -45749,6 +45796,39 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    #[serial]
+    fn malformed_structured_quarantine_is_reported_as_unhealthy() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+        let state_path = QuarantineState::path(&data_dir);
+        std::fs::write(&state_path, "{ definitely not valid quarantine json")?;
+
+        let summary = conversation_ingest_quarantine_summary(&data_dir);
+        anyhow::ensure!(
+            summary.status == "unhealthy",
+            "malformed structured quarantine must make health unhealthy; got {}",
+            summary.status
+        );
+        anyhow::ensure!(
+            summary.state_error.is_some(),
+            "malformed structured quarantine must retain a diagnostic"
+        );
+        anyhow::ensure!(
+            summary
+                .recommended_action
+                .as_deref()
+                .is_some_and(|action| action.contains("malformed or unreadable")),
+            "malformed structured quarantine must route to an explicit repair action"
+        );
+        anyhow::ensure!(
+            state_path.exists(),
+            "health inspection must preserve the bad file"
+        );
+        Ok(())
+    }
+
     /// #290 (contrapositive): a *fresh* recent burst of genuinely-new
     /// (version-stale / never-triaged-under-this-binary) quarantines still trips
     /// the circuit breaker / `critical` health, because those conversations'
@@ -48944,15 +49024,13 @@ mod tests {
             .expect("corrupt the persisted FTS structure record");
         }
 
-        let mut storage = FrankenStorage::open_readonly(&db_path).unwrap();
-        let problem = full_rebuild_existing_storage_integrity_problem(&storage)
+        let problem = full_rebuild_existing_archive_integrity_preflight(&db_path)
             .unwrap()
             .expect("a corrupt FTS structure must stop a full rebuild");
         assert!(
             problem.contains("FTS5 segment integrity-check failed"),
             "diagnostic must identify the FTS segment preflight: {problem}"
         );
-        storage.close_best_effort_in_place();
     }
 
     #[test]

@@ -2874,6 +2874,7 @@ schemas: (auto-generated from contract)
       - recent_window_seconds: integer
       - recommended_action: ?
       - schema_version: integer
+      - state_error: ?
       - status: string
     - initialized: boolean
     - latency_ms: integer
@@ -3025,6 +3026,7 @@ schemas: (auto-generated from contract)
         - recent_window_seconds: integer
         - recommended_action: ?
         - schema_version: integer
+        - state_error: ?
         - status: string
       - pending: object
         - orphaned: boolean
@@ -3526,6 +3528,7 @@ schemas: (auto-generated from contract)
       - recent_window_seconds: integer
       - recommended_action: ?
       - schema_version: integer
+      - state_error: ?
       - status: string
     - initialized: boolean
     - pending: object
@@ -3919,6 +3922,7 @@ schemas: (auto-generated from contract)
       - recent_window_seconds: integer
       - recommended_action: ?
       - schema_version: integer
+      - state_error: ?
       - status: string
     - initialized: boolean
     - pending: object
@@ -4188,6 +4192,7 @@ schemas: (auto-generated from contract)
         - recent_window_seconds: integer
         - recommended_action: ?
         - schema_version: integer
+        - state_error: ?
         - status: string
       - pending: object
         - inspected: boolean

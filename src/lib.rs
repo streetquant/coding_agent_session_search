@@ -82476,6 +82476,11 @@ fn run_status(
         .and_then(|q| q.get("circuit_breaker_active"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    let ingest_quarantine_state_error = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("state_error"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
     let ingest_quarantine_recommended_action = state
         .get("ingest_quarantine")
         .and_then(|q| q.get("recommended_action"))
@@ -82496,6 +82501,11 @@ fn run_status(
         .map(str::to_string);
     let live_integrity_corrupt = db_integrity == "corrupt";
     let mut warnings = Vec::<String>::new();
+    if let Some(error) = &ingest_quarantine_state_error {
+        warnings.push(format!(
+            "the structured ingest quarantine checkpoint is malformed or unreadable: {error}"
+        ));
+    }
     if live_integrity_corrupt {
         warnings.push(db_integrity_hint.clone().unwrap_or_else(|| {
             "the canonical archive's stored pages are malformed (bounded real-column probe); do NOT run 'cass index' — run 'cass doctor --check' and recover first".to_string()
@@ -82540,6 +82550,7 @@ fn run_status(
         && !rebuild_active
         && !index_empty_with_messages
         && !ingest_quarantine_critical
+        && ingest_quarantine_state_error.is_none()
         && !attested_integrity_failure
         && !live_integrity_corrupt;
     // Stalled rebuilds are reported as a distinct status so operators
@@ -82551,7 +82562,10 @@ fn run_status(
         "stalled"
     } else if rebuild_active {
         "rebuilding"
-    } else if ingest_quarantine_critical || live_integrity_corrupt {
+    } else if ingest_quarantine_state_error.is_some()
+        || ingest_quarantine_critical
+        || live_integrity_corrupt
+    {
         "unhealthy"
     } else if healthy {
         "healthy"
@@ -82568,8 +82582,10 @@ fn run_status(
         None
     };
 
-    let recommended_action = if rebuild_stalled {
-        Some("Index rebuild is wedged; see `cass status --json | jq .rebuild` for the stall age and capture a stack trace with `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` for a bug report".to_string())
+    let recommended_action = if ingest_quarantine_state_error.is_some() {
+        Some("The structured ingest quarantine checkpoint is malformed or unreadable; preserve it, inspect the reported error, and repair or restore it before trusting quarantine counts or search completeness.".to_string())
+    } else if rebuild_stalled {
+        Some("Index rebuild is wedged; see `cass status --json | jq .rebuild` for the stall age and capture a stack trace with `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` for issue #258".to_string())
     } else if rebuild_active {
         Some("Index rebuild is already in progress".to_string())
     } else if live_integrity_corrupt {
@@ -82712,7 +82728,7 @@ fn run_status(
         let payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
-            "health_level": if ingest_quarantine_critical { "critical" } else if healthy && quarantined_conversations > 0 { "degraded" } else { status },
+            "health_level": if ingest_quarantine_state_error.is_some() || ingest_quarantine_critical { "critical" } else if healthy && quarantined_conversations > 0 { "degraded" } else { status },
             "initialized": !not_initialized,
             "explanation": explanation,
             "warnings": warnings,
@@ -83913,12 +83929,22 @@ fn run_health(
         .and_then(|q| q.get("circuit_breaker_active"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    let ingest_quarantine_state_error = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("state_error"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
     let ingest_quarantine_recommended_action = state
         .get("ingest_quarantine")
         .and_then(|q| q.get("recommended_action"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
     let mut warnings = Vec::<String>::new();
+    if let Some(error) = &ingest_quarantine_state_error {
+        warnings.push(format!(
+            "the structured ingest quarantine checkpoint is malformed or unreadable: {error}"
+        ));
+    }
     if ingest_quarantine_critical {
         warnings.push(format!(
             "{recent_quarantined_conversations} recent conversation quarantine(s) triggered the ingest quarantine circuit breaker; lexical search coverage is suspect until the watcher/source path is inspected"
@@ -83939,13 +83965,16 @@ fn run_health(
         && index_fresh
         && !rebuild_active
         && !index_empty_with_messages
-        && !ingest_quarantine_critical;
+        && !ingest_quarantine_critical
+        && ingest_quarantine_state_error.is_none();
     let explanation = if not_initialized {
         Some(cass_not_initialized_explanation(&data_dir))
     } else {
         None
     };
-    let recommended_action = if rebuild_active {
+    let recommended_action = if ingest_quarantine_state_error.is_some() {
+        Some("The structured ingest quarantine checkpoint is malformed or unreadable; preserve it, inspect the reported error, and repair or restore it before trusting quarantine counts or search completeness.".to_string())
+    } else if rebuild_active {
         // [coding_agent_session_search-k0bzk] An active rebuild MUST short-circuit
         // before the !healthy stampede branch fires: previously, this selector
         // told polling agents to run `cass index --full` while a rebuild was
@@ -84012,13 +84041,18 @@ fn run_health(
     if ingest_quarantine_critical {
         errors.push("ingest quarantine circuit breaker active".to_string());
     }
+    if let Some(error) = &ingest_quarantine_state_error {
+        errors.push(format!(
+            "structured ingest quarantine checkpoint is malformed or unreadable: {error}"
+        ));
+    }
 
     // Determine status string for structured output.
     let status = if rebuild_stalled {
         "stalled"
     } else if rebuild_active {
         "rebuilding"
-    } else if ingest_quarantine_critical {
+    } else if ingest_quarantine_state_error.is_some() || ingest_quarantine_critical {
         "unhealthy"
     } else if healthy {
         "healthy"
@@ -84104,7 +84138,7 @@ fn run_health(
             // "binary-only" reports the same readiness verdict but exits 0
             // unless the executable itself malfunctions.
             "exit_policy": if binary_only { "binary-only" } else { "archive" },
-            "health_level": if ingest_quarantine_critical { "critical" } else if healthy && quarantined_conversations > 0 { "degraded" } else { status },
+            "health_level": if ingest_quarantine_state_error.is_some() || ingest_quarantine_critical { "critical" } else if healthy && quarantined_conversations > 0 { "degraded" } else { status },
             "initialized": !not_initialized,
             "explanation": explanation,
             "warnings": warnings,
@@ -85271,6 +85305,30 @@ mod cli_read_db_tests {
         assert_eq!(
             state["ingest_quarantine"]["quarantined_conversations"],
             serde_json::json!(1)
+        );
+    }
+
+    #[test]
+    fn health_state_surfaces_malformed_structured_quarantine() {
+        let temp = TempDir::new().expect("tempdir");
+        let quarantine_path = temp
+            .path()
+            .join(crate::indexer::quarantine::QuarantineState::FILENAME);
+        std::fs::write(&quarantine_path, "{ malformed quarantine checkpoint")
+            .expect("write malformed quarantine state");
+
+        let db_path = temp.path().join("agent_search.db");
+        let state = state_meta_json_for_health(temp.path(), &db_path, 60);
+
+        assert_eq!(
+            state["ingest_quarantine"]["status"],
+            serde_json::json!("unhealthy")
+        );
+        assert!(
+            state["ingest_quarantine"]["state_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("invalid quarantine state")),
+            "health state must retain the malformed-checkpoint diagnostic"
         );
     }
 
@@ -94642,6 +94700,7 @@ fn response_schema_ingest_quarantine() -> serde_json::Value {
         "properties": {
             "schema_version": { "type": "integer" },
             "status": { "type": "string" },
+            "state_error": { "type": ["string", "null"] },
             "quarantined_conversations": { "type": "integer" },
             "recent_quarantined_conversations": { "type": "integer" },
             "recent_window_seconds": { "type": "integer" },
