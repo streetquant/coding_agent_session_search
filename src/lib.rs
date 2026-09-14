@@ -50548,10 +50548,13 @@ fn doctor_summary_risk_level(coverage_risk: &DoctorCoverageRiskSummary) -> &'sta
 fn doctor_summary_health_class(
     coverage_risk: &DoctorCoverageRiskSummary,
     repair_blocked_reason: Option<&str>,
+    repair_previously_failed: bool,
     healthy: bool,
 ) -> &'static str {
     if repair_blocked_reason.is_some() {
         "repair-blocked"
+    } else if repair_previously_failed {
+        "repair-previously-failed"
     } else if coverage_risk.status == "sole_copy_risk"
         || coverage_risk.missing_current_source_count > 0
         || coverage_risk.db_without_raw_mirror_count > 0
@@ -50602,6 +50605,7 @@ fn build_doctor_runtime_summary(input: DoctorRuntimeSummaryInput<'_>) -> serde_j
     let health_class = doctor_summary_health_class(
         input.coverage_risk,
         repair_blocked_reason.as_deref(),
+        repair_previously_failed,
         input.healthy,
     );
     let archive_initialized = input.initialized && input.db_exists;
@@ -69227,6 +69231,44 @@ mod doctor_asset_taxonomy_tests {
         );
         assert_eq!(incidents[0].archive_risk_level, DoctorDataLossRisk::High);
         assert_eq!(incidents[1].derived_risk_level, DoctorDataLossRisk::Low);
+    }
+
+    #[test]
+    fn doctor_runtime_summary_surfaces_repair_failure_marker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = test_failure_marker("repair_apply", "status-reconcile", 1_733_001_111_000);
+        let marker_path = write_doctor_repair_failure_marker(temp.path(), &marker)
+            .expect("write repair failure marker");
+        let state = serde_json::json!({
+            "semantic": { "fallback_mode": "lexical" },
+            "rebuild": { "active": false },
+        });
+        let coverage_risk = doctor_fast_coverage_risk_unchecked(true);
+
+        let summary = build_doctor_runtime_summary(DoctorRuntimeSummaryInput {
+            surface: "health-summary",
+            state: &state,
+            status: "healthy",
+            healthy: true,
+            initialized: true,
+            db_exists: true,
+            rebuild_active: false,
+            coverage_risk: &coverage_risk,
+            coverage_source: "health-fast-state",
+            coverage_checked: false,
+            remote_source_sync_summary: None,
+            quarantine_summary: None,
+            recommended_action: None,
+            data_dir: temp.path(),
+        });
+
+        assert_eq!(summary["health_class"], "repair-previously-failed");
+        assert_eq!(summary["repair_previously_failed"], true);
+        assert_eq!(
+            summary["failure_marker_path"],
+            marker_path.to_string_lossy().as_ref()
+        );
+        assert_eq!(summary["doctor_check_recommended"], true);
     }
 
     #[test]
