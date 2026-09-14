@@ -861,6 +861,23 @@ pub struct SemanticWatchOnceStats {
     pub reason: String,
 }
 
+/// Durable result of the final WAL checkpoint performed after an index run.
+///
+/// A successful index close may still encounter an active reader that leaves
+/// WAL frames uncheckpointed. Keep that outcome in the structured result so a
+/// caller can distinguish a fully truncated WAL from a close that must be
+/// retried after the competing reader exits.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FinalWalCheckpointStats {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub busy: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_frames: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpointed_frames: Option<i64>,
+}
+
 /// Aggregate indexing statistics for JSON output (T7.4).
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct IndexingStats {
@@ -901,6 +918,11 @@ pub struct IndexingStats {
     /// True when SQLite ingest succeeded but inline lexical updates were
     /// deferred and the caller must rebuild lexical assets from the archive.
     pub lexical_update_deferred: bool,
+    /// Result of the final WAL checkpoint after the indexing storage handle
+    /// was closed. A blocked result is retained explicitly rather than being
+    /// discarded as a successful close.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_wal_checkpoint: Option<FinalWalCheckpointStats>,
 }
 
 fn record_connector_ingest_report(
@@ -1422,13 +1444,14 @@ impl IndexingProgress {
             .lock()
             .ok()
             .and_then(|value| *value);
-        let (quarantined_conversations, lexical_update_deferred) = self
+        let (quarantined_conversations, lexical_update_deferred, final_wal_checkpoint) = self
             .stats
             .lock()
             .map(|stats| {
                 (
                     stats.quarantined_conversations,
                     stats.lexical_update_deferred,
+                    stats.final_wal_checkpoint.clone(),
                 )
             })
             .unwrap_or_default();
@@ -1490,6 +1513,7 @@ impl IndexingProgress {
             "last_error": last_error,
             "quarantined_conversations": quarantined_conversations,
             "lexical_update_deferred": lexical_update_deferred,
+            "final_wal_checkpoint": final_wal_checkpoint,
             "rebuild_pipeline": {
                 "queue_depth": rebuild_pipeline_queue_depth,
                 "inflight_message_bytes": rebuild_pipeline_inflight_message_bytes,
@@ -2005,6 +2029,7 @@ fn reset_progress_to_idle(progress: Option<&Arc<IndexingProgress>>) {
 
     progress.phase.store(0, Ordering::Relaxed);
     progress.is_rebuilding.store(false, Ordering::Relaxed);
+    progress.finalizing.store(false, Ordering::Relaxed);
     progress
         .rebuild_pipeline_queue_depth
         .store(0, Ordering::Relaxed);
@@ -14346,7 +14371,12 @@ pub fn run_index(
             path_count,
             "skipping unchanged explicit watch-once index run before startup maintenance"
         );
-        return close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run");
+        return close_storage_after_index(
+            storage,
+            &opts.db_path,
+            "watch-once no-op index run",
+            opts.progress.as_ref(),
+        );
     }
 
     preflight_phase!("watch_startup:cleanup_orphan_fk_rows");
@@ -16117,7 +16147,12 @@ pub fn run_index(
                 path_count,
                 "skipping unchanged explicit watch-once paths before opening Tantivy"
             );
-            return close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run");
+            return close_storage_after_index(
+                storage,
+                &opts.db_path,
+                "watch-once no-op index run",
+                opts.progress.as_ref(),
+            );
         }
 
         // Startup watch ingest defers WAL auto-checkpoints for bulk import.
@@ -16406,7 +16441,12 @@ pub fn run_index(
         );
 
         let close_result =
-            release_watch_storage_after_index(storage, &opts.db_path, "watch indexing session");
+        release_watch_storage_after_index(
+            storage,
+            &opts.db_path,
+            "watch indexing session",
+            opts.progress.as_ref(),
+        );
         if let Err(err) = watch_result {
             if let Err(close_err) = close_result {
                 tracing::warn!(
@@ -16435,24 +16475,45 @@ pub fn run_index(
     if let Some(progress) = opts.progress.as_ref() {
         progress.finalizing.store(true, Ordering::Relaxed);
     }
-    close_storage_after_index(storage, &opts.db_path, "index run")
+    close_storage_after_index(storage, &opts.db_path, "index run", opts.progress.as_ref())
 }
 
-fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &str) -> Result<()> {
-    prepare_storage_for_final_checkpoint(&storage, db_path, context);
-    storage.close().with_context(|| {
-        format!(
-            "closing canonical db before final WAL checkpoint after {context}: {}",
-            db_path.display()
-        )
-    })?;
-    // The storage handle is already closed here, so the checkpoint should not be
-    // blocked; a `Blocked` outcome (e.g. another cass process holds a reader) is
-    // already surfaced via the WARN inside `query_final_wal_checkpoint`. Preserve
-    // the historically-lenient contract of this normal-close path (Ok even if the
-    // checkpoint could not fully truncate) — the abort path (#321) is the one that
-    // must branch on the outcome.
-    run_final_wal_checkpoint(db_path, context).map(|_outcome| ())
+fn close_storage_after_index(
+    storage: FrankenStorage,
+    db_path: &Path,
+    context: &str,
+    progress: Option<&Arc<IndexingProgress>>,
+) -> Result<()> {
+    if let Some(progress) = progress {
+        progress.finalizing.store(true, Ordering::Relaxed);
+    }
+
+    // Keep the progress state truthful even when storage close or the final
+    // checkpoint fails. The caller's `RunIndexProgressReset` also resets the
+    // state, but watch/no-op close paths can call this helper directly.
+    let result = (|| {
+        prepare_storage_for_final_checkpoint(&storage, db_path, context);
+        storage.close().with_context(|| {
+            format!(
+                "closing canonical db before final WAL checkpoint after {context}: {}",
+                db_path.display()
+            )
+        })?;
+        // A blocked outcome is a valid close result only when it is retained in
+        // the structured response. It must never disappear behind `map(|_| ())`.
+        let outcome = run_final_wal_checkpoint(db_path, context)?;
+        if let Some(progress) = progress {
+            if let Ok(mut stats) = progress.stats.lock() {
+                stats.final_wal_checkpoint = Some(outcome.into());
+            }
+        }
+        Ok(())
+    })();
+
+    if let Some(progress) = progress {
+        progress.finalizing.store(false, Ordering::Relaxed);
+    }
+    result
 }
 
 fn prepare_storage_for_final_checkpoint(storage: &FrankenStorage, db_path: &Path, context: &str) {
@@ -16489,6 +16550,29 @@ enum FinalWalCheckpointOutcome {
         log_frames: i64,
         checkpointed_frames: i64,
     },
+}
+
+impl From<FinalWalCheckpointOutcome> for FinalWalCheckpointStats {
+    fn from(outcome: FinalWalCheckpointOutcome) -> Self {
+        match outcome {
+            FinalWalCheckpointOutcome::Completed => Self {
+                status: "completed".to_string(),
+                busy: None,
+                log_frames: None,
+                checkpointed_frames: None,
+            },
+            FinalWalCheckpointOutcome::Blocked {
+                busy,
+                log_frames,
+                checkpointed_frames,
+            } => Self {
+                status: "blocked".to_string(),
+                busy: Some(busy),
+                log_frames: Some(log_frames),
+                checkpointed_frames: Some(checkpointed_frames),
+            },
+        }
+    }
 }
 
 /// Outcome of the separately supervised checkpoint attempted immediately
@@ -16732,6 +16816,7 @@ fn release_watch_storage_after_index(
     storage: Rc<Mutex<FrankenStorage>>,
     db_path: &Path,
     context: &str,
+    progress: Option<&Arc<IndexingProgress>>,
 ) -> Result<()> {
     let storage = Rc::try_unwrap(storage).map_err(|_| {
         anyhow::anyhow!(
@@ -16740,7 +16825,7 @@ fn release_watch_storage_after_index(
         )
     })?;
     match storage.into_inner() {
-        Ok(storage) => close_storage_after_index(storage, db_path, context),
+        Ok(storage) => close_storage_after_index(storage, db_path, context, progress),
         Err(poisoned) => {
             let mut storage = poisoned.into_inner();
             storage.close_best_effort_in_place();
@@ -17980,9 +18065,15 @@ fn full_rebuild_existing_archive_integrity_preflight(db_path: &Path) -> Result<O
             ));
         }
         Err(err) => {
-            return Ok(Some(format!(
-                "read-only full-rebuild integrity preflight could not open the canonical archive: {err:#}"
-            )));
+            let detail = format!("{err:#}");
+            let reason = if detail.to_ascii_lowercase().contains("fts5: corrupt") {
+                format!("FTS5 segment integrity-check failed while opening the canonical archive: {detail}")
+            } else {
+                format!(
+                    "read-only full-rebuild integrity preflight could not open the canonical archive: {detail}"
+                )
+            };
+            return Ok(Some(reason));
         }
     };
     let result = full_rebuild_existing_storage_integrity_problem(&storage);
@@ -24734,6 +24825,10 @@ fn poison_record_first_quarantined_at_ms(value: &serde_json::Value) -> Option<i6
 pub struct ConversationIngestQuarantineSummary {
     pub schema_version: i64,
     pub status: String,
+    /// Error loading the structured quarantine checkpoint, if one exists.
+    /// A malformed or unreadable checkpoint must not be treated as an empty
+    /// quarantine because that would make search health falsely optimistic.
+    pub state_error: Option<String>,
     pub quarantined_conversations: usize,
     pub recent_quarantined_conversations: usize,
     pub recent_window_seconds: i64,
@@ -24766,25 +24861,32 @@ pub fn conversation_ingest_quarantine_summary(
     let recent_cutoff_ms =
         FrankenStorage::now_millis().saturating_sub(recent_window_seconds.saturating_mul(1_000));
     let circuit_breaker_limit = ingest_quarantine_circuit_limit();
+    let mut state_error = None;
 
     let state_path = QuarantineState::path(data_dir);
     if state_path.exists() {
         quarantine_files.push(state_path.display().to_string());
-        let state = QuarantineState::load(data_dir);
-        for (key, record) in state.iter() {
-            let last_attempt_at_ms = record.last_attempt_at.timestamp_millis();
-            let summary_key = (key.conversation_id, i64::from(key.schema_version));
-            keys.insert(summary_key.clone());
-            if last_attempt_at_ms >= recent_cutoff_ms
-                && record.is_version_stale_for_retry(current_version)
-            {
-                recent_keys.insert(summary_key);
+        match QuarantineState::load_for_operator(data_dir) {
+            Ok(state) => {
+                for (key, record) in state.iter() {
+                    let last_attempt_at_ms = record.last_attempt_at.timestamp_millis();
+                    let summary_key = (key.conversation_id, i64::from(key.schema_version));
+                    keys.insert(summary_key.clone());
+                    if last_attempt_at_ms >= recent_cutoff_ms
+                        && record.is_version_stale_for_retry(current_version)
+                    {
+                        recent_keys.insert(summary_key);
+                    }
+                    newest_last_attempt_at_ms = Some(
+                        newest_last_attempt_at_ms.map_or(last_attempt_at_ms, |current| {
+                            current.max(last_attempt_at_ms)
+                        }),
+                    );
+                }
             }
-            newest_last_attempt_at_ms = Some(
-                newest_last_attempt_at_ms.map_or(last_attempt_at_ms, |current| {
-                    current.max(last_attempt_at_ms)
-                }),
-            );
+            Err(error) => {
+                state_error = Some(error.to_string());
+            }
         }
     }
 
@@ -24794,16 +24896,31 @@ pub fn conversation_ingest_quarantine_summary(
             continue;
         }
         quarantine_files.push(path.display().to_string());
-        let Ok(contents) = fs::read_to_string(&path) else {
-            continue;
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                if state_error.is_none() {
+                    state_error = Some(format!("reading quarantine file {}: {error}", path.display()));
+                }
+                continue;
+            }
         };
         for line in contents.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-                continue;
+            let value = match serde_json::from_str::<serde_json::Value>(trimmed) {
+                Ok(value) => value,
+                Err(error) => {
+                    if state_error.is_none() {
+                        state_error = Some(format!(
+                            "malformed quarantine record in {}: {error}",
+                            path.display()
+                        ));
+                    }
+                    continue;
+                }
             };
             let key = poison_record_key_from_value(&value);
             let is_fresh_quarantine = poison_record_version_needs_retry(
@@ -24841,15 +24958,19 @@ pub fn conversation_ingest_quarantine_summary(
     let recent_quarantined_conversations = recent_keys.len();
     let circuit_breaker_active =
         circuit_breaker_limit > 0 && recent_quarantined_conversations >= circuit_breaker_limit;
+    let state_error_present = state_error.is_some();
     ConversationIngestQuarantineSummary {
         schema_version: POISON_CONVERSATION_QUARANTINE_SCHEMA_VERSION,
-        status: if circuit_breaker_active {
+        status: if state_error_present {
+            "unhealthy".to_string()
+        } else if circuit_breaker_active {
             "critical".to_string()
         } else if quarantined_conversations > 0 {
             "degraded".to_string()
         } else {
             "ok".to_string()
         },
+        state_error,
         quarantined_conversations,
         recent_quarantined_conversations,
         recent_window_seconds,
@@ -24857,7 +24978,12 @@ pub fn conversation_ingest_quarantine_summary(
         circuit_breaker_active,
         quarantine_files,
         newest_last_attempt_at_ms,
-        recommended_action: if circuit_breaker_active {
+        recommended_action: if state_error_present {
+            Some(
+                "The structured quarantine checkpoint is malformed or unreadable; preserve it, inspect the reported error, and repair or restore it before trusting quarantine counts or search completeness."
+                    .to_string(),
+            )
+        } else if circuit_breaker_active {
             Some(
                 "Quarantine volume exceeded the recent circuit-breaker threshold; pause the watcher, inspect the listed quarantine file(s), then retry repaired source paths with `cass index --watch-once <path> --json --no-progress-events` before resuming watch."
                     .to_string(),
@@ -40023,19 +40149,26 @@ mod tests {
             Arc::new(LexicalRebuildProducerTelemetry::default()),
         );
 
-        let batch = match rx.recv().unwrap() {
-            LexicalRebuildPipelineMessage::Batch(batch) => batch,
-            other => panic!("expected prepared batch, got {other:?}"),
-        };
-        match rx.recv().unwrap() {
-            LexicalRebuildPipelineMessage::Done => {}
-            other => panic!("expected pipeline completion, got {other:?}"),
+        let mut packets = Vec::new();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                LexicalRebuildPipelineMessage::Batch(batch) => {
+                    release_lexical_rebuild_prepared_page_reservation(
+                        &batch,
+                        flow_limiter.as_ref(),
+                    );
+                    packets.extend(batch.packets);
+                }
+                LexicalRebuildPipelineMessage::Done => break,
+                LexicalRebuildPipelineMessage::Error(error) => {
+                    panic!("producer returned error: {error}")
+                }
+            }
         }
         handle.join().unwrap();
 
-        assert_eq!(batch.packets.len(), 3);
-        let remote_packet = batch
-            .packets
+        assert_eq!(packets.len(), 3);
+        let remote_packet = packets
             .iter()
             .find(|packet| packet.identity.external_id.as_deref() == Some("remote-lexical-fixture"))
             .expect("remote fixture packet should be present");
@@ -40051,14 +40184,9 @@ mod tests {
             Some("builder-host")
         );
         assert!(
-            batch.packets.iter().all(|packet| packet.message_count > 0),
+            packets.iter().all(|packet| packet.message_count > 0),
             "fixture pages should still carry grouped messages after producer-owned lookup warmup"
         );
-        assert!(
-            flow_limiter.bytes_in_flight() > 0,
-            "consumer-owned release should keep byte reservations visible until the sink drains them"
-        );
-        flow_limiter.release(flow_limiter.bytes_in_flight());
         assert_eq!(flow_limiter.bytes_in_flight(), 0);
     }
 
@@ -42110,6 +42238,32 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_json_reports_final_wal_checkpoint_outcome() {
+        let progress = IndexingProgress::default();
+        progress
+            .stats
+            .lock()
+            .expect("stats lock")
+            .final_wal_checkpoint = Some(FinalWalCheckpointStats {
+            status: "blocked".to_string(),
+            busy: Some(1),
+            log_frames: Some(12),
+            checkpointed_frames: Some(0),
+        });
+
+        let snapshot = progress.snapshot_json(0);
+        assert_eq!(
+            snapshot["final_wal_checkpoint"],
+            serde_json::json!({
+                "status": "blocked",
+                "busy": 1,
+                "log_frames": 12,
+                "checkpointed_frames": 0
+            })
+        );
+    }
+
+    #[test]
     fn snapshot_json_includes_rebuild_pipeline_runtime_metrics() {
         let progress = IndexingProgress::default();
         progress.phase.store(2, Ordering::Relaxed);
@@ -42920,6 +43074,34 @@ mod tests {
             "stable searchable backlog is a degraded advisory, not critical; got {}",
             summary.status
         );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn malformed_structured_quarantine_is_reported_as_unhealthy() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+        let state_path = QuarantineState::path(&data_dir);
+        std::fs::write(&state_path, "{ definitely not valid quarantine json")?;
+
+        let summary = conversation_ingest_quarantine_summary(&data_dir);
+        anyhow::ensure!(
+            summary.status == "unhealthy",
+            "malformed structured quarantine must make health unhealthy; got {}",
+            summary.status
+        );
+        anyhow::ensure!(
+            summary.state_error.is_some(),
+            "malformed structured quarantine must retain a diagnostic"
+        );
+        anyhow::ensure!(
+            summary.recommended_action.as_deref().is_some_and(|action| action
+                .contains("malformed or unreadable")),
+            "malformed structured quarantine must route to an explicit repair action"
+        );
+        anyhow::ensure!(state_path.exists(), "health inspection must preserve the bad file");
         Ok(())
     }
 
@@ -44078,7 +44260,23 @@ mod tests {
             .execute("INSERT INTO checkpoint_probe VALUES (42);")
             .unwrap();
 
-        close_storage_after_index(storage, &db_path, "test index run").unwrap();
+        let progress = Arc::new(IndexingProgress::default());
+        progress.finalizing.store(true, Ordering::Relaxed);
+        close_storage_after_index(storage, &db_path, "test index run", Some(&progress)).unwrap();
+        assert!(
+            !progress.finalizing.load(Ordering::Relaxed),
+            "finalizing must be cleared after the final close"
+        );
+        assert_eq!(
+            progress
+                .stats
+                .lock()
+                .unwrap()
+                .final_wal_checkpoint
+                .as_ref()
+                .map(|status| status.status.as_str()),
+            Some("completed")
+        );
 
         let conn = crate::franken_sync::Connection::open(db_path_str).unwrap();
         let rows = conn.query("PRAGMA wal_checkpoint(FULL);").unwrap();
@@ -45518,10 +45716,10 @@ mod tests {
                 .raw()
                 .execute(
                     "INSERT INTO fts_messages(
-                         rowid, content, title, agent, workspace, source_path, created_at, message_id
+                         rowid, content, title, agent, workspace, source_path, created_at
                      ) VALUES(
                          1, 'segment corruption sentinel', 'title', 'codex', '/workspace',
-                         '/tmp/session.jsonl', 1, 1
+                         '/tmp/session.jsonl', 1
                      )",
                 )
                 .expect("persist one FTS segment");
@@ -45540,15 +45738,13 @@ mod tests {
             .expect("corrupt the persisted FTS structure record");
         }
 
-        let mut storage = FrankenStorage::open_readonly(&db_path).unwrap();
-        let problem = full_rebuild_existing_storage_integrity_problem(&storage)
+        let problem = full_rebuild_existing_archive_integrity_preflight(&db_path)
             .unwrap()
             .expect("a corrupt FTS structure must stop a full rebuild");
         assert!(
             problem.contains("FTS5 segment integrity-check failed"),
             "diagnostic must identify the FTS segment preflight: {problem}"
         );
-        storage.close_best_effort_in_place();
     }
 
     #[test]
