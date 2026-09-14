@@ -60902,7 +60902,27 @@ fn doctor_probe_mutation_lock(data_dir: &Path) -> DoctorMutationLockObservation 
         return DoctorMutationLockObservation::Absent { path };
     }
 
-    let file = match OpenOptions::new().read(true).write(true).open(&path) {
+    let path_metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            return DoctorMutationLockObservation::Unavailable {
+                path,
+                reason: format!("failed to inspect doctor mutation lock path: {err}"),
+            };
+        }
+    };
+    if !path_metadata.file_type().is_file() {
+        return DoctorMutationLockObservation::Unavailable {
+            path,
+            reason: "doctor mutation lock path is not a regular file".to_string(),
+        };
+    }
+
+    // Read-only readiness surfaces may run concurrently. They must share
+    // the lock while inspecting it; taking an exclusive probe lock here made
+    // a second status/health process observe the first probe as an active
+    // doctor repair for the duration of the probe.
+    let file = match OpenOptions::new().read(true).open(&path) {
         Ok(file) => file,
         Err(err) => {
             return DoctorMutationLockObservation::Unavailable {
@@ -60912,9 +60932,9 @@ fn doctor_probe_mutation_lock(data_dir: &Path) -> DoctorMutationLockObservation 
         }
     };
     let metadata = doctor_read_lock_metadata(&file);
-    match fs2::FileExt::try_lock_exclusive(&file) {
+    match fs2::FileExt::try_lock_shared(&file) {
         Ok(()) => {
-            let _ = fs2::FileExt::unlock(&file);
+            let _ = fs2::FileExt::unlock_shared(&file);
             DoctorMutationLockObservation::Available { path, metadata }
         }
         Err(err) if doctor_lock_probe_error_is_active(&err) => {
@@ -100468,6 +100488,28 @@ mod response_schema_tests {
             summary["operation_outcome"]["reason"],
             "repair readiness is blocked because the doctor mutation lock could not be inspected safely"
         );
+    }
+
+    #[test]
+    fn doctor_read_only_lock_probes_share_without_reporting_active_repair() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lock_path = temp.path().join("doctor/locks/doctor-repair.lock");
+        std::fs::create_dir_all(lock_path.parent().expect("lock parent")).expect("lock parent");
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock");
+        fs2::FileExt::try_lock_shared(&holder).expect("hold shared read-only probe lock");
+
+        let observation = doctor_probe_mutation_lock(temp.path());
+        assert!(
+            matches!(observation, DoctorMutationLockObservation::Available { .. }),
+            "concurrent read-only probes must share the doctor lock: {observation:?}"
+        );
+
+        fs2::FileExt::unlock_shared(&holder).expect("release shared read-only probe lock");
     }
 
     #[test]
