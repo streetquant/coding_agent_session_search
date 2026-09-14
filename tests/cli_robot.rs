@@ -126,6 +126,7 @@ fn isolated_search_demo_data() -> Result<TempDir, Box<dyn Error>> {
     let snapshot_lock_path = src.join("index-run.lock");
     let snapshot_lock = fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .truncate(false)
