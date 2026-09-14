@@ -60934,7 +60934,7 @@ fn doctor_probe_mutation_lock(data_dir: &Path) -> DoctorMutationLockObservation 
     let metadata = doctor_read_lock_metadata(&file);
     match fs2::FileExt::try_lock_shared(&file) {
         Ok(()) => {
-            let _ = fs2::FileExt::unlock_shared(&file);
+            let _ = fs2::FileExt::unlock(&file);
             DoctorMutationLockObservation::Available { path, metadata }
         }
         Err(err) if doctor_lock_probe_error_is_active(&err) => {
@@ -100509,7 +100509,7 @@ mod response_schema_tests {
             "concurrent read-only probes must share the doctor lock: {observation:?}"
         );
 
-        fs2::FileExt::unlock_shared(&holder).expect("release shared read-only probe lock");
+        fs2::FileExt::unlock(&holder).expect("release shared read-only probe lock");
     }
 
     #[test]
