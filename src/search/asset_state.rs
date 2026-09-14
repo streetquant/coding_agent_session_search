@@ -18,8 +18,7 @@ use anyhow::{Context, Result};
 
 use crate::indexer::{
     LEXICAL_REBUILD_PAGE_SIZE_PUBLIC, LexicalRebuildCheckpoint,
-    lexical_rebuild_page_size_is_compatible, lexical_storage_fingerprint_for_db,
-    load_lexical_rebuild_checkpoint,
+    lexical_rebuild_page_size_is_compatible, load_lexical_rebuild_checkpoint,
 };
 use crate::search::ann_index::hnsw_index_path;
 use crate::search::embedder::Embedder;
@@ -1427,12 +1426,18 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
         .with_context(|| format!("loading lexical checkpoint from {}", index_path.display()))?;
     let current_db_fingerprint = if db_available && compute_lexical_fingerprint {
         Some(
-            lexical_storage_fingerprint_for_db(db_path).with_context(|| {
-                format!(
-                    "computing lexical storage fingerprint for {}",
-                    db_path.display()
-                )
-            })?,
+            // Keep the status/opened path on the same identity-keyed cache
+            // used by search. Health intentionally remains skip-open and
+            // serves this sidecar read-only; priming it here lets a status
+            // immediately followed by health agree even when an older
+            // matching checkpoint predates the sidecar.
+            crate::indexer::lexical_storage_fingerprint_for_db_cached(db_path, &index_path)
+                .with_context(|| {
+                    format!(
+                        "computing lexical storage fingerprint for {}",
+                        db_path.display()
+                    )
+                })?,
         )
     } else if db_available {
         // GH #353: the skip-open surfaces (health watermark lane, count-less

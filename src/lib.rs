@@ -85311,6 +85311,107 @@ mod cli_read_db_tests {
         );
     }
 
+    /// GH #353 / CASS 0.8 status-health parity: an older completed checkpoint
+    /// can still prove freshness when its archive fingerprint matches the live
+    /// database. Status opens the archive and must prime the identity-keyed
+    /// fingerprint sidecar so the following health probe (which deliberately
+    /// skips the archive open) reaches the same verdict. Health may read the
+    /// sidecar, but must not rewrite the cache or rebuild marker history while
+    /// doing so.
+    #[test]
+    fn health_follows_status_for_old_matching_checkpoint_without_sidecar() {
+        let (temp, db_path) = seed_cli_db();
+        let now_ms = FrankenStorage::now_millis();
+        {
+            let storage = FrankenStorage::open(&db_path).expect("reopen cass db");
+            storage
+                .set_last_indexed_at(now_ms)
+                .expect("set current last_indexed_at");
+            storage
+                .set_last_scan_ts(now_ms.saturating_sub(1_000))
+                .expect("set current last_scan_ts");
+        }
+
+        let index_path = crate::search::tantivy::expected_index_dir(temp.path());
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill index marker");
+
+        let fingerprint = crate::indexer::lexical_storage_fingerprint_for_db(&db_path)
+            .expect("compute matching archive fingerprint");
+        let checkpoint_path = index_path.join(".lexical-rebuild-state.json");
+        let checkpoint = serde_json::json!({
+            "version": 2,
+            "schema_hash": crate::search::tantivy::SCHEMA_HASH,
+            "db": {
+                "db_path": db_path.display().to_string(),
+                "total_conversations": 0,
+                "storage_fingerprint": fingerprint
+            },
+            "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
+            "committed_offset": 0,
+            "committed_conversation_id": null,
+            "processed_conversations": 0,
+            "indexed_docs": 0,
+            "committed_meta_fingerprint": null,
+            "pending": null,
+            "completed": true,
+            "updated_at_ms": now_ms
+        });
+        std::fs::write(
+            &checkpoint_path,
+            serde_json::to_vec_pretty(&checkpoint).expect("serialize old checkpoint"),
+        )
+        .expect("write old checkpoint");
+
+        let cache_path = index_path.join(crate::indexer::ARCHIVE_FINGERPRINT_CACHE_FILE);
+        assert!(
+            !cache_path.exists(),
+            "the regression must begin with a checkpoint predating the fingerprint sidecar"
+        );
+
+        let status = state_meta_json_for_status(temp.path(), &db_path, 60);
+        assert_eq!(status["index"]["status"], "ready", "status: {status}");
+        assert_eq!(status["index"]["fresh"], true, "status: {status}");
+        assert_eq!(
+            status["index"]["fingerprint"]["matches_current_db_fingerprint"], true,
+            "status must compare the live fingerprint to the old checkpoint: {status}"
+        );
+        assert!(
+            cache_path.is_file(),
+            "status must prime the sidecar consumed by health"
+        );
+        let cache_before_health =
+            std::fs::read(&cache_path).expect("read primed fingerprint cache");
+        let checkpoint_before_health =
+            std::fs::read(&checkpoint_path).expect("read rebuild marker before health");
+
+        let health = state_meta_json_for_health(temp.path(), &db_path, 60);
+        assert_eq!(health["index"]["status"], "ready", "health: {health}");
+        assert_eq!(health["index"]["fresh"], true, "health: {health}");
+        assert_eq!(health["index"]["stale"], false, "health: {health}");
+        assert_eq!(
+            health["index"]["fingerprint"]["matches_current_db_fingerprint"], true,
+            "health must reuse the fingerprint status computed for the same archive: {health}"
+        );
+        assert_eq!(health["rebuild"]["active"], false, "health: {health}");
+        assert_eq!(health["rebuild"]["orphaned"], false, "health: {health}");
+        assert_eq!(health["database"]["open_skipped"], true, "health: {health}");
+        assert_eq!(
+            std::fs::read(&cache_path).expect("read fingerprint cache after health"),
+            cache_before_health,
+            "health must preserve fingerprint-marker history byte-for-byte"
+        );
+        assert_eq!(
+            std::fs::read(&checkpoint_path).expect("read rebuild marker after health"),
+            checkpoint_before_health,
+            "health must preserve rebuild-marker history byte-for-byte"
+        );
+    }
+
     #[test]
     fn status_state_still_probes_malformed_non_file_db_path() {
         let temp = TempDir::new().expect("tempdir");
