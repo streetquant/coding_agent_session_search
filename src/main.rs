@@ -1,3 +1,7 @@
+// `unsafe` is denied crate-wide outside tests; the only sanctioned sites carry
+// `#[allow(unsafe_code)]` + a SAFETY comment (startup env writes, unavoidable FFI per AGENTS.md).
+#![cfg_attr(not(test), deny(unsafe_code))]
+
 fn env_requests_robot_output() -> bool {
     let cass_output_format = dotenvy::var("CASS_OUTPUT_FORMAT")
         .ok()
@@ -171,6 +175,7 @@ fn handle_fatal_error(err: coding_agent_search::CliError) -> ! {
     std::process::exit(err.code);
 }
 
+#[allow(unsafe_code)]
 fn apply_default_tantivy_writer_thread_cap() {
     let configured = dotenvy::var("CASS_TANTIVY_MAX_WRITER_THREADS")
         .ok()
@@ -182,6 +187,7 @@ fn apply_default_tantivy_writer_thread_cap() {
         // any Tantivy writers.
         let default_cap =
             coding_agent_search::search::tantivy::default_tantivy_max_writer_threads();
+        // SAFETY: single-threaded startup before any runtime thread exists.
         unsafe {
             std::env::set_var("CASS_TANTIVY_MAX_WRITER_THREADS", default_cap.to_string());
         }
@@ -204,6 +210,7 @@ fn apply_default_tantivy_writer_thread_cap() {
 ///
 /// Operators who need full per-cursor provenance can override by exporting
 /// `FSQLITE_READ_WITNESS_CAP=0` (or any value) before launching cass.
+#[allow(unsafe_code)]
 fn apply_default_fsqlite_read_witness_cap() {
     // The env var is parsed once by frankensqlite at first cursor construction
     // and cached in a process-wide OnceLock, so a later `set_var` after a
@@ -249,6 +256,26 @@ fn main() -> anyhow::Result<()> {
     apply_default_fsqlite_read_witness_cap();
 
     let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.get(1).map(String::as_str)
+        == Some(coding_agent_search::indexer::FINAL_WAL_CHECKPOINT_WORKER_ARG)
+    {
+        if raw_args.len() != 4 {
+            anyhow::bail!(
+                "{} requires exactly a database path and checkpoint context",
+                coding_agent_search::indexer::FINAL_WAL_CHECKPOINT_WORKER_ARG
+            );
+        }
+        let db_path = std::path::Path::new(&raw_args[2]);
+        let worker_result =
+            coding_agent_search::indexer::run_final_wal_checkpoint_worker(db_path, &raw_args[3]);
+        // Release any cached synchronous bridge runtimes even when opening or
+        // checkpointing the worker DB fails, before the process tears down.
+        let _ = coding_agent_search::shutdown_thread_local_bridge_runtimes();
+        let outcome = worker_result?;
+        println!("{}", serde_json::to_string(&outcome)?);
+        return Ok(());
+    }
+
     let parsed = match coding_agent_search::parse_cli(raw_args) {
         Ok(parsed) => parsed,
         Err(err) => handle_fatal_error(err),

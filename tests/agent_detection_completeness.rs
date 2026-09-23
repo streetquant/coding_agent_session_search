@@ -124,8 +124,24 @@ fn connector_factories_all_instantiate_and_detect() {
 
     // Required base connectors always present
     for required in [
-        "codex", "cline", "gemini", "claude", "clawdbot", "vibe", "amp", "aider", "pi_agent",
-        "factory", "omp", "openclaw", "copilot", "grok",
+        "codex",
+        "cline",
+        "gemini",
+        "claude",
+        "clawdbot",
+        "vibe",
+        "amp",
+        "aider",
+        "pi_agent",
+        "factory",
+        "omp",
+        "openclaw",
+        "copilot",
+        "grok",
+        "muse",
+        "prime_agent",
+        "kiro",
+        "devin",
     ] {
         assert!(
             unique.contains(required),
@@ -134,19 +150,21 @@ fn connector_factories_all_instantiate_and_detect() {
     }
 }
 
-/// Feature-gated connectors (chatgpt, cursor, opencode, crush, goose, hermes)
+/// Feature-gated connectors (chatgpt, cursor, opencode, crush, goose, hermes, devin)
 /// are available because cass enables those features in Cargo.toml.
 #[test]
 fn feature_gated_connectors_available() {
     let slugs = factory_fad_slugs();
-    for gated in ["chatgpt", "cursor", "opencode", "crush", "goose", "hermes"] {
+    for gated in [
+        "chatgpt", "cursor", "opencode", "crush", "goose", "hermes", "devin",
+    ] {
         assert!(
             slugs.contains(gated),
             "Feature-gated connector '{gated}' not found. \
              Check Cargo.toml enables the feature for franken-agent-detection"
         );
     }
-    assert_eq!(slugs.len(), 26, "Expected 26 connector factories");
+    assert_eq!(slugs.len(), 29, "Expected 29 connector factories");
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +219,16 @@ fn probe_paths_cover_all_factory_connectors() {
 fn probe_paths_are_tilde_relative() {
     let paths = franken_agent_detection::default_probe_paths_tilde();
     for (slug, paths) in &paths {
+        if *slug == "shelley" {
+            // A live SQLite database and WAL cannot yet be copied as a
+            // consistent remote bundle (GH #415). Local detection remains
+            // available, but advertising remote paths would be unsafe.
+            assert!(
+                paths.is_empty(),
+                "Shelley remote probes must remain disabled"
+            );
+            continue;
+        }
         assert!(!paths.is_empty(), "Connector '{slug}' has no probe paths");
         for path in paths {
             assert!(
@@ -450,4 +478,666 @@ fn new_agent_auto_discovery_documented() {
         report.summary.detected_count
     );
     eprintln!("  - Adding a connector to FAD auto-discovers in cass.");
+}
+
+mod prime_ingestion {
+    use super::*;
+    use coding_agent_search::connectors::{ScanContext, ScanRoot};
+    use serde_json::{Value, json};
+    use std::fs;
+    use std::io::Write;
+    use std::time::Duration;
+
+    #[test]
+    fn prime_active_branch_survives_cli_ingestion_and_incremental_append() {
+        let home = tempfile::tempdir().expect("isolated Prime home");
+        let sessions = home.path().join(".prime/agent/sessions");
+        let data = home.path().join("cass-data");
+        fs::create_dir_all(&sessions).expect("Prime session root");
+        let source = sessions.join("custom-session-id.jsonl");
+        let records = [
+            json!({"type":"session", "version":3, "id":"prime-session",
+                "timestamp":"2026-01-05T10:00:00Z", "cwd":"/work/prime"}),
+            json!({"type":"message", "id":"aaaa0001", "parentId":null,
+                "message":{"role":"user", "content":"primeneedle investigate"}}),
+            json!({"type":"message", "id":"aaaa0002", "parentId":"aaaa0001",
+                "message":{"role":"assistant", "content":"excludedbranch"}}),
+            json!({"type":"message", "id":"aaaa0003", "parentId":"aaaa0001",
+                "message":{"role":"assistant", "model":"model", "provider":"provider",
+                    "content":[{"type":"text", "text":"primeneedle corrected"},
+                        {"type":"thinking", "thinking":"inspect the active branch"},
+                        {"type":"image", "mimeType":"image/png", "data":"excludedimage"}],
+                    "usage":{"input":12,"output":7,"cacheRead":1,"cacheWrite":2}}}),
+            json!({"type":"message", "id":"aaaa0004", "parentId":"aaaa0003",
+                "message":{"role":"toolResult", "toolCallId":"call", "toolName":"shell",
+                    "content":[{"type":"text", "text":"primeneedle verified"}]}}),
+        ];
+        let mut bytes = records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        bytes.push('\n');
+        fs::write(&source, &bytes).expect("versioned Prime transcript");
+
+        let (_, factory) = get_connector_factories()
+            .into_iter()
+            .find(|(slug, _)| *slug == "prime_agent")
+            .expect("Prime factory");
+        let ctx = ScanContext::with_roots(
+            home.path().to_path_buf(),
+            vec![ScanRoot::local(sessions)],
+            None,
+        );
+        let conversations = factory().scan(&ctx).expect("Prime scan");
+        assert_eq!(conversations.len(), 1);
+        let conversation = &conversations[0];
+        assert_eq!(conversation.agent_slug, "prime_agent");
+        assert_eq!(conversation.external_id.as_deref(), Some("prime-session"));
+        assert_eq!(conversation.metadata["omitted_branch_entry_count"], 1);
+        assert_eq!(conversation.messages.len(), 3);
+        assert_eq!(conversation.messages[2].role, "tool");
+        assert!(
+            conversation.messages[1]
+                .content
+                .contains("inspect the active branch")
+        );
+        assert_eq!(conversation.messages[1].extra["usage"]["cacheRead"], 1);
+        for message in &conversation.messages {
+            assert!(!message.content.contains("excluded"));
+            assert!(!message.extra.to_string().contains("excludedimage"));
+        }
+
+        let cass = || {
+            let mut cmd = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+            cmd.env_clear()
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .env("PATH", "")
+                .env("XDG_DATA_HOME", home.path().join(".local/share"))
+                .env("XDG_CONFIG_HOME", home.path().join(".config"))
+                .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+                .env("CASS_AUTO_REFRESH", "0")
+                .env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0")
+                .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+                .env("RUST_MIN_STACK", "134217728")
+                .current_dir(home.path())
+                .arg("--data-dir")
+                .arg(&data)
+                .timeout(Duration::from_secs(120));
+            if let Ok(system_root) = dotenvy::var("SystemRoot") {
+                cmd.env("SystemRoot", system_root);
+            }
+            cmd
+        };
+        for round in 0..3 {
+            if round == 1 {
+                let line = json!({"type":"message", "id":"aaaa0005", "parentId":"aaaa0004",
+                    "message":{"role":"user", "content":"primeneedle followup"}})
+                .to_string()
+                    + "\n";
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&source)
+                    .expect("append source")
+                    .write_all(line.as_bytes())
+                    .expect("new Prime turn");
+                bytes.push_str(&line);
+            }
+            cass()
+                .args(if round == 0 {
+                    vec!["index", "--full", "--json"]
+                } else {
+                    vec!["index", "--json"]
+                })
+                .assert()
+                .success();
+            let output = cass()
+                .args([
+                    "search",
+                    "primeneedle",
+                    "--agent",
+                    "prime_agent",
+                    "--mode",
+                    "lexical",
+                    "--json",
+                    "--limit",
+                    "20",
+                ])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            let result: Value = serde_json::from_slice(&output).expect("Prime search JSON");
+            let hits = result["hits"].as_array().expect("Prime hits");
+            assert_eq!(hits.len(), if round == 0 { 3 } else { 4 }, "{result}");
+            assert!(hits.iter().all(|hit| hit["agent"] == "prime_agent"));
+            assert_eq!(
+                fs::read_to_string(&source).expect("preserved transcript"),
+                bytes
+            );
+        }
+    }
+}
+
+/// GH449: the Devin factory exists even when its SQLite parser is compiled out.
+/// Exercise the persisted provider format through the factory and real CLI so
+/// slug enumeration alone cannot certify support again.
+mod devin_ingestion {
+    use super::*;
+    use coding_agent_search::connectors::{ScanContext, ScanRoot};
+    use coding_agent_search::franken_sync::compat::ConnectionExt;
+    use coding_agent_search::franken_sync::{Connection, params};
+    use serde_json::{Value, json};
+    use std::fs;
+    use std::time::Duration;
+
+    fn seed_store(path: &Path) {
+        let conn = Connection::open(path.to_string_lossy().as_ref()).expect("create Devin store");
+        // Schema and JSON shapes from the published FAD 0.2.3 Devin connector,
+        // independently populated here with branch, hidden and empty sessions.
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY, title TEXT, working_directory TEXT,
+                 model TEXT, agent_mode TEXT, created_at INTEGER,
+                 last_activity_at INTEGER, main_chain_id INTEGER,
+                 hidden INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE message_nodes (
+                 node_id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
+                 parent_node_id INTEGER, chat_message TEXT, created_at INTEGER
+             );
+             INSERT INTO sessions VALUES
+                 ('kept', 'Devin branch repair', '/work/devin', 'model', 'agent',
+                  1700000000, 1700000060, 5, 0),
+                 ('hidden', 'Retired', NULL, NULL, NULL, 1700000000, 1700000060, 7, 1),
+                 ('empty', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0);
+             COMMIT;",
+        )
+        .expect("seed Devin schema");
+        for (session, id, parent, message) in [
+            (
+                "kept",
+                1,
+                None,
+                json!({"role":"system", "content":"excludedpolicy"}),
+            ),
+            (
+                "kept",
+                2,
+                Some(1),
+                json!({"role":"user", "content":"devinneedle fix the branch",
+                "images":[{"data":"excludedimagepayload", "mime_type":"image/png"}]}),
+            ),
+            (
+                "kept",
+                3,
+                Some(2),
+                json!({"role":"assistant", "content":"devinneedle inspect",
+                "thinking":{"thinking":"follow the parent chain", "signature":"signature"},
+                "tool_calls":[{"id":"call-1", "index":0, "kind":"function", "name":"shell",
+                    "arguments":{"command":"git status"}}]}),
+            ),
+            (
+                "kept",
+                4,
+                Some(3),
+                json!({"role":"tool", "content":"devinneedle clean tree", "tool_call_id":"call-1"}),
+            ),
+            (
+                "kept",
+                5,
+                Some(4),
+                json!({"role":"assistant", "content":"devinneedle repaired"}),
+            ),
+            (
+                "kept",
+                6,
+                Some(2),
+                json!({"role":"assistant", "content":"excludedabandonedbranch"}),
+            ),
+            (
+                "hidden",
+                7,
+                None,
+                json!({"role":"user", "content":"excludedhiddensession"}),
+            ),
+        ] {
+            conn.execute_compat(
+                "INSERT INTO message_nodes
+                 (session_id, node_id, parent_node_id, chat_message, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    session,
+                    id,
+                    parent,
+                    message.to_string(),
+                    1_700_000_000_i64 + i64::from(id)
+                ],
+            )
+            .expect("insert Devin message node");
+        }
+    }
+
+    fn source_bundle_bytes(db: &Path) -> Vec<Option<Vec<u8>>> {
+        ["", "-wal", "-shm"]
+            .into_iter()
+            .map(|suffix| {
+                let path = std::path::PathBuf::from(format!("{}{suffix}", db.display()));
+                path.exists()
+                    .then(|| fs::read(path).expect("source bundle bytes"))
+            })
+            .collect()
+    }
+
+    fn cass_command(home: &Path, data: &Path) -> std::process::Command {
+        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        cmd.env_clear()
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("PATH", "")
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("CASS_DEVIN_DATA_ROOT", home.join("sessions.db"))
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .current_dir(home)
+            .arg("--data-dir")
+            .arg(data);
+        if let Ok(system_root) = dotenvy::var("SystemRoot") {
+            cmd.env("SystemRoot", system_root);
+        }
+        cmd
+    }
+
+    fn cass(home: &Path, data: &Path) -> assert_cmd::Command {
+        let mut cmd = assert_cmd::Command::from_std(cass_command(home, data));
+        cmd.timeout(Duration::from_secs(120));
+        cmd
+    }
+
+    #[test]
+    fn devin_factory_reads_main_chain_without_mutating_source() {
+        let home = tempfile::tempdir().expect("isolated home");
+        let db = home.path().join("sessions.db");
+        seed_store(&db);
+        let before = fs::read(&db).expect("source bytes");
+        let (_, factory) = get_connector_factories()
+            .into_iter()
+            .find(|(slug, _)| *slug == "devin")
+            .expect("Devin factory");
+        let ctx = ScanContext::with_roots(
+            home.path().to_path_buf(),
+            vec![ScanRoot::local(db.clone())],
+            None,
+        );
+        let conversations = factory().scan(&ctx).expect("real Devin scan");
+        assert_eq!(
+            conversations.len(),
+            1,
+            "disabled parser or wrong branch selection"
+        );
+        let conversation = &conversations[0];
+        assert_eq!(conversation.agent_slug, "devin");
+        assert_eq!(conversation.external_id.as_deref(), Some("kept"));
+        assert_eq!(
+            conversation.workspace.as_deref(),
+            Some(Path::new("/work/devin"))
+        );
+        assert_eq!(conversation.source_path, db.join("kept"));
+        assert_eq!(conversation.started_at, Some(1_700_000_000_000));
+        assert_eq!(conversation.metadata["off_chain_nodes"], 1);
+        assert_eq!(conversation.messages.len(), 4);
+        assert_eq!(
+            conversation
+                .messages
+                .iter()
+                .map(|m| m.role.as_str())
+                .collect::<Vec<_>>(),
+            ["user", "assistant", "tool", "assistant"]
+        );
+        for message in &conversation.messages {
+            assert!(!message.content.contains("excluded"));
+        }
+        assert_eq!(fs::read(&db).expect("source after scan"), before);
+    }
+
+    #[test]
+    fn devin_cli_indexes_searches_and_reopens_without_duplicates() {
+        let home = tempfile::tempdir().expect("isolated home");
+        let db = home.path().join("sessions.db");
+        let data = home.path().join("cass-data");
+        seed_store(&db);
+        let mut before = source_bundle_bytes(&db);
+        let mut source_writer = None;
+        for round in 0..4 {
+            if round == 2 {
+                let conn = Connection::open(db.to_string_lossy().as_ref()).expect("Devin writer");
+                conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+                    .expect("live WAL store");
+                let now = chrono::Utc::now().timestamp();
+                conn.execute_compat(
+                    "INSERT INTO message_nodes VALUES (8, 'kept', 5, ?1, ?2)",
+                    params![
+                        json!({"role":"user", "content":"devinneedle followup"}).to_string(),
+                        now
+                    ],
+                )
+                .expect("append provider turn");
+                conn.execute_compat(
+                    "UPDATE sessions SET main_chain_id = 8, last_activity_at = ?1 WHERE id = 'kept'",
+                    params![now],
+                )
+                .expect("advance provider main chain");
+                assert!(
+                    fs::metadata(db.with_extension("db-wal"))
+                        .expect("live WAL")
+                        .len()
+                        > 32
+                );
+                source_writer = Some(conn);
+                before = source_bundle_bytes(&db);
+            }
+            cass(home.path(), &data)
+                .args(if round < 2 {
+                    vec!["index", "--full", "--json"]
+                } else {
+                    vec!["index", "--json"]
+                })
+                .assert()
+                .success();
+            let output = cass(home.path(), &data)
+                .args([
+                    "search",
+                    "devinneedle",
+                    "--mode",
+                    "lexical",
+                    "--agent",
+                    "devin",
+                    "--json",
+                    "--limit",
+                    "20",
+                ])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            let result: Value = serde_json::from_slice(&output).expect("search JSON");
+            let hits = result["hits"].as_array().expect("search hits");
+            assert_eq!(hits.len(), if round < 2 { 4 } else { 5 }, "{result}");
+            for hit in hits {
+                assert_eq!(hit["agent"], "devin");
+                assert_eq!(
+                    hit["source_path"],
+                    db.join("kept").to_string_lossy().as_ref()
+                );
+            }
+            assert_eq!(
+                source_bundle_bytes(&db),
+                before,
+                "source bundle changed in round {round}"
+            );
+        }
+        drop(source_writer);
+    }
+
+    #[test]
+    fn devin_file_override_watch_ingests_wal_only_commit_without_touching_source() {
+        use std::process::{Child, Stdio};
+        use std::time::Instant;
+
+        struct WatchChild(Child);
+
+        impl Drop for WatchChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let home = tempfile::tempdir().expect("isolated Devin watch home");
+        let db = home.path().join("sessions.db");
+        let data = home.path().join("cass-data");
+        seed_store(&db);
+        // Keep the provider's writer open throughout startup, the commit, and
+        // reader verification. Closing it could checkpoint the DB and conceal
+        // a watcher that observes only the main database file.
+        let writer = Connection::open(db.to_string_lossy().as_ref()).expect("live Devin writer");
+        writer
+            .execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+            .expect("provider WAL mode before watcher startup");
+        let initial_bundle = source_bundle_bytes(&db);
+        let initial_modified = fs::metadata(&db).unwrap().modified().unwrap();
+        let stdout_path = home.path().join("devin-watch.stdout");
+        let stderr_path = home.path().join("devin-watch.stderr");
+        let watch_logs = || {
+            format!(
+                "stdout:\n{}\nstderr:\n{}",
+                fs::read_to_string(&stdout_path).unwrap_or_default(),
+                fs::read_to_string(&stderr_path).unwrap_or_default(),
+            )
+        };
+        let mut watch = WatchChild(
+            cass_command(home.path(), &data)
+                // JSON mode suppresses the INFO readiness signal unless requested.
+                .arg("--verbose")
+                .args(["index", "--watch", "--watch-interval", "1", "--json"])
+                .env("RUST_LOG", "info")
+                .stdout(Stdio::from(fs::File::create(&stdout_path).unwrap()))
+                .stderr(Stdio::from(fs::File::create(&stderr_path).unwrap()))
+                .spawn()
+                .expect("start real Devin watcher"),
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let logs = watch_logs();
+            if logs.contains("watch mode: minimum interval between scan cycles") {
+                break;
+            }
+            assert!(
+                watch.0.try_wait().unwrap().is_none(),
+                "watch exited before installing notifications: {logs}"
+            );
+            assert!(Instant::now() < deadline, "watch startup timed out: {logs}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let search = |query: &str| {
+            let output = cass(home.path(), &data)
+                .args([
+                    "search",
+                    query,
+                    "--mode",
+                    "lexical",
+                    "--agent",
+                    "devin",
+                    "--json",
+                    "--no-maintenance",
+                    "--timeout",
+                    "3000",
+                    "--limit",
+                    "20",
+                ])
+                .timeout(Duration::from_secs(5))
+                .output()
+                .expect("read-only search while watching");
+            assert!(
+                output.status.success(),
+                "search failed: {}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                watch_logs(),
+            );
+            let result: Value = serde_json::from_slice(&output.stdout).expect("search JSON");
+            assert_ne!(
+                result.pointer("/budget/timed_out").and_then(Value::as_bool),
+                Some(true),
+                "a timed-out search cannot prove absence: {result}"
+            );
+            assert!(result["hits"].is_array(), "search hits missing: {result}");
+            result
+        };
+        assert_eq!(search("devinneedle")["hits"].as_array().unwrap().len(), 4);
+        assert_eq!(source_bundle_bytes(&db), initial_bundle);
+        assert_eq!(
+            fs::metadata(&db).unwrap().modified().unwrap(),
+            initial_modified
+        );
+
+        // Capture provider activity before a delayed commit. Its timestamp must
+        // precede the WAL event by more than a whole second, otherwise rounding
+        // the filesystem watermark could accidentally make this test pass.
+        let now = chrono::Utc::now().timestamp();
+        std::thread::sleep(Duration::from_millis(2100));
+        assert!(chrono::Utc::now().timestamp() > now + 1);
+        let mut committed_bundle = initial_bundle.clone();
+        // The second commit deliberately retains the older activity timestamp
+        // after the first callback has persisted its filesystem watermark.
+        for (node_id, parent_id, needle) in [
+            (8_i64, 5_i64, "devinwalneedle"),
+            (9, 8, "devindelayedwalneedle"),
+        ] {
+            writer
+                .execute_batch("BEGIN;")
+                .expect("begin provider append");
+            writer
+                .execute_compat(
+                    "INSERT INTO message_nodes VALUES (?1, 'kept', ?2, ?3, ?4)",
+                    params![
+                        node_id,
+                        parent_id,
+                        json!({"role":"user", "content":format!("{needle} new turn")}).to_string(),
+                        now
+                    ],
+                )
+                .expect("append provider node");
+            writer
+                .execute_compat(
+                    "UPDATE sessions SET main_chain_id = ?1, last_activity_at = ?2 WHERE id = 'kept'",
+                    params![node_id, now],
+                )
+                .expect("advance live main chain");
+            writer
+                .execute_batch("COMMIT;")
+                .expect("commit provider WAL");
+            let next_bundle = source_bundle_bytes(&db);
+            assert_eq!(next_bundle[0], initial_bundle[0], "commit touched main DB");
+            assert_eq!(
+                fs::metadata(&db).unwrap().modified().unwrap(),
+                initial_modified
+            );
+            assert_ne!(next_bundle[1], committed_bundle[1], "WAL did not change");
+            assert!(next_bundle[1].as_ref().is_some_and(|wal| wal.len() > 32));
+            committed_bundle = next_bundle;
+
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                assert!(
+                    watch.0.try_wait().unwrap().is_none(),
+                    "watch exited: {}",
+                    watch_logs(),
+                );
+                let result = search(needle);
+                assert_eq!(
+                    source_bundle_bytes(&db),
+                    committed_bundle,
+                    "reader mutated source"
+                );
+                assert_eq!(
+                    fs::metadata(&db).unwrap().modified().unwrap(),
+                    initial_modified
+                );
+                let hits = result["hits"].as_array().unwrap();
+                if !hits.is_empty() {
+                    assert_eq!(hits.len(), 1, "duplicate WAL ingestion: {result}");
+                    assert_eq!(hits[0]["agent"], "devin");
+                    assert_eq!(
+                        hits[0]["source_path"],
+                        db.join("kept").to_string_lossy().as_ref()
+                    );
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "WAL-only commit never became searchable: {result}\n{}",
+                    watch_logs(),
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            if node_id == 8 {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let watermark = fs::read(data.join("watch_state.json"))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                        .and_then(|state| state.pointer("/m/dv").and_then(Value::as_i64));
+                    if watermark.is_some_and(|timestamp| timestamp > (now + 1) * 1000) {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "first watch callback did not persist its event watermark: {watermark:?}\n{}",
+                        watch_logs()
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+        drop(watch);
+        assert_eq!(source_bundle_bytes(&db), committed_bundle);
+        assert_eq!(
+            fs::metadata(&db).unwrap().modified().unwrap(),
+            initial_modified
+        );
+        drop(writer);
+    }
+
+    #[test]
+    fn devin_reads_older_nullable_schema_and_rejects_unreadable_stores() {
+        use franken_agent_detection::connectors::devin::DevinConnector;
+
+        let home = tempfile::tempdir().expect("isolated source stores");
+        let db = home.path().join("sessions.db");
+        let conn = Connection::open(db.to_string_lossy().as_ref()).expect("older Devin store");
+        conn.execute_batch(
+            r#"CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, title TEXT, working_directory TEXT,
+                model TEXT, agent_mode TEXT, created_at INTEGER,
+                last_activity_at INTEGER, main_chain_id INTEGER
+             );
+             CREATE TABLE message_nodes (
+                node_id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
+                parent_node_id INTEGER, chat_message TEXT, created_at INTEGER
+             );
+             INSERT INTO sessions VALUES ('legacy', NULL, NULL, NULL, NULL, NULL, NULL, 1);
+             INSERT INTO message_nodes VALUES
+                (1, 'legacy', NULL, '{"role":"user","content":"older Devin turn"}', 1700000000);"#,
+        )
+        .expect("older schema without hidden column");
+        drop(conn);
+        let before = source_bundle_bytes(&db);
+        let conversations = DevinConnector::extract_from_sqlite(&db, None).expect("older scan");
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].title.as_deref(), Some("older Devin turn"));
+        assert_eq!(conversations[0].workspace, None);
+        assert_eq!(conversations[0].started_at, Some(1_700_000_000_000));
+        assert_eq!(source_bundle_bytes(&db), before);
+
+        let missing = home.path().join("missing.db");
+        assert!(DevinConnector::extract_from_sqlite(&missing, None).is_err());
+        assert!(
+            !missing.exists(),
+            "read-only missing store must not be created"
+        );
+        let corrupt = home.path().join("corrupt.db");
+        fs::write(&corrupt, b"invalid provider database").expect("corrupt fixture");
+        assert!(DevinConnector::extract_from_sqlite(&corrupt, None).is_err());
+        assert_eq!(
+            fs::read(corrupt).expect("corrupt source preserved"),
+            b"invalid provider database"
+        );
+    }
 }

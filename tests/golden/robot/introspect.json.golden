@@ -646,6 +646,23 @@
           ]
         },
         {
+          "name": "reconcile-conversation",
+          "description": "Targeted, idempotent lexical reconcile for ONE canonical conversation id (gh#382 partial-prefix recovery): upserts the conversation's full capped message set under stable document identities and publishes a successor generation. Retry-safe; no corpus-wide replay; the canonical archive is opened read-only",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "gc",
+          "description": "Reclaim merge-retired lexical segment files and exit (gh#453). Opens the lexical writer, which runs the engine's grace-period garbage sweep: a segment file is unlinked only once no published MANIFEST generation has referenced it for the engine's grace period (300 s), so readers on the previous generation are safe. Scans no sources and re-indexes nothing; every incremental `cass index` performs the same sweep at open. Reports files and bytes reclaimed (`--json` for automation)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "watch",
           "description": "Watch for changes and reindex automatically",
           "arg_type": "flag",
@@ -673,7 +690,7 @@
         },
         {
           "name": "semantic",
-          "description": "Build semantic vector index after text indexing. Progress reports canonical replay, embedding, vector publish, optional HNSW, manifest publish, and finalization as distinct phases. Set CASS_INDEX_STALL_DETECT_SECS=0 to disable stall diagnostics, or CASS_INDEX_STALL_ABORT_SECS=0 to keep abort-eligible lexical stalls report-only while still reporting semantic phase progress",
+          "description": "Build semantic vector index after text indexing. Progress reports canonical replay, embedding, vector publish, optional HNSW, manifest publish, and finalization as distinct phases. Set CASS_INDEX_STALL_DETECT_SECS=0 to disable stall diagnostics, or CASS_INDEX_STALL_ABORT_SECS=0 to keep abort-eligible lexical stalls report-only while still reporting semantic phase progress. Set CASS_INDEX_STALL_ABORT_ALL_PHASES=1 to promote the stall detector to a hard abort (exit 70) in every phase it reports on, including the otherwise report-only semantic/scribe lanes (issue #437)",
           "arg_type": "flag",
           "required": false,
           "enum_values": [
@@ -808,6 +825,27 @@
       "description": "Generate man page to stdout",
       "arguments": [],
       "has_json_output": false
+    },
+    {
+      "name": "bookmarks",
+      "description": "Save, list, search, remove, export, and import bookmarks (bookmarks.db)",
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "robot-docs",
@@ -1044,7 +1082,7 @@
         },
         {
           "name": "highlight",
-          "description": "Highlight matching terms in output (uses **bold** markers in text, <mark> in HTML)",
+          "description": "Highlight matching terms in snippets with **bold** markers (text and JSON output)",
           "arg_type": "flag",
           "required": false,
           "enum_values": [
@@ -1255,7 +1293,7 @@
         },
         {
           "name": "fields",
-          "description": "Select answer-pack top-level fields. Presets: minimal, summary, all",
+          "description": "Select answer-pack fields. Presets: minimal, standard, full, summary, all",
           "arg_type": "option",
           "value_type": "string",
           "required": false,
@@ -1424,6 +1462,17 @@
           "value_type": "integer",
           "required": false,
           "default": "2592000"
+        },
+        {
+          "name": "include-skill-content",
+          "description": "Include skill payload excerpts. Credentials remain redacted",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
           "name": "require-evidence",
@@ -3402,8 +3451,23 @@
     {
       "name": "quarantine",
       "description": "Inspect and manage the conversation-ingest quarantine (list / clear)",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "forget",
@@ -3464,50 +3528,170 @@
     {
       "name": "mirror",
       "description": "Inspect and prune raw-mirror evidence under explicit operator control",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "sources",
       "description": "Manage remote sources (P5.x)",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "models",
       "description": "Manage semantic search models",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "fleet",
       "description": "Fleet-safe upgrade rehearsal and bounded post-upgrade verification",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "lessons",
       "description": "Mine and query durable lessons from local evidence (commits, beads, proofs)",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "swarm",
       "description": "Read-only swarm operations status, work packets, and coordination lint",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "import",
       "description": "Import data from external sources",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "analytics",
       "description": "Token usage, tool, and model analytics",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "release-verify",
@@ -3630,8 +3814,23 @@
     {
       "name": "schedule",
       "description": "Keep the index fresh automatically via the OS scheduler (launchd / systemd user timers)",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     }
   ],
   "response_schemas": {
@@ -5578,6 +5777,21 @@
                 "null"
               ]
             },
+            "live_documents": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "hollow": {
+              "type": "boolean"
+            },
+            "segment_files": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "empty_with_messages": {
               "type": "boolean"
             },
@@ -7081,6 +7295,14 @@
                 },
                 "total_blob_bytes": {
                   "type": "integer"
+                },
+                "orphan_blob_count": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "orphan_blob_bytes": {
+                  "type": "integer",
+                  "minimum": 0
                 },
                 "amplified_source_count": {
                   "type": "integer"
@@ -12131,6 +12353,14 @@
                 },
                 "total_blob_bytes": {
                   "type": "integer"
+                },
+                "orphan_blob_count": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "orphan_blob_bytes": {
+                  "type": "integer",
+                  "minimum": 0
                 },
                 "amplified_source_count": {
                   "type": "integer"
@@ -29054,6 +29284,12 @@
             "status": {
               "type": "string"
             },
+            "state_error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "quarantined_conversations": {
               "type": "integer"
             },
@@ -29301,6 +29537,21 @@
                     "null"
                   ]
                 },
+                "live_documents": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "hollow": {
+                  "type": "boolean"
+                },
+                "segment_files": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
                 "empty_with_messages": {
                   "type": "boolean"
                 },
@@ -29376,6 +29627,15 @@
                 "exists": {
                   "type": "boolean"
                 },
+                "db_bytes": {
+                  "type": "integer"
+                },
+                "wal_bytes": {
+                  "type": "integer"
+                },
+                "shm_present": {
+                  "type": "boolean"
+                },
                 "opened": {
                   "type": "boolean"
                 },
@@ -29444,6 +29704,9 @@
                   "type": "boolean"
                 },
                 "orphaned": {
+                  "type": "boolean"
+                },
+                "engine_incompatible": {
                   "type": "boolean"
                 },
                 "pid": {
@@ -29831,6 +30094,12 @@
                 },
                 "status": {
                   "type": "string"
+                },
+                "state_error": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "quarantined_conversations": {
                   "type": "integer"
@@ -31262,6 +31531,16 @@
                 "null"
               ]
             },
+            "lexical_degrade_reason": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "query_fuel_exhausted",
+                null
+              ]
+            },
             "wildcard_fallback": {
               "type": "boolean"
             },
@@ -31791,6 +32070,21 @@
                         "null"
                       ]
                     },
+                    "live_documents": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "hollow": {
+                      "type": "boolean"
+                    },
+                    "segment_files": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
                     "empty_with_messages": {
                       "type": "boolean"
                     },
@@ -31866,6 +32160,15 @@
                     "exists": {
                       "type": "boolean"
                     },
+                    "db_bytes": {
+                      "type": "integer"
+                    },
+                    "wal_bytes": {
+                      "type": "integer"
+                    },
+                    "shm_present": {
+                      "type": "boolean"
+                    },
                     "opened": {
                       "type": "boolean"
                     },
@@ -31934,6 +32237,9 @@
                       "type": "boolean"
                     },
                     "orphaned": {
+                      "type": "boolean"
+                    },
+                    "engine_incompatible": {
                       "type": "boolean"
                     },
                     "pid": {
@@ -32322,6 +32628,12 @@
                     "status": {
                       "type": "string"
                     },
+                    "state_error": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
                     "quarantined_conversations": {
                       "type": "integer"
                     },
@@ -32562,6 +32874,18 @@
                       ]
                     },
                     "error": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "consecutive_failures": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "detail": {
                       "type": [
                         "string",
                         "null"
@@ -32988,6 +33312,21 @@
                 "null"
               ]
             },
+            "live_documents": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "hollow": {
+              "type": "boolean"
+            },
+            "segment_files": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "empty_with_messages": {
               "type": "boolean"
             },
@@ -33063,6 +33402,15 @@
             "exists": {
               "type": "boolean"
             },
+            "db_bytes": {
+              "type": "integer"
+            },
+            "wal_bytes": {
+              "type": "integer"
+            },
+            "shm_present": {
+              "type": "boolean"
+            },
             "opened": {
               "type": "boolean"
             },
@@ -33134,6 +33482,9 @@
               "type": "boolean"
             },
             "orphaned": {
+              "type": "boolean"
+            },
+            "engine_incompatible": {
               "type": "boolean"
             },
             "pid": {
@@ -33655,6 +34006,12 @@
             },
             "status": {
               "type": "string"
+            },
+            "state_error": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "quarantined_conversations": {
               "type": "integer"
@@ -35050,6 +35407,21 @@
                 "null"
               ]
             },
+            "live_documents": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "hollow": {
+              "type": "boolean"
+            },
+            "segment_files": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "empty_with_messages": {
               "type": "boolean"
             },
@@ -35125,6 +35497,15 @@
             "exists": {
               "type": "boolean"
             },
+            "db_bytes": {
+              "type": "integer"
+            },
+            "wal_bytes": {
+              "type": "integer"
+            },
+            "shm_present": {
+              "type": "boolean"
+            },
             "opened": {
               "type": "boolean"
             },
@@ -35196,6 +35577,9 @@
               "type": "boolean"
             },
             "orphaned": {
+              "type": "boolean"
+            },
+            "engine_incompatible": {
               "type": "boolean"
             },
             "pid": {
@@ -35717,6 +36101,12 @@
             },
             "status": {
               "type": "string"
+            },
+            "state_error": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "quarantined_conversations": {
               "type": "integer"
@@ -36934,26 +37324,42 @@
               "type": "string",
               "enum": [
                 "ok",
-                "degraded"
+                "degraded",
+                "not_inspected"
               ]
             },
             "quarantined_conversations": {
-              "type": "integer"
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "complete": {
-              "type": "boolean"
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "can_search": {
-              "type": "boolean"
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "coverage_suspect": {
-              "type": "boolean"
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "impact": {
               "type": "string"
             },
             "next_command": {
               "type": "string"
+            },
+            "inspected": {
+              "type": "boolean"
             }
           },
           "required": [
@@ -37011,6 +37417,9 @@
                 "string",
                 "null"
               ]
+            },
+            "inspected": {
+              "type": "boolean"
             }
           },
           "required": [
@@ -37029,7 +37438,10 @@
               "type": "object",
               "properties": {
                 "exists": {
-                  "type": "boolean"
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
                 },
                 "status": {
                   "type": "string"
@@ -37086,6 +37498,21 @@
                   ]
                 },
                 "documents": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "live_documents": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "hollow": {
+                  "type": "boolean"
+                },
+                "segment_files": {
                   "type": [
                     "integer",
                     "null"
@@ -37157,6 +37584,9 @@
                       ]
                     }
                   }
+                },
+                "inspected": {
+                  "type": "boolean"
                 }
               }
             },
@@ -37164,6 +37594,18 @@
               "type": "object",
               "properties": {
                 "exists": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "db_bytes": {
+                  "type": "integer"
+                },
+                "wal_bytes": {
+                  "type": "integer"
+                },
+                "shm_present": {
                   "type": "boolean"
                 },
                 "opened": {
@@ -37210,6 +37652,9 @@
                     "string",
                     "null"
                   ]
+                },
+                "inspected": {
+                  "type": "boolean"
                 }
               }
             },
@@ -37224,6 +37669,9 @@
                 },
                 "orphaned": {
                   "type": "boolean"
+                },
+                "inspected": {
+                  "type": "boolean"
                 }
               }
             },
@@ -37234,6 +37682,9 @@
                   "type": "boolean"
                 },
                 "orphaned": {
+                  "type": "boolean"
+                },
+                "engine_incompatible": {
                   "type": "boolean"
                 },
                 "pid": {
@@ -37315,6 +37766,9 @@
                   "type": "object",
                   "description": "Lexical rebuild pipeline settings plus optional runtime telemetry.",
                   "additionalProperties": true
+                },
+                "inspected": {
+                  "type": "boolean"
                 }
               }
             },
@@ -37449,6 +37903,9 @@
                     "string",
                     "null"
                   ]
+                },
+                "inspected": {
+                  "type": "boolean"
                 }
               }
             },
@@ -37744,6 +38201,9 @@
                       ]
                     }
                   }
+                },
+                "inspected": {
+                  "type": "boolean"
                 }
               }
             },
@@ -37755,6 +38215,12 @@
                 },
                 "status": {
                   "type": "string"
+                },
+                "state_error": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "quarantined_conversations": {
                   "type": "integer"
@@ -37788,6 +38254,9 @@
                     "string",
                     "null"
                   ]
+                },
+                "inspected": {
+                  "type": "boolean"
                 }
               }
             }

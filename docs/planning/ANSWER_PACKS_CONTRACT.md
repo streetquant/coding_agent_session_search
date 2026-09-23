@@ -228,6 +228,12 @@ Each `evidence[]` item is an extractive span.
 | `matched_terms` | array string | Normalized query terms found in the span. |
 | `redactions` | array object | Redaction events when policy redacts content. |
 
+Evidence IDs encode all 32 bytes of the BLAKE3 digest using the RFC 4648
+base32 alphabet (`A-Z`, `2-7`), without `=` padding. Each ID is `ev_` followed
+by 52 characters; the final character's unused bits are zero. Published IDs
+bind to the citation core after source verification, including unverified
+fallbacks.
+
 ## Pack Object Schema
 
 `pack` is deterministic display scaffolding built from selected evidence. It is

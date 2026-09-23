@@ -38,7 +38,7 @@ scoop bucket add dicklesworthstone https://github.com/Dicklesworthstone/scoop-bu
 scoop install dicklesworthstone/cass
 ```
 
-Homebrew bottles are currently published for Linux and Apple Silicon macOS. On Intel macOS, use the install script with `--from-source`.
+The Homebrew tap installs prebuilt release tarballs (not bottles) for Linux and Apple Silicon macOS. On Intel macOS, use the install script with `--from-source`.
 
 </div>
 
@@ -102,6 +102,7 @@ cass sources agents include openclaw
 - Corrupt or failed-validation assets are quarantined rather than auto-deleted. `cass diag --json --quarantine` enumerates every quarantined artifact (failed seed bundles, retained publish backups, quarantined lexical generations) with `size_bytes`, `age_seconds`, `safe_to_gc`, and a human-readable `gc_reason`. The `safe_to_gc` flag is **advisory** — it reflects retention policy + cleanup dry-run eligibility and is not wired to any automatic deletion path.
 - `cass doctor --json` surfaces the same quarantine summary plus `checks[]` status for every diagnostic the tool runs. Without `--fix`, doctor is read-only (`auto_fix_applied=false`, `auto_fix_actions=[]`, `issues_fixed=0`); with `--fix` it applies only the repairs whose dry-run plans are proven safe (currently: Track A analytics rebuild, Track B rollup rebuild via `rebuild_token_daily_stats` when the `token_usage` ledger is intact).
 - Lexical generation cleanup uses a dispositions + inspection-required-first policy. Operators running `cass doctor --fix` never have a generation reclaimed silently — every quarantine stays on disk until an explicit derived-asset rebuild (`cass models backfill` or an index refresh recommended by `cass health --json`) supersedes it.
+- A derived (SQLite fallback) FTS repair that fails **identically on 5 consecutive `cass index` runs** escalates from a warning to a non-zero exit ([#434](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/434)): the counter persists in `<data_dir>/index/.fts-repair-failure-streak.json`, watch daemons log the escalation instead of exiting, and any run whose repair succeeds — or fails differently — resets it. Canonical rows and the Tantivy index are unaffected; run `cass doctor --rebuild-canonical-fts --yes --json` for the explicit repair.
 
 **Schema stability guarantees**
 - The JSON contract surfaces (`triage`, `capabilities`, `selftest`, `health`, `status`, `diag`, `models status`, `models verify`, `models check-update`, `introspect`, `doctor`, `api-version`, `stats`, `sessions`, `search`, `pack`, `swarm status`, `swarm work-packet`, `swarm lint`) are pinned by golden-file regression tests under `tests/golden/robot/`. A change to any field name, type, or nullability fails the golden test suite and requires a deliberate regeneration pass (`UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_robot_json --test golden_robot_docs`).
@@ -217,6 +218,7 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
 - **Edge N-Gram Indexing**: We frontload the work by pre-computing prefix matches (e.g., "cal" -> "calculate") during indexing, trading disk space for O(1) lookup speed at query time.
 - **Smart Tokenization**: Handles `snake_case` ("my_var" matches "my" and "var"), hyphenated terms, and code symbols (`c++`, `foo.bar`) correctly.
 - **Zero-Stall Updates**: The background indexer commits changes atomically; `reader.reload()` ensures new messages appear in the search bar immediately without restarting.
+- **One-shot CLI overhead**: the sub-60ms figure is the engine query. A one-shot `cass search --robot` currently spends roughly a second in archive open and integrity preflight on a ~10 GB archive; `--robot-meta` reports that separately as `_meta.timing.other_ms`, while `search_ms` stays in the tens of milliseconds.
 
 ### 🧠 Optional Semantic Search (Local Inference, No Network at Query Time)
 - **Local inference**: Uses frankensearch's pure-Rust native MiniLM implementation with local safetensors weights. Once MiniLM is installed, no network traffic is required to answer queries.
@@ -229,8 +231,11 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
   default socket and owner-private pinned key; fresh handshake, health,
   embedding, batch, and rerank challenges authenticate the exact response and
   immutable Frankensearch embedding identity before any daemon output is used.
-  The one-shot CLI's `--two-tier` output is the final quality result set, while
-  the TUI is the surface that displays fast results and refines them in place.
+  `--two-tier` progressive refinement (fast results refined in place by the
+  quality tier) is experimental and currently inactive: the one-shot CLI
+  collapses it to a single-tier quality search and the TUI's progressive lanes
+  are disabled at HEAD, so hybrid search today is lexical plus one MiniLM
+  refinement pass when the model is installed.
 - **Opt-in acquisition**: `cass models install` downloads `all-minilm-l6-v2` from Hugging Face on explicit request and verifies SHA256 checksums. `cass models install --model multilingual-minilm` explicitly selects `paraphrase-multilingual-MiniLM-L12-v2` for CJK and mixed-language retrieval. Nothing is fetched until an install command runs, and merely installing the multilingual model never changes the active space.
 
 - **Air-gapped install**: `cass models install --model <minilm|multilingual-minilm> --from-file <dir>` accepts a pre-downloaded model directory so you can bring the assets in yourself.
@@ -276,7 +281,7 @@ The deterministic hash embedder is available only when explicitly selected, such
 **Features**:
 - **Memory-mappable**: large indexes open without copying into RAM
 - **Quantization**: supports `f32` and `f16` storage for smaller on-disk size
-- **Fast search**: brute-force vector search and optional HNSW approximate search
+- **Fast search**: exact brute-force vector search by default; HNSW approximate search runs only when `--approximate` is passed and the HNSW sidecar file exists. `hnsw_ready` in `status --json` means only that the sidecar file is present, not that ANN is in use
 
 **Index Location**: `~/.local/share/coding-agent-search/vector_index/index-<embedder>.fsvi`
 
@@ -288,7 +293,7 @@ The deterministic hash embedder is available only when explicitly selected, such
 |------|-----------|----------|
 | **Lexical** | BM25 full-text | Exact term matching, code searches |
 | **Semantic** | Vector similarity | Conceptual queries, "find similar" |
-| **Hybrid** (default) | Reciprocal Rank Fusion with lexical fail-open | Balanced precision and recall |
+| **Hybrid** (default) | Lexical + single-tier semantic refinement fused with RRF; lexical fail-open | Balanced precision and recall |
 
 **Lexical Search**: Uses Quill's BM25 implementation with prefix matching. Best when you know the exact terms you're looking for. The lexical index is derived from SQLite; if it is missing, stale, or incompatible, cass reports the state and rebuilds through the normal indexing path from the canonical database.
 
@@ -298,7 +303,7 @@ The deterministic hash embedder is available only when explicitly selected, such
 ```
 RRF_score = Σ 1 / (K + rank_i)
 ```
-Where K=60 (tuning constant) and rank_i is the position in each result list. This balances the precision of lexical search with the recall of semantic search.
+Where K=60 (tuning constant) and rank_i is the position in each result list. This balances the precision of lexical search with the recall of semantic search. Semantic refinement is a single pass over the installed MiniLM index; progressive two-tier refinement (`--two-tier`) is experimental and currently inactive.
 
 ```bash
 # CLI examples
@@ -315,7 +320,7 @@ cass search "auth error handling" --mode hybrid --robot
 - **Auto-Fuzzy Fallback**: When exact searches return sparse results, automatically retries with `*term*` wildcards to broaden matches. Visual indicator shows when fallback is active.
 - **Query History Deduplication**: Recent searches deduplicated to show unique queries; navigate with `Up`/`Down` arrows.
 - **Match Quality Ranking**: New ranking mode (cycle with `F12`) that prioritizes exact matches over wildcard/fuzzy results.
-- **Match Highlighting**: Use `--highlight` in robot mode to wrap matching terms with markers (`**bold**` for text, `<mark>` for HTML output).
+- **Match Highlighting**: Use `--highlight` in robot mode to wrap matching terms in snippets with `**bold**` markers (text and JSON output alike; search has no HTML output).
 
 ### 🖥️ Rich Terminal UI (TUI)
 
@@ -329,7 +334,7 @@ Powered by [FrankenTUI (ftui)](https://github.com/Dicklesworthstone/frankentui) 
 - **Mouse Support**: Click to select results, scroll panes, or clear filters.
 - **Theming**: Adaptive Dark/Light modes with role-colored messages (User/Assistant/System). Presets include dark, light, high-contrast, and accessible variants.
 - **Ranking Modes**: Cycle through `recent`/`balanced`/`relevance`/`quality` with `F12`; quality mode penalizes fuzzy matches.
-- **Analytics Dashboard**: 7 views (Dashboard, Explorer, Heatmap, Breakdowns, Tools, Plans, Coverage) with interactive charts, KPI tiles, and drill-down filtering. Toggle with `A`.
+- **Analytics Dashboard**: 7 views (Dashboard, Explorer, Heatmap, Breakdowns, Tools, Plans, Coverage) with interactive charts, KPI tiles, and drill-down filtering. Toggle with `Alt+A`.
 - **Inline Mode**: Run `cass tui --inline` to keep terminal scrollback intact. The UI anchors to a region of the terminal while logs scroll normally. Configure with `--ui-height <rows>` and `--anchor top|bottom`.
 - **Macro Recording**: Capture input sessions with `cass tui --record-macro session.macro` for reproducible bug reports and workflow automation. Events are saved as human-readable JSONL with full timing data.
 - **Asciicast Recording**: Capture reproducible TUI demos and bug repro artifacts with `cass tui --asciicast demo.cast`.
@@ -339,14 +344,14 @@ Powered by [FrankenTUI (ftui)](https://github.com/Dicklesworthstone/frankentui) 
 
 Export conversations as styled, portable HTML files with optional encryption:
 
-- **Mostly Self-Contained**: Critical structural CSS and the export payload are inlined directly; the file opens without a local web server. Tailwind's utility CSS runtime (`@tailwindcss/browser`) and Prism.js syntax-highlighting assets are loaded from `cdn.jsdelivr.net` for full fidelity.
-- **Progressive Enhancement / Graceful Degradation**: Prism.js resources fall back via `onerror="...no-prism"` — code blocks remain readable offline in plain monospace. Tailwind CDN does not currently have a built-in fallback: layout utilities require network on first open (the page is still legible but unstyled). Air-gapped archival users should note this limitation.
+- **Mostly Self-Contained**: All layout CSS and the export payload are inlined directly; the file opens without a local web server and references no Tailwind CDN (Tailwind is not used at runtime). Only the Prism.js syntax-highlighting assets are loaded from `cdn.jsdelivr.net`, pinned with SRI hashes.
+- **Progressive Enhancement / Graceful Degradation**: Prism.js resources fall back via `onerror="...no-prism"` — code blocks remain readable offline in plain monospace, and the page layout never depends on a network resource.
 - **Password Protection**: AES-256-GCM encryption with PBKDF2 key derivation (600,000 iterations)—opens directly in any browser
 - **Rich Styling**: Dark/light themes, syntax-highlighted code blocks, collapsible tool calls
 - **Print-Friendly**: Optimized print styles with page breaks and footers
 - **Searchable**: Built-in search functionality within the exported document
 
-**TUI Usage**: Press `e` in the detail view to open the export modal, or `Ctrl+E` for quick export with defaults.
+**TUI Usage**: Press `Ctrl+E` in the detail view to open the export modal, or `Ctrl+Shift+E` to export Markdown immediately with defaults. On the detail pane's Export tab, `e`/`h` open the HTML export modal and `m` runs the Markdown export.
 
 **CLI Usage**:
 ```bash
@@ -382,6 +387,7 @@ Ingests history from 26 local agents, normalizing them into a unified `Conversat
 - **ChatGPT**: `~/Library/Application Support/com.openai.chat` (v1 unencrypted JSON; v2/v3 encrypted—see Environment)
 - **Aider**: `~/.aider.chat.history.md` and per-project `.aider.chat.history.md` files (Markdown)
 - **Pi-Agent**: `~/.pi/agent/sessions` (Session JSONL with thinking content)
+- **Prime Agent (`prime_agent`)**: `~/.prime/agent/sessions/<session-id>.jsonl` (versions 1–3). Indexes the active branch with omission counts for abandoned siblings; preserves thinking, tool results and context summaries. Overrides, in precedence order: `PRIME_AGENT_SESSION_DIR`, legacy `PRIME_AGENT_CODING_AGENT_SESSION_DIR`, then `PRIME_AGENT_CODING_AGENT_DIR` (with `/sessions` appended). Prime retains its own agent identity.
 - **Oh My Pi (`omp`)**: OMP v18's default `~/.omp/agent/sessions`, named profiles under `~/.omp/profiles/<name>/agent/sessions`, XDG stores under `$XDG_DATA_HOME/omp`, and explicit OMP-only archive roots via `CASS_OMP_DATA_ROOT` (pi-family JSONL, including per-session sub-agent transcripts)
 - **GitHub Copilot Chat**: VS Code global storage under `github.copilot-chat` (JSON)
 - **Copilot CLI**: `~/.copilot/session-state`, legacy `~/.copilot/history-session-state`, and `gh copilot` config paths (JSONL/JSON)
@@ -389,11 +395,12 @@ Ingests history from 26 local agents, normalizing them into a unified `Conversat
 - **Goose**: `~/.local/share/goose/sessions/sessions.db` (SQLite, v1.20+), plus the earlier per-session `*.jsonl` layout under `~/.goose/sessions`
 - **Crush**: `~/.crush/crush.db` and per-project `.crush/crush.db` (SQLite)
 - **Hermes**: `~/.hermes/state.db` and project-local `.hermes/state.db` (SQLite)
+- **Devin CLI**: `~/.local/share/devin/cli/sessions.db` (SQLite; override with `CASS_DEVIN_DATA_ROOT`). Indexes visible local sessions along their active parent chain, preserving tool messages and excluding abandoned branches and inline image payloads. Cloud-only sessions are outside this connector's scope.
 - **Kimi Code**: `$KIMI_CODE_HOME/sessions/*/*/agents/*/wire.jsonl` (default `~/.kimi-code`; sub-agents index as `<sessionId>:<agentId>`), plus the legacy `~/.kimi/sessions/*/*/wire.jsonl` layout (Session JSONL)
 - **Muse Code**: `~/.local/share/muse/sessions/<YYYY>/<MM>/<DD>/<session-id>/session.jsonl`, including nested `subagent/*/session.jsonl` transcripts (override with `CASS_MUSE_DATA_ROOT`)
 - **Qwen Code**: `~/.qwen/tmp/*/chats/session-*.json` (Chat JSON)
 - **Factory (Droid)**: `~/.factory/sessions` (JSONL files organized by workspace slug)
-- **Antigravity (agy)**: `~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl` (clean JSONL transcript), with the durable per-conversation `conversations/<uuid>.db` (SQLite) mirrored alongside. Resume with `cass resume <transcript> --agent agy` (`agy --conversation <uuid>`).
+- **Antigravity (IDE + agy CLI)**: both stores are probed by default — the IDE's `~/.gemini/antigravity/` and the CLI's `~/.gemini/antigravity-cli/` — each holding `brain/<uuid>/.system_generated/logs/transcript.jsonl` (clean JSONL transcript) with the durable per-conversation `conversations/<uuid>.db` (SQLite) mirrored alongside. IDE conversations are keyed `ide/<uuid>` so the two stores never collide; `CASS_ANTIGRAVITY_DATA_ROOT` replaces both with one explicit base. Resume with `cass resume <transcript> --agent agy` (`agy --conversation <uuid>`).
 - **OpenHands (OpenDevin)**: `~/.openhands/conversations/<id>/` — `base_state.json` metadata plus an `events/event-NNNNN-<uuid>.json` event stream (JSON)
 - **Grok Build (xAI `grok`)**: `~/.grok/sessions/<percent-encoded-cwd>/<session-uuid>/` — `updates.jsonl` (authoritative ACP session-update stream) with `summary.json` metadata and `chat_history.jsonl` fallback (override the base dir with `GROK_HOME`). Resume with `grok --resume <session-id>`.
 
@@ -446,7 +453,7 @@ cass sources setup
 4. **Installs cass** on remotes that don't have it (optional)
 5. **Indexes** existing sessions on remotes (optional)
 6. **Configures** `sources.toml` with correct paths and mappings
-7. **Syncs** data to your local machine (optional)
+7. **Prints the sync command** (`cass sources sync`) for you to run; the wizard does not run the sync itself
 
 **Wizard options:**
 
@@ -457,7 +464,7 @@ cass sources setup
 | `--non-interactive` | Use auto-detected defaults for scripting |
 | `--skip-install` | Don't install cass on remotes |
 | `--skip-index` | Don't run indexing on remotes |
-| `--skip-sync` | Don't sync data after setup |
+| `--skip-sync` | Skip the final `cass sources sync`. Interactive setup runs that sync after the hosts are configured and records it as complete only once it has actually finished; `--json` setup always defers it and reports `sync.status = "pending"` with the command to run |
 | `--resume` | Resume an interrupted setup |
 | `--json` | Output progress as JSON (for automation) |
 
@@ -468,7 +475,7 @@ cass sources setup
 cass sources setup
 
 # Configure specific hosts only
-cass sources setup --hosts css,csd,yto
+cass sources setup --hosts laptop,workstation,build-server
 
 # Preview without making changes
 cass sources setup --dry-run
@@ -482,9 +489,64 @@ cass sources setup --non-interactive --hosts myserver --skip-install
 
 **Resumable state:** If setup is interrupted (Ctrl+C, connection lost), state is saved to the cache directory (`~/.cache/cass/setup_state.json` on Linux). Resume with `--resume`.
 
+#### Testing your real fleet
+
+Tailscale discovery is optional: `cass sources discover --tailscale --json` adds
+online tailnet peers to SSH-config discovery, and `cass sources setup --tailscale`
+offers them in setup. It reads local `tailscale status --json` with a five-second
+deadline; a missing CLI, stopped daemon, or login failure produces a warning and
+leaves SSH-config discovery available. Explicit `setup --hosts` skips discovery.
+Connections use ordinary SSH over assigned Tailscale IPv4 addresses, so MagicDNS
+is not required. Matching SSH aliases retain their user/key configuration;
+otherwise SSH uses its normal defaults. IPv6-only peers are currently omitted.
+Tailscale ACLs, SSH authorization and host-key checks still apply; discovery does
+not log in, install Tailscale, or change either SSH or tailnet configuration.
+
+The local fixture and Docker tests do not prove that your machines can sync and
+search each other's sessions. The opt-in live harness uses actual SSH connections
+and `cass sources discover`, `sources add`, `sources sync`, and `search`. It creates isolated synthetic
+Codex sessions on each machine, checks source provenance and filters, repeats a
+sync to detect duplicates, and appends messages. It checks both lexical and default
+hybrid search, requires one JSON response per sync, holds the real indexing lock to
+test busy refusal, and recovers transferred sessions through `sources reingest`.
+A refused SSH connection must leave the other sources searchable.
+
+Keep the inventory and SSH configuration **outside this repository**. For example,
+create a mode-0600 JSON file containing:
+
+```json
+{
+  "ssh_config": "/private/path/to/ssh_config",
+  "hosts": [{"ssh": "workstation"}, {"ssh": "laptop"}]
+}
+```
+
+Then run with an explicit binary:
+
+```bash
+python3 scripts/e2e/live_fleet_search.py \
+  --inventory /private/path/to/fleet.json \
+  --cass-bin /path/to/cass
+```
+
+Python 3 and authenticated SSH access are required on the remote machines.
+The Unix runner needs Python 3.9+, rsync, and a CASS binary supporting the tested
+commands. Each inventory alias must appear in the supplied SSH configuration;
+included configuration files are supported. Host-key verification stays enabled.
+To exercise actual tailnet discovery and transport, add `--tailscale` to the
+harness command and use tailnet IPv4 addresses as the private inventory targets.
+Keep any required SSH users, keys and trusted host-key aliases in the private SSH
+configuration. For a discovery test independent of explicit aliases, use SSH
+`Match originalhost` entries rather than literal `Host` entries for those addresses.
+The harness retains fresh test directories and raw
+receipts privately outside git; it never changes existing session archives or
+deletes test data. Console results use ordinal labels. An unreachable machine
+keeps the overall result failed, even if the other machines pass. Do not attach
+raw receipts or inventories to public issues: they contain machine identities.
+
 #### Remote Installation Methods
 
-When the wizard installs `cass` on remote machines, it uses an intelligent fallback chain:
+When the wizard installs `cass` on remote machines, it chooses one method in this priority order and reports a failure rather than falling through to the next:
 
 | Priority | Method | Speed | Requirements |
 |----------|--------|-------|--------------|
@@ -580,7 +642,7 @@ cass archive DB and cass-owned local mirror may be the only remaining evidence
 for those conversations. Treat gap names such as `remote_source_unavailable`,
 `remote_source_pruned`, `local_archive_ahead_of_remote`, and
 `remote_copy_ahead_verified` as preservation signals first: keep the archive and
-mirror intact, then run the recommended `cass sources sync --all --json` or
+mirror intact, then run the recommended `cass sources sync --json` (all configured remote sources; `--source <name>` narrows it) or
 source-specific sync command after reviewing the reported evidence.
 
 Raw-mirror retention is explicit and audited. Use `cass mirror prune
@@ -709,10 +771,10 @@ The sync engine uses rsync over SSH for efficient delta transfers, with automati
 
 **rsync Flags Used**:
 ```
--avz --stats --partial --protect-args --timeout=300 \
+-avz --links --safe-links --stats --partial [--protect-args | --secluded-args] --timeout 300 \
   -e "ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
 ```
-Where `-avz` = archive mode + verbose + compression.
+Where `-avz` = archive mode + verbose + compression. `--protect-args`/`--secluded-args` is auto-detected per remote rsync version (omitted when the remote rejects it), and `--timeout` carries the transfer timeout in seconds.
 
 **Data Flow**:
 ```
@@ -767,7 +829,7 @@ Each conversation tracks its origin:
 These fields appear in JSON/robot output and enable filtering:
 ```bash
 cass search "auth error" --source laptop --json
-cass timeline --days 7 --source remote
+cass timeline --since 7d --source remote
 cass stats --by-source
 ```
 
@@ -879,7 +941,7 @@ The CLI applies multiple normalization layers:
 22. **Current-session shorthand**: `current`, `current-session`, and `sessions current` become `sessions --current`
 23. **Global flag hoisting**: Position-independent flag handling
 
-When corrections are applied, `cass` emits a teaching note to stderr so agents learn the canonical syntax.
+When corrections are applied, `cass` emits a teaching note to stderr so agents learn the canonical syntax. In robot/JSON mode the same information is emitted as one `note: auto-corrected: <note>` line per correction on stderr, so stdout stays data-only.
 
 ### Structured Output Formats
 
@@ -899,7 +961,9 @@ cass search "error" --robot-format compact
 
 # Include performance metadata
 cass search "error" --robot --robot-meta
-# → { "hits": [...], "_meta": { "elapsed_ms": 12, "cache_hit": true, "wildcard_fallback": false, ... } }
+# → { "hits": [...], "_meta": { "elapsed_ms": 12, "cache_hit": true, "wildcard_fallback": false, "lexical_degrade_reason": null, ... } }
+#   lexical_degrade_reason is "query_fuel_exhausted" when a hybrid search dropped its
+#   lexical leg because Quill's query fuel ran out (see CASS_QUILL_QUERY_FUEL_BUDGET)
 
 # Per-hit trust verdict (advisory; --robot-meta only)
 cass search "error" --robot --robot-meta
@@ -976,6 +1040,11 @@ or `no_evidence_found` are data, not prose; branch on the JSON fields before
 copying the pack into another tool. Stale selected evidence is structural:
 inspect `freshness.stale_evidence_count`.
 
+Packs exclude injected skill payloads by default. Add `--include-skill-content`
+to include them explicitly; credential redaction still applies.
+`privacy.skill_content_included` reports whether the selected evidence includes
+skill payloads, including after token-budget trimming.
+
 ### Swarm Operations Workflow
 
 Use the swarm surfaces when multiple agents are sharing one repo and you need a
@@ -994,6 +1063,12 @@ cass swarm lint --json --bead coding_agent_session_search-example
 # Read-only sibling dependency drift sentinel
 cass swarm dependency-drift --json
 ```
+
+`swarm status`, `swarm work-packet`, and `swarm lint` currently compose their
+snapshot from checked-in fixtures (`--fixture <file>` or `--fixture-dir <dir>
+--fixture-id <id>`); without a fixture the live provider path reports every
+source as `live-provider-unimplemented`. Only `swarm dependency-drift` has a
+live path today.
 
 `swarm status` composes Beads, Agent Mail metadata, git state, rch/build
 pressure, cass health/status, and proof references. Stale candidates are
@@ -1029,6 +1104,7 @@ LLMs have context limits. `cass` provides multiple levers to control output size
 | `pack --max-sessions N` | Limit how many sessions can contribute evidence |
 | `pack --max-excerpt-chars N` | Shorten each cited excerpt before token estimation |
 | `pack --fields summary` | Return top-level summary fields for a smaller JSON envelope |
+| `pack --field-mask minimal\|standard\|full` | Select a documented pack projection; `--fields` accepts the same presets |
 | `pack --freshness-policy strict --freshness-window-seconds N` | Reject stale evidence instead of silently mixing it into a pack |
 | `pack --sessions-from FILE` | Restrict pack evidence to newline-delimited session paths; use `-` for stdin |
 
@@ -1070,7 +1146,7 @@ Errors are structured, actionable, and include recovery hints. A real sample fro
 | 5 | Data corruption | Run `cass doctor check --json`; repair or restore the canonical SQLite archive before indexing |
 | 6 | Incompatible version | Update cass |
 | 7 | Lock/busy | Retry later |
-| 8 | Partial result | Increase `--timeout` or reduce scope |
+| 8 | Partial result (`sources sync` only: some sources had path failures) | Inspect per-path errors in the JSON output and retry the failed sources |
 | 9 | Unknown error | Check `retryable` flag |
 | 10 | Config / timeout | Depends on `err.kind` |
 | 11 | Config validation | Fix config |
@@ -1082,6 +1158,8 @@ Errors are structured, actionable, and include recovery hints. A real sample fro
 | 22 | I/O during model handling | Retry |
 | 23 | Model download | Retry or use `--from-file` |
 | 24 | I/O during model verify/install | Retry |
+
+Search/pack timeouts are not exit 8: on expiry `search` and `pack` exit 0 with `{"hits": [], "budget": {"timed_out": true, "skipped_sections": [...], "retry": "<command>", ...}}`, and `--robot-format sessions` instead fails with exit 10, kind `timeout`.
 
 **Codes ≥ 10 are domain-specific** and the numeric value alone is ambiguous (e.g. code 10 maps to either `config` or `timeout` kinds depending on context). Agents should branch on `err.kind` from the JSON error envelope — not on the numeric code — when handling codes ≥ 10. See the Error Handling section above for the canonical `kind` list.
 
@@ -1227,8 +1305,8 @@ The `--highlight` flag wraps matching terms for visual/programmatic identificati
 
 ```bash
 cass search "authentication error" --robot --highlight
-# In text output: **authentication** and **error** are bold-wrapped
-# In HTML export: <mark>authentication</mark> and <mark>error</mark>
+# Snippets come back with **authentication** and **error** bold-wrapped,
+# in text and in JSON output alike (search has no HTML output format).
 ```
 
 Highlighting is query-aware: quoted phrases like `"auth error"` highlight as a unit; individual terms highlight separately.
@@ -1297,11 +1375,11 @@ cass index --full --json --robot-trace-ingest 2>/tmp/cass-ingest-trace.jsonl
 |------|---------|
 | `--robot` / `--json` | JSON output (pretty-printed) |
 | `--robot-format jsonl\|compact` | Streaming or single-line JSON |
-| `--robot-meta` | Include `_meta` block (elapsed_ms, cache stats, index freshness) |
+| `--robot-meta` | Include `_meta` block (elapsed_ms, cache stats, index freshness, `lexical_degrade_reason`: `"query_fuel_exhausted"` or null) |
 | `--fields minimal\|summary\|<list>` | Reduce payload size |
 | `--max-content-length N` | Truncate content fields to N chars |
 | `--max-tokens N` | Apply an approximate token budget to robot output |
-| `--timeout N` | Timeout in milliseconds; returns partial results on expiry |
+| `--timeout N` | Timeout in milliseconds. On expiry `search`/`pack` still exit 0 and emit `{"hits": [], "budget": {"timed_out": true, "skipped_sections": [...], "retry": "<command>", ...}}`; `--robot-format sessions` fails with exit 10, kind `timeout` |
 | `--cursor <token>` | Cursor-based pagination (from `_meta.next_cursor`) |
 | `--request-id ID` | Echoed in response for correlation |
 | `--aggregate agent,workspace,date` | Server-side aggregations |
@@ -1317,6 +1395,14 @@ cass index --full --json --robot-trace-ingest 2>/tmp/cass-ingest-trace.jsonl
 |------|---------|
 | `--idempotency-key KEY` | Safe retries: same key + params returns cached result (24h TTL) |
 | `--json` | JSON output with stats |
+| `--gc` | Reclaim merge-retired lexical segment files and exit: runs the engine's grace-period garbage sweep (a folded segment file is unlinked only once no published MANIFEST generation has referenced it for 300 s) and reports files/bytes reclaimed. Every incremental `cass index` performs the same sweep at open; `doctor --json` reports the reclaimable bytes under `storage_pressure.full_rebuild_readiness` (GH #453) |
+
+When `health --json` or `status --json` reports `index.status: "hollow"`, the
+live Quill generation serves fewer than half the documents certified by its
+completed rebuild checkpoint. `index.live_documents` reports the served count.
+Run `cass index` to let its pre-scan repair rebuild from the canonical archive;
+`cass index --full` also rescans the session sources. A missing count provides
+no hollow-generation verdict.
 
 ### Robot Documentation System
 
@@ -1350,7 +1436,7 @@ cass --robot-help
 
 ```bash
 cass api-version --json
-# → { "version": "0.4.0", "contract_version": "1", "breaking_changes": [] }
+# → { "crate_version": "<cargo version>", "build_commit": "<sha or unknown>", "api_version": 1, "contract_version": "1" }
 
 cass introspect --json
 # → Full schema: all commands, arguments, response types
@@ -1553,96 +1639,133 @@ When an exact query returns fewer than 3 results, `cass` automatically retries w
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+C` | Quit |
-| `F1` or `?` | Toggle help screen |
-| `F2` | Toggle dark/light theme |
+| `Ctrl+C` | Force quit |
+| `Esc` / `F10` | Unwind: close the open modal or surface, otherwise quit |
+| `F1` / `Alt+?` | Toggle help screen |
+| `F2` / `Alt+T` | Next theme (cycles all 19 presets) |
+| `Shift+F2` / `Alt+Shift+T` | Previous theme |
 | `Ctrl+B` | Toggle border style (rounded/plain) |
+| `Ctrl+P` / `Alt+P` | Open the command palette |
+| `Ctrl+S` | Toggle the stats bar |
+| `Ctrl+Shift+S` | Open the sources management surface |
+| `Alt+A` | Open the analytics dashboard |
+| `Alt+M` | Toggle macro recording (replay with `cass tui --play-macro FILE`) |
+| `Ctrl+Shift+I` | Toggle the inspector overlay |
 | `Ctrl+Shift+R` | Force re-index |
 | `Ctrl+Shift+Del` | Reset all TUI state |
+| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
+
+Launch-time flags: `cass tui --refresh` (alias `--catch-up`) runs an incremental index pass before opening; `--record-macro FILE` / `--play-macro FILE` record and replay input events.
 
 ### Search Bar (Query Input)
 
 | Key | Action |
 |-----|--------|
-| Type | Live search as you type |
-| `Enter` | Submit query immediately (if query is empty, edits last filter chip) |
-| `Esc` | Clear query / exit search |
-| `Up`/`Down` | Navigate query history |
+| Type | Live search as you type; plain characters (including `?`, `y`, `o`, `c`, `1`-`9`, `-`, `=`) go into the query |
+| `Enter` | Open the selected hit; with no selected hit, submit the query (if the query is empty, edit the last filter chip) |
+| `Backspace` | Delete character; if the query is empty, remove the last filter chip |
+| `Left`/`Right`, `Ctrl+Left`/`Ctrl+Right` | Move the cursor by character / by word |
+| `Home`/`End` | Jump the cursor to the start / end of the query |
+| `Ctrl+L` | Clear the query |
+| `Ctrl+U` / `Ctrl+K` / `Ctrl+W` | Kill to line start / to line end / previous word |
 | `Ctrl+R` | Cycle through query history |
-| `Backspace` | Delete character; if empty, remove last filter chip |
+| `Ctrl+N` / `Ctrl+Shift+N` | Next / previous query-history entry |
+| `Ctrl+F` | Toggle wildcard fallback |
+| `Ctrl+Shift+Y` | Copy the query |
 
 ### Navigation
 
 | Key | Action |
 |-----|--------|
 | `Up`/`Down` | Move selection in results list |
-| `Enter` | Open selected result in detail modal (Messages tab by default) |
-| `Left`/`Right` | Switch focus between results and detail pane |
-| `Tab`/`Shift+Tab` | Cycle focus: search → results → detail |
 | `PageUp`/`PageDown` | Scroll by page |
-| `Home`/`End` | Jump to first/last result |
-| `Alt+h/j/k/l` | Vim-style navigation (left/down/up/right) |
+| `Tab` / `Shift+Tab` | Toggle focus between results and detail pane / move focus left |
+| `Alt+h/j/k/l` | Vim-style directional focus (left/down/up/right) |
+| `Alt+1`..`Alt+9` | Switch to pane N |
+| `Alt+-` / `Alt+=` | Shrink / grow the results pane |
+| `Alt+D` | Hide / show the detail pane |
+| `Alt+[` / `Alt+]` | Timeline jump backward / forward |
 
 ### Filtering
 
 | Key | Action |
 |-----|--------|
-| `F3` | Open agent filter palette |
-| `F4` | Open workspace filter palette |
+| `F3` / `Alt+G` | Open agent filter palette |
+| `Shift+F3` / `Alt+Shift+G` | Clear the agent filter |
+| `F4` / `Alt+W` | Open workspace filter palette |
+| `Shift+F4` / `Alt+Shift+W` / `Ctrl+Del` | Clear all active filters |
 | `F5` | Set "from" time filter |
 | `F6` | Set "to" time filter |
-| `Shift+F3` | Scope to currently selected result's agent |
-| `Shift+F4` | Clear workspace filter |
 | `Shift+F5` | Cycle time presets: 24h → 7d → 30d → all |
-| `Ctrl+Del` | Clear all active filters |
+| `F11` / `Shift+F11` | Cycle the source filter / open the source filter menu |
+| `Alt+/` | Open the pane filter |
 
 ### Modes & Display
 
 | Key | Action |
 |-----|--------|
-| `F7` | Cycle context window size: S → M → L → XL |
+| `F7` / `Alt+C` | Cycle context window size: S → M → L → XL |
+| `Ctrl+Space` | Momentary "peek" to XL context |
 | `F9` | Toggle match mode: prefix (default) ↔ standard |
-| `F12` | Cycle ranking: recent → balanced → relevance → quality → newest → oldest |
-| `Shift+`/`=` | Increase items per pane (density) |
-| `-` | Decrease items per pane |
+| `F12` / `Alt+R` | Cycle ranking: recent → balanced → relevance → quality → newest → oldest |
+| `Alt+S` | Cycle search mode (lexical / semantic / hybrid) |
+| `Ctrl+D` | Cycle density: Compact → Cozy → Spacious |
+| `Ctrl+1`..`Ctrl+9` | Save the current view to slot N |
+| `Shift+1`..`Shift+9` | Load the view from slot N |
 
 ### Selection & Actions
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+M` / `Ctrl+X` | Toggle selection on current result |
+| `Enter` / `Ctrl+M` | Open selected result in the detail modal (Messages tab by default) |
+| `Ctrl+X` | Toggle selection on current result |
 | `Ctrl+A` | Select/deselect all visible results |
-| `A` | Open bulk actions menu (when items selected) |
+| `Alt+B` | Open bulk actions menu (when items selected) |
 | `Ctrl+Enter` | Add to multi-open queue |
 | `Ctrl+O` | Open all queued items in editor |
-| `y` | Copy current item (path or content to clipboard) |
-| `Ctrl+Y` | Copy all selected items |
+| `F8` / `Alt+O` | Open selected hit in `$EDITOR` |
+| `Alt+V` | View raw |
+| `Alt+Shift+J` | Toggle JSON view |
+| `Ctrl+Y` | Copy path |
+| `Alt+Y` | Copy snippet |
+| `Ctrl+Shift+C` | Copy content |
+| `Ctrl+E` | Open the export modal |
+| `Ctrl+Shift+E` | Export Markdown immediately |
+| `Alt+U` / `Alt+N` / `Alt+I` | Update banner: upgrade now / show release notes / skip this version |
 
 ### Detail Pane
 
+These apply while the detail modal is open:
+
 | Key | Action |
 |-----|--------|
-| `Space` | Toggle full-screen detail view |
-| `/` | Start find-in-detail search |
-| `n` | Jump to next match (in find mode) |
-| `N` | Jump to previous match |
-| `g` | Scroll to top (in full-screen) |
-| `G` | Scroll to bottom (in full-screen) |
-| `c` | Copy visible content |
-| `o` | Open in external viewer |
-| `[` / `]` | Switch detail tabs (Messages/Snippets/Raw) |
+| `Esc` | Close the detail modal |
+| `Tab` | Cycle detail tabs |
+| `/` (or `Ctrl+F`, `Alt+/`) | Start find-in-detail; type to search, `Enter` advances to the next match |
+| `n` / `N` | Next / previous contextual search hit within this session |
+| `Enter` (Messages tab) | Next contextual search hit |
+| `j` / `k`, `Up`/`Down` | Scroll |
+| `g` / `G`, `Home`/`End` | Scroll to top / bottom |
+| `{` / `}` | Jump to previous / next message |
+| `[` / `]` | Jump to previous / next user message |
+| `w` | Toggle line wrap |
+| `e` / `c` | Expand / collapse all tool and system messages |
+| `e`, `h` (Export tab) | Open the HTML export modal; `m` exports Markdown |
 | `F7` | Cycle context window size |
 | `Ctrl+Space` | Momentary "peek" to XL context |
 
 ### Detail Tabs
 
-The detail pane has three tabs, switchable with `[` and `]`:
+The detail pane has six tabs, cycled with `Tab`:
 
 | Tab | Content | Best For |
 |-----|---------|----------|
 | **Messages** | Full conversation with markdown rendering | Reading full context |
 | **Snippets** | Keyword-extracted summaries | Quick scanning |
 | **Raw** | Unformatted JSON/text | Debugging, copying exact content |
+| **Json** | Syntax-highlighted JSON with a collapsible tree | Inspecting structured payloads |
+| **Analytics** | Per-session token timeline, tool calls, message stats | Understanding one session |
+| **Export** | Export actions and filename previews (HTML/Markdown) | Sharing a session |
 
 ### Context Window Sizing
 
@@ -1669,12 +1792,12 @@ Control how much content shows in the detail preview. Cycle with `F7`:
 Efficiently work with multiple search results at once:
 
 **Multi-Select Mode**:
-1. Press `Ctrl+M` (or `Ctrl+X`) to toggle selection on current result (checkbox appears)
-2. Navigate to other results and press `Ctrl+M` or `Ctrl+X` again
+1. Press `Ctrl+X` to toggle selection on current result (checkbox appears)
+2. Navigate to other results and press `Ctrl+X` again
 3. Press `Ctrl+A` to select/deselect all visible results
 4. Selected count shown in footer: "3 selected"
 
-**Bulk Actions Menu** (`A` when items selected):
+**Bulk Actions Menu** (`Alt+B` when items selected):
 | Action | Description |
 |--------|-------------|
 | **Open All** | Open all selected files in editor |
@@ -1690,8 +1813,10 @@ For opening many files without navigating away:
 4. Confirmation prompt appears for 12+ items
 
 **Clipboard Operations**:
-- `y` - Copy current item (cycles: path → snippet → full content)
-- `Ctrl+Y` - Copy all selected items (paths on separate lines)
+- `Ctrl+Y` - Copy the current item's path
+- `Alt+Y` - Copy the current item's snippet
+- `Ctrl+Shift+C` - Copy the current item's content
+- Bulk actions menu → **Copy Paths** for every selected item
 
 ---
 
@@ -1839,14 +1964,14 @@ The same conversation content can appear multiple times due to:
 
 `cass` uses a multi-layer deduplication strategy:
 
-1. **Message Hash**: BLAKE3 of `(role + content + timestamp)`
-   - Identical messages in different files are stored once
+1. **Message identity**: messages are keyed by `UNIQUE(conversation_id, idx)` and inserted with `INSERT OR IGNORE`, so re-indexing the same file never stores a message twice
+   - No content hash is persisted for this; BLAKE3 content hashes are computed in memory only, as merge fingerprints when an updated file is reconciled against stored rows
 
-2. **Conversation Fingerprint**: Hash of first N message hashes
-   - Detects duplicate conversation files
+2. **Conversation identity**: conversations are keyed by `UNIQUE(source_id, agent_id, external_id)`
+   - There is no fingerprint built from message hashes; the same external id from the same source and agent is the same conversation
 
-3. **Search-Time Dedup**: Results are deduplicated by content similarity
-   - Even if stored twice, shown once in results
+3. **Search-Time Dedup**: hits are deduplicated on an exact key tuple — `(source, source path, conversation id or title, line number, created_at, whitespace-invariant content hash)` — keeping the highest-scored hit
+   - Identical content from different sources stays visible as separate results; tool-invocation noise is filtered
 
 ### Noise Filtering
 
@@ -1965,8 +2090,8 @@ Save your current filter configuration to one of 9 slots for instant recall.
 
 | Key | Action |
 |-----|--------|
-| `Shift+1` through `Shift+9` | Save current view to slot |
-| `1` through `9` | Load view from slot |
+| `Ctrl+1` through `Ctrl+9` | Save current view to slot |
+| `Shift+1` through `Shift+9` | Load view from slot |
 
 ### Via Command Palette
 
@@ -1982,13 +2107,13 @@ Views are stored in `tui_state.json` and persist across sessions. Clear all save
 
 ## 📐 Density Modes
 
-Control how many lines each search result occupies. Cycle with `Shift+D` or via the command palette.
+Control how many lines each search result occupies. Cycle with `Ctrl+D` or via the command palette.
 
 | Mode | Lines per Result | Best For |
 |------|------------------|----------|
-| **Compact** | 3 | Maximum results visible, scanning many items |
+| **Compact** | 2 | Maximum results visible, scanning many items |
 | **Cozy** (default) | 5 | Balanced view with context |
-| **Spacious** | 8 | Detailed preview, fewer results |
+| **Spacious** | 6 | Detailed preview, fewer results |
 
 The pane automatically adjusts how many results fit based on terminal height and density mode.
 
@@ -2063,13 +2188,28 @@ Toggle between rounded Unicode and plain ASCII borders with `Ctrl+B`.
 
 ## 🔖 Bookmark System
 
-Save important search results with notes and tags for later reference.
+Bookmarks are a CLI feature: `cass bookmarks add|list|remove|search|export|import --json` manages user-authored annotations on search results (a source path, optional line number, note, and tags). The TUI has no bookmark keybindings today.
+
+```bash
+# Bookmark a search hit (source_path + line_number from search output)
+cass bookmarks add /path/to/session.jsonl -n 42 --title "JWT refresh fix" \
+  --note "Good explanation of the refresh flow" --tags "auth,jwt" --json
+
+# List (optionally by tag), search notes/titles/snippets, remove by id
+cass bookmarks list --tag auth --json
+cass bookmarks search "refresh" --json
+cass bookmarks remove 1 --json          # exit 13 (`bookmark-not-found`) if the id is unknown
+
+# Back up and restore
+cass bookmarks export -o bookmarks.json --json
+cass bookmarks import bookmarks.json --json
+```
 
 ### Features
 
-- **Persistent storage**: Bookmarks saved to `bookmarks.db` (SQLite)
+- **Persistent storage**: Bookmarks saved to `bookmarks.db` (SQLite), separate from the search index and never pruned by doctor/cleanup flows
 - **Notes**: Add annotations explaining why you bookmarked something
-- **Tags**: Organize with comma-separated tags (e.g., "rust, important, auth")
+- **Tags**: Organize with comma-separated tags (e.g., "rust, important, auth"); `list` can filter by tag
 - **Search**: Find bookmarks by title, note, or snippet content
 - **Export/Import**: JSON format for backup and sharing
 
@@ -2215,11 +2355,11 @@ classDiagram
 
 ### The Pipeline
 1. **Discovery**: [franken_agent_detection](https://github.com/Dicklesworthstone/franken_agent_detection) auto-discovers sessions from 26 coding agents (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Oh My Pi, Copilot, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Goose, Hermes, Kimi, Muse Code, Qwen, Factory, OpenHands, Antigravity, Grok Build).
-2. **Storage (frankensqlite)**: The **Source of Truth**. Data is persisted to a normalized SQLite schema (`messages`, `conversations`, `agents`) via [frankensqlite](https://github.com/Dicklesworthstone/frankensqlite) — a pure-Rust SQLite reimplementation with `BEGIN CONCURRENT` support for MVCC multi-writer transactions.
+2. **Storage (frankensqlite)**: The **Source of Truth**. Data is persisted to a normalized SQLite schema (`messages`, `conversations`, `agents`) via [frankensqlite](https://github.com/Dicklesworthstone/frankensqlite) — a pure-Rust SQLite reimplementation. Production writes use single-writer `BEGIN IMMEDIATE` transactions; an experimental opt-in parallel persist path (`CASS_INDEXER_BEGIN_CONCURRENT=1`, off by default) exists but is not the default.
 3. **Search Index (frankensearch)**: The **Speed Layer**. New messages are incrementally pushed to a unified search index via [frankensearch](https://github.com/Dicklesworthstone/frankensearch) which provides BM25 lexical search, semantic embeddings, RRF fusion, and cross-encoder reranking in a single library.
  * **Fields**: `title`, `content`, `agent`, `workspace`, `created_at`.
  * **Prefix Fields**: `title_prefix` and `content_prefix` use **Index-Time Edge N-Grams** (not stored on disk to save space) for instant prefix matching.
- * **Deduping**: Search results are deduplicated by content hash to remove noise from repeated tool outputs.
+ * **Deduping**: Search results are deduplicated on an exact key tuple (source, source path, conversation, line number, timestamp, whitespace-invariant content hash) and tool-invocation noise is filtered.
 
 ```mermaid
 flowchart LR
@@ -2263,7 +2403,7 @@ flowchart LR
  end
 
  subgraph "Storage + Search"
- S1["frankensqlite (WAL)\nSource of Truth\nBEGIN CONCURRENT\nMigrations"]:::pastel3
+ S1["frankensqlite (WAL)\nSource of Truth\nBEGIN IMMEDIATE\nMigrations"]:::pastel3
  T1["frankensearch\nBM25 + Semantic\nRRF Fusion\nReranking"]:::pastel4
  end
 
@@ -2314,7 +2454,7 @@ An index that is always a little behind is the most common complaint about any l
 
 | Layer | What | When it runs | Enable |
 |-------|------|--------------|--------|
-| **Stale-on-read catch-up** | `search`, `pack`, and TUI launch check index freshness. If the index is stale (> 30 min), partial, or has pending sessions, a *detached* incremental `cass index --background` is spawned in its own process group and the current results are returned immediately. The next search is fresh. | On demand, at most once per 5 min per data dir (`CASS_AUTO_REFRESH_COOLDOWN_SECS`). Never for data dirs under the OS temp dir, and never for `search --no-maintenance`. | On by default. `CASS_AUTO_REFRESH=0` disables globally. `--robot-meta` reports `index_freshness.auto_refresh.{outcome,trigger,pid}`. |
+| **Stale-on-read catch-up** | `search`, `pack`, and TUI launch check index freshness. If the index is stale (> 30 min), partial, or has pending sessions, a *detached* incremental `cass index --background` is spawned in its own process group and the current results are returned immediately. The next search is fresh. | On demand, at most once per 5 min per data dir (`CASS_AUTO_REFRESH_COOLDOWN_SECS`). Never for data dirs under the OS temp dir, and never for `search --no-maintenance`. A catch-up that ends without advancing the index is not respawned blindly: 1 h, then 6 h between attempts, and three failures trip the breaker until any run completes. | On by default. `CASS_AUTO_REFRESH=0` disables globally. `--robot-meta` reports `index_freshness.auto_refresh.{outcome,trigger,pid,consecutive_failures,detail}`. |
 | **OS scheduler** (`cass schedule install`) | launchd LaunchAgents (macOS) or systemd user timers (Linux): an **incremental** job every 15 min and a **nightly** job (03:00) that runs `index --full`, then bounded `models backfill --scheduled` batches (fast/hash tier always; quality/MiniLM tier when the model is installed), plus any remote-source syncs whose `sync_schedule` in `sources.toml` is due. Priority is delegated to the OS (`ProcessType=Background`/`Nice`/`LowPriorityIO`, `Nice=19`/`IOSchedulingClass=idle`/`CPUSchedulingPolicy=idle`). | On the timer, even when no cass process is running; survives reboots (`Persistent=true` / launchd). | `cass schedule install [--interval-mins 15] [--nightly-hour 3] [--no-nightly] [--no-semantic] [--dry-run]`; `cass schedule status`; `cass schedule uninstall`. |
 | **Resident daemon timer** | The warm-model daemon (`cass daemon`, auto-spawned by semantic/hybrid searches) can also kick an incremental background index while it is resident. | Every `CASS_DAEMON_INDEX_INTERVAL_SECS` seconds while the daemon lives (it exits after its idle timeout). | Off by default; `CASS_DAEMON_INDEX_INTERVAL_SECS=900` recommended. |
 
@@ -2364,8 +2504,8 @@ graph TD
 Data integrity is paramount. `cass` treats the SQLite database (`src/storage/sqlite.rs`, powered by frankensqlite) as an **append-only log** for conversations:
 
 - **Immutable History**: When an agent adds a message to a conversation, we don't update the existing row. We insert the new message linked to the conversation ID.
-- **Deduplication**: The connector layer uses content hashing to prevent duplicate messages if an agent re-writes a file.
-- **Versioning**: A `schema_version` meta-table and strict migration path ensure that upgrades (like the recent move to v3) are safe and atomic.
+- **Deduplication**: Messages are keyed by `UNIQUE(conversation_id, idx)` and inserted with `INSERT OR IGNORE`, so an agent re-writing a file cannot store a message twice; BLAKE3 content hashes are used only in memory as merge fingerprints.
+- **Versioning**: A `_schema_migrations` table and strict migration path (20 versioned migrations at HEAD; see *Database Schema Migrations*) ensure that upgrades are safe and atomic.
 
 ---
 
@@ -2445,18 +2585,23 @@ This means corrupted lexical data is a repairable derivative-state problem. Oper
 
 ### Database Schema Migrations
 
-The SQLite database uses versioned schema migrations:
+The SQLite database uses 20 versioned schema migrations, tracked in the `_schema_migrations` table (`CURRENT_SCHEMA_VERSION = 20` and `MIGRATION_NAMES` in `src/storage/sqlite.rs`):
 
-| Version | Changes |
-|---------|---------|
-| v1 | Initial schema: agents, workspaces, conversations, messages, snippets, tags |
-| v2 | Added FTS5 full-text search |
-| v3 | Added source provenance tracking |
-| v4 | Added vector embeddings support |
-| v5 | Current: Added remote sources |
+| Version | Migration | Version | Migration |
+|---------|-----------|---------|-----------|
+| 1 | `core_tables` | 11 | `message_metrics` |
+| 2 | `fts_messages` | 12 | `model_dimensions` |
+| 3 | `fts_messages_rebuild` | 13 | `plan_token_rollups` |
+| 4 | `sources` | 14 | `fts_contentless` |
+| 5 | `provenance_columns` | 15 | `conversation_tail_state_cache` |
+| 6 | `source_path_index` | 16 | `drop_redundant_message_conv_idx` |
+| 7 | `msgpack_columns` | 17 | `drop_message_created_idx` |
+| 8 | `daily_stats` | 18 | `conversation_tail_state_hot_table` |
+| 9 | `embedding_jobs` | 19 | `conversation_external_lookup` |
+| 10 | `token_analytics` | 20 | `conversation_external_tail_lookup` (current) |
 
 **Migration Process**:
-1. On startup, `cass` checks `schema_version` in the database
+1. On startup, `cass` checks `_schema_migrations` in the database (older databases that still record `schema_version` in the `meta` table are transitioned automatically)
 2. If version < current, migrations run automatically
 3. Migrations are incremental and non-destructive
 4. User data (bookmarks, TUI state, sources.toml) is always preserved
@@ -2564,6 +2709,11 @@ all`, the window applies to Track A while Track B still rebuilds the complete
 filter because its invariant checks always cover the complete analytics
 database.
 
+The TUI analytics dashboard never rebuilds rollups in-process: when rollups are
+missing it spawns a detached `cass analytics rebuild` child, logs it to
+`<data_dir>/analytics-rebuild.log`, and reports the pid in the status line;
+reopen the dashboard once the rebuild finishes.
+
 ---
 
 ## 🐚 Shell Completions
@@ -2606,7 +2756,7 @@ cass completions powershell >> $PROFILE
 
 - **CPU**: any x86_64 or ARM64 processor. Semantic search runs on a pure-Rust inference backend (frankensearch/native) with runtime-dispatched SIMD — NEON on Apple Silicon, AVX2/FMA when present on x86, SSE2/scalar fallback otherwise — so there is no AVX requirement and no `SIGILL` hazard (the historical ONNX Runtime dependency was removed in cass#308).
 - **OS**: Linux, macOS, or Windows
-- **Linux glibc**: Pre-built binaries require **glibc 2.38+** (Ubuntu 24.04+, Fedora 39+, Debian 13+). Ubuntu 20.04 (glibc 2.31) and 22.04 (glibc 2.35) are **not supported** with pre-built binaries. Users on older distributions should build from source with `cargo install --git https://github.com/Dicklesworthstone/coding_agent_session_search`. This requirement exists because CI builds target ubuntu-24.04 to access newer kernel features used by the frankensqlite storage engine.
+- **Linux glibc**: Pre-built binaries require **glibc 2.38+** (Ubuntu 24.04+, Fedora 39+, Debian 13+). Ubuntu 20.04 (glibc 2.31) and 22.04 (glibc 2.35) are **not supported** with pre-built binaries. Users on older distributions should build from source with `cargo install --git https://github.com/Dicklesworthstone/coding_agent_session_search`. This requirement exists because CI builds target ubuntu-24.04 to access newer kernel features used by the frankensqlite storage engine. The install script probes the host's glibc (`ldd --version`) before downloading a Linux prebuilt binary and falls back to build-from-source with a warning when it is older than 2.38; `--from-source` forces that route, and `--artifact-url` bypasses the probe for an explicitly chosen artifact.
 - **Disk**: Sufficient space for the search index (varies with session history size)
 
 ---
@@ -2623,7 +2773,7 @@ brew install dicklesworthstone/tap/cass
 brew upgrade cass
 ```
 
-Homebrew bottles are currently published for Linux and Apple Silicon macOS. On Intel macOS, use the install script with `--from-source`.
+The Homebrew tap installs prebuilt release tarballs (not bottles) for Linux and Apple Silicon macOS. On Intel macOS, use the install script with `--from-source`.
 
 **Windows: Scoop**
 ```powershell
@@ -2663,13 +2813,13 @@ cass
 ### 3. Usage
 - **Type to search**: "python error", "refactor auth", "c++".
 - **Wildcards**: Use `foo*` (prefix), `*foo` (suffix), or `*foo*` (contains) for flexible matching.
-- **Navigation**: `Up`/`Down` to select, `Right` to focus detail pane. `Up`/`Down` in search bar navigates query history.
+- **Navigation**: `Up`/`Down` to select, `Tab` (or `Alt+l`) to focus the detail pane. `Ctrl+N`/`Ctrl+Shift+N` step through query history; `Ctrl+R` cycles it.
 - **Filters**:
     - `F3`: Filter by Agent (e.g., "codex").
     - `F4`: Filter by Workspace/Project.
     - `F5`/`F6`: Time filters (Today, Week, etc.).
 - **Modes**:
-    - `F2`: Toggle Dark/Light theme.
+    - `F2`: Next theme (`Shift+F2` previous; 19 presets).
     - `F12`: Cycle ranking mode (recent → balanced → relevance → quality → newest → oldest).
     - `Ctrl+B`: Toggle rounded/plain borders.
 - **Actions**:
@@ -2678,10 +2828,10 @@ cass
     - `F8`: Open selected hit in `$EDITOR`.
     - `Ctrl+Enter`: Add current result to queue (multi-open).
     - `Ctrl+O`: Open all queued results in editor.
-    - `Ctrl+M` / `Ctrl+X`: Toggle selection on current item.
-    - `A`: Bulk actions menu (when items selected).
-    - `y`: Copy file path or snippet to clipboard.
-    - `/`: Find text within detail pane; `n`/`N` cycle matches; `Esc` exits find before closing modal.
+    - `Ctrl+X`: Toggle selection on current item (`Ctrl+M` opens the detail modal, like `Enter`).
+    - `Alt+B`: Bulk actions menu (when items selected).
+    - `Ctrl+Y` / `Alt+Y` / `Ctrl+Shift+C`: Copy file path / snippet / content to clipboard.
+    - `/`: Find text within detail pane; `Enter` advances matches; `n`/`N` cycle contextual session hits; `Esc` closes the modal.
     - `Ctrl+Shift+R`: Trigger manual re-index (refresh search results).
     - `Ctrl+Shift+Del`: Reset TUI state (clear history, filters, layout).
 
@@ -2766,7 +2916,7 @@ cass completions bash > ~/.bash_completion.d/cass
 | `pack --robot` | Deterministic cited answer packs for agent/human handoffs; reports health, freshness, privacy, and warnings |
 | `triage` / `ready` / `preflight` | One-shot agent preflight: readiness, exact next command, docs, schemas, workflows, and recoveries |
 | `status` / `state` | Health snapshot: index freshness, DB stats, recommended action |
-| `health` | Minimal health check (<50ms), exit 0=healthy, 1=unhealthy |
+| `health` | Minimal health check (<50ms on a healthy archive; the strict, mutation-free owner-thread probe shared with `status` has a 30 s hard deadline and never checkpoints a dirty WAL), exit 0=healthy, 1=unhealthy |
 | `selftest` | Archive-independent executable probe for installers and binary-promotion gates; exercises an in-memory FrankenSQLite write/read round-trip |
 | `capabilities` | First-stop agent self-description: workflow recipes, mistake recoveries, commands, global flags, exit codes, env vars, and limits |
 | `introspect` | Full API schema: commands, arguments, response shapes |
@@ -2783,6 +2933,29 @@ cass completions bash > ~/.bash_completion.d/cass
 | `timeline` | Activity timeline with grouping by hour/day |
 | `sources` | Manage remote sources: add/list/remove/doctor/sync/mappings |
 | `doctor` | Diagnose and repair installation issues (safe, never deletes data) |
+
+Other subcommands (all present in the `Commands` enum in `src/lib.rs`):
+
+| Command | Purpose |
+|---------|---------|
+| `pages` | Export an encrypted, searchable static-site archive with GitHub Pages / Cloudflare Pages deploy; runs the interactive wizard by default, with `--export-only DIR`, `--verify BUNDLE`, `--preview BUNDLE`, and `--scan-secrets` as non-wizard modes |
+| `pages key list\|add-password\|add-recovery\|revoke\|rotate --archive BUNDLE` | Manage the key slots of an exported encrypted bundle (LUKS-style: several independently wrapped copies of one data key). Passwords come from an interactive prompt or `--password-stdin` (current password on line 1, new password on line 2), never from argv; `--json` for automation; recovery secrets are printed once and never stored. See `docs/RECOVERY.md` |
+| `upgrade` | Check for a newer release and optionally run the same checksum-verified installer the TUI uses (`--check`, `--yes`, `--force`) |
+| `man` | Generate the man page to stdout |
+| `storage` | On-disk storage footprint by component (DB, WAL, lexical index, raw mirror, semantic, quarantine) |
+| `dedup` | Collapse pre-existing duplicate conversation rows (`projects/<rel>` vs `<rel>` external-id twins); dry-run unless `--apply` |
+| `support-bundle` | Assemble a redacted, share-safe recovery/support evidence bundle |
+| `state` | Quick state/health check (alias of `status`) |
+| `onboarding` | Read-only first-run source onboarding + readiness wizard; `--json` for scripts, never launches the TUI |
+| `quarantine` | Inspect and manage the conversation-ingest quarantine (`list` / `clear`) |
+| `forget` | Prune already-indexed conversations by source-path glob; dry-run by default, `--apply` to commit, then derived search/analytics assets are rebuilt |
+| `fleet upgrade-rehearsal` | Fleet-safe upgrade rehearsal (dry run) with bounded post-upgrade verification; `--live` opts in to SSH probes of configured remotes |
+| `lessons list\|search` | Mine and query durable, redacted lessons from local evidence (commits, closed beads, proof manifests) |
+| `import chatgpt` | Split a ChatGPT web export (`conversations.json`) into files the ChatGPT connector can index |
+| `release-verify` | Verify release distribution channels (GitHub, Homebrew, Scoop, crates.io, installer) from a recorded observation (`--from`) or live (`--live`) |
+| `sources discover` | Auto-discover SSH hosts from `~/.ssh/config` |
+| `sources reingest` | Re-ingest an already-synced mirror into the canonical archive without re-running rsync |
+| `sources artifact-manifest` | Build or verify a lexical-artifact evidence manifest for remote exchange |
 
 ### Specialized Validation and Recording Tools
 
@@ -2802,7 +2975,7 @@ Commands for troubleshooting, debugging, and understanding system state:
 cass triage --json
 # → { "surface": "triage", "status": "healthy", "next_command": null, ... }
 
-# Health check (fast, <50ms)
+# Health check (fast, <50ms; the archive probe is bounded by a 30 s hard deadline)
 cass health --json
 # → { "healthy": true, "index_age_seconds": 120, "message_count": 5000 }
 
@@ -2927,6 +3100,8 @@ cass models check-update --json
 #     "current_revision": str|null, "latest_revision": str }
 ```
 
+In `cass status --json`, `semantic.preferred_backend` is `"fastembed"` when the native MiniLM lane is selected and `"hash"` for the hash tier; `fastembed` is only the id of the native pure-Rust MiniLM lane — no ONNX runtime is involved.
+
 **Model Files** (stored in `$CASS_DATA_DIR/models/all-MiniLM-L6-v2/`):
 - `model.safetensors` - The neural network weights (~90MB)
 - `tokenizer.json` - Vocabulary and tokenization rules
@@ -3026,10 +3201,9 @@ Windows (PowerShell):
 ```
 
 The update process:
-1. Downloads the new binary with SHA256 verification
-2. Backs up the current binary
-3. Replaces with the new version
-4. Prompts to restart `cass`
+1. Downloads `install.sh` (or `install.ps1`) and verifies it against the release `SHA256SUMS.txt`
+2. Replaces the current process with `install.sh --easy-mode --verify --version <tag>` (PowerShell equivalent on Windows), which downloads and checksum-verifies the new binary
+3. There is no separate binary backup or rollback step; reinstall an earlier tag with the installer's `--version` flag if needed
 
 ### Skip Version
 
@@ -3077,6 +3251,7 @@ Update check state is stored in the data directory:
 - **Cache debug**: set `CASS_DEBUG_CACHE_METRICS=1` to emit cache hit/miss/shortfall/reload stats via tracing (debug level).
 
 - **Temporary scan exclusions**: `CASS_EXCLUDE_PATHS` accepts comma- or newline-delimited file paths or directory prefixes to skip during source discovery and parsing. While exclusions are active, CASS preserves scan/watch watermarks so excluded active session files are picked up after the exclusion is removed.
+- **Active session retries**: continuous watch mode retains paths skipped because they are still being written, including during startup, and retries them after the normal watch cooldown even without another filesystem event. `CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS` controls the recent-write window (default 120 seconds, maximum 3600); writer and advisory-lock checks still apply.
 
 - **Watch testing (dev only)**: `cass index --watch --watch-once path1,path2` triggers a single reindex without filesystem notify (also respects `CASS_TEST_WATCH_PATHS` for backward compatibility); useful for deterministic tests/smoke runs.
 
@@ -3091,9 +3266,13 @@ Update check state is stored in the data directory:
 | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY` | unset | Set to `1` to hash every raw-mirror descriptor/chunk during a read-only doctor run, overriding the default bounded verification limits |
 | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_MANIFEST_LIMIT` | `256` | Defer full raw-mirror hashing above this manifest count while retaining metadata-only amplification diagnostics |
 | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_BYTE_LIMIT` | `536870912` | Defer full raw-mirror hashing when either physical storage or estimated logical verification work exceeds this byte count; metadata-only amplification diagnostics remain available |
+| `CASS_FTS_DRYRUN_CAP` | `4096` | Row-ID comparison cap for the read-only `doctor --rebuild-canonical-fts --dry-run` divergence scan ([#345](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/345)). At the cap the dry-run stops and reports a `>= N divergent` floor instead of an exact count; exact parity is deferred to the `--yes` apply path |
 | **Background Indexing** | | |
-| `CASS_AUTO_REFRESH` | `1` | Stale-on-read catch-up for a stale/partial/behind index seen by `search`, `pack`, or TUI launch. Set `0` to disable globally; `search --no-maintenance` always remains read-only. |
+| `CASS_AUTO_REFRESH` | `1` | Stale-on-read catch-up for a stale/partial/behind index seen by `search`, `pack`, or TUI launch. Set `0` to disable globally; `search --no-maintenance` always remains read-only. A spawned catch-up that ends without advancing `last_indexed_at` (OOM-killed in a memory-capped scope, stall-aborted, crashed) counts as a failure: the next attempt waits 1 h, then 6 h, and three failures in a row trip the breaker (no auto-spawn until any run completes). `--robot-meta`/`status --json` report `auto_refresh.outcome` = `backed_off`/`tripped` with `consecutive_failures` and `detail`; `schedule status` and `doctor` show the same. |
 | `CASS_AUTO_REFRESH_COOLDOWN_SECS` | `300` | Minimum spacing between auto-spawned catch-up runs per data dir |
+| `CASS_FTS_INLINE_BUDGET_SECS` | `300` | Wall-clock one index run may spend writing the `fts_messages` SQL-fallback shadow inline. Past it the rest of the run skips the shadow (canonical rows and the Quill index still land, `last_indexed_at` advances) and the reason is recorded for `doctor`; the shadow is behind until a repair. Exists because fsqlite's FTS5 does O(table) work per statement on a large shadow (GH #413, frankensqlite#405/#406). `0` disables. |
+| `CASS_FTS_REPAIR_PAGE_BUDGET_SECS` | `120` | Per-page budget for the paged shadow repair/rebuild (`index --full`, `doctor --fix`): a page over budget stops the repair truthfully (shadow left Partial, reason recorded) instead of wedging the run. `0` disables. |
+| `CASS_FTS_SHADOW_MAX_MESSAGES` | `100000` | Largest canonical corpus (indexable message count) for which cass keeps the `fts_messages` SQL-fallback shadow at all. fsqlite's FTS5 rebuilds the whole shadow in memory on the first write after every writable open (about 32 KB of RAM per message: a 631k-message archive costs 20 GB and minutes before anything is indexed), so above the bound the index run drops the shadow before its first write (through a deferred-FTS5 connection), records why (`status` `index.fallback_fts_repair`, `doctor` `fts_table`), and does not recreate it until the corpus fits. Quill lexical search is unaffected; the SQL fallback scans `messages`. `0` disables the bound. |
 | `CASS_BACKGROUND_NICE` | `15` | nice value `cass index --background` applies to itself (0..=19) |
 | `CASS_BACKGROUND_IONICE_CLASS` | `3` | ionice class for `cass index --background` on Linux (3 = idle) |
 | `CASS_DAEMON_INDEX_INTERVAL_SECS` | `0` | While the semantic daemon is resident, spawn an incremental background index every N seconds (`900` recommended; 0 = off) |
@@ -3103,6 +3282,12 @@ Update check state is stored in the data directory:
 | `CASS_INDEX_REDACTION` | `full` | Index-time secret redaction: `full` scrubs API keys/tokens/passwords/private keys from every persisted message, title, snippet, and metadata blob before they reach SQLite or the lexical index; `off` skips redaction for faster ingest. **`off` means raw text is indexed** — note that the original session files and the cass raw-mirror blobs (`<data_dir>/raw-mirror/v1/`) already contain the same raw text unencrypted on the same disk, so `full` protects the queryable surfaces (search results, exports, robot output), not disk-at-rest secrecy. Unrecognized values warn and behave as `full`. |
 | `CASS_REDACT_SECRETS` | `1` | Legacy redaction toggle (`0`/`false`/`off`/`no` disables). `CASS_INDEX_REDACTION` takes precedence when both are set. |
 | `CASS_REDACT_MEMO_CAPACITY` | 4096 | Entry cap for the per-worker redaction memo cache used during batched persist. Raise on very large, boilerplate-heavy corpora if eviction churn shows up in `cass::redact::memo` debug logs. Only strings the secret prefilter flags as candidate-bearing are memoized, and individual inputs over 64 KiB are never cached (bounds worst-case cache memory). |
+| `CASS_INDEX_STALL_DETECT_SECS` | `120` | Seconds without measured phase progress before `cass index` emits stall diagnostics; `0` disables detection |
+| `CASS_INDEX_STALL_ABORT_SECS` | `300` | Seconds without progress before an abort-eligible lexical stall exits 70; `0` keeps stalls report-only. Semantic phases are report-only unless `CASS_INDEX_STALL_ABORT_ALL_PHASES=1` |
+| `CASS_INDEX_STALL_ABORT_ALL_PHASES` | unset | Opt-in ([#437](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/437)): set `1` to promote the stall watchdog's report-only warnings to a hard abort (exit 70) in ANY phase — including scribe/accumulate and semantic report-only lanes — once `CASS_INDEX_STALL_ABORT_SECS` elapses without progress. The finalize/persist grace thresholds still apply; the abort finalizes exactly like lexical-phase aborts (best-effort WAL checkpoint, lock release via startup recovery) |
+| `CASS_INDEX_FINALIZE_ABORT_SECS` | `1800` | Larger abort grace applied while the indexer is inside the finalize WAL-checkpoint / rebuild-tail windows; `0` makes the finalize window report-only |
+| `CASS_INDEX_FINAL_WAL_CHECKPOINT_TIMEOUT_SECS` | `900` | Wall-clock budget for the index run's final `wal_checkpoint(TRUNCATE)`. If the checkpoint outlives it (an archive whose frankensqlite writable path loops, [#382](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/382)), the run still exits 0 after its publish, leaves the WAL for the next opener, and logs the remedy instead of hanging; `0` keeps the default |
+| `CASS_DOCTOR_WAL_CHECKPOINT_TIMEOUT_SECS` | `120` | Wall-clock budget for `cass doctor --fix`'s WAL checkpoint (`archive_wal`); on expiry the check reports `fail` with the deadline, #382 and the stock-sqlite remedy instead of never returning; `0` keeps the default |
 | `CASS_NO_COLOR` | unset | Force monochrome TUI output |
 | `NO_COLOR` | unset | Honored by TUI only when `CASS_RESPECT_NO_COLOR=1` |
 | `CASS_RESPECT_NO_COLOR` | unset | Make TUI inherit global `NO_COLOR` |
@@ -3112,6 +3297,8 @@ Update check state is stored in the data directory:
 | `CASS_CACHE_BYTE_CAP` | 10485760 | Cache byte limit (10MB) |
 | `CASS_WARM_DEBOUNCE_MS` | 120 | Warm-up search debounce |
 | `CASS_DEBUG_CACHE_METRICS` | unset | Enable cache hit/miss logging |
+| `CASS_QUILL_QUERY_FUEL_BUDGET` | Quill default (10000000) | Escape hatch for Quill's deterministic per-query work ceiling (GH #441). Zero or unparseable values keep the engine default. When fuel runs out on a hybrid query the lexical leg is dropped, the semantic leg still answers, and `_meta.lexical_degrade_reason` reports `query_fuel_exhausted`; lexical-only queries return an actionable hint. The durable fix for fuel exhaustion is a consolidated index (an incremental `cass index` folds fragmented generations in its maintenance pass; `--full` rebuilds from scratch), and cass now publishes Quill snapshots only on its own commits (no per-second visibility seals), which is what let segment counts grow into the hundreds on append-only archives |
+| `CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES` | 1073741824 (1 GiB) | Maximum estimated output per lexical merge run, including the covered document-ID range. Oversized singleton segments remain unmerged. This is a merge-planning limit, not a total-process RSS ceiling. Positive byte values accept underscores; zero or invalid values keep the default. |
 | **Semantic Search** | | |
 | `CASS_SEMANTIC_EMBEDDER` | auto | Force embedder: `hash`, `minilm`, or explicit `multilingual-minilm` |
 | `CASS_SEMANTIC_PROGRESS_JSONL` | unset | Absolute path to a JSONL file the semantic backfill appends one event per transition to (`selection_*`, `packet_replay_*`, `embed_batch_*`, `staging_write_*`, `checkpoint_save_*`, `publish_*`, `error`, `cancelled`, `complete`). Each line carries timestamp, phase + sub-phase, batch/row counters, byte counts, elapsed-since-start, and a cheap RSS estimate. Silent when unset. Best-effort writes — failures log at debug and never crash a backfill. See [cass#257](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/257). |
@@ -3122,7 +3309,6 @@ Update check state is stored in the data directory:
 | **TUI** | | |
 | `TUI_HEADLESS` | unset | Disable interactive features |
 | `CASS_ALLOW_DUMB_TERM` | unset | Allow TUI startup even when `TERM=dumb` |
-| `CASS_UI_METRICS` | unset | Enable UI interaction tracing |
 | `CASS_DISABLE_ANIMATIONS` | unset | Disable UI animations |
 | `EDITOR` | `$VISUAL` or `vi` | External editor command |
 | `EDITOR_LINE_FLAG` | `+` | Line number flag (e.g., `+42`) |
@@ -3148,14 +3334,14 @@ Update check state is stored in the data directory:
 
 ## Dependency Source Contract
 
-`cass` pins its contract-critical ecosystem dependencies with exact registry requirements in [`Cargo.toml`](Cargo.toml); other direct dependencies use normal semver requirements, and `Cargo.lock` freezes the complete resolved graph. Since gh#416 closed, no active dependency or patch resolves from git. Optional sibling-path overrides stay commented out by default and must never be committed active.
+`cass` pins its contract-critical ecosystem dependencies with exact registry requirements in [`Cargo.toml`](Cargo.toml); other direct dependencies use normal semver requirements, and `Cargo.lock` freezes the complete resolved graph. No active dependency or patch currently resolves from git. Optional sibling-path overrides stay commented out by default and must never be committed active.
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` | crates.io `=0.3.17` (the complete fsqlite family is converged on one registry release; the build contract rejects git/revision overrides, family-specific patches, mixed versions, and lockfile sources outside crates.io. This is the production-manager repair selected after the 0.3.13 large-WAL archive open/rollback probe failure. The engine API is async; `src/franken_sync.rs` preserves cass's synchronous call shape via a current-thread asupersync `block_on` bridge) |
-| `franken-agent-detection` | crates.io `=0.2.1` (2026-08-24; `src/` byte-identical to the previously pinned git rev `82424dc8` — first-class Oh My Pi v18 connector with profile, XDG, direct-root, and sub-agent discovery; preserves pi-family remote provenance; includes Muse Code and VS Code Copilot; aligned with fsqlite 0.3.x + asupersync 0.4.x) |
-| `asupersync` | `=0.4.9` (fsqlite 0.3.x requires the 0.4.x line, whose types its public API names; 0.4.9 preserves the typed-result cancellation contract) |
-| `frankensearch` | crates.io `=0.4.2` (2026-08-28, cass#410/frankensearch#40: adds the distinct opt-in `paraphrase-multilingual-MiniLM-L12-v2` native embedding space, immutable artifact/producer identity, explicit-only acquisition, and dynamic 6/12-layer Frankentorch loading to the 0.4.1 Windows Quill publication line. It retains the CASS→Quill lexical flip with `cass-compat` → `lexical-tantivy` for the differential oracle and schema-generation sentinel, pure-Rust `native`, architecture-safe HNSW, consumer-owned `TwoTierIndexPaths`, non-mutating lexical admission, cancellation-safe facade opening, and generation-pinned Quill hydration. Registry `0.3.2` is a stale same-version twin of an older tree (no quill/cass-compat/native) — the exact pin exists so resolution can never reach it. frankentorch resolves from crates.io as `frankentorch-*`; the HNSW fork is registry `frankenhnsw 0.3.5`; tantivy is registry `=0.26.1` (RUSTSEC-2026-0253 on its lru is unreachable: the advisory needs a panicking `Drop` on a cache key under `catch_unwind`, and tantivy's cache keys are trivially droppable) — cass #308, #333, #410, bd-8nqz.5, bd-07os, bd-r65a.1) |
+| `frankensqlite` / `fsqlite-types` | crates.io `=0.3.18` (updated 2026-09-07; adds parameterized rowid IN-list seeks for GH#415/cass#382, read-only WAL byte/timestamp preservation, reader-registration error propagation, I/O buffer lifetime fixes, and WAL-mode transition and scalar-query corrections). Retains 0.3.17's WAL-tail indexing, reserved lock-byte/freelist repair, FTS metadata/visibility and prefix-BM25 fixes, plus earlier FTS5 savepoint undo, incremental content-backed INSERT, read-only integrity preflight and Windows close repairs. The whole family resolves from one exact registry version; `build.rs` rejects any fsqlite-family registry patch, duplicate package resolution, wrong version, or non-crates.io lockfile source. The async facade and asupersync requirement are unchanged; `src/franken_sync.rs` preserves cass's synchronous call shape via a current-thread asupersync `block_on` bridge. This version does not resolve upstream GH#411's mixed-engine concurrent-WAL limitation. |
+| `franken-agent-detection` | crates.io `=0.2.4` (retains 0.2.3's Antigravity, Claude Code, Codex, tool-result, dedupe, scan-cap, Shelley and ChatGPT/OMP fixes; adds legacy Copilot CLI `workspacePath` extraction for history JSON). Retains 0.2.2's Cursor/Antigravity/Grok scan-root scoping and Aider, Copilot CLI, Amp, OpenCode, ClawdBot and Muse session-loss fixes. Aligned with fsqlite 0.3.x + asupersync 0.4.x. |
+| `asupersync` | `=0.4.10` (publishes `Cx::is_cancelled`, required by Quill 0.2.3; runtime validation is pending. fsqlite 0.3.x names the 0.4.x types in its public API.) |
+| `frankensearch` | crates.io `=0.4.3` / Quill `0.2.3` (cass#453). Segment collection uses retirement-receipt age so subsequent publication does not restart the grace period; `Cx::is_cancelled` comes from Asupersync `0.4.10`. Preserves the explicit multilingual MiniLM embedding space, Windows Quill publication, `cass-compat` → `lexical-tantivy` differential oracle, pure-Rust `native` embeddings, architecture-safe HNSW, consumer-owned `TwoTierIndexPaths`, non-mutating lexical admission and generation-pinned hydration. Registry `0.3.2` is a stale same-version twin without quill/cass-compat/native, so exact pins remain required. Frankentorch resolves as `frankentorch-*`, HNSW as `frankenhnsw 0.3.5`, and Tantivy as `=0.26.1`. RUSTSEC-2026-0253 on Tantivy's lru requires a panicking key destructor under `catch_unwind`; Tantivy's cache keys are trivially droppable. |
 | `frankentui` (`ftui`, `ftui-runtime`, `ftui-tty`, `ftui-extras`) | crates.io `=0.5.0` (2026-08-21; previously git `5f78cfa0` / 0.3.1 — the 0.5 API compiled with zero call-site changes) |
 | `toon` (`tru`) | crates.io `=0.2.4` (2026-08-24; production sources byte-identical to the previously pinned git rev `d7185c78` — registry 0.2.3 was rejected because its tree differs from the rev in real source despite the matching version field) |
 
@@ -3265,7 +3451,7 @@ opt-level = 3           # Maximum runtime optimization
 
 ### CI Pipeline & Artifacts
 
-The CI pipeline (`.github/workflows/ci.yml`) runs on every PR and push to main:
+The CI pipeline (`.github/workflows/ci.yml`) is defined to run on every PR and push to main. **Note:** every workflow defined in `.github/workflows/` is currently disabled (`gh workflow list --all` shows `disabled_manually` for all of them); until CI is re-enabled the same gates are run by agents through `rch`:
 
 | Job | Purpose | Artifacts |
 |-----|---------|-----------|

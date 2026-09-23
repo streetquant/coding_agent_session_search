@@ -22,6 +22,15 @@ use util::cass_bin;
 fn base_cmd() -> Command {
     let mut cmd = Command::new(cass_bin());
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    // WS-A.6 (2w1sc): 52 tests in this binary read the committed fixture
+    // archive IN PLACE (`tests/fixtures/search_demo_data`). Stale-on-read
+    // auto-refresh only stays quiet for data dirs under the OS temp dir, and
+    // the fixture is under the checkout, so on a fleet worker a `search` here
+    // spawned a detached `cass index --background` INTO the fixture, which
+    // ingested that worker's real sessions; every golden test that later
+    // copied the fixture absorbed them. These tests observe a fixture; they
+    // never want a live refresh.
+    cmd.env("CASS_AUTO_REFRESH", "0");
     cmd
 }
 
@@ -44,10 +53,21 @@ const SEARCH_DEMO_DATA_DIR: &str = "tests/fixtures/search_demo_data";
 
 fn is_transient_lexical_build_path(path: &Path) -> bool {
     path.components().any(|component| {
-        component
-            .as_os_str()
-            .to_str()
-            .is_some_and(|name| name.starts_with("cass-lexical-shards."))
+        component.as_os_str().to_str().is_some_and(|name| {
+            name.starts_with("cass-lexical-shards.")
+                // Published generations are immutable inputs for these robot
+                // fixtures. The backup tree is created while a concurrent
+                // shared-fixture consumer is publishing a replacement and
+                // must not become part of a copied test namespace.
+                || name == ".lexical-publish-backups"
+                // The lexical self-heal's archive-fingerprint sidecar is a
+                // derived cache written next to the index through a
+                // `.<pid>.tmp` file and a rename. In-place robot tests running
+                // in parallel with a fixture clone make that temp file vanish
+                // between the directory walk and the copy (bead zgzva); the
+                // clone never needs it — a copied archive re-derives it.
+                || name.starts_with(".archive-fingerprint-cache.json")
+        })
     })
 }
 
@@ -60,6 +80,22 @@ fn is_fsqlite_runtime_lock_sidecar_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.ends_with("-fsqlite-ns-gate") || name.ends_with("-fsqlite-ns-use"))
+}
+
+/// Lock files are process-local coordination state, even when they are
+/// zero-byte placeholders after their owner exits. Copying one into a
+/// fixture gives a child command a namespace it did not acquire and lets a
+/// stale shared-fixture owner affect an otherwise isolated test.
+fn is_fixture_runtime_lock_path(path: &Path) -> bool {
+    if is_fsqlite_runtime_lock_sidecar_path(path) {
+        return true;
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            matches!(name, "index-run.lock" | "index-run.lock.meta" | "LOCK")
+                || name.ends_with(".lock")
+        })
 }
 
 fn safe_fixture_destination(dst_root: &Path, rel: &Path) -> Result<PathBuf, Box<dyn Error>> {
@@ -82,6 +118,21 @@ fn safe_fixture_destination(dst_root: &Path, rel: &Path) -> Result<PathBuf, Box<
 fn isolated_search_demo_data() -> Result<TempDir, Box<dyn Error>> {
     let tmp = TempDir::new()?;
     let src = Path::new(SEARCH_DEMO_DATA_DIR);
+
+    // Take a shared snapshot lease while copying. Index/self-heal publishers
+    // hold this same data-dir lock exclusively, so a clone cannot observe a
+    // half-published generation or a database being replaced underneath it.
+    // The lease is dropped before the TempDir is returned.
+    let snapshot_lock_path = src.join("index-run.lock");
+    let snapshot_lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&snapshot_lock_path)?;
+    snapshot_lock.lock_shared()?;
+
     for entry in WalkDir::new(src) {
         let entry = match entry {
             Ok(entry) => entry,
@@ -95,7 +146,9 @@ fn isolated_search_demo_data() -> Result<TempDir, Box<dyn Error>> {
             }
             Err(err) => return Err(Box::new(err)),
         };
-        if is_fsqlite_runtime_lock_sidecar_path(entry.path()) {
+        if is_transient_lexical_build_path(entry.path())
+            || is_fixture_runtime_lock_path(entry.path())
+        {
             continue;
         }
         let rel = entry.path().strip_prefix(src)?;
@@ -282,6 +335,32 @@ fn hold_active_lexical_rebuild_lock(
 }
 
 #[test]
+fn isolated_search_demo_data_excludes_runtime_lock_namespace() -> Result<(), Box<dyn Error>> {
+    let fixture = isolated_search_demo_data()?;
+
+    let leaked_locks: Vec<PathBuf> = WalkDir::new(fixture.path())
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| is_fixture_runtime_lock_path(entry.path()))
+        .map(|entry| entry.path().to_path_buf())
+        .collect();
+    assert!(
+        leaked_locks.is_empty(),
+        "isolated fixture must not inherit coordination locks: {leaked_locks:?}"
+    );
+    assert!(
+        !fixture
+            .path()
+            .join("index")
+            .join(".lexical-publish-backups")
+            .exists(),
+        "isolated fixture must not inherit a concurrent publish backup namespace"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn robot_help_prints_contract() {
     let mut cmd = base_cmd();
     cmd.arg("--robot-help");
@@ -432,6 +511,7 @@ fn capabilities_are_self_describing_for_agents() {
         "PI_SESSIONS_DIR",
         "CASS_STATUS_BUDGET_MS",
         "CASS_DOCTOR_BUDGET_MS",
+        "CASS_FTS_DRYRUN_CAP",
         "CASS_VIEW_BUDGET_MS",
         "CASS_SEARCH_BUDGET_MS",
         "CASS_TRIAGE_BUDGET_MS",
@@ -447,6 +527,7 @@ fn capabilities_are_self_describing_for_agents() {
     for (name, expected_default) in [
         ("CASS_STATUS_BUDGET_MS", "8000"),
         ("CASS_DOCTOR_BUDGET_MS", "8000"),
+        ("CASS_FTS_DRYRUN_CAP", "4096"),
         ("CASS_VIEW_BUDGET_MS", "10000"),
         ("CASS_SEARCH_BUDGET_MS", "120000"),
         ("CASS_TRIAGE_BUDGET_MS", "8000"),
@@ -1197,16 +1278,53 @@ fn pack_named_query_flag_attaches_to_query_positional() {
     );
 }
 
-fn assert_pack_alias_runs(alias: &str) {
-    // The last direct shared-fixture consumer in this file (bead xwi3f): a
-    // CLI subprocess pointed at tests/fixtures/search_demo_data can rebuild
-    // derived lexical/sqlite assets in place and race every parallel test
-    // that copies the fixture mid-rebuild. Always search an isolated copy.
-    let fixture = isolated_search_demo_data().expect("isolated search demo fixture");
-    let mut cmd = base_cmd();
-    cmd.args([alias, "auth", "--json", "--data-dir"]);
-    cmd.arg(fixture.path());
-    cmd.args(["--limit", "1", "--max-evidence", "1", "--max-sessions", "1"]);
+fn assert_pack_command_returns_evidence(command: &str, extra_args: &[&str]) {
+    // The legacy demo archive has no auth evidence. Index an explicit source
+    // so each alias must return a real message, not just a well-shaped envelope.
+    let fixture = TempDir::new().expect("isolated pack alias home");
+    let home = fixture.path();
+    let data_dir = home.join("cass_data");
+    let codex_home = home.join(".codex");
+    let filename = "rollout-pack-alias.jsonl";
+    util::seed_codex_session(&codex_home, filename, "auth alias evidence", false);
+    let source_path = codex_home.join("sessions/2026/04/23").join(filename);
+    let mut index = isolated_cass_cmd(home);
+    for (key, relative) in [
+        ("CLAUDE_HOME", ".claude"),
+        ("GEMINI_HOME", ".gemini"),
+        ("OPENCODE_STORAGE_ROOT", ".opencode"),
+        ("CASS_AIDER_DATA_ROOT", ".aider-missing"),
+        ("PI_SESSIONS_DIR", ".pi-sessions-missing"),
+        ("PI_CODING_AGENT_DIR", ".pi-agent-missing"),
+        (
+            "PI_CODING_AGENT_SESSION_DIR",
+            ".pi-coding-agent-sessions-missing",
+        ),
+    ] {
+        index.env(key, home.join(relative));
+    }
+    index
+        .env_remove("PI_CONFIG_DIR")
+        .env_remove("PI_PROFILE")
+        .env("CASS_AUTO_REFRESH", "0")
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .timeout(std::time::Duration::from_secs(120))
+        .assert()
+        .success();
+    let mut cmd = isolated_cass_cmd(home);
+    cmd.args([command, "auth", "--json", "--data-dir"]);
+    cmd.arg(&data_dir);
+    cmd.args([
+        "--limit",
+        "1",
+        "--max-evidence",
+        "1",
+        "--max-sessions",
+        "1",
+        "--require-evidence",
+    ]);
+    cmd.args(extra_args);
 
     let output = cmd.assert().success().get_output().clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1216,31 +1334,46 @@ fn assert_pack_alias_runs(alias: &str) {
     assert_eq!(json["query"]["text"].as_str(), Some("auth"));
     assert_eq!(json["limits"]["max_evidence"].as_u64(), Some(1));
     assert_eq!(json["limits"]["max_sessions"].as_u64(), Some(1));
+    assert_eq!(json["evidence"].as_array().expect("pack evidence").len(), 1);
+    assert_eq!(json["evidence"][0]["excerpt"], "auth alias evidence");
+    let citation = &json["evidence"][0]["citation"];
+    assert_eq!(
+        Path::new(citation["source_path"].as_str().expect("source path")),
+        source_path
+    );
+    assert_eq!(citation["verified"], true);
 }
 
 #[test]
 fn answer_alias_runs_pack_command() {
-    assert_pack_alias_runs("answer");
+    assert_pack_command_returns_evidence("answer", &[]);
 }
 
 #[test]
 fn handoff_alias_runs_pack_command() {
-    assert_pack_alias_runs("handoff");
+    assert_pack_command_returns_evidence("handoff", &[]);
 }
 
 #[test]
 fn why_alias_runs_pack_command() {
-    assert_pack_alias_runs("why");
+    assert_pack_command_returns_evidence("why", &[]);
 }
 
 #[test]
 fn explain_alias_runs_pack_command() {
-    assert_pack_alias_runs("explain");
+    assert_pack_command_returns_evidence("explain", &[]);
 }
 
 #[test]
 fn rca_alias_runs_pack_command() {
-    assert_pack_alias_runs("rca");
+    assert_pack_command_returns_evidence("rca", &[]);
+}
+
+#[test]
+fn pack_contract_field_masks_return_real_cited_evidence() {
+    for preset in ["standard", "full"] {
+        assert_pack_command_returns_evidence("pack", &["--field-mask", preset]);
+    }
 }
 
 #[test]
@@ -2321,6 +2454,7 @@ fn robot_docs_env_lists_key_vars_and_no_ansi() {
         "TUI_HEADLESS",
         "CASS_STATUS_BUDGET_MS",
         "CASS_DOCTOR_BUDGET_MS",
+        "CASS_FTS_DRYRUN_CAP",
         "CASS_VIEW_BUDGET_MS",
         "CASS_SEARCH_BUDGET_MS",
         "CASS_TRIAGE_BUDGET_MS",
@@ -5415,6 +5549,42 @@ fn subcommand_alias_find_to_search() {
     assert.code(predicate::in_iter(vec![0, 1, 2, 3]));
 }
 
+/// README contract: when cass auto-corrects a robot invocation it emits a
+/// teaching note on stderr so the agent learns the canonical syntax, while
+/// stdout stays data-only. Positive observable: the note names the
+/// correction. Planted negative: a canonical invocation prints no note.
+#[test]
+fn robot_mode_auto_correction_emits_teaching_note_on_stderr() -> Result<(), Box<dyn Error>> {
+    let fixture = isolated_search_demo_data()?;
+    let data_dir = fixture.path().to_str().ok_or("non-utf8 data dir")?;
+
+    let corrected = base_cmd()
+        .args(["find", "hello", "--json", "--data-dir", data_dir])
+        .output()?;
+    let stderr = String::from_utf8_lossy(&corrected.stderr);
+    assert!(
+        stderr.contains("note: auto-corrected:"),
+        "robot-mode correction must teach on stderr; got stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Tip: Run 'cass --help'"),
+        "robot-mode note must be the compact machine form, not the human tip block: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&corrected.stdout);
+    let _: Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("stdout must stay a single JSON document: {e}; stdout={stdout}"))?;
+
+    let canonical = base_cmd()
+        .args(["search", "hello", "--json", "--data-dir", data_dir])
+        .output()?;
+    let canonical_stderr = String::from_utf8_lossy(&canonical.stderr);
+    assert!(
+        !canonical_stderr.contains("auto-corrected"),
+        "a canonical invocation must not print a correction note: {canonical_stderr}"
+    );
+    Ok(())
+}
+
 /// Subcommand alias: query → search
 #[test]
 fn subcommand_alias_query_to_search() {
@@ -5754,13 +5924,15 @@ fn implicit_robot_search_folds_unquoted_query_words() {
 
 #[test]
 fn implicit_robot_pack_query_uses_pack_when_pack_only_flags_present() {
+    let fixture = isolated_search_demo_data().expect("isolated implicit pack fixture");
+    util::prepare_copied_search_fixture(fixture.path()).expect("admit relocated pack fixture");
     let mut cmd = base_cmd();
     cmd.args([
         "auth",
         "failed",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        fixture.path().to_str().unwrap(),
         "--limit",
         "1",
         "--max-evidence",
@@ -5783,10 +5955,12 @@ fn implicit_robot_pack_query_uses_pack_when_pack_only_flags_present() {
 fn timed_out_robot_pack_returns_bounded_partial_and_names_shed_work() -> Result<(), Box<dyn Error>>
 {
     let data_dir = isolated_search_demo_data()?;
+    util::prepare_copied_search_fixture(data_dir.path())?;
+    let (stall_ms, guard) = pack_stall_and_guard_from_baseline(data_dir.path())?;
     let started = std::time::Instant::now();
     let output = base_cmd()
         .env("CASS_PACK_BUDGET_MS", "100")
-        .env("CASS_TEST_PACK_SLOW_MS", "2000")
+        .env("CASS_TEST_PACK_SLOW_MS", stall_ms.to_string())
         .args([
             "pack",
             "hello",
@@ -5800,12 +5974,17 @@ fn timed_out_robot_pack_returns_bounded_partial_and_names_shed_work() -> Result<
             "--limit",
             "7",
             "--explain-selection",
+            "--include-skill-content",
             "--data-dir",
             data_dir.path().to_str().ok_or("non-utf8 data dir")?,
         ])
         .output()?;
-    if started.elapsed() >= std::time::Duration::from_millis(1500) {
-        return Err("pack command waited for the simulated two-second search stall".into());
+    if started.elapsed() >= guard {
+        return Err(format!(
+            "pack command waited for the simulated {stall_ms} ms search stall instead of \
+             stopping at its 100 ms budget"
+        )
+        .into());
     }
     if !output.status.success() {
         return Err(format!(
@@ -5832,6 +6011,9 @@ fn timed_out_robot_pack_returns_bounded_partial_and_names_shed_work() -> Result<
     if payload["query"]["text"] != "hello" {
         return Err("pack timeout discarded the requested query identity".into());
     }
+    if payload["privacy"]["skill_content_included"] != false {
+        return Err("timed-out pack claimed to include skill content without evidence".into());
+    }
     if !["search", "selection_explanations"].iter().all(|expected| {
         skipped
             .iter()
@@ -5847,6 +6029,7 @@ fn timed_out_robot_pack_returns_bounded_partial_and_names_shed_work() -> Result<
                     && probe.contains("--agent codex")
                     && probe.contains("--source local")
                     && probe.contains("--limit 7")
+                    && probe.contains("--include-skill-content")
                     && probe.contains("--data-dir")
             })
     {
@@ -5987,12 +6170,70 @@ fn blocking_sessions_file_pack_returns_bounded_partial_without_fabricated_eviden
     Ok(())
 }
 
+/// Budget for the pack timeout tests, derived from an unstalled run on the
+/// same fixture. The timeout must expire inside the injected planner/render
+/// stall, not in `search_setup`: on the debug-build fleet the archive open
+/// alone took anywhere from under 0.5 s to over 2 s across runs, so any fixed
+/// budget was wrong on some worker (bead zgzva). Returns `(budget_ms,
+/// stall_ms)`: three times the unstalled wall time (at least 2 s) and a stall
+/// of three budgets, so a run that waited the stall out is unmistakable.
+fn pack_timeout_budget_from_baseline(
+    data_dir: &std::path::Path,
+) -> Result<(u64, u64), Box<dyn Error>> {
+    let baseline_ms = pack_unstalled_baseline_ms(data_dir)?;
+    let budget_ms = (baseline_ms.saturating_mul(3)).max(2_000);
+    Ok((budget_ms, budget_ms.saturating_mul(3)))
+}
+
+/// Wall time of one unstalled `cass pack hello --mode lexical` on `data_dir`,
+/// measured right before a stalled run so the stalled run's guard is relative
+/// to the worker's speed at that moment rather than to a fixed number.
+fn pack_unstalled_baseline_ms(data_dir: &std::path::Path) -> Result<u64, Box<dyn Error>> {
+    let started = std::time::Instant::now();
+    let output = base_cmd()
+        .args([
+            "pack",
+            "hello",
+            "--json",
+            "--mode",
+            "lexical",
+            "--data-dir",
+            data_dir.to_str().ok_or("non-utf8 data dir")?,
+        ])
+        .output()?;
+    let baseline_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if !output.status.success() {
+        return Err(format!(
+            "baseline pack run failed: status={:?}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(baseline_ms)
+}
+
+/// Stall and return-guard for a pack test that injects a stall the budget is
+/// expected to cut short: the stall is three unstalled baselines (at least
+/// 2 s) and the guard is one baseline plus half the stall, so a command that
+/// waited the stall out cannot pass and a bounded one on a loaded worker can.
+fn pack_stall_and_guard_from_baseline(
+    data_dir: &std::path::Path,
+) -> Result<(u64, std::time::Duration), Box<dyn Error>> {
+    let baseline_ms = pack_unstalled_baseline_ms(data_dir)?;
+    let stall_ms = (baseline_ms.saturating_mul(3)).max(2_000);
+    let guard = std::time::Duration::from_millis(baseline_ms.saturating_add(stall_ms / 2));
+    Ok((stall_ms, guard))
+}
+
 #[test]
 fn timed_out_robot_pack_renderer_emits_fixed_size_partial_fallback() -> Result<(), Box<dyn Error>> {
     let data_dir = isolated_search_demo_data()?;
+    util::prepare_copied_search_fixture(data_dir.path())?;
+    let (budget_ms, stall_ms) = pack_timeout_budget_from_baseline(data_dir.path())?;
     let started = std::time::Instant::now();
     let output = base_cmd()
-        .env("CASS_TEST_PACK_RENDER_SLOW_MS", "2000")
+        .env("CASS_TEST_PACK_RENDER_SLOW_MS", stall_ms.to_string())
         .args([
             "pack",
             "hello",
@@ -6000,13 +6241,17 @@ fn timed_out_robot_pack_renderer_emits_fixed_size_partial_fallback() -> Result<(
             "--mode",
             "lexical",
             "--timeout",
-            "500",
+            &budget_ms.to_string(),
             "--data-dir",
             data_dir.path().to_str().ok_or("non-utf8 data dir")?,
         ])
         .output()?;
-    if started.elapsed() >= std::time::Duration::from_millis(1500) {
-        return Err("pack command waited for the simulated two-second render stall".into());
+    if started.elapsed() >= std::time::Duration::from_millis(budget_ms + stall_ms / 2) {
+        return Err(format!(
+            "pack command waited for the simulated {stall_ms} ms render stall instead of \
+             stopping at its {budget_ms} ms budget"
+        )
+        .into());
     }
     if !output.status.success() {
         return Err(format!(
@@ -6054,7 +6299,8 @@ fn timed_out_robot_pack_renderer_emits_fixed_size_partial_fallback() -> Result<(
             .is_some_and(|probe| {
                 probe.starts_with("cass pack ")
                     && probe.contains("--data-dir")
-                    && probe.contains("--timeout 1000")
+                    // The retry doubles the budget that timed out.
+                    && probe.contains(&format!("--timeout {}", budget_ms * 2))
             })
     {
         return Err(format!(
@@ -6068,9 +6314,11 @@ fn timed_out_robot_pack_renderer_emits_fixed_size_partial_fallback() -> Result<(
 #[test]
 fn timed_out_robot_pack_planner_does_not_fabricate_selection() -> Result<(), Box<dyn Error>> {
     let data_dir = isolated_search_demo_data()?;
+    util::prepare_copied_search_fixture(data_dir.path())?;
+    let (budget_ms, stall_ms) = pack_timeout_budget_from_baseline(data_dir.path())?;
     let started = std::time::Instant::now();
     let output = base_cmd()
-        .env("CASS_TEST_PACK_PLAN_SLOW_MS", "2000")
+        .env("CASS_TEST_PACK_PLAN_SLOW_MS", stall_ms.to_string())
         .args([
             "pack",
             "hello",
@@ -6078,13 +6326,17 @@ fn timed_out_robot_pack_planner_does_not_fabricate_selection() -> Result<(), Box
             "--mode",
             "lexical",
             "--timeout",
-            "500",
+            &budget_ms.to_string(),
             "--data-dir",
             data_dir.path().to_str().ok_or("non-utf8 data dir")?,
         ])
         .output()?;
-    if started.elapsed() >= std::time::Duration::from_millis(1500) {
-        return Err("pack command waited for the simulated two-second planner stall".into());
+    if started.elapsed() >= std::time::Duration::from_millis(budget_ms + stall_ms / 2) {
+        return Err(format!(
+            "pack command waited for the simulated {stall_ms} ms planner stall instead of \
+             stopping at its {budget_ms} ms budget"
+        )
+        .into());
     }
     if !output.status.success() {
         return Err(format!(
@@ -6123,6 +6375,8 @@ fn timed_out_robot_pack_planner_does_not_fabricate_selection() -> Result<(), Box
 
 #[test]
 fn explicit_search_pack_only_flags_run_pack_in_robot_mode() {
+    let fixture = isolated_search_demo_data().expect("isolated explicit pack fixture");
+    util::prepare_copied_search_fixture(fixture.path()).expect("admit relocated pack fixture");
     for command in ["search", "find"] {
         let mut cmd = base_cmd();
         cmd.args([
@@ -6131,7 +6385,7 @@ fn explicit_search_pack_only_flags_run_pack_in_robot_mode() {
             "failed",
             "--json",
             "--data-dir",
-            "tests/fixtures/search_demo_data",
+            fixture.path().to_str().unwrap(),
             "--limit",
             "1",
             "--max-evidence",

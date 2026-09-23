@@ -73,6 +73,15 @@
         "documents": {
           "type": "null"
         },
+        "live_documents": {
+          "type": "null"
+        },
+        "hollow": {
+          "type": "boolean"
+        },
+        "segment_files": {
+          "type": "null"
+        },
         "empty_with_messages": {
           "type": "boolean"
         },
@@ -135,6 +144,15 @@
         },
         "path": {
           "type": "string"
+        },
+        "db_bytes": {
+          "type": "integer"
+        },
+        "wal_bytes": {
+          "type": "integer"
+        },
+        "shm_present": {
+          "type": "boolean"
         },
         "open_error": {
           "type": "null"

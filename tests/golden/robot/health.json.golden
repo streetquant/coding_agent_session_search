@@ -378,6 +378,9 @@
       "engine_incompatible": false,
       "activity_at": null,
       "documents": null,
+      "live_documents": null,
+      "hollow": false,
+      "segment_files": null,
       "empty_with_messages": false,
       "quarantined_conversations": 0,
       "fingerprint": {
@@ -396,6 +399,9 @@
     },
     "database": {
       "exists": false,
+      "db_bytes": "[LIVE_BYTES]",
+      "wal_bytes": "[LIVE_BYTES]",
+      "shm_present": false,
       "opened": false,
       "conversations": 0,
       "messages": 0,

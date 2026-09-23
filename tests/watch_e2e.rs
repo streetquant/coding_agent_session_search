@@ -9,6 +9,326 @@ use tempfile::TempDir;
 mod util;
 use util::cass_bin;
 
+mod deferred_watch_sources {
+    use super::*;
+    use std::fs;
+    use std::process::{Child, Stdio};
+    use std::time::Instant;
+
+    struct WatchChild(Child);
+
+    impl Drop for WatchChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn cass(home: &Path, data: &Path) -> std::process::Command {
+        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        cmd.env_clear()
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("PATH", "")
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .current_dir(home)
+            .arg("--data-dir")
+            .arg(data);
+        if let Ok(system_root) = dotenvy::var("SystemRoot") {
+            cmd.env("SystemRoot", system_root);
+        }
+        cmd
+    }
+
+    fn indexed_watch_home() -> TempDir {
+        let home = TempDir::new().expect("isolated watch home");
+        let data = home.path().join("cass-data");
+        let sessions = home.path().join(".codex/sessions");
+        fs::create_dir_all(&sessions).expect("sessions directory");
+        let baseline = sessions.join("rollout-baseline.jsonl");
+        write_codex_session(&baseline, "baselinewatch", "baseline-watch");
+        fs::File::options()
+            .write(true)
+            .open(&baseline)
+            .expect("open baseline session for timestamp update")
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            )
+            .expect("age baseline session");
+        assert_cmd::Command::from_std(cass(home.path(), &data))
+            .args(["index", "--full", "--json"])
+            .timeout(Duration::from_secs(120))
+            .assert()
+            .success();
+        home
+    }
+
+    fn start_watch(home: &Path, data: &Path, streaming: bool) -> (WatchChild, std::path::PathBuf) {
+        let log_path = home.join("watch.log");
+        let log = fs::File::create(&log_path).expect("watch log");
+        let mut command = cass(home, data);
+        command
+            // JSON mode suppresses the INFO readiness signal unless requested.
+            .arg("--verbose")
+            .args(["index", "--watch", "--watch-interval", "1", "--json"])
+            .env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "8")
+            .env("CASS_STREAMING_INDEX", if streaming { "1" } else { "0" })
+            .env("RUST_LOG", "info");
+        let mut child = WatchChild(
+            command
+                .stdout(Stdio::null())
+                .stderr(log)
+                .spawn()
+                .expect("start watch"),
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let logs = fs::read_to_string(&log_path).expect("read watch log");
+            if logs.contains("watch mode: minimum interval between scan cycles") {
+                break;
+            }
+            assert!(
+                child.0.try_wait().expect("watch status").is_none(),
+                "watch exited: {logs}"
+            );
+            assert!(Instant::now() < deadline, "watch did not start: {logs}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        (child, log_path)
+    }
+
+    fn search(home: &Path, data: &Path, query: &str) -> Value {
+        let output = assert_cmd::Command::from_std(cass(home, data))
+            .args([
+                "search",
+                query,
+                "--mode",
+                "lexical",
+                "--json",
+                "--no-maintenance",
+                "--timeout",
+                "3000",
+            ])
+            .timeout(Duration::from_secs(5))
+            .output()
+            .expect("read-only search");
+        assert!(
+            output.status.success(),
+            "search failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: Value = serde_json::from_slice(&output.stdout).expect("search JSON");
+        assert_ne!(
+            result.pointer("/budget/timed_out").and_then(Value::as_bool),
+            Some(true),
+            "a timed-out search cannot prove absence: {result}"
+        );
+        assert!(result["hits"].is_array(), "search hit array: {result}");
+        result
+    }
+
+    fn assert_deferred_source_retried(skipped_at_startup: bool, streaming: bool) {
+        let home = indexed_watch_home();
+        let data = home.path().join("cass-data");
+        let deferred = home.path().join(".codex/sessions/rollout-deferred.jsonl");
+        if skipped_at_startup {
+            write_codex_session(&deferred, "deferredwatchneedle", "deferred-watch");
+        }
+        let (mut child, log_path) = start_watch(home.path(), &data, streaming);
+        if !skipped_at_startup {
+            // Exactly one source write after the actual watcher is installed.
+            // Neither this source nor its directory is touched again.
+            write_codex_session(&deferred, "deferredwatchneedle", "deferred-watch");
+        }
+        let before = fs::read(&deferred).expect("deferred source bytes");
+        let modified = fs::metadata(&deferred)
+            .expect("source metadata")
+            .modified()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let mut observed_early_absence = false;
+        loop {
+            let logs = fs::read_to_string(&log_path).expect("read watch log");
+            let skips = logs
+                .lines()
+                .filter(|line| {
+                    line.contains("rollout-deferred.jsonl")
+                        && line
+                            .contains("skipping session source that appears to be actively written")
+                })
+                .count();
+            assert!(
+                child.0.try_wait().expect("watch status").is_none(),
+                "watch exited: {logs}"
+            );
+            if skips > 0 {
+                let result = search(home.path(), &data, "deferredwatchneedle");
+                let hits = content_hit_count(&result, "deferredwatchneedle");
+                if modified.elapsed().expect("source age") < Duration::from_secs(8) {
+                    assert_eq!(hits, 0, "recently modified source was indexed: {result}");
+                    observed_early_absence = true;
+                } else {
+                    assert!(
+                        observed_early_absence,
+                        "missed the recent-write window before checking absence: {logs}"
+                    );
+                }
+                // Discovery and post-parse filtering can both log a refusal in
+                // one scan. Actual search absence above is the safety oracle.
+                if skips >= 2 && hits == 1 {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a source skipped {skips} times never became searchable without a second event: {logs}"
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        assert_eq!(fs::read(&deferred).expect("source after retry"), before);
+        assert_eq!(
+            fs::metadata(&deferred).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+
+    #[test]
+    fn watch_retries_active_event_without_another_source_write() {
+        assert_deferred_source_retried(false, true);
+    }
+
+    #[test]
+    fn watch_retries_active_startup_source_after_streaming_scan() {
+        assert_deferred_source_retried(true, true);
+    }
+
+    #[test]
+    fn watch_retries_active_startup_source_after_batch_scan() {
+        assert_deferred_source_retried(true, false);
+    }
+
+    // Linux exposes writable descriptors through /proc. The isolated command
+    // deliberately has no PATH, so this does not claim macOS lsof coverage.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn watch_retains_writer_held_source_after_another_deferred_source_is_indexed() {
+        let home = indexed_watch_home();
+        let data = home.path().join("cass-data");
+        let sessions = home.path().join(".codex/sessions");
+        let completed = sessions.join("rollout-completed.jsonl");
+        let held = sessions.join("rollout-held.jsonl");
+        write_codex_session(&completed, "completedwatchneedle", "completed-watch");
+        write_codex_session(&held, "heldwatchneedle", "held-watch");
+        let writer = fs::OpenOptions::new()
+            .append(true)
+            .open(&held)
+            .expect("hold a real writable source descriptor");
+        let before_completed = fs::read(&completed).expect("completed source bytes");
+        let before_held = fs::read(&held).expect("held source bytes");
+        let completed_modified = fs::metadata(&completed).unwrap().modified().unwrap();
+        let held_modified = fs::metadata(&held).unwrap().modified().unwrap();
+        let (mut child, log_path) = start_watch(home.path(), &data, true);
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let mut writer_skips_after_completed = None;
+        loop {
+            let logs = fs::read_to_string(&log_path).expect("read watch log");
+            assert!(
+                child.0.try_wait().expect("watch status").is_none(),
+                "watch exited: {logs}"
+            );
+            let result = search(
+                home.path(),
+                &data,
+                "completedwatchneedle OR heldwatchneedle",
+            );
+            assert_eq!(
+                content_hit_count(&result, "heldwatchneedle"),
+                0,
+                "writer-held source became searchable before its descriptor closed: {result}"
+            );
+            // Read after the successful search: counts sampled before it could
+            // mistake two refusals within that same scan for a later retry.
+            let logs = fs::read_to_string(&log_path).expect("read watch log after search");
+            let writer_skips = logs
+                .lines()
+                .filter(|line| {
+                    line.contains("rollout-held.jsonl")
+                        && line.contains("WritableFileDescriptor")
+                        && line
+                            .contains("skipping session source that appears to be actively written")
+                })
+                .count();
+            if content_hit_count(&result, "completedwatchneedle") == 1 && writer_skips > 0 {
+                if writer_skips_after_completed.is_some_and(|previous| writer_skips > previous) {
+                    break;
+                }
+                writer_skips_after_completed.get_or_insert(writer_skips);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "completed source did not become searchable while the other source stayed pending: {logs}"
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let logs = fs::read_to_string(&log_path).expect("read watch deferral evidence");
+        for source in ["rollout-completed.jsonl", "rollout-held.jsonl"] {
+            assert!(
+                logs.lines().any(|line| {
+                    line.contains(source)
+                        && line.contains("RecentlyModified")
+                        && line
+                            .contains("skipping session source that appears to be actively written")
+                }),
+                "both sources must have entered the deferred queue: {source}: {logs}"
+            );
+        }
+
+        // Closing a writable descriptor may emit CLOSE_WRITE on Linux. The
+        // three tests above prove the separate no-further-event contract; this
+        // phase proves a fresh writer snapshot admits the now-closed source.
+        drop(writer);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let logs = fs::read_to_string(&log_path).expect("read watch log");
+            assert!(
+                child.0.try_wait().expect("watch status").is_none(),
+                "watch exited: {logs}"
+            );
+            let result = search(
+                home.path(),
+                &data,
+                "completedwatchneedle OR heldwatchneedle",
+            );
+            assert_eq!(content_hit_count(&result, "completedwatchneedle"), 1);
+            if content_hit_count(&result, "heldwatchneedle") == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "closed source did not become searchable with a fresh writer snapshot: {logs}"
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        assert_eq!(fs::read(&completed).unwrap(), before_completed);
+        assert_eq!(fs::read(&held).unwrap(), before_held);
+        assert_eq!(
+            fs::metadata(&completed).unwrap().modified().unwrap(),
+            completed_modified
+        );
+        assert_eq!(
+            fs::metadata(&held).unwrap().modified().unwrap(),
+            held_modified
+        );
+    }
+}
+
 fn run_index_full(
     data_dir: &Path,
     home_dir: &Path,

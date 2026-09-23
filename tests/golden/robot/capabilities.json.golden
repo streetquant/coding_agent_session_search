@@ -54,13 +54,16 @@
     "factory",
     "openclaw",
     "antigravity",
+    "prime_agent",
     "kimi",
+    "kiro",
     "muse",
     "openhands",
     "copilot",
     "copilot_cli",
     "qwen",
     "grok",
+    "devin",
     "goose",
     "crush",
     "hermes"
@@ -267,6 +270,23 @@
           ]
         },
         {
+          "name": "reconcile-conversation",
+          "description": "Targeted, idempotent lexical reconcile for ONE canonical conversation id (gh#382 partial-prefix recovery): upserts the conversation's full capped message set under stable document identities and publishes a successor generation. Retry-safe; no corpus-wide replay; the canonical archive is opened read-only",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "gc",
+          "description": "Reclaim merge-retired lexical segment files and exit (gh#453). Opens the lexical writer, which runs the engine's grace-period garbage sweep: a segment file is unlinked only once no published MANIFEST generation has referenced it for the engine's grace period (300 s), so readers on the previous generation are safe. Scans no sources and re-indexes nothing; every incremental `cass index` performs the same sweep at open. Reports files and bytes reclaimed (`--json` for automation)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "watch",
           "description": "Watch for changes and reindex automatically",
           "arg_type": "flag",
@@ -294,7 +314,7 @@
         },
         {
           "name": "semantic",
-          "description": "Build semantic vector index after text indexing. Progress reports canonical replay, embedding, vector publish, optional HNSW, manifest publish, and finalization as distinct phases. Set CASS_INDEX_STALL_DETECT_SECS=0 to disable stall diagnostics, or CASS_INDEX_STALL_ABORT_SECS=0 to keep abort-eligible lexical stalls report-only while still reporting semantic phase progress",
+          "description": "Build semantic vector index after text indexing. Progress reports canonical replay, embedding, vector publish, optional HNSW, manifest publish, and finalization as distinct phases. Set CASS_INDEX_STALL_DETECT_SECS=0 to disable stall diagnostics, or CASS_INDEX_STALL_ABORT_SECS=0 to keep abort-eligible lexical stalls report-only while still reporting semantic phase progress. Set CASS_INDEX_STALL_ABORT_ALL_PHASES=1 to promote the stall detector to a hard abort (exit 70) in every phase it reports on, including the otherwise report-only semantic/scribe lanes (issue #437)",
           "arg_type": "flag",
           "required": false,
           "enum_values": [
@@ -429,6 +449,27 @@
       "description": "Generate man page to stdout",
       "arguments": [],
       "has_json_output": false
+    },
+    {
+      "name": "bookmarks",
+      "description": "Save, list, search, remove, export, and import bookmarks (bookmarks.db)",
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "robot-docs",
@@ -665,7 +706,7 @@
         },
         {
           "name": "highlight",
-          "description": "Highlight matching terms in output (uses **bold** markers in text, <mark> in HTML)",
+          "description": "Highlight matching terms in snippets with **bold** markers (text and JSON output)",
           "arg_type": "flag",
           "required": false,
           "enum_values": [
@@ -876,7 +917,7 @@
         },
         {
           "name": "fields",
-          "description": "Select answer-pack top-level fields. Presets: minimal, summary, all",
+          "description": "Select answer-pack fields. Presets: minimal, standard, full, summary, all",
           "arg_type": "option",
           "value_type": "string",
           "required": false,
@@ -1045,6 +1086,17 @@
           "value_type": "integer",
           "required": false,
           "default": "2592000"
+        },
+        {
+          "name": "include-skill-content",
+          "description": "Include skill payload excerpts. Credentials remain redacted",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
           "name": "require-evidence",
@@ -3023,8 +3075,23 @@
     {
       "name": "quarantine",
       "description": "Inspect and manage the conversation-ingest quarantine (list / clear)",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "forget",
@@ -3085,50 +3152,170 @@
     {
       "name": "mirror",
       "description": "Inspect and prune raw-mirror evidence under explicit operator control",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "sources",
       "description": "Manage remote sources (P5.x)",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "models",
       "description": "Manage semantic search models",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "fleet",
       "description": "Fleet-safe upgrade rehearsal and bounded post-upgrade verification",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "lessons",
       "description": "Mine and query durable lessons from local evidence (commits, beads, proofs)",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "swarm",
       "description": "Read-only swarm operations status, work packets, and coordination lint",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "import",
       "description": "Import data from external sources",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "analytics",
       "description": "Token usage, tool, and model analytics",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "release-verify",
@@ -3251,8 +3438,23 @@
     {
       "name": "schedule",
       "description": "Keep the index fresh automatically via the OS scheduler (launchd / systemd user timers)",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     }
   ],
   "exit_codes": [
@@ -3423,6 +3625,11 @@
       "description": "Structured doctor reporting budget in milliseconds. Reports whose elapsed time exceeds it set budget.timed_out."
     },
     {
+      "name": "CASS_FTS_DRYRUN_CAP",
+      "default": "4096",
+      "description": "Row-ID comparison cap for the read-only 'doctor --rebuild-canonical-fts --dry-run' divergence scan (#345). At the cap the dry-run stops and reports a '>= N divergent' floor instead of an exact count; exact parity is deferred to the --yes apply path. Positive integer; invalid values fall back to the default."
+    },
+    {
       "name": "CASS_VIEW_BUDGET_MS",
       "default": "10000",
       "description": "Structured view read-only worker deadline in milliseconds. On expiry, view returns a partial budget envelope with an exact retry probe."
@@ -3560,7 +3767,12 @@
     {
       "name": "CASS_INDEX_STALL_ABORT_SECS",
       "default": "300",
-      "description": "Seconds without progress before an abort-eligible lexical stall exits 70; 0 keeps stalls report-only. Semantic phases are report-only."
+      "description": "Seconds without progress before an abort-eligible lexical stall exits 70; 0 keeps stalls report-only. Semantic phases are report-only unless CASS_INDEX_STALL_ABORT_ALL_PHASES=1."
+    },
+    {
+      "name": "CASS_INDEX_STALL_ABORT_ALL_PHASES",
+      "default": "0",
+      "description": "Opt-in (#437): promote the stall watchdog's report-only warnings to a hard abort (exit 70) in ANY phase — including scribe/accumulate and semantic report-only lanes — once CASS_INDEX_STALL_ABORT_SECS elapses without progress. The finalize/persist grace thresholds still apply; phases whose detection is suppressed (opaque HNSW, quiescent watch idle) never warn and therefore never abort."
     },
     {
       "name": "CASS_SEMANTIC_EMBEDDER",

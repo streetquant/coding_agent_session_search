@@ -28,20 +28,47 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ---
 
-## Git Branch: ONLY Use `main`, NEVER `master`
+## Git Branch: ONLY Use `main`
 
-**The default branch is `main`. The `master` branch exists only for legacy URL compatibility.**
+**The default and only supported branch is `main`; this repository has no legacy `master` branch or mirror.**
 
-- **All work happens on `main`** — commits, PRs, feature branches all merge to `main`
-- **Never reference `master` in code or docs** — if you see `master` anywhere, it's a bug that needs fixing
-- **The `master` branch must stay synchronized with `main`** — after pushing to `main`, also push to `master`:
-  ```bash
-  git push origin main:master
-  ```
+- **All work happens on `main`** — commits, PRs, and feature branches merge to `main`.
+- **Use `main` on both remotes** — `origin/main` is the upstream ref and `fork/main` is the fork ref; fetch, track, and push `main` only.
+- **Do not create, push, or synchronize a legacy `master` ref.** If an old `master` reference appears in code or docs, replace it with `main`.
 
-**If you see `master` referenced anywhere:**
-1. Update it to `main`
-2. Ensure `master` is synchronized: `git push origin main:master`
+---
+
+## Swarm Commits: Stage Only What You Changed
+
+Several agents edit this working tree at once. On 2026-09-01 two agents committed
+another session's uncommitted files under their own messages, rewrote three shared
+files from older copies (dropping helper functions whose callers had just been
+committed), and left `main` unable to compile for most of an hour. These rules exist
+because of that day:
+
+- **Never `git add -A`, `git add .`, or `git commit -a`.** Stage the exact paths you
+  edited (`git add src/foo.rs tests/bar.rs`). If `git status` shows files you did not
+  touch, they belong to another agent — leave them alone (AGENTS.md rule: never stash,
+  revert, or overwrite concurrent work).
+- **Reserve the shared monoliths before editing them** — `src/lib.rs`,
+  `src/indexer/mod.rs`, `src/storage/sqlite.rs`, `src/search/quill_bridge.rs`,
+  `src/ui/app.rs` — with an Agent Mail file reservation
+  (`file_reservation_paths(project_key, agent, ["src/lib.rs"], ttl_seconds=3600, exclusive=true)`),
+  and install the Agent Mail pre-commit guard (`install_precommit_guard`) so a commit
+  that includes a path reserved by another agent is refused instead of merged blind.
+- **Never restore a file from an older copy** to "fix" a compile error. Fix the
+  error in place; a symbol your rewrite removes may already have committed callers.
+- **Commit small and early.** A long-lived uncommitted tree is the surface that gets
+  swept. Verify with the batched gate (`scripts/gate.sh`) before pushing; a commit
+  titled "restore a compiling main" that does not compile is worse than no commit.
+- **After any commit by another agent touches a file you changed,** `git grep` every
+  symbol you landed there. Presence is not enough: check that the function still does
+  what yours did (an in-process memo is not an on-disk cache).
+- **A GitHub issue gets a bead within 24 hours** (`gh<issue>-<topic>` in the title, the
+  reporter's numbers in the description) and the first triage comment on the issue
+  cites that bead. On 2026-09-01 the five worst open issues (#439, #440, #441, #395,
+  #391) had no bead while 2,000 beads were closed around them; the tracker must track
+  what users report, not only what agents choose.
 
 ---
 
@@ -71,7 +98,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 - **Edition:** Rust 2024 (dated nightly pinned by `rust-toolchain.toml`)
 - **Dependency versions:** Wildcard constraints (`*`) for all crates
 - **Configuration:** Cargo.toml only (single-crate project, no workspace)
-- **Unsafe code:** Forbidden
+- **Unsafe code:** Forbidden as a general tool. Tightly scoped, narrowly audited `unsafe` is allowed only where it is unavoidable (e.g., the few Rust 2024 `std::env::set_var`/`remove_var` calls at controlled startup/teardown, or unavoidable FFI with no safe wrapper). Unsafe cross-thread connection wrappers and unjustified `Send`/`Sync` impls remain prohibited and must be UBS-gated.
 
 ### Async Runtime: asupersync
 
@@ -137,12 +164,12 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` | git `=0.3.13` at rev `2d8a68b9` (0.3.0 asupersync-0.4.3 migration + GH#333/GH#334 fix wave incl. cass#393 st_dev namespace-sidecar repair, + 0.3.1 allocator/freelist/concurrent-writer correctness wave; carries the FTS5 overlong-term skip cap [cass#362], the 0.3.9 Windows sidecar-less read-only close fix, the FTS5 read-only integrity-check admission, and the 0.3.13 autoindex-vanish corruption-writer fixes [cass#434]; single-family redirect via `[patch.crates-io].fsqlite`) |
-| `franken-agent-detection` | `82424dc8` (v0.2.1, 2026-08-23: first-class Oh My Pi v18 connector/profile/XDG discovery plus pi-family remote-provenance preservation, on the fsqlite 0.3.x + asupersync 0.4.x line) |
-| `asupersync` | `=0.4.9` (crates.io; fsqlite 0.3.x requires the 0.4.x line; asupersync 0.3.x and 0.4.x are non-interchangeable; 0.4.x preserves the 0.4.3 public API) |
-| `frankensearch` | `22859f74` (the v1.7.0 tag commit, 2026-08-23, aligned with fsqlite 0.3.8 + asupersync 0.4.9; explicit `cass-compat` → `lexical-tantivy`; pure-Rust `native` feature: frankentorch NativeEmbedder + NativeReranker; frankentorch pinned by git rev inside frankensearch — cass #308, bd-8nqz.5) |
+| `frankensqlite` / `fsqlite-types` | crates.io `=0.3.18` (owner-requested update 2026-09-07; release commit `1600766ca698dae99b6018474bc8c150ece4a82d`, 42 commits since 0.3.17). Adds parameterized rowid IN-list seeks (GH#415/cass#382), read-only WAL byte/timestamp preservation, reader-registration error propagation, I/O buffer lifetime fixes, and WAL-mode transition and scalar-query corrections. The async facade and asupersync requirement remain unchanged. Retains 0.3.17's incremental WAL-tail folding, reserved lock-byte/freelist repair (GH#410), FTS metadata/visibility fixes (GH#408), prefix-BM25 ranking and prepared-read cleanup, plus 0.3.16's GH#405 FTS5 savepoint undo log and GH#406 incremental content-backed INSERT. 0.3.15 was evaluated and not adopted; historical evidence remains in bead gh382-fsqlite-pin. This update does not prove repair of the owner's existing archive corruption, and upstream GH#411 mixed-engine concurrent-WAL safety remains unresolved. `build.rs` enforces the exact version for the whole fsqlite family. |
+| `franken-agent-detection` | crates.io `=0.2.3` (2026-09-07; the Antigravity connector probes the IDE store `~/.gemini/antigravity` as well as the `agy` CLI store with `ide/<uuid>` provenance (cass#454), Claude Code detection honors `CLAUDE_CONFIG_DIR`/`XDG_CONFIG_HOME` (cass#448), Codex token usage is read from real rollouts, Claude tool results survive as `role:"tool"` messages, Cursor/OpenCode mirrors dedupe, the 100 MB scan cap applies everywhere, Shelley discovery names the canonical database path like scan, and the Shelley connector, FAD#22 source-boundary seam, and chatgpt/omp injection seams are now published. CASS enables the `devin` feature for visible local sessions in `~/.local/share/devin/cli/sessions.db` (override `CASS_DEVIN_DATA_ROOT`); cloud-only Devin history remains out of scope. Retains 0.2.2's cursor/antigravity/grok scan-root scoping and aider/copilot-cli/amp/opencode/clawdbot/muse session-loss fixes; aligned with fsqlite 0.3.x + asupersync 0.4.x) |
+| `asupersync` | `=0.4.10` (crates.io; publishes `Cx::is_cancelled`, required by Quill 0.2.3; runtime validation is pending. fsqlite 0.3.x requires the 0.4.x line; asupersync 0.3.x and 0.4.x are non-interchangeable.) |
+| `frankensearch` | crates.io `=0.4.3` / Quill `0.2.3` (cass#453). Segment collection uses retirement-receipt age so subsequent publication does not restart the grace period; `Cx::is_cancelled` comes from Asupersync `0.4.10`. Preserves the explicit multilingual MiniLM embedding space, Windows Quill publication, `cass-compat` → `lexical-tantivy` differential oracle, pure-Rust `native` embeddings, architecture-safe HNSW, consumer-owned `TwoTierIndexPaths`, non-mutating lexical admission and generation-pinned hydration. Registry `0.3.2` is a stale same-version twin without quill/cass-compat/native, so exact pins remain required. Frankentorch resolves as `frankentorch-*`, HNSW as `frankenhnsw 0.3.5`, and Tantivy as `=0.26.1`. RUSTSEC-2026-0253 on Tantivy's lru requires a panicking key destructor under `catch_unwind`; Tantivy's cache keys are trivially droppable. |
 | `frankentui` (`ftui`, `ftui-runtime`, `ftui-tty`, `ftui-extras`) | crates.io `=0.5.0` (2026-08-21; previously git `5f78cfa0` / 0.3.1 — the 0.5 API compiled with zero call-site changes) |
-| `toon` (`tru`) | `d7185c78` (0.2.3) |
+| `toon` (`tru`) | crates.io `=0.2.4` (2026-08-24; production sources byte-identical to the previously pinned git rev `d7185c78` — registry 0.2.3 was rejected because its tree differs from the rev in real source despite the matching version field) |
 
 ### Release Profile
 
@@ -240,7 +267,7 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 ### UBS Pre-Merge Gate
 
-Per `coding_agent_session_search-dpfvr`, every PR runs `ubs --ci --fail-on-warning` against the changed files in CI (`.github/workflows/ci.yml::ubs-changed-files`). The gate is **blocking** — warnings stop merges.
+Per `coding_agent_session_search-dpfvr`, every PR is meant to run `ubs --ci --fail-on-warning` against the changed files in CI (`.github/workflows/ci.yml::ubs-changed-files`). The gate is **blocking** — warnings stop merges. **Current state:** every workflow defined in `.github/workflows/` is disabled (`gh workflow list --all` shows `disabled_manually` for all of them, including `CI`; only GitHub's own Copilot workflows are active), so until CI is re-enabled this gate — like fmt/clippy/tests — is agent-run through `rch` before pushing. Run it as ONE fleet admission with `scripts/gate.sh` (fmt, clippy `-D warnings`, lib tests, targeted integration tests, goldens; `--lib-filter`, `--integration name:filter,...`, `--regen-goldens`; `GATE_RETRIES=40` retries fleet refusals) and cite its `STAGE=<name> EXIT=<code>` receipt lines in the bead closure and the commit message — never spend an admission on a bare `cargo check`.
 
 **Local pre-flight before pushing:**
 
@@ -256,7 +283,7 @@ ubs $(git diff --name-only --cached)
 
 If a known-acceptable warning needs to ship despite the gate, suppress at the UBS config level (`tests/policies/no_mock_allowlist.json` or per-file inline pragma) — never bypass by removing the gate.
 
-The pinned UBS version lives in `.github/workflows/ubs-version.txt`; the CI installer reads that file. Local installs should match.
+The pinned UBS version lives in `.github/workflows/ubs-version.txt`; the CI installer reads that file when the workflow is enabled. Local installs should match.
 
 ---
 
@@ -360,14 +387,15 @@ Integration and E2E tests live in the `tests/` directory. Benchmarks live in `be
 
 ### Unit Tests
 
-> **Stack floor:** always run tests with `RUST_MIN_STACK=16777216`. fsqlite
-> 0.3.x's async engine builds deep debug-mode futures and the default 2 MiB
-> test-thread stack overflows in storage-touching unit tests (SIGABRT with
-> "has overflowed its stack"). CI sets this workflow-wide.
+> **Test stack:** use `RUST_MIN_STACK=134217728`, matching `.cargo/config.toml`
+> and `scripts/gate.sh`. fsqlite 0.3.x's deep debug-mode futures have exceeded
+> even a 16 MiB test-thread stack in storage tests. The 128 MiB setting reserves
+> virtual address space; pages are committed as needed. Do not override it with
+> the older 16 MiB value when running the full suite.
 
 ```bash
 # Run all tests
-rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-test-target RUST_MIN_STACK=16777216 cargo test
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-test-target RUST_MIN_STACK=134217728 cargo test
 
 # Run with output
 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-test-target cargo test -- --nocapture
@@ -427,8 +455,12 @@ Provides unified full-text and semantic search across all local coding agent ses
 - **Semantic enrichment is opportunistic.** Lexical-only behavior is expected during first indexing, semantic backfill, disabled semantic policy, missing model files, or vector catch-up.
 - **Semantic model acquisition is opt-in.** `cass models install` downloads the MiniLM model (~90 MB) on explicit operator request. cass never auto-downloads. Air-gapped installs use `--from-file <dir>`. While the model is absent, `fallback_mode="lexical"` is reported in health/status and queries silently degrade to lexical-only.
 - **Truth surfaces:** `cass health --json`, `cass status --json`, and search `--robot-meta` expose readiness, active rebuilds, realized search mode, fallback tier, and recommended action. Follow those fields instead of hard-coded manual repair rituals.
+- **Lexical query fuel is bounded.** cass opens Quill with the engine's deterministic per-query work ceiling (10,000,000 units; `CASS_QUILL_QUERY_FUEL_BUDGET` is an escape hatch, not a tuning knob). If a hybrid search exhausts it, the lexical leg is dropped rather than failing the search and `_meta.lexical_degrade_reason` reports `query_fuel_exhausted`; lexical-only searches get an actionable hint. cass publishes Quill snapshots only on its own commits (`max_visibility_lag_ms` is disabled in `src/search/quill_bridge.rs::cass_quill_config`), which stops the per-second seals that grew append-only archives into hundreds of tiny segments (GH #440/#441); `cass index --full` consolidates an archive that already fragmented.
 
 ### Keeping the Index Fresh (do not hand-roll cron for this)
+
+- **Hollow generations:** readiness compares the live Quill MANIFEST document count with a completed checkpoint for the current archive/contract. Fewer than 50% reports `index.status="hollow"`, `index.hollow=true`, and `index.live_documents`; missing counts give no hollow verdict. Follow the reported `cass index` remedy: its pre-scan sparse-index repair rebuilds from SQLite. The indexer's final check refuses to certify a hollow generation (GH #457).
+- **Merge memory:** `CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES` defaults to 1 GiB and caps each planned merge-output estimate, including document-ID range overhead. An oversized singleton is left unmerged; the setting does not cap total process RSS. Zero/unparseable values keep the default (GH #456).
 
 - **Stale-on-read catch-up is on by default.** When `search`/`pack`/TUI launch sees a stale (>30 min), partial, or behind index, cass spawns a *detached* `cass index --background` (nice 15 / ionice idle, own process group, 5-min cooldown, honors `index-run.lock`) and returns the current results immediately. `--robot-meta` shows it under `_meta.index_freshness.auto_refresh` (`outcome`: `spawned|disabled|index_run_active|cooldown|guard_busy|spawn_failed`, plus `trigger`). It never fires for data dirs under the OS temp dir or under `TUI_HEADLESS`, so tests are unaffected. `CASS_AUTO_REFRESH=0` disables. Implementation: `src/indexer/background_refresh.rs`, hook `maybe_auto_refresh_index_after_read` in `src/lib.rs`.
 - **`cass schedule install`** registers launchd LaunchAgents (macOS) / systemd user timers (Linux): incremental every 15 min, nightly full index + bounded `models backfill --scheduled` (fast/hash tier always, quality/MiniLM tier when installed; model-unavailable and index-busy exits count as skips, not failures) + due `sync_schedule` remote syncs, all at OS background priority. `cass schedule status --json` / `schedule run --job incremental|nightly [--force]` / `schedule uninstall`. Unsupported platforms get `err.kind="schedule"` with a manual recipe. Implementation: `src/schedule.rs`.
@@ -548,7 +580,7 @@ cass expand /path/to/session.jsonl -n 42 -C 3 --json
 
 # Export session as self-contained HTML
 cass export-html /path/to/session.jsonl --json
-cass export-html session.jsonl --encrypt --password "secret" --json
+printf '%s\n' "secret" | cass export-html session.jsonl --encrypt --password-stdin --json
 
 # Learn the full API
 cass capabilities --json      # Feature discovery
@@ -583,6 +615,8 @@ cass robot-docs guide         # LLM-optimized docs
 | OpenHands | `openhands.rs` | JSON event stream |
 | Antigravity | `antigravity.rs` | JSONL / SQLite |
 | Grok Build | `grok.rs` | ACP updates JSONL |
+| Goose | `goose.rs` | SQLite (`sessions.db`, v1.20+) / legacy per-session JSONL |
+| Muse Code | `muse.rs` | JSONL |
 
 ### HTML Export (Robot Mode)
 
@@ -592,11 +626,8 @@ Export conversations as self-contained HTML files with optional encryption:
 # Basic export (outputs to Downloads folder)
 cass export-html /path/to/session.jsonl --json
 
-# With encryption
-cass export-html session.jsonl --encrypt --password "secret" --json
-
-# Password from stdin (secure)
-echo "secret" | cass export-html session.jsonl --encrypt --password-stdin --json
+# With encryption (there is no --password argv flag; it is rejected on purpose)
+printf '%s\n' "secret" | cass export-html session.jsonl --encrypt --password-stdin --json
 
 # Custom output
 cass export-html session.jsonl --output-dir /tmp --filename "export" --json
@@ -606,10 +637,17 @@ cass export-html session.jsonl --output-dir /tmp --filename "export" --json
 ```json
 {
   "success": true,
-  "output_path": "/home/user/Downloads/claude_2026-01-25_session.html",
-  "file_size": 145623,
-  "encrypted": false,
-  "message_count": 42
+  "exported": {
+    "session_path": "/path/to/session.jsonl",
+    "output_path": "/home/user/Downloads/claude_2026-01-25_session.html",
+    "filename": "claude_2026-01-25_session.html",
+    "size_bytes": 145623,
+    "encrypted": false,
+    "messages_count": 42,
+    "agent": "claude_code",
+    "workspace": "/projects/myapp",
+    "title": "..."
+  }
 }
 ```
 
@@ -620,6 +658,7 @@ cass export-html session.jsonl --output-dir /tmp --filename "export" --json
 | 4 | output_not_writable | Cannot write to output directory |
 | 5 | encryption_error | Encryption failed |
 | 6 | password_required | --encrypt used without password |
+| 9 | opencode-parse / opencode-sqlite-parse / indexed-session-required / empty-session | Session could not be parsed, is not an indexed conversation or JSONL/OpenCode session, or has no messages |
 
 ### Key Flags
 
@@ -649,6 +688,8 @@ cass export-html session.jsonl --output-dir /tmp --filename "export" --json
 | `find "query"` | `search "query"` | `find` is an alias |
 | `--robot-docs` | `robot-docs` | It's a subcommand |
 
+Every applied correction is reported on stderr; in robot/JSON mode it is one `note: auto-corrected: <note>` line per correction, so stdout stays data-only.
+
 **Full alias list:**
 - **Search:** `find`, `query`, `q`, `lookup`, `grep` -> `search`
 - **Stats:** `ls`, `list`, `info`, `summary` -> `stats`
@@ -663,7 +704,7 @@ cass export-html session.jsonl --output-dir /tmp --filename "export" --json
 cass health --json
 ```
 
-Returns in <50ms:
+Returns in <50ms on a healthy archive (the archive probe is the same strict, mutation-free owner-thread probe as `status`, bounded by a 30 s hard deadline; it never checkpoints a dirty WAL):
 - **Exit 0:** Healthy — proceed with queries
 - **Exit 1:** Not ready — inspect `status`, `rebuild`, `semantic`, and `recommended_action`. Fresh installs usually need `cass index --full`; active rebuilds usually need bounded waiting; semantic-only gaps usually mean lexical fallback is expected.
 
@@ -679,7 +720,7 @@ Returns in <50ms:
 | 5 | Data corruption | Yes — inspect health/status, then rebuild derived assets if recommended |
 | 6 | Incompatible version | No — update cass |
 | 7 | Lock/busy | Yes — retry later |
-| 8 | Partial result | Yes — increase timeout |
+| 8 | Partial result (`sources sync` only: some sources had path failures) | Yes — inspect per-path errors, retry failed sources |
 | 9 | Unknown error | Maybe |
 | 10 | Config / timeout (domain-specific) | Depends on `err.kind` |
 | 11 | Config validation | No — fix config |
@@ -691,6 +732,8 @@ Returns in <50ms:
 | 22 | I/O during model handling | Maybe |
 | 23 | Download failure | Yes — retry or use `--from-file` |
 | 24 | I/O during model verify/install | Maybe |
+
+Search/pack timeouts are not exit 8: on expiry `search` and `pack` exit 0 with `{"hits": [], "budget": {"timed_out": true, "skipped_sections": [...], "retry": "<command>", ...}}`; `--robot-format sessions` instead fails with exit 10, kind `timeout`.
 
 **Codes ≥ 10 are domain-specific.** The numeric code alone is ambiguous (e.g. code 10 covers both `config` and `timeout` kinds). Agents should branch on `err.kind` from the JSON error envelope, not on the numeric code, when handling codes ≥ 10. Kind names are kebab-case (examples: `missing-index`, `missing-db`, `semantic-unavailable`, `embedder-unavailable`, `ambiguous-source`, `timeout`, `config`, `lock-busy`, `network`, `model`, `download`, `io`). The full set (~50 kinds) lives in `src/lib.rs`.
 
@@ -737,7 +780,7 @@ cass sources setup --json --hosts css  # JSON output for parsing
 cass search "database migration"
 
 # Sync latest data
-cass sources sync --all
+cass sources sync            # all configured remote sources; --source <name> narrows it
 
 # List configured sources
 cass sources list
@@ -1030,7 +1073,7 @@ rch status                    # Overview of current state
 rch queue                     # See active/waiting builds
 ```
 
-If rch or its workers are unavailable, it fails open — builds run locally as normal.
+If rch or its workers are unavailable, it fails open — builds run locally as normal. For proof runs use `RCH_REQUIRE_REMOTE=1 rch exec -- ...`: it fails closed and refuses local fallback (refusal `RCH-I012`, non-zero exit) when the fleet is pressure-blocked or has no admissible worker — that is not a build failure, so retry once `rch status` shows an admissible worker.
 
 **Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
 

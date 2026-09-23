@@ -620,6 +620,29 @@ fn intern_cache_key(s: &str) -> Arc<str> {
 // SQL Placeholder Builder (Opt 4.5: Pre-sized String Buffers)
 // ============================================================================
 
+/// Render rowids as a literal SQL list (`1,2,3`) for an `IN (...)` over an
+/// `INTEGER PRIMARY KEY`.
+///
+/// FrankenSQLite through 0.3.17 (verified on 0.3.16, cass GH #382) planned
+/// parameterized `WHERE id IN (?,?,...)` as `SCAN messages`, a full table
+/// walk, while integer literals used primary-key seeks. Version 0.3.18
+/// adds parameterized seeks; this established literal path remains covered
+/// at the full hydration chunk size. The ids come from
+/// cass's own index (never from user text) and `i64`'s `Display` emits only
+/// an optional `-` and ASCII digits, so embedding them cannot form SQL.
+pub fn sql_rowid_literal_list(ids: &[i64]) -> String {
+    let mut out = String::with_capacity(ids.len().saturating_mul(8));
+    for (idx, id) in ids.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        // `write!` into a String cannot fail.
+        use std::fmt::Write as _;
+        let _ = write!(out, "{id}");
+    }
+    out
+}
+
 /// Build a comma-separated list of SQL placeholders with pre-allocated capacity.
 ///
 /// For `n` items, produces "?,?,?..." (n "?" with n-1 ",").
@@ -3025,7 +3048,16 @@ pub struct SearchClient {
     /// can truthfully report lower-bound count precision without blocking the
     /// top-N result path.
     last_tantivy_total_count: Mutex<Option<usize>>,
+    /// GH #441: why the most recent hybrid search dropped its lexical leg
+    /// (`None` when lexical ran normally). Robot metadata surfaces it as
+    /// `_meta.lexical_degrade_reason` so an agent can tell "no lexical hits"
+    /// from "lexical was skipped because the engine ran out of query fuel".
+    last_lexical_degrade_reason: Mutex<Option<&'static str>>,
 }
+
+/// `_meta.lexical_degrade_reason` value when Quill's query-fuel ceiling was
+/// hit on the lexical leg of a hybrid search (GH #441).
+pub const LEXICAL_DEGRADE_QUERY_FUEL_EXHAUSTED: &str = "query_fuel_exhausted";
 
 #[derive(Debug, Clone, Copy)]
 pub struct SearchClientOptions {
@@ -3999,18 +4031,50 @@ impl SearchClient {
                 )
             })
             .ok();
-        let client_id = SEARCH_CLIENT_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let cache_namespace = format!(
-            "v{}|schema:{}|client:{}|index:{}",
-            CACHE_KEY_VERSION,
-            FS_CASS_SCHEMA_HASH,
-            client_id,
-            index_path.display()
-        );
         let federated_readers = if tantivy.is_none() {
             crate::search::tantivy::open_federated_search_readers(index_path)
                 .ok()
                 .flatten()
+                .filter(|readers| !readers.is_empty())
+        } else {
+            None
+        };
+
+        if tantivy.is_none() && federated_readers.is_none() && db_path.is_some_and(Path::exists) {
+            tracing::warn!(
+                index_path = %index_path.display(),
+                "Tantivy search index not found or incompatible. \
+                 Search results will be degraded. \
+                 Run `cass index --full` to rebuild the index."
+            );
+        }
+
+        Self::from_opened_lexical_index(
+            crate::search::tantivy::OpenedLexicalIndex {
+                path: index_path.to_path_buf(),
+                reader: tantivy,
+                federated_readers,
+            },
+            db_path,
+            options,
+        )
+    }
+
+    /// Consume the reader used by lexical admission without opening its path
+    /// again. This preserves the admitted snapshot even if publication changes
+    /// between validation and constructing the client.
+    pub(crate) fn from_opened_lexical_index(
+        index: crate::search::tantivy::OpenedLexicalIndex,
+        db_path: Option<&Path>,
+        options: SearchClientOptions,
+    ) -> Result<Option<Self>> {
+        let crate::search::tantivy::OpenedLexicalIndex {
+            path: index_path,
+            reader: tantivy,
+            federated_readers,
+        } = index;
+        let federated_readers =
+            federated_readers
                 .filter(|readers| !readers.is_empty())
                 .map(|readers| {
                     Arc::new(
@@ -4019,21 +4083,17 @@ impl SearchClient {
                             .map(|(reader, fields)| FederatedIndexReader { reader, fields })
                             .collect::<Vec<_>>(),
                     )
-                })
-        } else {
-            None
-        };
+                });
+        let client_id = SEARCH_CLIENT_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let cache_namespace = format!(
+            "v{}|schema:{}|client:{}|index:{}",
+            CACHE_KEY_VERSION,
+            FS_CASS_SCHEMA_HASH,
+            client_id,
+            index_path.display()
+        );
 
         let sqlite_path = db_path.map(Path::to_path_buf).filter(|path| path.exists());
-
-        if tantivy.is_none() && federated_readers.is_none() && sqlite_path.is_some() {
-            tracing::warn!(
-                index_path = %index_path.display(),
-                "Tantivy search index not found or incompatible. \
-                 Search results will be degraded. \
-                 Run `cass index --full` to rebuild the index."
-            );
-        }
 
         if tantivy.is_none() && federated_readers.is_none() && sqlite_path.is_none() {
             return Ok(None);
@@ -4079,6 +4139,7 @@ impl SearchClient {
             cache_namespace,
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         }))
     }
 
@@ -5694,27 +5755,22 @@ impl SearchClient {
             }
         }
 
-        let message_placeholder_capacity =
-            unique_message_ids.len().saturating_mul(2).saturating_sub(1);
-        let mut message_placeholders = String::with_capacity(message_placeholder_capacity);
-        let mut message_params: Vec<ParamValue> = Vec::with_capacity(unique_message_ids.len());
-        for (idx, message_id) in unique_message_ids.iter().enumerate() {
-            if idx > 0 {
-                message_placeholders.push(',');
-            }
-            message_placeholders.push('?');
-            message_params.push(ParamValue::from(i64::try_from(*message_id)?));
-        }
-
+        // Retain the literal rowid path: see `sql_rowid_literal_list`.
+        // FrankenSQLite through 0.3.17 scanned parameterized IN-lists.
+        let message_rowids = unique_message_ids
+            .iter()
+            .map(|message_id| i64::try_from(*message_id))
+            .collect::<Result<Vec<i64>, _>>()?;
         let message_sql = format!(
             "SELECT id, conversation_id, content, created_at, idx
              FROM messages
-             WHERE id IN ({message_placeholders})"
+             WHERE id IN ({})",
+            sql_rowid_literal_list(&message_rowids)
         );
 
         let message_rows: Vec<MessageHydrationRow> = transaction.query_map_collect(
             &message_sql,
-            &message_params,
+            &[],
             |row: &crate::franken_sync::Row| {
                 let message_id: i64 = row.get_typed(0)?;
                 Ok(MessageHydrationRow {
@@ -5744,18 +5800,8 @@ impl SearchClient {
                 conversation_ids.push(row.conversation_id);
             }
         }
-        let conversation_placeholder_capacity =
-            conversation_ids.len().saturating_mul(2).saturating_sub(1);
-        let mut conversation_placeholders =
-            String::with_capacity(conversation_placeholder_capacity);
-        let mut conversation_params: Vec<ParamValue> = Vec::with_capacity(conversation_ids.len());
-        for (idx, conversation_id) in conversation_ids.iter().enumerate() {
-            if idx > 0 {
-                conversation_placeholders.push(',');
-            }
-            conversation_placeholders.push('?');
-            conversation_params.push(ParamValue::from(*conversation_id));
-        }
+        // Literal rowid list for the same reason as the message step above.
+        let conversation_rowids = sql_rowid_literal_list(&conversation_ids);
         // LEFT JOIN + COALESCE on agents so search hits for conversations
         // with NULL agent_id (legacy V1 schema) still surface instead of
         // being silently dropped from results.  Consistent with the fts/
@@ -5766,35 +5812,31 @@ impl SearchClient {
              LEFT JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
              LEFT JOIN sources s ON c.source_id = s.id
-             WHERE c.id IN ({conversation_placeholders})"
+             WHERE c.id IN ({conversation_rowids})"
         );
 
         let conversation_rows: Vec<(i64, ConversationHydrationRow)> = transaction
-            .query_map_collect(
-                &sql,
-                &conversation_params,
-                |row: &crate::franken_sync::Row| {
-                    let conversation_id: i64 = row.get_typed(0)?;
-                    let title: Option<String> = if field_mask.wants_title() {
-                        row.get_typed(1)?
-                    } else {
-                        None
-                    };
-                    Ok((
-                        conversation_id,
-                        ConversationHydrationRow {
-                            title,
-                            source_path: row.get_typed(2)?,
-                            source_id: row.get_typed(3)?,
-                            origin_host: row.get_typed(4)?,
-                            agent: row.get_typed(5)?,
-                            workspace: row.get_typed(6)?,
-                            origin_kind: row.get_typed(7)?,
-                            started_at: row.get_typed(8)?,
-                        },
-                    ))
-                },
-            )?;
+            .query_map_collect(&sql, &[], |row: &crate::franken_sync::Row| {
+                let conversation_id: i64 = row.get_typed(0)?;
+                let title: Option<String> = if field_mask.wants_title() {
+                    row.get_typed(1)?
+                } else {
+                    None
+                };
+                Ok((
+                    conversation_id,
+                    ConversationHydrationRow {
+                        title,
+                        source_path: row.get_typed(2)?,
+                        source_id: row.get_typed(3)?,
+                        origin_host: row.get_typed(4)?,
+                        agent: row.get_typed(5)?,
+                        workspace: row.get_typed(6)?,
+                        origin_kind: row.get_typed(7)?,
+                        started_at: row.get_typed(8)?,
+                    },
+                ))
+            })?;
 
         let conversations_by_id: HashMap<i64, ConversationHydrationRow> =
             conversation_rows.into_iter().collect();
@@ -6243,17 +6285,6 @@ impl SearchClient {
         if canonical.trim().is_empty() {
             return Ok((Vec::new(), None));
         }
-        let limit = if limit == 0 {
-            self.total_docs().min(no_limit_result_cap()).max(1)
-        } else {
-            limit
-        };
-        let target_hits = limit.saturating_add(offset);
-        if target_hits == 0 {
-            return Ok((Vec::new(), None));
-        }
-        let initial_fetch_limit = target_hits;
-        let fallback_fetch_limit = target_hits.saturating_mul(3);
         loop {
             let (
                 embedding,
@@ -6319,6 +6350,24 @@ impl SearchClient {
                 );
             };
 
+            // A semantic-only client deliberately has no lexical reader. Use
+            // this admitted vector generation for an unlimited request's cap,
+            // rather than silently truncating it to one lexical document.
+            let limit = if limit == 0 {
+                candidate_context
+                    .artifacts
+                    .iter()
+                    .fold(0usize, |count, artifact| {
+                        count.saturating_add(artifact.index().record_count())
+                    })
+                    .min(no_limit_result_cap())
+                    .max(1)
+            } else {
+                limit
+            };
+            let target_hits = limit.saturating_add(offset);
+            let initial_fetch_limit = target_hits;
+            let fallback_fetch_limit = target_hits.saturating_mul(3);
             let finalize_hits =
                 |results: &[VectorSearchResult]| -> Result<(usize, Vec<SearchHit>)> {
                     let hits = self.hydrate_semantic_hits(results, field_mask)?;
@@ -6904,14 +6953,40 @@ impl SearchClient {
 
         let budget =
             hybrid_candidate_budget(semantic_query, requested_limit, limit, offset, total_docs);
-        let lexical = self.search_with_fallback(
+        self.record_lexical_degrade_reason(None);
+        let lexical = match self.search_with_fallback(
             lexical_query,
             filters.clone(),
             budget.lexical_candidates,
             0,
             sparse_threshold,
             field_mask,
-        )?;
+        ) {
+            Ok(lexical) => lexical,
+            // GH #441: Quill's per-query fuel ceiling is a work bound, not an
+            // index fault. A stopword-heavy natural-language query on a
+            // segment-heavy archive can hit it while the semantic leg is
+            // perfectly able to answer. Degrade to semantic-only and say so
+            // in the robot metadata instead of failing the whole search.
+            Err(err) if crate::search::quill_bridge::is_query_fuel_exhausted(&err) => {
+                tracing::warn!(
+                    error = %err,
+                    "lexical leg of hybrid search exhausted its Quill query fuel; \
+                     continuing with the semantic leg only (GH #441)"
+                );
+                self.record_lexical_degrade_reason(Some(LEXICAL_DEGRADE_QUERY_FUEL_EXHAUSTED));
+                SearchResult {
+                    hits: Vec::new(),
+                    wildcard_fallback: false,
+                    cache_stats: self.cache_stats(),
+                    suggestions: Vec::new(),
+                    ann_stats: None,
+                    ann_unavailable_reason: None,
+                    total_count: None,
+                }
+            }
+            Err(err) => return Err(err),
+        };
         let (semantic_hits, semantic_ann_stats) = self.search_semantic_with_tier(
             semantic_query,
             filters,
@@ -7138,9 +7213,9 @@ impl SearchClient {
         let sqlite_guard = self
             .sqlite_guard()
             .context("opening SQLite for Tantivy content hydration")?;
-        let conn = sqlite_guard.as_ref().ok_or_else(|| {
-            anyhow!("Tantivy content hydration requires a SQLite connection")
-        })?;
+        let conn = sqlite_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("Tantivy content hydration requires a SQLite connection"))?;
 
         let mut hydrated_exact = HashMap::new();
         let mut hydrated_fallback = HashMap::new();
@@ -7817,7 +7892,7 @@ impl SearchClient {
         )
     }
 
-    fn sqlite_fts5_message_hydrate_query(row_count: usize, field_mask: FieldMask) -> String {
+    fn sqlite_fts5_message_hydrate_query(message_ids: &[i64], field_mask: FieldMask) -> String {
         let title_expr = if field_mask.wants_title() {
             "COALESCE(c.title, '')"
         } else {
@@ -7830,7 +7905,9 @@ impl SearchClient {
         };
         let normalized_source_sql =
             normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
-        let placeholders = sql_placeholders(row_count);
+        // Literal rowid list: avoids the parameterized IN scan used by
+        // FrankenSQLite through 0.3.17 (see `sql_rowid_literal_list`).
+        let rowids = sql_rowid_literal_list(message_ids);
 
         format!(
             "SELECT m.id,
@@ -7850,7 +7927,7 @@ impl SearchClient {
              LEFT JOIN sources s ON c.source_id = s.id
              LEFT JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
-             WHERE m.id IN ({placeholders})"
+             WHERE m.id IN ({rowids})"
         )
     }
 
@@ -8659,15 +8736,11 @@ impl SearchClient {
             let mut metadata_by_message_id = HashMap::with_capacity(message_ids.len());
             for message_chunk in message_ids.chunks(SQLITE_FTS5_HYDRATE_PARAM_CHUNK) {
                 let metadata_sql =
-                    Self::sqlite_fts5_message_hydrate_query(message_chunk.len(), field_mask);
-                let metadata_params = message_chunk
-                    .iter()
-                    .map(|message_id| ParamValue::from(*message_id))
-                    .collect::<Vec<_>>();
+                    Self::sqlite_fts5_message_hydrate_query(message_chunk, field_mask);
                 let metadata_rows: Vec<SqliteFtsMessageRow> = match franken_query_map_collect_retry(
                     conn,
                     &metadata_sql,
-                    &metadata_params,
+                    &[],
                     |row| {
                         Ok((
                             row.get_typed(0)?,
@@ -8755,11 +8828,9 @@ impl SearchClient {
                         } else {
                             metadata_agent
                         },
-                        if metadata_workspace.is_empty() {
-                            fts_workspace.unwrap_or_default()
-                        } else {
-                            metadata_workspace
-                        },
+                        // Canonical NULL is authoritative too: a legacy
+                        // content-bearing FTS row can retain an old attribution.
+                        metadata_workspace,
                         if metadata_source_path.is_empty() {
                             fts_source_path.unwrap_or_default()
                         } else {
@@ -10110,6 +10181,22 @@ impl SearchClient {
         }
     }
 
+    fn record_lexical_degrade_reason(&self, reason: Option<&'static str>) {
+        if let Ok(mut slot) = self.last_lexical_degrade_reason.lock() {
+            *slot = reason;
+        }
+    }
+
+    /// Why the most recent hybrid search dropped its lexical leg, if it did.
+    /// See [`LEXICAL_DEGRADE_QUERY_FUEL_EXHAUSTED`] (GH #441).
+    #[must_use]
+    pub fn lexical_degrade_reason(&self) -> Option<&'static str> {
+        self.last_lexical_degrade_reason
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+    }
+
     pub fn cache_stats(&self) -> CacheStats {
         let (hits, searcher_cache, shortfall, reloads, reload_ms_total) =
             self.metrics.snapshot_all();
@@ -10244,6 +10331,7 @@ mod tests {
             cache_namespace: "vtest|schema:cass-layer-b".into(),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         }
     }
 
@@ -11639,6 +11727,7 @@ mod tests {
             cache_namespace: format!("v{}|schema:{}", CACHE_KEY_VERSION, FS_CASS_SCHEMA_HASH),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
         let semantic_embedder: Arc<dyn Embedder> = fast_embedder;
         client.set_semantic_context(
@@ -12411,6 +12500,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         // Wildcard query should skip cache logic entirely (no miss recorded)
@@ -12462,6 +12552,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = vec![SearchHit {
@@ -12673,6 +12764,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
         let field_mask = FieldMask::new(false, true, true, true);
         let lexical_hit = SearchHit {
@@ -13214,6 +13306,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.search("*handler", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -13296,6 +13389,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -13383,6 +13477,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -13486,6 +13581,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let sqlite_hits = client.search_sqlite_fts5(
@@ -13591,6 +13687,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let guard = client
@@ -13710,6 +13807,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:cross-worker"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         });
         let worker_count = 4;
         let start = Arc::new(std::sync::Barrier::new(worker_count + 1));
@@ -13997,6 +14095,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let guard = client.sqlite_guard()?;
@@ -14164,6 +14263,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
         let direct_hits = client.search_sqlite_fts5(
             Path::new(":memory:"),
@@ -14301,6 +14401,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let fallback_key = (
@@ -14348,6 +14449,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let error = client
@@ -14357,6 +14459,72 @@ mod tests {
             error
                 .to_string()
                 .contains("Tantivy exact content hydration returned no canonical row"),
+            "unexpected hydration error: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tantivy_hydration_fails_closed_when_sqlite_is_unavailable() -> Result<()> {
+        let client = cass_layer_b_test_client(None);
+
+        let error = client
+            .hydrate_tantivy_hit_contents(&[(41, 7)], &[])
+            .expect_err("requested content must require a SQLite connection");
+        assert!(
+            error
+                .to_string()
+                .contains("Tantivy content hydration requires a SQLite connection"),
+            "unexpected hydration error: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tantivy_hydration_skips_sqlite_for_empty_content_requests() -> Result<()> {
+        let client = cass_layer_b_test_client(None);
+        let (exact, fallback) = client.hydrate_tantivy_hit_contents(&[], &[])?;
+
+        assert!(exact.is_empty());
+        assert!(fallback.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn tantivy_hydration_fails_closed_when_fallback_row_is_missing() -> Result<()> {
+        let conn = SearchSqliteFixture::in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                source_id TEXT,
+                origin_host TEXT,
+                source_path TEXT NOT NULL
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                UNIQUE(conversation_id, idx)
+             );
+             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             INSERT INTO conversations(id, source_id, origin_host, source_path)
+             VALUES(1, 'local', NULL, '/tmp/missing-fallback.jsonl');",
+        )?;
+        let client = cass_layer_b_test_client(Some(conn.into_connection()));
+        let fallback_key = (
+            "local".to_string(),
+            "/tmp/missing-fallback.jsonl".to_string(),
+            0,
+        );
+
+        let error = client
+            .hydrate_tantivy_hit_contents(&[], std::slice::from_ref(&fallback_key))
+            .expect_err("missing fallback content must not degrade to preview fallback");
+        assert!(
+            error
+                .to_string()
+                .contains("Tantivy fallback content hydration returned no canonical row"),
             "unexpected hydration error: {error:#}"
         );
         Ok(())
@@ -14478,6 +14646,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.search("delta", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -14595,6 +14764,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let local_hits = client.browse_by_date(
@@ -14723,6 +14893,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let remote_hits = client.search(
@@ -14773,8 +14944,18 @@ mod tests {
 
     #[test]
     fn sqlite_backend_workspace_filter_matches_null_workspace_as_empty_string() -> Result<()> {
+        assert_sqlite_null_workspace_overrides_shadow(true)
+    }
+
+    #[test]
+    fn gh459_sqlite_null_workspace_overrides_legacy_content_bearing_shadow() -> Result<()> {
+        assert_sqlite_null_workspace_overrides_shadow(false)
+    }
+
+    fn assert_sqlite_null_workspace_overrides_shadow(contentless: bool) -> Result<()> {
         let conn = SearchSqliteFixture::in_memory()?;
-        conn.execute_batch(
+        let content_option = if contentless { "content=''," } else { "" };
+        conn.execute_batch(&format!(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
              CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
@@ -14801,10 +14982,10 @@ mod tests {
                 workspace,
                 source_path,
                 created_at UNINDEXED,
-                content='',
+                {content_option}
                 tokenize='porter'
              );",
-        )?;
+        ))?;
         conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
         conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
         conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/named')")?;
@@ -14820,7 +15001,7 @@ mod tests {
         conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(2, 2, 0, 'auth token failure', 43)")?;
         conn.execute_compat(
             "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             VALUES(?1, ?2, ?3, ?4, NULL, ?5, ?6)",
+             VALUES(?1, ?2, ?3, ?4, '/old-guessed-workspace', ?5, ?6)",
             params![
                 1_i64,
                 "auth token failure",
@@ -14843,6 +15024,20 @@ mod tests {
                 43_i64
             ],
         )?;
+        let stored_workspace: Option<String> = conn.connection().query_row_map(
+            "SELECT workspace FROM fts_messages WHERE rowid = 1",
+            &[],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(
+            stored_workspace.as_deref(),
+            if contentless {
+                Some("")
+            } else {
+                Some("/old-guessed-workspace")
+            },
+            "the shadow must retain obsolete attribution only when it stores content",
+        );
 
         let client = SearchClient {
             reader: None,
@@ -14860,6 +15055,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.search(
@@ -14875,6 +15071,28 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].workspace, "");
         assert_eq!(hits[0].source_path, "/tmp/null-workspace.jsonl");
+
+        let stale_hits = client.search(
+            "auth",
+            SearchFilters {
+                workspaces: HashSet::from_iter(["/old-guessed-workspace".to_string()]),
+                ..SearchFilters::default()
+            },
+            5,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert!(
+            stale_hits.is_empty(),
+            "canonical NULL must not resurrect the shadow workspace"
+        );
+        let all_hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
+        assert_eq!(
+            all_hits.len(),
+            2,
+            "workspace repair must retain both messages"
+        );
+        assert!(all_hits.iter().any(|hit| hit.workspace == "/named"));
 
         Ok(())
     }
@@ -15321,6 +15539,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:negated-or-fallback"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.search_sqlite_fts5(
@@ -15393,6 +15612,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:wildcard-scan-fallback"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
         let contents = |query: &str| -> Result<HashSet<String>> {
             Ok(client
@@ -15499,6 +15719,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.browse_by_date(
@@ -15594,6 +15815,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -16037,6 +16259,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -16110,6 +16333,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -16199,6 +16423,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let first_hit = SearchHit {
@@ -16316,6 +16541,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -16402,6 +16628,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let first_hit = SearchHit {
@@ -16495,6 +16722,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -16578,6 +16806,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -16661,6 +16890,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -16745,6 +16975,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -16867,6 +17098,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.browse_by_date(
@@ -16995,6 +17227,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -17057,6 +17290,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -17112,6 +17346,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         client.metrics.inc_cache_hits();
@@ -17153,6 +17388,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
         let mut filters = SearchFilters::default();
         filters.workspaces.insert("/tmp/cass-workspace".into());
@@ -17217,6 +17453,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
         let filters = SearchFilters::default();
 
@@ -17259,6 +17496,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -17471,6 +17709,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         // Large content to exceed byte cap quickly
@@ -18838,6 +19077,7 @@ mod tests {
             cache_namespace: "vtest|schema:none".into(),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let result = client.search_with_fallback(
@@ -18931,6 +19171,7 @@ mod tests {
             cache_namespace: "vtest|schema:none".into(),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let result = client.search_with_fallback(
@@ -18976,6 +19217,7 @@ mod tests {
             cache_namespace: "vtest|schema:none".into(),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let mut filters = SearchFilters::default();
@@ -19394,6 +19636,63 @@ mod tests {
                 .map(|guard| guard.is_none())
                 .unwrap_or(false),
             "short full-content hit should not lazy-open sqlite"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn caller_search_propagates_missing_canonical_hydration_row() -> Result<()> {
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        storage.close()?;
+
+        let index_path = dir.path().join("search-index");
+        let long_content = format!(
+            "{}callerhydrationmissing appears past the preview boundary",
+            "padding ".repeat(70)
+        );
+        let conversation = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: Some("caller-hydration-missing".into()),
+            title: Some("caller-level hydration".into()),
+            workspace: Some(dir.path().to_path_buf()),
+            source_path: dir.path().join("caller-hydration.jsonl"),
+            started_at: Some(1_700_000_123_000),
+            ended_at: Some(1_700_000_123_000),
+            metadata: json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: Some("user".into()),
+                created_at: Some(1_700_000_123_000),
+                content: long_content,
+                extra: json!({}),
+                snippets: vec![],
+                invocations: Vec::new(),
+            }],
+        };
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        index.add_conversation_with_id(&conversation, Some(41))?;
+        index.commit()?;
+
+        let client = SearchClient::open(&index_path, Some(&db_path))?.expect("db-backed client");
+        let error = client
+            .search(
+                "callerhydrationmissing",
+                SearchFilters::default(),
+                5,
+                0,
+                FieldMask::FULL,
+            )
+            .expect_err("caller-level search must propagate missing canonical hydration rows");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(
+                "Tantivy exact content hydration returned no canonical row for conversation 41 line 0"
+            ),
+            "unexpected caller-level hydration error: {rendered}"
         );
 
         Ok(())
@@ -20051,6 +20350,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let filters_empty = SearchFilters::default();
@@ -20257,6 +20557,7 @@ mod tests {
             cache_namespace: "fts5-disabled".to_string(),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.search_sqlite_fts5(
@@ -20398,6 +20699,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:k0e5p"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         // Hit-key tuple: (source_path, line_number) is the stable
@@ -21186,6 +21488,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         // Initial metrics should be zero
@@ -21225,6 +21528,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let filters1 = SearchFilters::default();
@@ -21850,6 +22154,36 @@ mod tests {
     }
 
     #[test]
+    fn gh452_semantic_no_limit_uses_vector_count_without_a_lexical_reader() -> Result<()> {
+        for sharded in [false, true] {
+            let fixture =
+                build_semantic_test_fixture_with_options(sharded, SemanticAnnFixtureMode::Missing)?;
+            assert!(!fixture.client.has_tantivy());
+            let (hits, _) = fixture.client.search_semantic(
+                "semantic fixture query",
+                SearchFilters::default(),
+                0,
+                0,
+                FieldMask::FULL,
+                false,
+            )?;
+            assert_eq!(hits.len(), 3);
+            let (page, _) = fixture.client.search_semantic(
+                "semantic fixture query",
+                SearchFilters::default(),
+                0,
+                1,
+                FieldMask::FULL,
+                false,
+            )?;
+            assert_eq!(page.len(), 2);
+            assert_eq!(page[0].source_path, hits[1].source_path);
+            assert_eq!(page[1].source_path, hits[2].source_path);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn semantic_search_session_paths_filter_retries_past_initial_candidates() -> Result<()> {
         let fixture = build_semantic_test_fixture()?;
         let mut filters = SearchFilters::default();
@@ -22327,6 +22661,24 @@ mod tests {
     #[test]
     fn sql_placeholders_empty() {
         assert_eq!(sql_placeholders(0), "");
+    }
+
+    #[test]
+    fn sql_rowid_literal_list_renders_integers_only() {
+        assert_eq!(sql_rowid_literal_list(&[]), "");
+        assert_eq!(sql_rowid_literal_list(&[7]), "7");
+        assert_eq!(sql_rowid_literal_list(&[1, 22, 333]), "1,22,333");
+        assert_eq!(
+            sql_rowid_literal_list(&[i64::MIN, -1, 0, i64::MAX]),
+            "-9223372036854775808,-1,0,9223372036854775807"
+        );
+        let rendered = sql_rowid_literal_list(&[12_966_472, 5]);
+        assert!(
+            rendered
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == ',' || c == '-'),
+            "a rowid list can only ever contain digits, commas and minus signs: {rendered}"
+        );
     }
 
     #[test]

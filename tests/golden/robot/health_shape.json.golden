@@ -939,6 +939,15 @@
             "documents": {
               "type": "null"
             },
+            "live_documents": {
+              "type": "null"
+            },
+            "hollow": {
+              "type": "boolean"
+            },
+            "segment_files": {
+              "type": "null"
+            },
             "empty_with_messages": {
               "type": "boolean"
             },
@@ -988,6 +997,15 @@
           "type": "object",
           "properties": {
             "exists": {
+              "type": "boolean"
+            },
+            "db_bytes": {
+              "type": "string"
+            },
+            "wal_bytes": {
+              "type": "string"
+            },
+            "shm_present": {
               "type": "boolean"
             },
             "opened": {

@@ -8,6 +8,13 @@ use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
+#[test]
+fn public_cursor_connector_preserves_registry_construction_surface() {
+    let _unit_constructed = CursorConnector;
+    let _constructed = CursorConnector::new();
+    let _app_support = CursorConnector::app_support_dir();
+}
+
 // ============================================================================
 // Helper
 // ============================================================================

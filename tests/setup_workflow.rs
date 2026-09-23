@@ -50,6 +50,7 @@ fn setup_options_custom_values() {
         dry_run: true,
         non_interactive: true,
         hosts: Some(vec!["host1".to_string(), "host2".to_string()]),
+        tailscale: true,
         skip_install: true,
         skip_index: true,
         skip_sync: true,
@@ -350,6 +351,7 @@ fn setup_result_structure() {
         hosts_indexed: 2,
         total_sessions: 150,
         dry_run: false,
+        sync_pending: false,
     };
 
     assert_eq!(result.sources_added, 3);
@@ -368,6 +370,7 @@ fn setup_result_dry_run() {
         hosts_indexed: 3,
         total_sessions: 0,
         dry_run: true,
+        sync_pending: false,
     };
 
     assert!(result.dry_run);

@@ -14,6 +14,9 @@ QUIET=0
 VERIFY=0
 QUICKSTART=0
 FROM_SOURCE=0
+# Linux prebuilt binaries are built on ubuntu-24.04 (frankensqlite needs the
+# newer kernel/libc surface); older glibc cannot load them. Probed below.
+MIN_GLIBC="2.38"
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
@@ -401,6 +404,59 @@ case "$TARGET" in
 esac
 
 # Prefer prebuilt artifact when we know the target or the caller supplied a direct URL.
+# glibc probe (WS-G.2): a prebuilt Linux binary on a host older than
+# MIN_GLIBC fails at load time with a linker error after a successful-looking
+# install. Detect it here and take the source route instead. An explicit
+# --artifact-url is honored as written (the operator asked for that file).
+last_major_minor_in_line() {
+  # Print the LAST `<digits>.<digits>` token of the first line of $1, or
+  # nothing. Builtins only: no pipeline, so nothing can close early.
+  local first="${1%%$'\n'*}" rest version=""
+  rest="$first"
+  while [[ "$rest" =~ ([0-9]+\.[0-9]+)(.*) ]]; do
+    version="${BASH_REMATCH[1]}"
+    rest="${BASH_REMATCH[2]}"
+  done
+  printf '%s' "$version"
+}
+host_glibc_version() {
+  # GH #444: `ldd --version` is a shell script on glibc that prints its banner
+  # with several separate writes. The old `ldd | head -n 1 | grep | tail`
+  # pipeline let `head` close its end after the first line, `ldd` then took
+  # SIGPIPE (exit 141), and `set -o pipefail` turned that race into an
+  # installer failure roughly half the time. Capture the whole banner once
+  # (no early-closing reader), then parse it in-process; fall back to
+  # `getconf GNU_LIBC_VERSION` when ldd is absent or prints nothing usable
+  # (e.g. musl's ldd, which prints usage to stderr and exits non-zero).
+  local banner="" version=""
+  banner=$(LC_ALL=C ldd --version 2>/dev/null) || banner=""
+  version=$(last_major_minor_in_line "$banner")
+  if [ -z "$version" ]; then
+    banner=$(LC_ALL=C getconf GNU_LIBC_VERSION 2>/dev/null) || banner=""
+    version=$(last_major_minor_in_line "$banner")
+  fi
+  printf '%s' "$version"
+}
+glibc_at_least() {
+  # $1 = required, $2 = host; true when host >= required (numeric major.minor)
+  req_major=${1%%.*}; req_minor=${1#*.}
+  host_major=${2%%.*}; host_minor=${2#*.}
+  [ "$host_major" -gt "$req_major" ] 2>/dev/null && return 0
+  [ "$host_major" -eq "$req_major" ] 2>/dev/null && [ "$host_minor" -ge "$req_minor" ] 2>/dev/null
+}
+if [ "$FROM_SOURCE" -eq 0 ] && [ -z "$ARTIFACT_URL" ]; then
+  case "$TARGET" in
+    linux-*musl*) : ;;
+    linux-*)
+      HOST_GLIBC=$(host_glibc_version)
+      if [ -n "$HOST_GLIBC" ] && ! glibc_at_least "$MIN_GLIBC" "$HOST_GLIBC"; then
+        warn "Host glibc ${HOST_GLIBC} is older than ${MIN_GLIBC}, which the prebuilt Linux binary requires; falling back to build-from-source (pass --artifact-url to force a prebuilt artifact)"
+        FROM_SOURCE=1
+      fi
+      ;;
+    *) : ;;
+  esac
+fi
 TAR=""
 URL=""
 if [ "$FROM_SOURCE" -eq 0 ]; then

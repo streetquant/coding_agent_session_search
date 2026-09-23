@@ -239,6 +239,7 @@ const INPUT_AUTOCOMPLETE_AGENT_HINTS: &[&str] = &[
     "copilot_cli",
     "crush",
     "cursor",
+    "devin",
     "factory",
     "gemini",
     "goose",
@@ -247,6 +248,7 @@ const INPUT_AUTOCOMPLETE_AGENT_HINTS: &[&str] = &[
     "openclaw",
     "omp",
     "pi_agent",
+    "prime_agent",
     "qwen",
     "vibe",
 ];
@@ -3081,6 +3083,8 @@ fn legacy_agent_color(agent: &str) -> ftui::PackedRgba {
         "chatgpt" => ftui::PackedRgba::rgb(16, 163, 127), // chatgpt green
         "aider" => ftui::PackedRgba::rgb(255, 165, 0), // orange
         "pi_agent" => ftui::PackedRgba::rgb(255, 140, 0), // dark orange
+        "prime_agent" => ftui::PackedRgba::rgb(99, 102, 241), // indigo
+        "devin" => ftui::PackedRgba::rgb(56, 189, 248), // sky blue
         "factory" | "droid" => ftui::PackedRgba::rgb(230, 176, 60), // amber
         "clawdbot" => ftui::PackedRgba::rgb(140, 130, 240), // indigo
         "vibe" | "mistral" => ftui::PackedRgba::rgb(220, 100, 160), // rose
@@ -5159,6 +5163,14 @@ pub struct CassApp {
     pub search_has_more: bool,
     /// Guard against overlapping async search requests (initial or load-more).
     pub search_in_flight: bool,
+    /// GH #452 / PR #451: true when the search currently in flight was itself
+    /// dispatched while another search was still running. Typing must be able
+    /// to preempt one slow search (typically the automatic empty-query search
+    /// issued at startup), but a further keystroke must NOT stack a third
+    /// concurrent backend search: on a multi-million-message archive each one
+    /// admits gigabytes of search state, so unbounded overlap wedges the
+    /// process. While this is set the debounce tick re-arms instead of firing.
+    pub search_preempted_in_flight: bool,
     /// True after initial live results arrive but refinement is still streaming.
     pub search_refining: bool,
     /// Which search mode is active (lexical / semantic / hybrid).
@@ -5522,6 +5534,7 @@ impl Default for CassApp {
             search_backend_offset: 0,
             search_has_more: false,
             search_in_flight: false,
+            search_preempted_in_flight: false,
             search_refining: false,
             search_mode: SearchMode::default(),
             match_mode: MatchMode::default(),
@@ -15817,8 +15830,11 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                     KeyCode::Char('i') | KeyCode::Char('I') if alt => CassMsg::UpdateSkipped,
 
                     // -- Swarm operations -----------------------------------------
-                    KeyCode::Char('w') if alt => CassMsg::SwarmEntered,
-                    KeyCode::Char('W') if alt => CassMsg::SwarmEntered,
+                    // No direct key: `Alt+W` is the documented workspace-filter
+                    // palette (matched above), so an `Alt+W => SwarmEntered` arm
+                    // here was unreachable dead code (reality check 2026-09-01,
+                    // WS-D.4). The swarm cockpit is entered through the surface
+                    // switch (`AppSurface::Swarm`).
 
                     // -- Sources management -----------------------------------------
                     KeyCode::Char('s') if ctrl && shift => CassMsg::SourcesEntered,
@@ -17063,6 +17079,10 @@ impl super::ftui_adapter::Model for CassApp {
                 );
                 self.search_dirty_since = None;
                 self.search_error_message = None;
+                // GH #452: remember whether THIS dispatch preempted a search
+                // that was still running. While that is true the debounce tick
+                // coalesces instead of stacking a third concurrent search.
+                self.search_preempted_in_flight = self.search_in_flight;
                 if self.progressive_search_service.is_some() && progressive {
                     self.search_generation = generation;
                     self.search_backend_offset = 0;
@@ -19861,13 +19881,23 @@ impl super::ftui_adapter::Model for CassApp {
                 if let Some(dirty_ts) = self.search_dirty_since {
                     let elapsed = dirty_ts.elapsed();
                     if elapsed >= SEARCH_DEBOUNCE {
-                        // Fire the new search even if one is already in-flight.
-                        // The generation counter ensures stale results from the
-                        // previous search are safely ignored when they arrive.
-                        // This prevents the user from waiting for an initial
-                        // empty-query search to finish before their typed query
-                        // starts executing.
-                        cmds.push(ftui::Cmd::msg(CassMsg::SearchRequested));
+                        if self.search_in_flight && self.search_preempted_in_flight {
+                            // A search is running that already preempted an
+                            // earlier one. Stacking a third concurrent backend
+                            // search would multiply the admitted search state
+                            // (GH #452), so keep the dirty flag and re-arm; the
+                            // pending query fires from the completion handler,
+                            // or from a later tick, as soon as we are idle.
+                            cmds.push(Self::delayed_tick(SEARCH_DEBOUNCE));
+                        } else {
+                            // Fire the new search even if one is already
+                            // in-flight. The generation counter ensures stale
+                            // results from the previous search are safely
+                            // ignored when they arrive. This prevents the user
+                            // from waiting for an initial empty-query search to
+                            // finish before their typed query starts executing.
+                            cmds.push(ftui::Cmd::msg(CassMsg::SearchRequested));
+                        }
                     } else {
                         cmds.push(Self::delayed_tick(SEARCH_DEBOUNCE.saturating_sub(elapsed)));
                     }
@@ -20370,106 +20400,50 @@ impl super::ftui_adapter::Model for CassApp {
             }
             CassMsg::AnalyticsLoadRequested => {
                 let db_path = self.db_path.clone();
+                let data_dir = self.data_dir.clone();
                 let filters = self.analytics_filters.clone();
                 let group_by = self.explorer_group_by;
-                #[cfg(test)]
-                {
-                    let _ = (db_path, filters, group_by);
-                    ftui::Cmd::task(|| CassMsg::AnalyticsChartDataLoaded(Box::default()))
-                }
-                #[cfg(not(test))]
-                {
-                    ftui::Cmd::task(move || {
-                        match crate::storage::sqlite::FrankenStorage::open_readonly(&db_path) {
-                            Ok(db) => {
-                                let mut data = super::analytics_charts::load_chart_data(
-                                    &db, &filters, group_by,
-                                );
-
-                                let should_auto_rebuild = if data.is_empty() {
-                                    // Data is empty — check whether messages exist
-                                    // and analytics tables need rebuilding.
-                                    match crate::analytics::query::query_status(
-                                        db.raw(),
-                                        &crate::analytics::AnalyticsFilter::default(),
-                                    ) {
-                                        Ok(status) => {
-                                            let has_messages = status.coverage.total_messages > 0;
-                                            let needs_rebuild =
-                                                status.recommended_action.starts_with("rebuild")
-                                                    || status.drift.signals.iter().any(|signal| {
-                                                        matches!(
-                                                            signal.signal.as_str(),
-                                                            "missing_rollups" | "no_analytics_data"
-                                                        )
-                                                    });
-                                            tracing::debug!(
-                                                has_messages,
-                                                needs_rebuild,
-                                                action = %status.recommended_action,
-                                                "analytics auto-rebuild check"
-                                            );
-                                            has_messages && needs_rebuild
-                                        }
-                                        Err(e) => {
-                                            // query_status failed (likely frankensqlite compat) —
-                                            // try rebuild anyway since we have no data to show.
-                                            tracing::warn!(
-                                                error = %e,
-                                                "analytics query_status failed, attempting rebuild"
-                                            );
-                                            true
-                                        }
-                                    }
-                                } else {
-                                    false
-                                };
-
-                                if should_auto_rebuild {
-                                    tracing::info!("analytics auto-rebuild triggered");
-                                    match crate::storage::sqlite::FrankenStorage::open(&db_path) {
-                                        Ok(db_rw) => match db_rw.rebuild_analytics() {
-                                            Ok(_) => {
-                                                // Re-open with FrankenStorage to load refreshed data
-                                                match crate::storage::sqlite::FrankenStorage::open_readonly(&db_path) {
-                                                    Ok(db_refreshed) => {
-                                                        let mut refreshed =
-                                                            super::analytics_charts::load_chart_data(
-                                                                &db_refreshed, &filters, group_by,
-                                                            );
-                                                        refreshed.auto_rebuilt = true;
-                                                        data = refreshed;
-                                                    }
-                                                    Err(err) => {
-                                                        data.auto_rebuild_error = Some(format!(
-                                                            "failed re-opening analytics DB after rebuild: {err}"
-                                                        ));
-                                                    }
-                                                }
-                                            }
-                                            Err(err) => {
-                                                data.auto_rebuild_error = Some(format!(
-                                                    "analytics rebuild failed: {err}"
-                                                ));
-                                            }
-                                        },
-                                        Err(err) => {
-                                            data.auto_rebuild_error =
-                                                Some(format!("failed opening analytics DB: {err}"));
-                                        }
-                                    }
-                                }
-
-                                CassMsg::AnalyticsChartDataLoaded(Box::new(data))
-                            }
-                            Err(e) => CassMsg::AnalyticsChartDataFailed(e.to_string()),
+                ftui::Cmd::task(move || {
+                    // GH #395: the load runs read-only and never rebuilds
+                    // rollups in-process (analytics_charts::
+                    // load_chart_data_with_auto_rebuild); an archive whose
+                    // rollups are missing gets a detached `cass analytics
+                    // rebuild` child instead. Under `cfg(test)` the current
+                    // executable is the test binary, so the spawner refuses
+                    // rather than launching it; the load logic itself stays
+                    // the production path.
+                    let spawn_rebuild = || {
+                        #[cfg(test)]
+                        {
+                            let _ = (&data_dir, &db_path);
+                            Err("detached analytics rebuild is disabled under cfg(test)"
+                                .to_string())
                         }
-                    })
-                }
+                        #[cfg(not(test))]
+                        {
+                            crate::indexer::background_refresh::spawn_detached_analytics_rebuild(
+                                &data_dir, &db_path,
+                            )
+                        }
+                    };
+                    match super::analytics_charts::load_chart_data_with_auto_rebuild(
+                        &db_path,
+                        &filters,
+                        group_by,
+                        spawn_rebuild,
+                    ) {
+                        Ok(data) => CassMsg::AnalyticsChartDataLoaded(Box::new(data)),
+                        Err(error) => CassMsg::AnalyticsChartDataFailed(error),
+                    }
+                })
             }
             CassMsg::AnalyticsChartDataLoaded(data) => {
                 if data.auto_rebuilt {
                     self.status = "Analytics data rebuilt automatically.".to_string();
+                } else if let Some(pid) = data.auto_rebuild_spawned_pid {
+                    self.status = format!(
+                        "Analytics rollups are being rebuilt in the background (pid {pid}); reopen the dashboard in a few minutes."
+                    );
                 } else if let Some(err) = data.auto_rebuild_error.as_deref() {
                     self.status = format!("Automatic analytics rebuild failed: {err}");
                 }
@@ -23387,16 +23361,23 @@ pub fn run_tui_ftui(
             Ok(Some(client)) => {
                 use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
                 use crate::search::model_manager::{
-                    load_hash_semantic_context, load_semantic_context,
+                    load_hash_semantic_context, load_semantic_context_deferred,
                 };
 
                 let client = Arc::new(client);
                 let prefer_hash =
                     EmbedderRegistry::new(&data_dir).best_available().name == HASH_EMBEDDER;
+                // GH #395: this runs on the main thread BEFORE the first frame.
+                // The deferred loader resolves the model's identity and
+                // artifacts now but initializes the in-process MiniLM lazily
+                // on the first semantic query (which the TUI already runs on a
+                // background task), so a large model or slow disk can never
+                // hold the UI at a blank screen. The CLI's daemon-first path
+                // uses the same lazy embedder.
                 let setup = if prefer_hash {
                     load_hash_semantic_context(&data_dir, &model.db_path)
                 } else {
-                    load_semantic_context(&data_dir, &model.db_path)
+                    load_semantic_context_deferred(&data_dir, &model.db_path)
                 };
                 model.semantic_availability = setup.availability.clone();
 
@@ -27478,6 +27459,71 @@ mod tests {
         assert!(
             matches!(cmd, ftui::Cmd::Batch(_)),
             "tick should return batch with SearchRequested when debounce elapsed"
+        );
+    }
+
+    /// GH #452 / PR #451: typing must still preempt ONE slow in-flight search
+    /// (the startup empty-query search), but the next keystroke must not stack
+    /// a third concurrent backend search.
+    #[test]
+    fn debounce_preempts_one_in_flight_search_then_coalesces() {
+        let mut app = CassApp::default();
+        app.search_in_flight = true;
+        app.search_preempted_in_flight = false;
+        app.search_dirty_since = Some(Instant::now() - std::time::Duration::from_millis(100));
+
+        let msgs = extract_msgs(app.update(CassMsg::Tick));
+        assert!(
+            msgs.iter()
+                .any(|msg| matches!(msg, CassMsg::SearchRequested)),
+            "the first keystroke must preempt the slow in-flight search"
+        );
+
+        // Simulate the dispatch the emitted SearchRequested performs: it marks
+        // the new search as one that preempted a running search.
+        app.search_preempted_in_flight = app.search_in_flight;
+        app.search_dirty_since = Some(Instant::now() - std::time::Duration::from_millis(100));
+
+        let msgs = extract_msgs(app.update(CassMsg::Tick));
+        assert!(
+            !msgs
+                .iter()
+                .any(|msg| matches!(msg, CassMsg::SearchRequested)),
+            "a second overlapping search must be coalesced, not stacked"
+        );
+        assert!(
+            app.search_dirty_since.is_some(),
+            "the pending query stays armed so it fires once the backend is idle"
+        );
+
+        // Once the in-flight search finishes, the pending query fires.
+        app.search_in_flight = false;
+        let msgs = extract_msgs(app.update(CassMsg::Tick));
+        assert!(
+            msgs.iter()
+                .any(|msg| matches!(msg, CassMsg::SearchRequested)),
+            "the coalesced query must fire as soon as the backend is idle"
+        );
+    }
+
+    /// The preemption budget is per in-flight search: a dispatch made while
+    /// nothing was running resets it, so the next keystroke may preempt again.
+    #[test]
+    fn search_requested_records_whether_it_preempted_a_running_search() {
+        let mut app = CassApp::default();
+        app.search_in_flight = true;
+        app.search_preempted_in_flight = false;
+        let _ = app.update(CassMsg::SearchRequested);
+        assert!(
+            app.search_preempted_in_flight,
+            "a dispatch made while a search was running is a preemption"
+        );
+
+        app.search_in_flight = false;
+        let _ = app.update(CassMsg::SearchRequested);
+        assert!(
+            !app.search_preempted_in_flight,
+            "a dispatch made while idle resets the preemption budget"
         );
     }
 

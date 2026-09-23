@@ -18,8 +18,7 @@ use anyhow::{Context, Result};
 
 use crate::indexer::{
     LEXICAL_REBUILD_PAGE_SIZE_PUBLIC, LexicalRebuildCheckpoint,
-    lexical_rebuild_page_size_is_compatible, lexical_storage_fingerprint_for_db,
-    load_lexical_rebuild_checkpoint,
+    lexical_rebuild_page_size_is_compatible, load_lexical_rebuild_checkpoint,
 };
 use crate::search::ann_index::hnsw_index_path;
 use crate::search::embedder::Embedder;
@@ -186,7 +185,18 @@ pub(crate) fn clear_index_run_lock_metadata_sidecar(lock_path: &Path) -> Result<
             "syncing cleared index-run lock metadata sidecar {}",
             sidecar_path.display()
         )
-    })
+    })?;
+    drop(sidecar);
+    match std::fs::remove_file(&sidecar_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "removing cleared index-run lock metadata sidecar {}",
+                sidecar_path.display()
+            )
+        }),
+    }
 }
 
 fn read_capped_metadata_from_path(path: &Path, max_len: u64) -> std::io::Result<String> {
@@ -206,7 +216,27 @@ pub(crate) fn windows_lock_conflict(_err: &std::io::Error) -> bool {
     false
 }
 
+/// Pure-read maintenance probe (gh#422): search-triggered refresh decisions
+/// must never write, so this variant is byte-for-byte read-only even for
+/// stale metadata (which it still hides from the caller).
 pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMaintenanceSnapshot {
+    read_search_maintenance_snapshot_inner(data_dir, false)
+}
+
+/// Observation-surface maintenance probe (#176 / bd-k9jb9): status, health,
+/// and TUI polls additionally REAP stale metadata in place (flock-guarded,
+/// best-effort) so subsequent readers observe a clean lock file without
+/// re-doing the staleness dance. Search paths must use the pure variant.
+pub(crate) fn read_search_maintenance_snapshot_reaping(
+    data_dir: &Path,
+) -> SearchMaintenanceSnapshot {
+    read_search_maintenance_snapshot_inner(data_dir, true)
+}
+
+fn read_search_maintenance_snapshot_inner(
+    data_dir: &Path,
+    reap_stale: bool,
+) -> SearchMaintenanceSnapshot {
     // Real index-run.lock files written by `acquire_index_run_lock`
     // have a fixed key=value shape under ~1 KiB. Cap the read at 64 KiB
     // so a corrupted or maliciously-large lock file cannot force us to
@@ -263,19 +293,27 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
         match file.try_lock_shared() {
             Ok(()) => {
                 // A shared lock succeeds only when no writer holds the
-                // exclusive index-run lock. Treat any metadata as stale, but
-                // do not rewrite it here: this function is used by search,
-                // status, health, and TUI observation paths and therefore
-                // must be byte-for-byte read-only.
+                // exclusive index-run lock: the metadata is stale.
                 //
-                // Historically this produced a permanent `orphaned: true`
-                // state that callers (notably the TUI) interpreted as
-                // "rebuild in progress, keep polling" — yielding a tight
-                // CPU-bound loop that only cleared when the user manually
-                // deleted the lock file (see issue #176).
+                // Historically stale metadata produced a permanent
+                // `orphaned: true` state that callers (notably the TUI)
+                // interpreted as "rebuild in progress, keep polling" —
+                // yielding a tight CPU-bound loop that only cleared when the
+                // user manually deleted the lock file (see issue #176).
                 //
+                // On observation surfaces (#176, pinned by bd-k9jb9's e2e
+                // contract) the stale metadata is also reaped IN PLACE —
+                // guarded by the exclusive flock, best-effort — so every
+                // subsequent reader observes a clean file without re-doing
+                // this dance. Pure-read callers (gh#422 search paths) skip
+                // the reap and stay byte-for-byte read-only. On a read-only
+                // filesystem (or a lost lock race) the truncate is skipped;
+                // either way the caller gets the clean default snapshot.
                 let _ = file.unlock();
                 if metadata_present {
+                    if reap_stale {
+                        reap_stale_index_run_lock_metadata(&lock_path, &sidecar_path);
+                    }
                     return SearchMaintenanceSnapshot::default();
                 }
                 false
@@ -287,6 +325,47 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
     };
     snapshot.orphaned = metadata_present && !snapshot.active;
     snapshot
+}
+
+/// #176 / bd-k9jb9: truncate stale `index-run.lock` metadata in place so a
+/// subsequent reader (next `cass status`, next TUI poll) observes a clean
+/// state without re-doing the reaping dance. The truncate happens only while
+/// holding the exclusive flock (concurrent readers/writers cannot race the
+/// reap) and is best-effort: a read-only filesystem or a lost lock race
+/// leaves the bytes untouched — the caller already reports the clean default
+/// snapshot either way. The file itself is truncated, never deleted, to
+/// preserve permissions and avoid create/recreate races with writers. The
+/// metadata sidecar is cleared alongside it, since an empty lock file falls
+/// back to the sidecar on the next read.
+fn reap_stale_index_run_lock_metadata(lock_path: &Path, sidecar_path: &Path) {
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(lock_path) else {
+        return;
+    };
+    if file.try_lock().is_err() {
+        // A writer appeared between our shared probe and now; its metadata
+        // is live again — do not touch it.
+        return;
+    }
+    match file.set_len(0) {
+        Ok(()) => {
+            let _ = file.sync_all();
+            tracing::info!(
+                path = %lock_path.display(),
+                "reaped stale index-run.lock metadata left by a dead owner (#176)"
+            );
+            if sidecar_path.exists() {
+                let _ = std::fs::write(sidecar_path, b"");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %lock_path.display(),
+                error = %err,
+                "failed to reap stale index-run.lock metadata; leaving bytes in place"
+            );
+        }
+    }
+    let _ = file.unlock();
 }
 
 fn parse_search_maintenance_snapshot(
@@ -434,6 +513,16 @@ pub(crate) struct LexicalAssetState {
     pub processed_conversations: Option<u64>,
     pub total_conversations: Option<u64>,
     pub indexed_docs: Option<u64>,
+    /// GH #457: the published generation serves far fewer documents than the
+    /// completed rebuild checkpoint certified for it (see
+    /// [`lexical_generation_hollow_verdict`]). Search still runs against a
+    /// hollow generation and confidently answers "nothing found", so this is
+    /// a rebuild-now condition, never "stale but searchable".
+    pub hollow: bool,
+    /// Live documents in the published lexical generation, from manifest
+    /// metadata alone (`None` when no manifest decodes or the generation
+    /// predates the Quill engine).
+    pub live_docs: Option<u64>,
     pub status_reason: Option<String>,
     pub fingerprint: LexicalFingerprintState,
     pub checkpoint: LexicalCheckpointState,
@@ -1337,13 +1426,28 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
         .with_context(|| format!("loading lexical checkpoint from {}", index_path.display()))?;
     let current_db_fingerprint = if db_available && compute_lexical_fingerprint {
         Some(
-            lexical_storage_fingerprint_for_db(db_path).with_context(|| {
-                format!(
-                    "computing lexical storage fingerprint for {}",
-                    db_path.display()
-                )
-            })?,
+            // Keep the status/opened path on the same identity-keyed cache
+            // used by search. Health intentionally remains skip-open and
+            // serves this sidecar read-only; priming it here lets a status
+            // immediately followed by health agree even when an older
+            // matching checkpoint predates the sidecar.
+            crate::indexer::lexical_storage_fingerprint_for_db_cached(db_path, &index_path)
+                .with_context(|| {
+                    format!(
+                        "computing lexical storage fingerprint for {}",
+                        db_path.display()
+                    )
+                })?,
         )
+    } else if db_available {
+        // GH #353: the skip-open surfaces (health watermark lane, count-less
+        // status) deliberately never open the archive, but they must still
+        // compare the storage fingerprint `search` defers repair on instead
+        // of leaving `matches_current_db_fingerprint` null while reporting
+        // fresh. Serve the identity-keyed sidecar fingerprint — never an
+        // open — and stay honestly null when the sidecar does not describe
+        // the current archive identity.
+        crate::indexer::lexical_storage_fingerprint_for_db_cached_readonly(db_path, &index_path)
     } else {
         None
     };
@@ -1357,6 +1461,7 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
         maintenance,
         checkpoint: checkpoint.as_ref(),
         current_db_fingerprint: current_db_fingerprint.as_deref(),
+        live_docs: crate::search::tantivy::searchable_index_live_doc_count(&index_path),
     }))
 }
 
@@ -1370,6 +1475,98 @@ struct LexicalObservationInput<'a> {
     maintenance: SearchMaintenanceSnapshot,
     checkpoint: Option<&'a LexicalRebuildCheckpoint>,
     current_db_fingerprint: Option<&'a str>,
+    /// Live documents the published generation serves, from manifest metadata
+    /// alone (GH #457); `None` when no manifest decodes.
+    live_docs: Option<u64>,
+}
+
+/// GH #457: floor, as a percentage of the completed checkpoint's
+/// `indexed_docs`, below which the published generation is HOLLOW.
+///
+/// Every rebuild proves `live == indexed_docs` before it certifies its
+/// checkpoint, incremental ingest only adds documents, and an upsert replaces
+/// one live document with one live document, so the served count never
+/// legitimately drops below what the checkpoint certified; `cass forget`
+/// rewrites the checkpoint along with the derived assets. Half is a generous
+/// margin against any bookkeeping skew while still catching the reported
+/// shape (3 live documents against ~1M certified) by orders of magnitude.
+pub(crate) const LEXICAL_HOLLOW_LIVE_DOC_FLOOR_PERCENT: u64 = 50;
+
+/// GH #457: a published lexical generation that serves far fewer documents
+/// than its completed rebuild checkpoint certified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LexicalHollowVerdict {
+    /// `indexed_docs` recorded by the completed checkpoint for this DB.
+    pub expected_docs: u64,
+    /// Documents the published generation currently serves.
+    pub live_docs: u64,
+}
+
+impl LexicalHollowVerdict {
+    /// Share of the certified documents the generation no longer serves.
+    #[must_use]
+    pub(crate) fn missing_percent(&self) -> u64 {
+        if self.expected_docs == 0 {
+            return 0;
+        }
+        let missing = u128::from(self.expected_docs.saturating_sub(self.live_docs));
+        u64::try_from(missing * 100 / u128::from(self.expected_docs)).unwrap_or(100)
+    }
+
+    /// Operator-facing reason naming the gap and the only remedy that works.
+    #[must_use]
+    pub(crate) fn reason(&self) -> String {
+        format!(
+            "lexical index is HOLLOW: the published Quill generation serves {live} live document(s) \
+             but the completed rebuild checkpoint certified {expected} indexed document(s) \
+             ({missing}% missing); search silently answers from a near-empty index. \
+             Run `cass index`: its pre-scan check rebuilds the lexical index from the canonical \
+             database when the live index is sparse (`cass index --full` does the same after a \
+             full rescan)",
+            live = self.live_docs,
+            expected = self.expected_docs,
+            missing = self.missing_percent(),
+        )
+    }
+}
+
+/// GH #457: compare what the published generation serves against what the
+/// completed checkpoint certified. `expected_docs` must already be gated on
+/// a completed checkpoint for the current DB and lexical contract (a
+/// mismatched or incomplete checkpoint is reported by its own signal);
+/// `None` on either side means "no verdict", never "hollow".
+#[must_use]
+pub(crate) fn lexical_generation_hollow_verdict(
+    expected_docs: Option<u64>,
+    live_docs: Option<u64>,
+) -> Option<LexicalHollowVerdict> {
+    let expected_docs = expected_docs.filter(|&docs| docs > 0)?;
+    let live_docs = live_docs?;
+    // u128 so the comparison is exact at every scale (saturating u64 math
+    // would collapse the ratio near the top of the range).
+    let hollow = u128::from(live_docs) * 100
+        < u128::from(expected_docs) * u128::from(LEXICAL_HOLLOW_LIVE_DOC_FLOOR_PERCENT);
+    hollow.then_some(LexicalHollowVerdict {
+        expected_docs,
+        live_docs,
+    })
+}
+
+/// `indexed_docs` certified by a COMPLETED lexical rebuild checkpoint that
+/// describes `db_path` under the current lexical contract; `None` when no
+/// such checkpoint exists (nothing certified means nothing to be hollow
+/// against). Shared by readiness, `doctor` and the post-run indexer guard so
+/// every surface applies the same gate (GH #457).
+pub(crate) fn completed_lexical_checkpoint_indexed_docs(
+    index_path: &Path,
+    db_path: &Path,
+) -> Option<u64> {
+    let checkpoint = load_lexical_rebuild_checkpoint(index_path).ok().flatten()?;
+    let certified = checkpoint.completed
+        && crate::stored_path_identity_matches(&checkpoint.db_path, db_path)
+        && checkpoint.schema_hash == SCHEMA_HASH
+        && lexical_rebuild_page_size_is_compatible(checkpoint.page_size);
+    certified.then_some(checkpoint.indexed_docs as u64)
 }
 
 /// b4uax: the exact operator contract for a legacy Tantivy generation. Names
@@ -1387,6 +1584,7 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         maintenance,
         checkpoint,
         current_db_fingerprint,
+        live_docs,
     } = input;
     let exists = crate::search::tantivy::searchable_index_exists(index_path);
     // b4uax: a Tantivy-era `meta.json` without a Quill `MANIFEST` (or a
@@ -1415,6 +1613,19 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     let checkpoint_db_mismatch = checkpoint_db_matches == Some(false);
     let contract_mismatch = schema_matches == Some(false) || page_size_compatible == Some(false);
     let fingerprint_mismatch = fingerprint_matches == Some(false);
+    // GH #457: only a checkpoint that otherwise certifies this generation for
+    // this DB can be contradicted by the served count; an incomplete, foreign
+    // or contract-mismatched checkpoint already carries its own verdict.
+    let certified_docs = checkpoint
+        .filter(|state| {
+            state.completed
+                && checkpoint_db_matches == Some(true)
+                && schema_matches == Some(true)
+                && page_size_compatible == Some(true)
+        })
+        .map(|state| state.indexed_docs as u64);
+    let hollow_verdict = lexical_generation_hollow_verdict(certified_docs, live_docs);
+    let hollow = hollow_verdict.is_some();
     // F4 (cass tech debt): derive the (legacy) second-resolution clock
     // from `now_ms` rather than the other way around so the comparison
     // against ms-precision `last_progress_at_ms` below is no longer
@@ -1423,25 +1634,22 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     let now_secs: u64 = now_ms.div_euclid(1000).max(0) as u64;
     let age_seconds = last_indexed_at_ms
         .and_then(|ts| (ts > 0).then(|| now_secs.saturating_sub((ts / 1000) as u64)));
-    let age_stale_by_clock = match age_seconds {
+    let age_exceeds_threshold = match age_seconds {
         Some(age) => age > stale_threshold,
         None => true,
     };
-    // A completed lexical generation carries a stronger freshness proof than
-    // the wall-clock age of the legacy DB watermark: it records the exact DB
-    // fingerprint, checkpoint, schema, and document count used for publish.
-    // Once the live DB fingerprint matches that completed checkpoint, age alone
-    // cannot make a content-equivalent generation stale. Scan-ahead and all
-    // structural/fingerprint mismatch checks below still force stale.
-    let completed_checkpoint_matches_current_db = checkpoint.is_some_and(|state| {
-        state.completed
-            && checkpoint_db_matches == Some(true)
-            && schema_matches == Some(true)
-            && page_size_compatible == Some(true)
-            && current_db_fingerprint.is_some()
-            && fingerprint_matches == Some(true)
-    });
-    let age_stale = age_stale_by_clock && !completed_checkpoint_matches_current_db;
+    // GH #452: a checkpoint fingerprint that still matches the live database
+    // means no conversation and no message has been added since the last
+    // successful index (`content-v1:<conversations>:<max_conversation_id>:
+    // <max_message_id>`), so the index is not out of date — only old. Age alone
+    // must not mark it stale and send every ordinary read into a refresh.
+    //
+    // Only genuine age is covered: an index with NO recorded `last_indexed_at`
+    // is unproven rather than old, and stays stale. Every other staleness
+    // signal (contract, engine, checkpoint, fingerprint mismatch) is untouched.
+    let age_stale_covered_by_fingerprint =
+        age_seconds.is_some() && fingerprint_matches == Some(true);
+    let age_stale = age_exceeds_threshold && !age_stale_covered_by_fingerprint;
     let maintenance_targets_current_db = maintenance
         .db_path
         .as_ref()
@@ -1491,7 +1699,8 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
                 || checkpoint_db_mismatch
                 || checkpoint_incomplete
                 || contract_mismatch
-                || fingerprint_mismatch)
+                || fingerprint_mismatch
+                || hollow)
     };
     let fresh = exists && !stale && !rebuilding;
     let status = if stalled {
@@ -1502,6 +1711,8 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         "missing"
     } else if engine_incompatible {
         "legacy_engine"
+    } else if hollow {
+        "hollow"
     } else if stale {
         "stale"
     } else {
@@ -1518,6 +1729,8 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         Some("lexical index metadata missing".to_string())
     } else if engine_incompatible {
         Some(LEGACY_ENGINE_STATUS_REASON.to_string())
+    } else if let Some(verdict) = hollow_verdict {
+        Some(verdict.reason())
     } else if checkpoint_db_mismatch {
         Some("lexical rebuild checkpoint points at a different database".to_string())
     } else if contract_mismatch {
@@ -1586,6 +1799,8 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         indexed_docs: checkpoint
             .filter(|_| checkpoint_progress_usable)
             .map(|state| state.indexed_docs as u64),
+        hollow,
+        live_docs,
         status_reason,
         fingerprint: LexicalFingerprintState {
             current_db_fingerprint: current_db_fingerprint.map(ToOwned::to_owned),
@@ -2374,7 +2589,7 @@ mod tests {
         assert_eq!(
             std::fs::read(&lock_path).expect("read unchanged lock metadata"),
             stale_metadata.as_bytes(),
-            "an observational lock probe must preserve every byte"
+            "the PURE probe (gh#422 search paths) must preserve every byte"
         );
 
         // Second read also returns a clean default snapshot.
@@ -2384,8 +2599,30 @@ mod tests {
         assert_eq!(
             std::fs::read(&lock_path).expect("read lock metadata after second probe"),
             stale_metadata.as_bytes(),
-            "repeated observation must remain byte-for-byte read-only"
+            "repeated pure observation must remain byte-for-byte read-only"
         );
+
+        // #176 / bd-k9jb9 contract: the REAPING probe (status/health/TUI
+        // observation surfaces) truncates the stale metadata in place —
+        // never deleting the file — so subsequent readers observe a clean
+        // lock without re-doing the staleness dance.
+        let reaped = read_search_maintenance_snapshot_reaping(temp.path());
+        assert!(!reaped.active);
+        assert!(!reaped.orphaned);
+        assert_eq!(
+            std::fs::metadata(&lock_path)
+                .expect("stat lock after reaping probe")
+                .len(),
+            0,
+            "stale lock metadata must be truncated in place by the reaping probe"
+        );
+        assert!(
+            lock_path.exists(),
+            "the lock file must be truncated, never deleted"
+        );
+        let after_reap = read_search_maintenance_snapshot_reaping(temp.path());
+        assert!(!after_reap.active);
+        assert!(!after_reap.orphaned);
     }
 
     #[test]
@@ -2472,6 +2709,164 @@ mod tests {
         }
     }
 
+    fn hollow_probe_checkpoint(db_path: &Path, indexed_docs: usize) -> LexicalRebuildCheckpoint {
+        LexicalRebuildCheckpoint {
+            db_path: db_path.display().to_string(),
+            total_conversations: 10,
+            storage_fingerprint: "content-v1:10:10:100".to_string(),
+            committed_offset: 10,
+            committed_conversation_id: Some(10),
+            processed_conversations: 10,
+            indexed_docs,
+            schema_hash: SCHEMA_HASH.to_string(),
+            page_size: LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
+            completed: true,
+            updated_at_ms: 1_733_000_000_000,
+        }
+    }
+
+    fn hollow_probe_state(
+        index_path: &Path,
+        db_path: &Path,
+        checkpoint: Option<&LexicalRebuildCheckpoint>,
+        live_docs: Option<u64>,
+    ) -> LexicalAssetState {
+        lexical_state_from_observations(LexicalObservationInput {
+            index_path,
+            db_path,
+            stale_threshold: 3600,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_ms: 1_733_000_001_000,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            checkpoint,
+            current_db_fingerprint: Some("content-v1:10:10:100"),
+            live_docs,
+        })
+    }
+
+    /// GH #457: a completed, fingerprint-matching checkpoint that certified
+    /// 1,000 documents over a generation serving 3 is HOLLOW — its own
+    /// status, stale, not fresh, and the reason names the only remedy.
+    #[test]
+    fn lexical_state_reports_a_hollow_generation_as_its_own_status() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v9-quill");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+        let checkpoint = hollow_probe_checkpoint(&db_path, 1_000);
+
+        let state = hollow_probe_state(&index_path, &db_path, Some(&checkpoint), Some(3));
+        assert!(state.hollow);
+        assert_eq!(state.live_docs, Some(3));
+        assert_eq!(state.status, "hollow");
+        assert!(state.stale);
+        assert!(!state.fresh);
+        assert_eq!(
+            state.fingerprint.matches_current_db_fingerprint,
+            Some(true),
+            "hollowness is orthogonal to the content fingerprint"
+        );
+        let reason = state.status_reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("HOLLOW"), "{reason}");
+        assert!(reason.contains("3 live document"), "{reason}");
+        assert!(reason.contains("1000 indexed document"), "{reason}");
+        assert!(reason.contains("99% missing"), "{reason}");
+        assert!(reason.contains("Run `cass index`"), "{reason}");
+
+        // Exactly the floor is not hollow; one below it is.
+        let at_floor = hollow_probe_state(&index_path, &db_path, Some(&checkpoint), Some(500));
+        assert!(!at_floor.hollow, "50% of the certified count is the floor");
+        assert_eq!(at_floor.status, "ready");
+        let below_floor = hollow_probe_state(&index_path, &db_path, Some(&checkpoint), Some(499));
+        assert!(below_floor.hollow);
+
+        // Growth after the rebuild (incremental ingest) is never hollow.
+        let grown = hollow_probe_state(&index_path, &db_path, Some(&checkpoint), Some(5_000));
+        assert!(!grown.hollow);
+        assert_eq!(grown.status, "ready");
+    }
+
+    /// GH #457: without a certifying checkpoint, or without a decodable
+    /// manifest, there is no verdict — an incomplete checkpoint keeps its
+    /// own `partial`/incomplete signal and never doubles as hollow.
+    #[test]
+    fn lexical_state_never_calls_an_uncertified_generation_hollow() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v9-quill");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+
+        let no_checkpoint = hollow_probe_state(&index_path, &db_path, None, Some(0));
+        assert!(!no_checkpoint.hollow);
+        assert_ne!(no_checkpoint.status, "hollow");
+
+        let mut incomplete = hollow_probe_checkpoint(&db_path, 1_000);
+        incomplete.completed = false;
+        let partial = hollow_probe_state(&index_path, &db_path, Some(&incomplete), Some(3));
+        assert!(
+            !partial.hollow,
+            "an incomplete checkpoint is partial, not hollow"
+        );
+        assert_eq!(partial.status, "stale");
+        assert!(
+            partial
+                .status_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("incomplete")
+        );
+
+        let mut foreign = hollow_probe_checkpoint(&db_path, 1_000);
+        foreign.db_path = temp.path().join("other.db").display().to_string();
+        let foreign_state = hollow_probe_state(&index_path, &db_path, Some(&foreign), Some(3));
+        assert!(
+            !foreign_state.hollow,
+            "a foreign checkpoint certifies nothing here"
+        );
+
+        let unreadable = hollow_probe_state(
+            &index_path,
+            &db_path,
+            Some(&hollow_probe_checkpoint(&db_path, 1_000)),
+            None,
+        );
+        assert!(!unreadable.hollow, "no manifest means no verdict");
+        assert_eq!(unreadable.status, "ready");
+
+        let zero_certified = hollow_probe_state(
+            &index_path,
+            &db_path,
+            Some(&hollow_probe_checkpoint(&db_path, 0)),
+            Some(0),
+        );
+        assert!(!zero_certified.hollow, "an empty archive certifies nothing");
+    }
+
+    #[test]
+    fn hollow_verdict_math_is_exact_at_the_floor_and_saturates() {
+        assert_eq!(lexical_generation_hollow_verdict(None, Some(0)), None);
+        assert_eq!(lexical_generation_hollow_verdict(Some(0), Some(0)), None);
+        assert_eq!(lexical_generation_hollow_verdict(Some(10), None), None);
+        assert_eq!(lexical_generation_hollow_verdict(Some(10), Some(5)), None);
+        let verdict = lexical_generation_hollow_verdict(Some(10), Some(4)).expect("hollow");
+        assert_eq!(verdict.missing_percent(), 60);
+        let huge = lexical_generation_hollow_verdict(Some(u64::MAX), Some(1)).expect("hollow");
+        assert_eq!(huge.missing_percent(), 99);
+        assert!(huge.reason().contains("Run `cass index`"));
+    }
+
     /// b4uax (gh#382): a Tantivy-era `meta.json` without a Quill MANIFEST is
     /// an existing-but-unreadable generation: not fresh, not "ready", and the
     /// reason names the exact rebuild command.
@@ -2493,6 +2888,7 @@ mod tests {
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint: None,
             current_db_fingerprint: None,
+            live_docs: None,
         });
         assert!(state.exists, "a legacy generation still counts as existing");
         assert!(state.engine_incompatible);
@@ -2542,6 +2938,7 @@ mod tests {
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: Some("content-v1:10:20:30"),
+            live_docs: None,
         });
 
         assert_eq!(state.status, "ready");
@@ -2591,6 +2988,7 @@ mod tests {
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: Some("after"),
+            live_docs: None,
         });
 
         assert_eq!(state.status, "stale");
@@ -2608,6 +3006,116 @@ mod tests {
         assert_eq!(state.processed_conversations, None);
         assert_eq!(state.total_conversations, None);
         assert_eq!(state.indexed_docs, None);
+    }
+
+    /// GH #452: an index whose checkpoint fingerprint still matches the live
+    /// database has nothing new to ingest, so an old `last_indexed_at` alone
+    /// must report `ready` — not `stale`, which sends every ordinary read into
+    /// an archive-scale refresh.
+    #[test]
+    fn lexical_state_treats_age_as_covered_by_a_matching_fingerprint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v4");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+
+        let checkpoint = LexicalRebuildCheckpoint {
+            db_path: db_path.display().to_string(),
+            total_conversations: 10,
+            storage_fingerprint: "content-v1:10:10:100".to_string(),
+            committed_offset: 10,
+            committed_conversation_id: Some(10),
+            processed_conversations: 10,
+            indexed_docs: 100,
+            schema_hash: SCHEMA_HASH.to_string(),
+            page_size: LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
+            completed: true,
+            updated_at_ms: 1_733_000_000_000,
+        };
+        // Indexed long ago (well past the 60 s threshold) but the database has
+        // not gained a conversation or a message since.
+        let input = |current_db_fingerprint: Option<&'static str>| LexicalObservationInput {
+            index_path: &index_path,
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_ms: 1_733_000_600_000,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            checkpoint: Some(&checkpoint),
+            current_db_fingerprint,
+            live_docs: None,
+        };
+
+        let covered = lexical_state_from_observations(input(Some("content-v1:10:10:100")));
+        assert_eq!(
+            covered.status, "ready",
+            "a matching fingerprint covers pure age-staleness"
+        );
+        assert_eq!(covered.status_reason, None);
+
+        // New content since the checkpoint still reports stale.
+        let changed = lexical_state_from_observations(input(Some("content-v1:11:11:120")));
+        assert_eq!(changed.status, "stale");
+
+        // No fingerprint probe at all: age still decides, unchanged.
+        let unprobed = lexical_state_from_observations(input(None));
+        assert_eq!(unprobed.status, "stale");
+        assert!(
+            unprobed
+                .status_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("older than the stale threshold"))
+        );
+    }
+
+    /// An index with a matching fingerprint but NO recorded `last_indexed_at`
+    /// is unproven, not merely old: it stays stale.
+    #[test]
+    fn lexical_state_keeps_unknown_age_stale_even_with_a_matching_fingerprint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v4");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+
+        let checkpoint = LexicalRebuildCheckpoint {
+            db_path: db_path.display().to_string(),
+            total_conversations: 10,
+            storage_fingerprint: "content-v1:10:10:100".to_string(),
+            committed_offset: 10,
+            committed_conversation_id: Some(10),
+            processed_conversations: 10,
+            indexed_docs: 100,
+            schema_hash: SCHEMA_HASH.to_string(),
+            page_size: LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
+            completed: true,
+            updated_at_ms: 1_733_000_000_000,
+        };
+
+        let state = lexical_state_from_observations(LexicalObservationInput {
+            index_path: &index_path,
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: None,
+            now_ms: 1_733_000_600_000,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            checkpoint: Some(&checkpoint),
+            current_db_fingerprint: Some("content-v1:10:10:100"),
+            live_docs: None,
+        });
+
+        assert_eq!(state.status, "stale");
     }
 
     #[test]
@@ -2648,6 +3156,7 @@ mod tests {
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: None,
+            live_docs: None,
         });
 
         assert_eq!(state.status, "stale");
@@ -2684,6 +3193,7 @@ mod tests {
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint: None,
             current_db_fingerprint: None,
+            live_docs: None,
         });
 
         assert_eq!(state.status, "missing");
@@ -2744,6 +3254,7 @@ mod tests {
             },
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: Some("after"),
+            live_docs: None,
         });
 
         assert_eq!(state.status, "building");
@@ -2797,6 +3308,7 @@ mod tests {
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: Some("before"),
+            live_docs: None,
         });
 
         assert_eq!(state.status, "stale");
@@ -2858,6 +3370,7 @@ mod tests {
             },
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: Some("after"),
+            live_docs: None,
         });
 
         assert_eq!(state.status, "building");
@@ -2914,6 +3427,7 @@ mod tests {
             },
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: Some("after"),
+            live_docs: None,
         });
 
         assert_eq!(state.status, "stale");
@@ -2970,6 +3484,7 @@ mod tests {
             },
             checkpoint: None,
             current_db_fingerprint: None,
+            live_docs: None,
         });
 
         assert_eq!(state.status, "ready");
@@ -3029,6 +3544,7 @@ mod tests {
             },
             checkpoint: None,
             current_db_fingerprint: None,
+            live_docs: None,
         });
 
         assert!(state.rebuilding, "active rebuild lock must still register");
@@ -3102,6 +3618,7 @@ mod tests {
             },
             checkpoint: None,
             current_db_fingerprint: None,
+            live_docs: None,
         });
 
         assert!(state.rebuilding);
@@ -3152,6 +3669,7 @@ mod tests {
             },
             checkpoint: None,
             current_db_fingerprint: None,
+            live_docs: None,
         });
 
         assert!(state.rebuilding);
@@ -3210,6 +3728,7 @@ mod tests {
             },
             checkpoint: None,
             current_db_fingerprint: None,
+            live_docs: None,
         });
 
         let age = state

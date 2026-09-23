@@ -1,5 +1,6 @@
 pub mod background_refresh;
 pub(crate) mod lexical_generation;
+pub mod lexical_reconcile;
 pub(crate) mod memoization;
 pub(crate) mod parallel_wal_shadow;
 pub mod quarantine;
@@ -22,12 +23,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Seek, Write};
+use std::io::{BufWriter, Read, Seek, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -51,16 +51,17 @@ use tempfile::Builder as TempDirBuilder;
 use crate::connector_ingest_diagnostics::{
     ConnectorIngestDiagnostic, ConnectorIngestReport, ConnectorIngestRun, ProviderIngestSummary,
 };
-use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
 use crate::connectors::{
     Connector, ScanRoot, aider::AiderConnector, amp::AmpConnector,
     antigravity::AntigravityConnector, chatgpt::ChatGptConnector, claude_code::ClaudeCodeConnector,
     clawdbot::ClawdbotConnector, cline::ClineConnector, codex::CodexConnector,
     copilot::CopilotConnector, copilot_cli::CopilotCliConnector, cursor::CursorConnector,
     factory::FactoryConnector, gemini::GeminiConnector, grok::GrokConnector, kimi::KimiConnector,
-    omp::OmpConnector, openclaw::OpenClawConnector, opencode::OpenCodeConnector,
-    pi_agent::PiAgentConnector, qwen::QwenConnector, vibe::VibeConnector,
+    muse::MuseConnector, omp::OmpConnector, openclaw::OpenClawConnector,
+    opencode::OpenCodeConnector, pi_agent::PiAgentConnector, qwen::QwenConnector,
+    vibe::VibeConnector,
 };
+use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
 use crate::model::conversation_packet::{
     CONVERSATION_PACKET_VERSION, ConversationPacket, ConversationPacketHashes,
     ConversationPacketProvenance, ConversationPacketSinkProjections,
@@ -73,6 +74,7 @@ use crate::search::tantivy::{
 use crate::search::vector_index::{
     ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER, vector_index_path,
 };
+use wait_timeout::ChildExt;
 
 use crate::sources::config::{Platform, SourcesConfig};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceKind};
@@ -137,6 +139,7 @@ enum ActiveSessionSourceReason {
 struct ActiveSessionSourceFilter {
     writable_file_ids: HashSet<SourceFileId>,
     recent_write_window: Option<Duration>,
+    deferred_sources: Mutex<BTreeSet<PathBuf>>,
 }
 
 impl ActiveSessionSourceFilter {
@@ -144,6 +147,7 @@ impl ActiveSessionSourceFilter {
         Self {
             writable_file_ids: collect_writable_open_session_file_ids(),
             recent_write_window: active_session_recent_write_window(enable_recent_write_window),
+            deferred_sources: Mutex::default(),
         }
     }
 
@@ -152,7 +156,17 @@ impl ActiveSessionSourceFilter {
         Self {
             writable_file_ids: HashSet::new(),
             recent_write_window,
+            deferred_sources: Mutex::default(),
         }
+    }
+
+    fn take_deferred_sources(&self) -> BTreeSet<PathBuf> {
+        std::mem::take(
+            &mut *self
+                .deferred_sources
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        )
     }
 
     fn active_writer_reason(&self, path: &Path) -> Option<ActiveSessionSourceReason> {
@@ -249,6 +263,11 @@ fn should_skip_active_session_source(
         return false;
     };
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
+    active_source_filter
+        .deferred_sources
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(source_path.to_path_buf());
     tracing::info!(
         source_path = %source_path.display(),
         ?reason,
@@ -466,6 +485,9 @@ mod linux_publish_swap {
     /// underlying filesystem doesn't support `RENAME_EXCHANGE`).
     pub const EINVAL: i32 = 22;
 
+    // SAFETY: a raw libc symbol declaration; the only caller is
+    // `atomic_exchange_paths`, which documents its argument invariants.
+    #[allow(unsafe_code)]
     unsafe extern "C" {
         pub fn renameat2(
             olddirfd: c_int,
@@ -981,12 +1003,15 @@ struct NonWatchIngestOutcome {
     lexical_update_deferred: bool,
     scanned_connectors: BTreeSet<String>,
     scan_had_errors: bool,
+    deferred_sources: BTreeSet<PathBuf>,
 }
 
 impl NonWatchIngestOutcome {
     fn accumulate(self, other: Self) -> Self {
         let mut scanned_connectors = self.scanned_connectors;
         scanned_connectors.extend(other.scanned_connectors);
+        let mut deferred_sources = self.deferred_sources;
+        deferred_sources.extend(other.deferred_sources);
         Self {
             canonical_mutations: self
                 .canonical_mutations
@@ -997,6 +1022,7 @@ impl NonWatchIngestOutcome {
             lexical_update_deferred: self.lexical_update_deferred || other.lexical_update_deferred,
             scanned_connectors,
             scan_had_errors: self.scan_had_errors || other.scan_had_errors,
+            deferred_sources,
         }
     }
 }
@@ -1076,6 +1102,8 @@ pub struct IndexingProgress {
     pub discovered_agent_names: Mutex<Vec<String>>,
     /// Last error message from background indexer, if any
     pub last_error: Mutex<Option<String>>,
+    /// Final WAL checkpoint result for the current index invocation.
+    pub(crate) final_wal_checkpoint: Mutex<Option<FinalWalCheckpointReport>>,
     /// Structured stats for JSON output (T7.4)
     pub stats: Mutex<IndexingStats>,
     /// Live authoritative rebuild queue depth for same-process progress output.
@@ -1215,9 +1243,16 @@ impl IndexingProgress {
     }
 
     /// Human-readable label for the current phase.
-    /// See the `INDEX_PHASE_*` constants for the canonical phase taxonomy.
+    /// See the INDEX_PHASE_* constants for the canonical phase taxonomy.
     pub fn phase_label(&self) -> &'static str {
         Self::phase_label_for(self.phase.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn final_wal_checkpoint_report(&self) -> Option<FinalWalCheckpointReport> {
+        self.final_wal_checkpoint
+            .lock()
+            .map(|report| report.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
     }
 
     /// True when the authoritative lexical rebuild pipeline holds no
@@ -2226,6 +2261,36 @@ fn producer_state_transition_is_work(previous: &str, current: &str) -> bool {
     previous != current && !(previous.starts_with("waiting_") && current.starts_with("waiting_"))
 }
 
+/// GH #446: the stall watchdog's liveness signal, shaped for the Quill sink
+/// (`quill_bridge::EngineLivenessProbe`). `None` when the run has no progress
+/// tracker, in which case the sink stays silent as before.
+fn lexical_index_heartbeat(
+    progress: Option<&Arc<IndexingProgress>>,
+) -> Option<crate::search::quill_bridge::EngineHeartbeat> {
+    progress.map(|progress| {
+        let progress = Arc::clone(progress);
+        Arc::new(move || progress.tick_activity()) as crate::search::quill_bridge::EngineHeartbeat
+    })
+}
+
+fn install_lexical_index_heartbeat(
+    t_index: &mut TantivyIndex,
+    progress: Option<&Arc<IndexingProgress>>,
+) {
+    t_index.set_heartbeat(lexical_index_heartbeat(progress));
+}
+
+/// Open the live lexical index with the stall watchdog's liveness signal
+/// already routed into its sink (GH #446).
+fn open_lexical_index_with_heartbeat(
+    index_path: &Path,
+    progress: Option<&Arc<IndexingProgress>>,
+) -> Result<TantivyIndex> {
+    let mut t_index = TantivyIndex::open_or_create(index_path)?;
+    install_lexical_index_heartbeat(&mut t_index, progress);
+    Ok(t_index)
+}
+
 /// #366: true when the pipeline runtime snapshot moved on a field that only
 /// changes with forward progress — pages flowing, prep/build/merge jobs
 /// starting or finishing, the producer moving between park sites. Pure wait
@@ -2633,10 +2698,13 @@ fn nonresumable_pending_lexical_rebuild_status_without_fingerprint(
     db_path: &Path,
     total_conversations: usize,
 ) -> Result<Option<MatchingLexicalRebuildStateStatus>> {
-    let Some(state) = nonresumable_pending_lexical_rebuild_state_for_db(index_path, db_path)? else {
+    let Some(state) = nonresumable_pending_lexical_rebuild_state_for_db(index_path, db_path)?
+    else {
         return Ok(None);
     };
-    if state.db.total_conversations != total_conversations {
+    if state.effective_execution_mode() != LexicalRebuildExecutionMode::CanonicalMetadataRepair
+        && state.db.total_conversations != total_conversations
+    {
         return Ok(None);
     }
 
@@ -2682,7 +2750,8 @@ fn nonresumable_pending_lexical_rebuild_status_from_readonly_db(
     index_path: &Path,
     db_path: &Path,
 ) -> Result<Option<(MatchingLexicalRebuildStateStatus, usize)>> {
-    let Some(state) = nonresumable_pending_lexical_rebuild_state_for_db(index_path, db_path)? else {
+    let Some(state) = nonresumable_pending_lexical_rebuild_state_for_db(index_path, db_path)?
+    else {
         return Ok(None);
     };
     confirm_nonresumable_pending_lexical_rebuild_state_from_readonly_db(&state, db_path)
@@ -2702,7 +2771,9 @@ fn confirm_nonresumable_pending_lexical_rebuild_state_from_readonly_db(
     let total_conversations = count_total_conversations_exact(&storage)?;
     storage.close_best_effort_in_place();
 
-    if state.db.total_conversations != total_conversations {
+    if state.effective_execution_mode() != LexicalRebuildExecutionMode::CanonicalMetadataRepair
+        && state.db.total_conversations != total_conversations
+    {
         return Ok(None);
     }
     Ok(Some((
@@ -2712,6 +2783,43 @@ fn confirm_nonresumable_pending_lexical_rebuild_state_from_readonly_db(
         },
         total_conversations,
     )))
+}
+
+/// Runs under the index writer lock, before spawning readonly rebuild workers.
+/// Only the optional fallback shadow and its repair markers may change here;
+/// canonical conversations and messages remain the rebuild authority.
+fn preflight_fts_shadow_before_lexical_readers(db_path: &Path) -> Result<()> {
+    let storage = FrankenStorage::open_deferred_fts5_for_repair(db_path)
+        .with_context(|| format!("opening deferred FTS5 preflight for {}", db_path.display()))?;
+    let result = (|| -> Result<()> {
+        if let crate::storage::sqlite::FtsShadowViability::NotViable {
+            corpus_messages,
+            bound_messages,
+        } = storage.fts_shadow_viability()?
+        {
+            let detail = crate::storage::sqlite::fts_shadow_not_viable_detail(
+                corpus_messages,
+                bound_messages,
+            );
+            tracing::warn!(
+                db_path = %db_path.display(),
+                corpus_messages,
+                bound_messages,
+                "dropping oversized fallback FTS shadow before lexical readers (GH #413); canonical rows and Quill search are preserved"
+            );
+            storage.drop_fts_shadow_as_not_viable(&detail)?;
+        }
+        Ok(())
+    })();
+    let close = storage
+        .close_without_checkpoint()
+        .with_context(|| format!("closing deferred FTS5 preflight for {}", db_path.display()));
+    if result.is_err()
+        && let Err(error) = &close
+    {
+        tracing::warn!(%error, "FTS shadow preflight also failed to close");
+    }
+    result.and(close)
 }
 
 fn should_try_readonly_nonresumable_lexical_resume(opts: &IndexOptions) -> bool {
@@ -2948,6 +3056,27 @@ fn should_skip_noop_final_lexical_checkpoint_refresh(
         // refresh when the checkpoint file still exists at run end; if it went
         // missing mid-run, fall through and re-persist it.
         && completed_checkpoint_present_at_run_end
+}
+
+/// GH #457 follow-on: must this run re-derive its exact canonical totals and
+/// re-persist the lexical checkpoint after a pre-scan authoritative repair?
+///
+/// The pre-scan repair (choose_incremental_canonical_lexical_repair_plan)
+/// rebuilds the lexical index from the authoritative database and persists an
+/// exact completed checkpoint, and the run then continues into the incremental
+/// source scan. That ordering is unique to this path: the canonical-only full
+/// rebuild performs no scan, and the post-scan rebuilds run after ingest. So
+/// the checkpoint written by the repair is the only one a run can invalidate
+/// itself, and only when the follow-up scan actually ingested canonical rows,
+/// which is what moves the COUNT/MAX(id) content fingerprint it carries.
+///
+/// No canonical mutation means the fingerprint the rebuild certified is still
+/// exactly the database's, and the cheaper skip stays correct.
+fn should_redrive_final_lexical_checkpoint_refresh_after_pre_scan_repair(
+    exact_completed_checkpoint_predates_scan: bool,
+    scan_canonical_mutations: CanonicalMutationCounts,
+) -> bool {
+    exact_completed_checkpoint_predates_scan && scan_canonical_mutations.changed()
 }
 
 fn should_skip_post_full_scan_authoritative_rebuild(
@@ -3665,6 +3794,7 @@ const WATCH_STARTUP_SUB_PHASE_TAXONOMY: &[&str] = &[
     // Retired by GH #413's count-free authoritative restart. Keep the slot so
     // the stable IDs of any future appended phases cannot reuse it.
     "watch_startup:count_nonresumable_checkpoint_conversations",
+    "watch_startup:fts_shadow_viability",
 ];
 
 /// Lookup the taxonomy step index for a sub-phase string. Returns
@@ -3676,6 +3806,22 @@ fn watch_startup_step_idx(sub_phase: &str) -> Option<u8> {
         .iter()
         .position(|s| *s == sub_phase)
         .and_then(|i| u8::try_from(i).ok())
+}
+
+/// Should `run_index` write `sub_phase` to the lock file's `phase=` line
+/// under `mode`?
+///
+/// Always. The preflight steps run in the same order in every index mode,
+/// and a breadcrumb that is written for one step and then never advanced is
+/// a lie: GH #443 reported a plain incremental run "stalled in
+/// `classify_nonresumable_checkpoint`" (a sidecar-only read that returns in
+/// milliseconds) when the process was actually wedged in the writable
+/// frankensqlite open that follows it. `cass status`, the `stall_detected`
+/// diagnostics and the operator all key on this string, so it must name the
+/// step that is running now. The per-step abort watchdog is a separate
+/// decision (`timeout_enforced` in the macro) and stays watch-startup-only.
+const fn preflight_breadcrumb_visible(_mode: SearchMaintenanceMode, _sub_phase: &str) -> bool {
+    true
 }
 
 /// True if the operator has set `CASS_SKIP_PREFLIGHT_<NAME>=1` for the
@@ -4884,6 +5030,7 @@ fn build_lexical_rebuild_shard_index(
             batch,
             lexical_rebuild_worker_pool,
             None,
+            None,
         )?
         .docs,
     )
@@ -4894,6 +5041,7 @@ fn build_lexical_rebuild_shard_index_summary_with_writer_parallelism(
     batch: &[LexicalRebuildConversationPacket],
     lexical_rebuild_worker_pool: Option<&ThreadPool>,
     writer_parallelism: Option<usize>,
+    heartbeat: Option<crate::search::quill_bridge::EngineHeartbeat>,
 ) -> Result<SearchableIndexSummary> {
     let mut shard_index = if let Some(writer_parallelism) = writer_parallelism {
         TantivyIndex::open_or_create_with_writer_parallelism(shard_index_path, writer_parallelism)
@@ -4906,6 +5054,9 @@ fn build_lexical_rebuild_shard_index_summary_with_writer_parallelism(
             shard_index_path.display()
         )
     })?;
+    // GH #446: a single giant shard build is minutes of silent Quill work
+    // between the pipeline counter changes the watchdog can see.
+    shard_index.set_heartbeat(heartbeat);
     shard_index.configure_bulk_load_merge_policy();
     let prepared_docs =
         lexical_rebuild_prepare_prebuilt_doc_refs(batch, lexical_rebuild_worker_pool);
@@ -5076,6 +5227,7 @@ fn spawn_lexical_rebuild_shard_builder_workers(
     tx: Sender<LexicalRebuildShardBuildMessage>,
     flow_limiter: Arc<StreamingByteLimiter>,
     lexical_rebuild_worker_pool: Option<Arc<ThreadPool>>,
+    heartbeat: Option<crate::search::quill_bridge::EngineHeartbeat>,
 ) -> Vec<JoinHandle<()>> {
     let tracing_dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
     (0..worker_count.max(1))
@@ -5084,6 +5236,7 @@ fn spawn_lexical_rebuild_shard_builder_workers(
             let tx = tx.clone();
             let flow_limiter = Arc::clone(&flow_limiter);
             let lexical_rebuild_worker_pool = lexical_rebuild_worker_pool.clone();
+            let heartbeat = heartbeat.clone();
             let tracing_dispatch = tracing_dispatch.clone();
             thread::spawn(move || {
                 tracing::dispatcher::with_default(&tracing_dispatch, || {
@@ -5113,6 +5266,7 @@ fn spawn_lexical_rebuild_shard_builder_workers(
                                     &work.packets,
                                     lexical_rebuild_worker_pool.as_deref(),
                                     Some(work.writer_parallelism),
+                                    heartbeat.clone(),
                                 )
                             },
                         )) {
@@ -6162,6 +6316,16 @@ fn commit_lexical_rebuild_progress(
         profile.commit_count = profile.commit_count.saturating_add(1);
         profile.commit_duration += started.elapsed();
     }
+    // GH #440 test hook: the engine commit above is the moment the published
+    // authority moves ahead of the durable checkpoint (written below). A
+    // process killed here leaves exactly the state #440 reported — a staging
+    // MANIFEST several conversations ahead of `.lexical-rebuild-state.json` —
+    // and the next plain `cass index` must resume through it, not exit 9.
+    maybe_pause_lexical_rebuild_after_commit_for_kill(
+        state_path,
+        rebuild_state.indexed_docs,
+        indexed_docs,
+    )?;
     let meta_fingerprint_started = perf_profile.as_ref().map(|_| Instant::now());
     let meta_fingerprint = index_meta_fingerprint(content_path)?;
     if let (Some(profile), Some(started)) = (perf_profile.as_mut(), meta_fingerprint_started) {
@@ -6427,17 +6591,21 @@ enum LexicalRebuildExecutionMode {
     #[default]
     SharedWriter,
     StagedShardBuild,
+    /// Canonical workspace metadata is changing; all existing documents need
+    /// rehydration even though conversation/message counts may stay identical.
+    CanonicalMetadataRepair,
 }
 
 impl LexicalRebuildExecutionMode {
     fn requires_restart_from_zero_on_resume(self) -> bool {
-        matches!(self, Self::StagedShardBuild)
+        matches!(self, Self::StagedShardBuild | Self::CanonicalMetadataRepair)
     }
 
     fn as_str(self) -> &'static str {
         match self {
             Self::SharedWriter => "shared_writer",
             Self::StagedShardBuild => "staged_shard_build",
+            Self::CanonicalMetadataRepair => "canonical_metadata_repair",
         }
     }
 }
@@ -6489,7 +6657,14 @@ impl LexicalRebuildState {
     }
 
     fn matches_run(&self, db: &LexicalRebuildDbState, _page_size: i64) -> bool {
-        let db_matches = if self.db.storage_fingerprint.starts_with("content-v1:")
+        let db_matches = if self.is_incomplete()
+            && self.effective_execution_mode()
+                == LexicalRebuildExecutionMode::CanonicalMetadataRepair
+        {
+            // This pre-mutation marker deliberately survives additional inserts
+            // in the same interrupted batch. It never authorizes cursor reuse.
+            lexical_rebuild_db_paths_match(&self.db.db_path, &db.db_path)
+        } else if self.db.storage_fingerprint.starts_with("content-v1:")
             && db.storage_fingerprint.starts_with("content-v1:")
         {
             lexical_rebuild_db_state_matches(&self.db, db)
@@ -7562,13 +7737,18 @@ struct LexicalRebuildResponsivenessController {
     reason: String,
     clear_samples: usize,
     last_transition_at: Instant,
+    /// GH #445: pressure demotions in this run. Each one doubles the restore
+    /// hold (capped) so a host with no load telemetry, where saturation alone
+    /// can demote, cannot flap between budgets every few seconds.
+    pressure_demotions: u32,
     last_observed_producer_budget_wait_count: usize,
     last_observed_producer_handoff_wait_count: usize,
 }
 
 impl LexicalRebuildResponsivenessController {
     const INFLIGHT_HIGH_WATERMARK_PERCENT: usize = 90;
-    const INFLIGHT_LOW_WATERMARK_PERCENT: usize = 50;
+    /// Upper bound on the restore-hold doubling (2^3 = 8x the base hold).
+    const MAX_RESTORE_HOLD_DOUBLINGS: u32 = 3;
 
     fn new(
         policy: LexicalRebuildResponsivenessPolicy,
@@ -7614,6 +7794,7 @@ impl LexicalRebuildResponsivenessController {
             reason,
             clear_samples: 0,
             last_transition_at: Instant::now(),
+            pressure_demotions: 0,
             last_observed_producer_budget_wait_count: 0,
             last_observed_producer_handoff_wait_count: 0,
         }
@@ -7697,6 +7878,7 @@ impl LexicalRebuildResponsivenessController {
                 let old_budget = self.current_budget();
                 self.state = LexicalRebuildResponsivenessState::PressureLimited;
                 self.last_transition_at = Instant::now();
+                self.pressure_demotions = self.pressure_demotions.saturating_add(1);
                 let new_budget = self.current_budget();
                 if old_budget != new_budget {
                     return Some(LexicalRebuildBudgetTransition {
@@ -7712,16 +7894,27 @@ impl LexicalRebuildResponsivenessController {
 
         if self.state == LexicalRebuildResponsivenessState::PressureLimited {
             let held_for = self.last_transition_at.elapsed();
-            if held_for < self.restore_hold {
+            let restore_hold = self.restore_hold_after_demotions();
+            if held_for < restore_hold {
                 self.reason = format!(
                     "holding_conservative_budget_after_pressure_demote_for_{}ms",
-                    self.restore_hold.as_millis()
+                    restore_hold.as_millis()
                 );
                 self.clear_samples = 0;
                 return None;
             }
 
-            if self.runtime_is_clear(runtime) {
+            // GH #445: restore judges host pressure, not pipeline emptiness.
+            // The previous gate demanded a fully drained pipeline (no queued
+            // pages, no pending batch, inflight <= 50% of cap) for three
+            // consecutive samples — unreachable while a producer exists to
+            // keep the pipeline full — so one transient demotion pinned the
+            // whole rebuild to the startup budget (66 min in steady mode vs.
+            // crawl/wedge under auto on a 2.4M-doc archive).
+            if let Some(reason) = self.host_pressure_not_clear_reason(runtime) {
+                self.clear_samples = 0;
+                self.reason = reason;
+            } else {
                 self.clear_samples = self.clear_samples.saturating_add(1);
                 if self.clear_samples >= self.restore_clear_samples {
                     let old_budget = self.current_budget();
@@ -7747,15 +7940,27 @@ impl LexicalRebuildResponsivenessController {
                         self.clear_samples, self.restore_clear_samples
                     );
                 }
-            } else {
-                self.clear_samples = 0;
-                self.reason = "pressure_signals_not_yet_clear".to_string();
             }
         } else {
             self.reason = "steady_budget_with_headroom".to_string();
         }
 
         None
+    }
+
+    /// GH #445: the restore hold doubles with every pressure demotion in this
+    /// run (capped at 2^[`Self::MAX_RESTORE_HOLD_DOUBLINGS`]). On hosts without
+    /// load telemetry a saturated pipeline alone can demote, and it saturates
+    /// again as soon as the steady budget returns; the growing hold bounds
+    /// that demote/restore churn without ever pinning the demoted budget.
+    fn restore_hold_after_demotions(&self) -> Duration {
+        let doublings = self
+            .pressure_demotions
+            .saturating_sub(1)
+            .min(Self::MAX_RESTORE_HOLD_DOUBLINGS);
+        self.restore_hold
+            .checked_mul(1u32 << doublings)
+            .unwrap_or(Duration::MAX)
     }
 
     fn observe_new_producer_budget_wait(&mut self, observed_count: usize) -> bool {
@@ -7799,7 +8004,28 @@ impl LexicalRebuildResponsivenessController {
         runtime: &LexicalRebuildPipelineRuntimeSnapshot,
         new_producer_handoff_wait: bool,
     ) -> Option<String> {
-        let current_budget = self.current_budget();
+        if let Some(reason) = self.detect_host_pressure(runtime) {
+            return Some(reason);
+        }
+        // GH #445: queue depth at capacity, inflight bytes near the cap, a
+        // full pending batch, an ordered-barrier backlog, or a producer
+        // handoff wait are the pipeline's bounded backpressure doing its job
+        // — the healthy steady run on the reporting archive sat at 93% of
+        // the inflight cap for an hour. They only mean the HOST is in trouble
+        // when host telemetry says so (or is unavailable, in which case the
+        // pipeline shape is the only signal we have and the old behaviour
+        // stands). Demoting on saturation alone starved the producer while
+        // Quill's accumulation kept growing RSS regardless.
+        if self.host_is_demonstrably_calm(runtime) {
+            return None;
+        }
+        self.detect_pipeline_saturation(runtime, new_producer_handoff_wait)
+    }
+
+    fn detect_host_pressure(
+        &self,
+        runtime: &LexicalRebuildPipelineRuntimeSnapshot,
+    ) -> Option<String> {
         if let (Some(loadavg_1m_milli), Some(high_watermark_1m_milli)) = (
             runtime.host_loadavg_1m_milli,
             self.loadavg_high_watermark_1m_milli,
@@ -7826,6 +8052,71 @@ impl LexicalRebuildResponsivenessController {
                 ));
             }
         }
+        None
+    }
+
+    /// True only when host telemetry positively shows a calm machine: a
+    /// loadavg reading at or below the low watermark AND (when known)
+    /// available memory above the reserve. Missing loadavg telemetry (no
+    /// reading, or no watermark on this platform) is NOT calm — it is
+    /// unknown, and pipeline saturation keeps its say.
+    fn host_is_demonstrably_calm(&self, runtime: &LexicalRebuildPipelineRuntimeSnapshot) -> bool {
+        let loadavg_calm = match (
+            runtime.host_loadavg_1m_milli,
+            self.loadavg_low_watermark_1m_milli,
+        ) {
+            (Some(loadavg_1m_milli), Some(low_watermark_1m_milli)) => {
+                loadavg_1m_milli <= low_watermark_1m_milli
+            }
+            _ => false,
+        };
+        loadavg_calm && self.memory_is_clear(runtime)
+    }
+
+    fn memory_is_clear(&self, runtime: &LexicalRebuildPipelineRuntimeSnapshot) -> bool {
+        runtime
+            .host_available_memory_bytes
+            .is_none_or(|available_memory_bytes| {
+                usize_from_u64_saturating(available_memory_bytes) > self.memory_reserve_bytes
+            })
+    }
+
+    /// Why a demoted budget cannot be restored yet, or `None` when the host
+    /// signals that can demote have cleared (loadavg at or below the low
+    /// watermark — hysteresis against the high-watermark demote — and memory
+    /// above the reserve). Pipeline occupancy is deliberately not consulted:
+    /// a rebuild with a live producer never drains mid-run.
+    fn host_pressure_not_clear_reason(
+        &self,
+        runtime: &LexicalRebuildPipelineRuntimeSnapshot,
+    ) -> Option<String> {
+        if let (Some(loadavg_1m_milli), Some(low_watermark_1m_milli)) = (
+            runtime.host_loadavg_1m_milli,
+            self.loadavg_low_watermark_1m_milli,
+        ) && loadavg_1m_milli > low_watermark_1m_milli
+        {
+            return Some(format!(
+                "host_loadavg_1m_{}_above_low_watermark_{}",
+                format_lexical_rebuild_loadavg_1m_milli(loadavg_1m_milli),
+                format_lexical_rebuild_loadavg_1m_milli(low_watermark_1m_milli)
+            ));
+        }
+        if !self.memory_is_clear(runtime) {
+            return Some(format!(
+                "host_available_memory_bytes_{}_at_or_below_reserve_{}",
+                runtime.host_available_memory_bytes.unwrap_or_default(),
+                self.memory_reserve_bytes
+            ));
+        }
+        None
+    }
+
+    fn detect_pipeline_saturation(
+        &self,
+        runtime: &LexicalRebuildPipelineRuntimeSnapshot,
+        new_producer_handoff_wait: bool,
+    ) -> Option<String> {
+        let current_budget = self.current_budget();
         if new_producer_handoff_wait {
             return Some(format!(
                 "producer_handoff_wait_count_{}_observed_consumer_backpressure",
@@ -7868,37 +8159,6 @@ impl LexicalRebuildResponsivenessController {
             ));
         }
         None
-    }
-
-    fn runtime_is_clear(&self, runtime: &LexicalRebuildPipelineRuntimeSnapshot) -> bool {
-        let current_budget = self.current_budget();
-        let loadavg_is_clear = match (
-            runtime.host_loadavg_1m_milli,
-            self.loadavg_low_watermark_1m_milli,
-        ) {
-            (_, None) => true,
-            (Some(loadavg_1m_milli), Some(low_watermark_1m_milli)) => {
-                loadavg_1m_milli <= low_watermark_1m_milli
-            }
-            (None, Some(_)) => true,
-        };
-        let memory_is_clear = runtime
-            .host_available_memory_bytes
-            .map(|available_memory_bytes| {
-                usize_from_u64_saturating(available_memory_bytes) > self.memory_reserve_bytes
-            })
-            .unwrap_or(true);
-        runtime.queue_depth == 0
-            && runtime.ordered_buffered_pages == 0
-            && runtime.pending_batch_conversations == 0
-            && runtime.pending_batch_message_bytes == 0
-            && current_budget.max_message_bytes_in_flight > 0
-            && runtime.inflight_message_bytes.saturating_mul(100)
-                <= current_budget
-                    .max_message_bytes_in_flight
-                    .saturating_mul(Self::INFLIGHT_LOW_WATERMARK_PERCENT)
-            && loadavg_is_clear
-            && memory_is_clear
     }
 }
 
@@ -8564,6 +8824,71 @@ fn completed_lexical_rebuild_meta_fingerprint(
         Some(fingerprint) => Ok(Some(fingerprint.clone())),
         None => index_meta_fingerprint(index_path),
     }
+}
+
+/// GH #457: the post-publish proof that a rebuild's generation serves exactly
+/// the documents it counted. A count that cannot be observed — no manifest
+/// landed, or no reader can open what did — is a FAILED proof, never a
+/// skipped one: the previous `if let Some(observed)` shape verified nothing
+/// in exactly the cases that matter, so a generation whose MANIFEST never
+/// landed could still be certified by a completed checkpoint.
+fn verify_published_lexical_doc_count(
+    index_path: &Path,
+    indexed_docs: usize,
+    publish_mode: &str,
+) -> Result<()> {
+    let summary = crate::search::tantivy::searchable_index_summary(index_path)
+        .with_context(|| {
+            format!(
+                "{publish_mode} lexical rebuild published {indexed_docs} docs but the generation at {} \
+                 cannot be opened for verification; refusing to certify it (GH #457)",
+                index_path.display()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{publish_mode} lexical rebuild published {indexed_docs} docs but no searchable \
+                 generation was found at {}; refusing to certify it (GH #457)",
+                index_path.display()
+            )
+        })?;
+    if summary.docs != indexed_docs {
+        return Err(anyhow::anyhow!(
+            "{publish_mode} lexical rebuild published {indexed_docs} docs but a fresh reader only \
+             sees {}; refusing to certify the generation (GH #457)",
+            summary.docs
+        ));
+    }
+    Ok(())
+}
+
+/// GH #457: a run must not certify a hollow generation. Every full rebuild
+/// proves `live == indexed_docs` before completing its checkpoint, and the
+/// pre-scan sparse check (`choose_incremental_canonical_lexical_repair_plan`)
+/// rebuilds a generation that was already hollow when the run started, so at
+/// the end of any run the served count (read from the MANIFEST the run just
+/// committed, no engine open) must still cover what the checkpoint certified.
+/// This is the backstop for a generation hollowed DURING the run: a shortfall
+/// past the readiness floor is a hard failure naming the remedy, and the
+/// ingest itself is already durable.
+fn verify_lexical_generation_not_hollow_after_run(index_path: &Path, db_path: &Path) -> Result<()> {
+    let Some(expected_docs) =
+        crate::search::asset_state::completed_lexical_checkpoint_indexed_docs(index_path, db_path)
+    else {
+        return Ok(());
+    };
+    let live_docs = crate::search::tantivy::searchable_index_live_doc_count(index_path);
+    if let Some(verdict) = crate::search::asset_state::lexical_generation_hollow_verdict(
+        Some(expected_docs),
+        live_docs,
+    ) {
+        return Err(anyhow::anyhow!(
+            "refusing to certify the lexical generation at {} after this run: {}",
+            index_path.display(),
+            verdict.reason()
+        ));
+    }
+    Ok(())
 }
 
 fn live_tantivy_doc_count(index_path: &Path) -> Result<Option<usize>> {
@@ -9679,6 +10004,12 @@ enum FallbackFtsRepairOutcome {
     SkippedRepairFailed {
         detail: String,
     },
+    /// GH #413 follow-up (iify0): the shadow was dropped for size and the
+    /// corpus still exceeds the bound; there is nothing to repair until it
+    /// fits again. Quill serves lexical search; doctor carries the detail.
+    SkippedNotViable {
+        detail: String,
+    },
     Repaired(FtsConsistencyRepair),
 }
 
@@ -9695,6 +10026,9 @@ enum DailyStatsRepairOutcome {
 }
 
 fn nonfatal_fallback_fts_repair_outcome(detail: String) -> Option<FallbackFtsRepairOutcome> {
+    if crate::storage::sqlite::error_message_indicates_fts_shadow_not_viable(&detail) {
+        return Some(FallbackFtsRepairOutcome::SkippedNotViable { detail });
+    }
     if crate::storage::sqlite::error_message_indicates_populated_fts_shadow_without_rowid_reload(
         &detail,
     ) {
@@ -9712,6 +10046,7 @@ fn repair_fallback_fts_after_full_index_run(
     full_rebuild: bool,
     canonical_only_full_rebuild: bool,
     known_archive_fingerprint: Option<&str>,
+    heartbeat: Option<Box<dyn Fn() + Send + Sync>>,
 ) -> Result<Option<FallbackFtsRepairOutcome>> {
     if !should_repair_fallback_fts_after_full_index_run(full_rebuild, canonical_only_full_rebuild) {
         return Ok(None);
@@ -9757,6 +10092,8 @@ fn repair_fallback_fts_after_full_index_run(
             }));
         }
     };
+    // #439: stream-page liveness for the stall watchdog (see the call site).
+    fresh_storage.set_fts_maintenance_heartbeat(heartbeat);
 
     let outcome: FallbackFtsRepairOutcome = 'compute: {
         if let Some(archive_fingerprint) = known_archive_fingerprint {
@@ -9827,6 +10164,101 @@ fn repair_fallback_fts_after_full_index_run(
     Ok(Some(outcome))
 }
 
+/// #434 defect 3: consecutive `cass index` runs whose optional derived FTS
+/// repair failed IDENTICALLY before escalation. Below the threshold the
+/// failure stays a warning (canonical rows and the Tantivy index are good, so
+/// exit 0 is honest for the run's own work); at the threshold a non-watch
+/// `cass index` exits non-zero so cron/automation notices the persistent
+/// shadow corruption instead of logging the same warning forever — the #434
+/// report ate a month of identical daily warnings before a version bump turned
+/// the latent damage into a hard refusal.
+const FTS_REPAIR_FAILURE_ESCALATION_RUNS: u64 = 5;
+
+/// Cap on the failure detail persisted in the streak state file (identity
+/// comparison and the escalation message both use the bounded form).
+const FTS_REPAIR_FAILURE_STREAK_DETAIL_MAX_CHARS: usize = 2048;
+
+/// Persisted consecutive-identical-failure counter for the optional derived
+/// FTS repair (#434 defect 3). Lives as a dotfile in the index state dir like
+/// `.lexical-rebuild-state.json`; the DB is deliberately NOT used because one
+/// failure class is "cannot open a fresh connection at all".
+fn fts_repair_failure_streak_path(index_path: &Path) -> PathBuf {
+    index_path.join(".fts-repair-failure-streak.json")
+}
+
+fn read_fts_repair_failure_streak(index_path: &Path) -> Option<(u64, String)> {
+    let raw = std::fs::read_to_string(fts_repair_failure_streak_path(index_path)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let streak = value.get("consecutive_identical_failures")?.as_u64()?;
+    if streak == 0 {
+        return None;
+    }
+    let detail = value.get("detail")?.as_str()?.to_string();
+    Some((streak, detail))
+}
+
+/// Record one more derived-FTS repair failure and return the new streak
+/// length: incremented when `detail` matches the persisted failure exactly
+/// (bounded form), reset to 1 when the failure changed. Best-effort — a state
+/// write failure never fails a run whose canonical + Tantivy work succeeded.
+fn record_fts_repair_failure_streak(index_path: &Path, detail: &str) -> u64 {
+    let bounded: String = detail
+        .chars()
+        .take(FTS_REPAIR_FAILURE_STREAK_DETAIL_MAX_CHARS)
+        .collect();
+    let streak = match read_fts_repair_failure_streak(index_path) {
+        Some((prior, prior_detail)) if prior_detail == bounded => prior.saturating_add(1),
+        _ => 1,
+    };
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "consecutive_identical_failures": streak,
+        "escalation_threshold_runs": FTS_REPAIR_FAILURE_ESCALATION_RUNS,
+        "detail": bounded,
+        "updated_at_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    });
+    let _ = std::fs::create_dir_all(index_path);
+    if let Err(err) =
+        write_json_pretty_atomically(&fts_repair_failure_streak_path(index_path), &payload)
+    {
+        tracing::debug!(
+            error = %err,
+            "persisting derived-FTS repair failure streak failed (non-fatal)"
+        );
+    }
+    streak
+}
+
+/// Reset the streak after any repair attempt that did not hit the corruption
+/// class (repaired, already healthy, known-healthy fingerprint, or a different
+/// nonfatal class — a changed failure breaks the "identical" chain anyway).
+/// Writes a zeroed record rather than deleting: cass never deletes.
+fn clear_fts_repair_failure_streak(index_path: &Path) {
+    let path = fts_repair_failure_streak_path(index_path);
+    if !path.exists() {
+        return;
+    }
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "consecutive_identical_failures": 0,
+        "escalation_threshold_runs": FTS_REPAIR_FAILURE_ESCALATION_RUNS,
+        "detail": serde_json::Value::Null,
+        "updated_at_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    });
+    if let Err(err) = write_json_pretty_atomically(&path, &payload) {
+        tracing::debug!(
+            error = %err,
+            "clearing derived-FTS repair failure streak failed (non-fatal)"
+        );
+    }
+}
+
 /// The failure detail to persist as the "shadow may be half-rebuilt" marker for
 /// an outcome — `Some` for the skipped/failed cases, `None` (clear) when the
 /// shadow is repaired or known-healthy (zn1xn).
@@ -9834,9 +10266,8 @@ fn fallback_fts_repair_pending_detail(outcome: &FallbackFtsRepairOutcome) -> Opt
     match outcome {
         FallbackFtsRepairOutcome::SkippedRepairFailed { detail }
         | FallbackFtsRepairOutcome::SkippedCorruptDerivedIndex { detail }
-        | FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail } => {
-            Some(detail.as_str())
-        }
+        | FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail }
+        | FallbackFtsRepairOutcome::SkippedNotViable { detail } => Some(detail.as_str()),
         FallbackFtsRepairOutcome::Repaired(_)
         | FallbackFtsRepairOutcome::SkippedKnownHealthyForFingerprint { .. } => None,
     }
@@ -9886,6 +10317,68 @@ mod fallback_fts_repair_pending_tests {
             )),
             None
         );
+    }
+}
+
+/// #434 defect 3: the persisted consecutive-identical-failure counter behind
+/// the warn-forever → non-zero-exit escalation of `cass index`.
+#[cfg(test)]
+mod fts_repair_failure_streak_tests {
+    use super::{
+        FTS_REPAIR_FAILURE_ESCALATION_RUNS, clear_fts_repair_failure_streak,
+        fts_repair_failure_streak_path, read_fts_repair_failure_streak,
+        record_fts_repair_failure_streak,
+    };
+
+    #[test]
+    fn identical_failures_increment_and_changed_failures_reset() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index_path = tmp.path().join("index");
+
+        assert_eq!(read_fts_repair_failure_streak(&index_path), None);
+        assert_eq!(record_fts_repair_failure_streak(&index_path, "boom"), 1);
+        assert_eq!(record_fts_repair_failure_streak(&index_path, "boom"), 2);
+        // A different failure breaks the "identical" chain.
+        assert_eq!(record_fts_repair_failure_streak(&index_path, "other"), 1);
+        for expected in 2..=FTS_REPAIR_FAILURE_ESCALATION_RUNS {
+            assert_eq!(
+                record_fts_repair_failure_streak(&index_path, "other"),
+                expected
+            );
+        }
+        let (streak, detail) =
+            read_fts_repair_failure_streak(&index_path).expect("streak persisted");
+        assert_eq!(streak, FTS_REPAIR_FAILURE_ESCALATION_RUNS);
+        assert_eq!(detail, "other");
+    }
+
+    #[test]
+    fn clearing_zeroes_the_counter_without_deleting_the_state_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index_path = tmp.path().join("index");
+        assert_eq!(record_fts_repair_failure_streak(&index_path, "boom"), 1);
+
+        clear_fts_repair_failure_streak(&index_path);
+        assert_eq!(
+            read_fts_repair_failure_streak(&index_path),
+            None,
+            "a cleared streak must read back as no streak"
+        );
+        assert!(
+            fts_repair_failure_streak_path(&index_path).exists(),
+            "clearing zeroes the record in place — cass never deletes"
+        );
+        // The next failure restarts from 1.
+        assert_eq!(record_fts_repair_failure_streak(&index_path, "boom"), 1);
+    }
+
+    #[test]
+    fn clearing_a_never_written_streak_is_a_no_op() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index_path = tmp.path().join("index");
+        clear_fts_repair_failure_streak(&index_path);
+        assert!(!fts_repair_failure_streak_path(&index_path).exists());
+        assert_eq!(read_fts_repair_failure_streak(&index_path), None);
     }
 }
 
@@ -10895,6 +11388,191 @@ pub(crate) fn lexical_storage_fingerprint_for_db_strict(db_path: &Path) -> Resul
         )
     })?;
     Ok(fingerprint)
+}
+
+/// Sidecar (inside the lexical index directory, next to the rebuild
+/// checkpoint) that memoizes the canonical archive fingerprint against the
+/// archive's physical identity. It exists for the one-shot CLI: every
+/// `cass search --robot` is a fresh process, so an in-process memo alone
+/// never hits on the path that matters most.
+pub(crate) const ARCHIVE_FINGERPRINT_CACHE_FILE: &str = ".archive-fingerprint-cache.json";
+
+const ARCHIVE_FINGERPRINT_CACHE_SCHEMA_VERSION: u32 = 1;
+
+/// Physical identity of a canonical archive for fingerprint memoization: the
+/// size and mtime of the main database file and of its WAL sidecar. Any
+/// committed write touches at least one of them (a WAL append changes the WAL
+/// length and mtime; a checkpoint changes the main file), so an unchanged key
+/// means the strict fingerprint computed last time is still the current one.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+struct ArchivePhysicalIdentity {
+    db_len: u64,
+    db_mtime_secs: u64,
+    db_mtime_nanos: u32,
+    wal_len: u64,
+    wal_mtime_secs: u64,
+    wal_mtime_nanos: u32,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ArchiveFingerprintCache {
+    schema_version: u32,
+    identity: ArchivePhysicalIdentity,
+    fingerprint: String,
+    computed_at_ms: i64,
+}
+
+fn lexical_storage_physical_identity(db_path: &Path) -> Option<ArchivePhysicalIdentity> {
+    fn stamp(path: &Path) -> Option<(u64, u64, u32)> {
+        match fs::metadata(path) {
+            Ok(meta) => {
+                let modified = meta
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())?;
+                Some((meta.len(), modified.as_secs(), modified.subsec_nanos()))
+            }
+            // An absent WAL sidecar is a legitimate, stable state.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some((0, 0, 0)),
+            Err(_) => None,
+        }
+    }
+    let (db_len, db_mtime_secs, db_mtime_nanos) = stamp(db_path)?;
+    if db_len == 0 {
+        // No archive (or an empty placeholder): nothing worth memoizing.
+        return None;
+    }
+    let wal_path = crate::storage::sqlite::database_sidecar_path(db_path, "-wal");
+    let (wal_len, wal_mtime_secs, wal_mtime_nanos) = stamp(&wal_path)?;
+    Some(ArchivePhysicalIdentity {
+        db_len,
+        db_mtime_secs,
+        db_mtime_nanos,
+        wal_len,
+        wal_mtime_secs,
+        wal_mtime_nanos,
+    })
+}
+
+/// The on-disk layer of [`lexical_storage_fingerprint_for_db_cached`]: serve
+/// the sidecar's fingerprint when it was computed for exactly this physical
+/// identity, otherwise compute the strict fingerprint and rewrite the sidecar
+/// (best effort, tmp + rename, never fatal). The sidecar is never consulted
+/// by the indexer's own checkpoint logic, which always recomputes.
+fn lexical_storage_fingerprint_for_db_disk_cached(
+    db_path: &Path,
+    identity: &ArchivePhysicalIdentity,
+    cache_dir: &Path,
+) -> Result<String> {
+    let cache_path = cache_dir.join(ARCHIVE_FINGERPRINT_CACHE_FILE);
+    if let Ok(raw) = fs::read(&cache_path)
+        && let Ok(cached) = serde_json::from_slice::<ArchiveFingerprintCache>(&raw)
+        && cached.schema_version == ARCHIVE_FINGERPRINT_CACHE_SCHEMA_VERSION
+        && &cached.identity == identity
+        && cached.fingerprint.starts_with("content-v1:")
+    {
+        tracing::debug!(
+            archive_fingerprint_cache = "hit",
+            cache = %cache_path.display(),
+            "archive fingerprint served from the identity sidecar"
+        );
+        return Ok(cached.fingerprint);
+    }
+    tracing::debug!(
+        archive_fingerprint_cache = "miss",
+        cache = %cache_path.display(),
+        "archive fingerprint recomputed from the canonical database"
+    );
+    let fingerprint = lexical_storage_fingerprint_for_db_strict(db_path)?;
+    let payload = ArchiveFingerprintCache {
+        schema_version: ARCHIVE_FINGERPRINT_CACHE_SCHEMA_VERSION,
+        identity: identity.clone(),
+        fingerprint: fingerprint.clone(),
+        computed_at_ms: semantic_indexing_now_ms(),
+    };
+    // Per-process temp name: concurrent one-shot searches may all miss at once.
+    let tmp_path = cache_dir.join(format!(
+        "{ARCHIVE_FINGERPRINT_CACHE_FILE}.{}.tmp",
+        std::process::id()
+    ));
+    let written = serde_json::to_vec(&payload)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| fs::write(&tmp_path, bytes))
+        .and_then(|()| fs::rename(&tmp_path, &cache_path));
+    if let Err(err) = written {
+        tracing::debug!(
+            error = %err,
+            cache = %cache_path.display(),
+            "archive fingerprint cache write skipped"
+        );
+        let _ = fs::remove_file(&tmp_path);
+    }
+    Ok(fingerprint)
+}
+
+/// [`lexical_storage_fingerprint_for_db_strict`], memoized on the archive's
+/// physical identity (`lexical_storage_physical_identity`) and the lexical
+/// index it is being validated against — first in this process, then in the
+/// on-disk sidecar inside `index_path`.
+///
+/// The strict variant opens a synchronous read-only handle and replays the
+/// WAL; on a large archive that cost every default `cass search` seconds
+/// (measured: 201 MB of WAL read in 97k calls, 3.5–4 s) before the engine
+/// query even ran, and a one-shot CLI process cannot amortize it in memory.
+/// A search-time freshness check only needs the answer to change when the
+/// archive does, and any committed write moves the database or WAL
+/// size/mtime, so both layers are invalidated exactly when they must be. When
+/// the identity cannot be read the strict path runs uncached.
+pub(crate) fn lexical_storage_fingerprint_for_db_cached(
+    db_path: &Path,
+    index_path: &Path,
+) -> Result<String> {
+    type MemoKey = (PathBuf, PathBuf, ArchivePhysicalIdentity);
+    static MEMO: std::sync::OnceLock<Mutex<HashMap<MemoKey, String>>> = std::sync::OnceLock::new();
+    let Some(identity) = lexical_storage_physical_identity(db_path) else {
+        return lexical_storage_fingerprint_for_db_strict(db_path);
+    };
+    let key: MemoKey = (
+        db_path.to_path_buf(),
+        index_path.to_path_buf(),
+        identity.clone(),
+    );
+    let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(fingerprint) = memo.lock().ok().and_then(|guard| guard.get(&key).cloned()) {
+        return Ok(fingerprint);
+    }
+    let fingerprint =
+        lexical_storage_fingerprint_for_db_disk_cached(db_path, &identity, index_path)?;
+    if let Ok(mut guard) = memo.lock() {
+        // One entry per archive/index pair: a changed identity replaces the
+        // stale one rather than accumulating history.
+        guard.retain(|(db, index, _), _| !(db == &key.0 && index == &key.1));
+        guard.insert(key, fingerprint.clone());
+    }
+    Ok(fingerprint)
+}
+
+/// GH #353: the sidecar-cached archive fingerprint WITHOUT opening the
+/// database. The watermark health lane and other `open_skipped` surfaces
+/// promise a mutation-free probe with no archive open (k2k20: a readonly
+/// open on a large dirty-WAL archive can take minutes), but they must still
+/// compare the SAME storage fingerprint `search` defers repair on. Served
+/// from the identity-keyed sidecar only; `None` when the sidecar does not
+/// describe the current physical identity — an honest "not computed", never
+/// a guess. Search primes that sidecar after every real fingerprint
+/// computation, so a status that follows any search sees what search saw.
+pub(crate) fn lexical_storage_fingerprint_for_db_cached_readonly(
+    db_path: &Path,
+    index_path: &Path,
+) -> Option<String> {
+    let identity = lexical_storage_physical_identity(db_path)?;
+    let cache_path = index_path.join(ARCHIVE_FINGERPRINT_CACHE_FILE);
+    let raw = fs::read(cache_path).ok()?;
+    let cached = serde_json::from_slice::<ArchiveFingerprintCache>(&raw).ok()?;
+    (cached.schema_version == ARCHIVE_FINGERPRINT_CACHE_SCHEMA_VERSION
+        && cached.identity == identity
+        && cached.fingerprint.starts_with("content-v1:"))
+    .then_some(cached.fingerprint)
 }
 
 /// Same fingerprint as [`lexical_storage_fingerprint_for_db`], computed on an
@@ -12070,9 +12748,7 @@ struct StreamingConversationFootprint {
 /// pair that must exist for each node and all recursively owned allocations.
 fn json_heap_bytes(value: &serde_json::Value) -> usize {
     match value {
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_) => 0,
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => 0,
         serde_json::Value::String(text) => text.capacity(),
         serde_json::Value::Array(values) => values
             .capacity()
@@ -12137,44 +12813,35 @@ fn conversation_batch_footprint(conv: &NormalizedConversation) -> StreamingConve
         );
 
     for message in &conv.messages {
-        retained_bytes = retained_bytes
-            .saturating_add(message.role.capacity())
-            .saturating_add(optional_string_heap_bytes(message.author.as_ref()))
-            .saturating_add(message.content.capacity())
-            .saturating_add(json_heap_bytes(&message.extra))
-            .saturating_add(
-                message
-                    .snippets
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<NormalizedSnippet>()),
-            )
-            .saturating_add(
-                message
-                    .snippets
-                    .iter()
-                    .map(normalized_snippet_heap_bytes)
-                    .fold(0usize, usize::saturating_add),
-            )
-            .saturating_add(
-                message
-                    .invocations
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<
-                        franken_agent_detection::NormalizedInvocation,
-                    >()),
-            );
+        retained_bytes =
+            retained_bytes
+                .saturating_add(message.role.capacity())
+                .saturating_add(optional_string_heap_bytes(message.author.as_ref()))
+                .saturating_add(message.content.capacity())
+                .saturating_add(json_heap_bytes(&message.extra))
+                .saturating_add(
+                    message
+                        .snippets
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<NormalizedSnippet>()),
+                )
+                .saturating_add(
+                    message
+                        .snippets
+                        .iter()
+                        .map(normalized_snippet_heap_bytes)
+                        .fold(0usize, usize::saturating_add),
+                )
+                .saturating_add(message.invocations.capacity().saturating_mul(
+                    std::mem::size_of::<franken_agent_detection::NormalizedInvocation>(),
+                ));
         for invocation in &message.invocations {
             retained_bytes = retained_bytes
                 .saturating_add(invocation.kind.capacity())
                 .saturating_add(invocation.name.capacity())
                 .saturating_add(optional_string_heap_bytes(invocation.raw_name.as_ref()))
                 .saturating_add(optional_string_heap_bytes(invocation.call_id.as_ref()))
-                .saturating_add(
-                    invocation
-                        .arguments
-                        .as_ref()
-                        .map_or(0, json_heap_bytes),
-                );
+                .saturating_add(invocation.arguments.as_ref().map_or(0, json_heap_bytes));
         }
     }
 
@@ -12272,11 +12939,14 @@ impl<'a> StreamingBatchSender<'a> {
             self.flush()?;
         }
 
-        let byte_reservation = self.flow_limiter.acquire(footprint.retained_bytes).map_err(|_| {
-            anyhow::Error::new(StreamingConsumerDisconnected {
-                connector_name: self.connector_name,
-            })
-        })?;
+        let byte_reservation = self
+            .flow_limiter
+            .acquire(footprint.retained_bytes)
+            .map_err(|_| {
+                anyhow::Error::new(StreamingConsumerDisconnected {
+                    connector_name: self.connector_name,
+                })
+            })?;
         self.message_count = self.message_count.saturating_add(footprint.message_count);
         self.content_bytes = self.content_bytes.saturating_add(footprint.content_bytes);
         self.retained_bytes = self.retained_bytes.saturating_add(footprint.retained_bytes);
@@ -12440,6 +13110,8 @@ struct StreamingProducerConfig {
     flow_limiter: Arc<StreamingByteLimiter>,
     data_dir: PathBuf,
     additional_scan_roots: Vec<ScanRoot>,
+    /// qu81y closed-world override; see [`LocalConnectorRootsOverride`].
+    local_connector_roots: LocalConnectorRootsOverride,
     since_ts: Option<i64>,
     local_since_ts_by_connector: Arc<HashMap<&'static str, Option<i64>>>,
     progress: Option<Arc<IndexingProgress>>,
@@ -12461,8 +13133,8 @@ fn spawn_connector_producer(
     thread::spawn(move || {
         let scan_start = std::time::Instant::now();
         let conn = factory();
-        let detect = conn.detect();
-        let was_detected = detect.detected;
+        let detect = detect_for_local_scan(&config.local_connector_roots, || conn.detect());
+        let was_detected = detect.as_ref().is_some_and(|result| result.detected);
         let mut is_discovered = false;
         let mut scan_succeeded = true;
         let mut active_source_skipped = false;
@@ -12482,7 +13154,20 @@ fn spawn_connector_producer(
             None => ctx,
         };
 
-        if detect.detected {
+        // qu81y closed-world override: when a per-connector roots map is
+        // supplied, scan exactly those roots and never consult env-based
+        // default detection; connectors absent from the map are skipped.
+        let override_roots: Option<Vec<ScanRoot>> =
+            config.local_connector_roots.as_ref().map(|map| {
+                map.get(name)
+                    .map(|roots| roots.iter().cloned().map(ScanRoot::local).collect())
+                    .unwrap_or_default()
+            });
+        let scan_local = match &override_roots {
+            Some(roots) => !roots.is_empty(),
+            None => detect.as_ref().is_some_and(|result| result.detected),
+        };
+        if scan_local {
             // Update discovered agents count immediately when detected
             if let Some(p) = &config.progress {
                 p.discovered_agents.fetch_add(1, Ordering::Relaxed);
@@ -12496,19 +13181,34 @@ fn spawn_connector_producer(
                 .unwrap_or(config.since_ts);
 
             // Scan local sources
-            let ctx = with_scan_tick(crate::connectors::ScanContext::local_default(
-                config.data_dir.clone(),
-                local_since_ts,
-            ));
+            let ctx = with_scan_tick(match &override_roots {
+                Some(roots) => crate::connectors::ScanContext::with_roots(
+                    config.data_dir.clone(),
+                    roots.clone(),
+                    local_since_ts,
+                ),
+                None => crate::connectors::ScanContext::local_default(
+                    config.data_dir.clone(),
+                    local_since_ts,
+                ),
+            });
             let local_origin = Origin::local();
             let mut batch_sender =
                 StreamingBatchSender::new(&tx, config.flow_limiter.clone(), name, is_discovered);
-            let fallback_roots: Vec<ScanRoot> = detect
-                .root_paths
-                .iter()
-                .cloned()
-                .map(ScanRoot::local)
-                .collect();
+            let fallback_roots: Vec<ScanRoot> = match &override_roots {
+                Some(roots) => roots.clone(),
+                None => detect
+                    .as_ref()
+                    .map(|result| {
+                        result
+                            .root_paths
+                            .iter()
+                            .cloned()
+                            .map(ScanRoot::local)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            };
             let (mut ingest_diagnostics, preparse_active_source_skipped) =
                 capture_connector_sources_before_parse(
                     conn.as_ref(),
@@ -12599,7 +13299,8 @@ fn spawn_connector_producer(
                 .get(name)
                 .copied()
                 .unwrap_or(config.since_ts);
-            let root_since_ts = explicit_scan_root_since_ts(root, &config.data_dir, local_since_ts);
+            let root_since_ts =
+                connector_explicit_scan_root_since_ts(name, root, &config.data_dir, local_since_ts);
             if config.since_ts.is_some() && root_since_ts.is_none() {
                 tracing::debug!(
                     connector = name,
@@ -12891,6 +13592,8 @@ fn run_streaming_consumer(
             }) => {
                 // Accumulators start with the first-received batch.
                 let mut combined_conversations: Vec<NormalizedConversation> = conversations;
+                let mut combined_connector_ranges =
+                    vec![(connector_name, 0..combined_conversations.len())];
                 let mut combined_message_count = message_count;
                 let mut combined_byte_reservation = byte_reservation;
                 let mut combined_batch_size = combined_conversations.len();
@@ -12974,7 +13677,10 @@ fn run_streaming_consumer(
                                     p.total.fetch_add(extra_size, Ordering::Relaxed);
                                     p.tick_activity();
                                 }
+                                let start = combined_conversations.len();
                                 combined_conversations.extend(extra_convs);
+                                combined_connector_ranges
+                                    .push((cname2, start..combined_conversations.len()));
                                 combined_message_count += extra_msg_count;
                                 combined_byte_reservation += extra_byte_reservation;
                                 combined_batch_size += extra_size;
@@ -13011,6 +13717,15 @@ fn run_streaming_consumer(
                 // trees. Drop them before waking blocked producers so the
                 // queue's byte counter never advertises memory that is still
                 // live in this consumer arm (#320).
+                if let Ok(outcome) = &batch_outcome {
+                    for (name, range) in combined_connector_ranges {
+                        if combined_conversations[range].iter().any(|conversation| {
+                            outcome.deferred_sources.contains(&conversation.source_path)
+                        }) {
+                            failed_scan_connectors.insert(name.to_string());
+                        }
+                    }
+                }
                 drop(combined_conversations);
                 flow_limiter.release(combined_byte_reservation);
                 ingest_outcome = ingest_outcome.accumulate(batch_outcome?);
@@ -13221,6 +13936,7 @@ fn run_streaming_index(
     since_ts: Option<i64>,
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
+    local_connector_roots: LocalConnectorRootsOverride,
     scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
@@ -13231,6 +13947,7 @@ fn run_streaming_index(
         since_ts,
         lexical_strategy,
         additional_scan_roots,
+        local_connector_roots,
         configured_connector_factories(),
         scan_start_ts,
         progress_bump,
@@ -13288,6 +14005,7 @@ fn run_streaming_index_with_connector_factories(
     since_ts: Option<i64>,
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
+    local_connector_roots: LocalConnectorRootsOverride,
     connector_factories: Vec<(&'static str, ConnectorFactory)>,
     scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
@@ -13341,6 +14059,7 @@ fn run_streaming_index_with_connector_factories(
         flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
         data_dir: opts.data_dir.clone(),
         additional_scan_roots: additional_scan_roots.clone(),
+        local_connector_roots: local_connector_roots.clone(),
         since_ts,
         local_since_ts_by_connector: Arc::new(connector_local_scan_since_ts_map(
             storage,
@@ -13416,10 +14135,13 @@ fn run_streaming_index_with_connector_factories(
         return Err(anyhow::anyhow!(error));
     }
 
-    let (discovered_names, ingest_outcome) = match consumer_result {
+    let (discovered_names, mut ingest_outcome) = match consumer_result {
         Ok(result) => result,
         Err(_) => unreachable!("handled above"),
     };
+    ingest_outcome
+        .deferred_sources
+        .extend(producer_config.active_source_filter.take_deferred_sources());
 
     // Update discovered agent names in progress tracker
     if let Some(p) = &opts.progress
@@ -13444,6 +14166,7 @@ fn run_batch_index(
     since_ts: Option<i64>,
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
+    local_connector_roots: LocalConnectorRootsOverride,
     scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
@@ -13454,6 +14177,7 @@ fn run_batch_index(
         since_ts,
         lexical_strategy,
         additional_scan_roots,
+        local_connector_roots,
         configured_connector_factories(),
         scan_start_ts,
         progress_bump,
@@ -13468,6 +14192,7 @@ fn run_batch_index_with_connector_factories(
     since_ts: Option<i64>,
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
+    local_connector_roots: LocalConnectorRootsOverride,
     connector_factories: Vec<(&'static str, ConnectorFactory)>,
     scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
@@ -13526,8 +14251,8 @@ fn run_batch_index_with_connector_factories(
             .into_par_iter()
             .filter_map(|(name, factory)| {
                 let conn = factory();
-                let detect = conn.detect();
-                let was_detected = detect.detected;
+                let detect = detect_for_local_scan(&local_connector_roots, || conn.detect());
+                let was_detected = detect.as_ref().is_some_and(|result| result.detected);
                 let mut convs = Vec::new();
                 let mut is_discovered = false;
                 let mut scan_succeeded = true;
@@ -13540,7 +14265,20 @@ fn run_batch_index_with_connector_factories(
                     }
                 };
 
-                if detect.detected {
+                // qu81y closed-world override: see the streaming lane — same
+                // semantics for the batch path.
+                let override_roots: Option<Vec<ScanRoot>> = local_connector_roots
+                    .as_ref()
+                    .map(|map| {
+                        map.get(name)
+                            .map(|roots| roots.iter().cloned().map(ScanRoot::local).collect())
+                            .unwrap_or_default()
+                    });
+                let scan_local = match &override_roots {
+                    Some(roots) => !roots.is_empty(),
+                    None => detect.as_ref().is_some_and(|result| result.detected),
+                };
+                if scan_local {
                     // Update discovered agents count immediately when detected
                     // This gives fast UI feedback during the discovery phase
                     // Note: AtomicUsize has no contention, only the mutex was problematic
@@ -13553,16 +14291,31 @@ fn run_batch_index_with_connector_factories(
                         .get(name)
                         .copied()
                         .unwrap_or(since_ts);
-                    let ctx = with_scan_tick(crate::connectors::ScanContext::local_default(
-                        data_dir.clone(),
-                        local_since_ts,
-                    ));
-                    let fallback_roots: Vec<ScanRoot> = detect
-                        .root_paths
-                        .iter()
-                        .cloned()
-                        .map(ScanRoot::local)
-                        .collect();
+                    let ctx = with_scan_tick(match &override_roots {
+                        Some(roots) => crate::connectors::ScanContext::with_roots(
+                            data_dir.clone(),
+                            roots.clone(),
+                            local_since_ts,
+                        ),
+                        None => crate::connectors::ScanContext::local_default(
+                            data_dir.clone(),
+                            local_since_ts,
+                        ),
+                    });
+                    let fallback_roots: Vec<ScanRoot> = match &override_roots {
+                        Some(roots) => roots.clone(),
+                        None => detect
+                            .as_ref()
+                            .map(|result| {
+                                result
+                                    .root_paths
+                                    .iter()
+                                    .cloned()
+                                    .map(ScanRoot::local)
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    };
                     let (mut ingest_diagnostics, preparse_active_source_skipped) =
                         capture_connector_sources_before_parse(
                         conn.as_ref(),
@@ -13622,8 +14375,12 @@ fn run_batch_index_with_connector_factories(
                             .get(name)
                             .copied()
                             .unwrap_or(since_ts);
-                        let root_since_ts =
-                            explicit_scan_root_since_ts(root, &data_dir, local_since_ts);
+                        let root_since_ts = connector_explicit_scan_root_since_ts(
+                            name,
+                            root,
+                            &data_dir,
+                            local_since_ts,
+                        );
                         if since_ts.is_some() && root_since_ts.is_none() {
                             tracing::debug!(
                                 connector = name,
@@ -13801,6 +14558,7 @@ fn run_batch_index_with_connector_factories(
             !opts.watch,
             progress_bump,
         )?;
+        let persistence_completed = !batch_outcome.scan_had_errors;
         ingest_outcome = ingest_outcome.accumulate(batch_outcome);
         // #426: this connector's complete scan has now been persisted. Advance
         // only its watermark at this transaction boundary. The former timed
@@ -13808,6 +14566,7 @@ fn run_batch_index_with_connector_factories(
         // still pending, so termination could permanently skip those rows.
         let connector_watermark_safe = pending.is_discovered
             && pending.scan_succeeded
+            && persistence_completed
             && !pending.active_source_skipped
             && !scan_path_exclusions_active();
         if connector_watermark_safe {
@@ -13858,6 +14617,9 @@ fn run_batch_index_with_connector_factories(
 
     ingest_outcome.scanned_connectors.extend(scanned_connectors);
     ingest_outcome.scan_had_errors |= scan_had_errors;
+    ingest_outcome
+        .deferred_sources
+        .extend(active_source_filter.take_deferred_sources());
 
     Ok(ingest_outcome)
 }
@@ -13880,11 +14642,14 @@ fn connector_local_scan_since_ts_from_state(
     connector_last_scan_ts: Option<i64>,
     connector_has_conversations: bool,
 ) -> Option<i64> {
+    // A full scan or deliberate repair has no cutoff. A saved connector
+    // watermark must not turn that request back into an incremental scan.
+    let fallback_since_ts = fallback_since_ts?;
     if let Some(ts) = connector_last_scan_ts {
         return Some(ts.saturating_sub(1).max(0));
     }
     if connector_has_conversations {
-        fallback_since_ts
+        Some(fallback_since_ts)
     } else {
         None
     }
@@ -13913,7 +14678,15 @@ fn connector_local_scan_since_ts_map(
             // dedicated connector has ever completed a scan; do one full OMP
             // scan until its own watermark exists so older profile/XDG roots
             // are not skipped by the global Pi-era cutoff.
-            let local_since_ts = if *name == "omp" && connector_last_scan_ts.is_none() {
+            let local_since_ts = if *name == "devin" {
+                // Devin stores provider activity at whole-second precision while
+                // CASS scan watermarks are millisecond timestamps. A commit made
+                // after the previous scan can therefore carry an activity value
+                // that sorts before that scan's watermark. The provider can also
+                // commit only to its WAL. Re-read this connector without a time
+                // cutoff and let canonical idempotency discard unchanged rows.
+                None
+            } else if *name == "omp" && connector_last_scan_ts.is_none() {
                 None
             } else {
                 connector_local_scan_since_ts_from_state(
@@ -13925,6 +14698,15 @@ fn connector_local_scan_since_ts_map(
             Ok((*name, local_since_ts))
         })
         .collect()
+}
+
+fn connector_explicit_scan_root_since_ts(
+    _connector_name: &str,
+    root: &ScanRoot,
+    built_in_local_root: &Path,
+    fallback_since_ts: Option<i64>,
+) -> Option<i64> {
+    explicit_scan_root_since_ts(root, built_in_local_root, fallback_since_ts)
 }
 
 fn explicit_scan_root_since_ts(
@@ -13946,8 +14728,45 @@ pub fn run_index(
     opts: IndexOptions,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
 ) -> Result<()> {
+    run_index_inner(opts, event_channel, None)
+}
+
+/// qu81y class-B injection seam: run one index pass with the connectors'
+/// LOCAL default-detection lane replaced by an explicit CLOSED-WORLD set of
+/// per-connector scan roots. Connectors absent from the map are skipped
+/// entirely — detection never consults process-global environment (HOME,
+/// CODEX_HOME, ...), so in-process tests can drive `run_index` against
+/// fixture roots without mutating env vars shared across libtest threads.
+/// Explicitly configured `sources.toml` roots and the watch path are
+/// unaffected; production callers keep using [`run_index`].
+pub fn run_index_with_local_connector_roots(
+    opts: IndexOptions,
+    local_connector_roots: HashMap<String, Vec<PathBuf>>,
+    event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
+) -> Result<()> {
+    run_index_inner(opts, event_channel, Some(Arc::new(local_connector_roots)))
+}
+
+/// Per-connector local scan roots override (qu81y): `Some(map)` means a
+/// closed world — scan exactly `map[connector]` per connector, skip
+/// connectors without an entry, and never run env-based default detection.
+type LocalConnectorRootsOverride = Option<Arc<HashMap<String, Vec<PathBuf>>>>;
+
+fn detect_for_local_scan(
+    local_connector_roots: &LocalConnectorRootsOverride,
+    detect: impl FnOnce() -> crate::connectors::DetectionResult,
+) -> Option<crate::connectors::DetectionResult> {
+    local_connector_roots.is_none().then(detect)
+}
+
+fn run_index_inner(
+    opts: IndexOptions,
+    event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
+    local_connector_roots: LocalConnectorRootsOverride,
+) -> Result<()> {
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
+    set_progress_final_wal_checkpoint(opts.progress.as_ref(), None);
     // Analytics tables are derived assets and can be rebuilt by doctor/rebuild
     // flows. Keep routine indexing focused on the canonical conversation store
     // and lexical assets; set CASS_INLINE_ANALYTICS_UPDATES=1 to restore the
@@ -14031,6 +14850,12 @@ pub fn run_index(
             path_count,
             "skipping watch-once index because all explicit paths are absent"
         );
+        set_progress_final_wal_checkpoint(
+            opts.progress.as_ref(),
+            Some(FinalWalCheckpointReport::NotNeeded {
+                reason: "absent_explicit_watch_once_paths".to_string(),
+            }),
+        );
         return Ok(());
     }
 
@@ -14038,17 +14863,23 @@ pub fn run_index(
     // breadcrumb so operators investigating a watch-startup wedge can see
     // WHICH step stalled instead of an opaque top-level phase for the entire
     // pre-pipeline block. The historical `watch_startup:` namespace remains a
-    // compatibility contract. Plain incremental indexing additionally exposes
-    // the cheap restart-from-zero checkpoint classification it can enter;
-    // other index modes retain their existing telemetry. The hard watchdog
-    // remains scoped to watch startup; plain restart no longer performs an
-    // exact startup count and therefore needs no preflight abort path.
-    // Each visible `set_phase`
+    // compatibility contract.
+    //
+    // GH #443: the breadcrumb is written in EVERY index mode, not only watch
+    // startup. Plain incremental runs used to expose just the (sidecar-only,
+    // millisecond) `classify_nonresumable_checkpoint` step and then go dark:
+    // the lock file kept naming that step while the process was actually
+    // inside the writable frankensqlite open (`open_storage`) or a later
+    // preflight, so a wedge there was reported — by `cass status`, the stall
+    // event and the reporter — against a function that had already returned.
+    // A stale breadcrumb is worse than none; see
+    // `preflight_breadcrumb_visible`. The hard per-step abort watchdog
+    // remains scoped to watch startup.
+    // Each `set_phase`
     // call bumps `last_progress_at_ms` (in both the atomic and the on-disk
     // field) and emits a new `phase=` string that `IndexStallWatchdog` treats
     // as a phase transition (resets its `last_progress_advance` timer). The
-    // macro keeps the call sites compact while leaving unrelated full/plain
-    // preflight telemetry unchanged.
+    // macro keeps the call sites compact.
     //
     // v0.6.7 extension: the macro also notifies the
     // `WatchStartupPreflightState` so the watchdog thread can detect
@@ -14073,8 +14904,7 @@ pub fn run_index(
     });
     macro_rules! preflight_phase {
         ($phase:expr) => {{
-            let phase_visible = initial_lock_mode == SearchMaintenanceMode::WatchStartup
-                || $phase == "watch_startup:classify_nonresumable_checkpoint";
+            let phase_visible = preflight_breadcrumb_visible(initial_lock_mode, $phase);
             let timeout_enforced = initial_lock_mode == SearchMaintenanceMode::WatchStartup;
             if timeout_enforced {
                 // Notify the watchdog of the new active step BEFORE writing
@@ -14125,16 +14955,15 @@ pub fn run_index(
         // ingest work. The persisted count is only a progress hint: it may be
         // stale after an interrupted run and must never authorize an early
         // return or become the completed generation's fingerprint.
-        let pending_state =
-            if preflight_skip("watch_startup:classify_nonresumable_checkpoint") {
-                Ok(None)
-            } else {
-                preflight_phase!("watch_startup:classify_nonresumable_checkpoint");
-                let result =
-                    nonresumable_pending_lexical_rebuild_state_for_db(&index_path, &opts.db_path);
-                complete_preflight_phase!();
-                result
-            };
+        let pending_state = if preflight_skip("watch_startup:classify_nonresumable_checkpoint") {
+            Ok(None)
+        } else {
+            preflight_phase!("watch_startup:classify_nonresumable_checkpoint");
+            let result =
+                nonresumable_pending_lexical_rebuild_state_for_db(&index_path, &opts.db_path);
+            complete_preflight_phase!();
+            result
+        };
         match pending_state {
             Ok(Some(state)) => {
                 let total_conversations_hint = state.db.total_conversations;
@@ -14157,6 +14986,12 @@ pub fn run_index(
                     &opts.data_dir,
                     &opts.db_path,
                 )?;
+                // The legacy restart skips the ordinary writable-open path.
+                // Apply its derived-shadow bound before any readonly reader
+                // can hydrate the oversized FTS index (GH #413).
+                preflight_phase!("watch_startup:fts_shadow_viability");
+                preflight_fts_shadow_before_lexical_readers(&opts.db_path)?;
+                complete_preflight_phase!();
                 let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                     &opts.db_path,
                     &opts.data_dir,
@@ -14177,6 +15012,12 @@ pub fn run_index(
                         observed_messages,
                     );
                 }
+                set_progress_final_wal_checkpoint(
+                    opts.progress.as_ref(),
+                    Some(FinalWalCheckpointReport::NotNeeded {
+                        reason: "readonly_lexical_resume".to_string(),
+                    }),
+                );
                 return Ok(());
             }
             Ok(None) => {}
@@ -14190,6 +15031,12 @@ pub fn run_index(
         }
     }
     if try_readonly_canonical_force_rebuild(&opts, &progress_bump)? {
+        set_progress_final_wal_checkpoint(
+            opts.progress.as_ref(),
+            Some(FinalWalCheckpointReport::NotNeeded {
+                reason: "readonly_canonical_force_rebuild".to_string(),
+            }),
+        );
         return Ok(());
     }
 
@@ -14212,8 +15059,82 @@ pub fn run_index(
         ));
     }
 
+    // GH #450: this writable open is where frankensqlite runs its one-time
+    // migration repair, which copies and rewrites the whole archive and took
+    // ~25 minutes on a 2.6 GiB bundle. It posts no progress of its own, so the
+    // #258 stall detector saw `last_progress_at_ms` frozen and reported
+    // `status: "stalled"` at 0/N conversations while the process was doing
+    // sustained IO. Tick the same honest liveness signal the Quill sink uses
+    // (#446): progress is posted only in an interval where the database bundle
+    // (including the migration backup being written) grew or the process burned
+    // CPU, so a genuinely wedged open still reports `stalled`.
+    let open_liveness_targets = storage_open_liveness_targets(&opts.db_path);
+    let open_liveness_heartbeat: crate::search::quill_bridge::EngineHeartbeat = {
+        let progress = opts.progress.clone();
+        let progress_bump = Arc::clone(&progress_bump);
+        Arc::new(move || {
+            if let Some(progress) = progress.as_ref() {
+                progress.tick_activity();
+            }
+            bump_index_run_lock_progress_atomic(&progress_bump);
+        })
+    };
+    let storage_open_started = Instant::now();
     let (mut storage, canonical_storage_rebuilt, opened_fresh_for_full) =
-        open_storage_for_index(&opts.db_path, opts.full)?;
+        crate::search::quill_bridge::run_with_liveness_ticks(
+            open_liveness_targets,
+            open_liveness_heartbeat,
+            || open_storage_for_index(&opts.db_path, opts.full),
+        )?;
+    let storage_open_elapsed = storage_open_started.elapsed();
+    if storage_open_elapsed >= SLOW_STORAGE_OPEN_WARN_THRESHOLD {
+        // GH #450: name the cost. An open this long is a schema migration or
+        // frankensqlite's one-time migration repair, and the operator otherwise
+        // sees only a long silence before the first indexing phase.
+        tracing::warn!(
+            db_path = %opts.db_path.display(),
+            elapsed_secs = storage_open_elapsed.as_secs_f64(),
+            bundle_bytes = database_bundle_size_bytes(&opts.db_path),
+            "opening the canonical archive for writing took a long time; this phase covers schema \
+             migration and frankensqlite's one-time migration repair, and its cost scales with the \
+             archive size"
+        );
+    }
+    complete_preflight_phase!();
+
+    preflight_phase!("watch_startup:fts_shadow_viability");
+    // GH #413 follow-up (iify0): decide BEFORE the first write on this
+    // connection — the moment fsqlite rebuilds the whole in-memory index of a
+    // populated shadow (20 GB and minutes on a 10 GB archive) — whether the
+    // derived shadow may exist at all. The drop goes through a deferred-FTS5
+    // connection so it never hydrates what it removes.
+    match storage.fts_shadow_viability() {
+        Ok(crate::storage::sqlite::FtsShadowViability::NotViable { .. }) => {
+            storage.close_best_effort_in_place();
+            preflight_fts_shadow_before_lexical_readers(&opts.db_path)?;
+            storage = crate::storage::sqlite::open_franken_storage_with_timeout(
+                &opts.db_path,
+                Duration::from_secs(10),
+            )
+            .with_context(|| {
+                format!(
+                    "reopening storage after dropping the oversized fallback FTS shadow in {}",
+                    opts.db_path.display()
+                )
+            })?;
+        }
+        Ok(crate::storage::sqlite::FtsShadowViability::Viable { corpus_messages }) => {
+            storage.note_fts_shadow_corpus_messages(corpus_messages);
+        }
+        Ok(crate::storage::sqlite::FtsShadowViability::Absent) => {}
+        Err(err) => {
+            tracing::warn!(
+                db_path = %opts.db_path.display(),
+                error = %format!("{err:#}"),
+                "could not assess the fallback FTS shadow's viability; leaving it as it is"
+            );
+        }
+    }
     complete_preflight_phase!();
 
     let defer_checkpoints = !opts.watch;
@@ -14610,6 +15531,7 @@ pub fn run_index(
     let mut scanned_connectors = BTreeSet::new();
     let mut scan_had_errors = false;
     let mut stale_index_ingest_quarantine_retry_attempted = false;
+    let mut deferred_watch_sources = BTreeSet::new();
 
     let mut tantivy_requires_rebuild = false;
     let mut observed_tantivy_docs = None;
@@ -14743,6 +15665,13 @@ pub fn run_index(
             .is_some_and(|paths| !paths.is_empty());
 
     let mut exact_completed_lexical_checkpoint = false;
+    // GH #457 follow-on: set when an authoritative rebuild persisted its exact
+    // completed checkpoint before this run's incremental source scan, i.e. by
+    // the pre-scan sparse/invalid repair. The canonical-only full rebuild runs
+    // no scan at all and the post-scan rebuilds run after ingest, so that path
+    // is the only one whose checkpoint (and exact row counts recorded in
+    // progress) can be invalidated by the rest of its own run.
+    let mut exact_completed_lexical_checkpoint_predates_scan = false;
     let mut skipped_noop_full_scan_authoritative_rebuild = false;
     let mut targeted_watch_once_only_run = false;
     let t_index = if resume_lexical_rebuild {
@@ -14793,7 +15722,10 @@ pub fn run_index(
             );
         }
         if keep_tantivy_open_after_rebuild {
-            Some(TantivyIndex::open_or_create(&index_path)?)
+            Some(open_lexical_index_with_heartbeat(
+                &index_path,
+                opts.progress.as_ref(),
+            )?)
         } else {
             None
         }
@@ -15083,7 +16015,10 @@ pub fn run_index(
                 );
             }
             if keep_tantivy_open_after_rebuild {
-                t_index = Some(TantivyIndex::open_or_create(&index_path)?);
+                t_index = Some(open_lexical_index_with_heartbeat(
+                    &index_path,
+                    opts.progress.as_ref(),
+                )?);
             }
         } else {
             let followup_scan_after_authoritative_repair =
@@ -15127,6 +16062,11 @@ pub fn run_index(
                     Arc::clone(&progress_bump),
                 )?;
                 exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
+                // GH #457 follow-on: this repair runs before the incremental
+                // source scan below, so whatever it just certified describes
+                // the pre-scan database.
+                exact_completed_lexical_checkpoint_predates_scan =
+                    exact_completed_lexical_checkpoint;
                 if let Some(observed_messages) = rebuild.observed_messages {
                     record_exact_total_counts_in_progress(
                         opts.progress.as_ref(),
@@ -15134,7 +16074,10 @@ pub fn run_index(
                         observed_messages,
                     );
                 }
-                t_index = Some(TantivyIndex::open_or_create(&index_path)?);
+                t_index = Some(open_lexical_index_with_heartbeat(
+                    &index_path,
+                    opts.progress.as_ref(),
+                )?);
                 needs_rebuild = false;
             }
 
@@ -15251,8 +16194,14 @@ pub fn run_index(
                     tracing::info!("full_scan: no last_scan_ts or rebuild requested");
                 }
 
-                let additional_scan_roots =
-                    additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir);
+                // qu81y closed-world override: sources.toml resolution is
+                // HOME/XDG-scoped, so an env-free run must not consult it —
+                // the override map is the complete scan universe.
+                let additional_scan_roots = if local_connector_roots.is_some() {
+                    Vec::new()
+                } else {
+                    additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir)
+                };
                 // #372: drop remote mirror roots whose on-disk fingerprint is
                 // unchanged since the last error-free scan (they would otherwise
                 // be fully re-scanned every run), and capture fingerprints to
@@ -15264,7 +16213,10 @@ pub fn run_index(
 
                 // Choose between streaming indexing (Opt 8.2) and batch indexing
                 if scan_requires_tantivy && t_index.is_none() {
-                    t_index = Some(TantivyIndex::open_or_create(&index_path)?);
+                    t_index = Some(open_lexical_index_with_heartbeat(
+                        &index_path,
+                        opts.progress.as_ref(),
+                    )?);
                 } else if !scan_requires_tantivy {
                     tracing::info!(
                         strategy = lexical_strategy.as_str(),
@@ -15282,6 +16234,7 @@ pub fn run_index(
                         since_ts,
                         lexical_strategy,
                         additional_scan_roots.clone(),
+                        local_connector_roots.clone(),
                         scan_start_ts,
                         Some(&progress_bump),
                     )?;
@@ -15297,6 +16250,7 @@ pub fn run_index(
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
                     scanned_connectors.extend(scan_outcome.scanned_connectors);
                     scan_had_errors |= scan_outcome.scan_had_errors;
+                    deferred_watch_sources.extend(scan_outcome.deferred_sources);
                 } else {
                     tracing::info!(
                         "using batch indexing (streaming disabled via CASS_STREAMING_INDEX=0)"
@@ -15308,6 +16262,7 @@ pub fn run_index(
                         since_ts,
                         lexical_strategy,
                         additional_scan_roots.clone(),
+                        local_connector_roots.clone(),
                         scan_start_ts,
                         Some(&progress_bump),
                     )?;
@@ -15317,6 +16272,7 @@ pub fn run_index(
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
                     scanned_connectors.extend(scan_outcome.scanned_connectors);
                     scan_had_errors |= scan_outcome.scan_had_errors;
+                    deferred_watch_sources.extend(scan_outcome.deferred_sources);
                 }
                 // #372: persist remote mirror fingerprints only after an
                 // error-free scan (the same signal that gates last_scan_ts), so
@@ -15368,13 +16324,49 @@ pub fn run_index(
                         );
                     }
                     if keep_tantivy_open_after_rebuild {
-                        t_index = Some(TantivyIndex::open_or_create(&index_path)?);
+                        t_index = Some(open_lexical_index_with_heartbeat(
+                            &index_path,
+                            opts.progress.as_ref(),
+                        )?);
                     }
                 } else if scan_requires_tantivy {
-                    t_index
+                    let t_index = t_index
                         .as_mut()
-                        .expect("tantivy index must remain open for lexical commit")
-                        .commit()?;
+                        .expect("tantivy index must remain open for lexical commit");
+                    t_index.commit()?;
+                    // #441: an append-only archive never trips Quill's
+                    // tombstone-driven compaction, and its width-tiered merge
+                    // cannot fold the sparse per-session docid leases, so
+                    // every incremental run used to add segments that only a
+                    // full rebuild removed. Apply the bounded size-tiered
+                    // policy here (threshold + cooldown gated), the same hook
+                    // the watch loop already runs. The merge is post-publish
+                    // work with parked counters, so it runs under the
+                    // finalize-class grace like the WAL checkpoint does.
+                    if (scan_canonical_mutations.inserted_messages > 0
+                        || scan_canonical_mutations.inserted_conversations > 0)
+                        && !lexical_post_run_maintenance_skipped_for_test()
+                    {
+                        if let Some(progress) = opts.progress.as_ref() {
+                            progress.finalizing.store(true, Ordering::Relaxed);
+                            progress.tick_activity();
+                        }
+                        match t_index.optimize_if_idle() {
+                            Ok(true) => tracing::info!(
+                                segments = t_index.segment_count(),
+                                "folded lexical segments after incremental index run (#441)"
+                            ),
+                            Ok(false) => {}
+                            Err(err) => tracing::warn!(
+                                error = %format!("{err:#}"),
+                                "segment merge after incremental index run failed; continuing with the unmerged generation"
+                            ),
+                        }
+                        if let Some(progress) = opts.progress.as_ref() {
+                            progress.tick_activity();
+                            progress.finalizing.store(false, Ordering::Relaxed);
+                        }
+                    }
                 }
 
                 if !scan_lexical_update_deferred
@@ -15449,7 +16441,10 @@ pub fn run_index(
                             );
                         }
                         if keep_tantivy_open_after_rebuild {
-                            t_index = Some(TantivyIndex::open_or_create(&index_path)?);
+                            t_index = Some(open_lexical_index_with_heartbeat(
+                                &index_path,
+                                opts.progress.as_ref(),
+                            )?);
                         }
                     }
                 }
@@ -15458,6 +16453,11 @@ pub fn run_index(
 
         t_index
     };
+
+    // GH #457: whatever this run did (incremental ingest, no-op scan, or a
+    // rebuild that already proved itself), the generation it leaves behind
+    // must serve what its completed checkpoint certified.
+    verify_lexical_generation_not_hollow_after_run(&index_path, &opts.db_path)?;
 
     if legacy_omp_upgrade.lexical_rebuild_required {
         if !exact_completed_lexical_checkpoint {
@@ -15931,6 +16931,44 @@ pub fn run_index(
             scan_start_ts,
             now_ms,
         )?;
+        // GH #413 follow-up: when this run's inline `fts_messages` writes blew
+        // their budget the shadow was left behind on purpose (canonical rows
+        // and the Quill index landed; only the SQL fallback lags). Persist the
+        // reason where `doctor` already reads it. Best-effort observability.
+        if let Some(detail) = storage.fts_inline_suspension() {
+            tracing::warn!(
+                db_path = %opts.db_path.display(),
+                detail = %detail,
+                "inline fallback-FTS shadow writes were suspended for this run; the shadow is behind \
+                 (Quill lexical search is unaffected) and `cass doctor` reports it"
+            );
+            if let Err(err) = storage.record_fallback_fts_repair_pending(Some(&detail)) {
+                tracing::warn!(
+                    error = %err,
+                    "recording the suspended inline FTS shadow writes failed (non-fatal)"
+                );
+            }
+        }
+        // GH #413 follow-up (iify0): a run that grew the corpus past the shadow
+        // bound drops the shadow now, on this connection (the vtab's destructor
+        // never reads it), so the next writable open pays nothing for it.
+        if storage.fts_shadow_drop_pending() {
+            let detail = storage
+                .fts_inline_suspension()
+                .unwrap_or_else(|| crate::storage::sqlite::fts_shadow_not_viable_detail(0, 0));
+            match storage.drop_fts_shadow_as_not_viable(&detail) {
+                Ok(()) => tracing::warn!(
+                    db_path = %opts.db_path.display(),
+                    "dropped the derived fallback FTS shadow: the corpus crossed the shadow bound \
+                     during this run (GH #413); Quill lexical search is unaffected"
+                ),
+                Err(err) => tracing::warn!(
+                    error = %format!("{err:#}"),
+                    "dropping the oversized fallback FTS shadow failed (non-fatal); the next run \
+                     retries at preflight"
+                ),
+            }
+        }
         // zn1xn F4: track the persistent lexical-repair deferral streak so
         // `status`/`index --json` expose the recurring full-rebuild
         // amplification (previously only a stderr warn). Increment when this
@@ -15939,9 +16977,8 @@ pub fn run_index(
         // write must never fail a run whose indexing work already succeeded.
         if scan_lexical_update_deferred {
             if let Err(err) = storage.record_lexical_repair_deferred(
-                "inline lexical updates deferred during non-watch scan (streaming ingest \
-                 pressure on one or more conversations); full authoritative lexical rebuild \
-                 performed — recurs every run until the offending source is resolved",
+                "inline lexical publication deferred during non-watch scan; \
+                 authoritative canonical lexical rebuild performed",
             ) {
                 tracing::debug!(
                     error = %format!("{err:#}"),
@@ -15959,6 +16996,41 @@ pub fn run_index(
                 scan_start_ts,
             )?;
         }
+    }
+    // GH #457 follow-on: the pre-scan authoritative repair rebuilt the lexical
+    // index from SQLite and persisted an exact completed checkpoint, and this
+    // run then continued into the incremental source scan. If that scan
+    // ingested anything, both the checkpoint's storage fingerprint and the
+    // exact row counts the rebuild recorded in progress describe the pre-scan
+    // database. Leaving them alone would keep the stale fingerprint on disk,
+    // so search and cass status would report the lexical assets stale until a
+    // later run rewrote the checkpoint.
+    //
+    // Re-derive rather than merely force the refresh. total_counts_exact is
+    // sticky once the rebuild sets it, but the scan that follows overwrites the
+    // counts beside it with what it discovered. At this point those values can
+    // be neither the rebuild's totals nor the database's, and the final
+    // refresh would otherwise build a wrong fingerprint from them.
+    if should_redrive_final_lexical_checkpoint_refresh_after_pre_scan_repair(
+        exact_completed_lexical_checkpoint_predates_scan,
+        scan_canonical_mutations,
+    ) {
+        let post_scan_conversations = count_total_conversations_exact(&storage)?;
+        let post_scan_messages = count_total_messages_exact(&storage)?;
+        tracing::info!(
+            db_path = %opts.db_path.display(),
+            inserted_conversations = scan_canonical_mutations.inserted_conversations,
+            inserted_messages = scan_canonical_mutations.inserted_messages,
+            post_scan_conversations,
+            post_scan_messages,
+            "re-deriving exact canonical totals after the pre-scan authoritative lexical repair because this run's follow-up scan ingested new rows; the rebuild's checkpoint predates them"
+        );
+        record_exact_total_counts_in_progress(
+            opts.progress.as_ref(),
+            post_scan_conversations,
+            post_scan_messages,
+        );
+        exact_completed_lexical_checkpoint = false;
     }
     let exact_total_counts = exact_total_counts_from_progress(opts.progress.as_ref());
     if exact_completed_lexical_checkpoint && exact_total_counts.is_some() {
@@ -16052,19 +17124,63 @@ pub fn run_index(
                 .as_deref(),
         )
         .flatten();
-    if let Some(repair) = repair_fallback_fts_after_full_index_run(
+    // #439: the fallback-FTS shadow maintenance below is the last heavy step
+    // of a `--full` run and it runs AFTER the lexical generation is published
+    // with every progress counter parked at phase 0 / `current == total`. To
+    // the stall watchdog that is the #297 finalize-wedge shape, and on a
+    // large corpus (the report: 640k messages) the shadow rebuild alone runs
+    // past the base 300 s abort — killing a run whose index is already
+    // complete and healthy. Two signals cover it: the per-page heartbeat
+    // ticks `activity` while rows stream (so an active rebuild never even
+    // reports), and `finalizing` grants the bounded finalize-class grace for
+    // the parity probes that cannot tick (a COUNT over the FTS shadow).
+    if should_repair_fallback_fts_after_full_index_run(opts.full, canonical_only_full_rebuild) {
+        if let Some(progress) = opts.progress.as_ref() {
+            progress.finalizing.store(true, Ordering::Relaxed);
+            progress.tick_activity();
+        }
+        if let Err(err) = index_run_lock.set_phase(initial_lock_mode, "fts:fallback_repair") {
+            tracing::debug!(
+                error = %err,
+                "fallback FTS repair phase breadcrumb write failed (continuing)"
+            );
+        }
+    }
+    let fallback_fts_heartbeat: Option<Box<dyn Fn() + Send + Sync>> = {
+        let progress = opts.progress.clone();
+        let progress_bump = Arc::clone(&progress_bump);
+        Some(Box::new(move || {
+            if let Some(progress) = progress.as_ref() {
+                progress.tick_activity();
+            }
+            bump_index_run_lock_progress_atomic(&progress_bump);
+        }))
+    };
+    let fallback_fts_repair = repair_fallback_fts_after_full_index_run(
         &storage,
         &opts.db_path,
         opts.full,
         canonical_only_full_rebuild,
         fallback_fts_archive_fingerprint,
-    )
-    .with_context(|| {
+        fallback_fts_heartbeat,
+    );
+    if let Some(progress) = opts.progress.as_ref() {
+        progress.tick_activity();
+        // The final WAL checkpoint below re-arms `finalizing` for its own
+        // window; keep the flag scoped to the work it describes.
+        progress.finalizing.store(false, Ordering::Relaxed);
+    }
+    if let Some(repair) = fallback_fts_repair.with_context(|| {
         format!(
             "repairing frankensqlite-owned fallback FTS after full index run for {}",
             opts.db_path.display()
         )
     })? {
+        // #434 defect 3: track consecutive IDENTICAL derived-FTS corruption
+        // failures across runs. `Some(detail)` marks this run's repair attempt
+        // as the corruption class; any other attempted outcome resets the
+        // chain below.
+        let mut fts_repair_corruption_failure: Option<String> = None;
         match repair {
             FallbackFtsRepairOutcome::SkippedKnownHealthyForFingerprint {
                 archive_fingerprint,
@@ -16088,12 +17204,22 @@ pub fn run_index(
                     error = %detail,
                     "derived fallback FTS remains corrupt after its best-effort repair; preserving the successful canonical SQLite and Tantivy build. Run 'cass doctor check --json' before an explicit fallback-FTS rebuild"
                 );
+                fts_repair_corruption_failure = Some(detail);
             }
             FallbackFtsRepairOutcome::SkippedRepairFailed { detail } => {
                 tracing::warn!(
                     db_path = %opts.db_path.display(),
                     error = %detail,
                     "optional derived fallback FTS repair failed; preserving the successful canonical SQLite and Tantivy build (#329). Lexical search is served by Tantivy; run 'cass doctor check --json' to inspect the shadow, and 'cass doctor --rebuild-canonical-fts --yes' for an explicit repair"
+                );
+                fts_repair_corruption_failure = Some(detail);
+            }
+            FallbackFtsRepairOutcome::SkippedNotViable { detail } => {
+                tracing::warn!(
+                    db_path = %opts.db_path.display(),
+                    detail = %detail,
+                    "derived fallback FTS shadow stays dropped: the corpus exceeds the shadow bound \
+                     (GH #413); Quill lexical search is unaffected"
                 );
             }
             FallbackFtsRepairOutcome::Repaired(FtsConsistencyRepair::AlreadyHealthy { rows }) => {
@@ -16121,6 +17247,46 @@ pub fn run_index(
                     "rebuilt fallback FTS after full index run"
                 );
             }
+        }
+        // #434 defect 3: a derived FTS repair that fails IDENTICALLY on run
+        // after run must not stay warn-and-exit-0 forever. Persist the streak
+        // in the index state dir; once it reaches
+        // FTS_REPAIR_FAILURE_ESCALATION_RUNS, a non-watch run exits non-zero
+        // (the canonical + Tantivy work is already published and durable — the
+        // exit code is the escalation signal for cron/automation). A watch
+        // daemon logs the escalation instead of crash-looping.
+        match fts_repair_corruption_failure {
+            Some(detail) => {
+                let streak = record_fts_repair_failure_streak(&index_path, &detail);
+                let watch_mode = opts.watch || opts.watch_once_paths.is_some();
+                if streak >= FTS_REPAIR_FAILURE_ESCALATION_RUNS {
+                    if watch_mode {
+                        tracing::warn!(
+                            db_path = %opts.db_path.display(),
+                            consecutive_identical_failures = streak,
+                            escalation_threshold_runs = FTS_REPAIR_FAILURE_ESCALATION_RUNS,
+                            "the optional derived fallback FTS repair keeps failing identically; a non-watch 'cass index' would now exit non-zero (#434). Run 'cass doctor --rebuild-canonical-fts --yes --json' for an explicit repair"
+                        );
+                    } else {
+                        reset_progress_to_idle(opts.progress.as_ref());
+                        anyhow::bail!(
+                            "the optional derived fallback FTS repair has failed identically on {streak} consecutive index runs (escalation threshold: {FTS_REPAIR_FAILURE_ESCALATION_RUNS}; #434). \
+                             This run's canonical rows and Tantivy lexical index completed and search still works — the non-zero exit exists so automation notices the persistent shadow-FTS corruption instead of an identical warning every run. \
+                             Run 'cass doctor check --json' to inspect the shadow and 'cass doctor --rebuild-canonical-fts --yes --json' for an explicit repair; any run whose repair succeeds (or fails differently) resets the counter in {}. \
+                             Last failure: {detail}",
+                            fts_repair_failure_streak_path(&index_path).display()
+                        );
+                    }
+                } else if streak > 1 {
+                    tracing::warn!(
+                        db_path = %opts.db_path.display(),
+                        consecutive_identical_failures = streak,
+                        escalation_threshold_runs = FTS_REPAIR_FAILURE_ESCALATION_RUNS,
+                        "the optional derived fallback FTS repair has now failed identically on consecutive runs; 'cass index' escalates to a non-zero exit at the threshold (#434)"
+                    );
+                }
+            }
+            None => clear_fts_repair_failure_streak(&index_path),
         }
     } else if opts.full {
         tracing::info!(
@@ -16188,12 +17354,13 @@ pub fn run_index(
         let t_index = Mutex::new(if should_preopen_tantivy_for_watch {
             Some(match t_index {
                 Some(t_index) => t_index,
-                None => TantivyIndex::open_or_create(&index_path).with_context(|| {
-                    format!(
-                        "opening Tantivy index before entering watch mode for {}",
-                        index_path.display()
-                    )
-                })?,
+                None => open_lexical_index_with_heartbeat(&index_path, opts.progress.as_ref())
+                    .with_context(|| {
+                        format!(
+                            "opening Tantivy index before entering watch mode for {}",
+                            index_path.display()
+                        )
+                    })?,
             })
         } else {
             t_index
@@ -16260,8 +17427,10 @@ pub fn run_index(
             event_channel,
             stale_detector,
             opts.watch_interval_secs,
+            deferred_watch_sources,
             move |paths, roots, is_rebuild| {
                 let mut semantic_delta = WatchSemanticDelta::default();
+                let active_source_filter = ActiveSessionSourceFilter::new(!watch_once_mode);
                 let indexed = if is_rebuild {
                     if let Ok(mut g) = state.lock() {
                         g.clear();
@@ -16274,7 +17443,7 @@ pub fn run_index(
                     // For rebuild, trigger reindex on all active roots
                     let all_root_paths: Vec<PathBuf> =
                         roots.iter().map(|(_, root)| root.path.clone()).collect();
-                    let indexed = reindex_paths(
+                    let indexed = reindex_paths_with_semantic_delta(
                         &opts_clone,
                         all_root_paths,
                         roots,
@@ -16283,13 +17452,15 @@ pub fn run_index(
                         &t_index,
                         &index_path_for_watch,
                         true,
+                        None,
+                        &active_source_filter,
                     );
                     finalize_watch_reindex_result(
                         indexed,
                         &detector_clone,
                         opts_clone.progress.as_ref(),
                         "watch rebuild reindex",
-                    )
+                    )?
                 } else if watch_once_mode {
                     let indexed = finalize_watch_once_reindex_result(
                         reindex_paths_with_semantic_delta(
@@ -16302,6 +17473,7 @@ pub fn run_index(
                             &index_path_for_watch,
                             false,
                             semantic_enabled.then_some(&mut semantic_delta),
+                            &active_source_filter,
                         ),
                         &detector_clone,
                         opts_clone.progress.as_ref(),
@@ -16351,11 +17523,12 @@ pub fn run_index(
                             &index_path_for_watch,
                             false,
                             semantic_enabled.then_some(&mut semantic_delta),
+                            &active_source_filter,
                         ),
                         &detector_clone,
                         opts_clone.progress.as_ref(),
                         "watch incremental reindex",
-                    );
+                    )?;
 
                     // Merge Tantivy segments if idle conditions are met.
                     // Without this, each reindex_paths() commit creates a new
@@ -16450,12 +17623,11 @@ pub fn run_index(
                     }
                 }
 
-                Ok(())
+                Ok(active_source_filter.take_deferred_sources())
             },
         );
 
-        let close_result =
-        release_watch_storage_after_index(
+        let close_result = release_watch_storage_after_index(
             storage,
             &opts.db_path,
             "watch indexing session",
@@ -16475,21 +17647,36 @@ pub fn run_index(
         return Ok(());
     }
 
-    // #319/#321: `close_storage_after_index` runs the final WAL checkpoint of
-    // the deferred bulk-ingest WAL — a synchronous, `!Send` frankensqlite
-    // `conn.close()` + `wal_checkpoint(TRUNCATE)` that executes on THIS thread
-    // and cannot report progress. On a large corpus (the report: ~1.1 GB /
-    // ~290k-frame WAL) it legitimately takes minutes, especially on macOS.
-    // Signal the stall watchdog that we have entered that finalize window so it
-    // does not misread the quiescent, phase-0, current==total state as a #297
-    // finalize wedge and kill the process (exit 70) mid-checkpoint — which would
-    // strand the un-truncated WAL and leave the DB malformed (#296/#321). The
-    // watchdog still bounds this window (see `index_finalize_abort_threshold`),
+    // #319/#321: close_storage_after_index enters the post-publish finalize
+    // window. Closing the storage handle and supervising the native WAL
+    // checkpoint are heavy operations on large archives. The checkpoint runs
+    // in a disposable worker so a deadline can kill and reap any DB-owning
+    // child without detaching it, while the watchdog recognizes this window
+    // instead of treating its parked counters as a finalize wedge.
+    // The watchdog still bounds this window (see index_finalize_abort_threshold),
     // so a genuinely stuck finalize is still aborted.
     if let Some(progress) = opts.progress.as_ref() {
         progress.finalizing.store(true, Ordering::Relaxed);
     }
     close_storage_after_index(storage, &opts.db_path, "index run", opts.progress.as_ref())
+}
+
+/// Close a write handle the way `cass index` closes its own: restore the
+/// checkpoint policy, close, then `wal_checkpoint(TRUNCATE)` on a fresh
+/// handle so the sidecar does not outlive the command that filled it.
+///
+/// WS-B.5 (z2uon): every mutating command that is not an index run —
+/// analytics rebuilds, doctor repairs, quarantine retries — used to drop its
+/// handle and leave the WAL for the next opener to replay. The owner's archive
+/// carried a 200 MB WAL for 18 days that way, and every default search paid
+/// for it. A blocked, timed-out, unavailable, or failed checkpoint is an error;
+/// callers must retain the failure state and retry on a later invocation.
+pub(crate) fn close_storage_with_wal_checkpoint(
+    storage: FrankenStorage,
+    db_path: &Path,
+    context: &str,
+) -> Result<()> {
+    close_storage_after_index(storage, db_path, context, None)
 }
 
 fn close_storage_after_index(
@@ -16498,36 +17685,65 @@ fn close_storage_after_index(
     context: &str,
     progress: Option<&Arc<IndexingProgress>>,
 ) -> Result<()> {
-    if let Some(progress) = progress {
-        progress.finalizing.store(true, Ordering::Relaxed);
-    }
-
-    // Keep the progress state truthful even when storage close or the final
-    // checkpoint fails. The caller's `RunIndexProgressReset` also resets the
-    // state, but watch/no-op close paths can call this helper directly.
-    let result = (|| {
-        prepare_storage_for_final_checkpoint(&storage, db_path, context);
-        storage.close().with_context(|| {
-            format!(
-                "closing canonical db before final WAL checkpoint after {context}: {}",
-                db_path.display()
-            )
-        })?;
-        // A blocked outcome is a valid close result only when it is retained in
-        // the structured response. It must never disappear behind `map(|_| ())`.
-        let outcome = run_final_wal_checkpoint(db_path, context)?;
-        if let Some(progress) = progress {
-            if let Ok(mut stats) = progress.stats.lock() {
-                stats.final_wal_checkpoint = Some(outcome.into());
-            }
+    prepare_storage_for_final_checkpoint(&storage, db_path, context);
+    storage.close().with_context(|| {
+        format!(
+            "closing canonical db before final WAL checkpoint after {context}: {}",
+            db_path.display()
+        )
+    })?;
+    // The storage handle is already closed here, but another reader or a
+    // worker failure can still prevent the bounded checkpoint from completing.
+    // Keep that outcome attached to the index progress and propagate it so the
+    // caller never publishes a false success.
+    // GH #382 / g3zyo: bounded. On an archive whose frankensqlite writable path
+    // loops (the disowned-page reclaim sweep rescans the WAL per ledger page)
+    // this checkpoint never returned, so every index run hung *after* a
+    // successful publish and every stale-on-read refresh died here. The publish
+    // is durable before this point and an un-truncated WAL costs the next
+    // opener a replay, never data — so a checkpoint that outlives its budget is
+    // reported as a failure and retried by the next invocation.
+    let timeout = final_wal_checkpoint_timeout();
+    let report = FinalWalCheckpointReport::from_attempt(
+        run_bounded_native_wal_checkpoint(db_path.to_path_buf(), timeout, context),
+        timeout,
+    );
+    match &report {
+        FinalWalCheckpointReport::TimedOut { timeout_secs } => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                context,
+                timeout_secs,
+                "final WAL checkpoint exceeded its budget; index finalization failed and the WAL was left for the next opener"
+            );
         }
-        Ok(())
-    })();
-
-    if let Some(progress) = progress {
-        progress.finalizing.store(false, Ordering::Relaxed);
+        FinalWalCheckpointReport::WorkerUnavailable { error } => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                context,
+                %error,
+                "final WAL checkpoint worker was unavailable; index finalization failed and the WAL was left for the next opener"
+            );
+        }
+        _ => {}
     }
-    result
+    set_progress_final_wal_checkpoint(progress, Some(report.clone()));
+    report.require_success(context)
+}
+
+/// Wall-clock budget for the index run's final WAL checkpoint.
+/// (GH #382 / g3zyo). The 900 s default stays below the finalize stall abort
+/// (1800 s), so a looping checkpoint is terminated, reaped, and reported as a
+/// failure instead of leaving an orphan worker or turning into an exit-70 abort.
+/// A value of zero falls back to the default rather than disabling the bound.
+fn final_wal_checkpoint_timeout() -> Duration {
+    const DEFAULT_SECS: u64 = 900;
+    let secs = dotenvy::var("CASS_INDEX_FINAL_WAL_CHECKPOINT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_SECS);
+    Duration::from_secs(secs)
 }
 
 fn prepare_storage_for_final_checkpoint(storage: &FrankenStorage, db_path: &Path, context: &str) {
@@ -16544,6 +17760,7 @@ fn prepare_storage_for_final_checkpoint(storage: &FrankenStorage, db_path: &Path
     }
 }
 
+pub const FINAL_WAL_CHECKPOINT_WORKER_ARG: &str = "__cass-finalize-wal-checkpoint";
 /// Result of a `PRAGMA wal_checkpoint(TRUNCATE)` issued during index finalize
 /// or the bounded stall-abort path.
 ///
@@ -16552,8 +17769,8 @@ fn prepare_storage_for_final_checkpoint(storage: &FrankenStorage, db_path: &Path
 /// truncate the WAL, so the canonical DB is still a replay dependency on a
 /// large `*.db-wal` and stock `PRAGMA integrity_check` will fail. Callers must
 /// not report such a checkpoint as success.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FinalWalCheckpointOutcome {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FinalWalCheckpointOutcome {
     /// The WAL was fully checkpointed and truncated (`busy == 0` and every
     /// logged frame was backfilled).
     Completed,
@@ -16566,25 +17783,74 @@ enum FinalWalCheckpointOutcome {
     },
 }
 
-impl From<FinalWalCheckpointOutcome> for FinalWalCheckpointStats {
-    fn from(outcome: FinalWalCheckpointOutcome) -> Self {
-        match outcome {
-            FinalWalCheckpointOutcome::Completed => Self {
-                status: "completed".to_string(),
-                busy: None,
-                log_frames: None,
-                checkpointed_frames: None,
+/// Structured finalization result exposed by the index JSON summary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum FinalWalCheckpointReport {
+    Completed,
+    NotNeeded {
+        reason: String,
+    },
+    Blocked {
+        busy: i64,
+        log_frames: i64,
+        checkpointed_frames: i64,
+    },
+    TimedOut {
+        timeout_secs: u64,
+    },
+    WorkerUnavailable {
+        error: String,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+impl FinalWalCheckpointReport {
+    fn from_attempt(attempt: AbortWalCheckpointAttempt, timeout: Duration) -> Self {
+        match attempt {
+            AbortWalCheckpointAttempt::Finished(Ok(outcome)) => match outcome {
+                FinalWalCheckpointOutcome::Completed => Self::Completed,
+                FinalWalCheckpointOutcome::Blocked {
+                    busy,
+                    log_frames,
+                    checkpointed_frames,
+                } => Self::Blocked {
+                    busy,
+                    log_frames,
+                    checkpointed_frames,
+                },
             },
-            FinalWalCheckpointOutcome::Blocked {
+            AbortWalCheckpointAttempt::Finished(Err(error)) => Self::Failed { error },
+            AbortWalCheckpointAttempt::TimedOut => Self::TimedOut {
+                timeout_secs: timeout.as_secs(),
+            },
+            AbortWalCheckpointAttempt::WorkerUnavailable(error) => {
+                Self::WorkerUnavailable { error }
+            }
+        }
+    }
+
+    fn require_success(&self, context: &str) -> Result<()> {
+        match self {
+            Self::Completed | Self::NotNeeded { .. } => Ok(()),
+            Self::Blocked {
                 busy,
                 log_frames,
                 checkpointed_frames,
-            } => Self {
-                status: "blocked".to_string(),
-                busy: Some(busy),
-                log_frames: Some(log_frames),
-                checkpointed_frames: Some(checkpointed_frames),
-            },
+            } => Err(anyhow::anyhow!(
+                "final WAL checkpoint after {context} did not complete: blocked (busy={busy}, log_frames={log_frames}, checkpointed_frames={checkpointed_frames})"
+            )),
+            Self::TimedOut { timeout_secs } => Err(anyhow::anyhow!(
+                "final WAL checkpoint after {context} timed out after {timeout_secs}s; the WAL was left for the next opener"
+            )),
+            Self::WorkerUnavailable { error } => Err(anyhow::anyhow!(
+                "final WAL checkpoint after {context} worker was unavailable: {error}; the WAL was left for the next opener"
+            )),
+            Self::Failed { error } => Err(anyhow::anyhow!(
+                "final WAL checkpoint after {context} failed: {error}"
+            )),
         }
     }
 }
@@ -16600,24 +17866,55 @@ enum AbortWalCheckpointAttempt {
 
 const ABORT_WAL_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Run the pre-abort checkpoint on a disposable worker and wait only for the
-/// supplied deadline. The watchdog is supervising a process whose indexer
-/// thread is already proven wedged; running another database open/checkpoint
-/// synchronously on the watchdog thread can block behind that same owner and
-/// defeat the promised bounded exit.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug)]
+struct WalCheckpointCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl WalCheckpointCancellation {
+    fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+/// Run a bounded, cooperative finalization callback and always join its worker.
+///
+/// The callback receives a cancellation token and must poll it at every
+/// potentially blocking step. Native fsqlite finalization is not
+/// cancellable, so production callers use the process-contained helper below;
+/// this thread helper is reserved for cooperative work and deterministic tests.
+/// No return path detaches a worker that may still hold the database or WAL.
 fn run_bounded_abort_wal_checkpoint<F>(
     db_path: PathBuf,
     timeout: Duration,
     checkpoint: F,
 ) -> AbortWalCheckpointAttempt
 where
-    F: FnOnce(&Path) -> Result<FinalWalCheckpointOutcome> + Send + 'static,
+    F: FnOnce(&Path, &WalCheckpointCancellation) -> Result<FinalWalCheckpointOutcome>
+        + Send
+        + 'static,
 {
+    let cancellation = WalCheckpointCancellation::new();
+    let worker_cancellation = cancellation.clone();
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
-    let _worker = match std::thread::Builder::new()
+    let worker = match std::thread::Builder::new()
         .name("cass-abort-wal-checkpoint".to_string())
         .spawn(move || {
-            let result = checkpoint(&db_path).map_err(|err| format!("{err:#}"));
+            let result =
+                checkpoint(&db_path, &worker_cancellation).map_err(|err| format!("{err:#}"));
             let _ = result_tx.send(result);
         }) {
         Ok(worker) => worker,
@@ -16625,14 +17922,172 @@ where
     };
 
     match result_rx.recv_timeout(timeout) {
-        Ok(result) => AbortWalCheckpointAttempt::Finished(result),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => AbortWalCheckpointAttempt::TimedOut,
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            AbortWalCheckpointAttempt::WorkerUnavailable(
-                "checkpoint worker exited without reporting an outcome".to_string(),
-            )
+        Ok(result) => match worker.join() {
+            Ok(()) => AbortWalCheckpointAttempt::Finished(result),
+            Err(payload) => AbortWalCheckpointAttempt::WorkerUnavailable(format!(
+                "checkpoint worker panicked after reporting an outcome: {}",
+                panic_payload_message(payload)
+            )),
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            cancellation.cancel();
+            match worker.join() {
+                Ok(()) => AbortWalCheckpointAttempt::TimedOut,
+                Err(payload) => AbortWalCheckpointAttempt::WorkerUnavailable(format!(
+                    "checkpoint worker panicked while joining after cancellation: {}",
+                    panic_payload_message(payload)
+                )),
+            }
         }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match worker.join() {
+            Ok(()) => AbortWalCheckpointAttempt::WorkerUnavailable(
+                "checkpoint worker exited without reporting an outcome".to_string(),
+            ),
+            Err(payload) => AbortWalCheckpointAttempt::WorkerUnavailable(format!(
+                "checkpoint worker panicked without reporting an outcome: {}",
+                panic_payload_message(payload)
+            )),
+        },
     }
+}
+
+#[cfg(test)]
+fn run_bounded_native_wal_checkpoint(
+    db_path: PathBuf,
+    timeout: Duration,
+    context: &str,
+) -> AbortWalCheckpointAttempt {
+    let worker_context = context.to_string();
+    run_bounded_abort_wal_checkpoint(db_path, timeout, move |path, cancellation| {
+        run_final_wal_checkpoint_with_cancellation(path, &worker_context, cancellation)
+    })
+}
+
+#[cfg(not(test))]
+fn run_bounded_native_wal_checkpoint(
+    db_path: PathBuf,
+    timeout: Duration,
+    context: &str,
+) -> AbortWalCheckpointAttempt {
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(error) => {
+            return AbortWalCheckpointAttempt::WorkerUnavailable(format!(
+                "resolving cass executable for final WAL checkpoint worker: {error}"
+            ));
+        }
+    };
+    run_bounded_native_wal_checkpoint_with_executable(&executable, db_path, timeout, context)
+}
+
+fn run_bounded_native_wal_checkpoint_with_executable(
+    executable: &Path,
+    db_path: PathBuf,
+    timeout: Duration,
+    context: &str,
+) -> AbortWalCheckpointAttempt {
+    let mut child = match Command::new(executable)
+        .arg(FINAL_WAL_CHECKPOINT_WORKER_ARG)
+        .arg(&db_path)
+        .arg(context)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return AbortWalCheckpointAttempt::WorkerUnavailable(format!(
+                "spawning final WAL checkpoint worker {}: {error}",
+                executable.display()
+            ));
+        }
+    };
+
+    let status = match child.wait_timeout(timeout) {
+        Ok(status) => status,
+        Err(error) => {
+            return match terminate_and_reap_wal_checkpoint_child(&mut child) {
+                Ok(()) => AbortWalCheckpointAttempt::WorkerUnavailable(format!(
+                    "waiting for final WAL checkpoint worker failed: {error}"
+                )),
+                Err(reap_error) => AbortWalCheckpointAttempt::WorkerUnavailable(format!(
+                    "waiting for final WAL checkpoint worker failed: {error}; \
+                     terminating and reaping it also failed: {reap_error}"
+                )),
+            };
+        }
+    };
+    let Some(status) = status else {
+        return match terminate_and_reap_wal_checkpoint_child(&mut child) {
+            Ok(()) => AbortWalCheckpointAttempt::TimedOut,
+            Err(error) => AbortWalCheckpointAttempt::WorkerUnavailable(format!(
+                "final WAL checkpoint worker exceeded {} ms and could not be terminated and \
+                 reaped: {error}",
+                timeout.as_millis()
+            )),
+        };
+    };
+
+    let mut stdout = Vec::new();
+    if let Some(mut pipe) = child.stdout.take()
+        && let Err(error) = pipe.read_to_end(&mut stdout)
+    {
+        return AbortWalCheckpointAttempt::WorkerUnavailable(format!(
+            "reading final WAL checkpoint worker stdout failed: {error}"
+        ));
+    }
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stderr.take()
+        && let Err(error) = pipe.read_to_end(&mut stderr)
+    {
+        return AbortWalCheckpointAttempt::WorkerUnavailable(format!(
+            "reading final WAL checkpoint worker stderr failed: {error}"
+        ));
+    }
+
+    if !status.success() {
+        return AbortWalCheckpointAttempt::Finished(Err(format!(
+            "final WAL checkpoint worker exited with {status}: {}",
+            summarize_wal_checkpoint_child_output(&stderr)
+        )));
+    }
+
+    match serde_json::from_slice::<FinalWalCheckpointOutcome>(&stdout) {
+        Ok(outcome) => AbortWalCheckpointAttempt::Finished(Ok(outcome)),
+        Err(error) => AbortWalCheckpointAttempt::WorkerUnavailable(format!(
+            "final WAL checkpoint worker exited successfully without a valid outcome: {error}; \
+             stdout={}; stderr={}",
+            summarize_wal_checkpoint_child_output(&stdout),
+            summarize_wal_checkpoint_child_output(&stderr)
+        )),
+    }
+}
+
+fn terminate_and_reap_wal_checkpoint_child(child: &mut Child) -> std::io::Result<()> {
+    let kill_error = child.kill().err();
+    match child.wait() {
+        Ok(_) => Ok(()),
+        Err(wait_error) => match kill_error {
+            Some(kill_error) => Err(std::io::Error::other(format!(
+                "kill failed: {kill_error}; wait failed: {wait_error}"
+            ))),
+            None => Err(wait_error),
+        },
+    }
+}
+
+fn summarize_wal_checkpoint_child_output(output: &[u8]) -> String {
+    const MAX_OUTPUT_CHARS: usize = 1024;
+    let output = String::from_utf8_lossy(output).trim().to_string();
+    if output.is_empty() {
+        return "<empty>".to_string();
+    }
+    let mut summary = output.chars().take(MAX_OUTPUT_CHARS).collect::<String>();
+    if output.chars().count() > MAX_OUTPUT_CHARS {
+        summary.push_str("...");
+    }
+    summary
 }
 
 /// Classify a `wal_checkpoint` status row `(busy, log_frames, checkpointed)`.
@@ -16648,8 +18103,9 @@ fn classify_final_wal_checkpoint(
     log_frames: i64,
     checkpointed_frames: i64,
 ) -> FinalWalCheckpointOutcome {
+    let invalid_status = busy < 0 || log_frames < 0 || checkpointed_frames < 0;
     let left_frames_uncheckpointed = log_frames > 0 && checkpointed_frames < log_frames;
-    if busy > 0 || left_frames_uncheckpointed {
+    if busy != 0 || invalid_status || left_frames_uncheckpointed {
         FinalWalCheckpointOutcome::Blocked {
             busy,
             log_frames,
@@ -16669,7 +18125,7 @@ fn classify_final_wal_checkpoint(
 /// canonical DB file (the wedged storage handle's workers are parked, but the
 /// file itself is checkpointable through a new connection) and runs
 /// `wal_checkpoint(TRUNCATE)` so the post-abort DB is recoverable by stock
-/// SQLite. The fresh checkpoint itself is supervised from a disposable thread
+/// SQLite. The fresh checkpoint itself is supervised by a child cass process
 /// and gets only [`ABORT_WAL_CHECKPOINT_TIMEOUT`]: the still-live wedged writer
 /// can otherwise block the fresh open/checkpoint indefinitely and turn the
 /// watchdog's promised exit into another hang. Everything is best-effort; a
@@ -16690,9 +18146,11 @@ pub fn best_effort_abort_wal_checkpoint(data_dir: &Path) {
     if !db_path.exists() {
         return;
     }
-    match run_bounded_abort_wal_checkpoint(db_path.clone(), ABORT_WAL_CHECKPOINT_TIMEOUT, |path| {
-        run_final_wal_checkpoint(path, "stall abort")
-    }) {
+    match run_bounded_native_wal_checkpoint(
+        db_path.clone(),
+        ABORT_WAL_CHECKPOINT_TIMEOUT,
+        "stall abort",
+    ) {
         AbortWalCheckpointAttempt::Finished(Ok(FinalWalCheckpointOutcome::Completed)) => {
             tracing::info!(
                 db_path = %db_path.display(),
@@ -16739,7 +18197,104 @@ pub fn best_effort_abort_wal_checkpoint(data_dir: &Path) {
     }
 }
 
+/// Run one `wal_checkpoint(TRUNCATE)` on a fresh handle and report whether
+/// the WAL was actually truncated (`Ok(true)`) or left in place because a
+/// concurrent reader/writer pinned it (`Ok(false)`). For repair surfaces
+/// (`doctor --fix`, WS-B.5) that must tell the operator the truth about an
+/// oversized sidecar rather than claim a checkpoint that did not happen.
+/// Test hook: park every `wal_checkpoint(TRUNCATE)` issued through
+/// [`run_final_wal_checkpoint`] for this many milliseconds before it opens the
+/// archive, so the deadlines around it (doctor `--fix`, the index run's final
+/// close) can be exercised without an archive whose writable open really
+/// loops (GH #382 needs a multi-GB archive for that).
+pub(crate) const CASS_TEST_WAL_CHECKPOINT_PARK_MS_ENV: &str = "CASS_TEST_WAL_CHECKPOINT_PARK_MS";
+
+/// [`checkpoint_wal_truncate`] with a wall-clock deadline (GH #382, bead
+/// g3zyo). On the owner-scale archive with a 200 MB WAL, frankensqlite's
+/// writable open never returns, which turned `cass doctor --fix` into an
+/// infinite hang. The checkpoint runs on the same disposable worker as the
+/// stall-abort checkpoint; if it has not finished by `deadline`, the child is
+/// killed and reaped before the caller receives a timeout and its out-of-band
+/// remedy. No DB/WAL-holding worker survives that deadline, and the caller
+/// receives a truthful terminal state even when the native operation cannot be
+/// cancelled.
+pub(crate) fn checkpoint_wal_truncate_with_deadline(
+    db_path: &Path,
+    context: &str,
+    deadline: Duration,
+) -> Result<bool> {
+    match run_bounded_native_wal_checkpoint(db_path.to_path_buf(), deadline, context) {
+        AbortWalCheckpointAttempt::Finished(Ok(outcome)) => {
+            Ok(matches!(outcome, FinalWalCheckpointOutcome::Completed))
+        }
+        AbortWalCheckpointAttempt::Finished(Err(error)) => Err(anyhow::anyhow!("{error}")),
+        AbortWalCheckpointAttempt::TimedOut => Err(anyhow::anyhow!(
+            "WAL checkpoint did not complete within {} s; on a large archive this means the \
+             writable open is looping on the WAL (GH #382): back up {} and its -wal/-shm \
+             sidecars, then checkpoint with stock sqlite3 (`PRAGMA wal_checkpoint(TRUNCATE)`)",
+            deadline.as_secs(),
+            db_path.display()
+        )),
+        AbortWalCheckpointAttempt::WorkerUnavailable(error) => Err(anyhow::anyhow!(
+            "WAL checkpoint worker was unavailable after {context}: {error}"
+        )),
+    }
+}
+
+#[doc(hidden)]
+pub fn run_final_wal_checkpoint_worker(
+    db_path: &Path,
+    context: &str,
+) -> Result<FinalWalCheckpointOutcome> {
+    run_final_wal_checkpoint(db_path, context)
+}
+
+#[cfg(test)]
+fn run_final_wal_checkpoint_with_cancellation(
+    db_path: &Path,
+    context: &str,
+    cancellation: &WalCheckpointCancellation,
+) -> Result<FinalWalCheckpointOutcome> {
+    run_final_wal_checkpoint_inner(db_path, context, Some(cancellation))
+}
+
 fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<FinalWalCheckpointOutcome> {
+    run_final_wal_checkpoint_inner(db_path, context, None)
+}
+
+fn run_final_wal_checkpoint_inner(
+    db_path: &Path,
+    context: &str,
+    cancellation: Option<&WalCheckpointCancellation>,
+) -> Result<FinalWalCheckpointOutcome> {
+    if let Some(park_ms) = dotenvy::var(CASS_TEST_WAL_CHECKPOINT_PARK_MS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+    {
+        let deadline = Instant::now() + Duration::from_millis(park_ms);
+        loop {
+            if cancellation.is_some_and(|cancellation| cancellation.is_cancelled()) {
+                anyhow::bail!(
+                    "final WAL checkpoint canceled before opening {}",
+                    db_path.display()
+                );
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            if remaining.is_zero() {
+                break;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        }
+    }
+    if cancellation.is_some_and(|cancellation| cancellation.is_cancelled()) {
+        anyhow::bail!(
+            "final WAL checkpoint canceled before opening {}",
+            db_path.display()
+        );
+    }
     // Run this after closing the indexing storage handle: frankensqlite flushes
     // retained autocommit writes during close, and TRUNCATE avoids leaving the
     // completed bulk-ingest WAL for the next opener to replay.
@@ -16758,9 +18313,14 @@ fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<FinalWalChe
             db_path.display()
         )
     });
-    let outcome = checkpoint_result?;
-    close_result?;
-    Ok(outcome)
+    match (checkpoint_result, close_result) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Err(checkpoint_error), Ok(())) => Err(checkpoint_error),
+        (Ok(_), Err(close_error)) => Err(close_error),
+        (Err(checkpoint_error), Err(close_error)) => Err(anyhow::anyhow!(
+            "final WAL checkpoint failed: {checkpoint_error:#}; closing its connection also failed: {close_error:#}"
+        )),
+    }
 }
 
 fn query_final_wal_checkpoint(
@@ -17925,9 +19485,7 @@ fn incompatible_legacy_fts_shadow_problem(storage: &FrankenStorage) -> Result<Op
 /// b-trees, but it does not understand the payload stored inside `%_data`, so
 /// it can report `ok` for the exact corrupt-segment shape seen in GH #374.
 /// The special command is read-only despite its INSERT syntax.
-fn canonical_fts_segment_integrity_problem(
-    storage: &FrankenStorage,
-) -> Result<Option<String>> {
+fn canonical_fts_segment_integrity_problem(storage: &FrankenStorage) -> Result<Option<String>> {
     let fts_exists = storage
         .raw()
         .query_row_map(
@@ -17946,15 +19504,43 @@ fn canonical_fts_segment_integrity_problem(
         .execute("INSERT INTO fts_messages(fts_messages) VALUES('integrity-check')")
     {
         Ok(_) => Ok(None),
-        Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
-            Err(anyhow::anyhow!(
-                "full rebuild FTS segment integrity preflight hit transient storage contention: {err}"
-            ))
-        }
-        Err(err) => Ok(Some(format!(
-            "FTS5 segment integrity-check failed: {err}"
-        ))),
+        Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => Err(anyhow::anyhow!(
+            "full rebuild FTS segment integrity preflight hit transient storage contention: {err}"
+        )),
+        Err(err) => Ok(Some(format!("FTS5 segment integrity-check failed: {err}"))),
     }
+}
+
+/// Return whether a database is the marker-only state left by an interrupted
+/// first schema migration.
+///
+/// `MigrationRunner` creates `_schema_migrations` before running the first
+/// migration transaction. If the process is SIGKILLed while that transaction
+/// is still creating the fresh schema, the marker table survives while the
+/// transaction's `meta` and canonical tables correctly roll back. This is a
+/// resumable empty database, not an existing archive whose canonical rows may
+/// be discarded. Keep the classification deliberately exact: any additional
+/// schema object, or any recorded migration, remains on the fail-closed
+/// archive-health path below.
+fn is_interrupted_fresh_schema_archive(storage: &FrankenStorage) -> Result<bool> {
+    let objects = storage.raw().query_map_collect(
+        "SELECT type, name
+         FROM sqlite_master
+         WHERE name NOT LIKE 'sqlite_%'
+         ORDER BY type, name",
+        &[] as &[ParamValue],
+        |row| Ok((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?)),
+    )?;
+    if objects != vec![("table".to_string(), "_schema_migrations".to_string())] {
+        return Ok(false);
+    }
+
+    let applied_migrations = storage.raw().query_row_map(
+        "SELECT COUNT(*) FROM _schema_migrations",
+        &[] as &[ParamValue],
+        |row| row.get_typed::<i64>(0),
+    )?;
+    Ok(applied_migrations == 0)
 }
 
 fn full_rebuild_existing_storage_integrity_problem(
@@ -17971,6 +19557,13 @@ fn full_rebuild_existing_storage_integrity_problem(
         return Ok(None);
     }
 
+    if is_interrupted_fresh_schema_archive(storage)? {
+        tracing::info!(
+            "full rebuild found an empty interrupted schema bootstrap; allowing the normal migration path to resume it"
+        );
+        return Ok(None);
+    }
+
     match incompatible_legacy_fts_shadow_problem(storage) {
         Ok(Some(problem)) => return Ok(Some(problem)),
         Ok(None) => {}
@@ -17980,9 +19573,7 @@ fn full_rebuild_existing_storage_integrity_problem(
             ));
         }
         Err(err) => {
-            return Ok(Some(format!(
-                "FTS shadow-schema preflight failed: {err:#}"
-            )));
+            return Ok(Some(format!("FTS shadow-schema preflight failed: {err:#}")));
         }
     }
 
@@ -18037,6 +19628,21 @@ fn full_rebuild_existing_storage_integrity_problem(
 }
 
 fn full_rebuild_existing_archive_integrity_preflight(db_path: &Path) -> Result<Option<String>> {
+    full_rebuild_existing_archive_integrity_preflight_with_max_bytes(
+        db_path,
+        index_integrity_preflight_max_bytes(),
+    )
+}
+
+/// Injected-cap half of the read-only full-rebuild preflight (bet45/qu81y):
+/// tests exercise the size gate through this parameter instead of mutating
+/// process-global CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES, which under
+/// parallel scheduling leaked into sibling preflight tests and made their
+/// detection silently skip.
+fn full_rebuild_existing_archive_integrity_preflight_with_max_bytes(
+    db_path: &Path,
+    max_bytes: u64,
+) -> Result<Option<String>> {
     let archive_bytes = match fs::metadata(db_path) {
         Ok(metadata) => metadata.len(),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -18057,7 +19663,6 @@ fn full_rebuild_existing_archive_integrity_preflight(db_path: &Path) -> Result<O
     // syntactically tiny sqlite_master or COUNT query can hydrate gigabytes in
     // the current engine, so an after-open/after-query cap is not a bound.
     let bundle_bytes = database_bundle_size_bytes(db_path);
-    let max_bytes = index_integrity_preflight_max_bytes();
     if !should_run_engine_backed_archive_integrity_preflight(Some(bundle_bytes), max_bytes) {
         tracing::warn!(
             db_path = %db_path.display(),
@@ -18081,7 +19686,9 @@ fn full_rebuild_existing_archive_integrity_preflight(db_path: &Path) -> Result<O
         Err(err) => {
             let detail = format!("{err:#}");
             let reason = if detail.to_ascii_lowercase().contains("fts5: corrupt") {
-                format!("FTS5 segment integrity-check failed while opening the canonical archive: {detail}")
+                format!(
+                    "FTS5 segment integrity-check failed while opening the canonical archive: {detail}"
+                )
             } else {
                 format!(
                     "read-only full-rebuild integrity preflight could not open the canonical archive: {detail}"
@@ -18264,7 +19871,7 @@ fn ensure_index_storage_headroom(
     Ok(())
 }
 
-fn index_disk_headroom_check_disabled() -> bool {
+pub(crate) fn index_disk_headroom_check_disabled() -> bool {
     dotenvy::var("CASS_INDEX_SKIP_DISK_HEADROOM_CHECK")
         .map(|value| env_value_truthy(&value))
         .unwrap_or(false)
@@ -18277,7 +19884,11 @@ fn env_value_truthy(value: &str) -> bool {
     )
 }
 
-fn existing_headroom_probe_paths(data_dir: &Path, db_path: &Path) -> Vec<PathBuf> {
+/// The filesystem locations whose free space gates an index run: the data
+/// dir and the database's directory (deduplicated; nearest existing
+/// ancestor when the path does not exist yet). Shared with `doctor` so its
+/// full-rebuild readiness answer probes exactly what `index --full` probes.
+pub(crate) fn existing_headroom_probe_paths(data_dir: &Path, db_path: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::with_capacity(2);
     for candidate in [data_dir, db_path.parent().unwrap_or(db_path)] {
         if let Some(existing) = nearest_existing_path(candidate) {
@@ -18337,34 +19948,225 @@ fn required_index_headroom_bytes(
     match requirement {
         IndexStorageHeadroomRequirement::IncrementalStartup => INDEX_MIN_FREE_SPACE_BYTES,
         IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild => {
-            // An authoritative rebuild writes a *second* full lexical index (plus
-            // staged shard/merge scratch) while the existing one is still on
-            // disk, so the db bundle alone badly under-projects the requirement.
-            //
-            // Sizing this as `db_bundle * 2` (the pre-2026-07 formula) let a real
-            // rebuild run a filesystem to 0 bytes: on a host with a 25 GB db and a
-            // 57 GB lexical index the check required 50 GB, passed against 113 GB
-            // free, then consumed ~115 GB and died on `disk I/O error (10)`.
-            // Counting the lexical index makes that case fail the preflight
-            // instead of failing mid-commit.
-            let db_bundle_bytes = database_bundle_size_bytes(db_path);
-            let lexical_bytes = lexical_index_size_bytes(data_dir);
-            let projected = db_bundle_bytes
-                .saturating_mul(2)
-                .saturating_add(lexical_bytes.saturating_mul(2));
-            INDEX_MIN_FREE_SPACE_BYTES.max(projected)
+            full_rebuild_headroom_projection(data_dir, db_path).required_bytes
         }
     }
 }
 
-/// Total bytes of the on-disk lexical index, or 0 when it does not exist yet.
+/// Human-readable statement of the full-rebuild headroom rule, reported by
+/// `doctor` next to the numbers so an agent can see *why* a rebuild is
+/// blocked. Keep in sync with [`full_rebuild_headroom_projection`].
+/// `lexical_index_bytes` is the LIVE lexical footprint (see
+/// [`LexicalIndexFootprint::live_bytes`]).
+pub(crate) const FULL_REBUILD_HEADROOM_FORMULA: &str =
+    "max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2)";
+
+/// The inputs and result of the full-rebuild headroom rule, so `doctor` can
+/// report the same requirement `index --full` / `--force-rebuild` enforces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FullRebuildHeadroomProjection {
+    /// Bytes that must be free at every probe path for the rebuild to start.
+    pub(crate) required_bytes: u64,
+    /// The absolute floor (`INDEX_MIN_FREE_SPACE_BYTES`).
+    pub(crate) floor_bytes: u64,
+    /// `agent_search.db` plus its `-wal`/`-shm` sidecars.
+    pub(crate) db_bundle_bytes: u64,
+    /// Live on-disk size of the lexical index tree: the bytes a rebuild has
+    /// to write a second copy of ([`LexicalIndexFootprint::live_bytes`]).
+    pub(crate) lexical_index_bytes: u64,
+    /// Merge-retired segment files still on disk under the lexical index
+    /// ([`LexicalIndexFootprint::retired_segment_bytes`]). Already consumed,
+    /// reclaimed by the engine, never rewritten by a rebuild: excluded from
+    /// `required_bytes`.
+    pub(crate) retired_segment_bytes: u64,
+    /// Number of files behind `retired_segment_bytes`.
+    pub(crate) retired_segment_files: usize,
+    /// Prior generations parked under `index/.lexical-publish-backups/`
+    /// ([`LexicalIndexFootprint::retained_backup_bytes`]). A rebuild replaces
+    /// them (retention keeps the newest, `cass doctor cleanup` reclaims the
+    /// rest); excluded from `required_bytes`.
+    pub(crate) retained_backup_bytes: u64,
+}
+
+/// Single source of truth for the authoritative (full) rebuild headroom rule.
+///
+/// An authoritative rebuild writes a *second* full lexical index (plus staged
+/// shard/merge scratch) while the existing one is still on disk, so the db
+/// bundle alone badly under-projects the requirement.
+///
+/// Sizing this as `db_bundle * 2` (the pre-2026-07 formula) let a real
+/// rebuild run a filesystem to 0 bytes: on a host with a 25 GB db and a
+/// 57 GB lexical index the check required 50 GB, passed against 113 GB
+/// free, then consumed ~115 GB and died on `disk I/O error (10)`.
+/// Counting the lexical index makes that case fail the preflight
+/// instead of failing mid-commit.
+///
+/// Only the LIVE lexical bytes count (#453). Merge-retired segment files the
+/// MANIFEST no longer references and prior generations parked under
+/// `.lexical-publish-backups/` are already on disk and are not rewritten by
+/// the rebuild -- the engine sweep and backup retention reclaim them -- so
+/// doubling them would refuse a rebuild the disk can hold. On the archive
+/// that motivated this, 4.2 GB of folded inputs plus a 6.4 GB retained
+/// backup sat next to a 6.8 GB live index; the recursive size demanded
+/// 48 GB and refused, while the rebuild itself needed 37 GB against 43 GB
+/// free.
+pub(crate) fn full_rebuild_headroom_projection(
+    data_dir: &Path,
+    db_path: &Path,
+) -> FullRebuildHeadroomProjection {
+    let db_bundle_bytes = database_bundle_size_bytes(db_path);
+    let footprint = lexical_index_footprint(data_dir);
+    let projected = db_bundle_bytes
+        .saturating_mul(2)
+        .saturating_add(footprint.live_bytes.saturating_mul(2));
+    FullRebuildHeadroomProjection {
+        required_bytes: INDEX_MIN_FREE_SPACE_BYTES.max(projected),
+        floor_bytes: INDEX_MIN_FREE_SPACE_BYTES,
+        db_bundle_bytes,
+        lexical_index_bytes: footprint.live_bytes,
+        retired_segment_bytes: footprint.retired_segment_bytes,
+        retired_segment_files: footprint.retired_segment_files,
+        retained_backup_bytes: footprint.retained_backup_bytes,
+    }
+}
+
+/// On-disk bytes under `<data_dir>/index/`, split by whether a full rebuild
+/// has to reproduce them (#453).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LexicalIndexFootprint {
+    /// Everything a rebuild rewrites: segment files the current MANIFEST
+    /// references, manifests and sidecars, schema markers, staging scratch,
+    /// and any file whose classification is uncertain.
+    pub(crate) live_bytes: u64,
+    /// `seg-*.fslx` files (and `.retired` receipts) inside a readable Quill
+    /// index directory that its MANIFEST no longer references: merge-folded
+    /// inputs the engine unlinks once they have been unreferenced by both
+    /// durable slots for its grace period.
+    pub(crate) retired_segment_bytes: u64,
+    /// Number of unreferenced `seg-*.fslx` files behind `retired_segment_bytes`.
+    pub(crate) retired_segment_files: usize,
+    /// Everything under `index/.lexical-publish-backups/`: prior live
+    /// generations kept for rollback, pruned to the retention cap on the next
+    /// staged publish and reclaimable through `cass doctor cleanup`.
+    pub(crate) retained_backup_bytes: u64,
+}
+
+impl LexicalIndexFootprint {
+    /// Recursive size of the tree, the figure the pre-#453 preflight doubled.
+    #[cfg(test)]
+    pub(crate) fn total_bytes(&self) -> u64 {
+        self.live_bytes
+            .saturating_add(self.retired_segment_bytes)
+            .saturating_add(self.retained_backup_bytes)
+    }
+}
+
+/// Directory under `index/` where staged publishes park the prior live
+/// generation (see `lexical_publish_backups_dir`).
+const LEXICAL_PUBLISH_BACKUPS_DIR_NAME: &str = ".lexical-publish-backups";
+
+/// Outcome of one explicit lexical garbage sweep (`cass index --gc`, #453).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LexicalSegmentGcReport {
+    /// The Quill index directory that was swept.
+    pub index_path: PathBuf,
+    /// Segments the published MANIFEST references after the sweep: the count
+    /// a query pays for.
+    pub live_segments: usize,
+    /// `seg-*.fslx` files on disk before and after the sweep.
+    pub segment_files_before: usize,
+    pub segment_files_after: usize,
+    /// Bytes of MANIFEST-unreferenced segment files (and their receipts)
+    /// before and after the sweep.
+    pub retired_bytes_before: u64,
+    pub retired_bytes_after: u64,
+    /// What the sweep unlinked.
+    pub reclaimed_files: usize,
+    pub reclaimed_bytes: u64,
+    /// The engine's grace period: a retired segment survives at least this
+    /// long after the publication that dropped it from every MANIFEST slot,
+    /// so a reader that opened the previous generation can still finish
+    /// opening its segments.
+    pub grace_secs: u64,
+}
+
+/// Reclaim merge-retired lexical segment files without indexing anything
+/// (`cass index --gc`, #453).
+///
+/// The engine owns the reader-safety rule for unlinking a segment (a file is
+/// removed only once no durable MANIFEST slot has referenced it for the
+/// grace period), so cass never deletes segment files itself: it opens the
+/// lexical writer, which runs that sweep under the writer admission, and
+/// reports the before/after footprint. This is the same sweep every
+/// incremental `cass index` performs at open; the flag exists so an operator
+/// can run it on its own and see what it reclaimed.
+///
+/// # Errors
+///
+/// Fails when no published lexical index exists, when the writer admission
+/// cannot be acquired (another `cass index` holds it), or when the engine
+/// refuses to open the index.
+pub fn run_lexical_segment_gc(data_dir: &Path) -> Result<LexicalSegmentGcReport> {
+    use crate::search::quill_bridge::{
+        QUILL_INDEX_MARKER, QuillCassIndex, quill_directory_footprint, segment_file_count,
+    };
+
+    let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+    if !index_path.join(QUILL_INDEX_MARKER).is_file() {
+        anyhow::bail!(
+            "no published lexical index at {} (run `cass index` first)",
+            index_path.display()
+        );
+    }
+    let before = quill_directory_footprint(&index_path).with_context(|| {
+        format!(
+            "reading the lexical MANIFEST at {} before the sweep",
+            index_path.display()
+        )
+    })?;
+    let segment_files_before = segment_file_count(&index_path).unwrap_or(0);
+
+    // Opening the writer is the sweep: `KeeperWriter::open` witnesses
+    // orphans and collects aged garbage before it hands the writer back.
+    let index = QuillCassIndex::open_or_create(&index_path)
+        .with_context(|| format!("opening the lexical writer at {}", index_path.display()))?;
+    let live_segments = index.segment_count();
+    drop(index);
+
+    let after = quill_directory_footprint(&index_path).with_context(|| {
+        format!(
+            "reading the lexical MANIFEST at {} after the sweep",
+            index_path.display()
+        )
+    })?;
+    let segment_files_after = segment_file_count(&index_path).unwrap_or(0);
+    Ok(LexicalSegmentGcReport {
+        index_path,
+        live_segments,
+        segment_files_before,
+        segment_files_after,
+        retired_bytes_before: before.retired_bytes,
+        retired_bytes_after: after.retired_bytes,
+        reclaimed_files: segment_files_before.saturating_sub(segment_files_after),
+        reclaimed_bytes: before.retired_bytes.saturating_sub(after.retired_bytes),
+        grace_secs: frankensearch::quill::DEFAULT_GARBAGE_GRACE.as_secs(),
+    })
+}
+
+/// Classify every byte under `<data_dir>/index/`, or all zeros when it does
+/// not exist yet.
 ///
 /// Walks explicitly (rather than following symlinks) so a symlinked index dir
-/// cannot make the projection wander outside the data dir.
-fn lexical_index_size_bytes(data_dir: &Path) -> u64 {
-    let mut total = 0u64;
-    let mut stack = vec![data_dir.join(LEXICAL_INDEX_ROOT_DIR)];
-    while let Some(path) = stack.pop() {
+/// cannot make the projection wander outside the data dir. A directory that
+/// holds a readable Quill MANIFEST is split through
+/// [`crate::search::quill_bridge::quill_directory_footprint`]; anything the
+/// manifest cannot vouch for is counted live, because an unreadable manifest
+/// is a reason to over-provision, never to call bytes reclaimable.
+pub(crate) fn lexical_index_footprint(data_dir: &Path) -> LexicalIndexFootprint {
+    let mut footprint = LexicalIndexFootprint::default();
+    // (path, whether an ancestor is the retained-backups directory)
+    let mut stack = vec![(data_dir.join(LEXICAL_INDEX_ROOT_DIR), false)];
+    while let Some((path, in_backups)) = stack.pop() {
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
             continue;
         };
@@ -18372,17 +20174,48 @@ fn lexical_index_size_bytes(data_dir: &Path) -> u64 {
             continue;
         }
         if metadata.is_file() {
-            total = total.saturating_add(metadata.len());
-        } else if metadata.is_dir() {
-            let Ok(entries) = std::fs::read_dir(&path) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                stack.push(entry.path());
+            if in_backups {
+                footprint.retained_backup_bytes = footprint
+                    .retained_backup_bytes
+                    .saturating_add(metadata.len());
+            } else {
+                footprint.live_bytes = footprint.live_bytes.saturating_add(metadata.len());
             }
+            continue;
+        }
+        if !metadata.is_dir() {
+            continue;
+        }
+        let in_backups = in_backups
+            || path
+                .file_name()
+                .is_some_and(|name| name == LEXICAL_PUBLISH_BACKUPS_DIR_NAME);
+        let quill = if in_backups {
+            None
+        } else {
+            crate::search::quill_bridge::quill_directory_footprint(&path)
+        };
+        if let Some(quill) = quill {
+            footprint.live_bytes = footprint.live_bytes.saturating_add(quill.live_bytes);
+            footprint.retired_segment_bytes = footprint
+                .retired_segment_bytes
+                .saturating_add(quill.retired_bytes);
+            footprint.retired_segment_files += quill.retired_segment_files;
+        }
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            // A Quill directory's regular children were already accounted
+            // for through the manifest split; only descend into
+            // subdirectories there.
+            if quill.is_some() && !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            stack.push((entry.path(), in_backups));
         }
     }
-    total
+    footprint
 }
 
 fn database_bundle_size_bytes(db_path: &Path) -> u64 {
@@ -18398,6 +20231,31 @@ fn database_sidecar_paths(db_path: &Path) -> [PathBuf; 2] {
         database_path_with_suffix(db_path, "-wal"),
         database_path_with_suffix(db_path, "-shm"),
     ]
+}
+
+/// GH #450: how long a writable canonical open may take before it is worth an
+/// operator-visible warning naming the phase (schema migration / frankensqlite
+/// migration repair). Well above a healthy open on a multi-gigabyte archive.
+const SLOW_STORAGE_OPEN_WARN_THRESHOLD: Duration = Duration::from_secs(30);
+
+/// GH #450: the files whose byte footprint proves a writable storage open is
+/// still doing work. The archive and its WAL/SHM sidecars cover an ordinary
+/// open and a schema migration; the `.pre-migration-bak*` copies and the
+/// `.fsqlite-migration-state` marker cover frankensqlite's one-time migration
+/// repair, whose first (and longest) act is writing that backup.
+fn storage_open_liveness_targets(db_path: &Path) -> Vec<PathBuf> {
+    let mut targets = Vec::with_capacity(7);
+    targets.push(db_path.to_path_buf());
+    targets.extend(database_sidecar_paths(db_path));
+    for suffix in [
+        ".pre-migration-bak",
+        ".pre-migration-bak-wal",
+        ".pre-migration-bak-shm",
+        ".fsqlite-migration-state",
+    ] {
+        targets.push(database_path_with_suffix(db_path, suffix));
+    }
+    targets
 }
 
 fn database_path_with_suffix(db_path: &Path, suffix: &str) -> PathBuf {
@@ -19024,8 +20882,8 @@ fn prepare_lexical_rebuild_page_work(
                         "preparing lexical rebuild packet for conversation {conversation_id} after page guardrail overflow"
                     )
                 })?;
-                packet_prepare_duration = packet_prepare_duration
-                    .saturating_add(fallback_prepare_started.elapsed());
+                packet_prepare_duration =
+                    packet_prepare_duration.saturating_add(fallback_prepare_started.elapsed());
                 prepared_packets.extend(conversation_packets);
             }
             prepared_packets
@@ -19469,11 +21327,10 @@ fn spawn_lexical_rebuild_packet_producer(
                                 pipeline_budget.page_conversation_limit,
                                 pipeline_budget.batch_fetch_message_bytes_limit,
                             );
-                        let conversation_page_limit = i64::try_from(
-                            content_bounded_page_conversation_limit,
-                        )
-                        .unwrap_or(i64::MAX)
-                        .min(page_size.max(1));
+                        let conversation_page_limit =
+                            i64::try_from(content_bounded_page_conversation_limit)
+                                .unwrap_or(i64::MAX)
+                                .min(page_size.max(1));
                         let current_planned_shard = planned_shard_cursor
                             .as_ref()
                             .and_then(LexicalRebuildPlannedShardCursor::current)
@@ -19958,6 +21815,66 @@ fn rename_lexical_publish_path(
     fs::rename(src, dst)
 }
 
+/// GH #441 test hook (tests/cli_index.rs): skip the post-run segment
+/// maintenance (`optimize_if_idle` after an incremental run, `force_merge`
+/// after a full rebuild) so a test can build a deliberately fragmented
+/// generation — the shape of a v0.7.1 archive — and then prove that an
+/// ordinary `cass index` consolidates it. Unset in production.
+fn lexical_post_run_maintenance_skipped_for_test() -> bool {
+    dotenvy::var("CASS_TEST_SKIP_POST_RUN_LEXICAL_MAINTENANCE")
+        .ok()
+        .is_some_and(|raw| matches!(raw.trim(), "1" | "true" | "yes"))
+}
+
+/// GH #440 test hook (tests/cli_index.rs): after the Nth staged engine commit
+/// (`CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMITS`, default 1), write a
+/// sentinel describing the authority/checkpoint gap the commit just opened
+/// and park so the test can SIGKILL the run inside that window. Unset in
+/// production: an absent sentinel path returns immediately.
+fn maybe_pause_lexical_rebuild_after_commit_for_kill(
+    state_path: &Path,
+    checkpoint_indexed_docs: usize,
+    committed_indexed_docs: usize,
+) -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    static COMMITS_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+    let sentinel_path = match dotenvy::var("CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMIT_SENTINEL") {
+        Ok(raw) if !raw.trim().is_empty() => PathBuf::from(raw),
+        _ => return Ok(()),
+    };
+    let fire_on = dotenvy::var("CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMITS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1);
+    let seen = COMMITS_SEEN.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+    if seen != fire_on {
+        return Ok(());
+    }
+    let sleep_ms = dotenvy::var("CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMIT_SLEEP_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(30_000);
+    let payload = serde_json::json!({
+        "stage": "staged_commit_published_checkpoint_not_yet_written",
+        "pid": std::process::id(),
+        "commit_ordinal": seen,
+        "state_path": state_path.display().to_string(),
+        "checkpoint_indexed_docs": checkpoint_indexed_docs,
+        "committed_indexed_docs": committed_indexed_docs,
+    });
+    write_json_pretty_atomically(&sentinel_path, &payload).with_context(|| {
+        format!(
+            "writing lexical rebuild kill-after-commit sentinel {}",
+            sentinel_path.display()
+        )
+    })?;
+    thread::sleep(Duration::from_millis(sleep_ms));
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn maybe_pause_lexical_publish_for_kill_relaunch(
     index_path: &Path,
@@ -20009,6 +21926,39 @@ fn maybe_pause_lexical_publish_for_kill_relaunch(
 /// the next from-zero rebuild clears it before reuse while an interrupted run
 /// resumes into it. Worst case is one stale scratch directory, never a growing
 /// set.
+/// Extra documents routed through the upsert path beyond the measured
+/// authority/checkpoint gap (#440). Upserting a document whose identity is
+/// absent is an ordinary insert, so the margin only costs an identity probe
+/// per document and buys tolerance for any off-by-a-batch drift between the
+/// checkpoint's document accounting and the engine's live count.
+const RESUME_RECONCILE_SLACK_DOCS: usize = 4_096;
+
+/// How many leading replayed documents a resumed rebuild must upsert (#440).
+///
+/// * A from-zero build (`resuming == false`) owes nothing: its target is empty.
+/// * A resume into the LIVE index (`builds_in_live_index`) may be replaying
+///   over a complete prior generation, so every document is upserted.
+/// * A resume into a staged scratch owes the documents the authority holds
+///   beyond the checkpoint, plus [`RESUME_RECONCILE_SLACK_DOCS`]; nothing when
+///   the authority is at or behind the checkpoint.
+fn resume_reconcile_upsert_budget(
+    builds_in_live_index: bool,
+    resuming: bool,
+    checkpoint_indexed_docs: usize,
+    published_docs: usize,
+) -> usize {
+    if !resuming {
+        return 0;
+    }
+    if builds_in_live_index {
+        return usize::MAX;
+    }
+    match published_docs.checked_sub(checkpoint_indexed_docs) {
+        Some(gap) if gap > 0 => gap.saturating_add(RESUME_RECONCILE_SLACK_DOCS),
+        _ => 0,
+    }
+}
+
 fn staged_lexical_rebuild_scratch_path(index_path: &Path) -> PathBuf {
     let name = index_path
         .file_name()
@@ -20498,9 +22448,12 @@ fn path_to_cstring(path: &Path) -> Result<CString> {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 pub(crate) fn atomic_exchange_paths(left: &Path, right: &Path) -> Result<()> {
     let left_c = path_to_cstring(left)?;
     let right_c = path_to_cstring(right)?;
+    // SAFETY: both paths are valid NUL-terminated C strings that outlive the
+    // call, AT_FDCWD is a valid dirfd, and renameat2 reads nothing else.
     let result = unsafe {
         linux_publish_swap::renameat2(
             linux_publish_swap::AT_FDCWD,
@@ -20849,6 +22802,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         shard_result_tx,
         Arc::clone(&lexical_rebuild_flow_limiter),
         lexical_rebuild_worker_pool.clone(),
+        lexical_index_heartbeat(progress.as_ref()),
     );
     let shard_work_dispatch_tx = shard_work_tx.clone();
     let (merge_work_tx, merge_work_rx) =
@@ -21870,15 +23824,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
             index_path.display()
         )
     })?;
-    if let Some(observed_tantivy_docs) = live_tantivy_doc_count(index_path)?
-        && observed_tantivy_docs != indexed_docs
-    {
-        return Err(anyhow::anyhow!(
-            "staged lexical rebuild published {} docs but a fresh Tantivy reader only sees {}",
-            indexed_docs,
-            observed_tantivy_docs
-        ));
-    }
+    verify_published_lexical_doc_count(index_path, indexed_docs, "staged")?;
     let refresh_ledger =
         build_authoritative_lexical_refresh_ledger(AuthoritativeLexicalRefreshLedgerInput {
             publish_mode: "atomic_staged_swap",
@@ -21902,8 +23848,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
     rebuild_state.db.storage_fingerprint = final_storage_fingerprint;
     rebuild_state.db.total_conversations = final_total_conversations;
     rebuild_state.db.total_messages = final_observed_messages;
-    rebuild_state.committed_offset =
-        i64::try_from(final_total_conversations).unwrap_or(i64::MAX);
+    rebuild_state.committed_offset = i64::try_from(final_total_conversations).unwrap_or(i64::MAX);
     rebuild_state.committed_conversation_id = last_processed_conversation_id;
     rebuild_state.processed_conversations = processed_conversations;
     rebuild_state.indexed_docs = indexed_docs;
@@ -21913,8 +23858,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
     if let Some(p) = &progress {
         p.current
             .store(final_total_conversations, Ordering::Relaxed);
-        p.total
-            .store(final_total_conversations, Ordering::Relaxed);
+        p.total.store(final_total_conversations, Ordering::Relaxed);
         p.total_is_final.store(true, Ordering::Relaxed);
         p.phase.store(0, Ordering::Relaxed);
         p.is_rebuilding.store(false, Ordering::Relaxed);
@@ -22070,6 +24014,7 @@ fn rebuild_tantivy_from_db_with_options(
         });
     }
 
+    let resumed_from_checkpoint = rebuild_state.processed_conversations > 0;
     let restart_from_zero =
         rebuild_state.processed_conversations == 0 && rebuild_state.pending.is_none();
 
@@ -22398,11 +24343,11 @@ fn rebuild_tantivy_from_db_with_options(
         };
         log_prep_step("open_tantivy", &mut prep_step_started);
 
+        // GH #446: the sink side of the pipeline (accumulate / commit /
+        // merge) is where a large rebuild spends its longest silent
+        // stretches; let that work tick the watchdog's `activity` signal.
+        install_lexical_index_heartbeat(&mut t_index, progress.as_ref());
         t_index.configure_bulk_load_merge_policy();
-        if staged_build_path.is_some() && rebuild_state.committed_offset > 0 {
-            t_index.enable_resume_upsert();
-        }
-
         // Keep the persisted checkpoint aligned with the in-memory active-run
         // state before any producer heartbeat arrives. This closes attach/resume
         // windows where we discarded or reset stale state in memory but would
@@ -22430,7 +24375,33 @@ fn rebuild_tantivy_from_db_with_options(
             return Err(err);
         }
     };
-    let resumed_staged_replay = staged_build_path.is_some() && rebuild_state.committed_offset > 0;
+    // #440: fence the resume cursor against the published authority. The
+    // checkpoint says how many documents the last durable commit covered;
+    // the index says how many are actually live. Anything live beyond the
+    // checkpoint was published without a matching checkpoint advance (a
+    // pre-fix engine visibility publish, or an upsert-triggered commit inside
+    // an earlier reconcile window) and replaying it with plain adds is
+    // refused as a duplicate identity. Route that many leading documents —
+    // plus a small margin — through the identity-idempotent upsert path so
+    // the replay converges instead of failing. A resume that builds in the
+    // LIVE directory (no staged scratch) may be sitting on a complete prior
+    // generation whose identities are anywhere in the replay, so it upserts
+    // everything.
+    let resume_reconcile_docs = resume_reconcile_upsert_budget(
+        staged_build_path.is_none(),
+        rebuild_state.processed_conversations > 0 || rebuild_state.pending.is_some(),
+        rebuild_state.indexed_docs,
+        usize::try_from(t_index.doc_count().unwrap_or(0)).unwrap_or(usize::MAX),
+    );
+    if resume_reconcile_docs > 0 {
+        tracing::warn!(
+            checkpoint_indexed_docs = rebuild_state.indexed_docs,
+            build_path = %build_path.display(),
+            reconcile_docs = resume_reconcile_docs,
+            "published lexical authority is ahead of the rebuild checkpoint; resuming through identity-idempotent upserts (#440)"
+        );
+        t_index.arm_resume_reconcile(resume_reconcile_docs);
+    }
 
     if let Some(p) = &progress {
         p.phase.store(2, Ordering::Relaxed);
@@ -23002,28 +24973,61 @@ fn rebuild_tantivy_from_db_with_options(
         ),
     );
 
-    if conversations_since_commit > 0
-        || messages_since_commit > 0
-        || message_bytes_since_commit > 0
-        || rebuild_state.pending.is_some()
-    {
-        // The terminal successful commit persists the pending checkpoint before
-        // commit, then lets completion fold commit-finalization into the final
-        // completed-state write. If the process dies after commit but before
-        // completion, restart reconciliation still lands the pending commit.
-        commit_lexical_rebuild_progress(
-            &index_path,
-            &build_path,
-            &mut rebuild_state,
-            last_processed_conversation_id,
-            processed_conversations,
-            indexed_docs,
-            &latest_pipeline_runtime,
-            &mut t_index,
-            false,
-            perf_profile.as_mut(),
-        )?;
+    // #441: publish everything staged, then fold the freshly built generation
+    // into one segment BEFORE the terminal checkpoint records the manifest
+    // fingerprint. A from-scratch build seals one segment per ingest shard
+    // per accumulation budget, and Quill's query planner probes every sealed
+    // dictionary for every lowered segment, so segment count is the dominant
+    // query cost on a large archive; a published generation should start at
+    // one. The merge is a Q1-preserving concat behind an atomic MANIFEST
+    // publish, so a failure leaves the (valid, merely unmerged) generation in
+    // place and is logged rather than failing a completed rebuild.
+    t_index.commit()?;
+    if let Some(p) = &progress {
+        p.tick_activity();
     }
+    let merge_started = Instant::now();
+    if lexical_post_run_maintenance_skipped_for_test() {
+        tracing::warn!(
+            segments = t_index.segment_count(),
+            "post-rebuild segment merge skipped by CASS_TEST_SKIP_POST_RUN_LEXICAL_MAINTENANCE (test hook)"
+        );
+    } else {
+        match t_index.force_merge() {
+            Ok(()) => tracing::info!(
+                merge_ms = merge_started.elapsed().as_millis() as u64,
+                segments = t_index.segment_count(),
+                "folded the rebuilt lexical generation before publish (#441)"
+            ),
+            Err(err) => tracing::warn!(
+                error = %format!("{err:#}"),
+                "segment merge after lexical rebuild failed; publishing the unmerged generation"
+            ),
+        }
+    }
+    if let Some(p) = &progress {
+        p.tick_activity();
+    }
+    // The terminal commit persists the pending checkpoint before commit, then
+    // lets completion fold commit-finalization into the final completed-state
+    // write. If the process dies after commit but before completion, restart
+    // reconciliation still lands the pending commit. It runs unconditionally:
+    // the merge above changed the manifest, and the fingerprint the completed
+    // checkpoint carries must describe the generation that is actually
+    // published — a stale fingerprint reads as "index changed underneath the
+    // checkpoint" and forces the next run into another full rebuild.
+    commit_lexical_rebuild_progress(
+        &index_path,
+        &build_path,
+        &mut rebuild_state,
+        last_processed_conversation_id,
+        processed_conversations,
+        indexed_docs,
+        &latest_pipeline_runtime,
+        &mut t_index,
+        false,
+        perf_profile.as_mut(),
+    )?;
 
     drop(t_index);
     // Swap the freshly built index into the live path. Until this call the live
@@ -23043,40 +25047,17 @@ fn rebuild_tantivy_from_db_with_options(
             index_path.display()
         )
     })?;
-    if let Some(observed_tantivy_docs) = live_tantivy_doc_count(&index_path)?
-        && observed_tantivy_docs != indexed_docs
-    {
-        // An older Quill writer may have published documents ahead of the
-        // durable CASS checkpoint. Resuming that staged generation upserts the
-        // replayed tail, so its old running counter can be low even when the
-        // final index is exact. Accept the reader's count only after comparing
-        // it with the same noise-adjusted canonical count used by the sink.
-        if resumed_staged_replay {
-            let expected_docs = expected_live_lexical_doc_count(&storage)?;
-            if observed_tantivy_docs == expected_docs {
-                tracing::warn!(
-                    checkpoint_docs = indexed_docs,
-                    observed_tantivy_docs,
-                    "reconciled resumed lexical accounting with the complete canonical corpus"
-                );
-                indexed_docs = observed_tantivy_docs;
-            } else {
-                return Err(anyhow::anyhow!(
-                    "resumed lexical rebuild committed {} docs, a fresh reader sees {}, and the canonical archive expects {}",
-                    indexed_docs,
-                    observed_tantivy_docs,
-                    expected_docs
-                ));
-            }
-        } else {
-            return Err(anyhow::anyhow!(
-                "lexical rebuild committed {} docs but a fresh Tantivy reader only sees {}",
-                indexed_docs,
-                observed_tantivy_docs
-            ));
-        }
-    }
+    verify_published_lexical_doc_count(&index_path, indexed_docs, "direct")?;
 
+    // GH #440: indexed_docs omits hard-noise messages from the committed
+    // prefix, so prefix docs + newly streamed rows is not an exact canonical
+    // count after resume. Count once at completion while the readonly handle
+    // is still open; fresh rebuilds already observed every canonical packet.
+    let final_observed_messages = if resumed_from_checkpoint {
+        count_total_messages_exact(&storage)?
+    } else {
+        observed_messages.max(indexed_docs)
+    };
     storage.close_without_checkpoint().with_context(|| {
         format!(
             "closing readonly database after Tantivy rebuild without checkpoint: {}",
@@ -23094,38 +25075,23 @@ fn rebuild_tantivy_from_db_with_options(
             max_conversation_id,
             max_message_id,
         );
+    } else {
+        // A compatible interrupted checkpoint may carry content-pending-v1.
+        // This run obtained an exact startup fingerprint: publish that value,
+        // rather than certifying the placeholder loaded from the checkpoint.
+        rebuild_state.db.storage_fingerprint = db_state.storage_fingerprint;
     }
     rebuild_state.db.total_conversations = final_total_conversations;
-    let final_observed_messages = observed_messages.max(indexed_docs);
     rebuild_state.db.total_messages = final_observed_messages;
-    rebuild_state.committed_offset =
-        i64::try_from(final_total_conversations).unwrap_or(i64::MAX);
+    rebuild_state.committed_offset = i64::try_from(final_total_conversations).unwrap_or(i64::MAX);
     rebuild_state.committed_conversation_id = last_processed_conversation_id;
     rebuild_state.processed_conversations = processed_conversations;
     rebuild_state.indexed_docs = indexed_docs;
-    rebuild_state.mark_completed(completed_lexical_rebuild_meta_fingerprint(
-        &rebuild_state,
-        &index_path,
-    )?);
-    persist_lexical_rebuild_state(&index_path, &rebuild_state)?;
-
-    if let Some(p) = &progress {
-        p.current
-            .store(final_total_conversations, Ordering::Relaxed);
-        p.total
-            .store(final_total_conversations, Ordering::Relaxed);
-        p.total_is_final.store(true, Ordering::Relaxed);
-        p.phase.store(0, Ordering::Relaxed);
-        p.is_rebuilding.store(false, Ordering::Relaxed);
-    }
-
-    if let Some(profile) = perf_profile.as_mut() {
-        if let Some(started) = rebuild_profile_started {
-            profile.total_duration = started.elapsed();
-        }
-        profile.log_summary();
-    }
-
+    // GH #457: the generation manifest is durable BEFORE the checkpoint is
+    // marked completed (the staged path's ordering). A crash between the two
+    // used to leave `completed: true` over a generation with no manifest, so
+    // every readiness surface reported ready with nothing to read the doc
+    // count from.
     let lexical_rebuild_duration = lexical_rebuild_started.elapsed();
     let publish_started = Instant::now();
     let equivalence_evidence = equivalence_accumulator.finalize();
@@ -23139,6 +25105,28 @@ fn rebuild_tantivy_from_db_with_options(
         &equivalence_evidence,
     )?;
     log_lexical_generation_manifest_published(&generation_manifest, &equivalence_evidence);
+    rebuild_state.mark_completed(completed_lexical_rebuild_meta_fingerprint(
+        &rebuild_state,
+        &index_path,
+    )?);
+    persist_lexical_rebuild_state(&index_path, &rebuild_state)?;
+
+    if let Some(p) = &progress {
+        p.current
+            .store(final_total_conversations, Ordering::Relaxed);
+        p.total.store(final_total_conversations, Ordering::Relaxed);
+        p.total_is_final.store(true, Ordering::Relaxed);
+        p.phase.store(0, Ordering::Relaxed);
+        p.is_rebuilding.store(false, Ordering::Relaxed);
+    }
+
+    if let Some(profile) = perf_profile.as_mut() {
+        if let Some(started) = rebuild_profile_started {
+            profile.total_duration = started.elapsed();
+        }
+        profile.log_summary();
+    }
+
     let refresh_ledger =
         build_authoritative_lexical_refresh_ledger(AuthoritativeLexicalRefreshLedgerInput {
             publish_mode: "direct_live_commit",
@@ -23257,6 +25245,7 @@ fn ingest_batch_detailed(
     if batch_outcome.lexical_update_deferred {
         tracing::warn!(
             error = ?batch_outcome.lexical_update_error,
+            workspace_changes = batch_outcome.workspace_changes,
             "SQLite ingest succeeded but inline lexical update was deferred; scheduling authoritative lexical rebuild"
         );
     }
@@ -23293,6 +25282,7 @@ fn ingest_batch_detailed(
         lexical_update_deferred: batch_outcome.lexical_update_deferred,
         scanned_connectors: BTreeSet::new(),
         scan_had_errors: false,
+        deferred_sources: BTreeSet::new(),
     })
 }
 
@@ -23518,7 +25508,8 @@ fn ingest_non_watch_oom_retry_or_quarantine(
             quarantined_conversations: 0,
             lexical_update_deferred: true,
             scanned_connectors: BTreeSet::new(),
-            scan_had_errors: false,
+            scan_had_errors: true,
+            deferred_sources: BTreeSet::from([conv.source_path.clone()]),
         });
     }
 
@@ -23549,7 +25540,8 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         quarantined_conversations: 1,
         lexical_update_deferred: true,
         scanned_connectors: BTreeSet::new(),
-        scan_had_errors: false,
+        scan_had_errors: true,
+        deferred_sources: BTreeSet::from([conv.source_path.clone()]),
     })
 }
 
@@ -24872,6 +26864,7 @@ pub struct ConversationIngestQuarantineSummary {
     /// Error loading the structured quarantine checkpoint, if one exists.
     /// A malformed or unreadable checkpoint must not be treated as an empty
     /// quarantine because that would make search health falsely optimistic.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub state_error: Option<String>,
     pub quarantined_conversations: usize,
     pub recent_quarantined_conversations: usize,
@@ -24944,7 +26937,10 @@ pub fn conversation_ingest_quarantine_summary(
             Ok(contents) => contents,
             Err(error) => {
                 if state_error.is_none() {
-                    state_error = Some(format!("reading quarantine file {}: {error}", path.display()));
+                    state_error = Some(format!(
+                        "reading quarantine file {}: {error}",
+                        path.display()
+                    ));
                 }
                 continue;
             }
@@ -25317,34 +27313,68 @@ pub fn plan_quarantine_retry(
     ))
 }
 
-/// Holds the authoritative data-dir maintenance lock while a quarantine
-/// command mutates quarantine metadata, SQLite, or derived lexical assets.
+/// Holds the authoritative data-dir maintenance lock while an operator
+/// command mutates canonical storage or derived search assets.
 ///
 /// The heartbeat is declared first so it stops before the underlying lock is
 /// released. Otherwise its worker could race the lock guard's final metadata
 /// cleanup during drop.
-pub(crate) struct QuarantineMutationGuard {
+pub(crate) struct SearchMaintenanceMutationGuard {
     _heartbeat: IndexRunLockHeartbeat,
     lock: IndexRunLockGuard,
 }
 
-impl QuarantineMutationGuard {
+impl SearchMaintenanceMutationGuard {
     fn mark_progress(&self) {
         bump_index_run_lock_progress_atomic(&self.lock.last_progress_at_ms_atomic);
     }
+
+    pub(crate) fn progress_atomic(&self) -> Arc<AtomicI64> {
+        Arc::clone(&self.lock.last_progress_at_ms_atomic)
+    }
 }
 
-pub(crate) fn acquire_quarantine_mutation_lock(data_dir: &Path) -> Result<QuarantineMutationGuard> {
+pub(crate) fn acquire_quarantine_mutation_lock(
+    data_dir: &Path,
+) -> Result<SearchMaintenanceMutationGuard> {
     let db_path = data_dir.join("agent_search.db");
-    let lock = acquire_index_run_lock(data_dir, &db_path, SearchMaintenanceMode::Index)
-        .context("acquiring quarantine mutation lock")?;
+    acquire_search_maintenance_mutation_lock(
+        data_dir,
+        &db_path,
+        maintenance_job_kind_for_mode(SearchMaintenanceMode::Index),
+    )
+    .context("acquiring quarantine mutation lock")
+}
+
+pub(crate) fn acquire_semantic_backfill_lock(
+    data_dir: &Path,
+    db_path: &Path,
+) -> Result<SearchMaintenanceMutationGuard> {
+    acquire_search_maintenance_mutation_lock(
+        data_dir,
+        db_path,
+        SearchMaintenanceJobKind::SemanticRebuild,
+    )
+}
+
+fn acquire_search_maintenance_mutation_lock(
+    data_dir: &Path,
+    db_path: &Path,
+    job_kind: SearchMaintenanceJobKind,
+) -> Result<SearchMaintenanceMutationGuard> {
+    let lock = acquire_index_run_lock_with_job_kind(
+        data_dir,
+        db_path,
+        SearchMaintenanceMode::Index,
+        job_kind,
+    )?;
     let heartbeat = IndexRunLockHeartbeat::start(
         data_dir.to_path_buf(),
         index_run_lock_heartbeat_interval(),
         Arc::clone(&lock.metadata_write_lock),
         Arc::clone(&lock.last_progress_at_ms_atomic),
     );
-    Ok(QuarantineMutationGuard {
+    Ok(SearchMaintenanceMutationGuard {
         _heartbeat: heartbeat,
         lock,
     })
@@ -25706,6 +27736,14 @@ impl ConnectorKind {
             "copilot_cli" => Some(Self::CopilotCli),
             "qwen" => Some(Self::Qwen),
             "grok" => Some(Self::Grok),
+            "muse" => Some(Self::Muse),
+            "prime_agent" => Some(Self::PrimeAgent),
+            "kiro" => Some(Self::Kiro),
+            "devin" => Some(Self::Devin),
+            "openhands" => Some(Self::OpenHands),
+            "goose" => Some(Self::Goose),
+            "crush" => Some(Self::Crush),
+            "hermes" => Some(Self::Hermes),
             _ => None,
         }
     }
@@ -25733,6 +27771,14 @@ impl ConnectorKind {
             Self::CopilotCli => "copilot_cli",
             Self::Qwen => "qwen",
             Self::Grok => "grok",
+            Self::Muse => "muse",
+            Self::PrimeAgent => "prime_agent",
+            Self::Kiro => "kiro",
+            Self::Devin => "devin",
+            Self::OpenHands => "openhands",
+            Self::Goose => "goose",
+            Self::Crush => "crush",
+            Self::Hermes => "hermes",
         }
     }
 
@@ -25761,6 +27807,14 @@ impl ConnectorKind {
             Self::CopilotCli => Box::new(CopilotCliConnector::new()),
             Self::Qwen => Box::new(QwenConnector::new()),
             Self::Grok => Box::new(GrokConnector::new()),
+            Self::Muse => Box::new(MuseConnector::new()),
+            Self::PrimeAgent => Box::new(franken_agent_detection::PrimeAgentConnector::new()),
+            Self::Kiro => Box::new(franken_agent_detection::KiroConnector::new()),
+            Self::Devin => Box::new(franken_agent_detection::DevinConnector::new()),
+            Self::OpenHands => Box::new(franken_agent_detection::OpenHandsConnector::new()),
+            Self::Goose => Box::new(franken_agent_detection::GooseConnector::new()),
+            Self::Crush => Box::new(franken_agent_detection::CrushConnector::new()),
+            Self::Hermes => Box::new(franken_agent_detection::HermesConnector::new()),
         }
     }
 }
@@ -25785,14 +27839,72 @@ fn watch_ingest_chunk_size() -> usize {
     }
 }
 
-fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Result<()>>(
+/// Keep deferred sources in the watch loop, including sources skipped during
+/// startup. An active writer may close without producing another filesystem
+/// event; the cooldown must therefore drive retries itself (GH455).
+fn dispatch_watch_callback<F>(
+    pending: &mut BTreeSet<PathBuf>,
+    roots: &[(ConnectorKind, ScanRoot)],
+    is_rebuild: bool,
+    callback: &F,
+) where
+    F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Result<BTreeSet<PathBuf>>,
+{
+    let paths = if is_rebuild {
+        Vec::new()
+    } else {
+        pending.iter().cloned().collect()
+    };
+    match callback(paths, roots, is_rebuild) {
+        Ok(deferred) => *pending = deferred,
+        Err(error) => {
+            tracing::warn!(%error, is_rebuild, "watch callback failed; retaining sources for retry");
+            if is_rebuild {
+                pending.extend(roots.iter().map(|(_, root)| root.path.clone()));
+            }
+        }
+    }
+}
+
+fn is_devin_database_watch_root(kind: ConnectorKind, root: &ScanRoot) -> bool {
+    kind == ConnectorKind::Devin
+        && root
+            .path
+            .extension()
+            .is_some_and(|extension| extension == "db")
+        && root.path.is_file()
+}
+
+fn watch_scan_lower_bound(kind: ConnectorKind, since_ts: Option<i64>) -> Option<i64> {
+    if kind == ConnectorKind::Cursor && since_ts == Some(WATCH_FORCE_FULL_SCAN_TS) {
+        // A removed .workspace-trusted file has no mtime. The classifier uses
+        // a private sentinel so deletion clears authority without disabling
+        // ordinary Cursor incremental scans.
+        None
+    } else if kind == ConnectorKind::Devin {
+        // Devin filters sessions by provider activity time, which can precede
+        // the WAL commit that triggered this scan. Filesystem event times cannot
+        // bound it, even after rounding to seconds. Re-read the changed store and
+        // let idempotent ingestion skip unchanged sessions; retain event
+        // watermarks separately for scheduling and provenance.
+        None
+    } else {
+        since_ts
+    }
+}
+
+fn watch_sources<F>(
     watch_once_paths: Option<Vec<PathBuf>>,
     roots: Vec<(ConnectorKind, ScanRoot)>,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
     stale_detector: Arc<StaleDetector>,
     watch_interval_secs: u64,
+    deferred_sources: BTreeSet<PathBuf>,
     callback: F,
-) -> Result<()> {
+) -> Result<()>
+where
+    F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Result<BTreeSet<PathBuf>>,
+{
     if let Some(paths) = watch_once_paths {
         if !paths.is_empty() {
             callback(paths, &roots, false)?;
@@ -25820,11 +27932,22 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Resu
     })?;
 
     // Watch all detected roots
-    for (_, root) in &roots {
-        if let Err(e) = watcher.watch(&root.path, RecursiveMode::Recursive) {
-            tracing::warn!("failed to watch {}: {}", root.path.display(), e);
+    for (kind, root) in &roots {
+        // Devin's explicit database override can be a file. SQLite commits
+        // may touch only a sibling WAL, including creating it after startup.
+        // Watch the parent, but retain the database root for classification.
+        let (watch_path, mode) = if is_devin_database_watch_root(*kind, root) {
+            (
+                root.path.parent().unwrap_or(&root.path),
+                RecursiveMode::NonRecursive,
+            )
         } else {
-            tracing::info!("watching {}", root.path.display());
+            (root.path.as_path(), RecursiveMode::Recursive)
+        };
+        if let Err(e) = watcher.watch(watch_path, mode) {
+            tracing::warn!("failed to watch {}: {}", watch_path.display(), e);
+        } else {
+            tracing::info!("watching {}", watch_path.display());
         }
     }
 
@@ -25835,8 +27958,8 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Resu
     let min_scan_interval = Duration::from_secs(watch_interval_secs.max(1));
     // Stale check interval: check every 5 minutes for quicker detection
     let stale_check_interval = Duration::from_secs(300);
-    let mut pending: Vec<PathBuf> = Vec::new();
-    let mut first_event: Option<Instant> = None;
+    let mut pending = deferred_sources;
+    let mut first_event = (!pending.is_empty()).then(Instant::now);
     let mut last_stale_check = Instant::now();
     // Initialize to the past so the first scan can fire immediately.
     // Use checked_sub to avoid panic if system uptime < min_scan_interval
@@ -25873,11 +27996,9 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Resu
             if elapsed >= max_wait {
                 if cooldown_remaining.is_zero() {
                     // Cooldown elapsed and max_wait exceeded: fire now.
-                    if let Err(error) = callback(std::mem::take(&mut pending), &roots, false) {
-                        tracing::warn!(error = %error, "watch incremental callback failed");
-                    }
+                    dispatch_watch_callback(&mut pending, &roots, false, &callback);
                     last_scan = Instant::now();
-                    first_event = None;
+                    first_event = (!pending.is_empty()).then(Instant::now);
                     continue;
                 }
                 // max_wait exceeded but cooldown still active: wait for
@@ -25902,26 +28023,20 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Resu
                 ReindexCommand::Full => {
                     // Full rebuild commands bypass cooldown for responsive
                     // operator-initiated rebuilds.
-                    if !pending.is_empty()
-                        && let Err(error) = callback(std::mem::take(&mut pending), &roots, false)
-                    {
-                        tracing::warn!(error = %error, "watch incremental callback failed");
+                    if !pending.is_empty() {
+                        dispatch_watch_callback(&mut pending, &roots, false, &callback);
                     }
-                    if let Err(error) = callback(vec![], &roots, true) {
-                        tracing::warn!(error = %error, "watch rebuild callback failed");
-                    }
+                    dispatch_watch_callback(&mut pending, &roots, true, &callback);
                     last_scan = Instant::now();
-                    first_event = None;
+                    first_event = (!pending.is_empty()).then(Instant::now);
                 }
             },
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 // Process pending events only if cooldown has elapsed
                 if !pending.is_empty() && last_scan.elapsed() >= min_scan_interval {
-                    if let Err(error) = callback(std::mem::take(&mut pending), &roots, false) {
-                        tracing::warn!(error = %error, "watch incremental callback failed");
-                    }
+                    dispatch_watch_callback(&mut pending, &roots, false, &callback);
                     last_scan = Instant::now();
-                    first_event = None;
+                    first_event = (!pending.is_empty()).then(Instant::now);
                 }
 
                 // Periodic stale check
@@ -25951,13 +28066,9 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Resu
                                     "stale state detected, triggering automatic full rebuild"
                                 );
                                 // Trigger full rebuild
-                                if let Err(error) = callback(vec![], &roots, true) {
-                                    tracing::warn!(
-                                        error = %error,
-                                        "watch stale-rebuild callback failed"
-                                    );
-                                }
+                                dispatch_watch_callback(&mut pending, &roots, true, &callback);
                                 last_scan = Instant::now();
+                                first_event = (!pending.is_empty()).then(Instant::now);
                             }
                             StaleAction::None => {
                                 // Stale detection disabled, should not reach here
@@ -26006,6 +28117,7 @@ fn reset_storage(storage: &FrankenStorage) -> Result<()> {
 /// Returns `Ok(count)` where count is the number of conversations successfully indexed.
 /// This count is used by the stale detector to track indexing activity.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn reindex_paths(
     opts: &IndexOptions,
     paths: Vec<PathBuf>,
@@ -26017,7 +28129,18 @@ fn reindex_paths(
     force_full: bool,
 ) -> Result<usize> {
     reindex_paths_with_semantic_delta(
-        opts, paths, roots, state, storage, t_index, index_path, force_full, None,
+        opts,
+        paths,
+        roots,
+        state,
+        storage,
+        t_index,
+        index_path,
+        force_full,
+        None,
+        &ActiveSessionSourceFilter::new(
+            opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
+        ),
     )
 }
 
@@ -26032,6 +28155,7 @@ fn reindex_paths_with_semantic_delta(
     index_path: &Path,
     force_full: bool,
     semantic_delta: Option<&mut WatchSemanticDelta>,
+    active_source_filter: &ActiveSessionSourceFilter,
 ) -> Result<usize> {
     // DO NOT lock storage/index here for the whole duration.
     // We only need them for the ingest phase, not the scan phase.
@@ -26051,9 +28175,6 @@ fn reindex_paths_with_semantic_delta(
 
     let mut semantic_delta = semantic_delta;
     let preserve_watch_watermark = scan_path_exclusions_active();
-    let active_source_filter = ActiveSessionSourceFilter::new(
-        opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
-    );
 
     for (kind, root, min_ts, max_ts) in triggers {
         let conn = kind.create_connector();
@@ -26118,12 +28239,10 @@ fn reindex_paths_with_semantic_delta(
             }
         };
 
+        let since_ts = watch_scan_lower_bound(kind, since_ts);
+
         if root.path.is_file()
-            && should_skip_active_session_source(
-                &active_source_filter,
-                root.origin.kind,
-                &root.path,
-            )
+            && should_skip_active_session_source(active_source_filter, root.origin.kind, &root.path)
         {
             tracing::debug!(
                 ?kind,
@@ -26148,7 +28267,7 @@ fn reindex_paths_with_semantic_delta(
                 kind.slug(),
                 std::slice::from_ref(&root),
                 since_ts,
-                &active_source_filter,
+                active_source_filter,
             );
 
         // SCAN PHASE: IO-heavy, no locks held
@@ -26171,7 +28290,7 @@ fn reindex_paths_with_semantic_delta(
         let pre_active_filter_count = convs.len();
         convs.retain(|conv| {
             !should_skip_active_session_source(
-                &active_source_filter,
+                active_source_filter,
                 root.origin.kind,
                 &conv.source_path,
             )
@@ -26261,6 +28380,28 @@ fn reindex_paths_with_semantic_delta(
             };
             let capture_semantic_delta = semantic_delta.is_some();
             for chunk in convs.chunks(ingest_chunk_size) {
+                if let Some(pending) = load_lexical_rebuild_state(index_path)?
+                    && pending.is_incomplete()
+                    && pending.version == LEXICAL_REBUILD_STATE_VERSION
+                    && pending.schema_hash == crate::search::tantivy::SCHEMA_HASH
+                    && lexical_rebuild_page_size_is_compatible(pending.page_size)
+                    && lexical_rebuild_db_paths_match(
+                        &pending.db.db_path,
+                        &crate::normalize_path_identity(&opts.db_path).to_string_lossy(),
+                    )
+                {
+                    // A previous metadata transaction may already have landed.
+                    // Its repeated packet then has zero mutations; the durable
+                    // debt, rather than this packet's counts, requires repair.
+                    *t_index_guard = None;
+                    rebuild_tantivy_from_db_deferred_startup_with_options(
+                        &opts.db_path,
+                        &opts.data_dir,
+                        count_total_conversations_exact(&storage)?,
+                        opts.progress.clone(),
+                        None,
+                    )?;
+                }
                 if t_index_guard.is_none() {
                     tracing::info!(
                         index_path = %index_path.display(),
@@ -26300,7 +28441,22 @@ fn reindex_paths_with_semantic_delta(
                 // Commit each successful chunk before advancing the partial
                 // watch watermark. A crash after this point replays at worst
                 // the next unfinished chunk, not the entire backlog.
-                let lexical_update_deferred = chunk_outcome.batch_outcome.lexical_update_deferred;
+                let mut lexical_update_deferred =
+                    chunk_outcome.batch_outcome.lexical_update_deferred;
+                if chunk_outcome.batch_outcome.workspace_changes > 0 {
+                    // Do not leave a live watcher serving old workspace filters.
+                    // The pre-mutation checkpoint remains pending if this fails.
+                    *t_index_guard = None;
+                    rebuild_tantivy_from_db_deferred_startup_with_options(
+                        &opts.db_path,
+                        &opts.data_dir,
+                        count_total_conversations_exact(&storage)?,
+                        opts.progress.clone(),
+                        None,
+                    )?;
+                    *t_index_guard = Some(TantivyIndex::open_or_create(index_path)?);
+                    lexical_update_deferred = false;
+                }
                 if lexical_update_deferred {
                     tracing::warn!(
                         error = ?chunk_outcome.batch_outcome.lexical_update_error,
@@ -26849,6 +29005,22 @@ enum ConnectorKind {
     Qwen,
     #[serde(rename = "gk", alias = "Grok")]
     Grok,
+    #[serde(rename = "mu", alias = "Muse")]
+    Muse,
+    #[serde(rename = "pr", alias = "PrimeAgent")]
+    PrimeAgent,
+    #[serde(rename = "kr", alias = "Kiro")]
+    Kiro,
+    #[serde(rename = "dv", alias = "Devin")]
+    Devin,
+    #[serde(rename = "oh", alias = "OpenHands")]
+    OpenHands,
+    #[serde(rename = "gs", alias = "Goose")]
+    Goose,
+    #[serde(rename = "cr", alias = "Crush")]
+    Crush,
+    #[serde(rename = "hm", alias = "Hermes")]
+    Hermes,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -27027,6 +29199,20 @@ fn save_watch_state(data_dir: &Path, state: &HashMap<ConnectorKind, i64>) -> Res
     Ok(())
 }
 
+fn set_progress_final_wal_checkpoint(
+    progress: Option<&Arc<IndexingProgress>>,
+    report: Option<FinalWalCheckpointReport>,
+) {
+    let Some(progress) = progress else {
+        return;
+    };
+
+    match progress.final_wal_checkpoint.lock() {
+        Ok(mut guard) => *guard = report,
+        Err(poisoned) => *poisoned.into_inner() = report,
+    }
+}
+
 fn set_progress_last_error(progress: Option<&Arc<IndexingProgress>>, error: Option<String>) {
     let Some(progress) = progress else {
         return;
@@ -27043,12 +29229,12 @@ fn finalize_watch_reindex_result(
     detector: &StaleDetector,
     progress: Option<&Arc<IndexingProgress>>,
     context: &str,
-) -> usize {
+) -> Result<usize> {
     match result {
         Ok(indexed) => {
             set_progress_last_error(progress, None);
             detector.record_scan(indexed);
-            indexed
+            Ok(indexed)
         }
         Err(error) => {
             // ERROR (not WARN) with the full chain so watch-cycle failures are
@@ -27063,7 +29249,9 @@ fn finalize_watch_reindex_result(
             reset_progress_to_idle(progress);
             set_progress_last_error(progress, Some(format!("{context}: {error}")));
             detector.record_scan(0);
-            0
+            // Let the watch loop retain its pending sources. Reporting zero
+            // here would consume the only retry for a previously active file.
+            Err(error)
         }
     }
 }
@@ -27116,6 +29304,30 @@ fn explicit_watch_once_connector_hint(path: &Path) -> Option<ConnectorKind> {
         Some(ConnectorKind::Claude)
     } else if has_pair(".gemini", "tmp") {
         Some(ConnectorKind::Gemini)
+    } else if components
+        .iter()
+        .any(|component| component == "com.openai.chat")
+    {
+        Some(ConnectorKind::ChatGpt)
+    } else if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.starts_with("rollout-")
+                && path.extension().is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("jsonl")
+                        || extension.eq_ignore_ascii_case("json")
+                })
+        })
+    {
+        // Explicitly enrolled rollout files may live in a relocated Codex
+        // home, an archive/cold-rollout root, or the CloudMCP projection
+        // root. Those paths do not necessarily contain the conventional
+        // `.codex/sessions` marker, but the filename contract is the same
+        // one enforced by the Codex connector. Treat the typed file as a
+        // Codex target so `--watch-once` remains targeted and cannot fall
+        // back to a broad connector scan.
+        Some(ConnectorKind::Codex)
     } else if crate::connectors::omp::owns_session_path(path) {
         Some(ConnectorKind::Omp)
     } else {
@@ -27145,6 +29357,13 @@ fn explicit_watch_once_scan_path(kind: ConnectorKind, path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+const WATCH_FORCE_FULL_SCAN_TS: i64 = i64::MIN;
+
+fn is_workspace_trust_sidecar(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name == ".workspace-trusted")
+}
+
 fn classify_paths(
     paths: Vec<PathBuf>,
     roots: &[(ConnectorKind, ScanRoot)],
@@ -27157,99 +29376,110 @@ fn classify_paths(
         let hinted_kind = prefer_explicit_paths
             .then(|| explicit_watch_once_connector_hint(&p))
             .flatten();
-        if let Ok(meta) = std::fs::metadata(&p)
-            && let Ok(time) = meta.modified()
-            && let Ok(dur) = time.duration_since(std::time::UNIX_EPOCH)
-        {
-            let ts = Some(i64::try_from(dur.as_millis()).unwrap_or(i64::MAX));
+        let removed_workspace_sidecar = is_workspace_trust_sidecar(&p) && !p.exists();
+        let ts = if removed_workspace_sidecar {
+            // The file no longer has an mtime, but its removal still invalidates
+            // every transcript in the enclosing Cursor project. A sentinel keeps
+            // the ordinary event watermark separate while requesting a full
+            // Cursor reconstruction scan below.
+            WATCH_FORCE_FULL_SCAN_TS
+        } else {
+            let Ok(meta) = std::fs::metadata(&p) else {
+                continue;
+            };
+            let Ok(time) = meta.modified() else {
+                continue;
+            };
+            let Ok(dur) = time.duration_since(std::time::UNIX_EPOCH) else {
+                continue;
+            };
+            i64::try_from(dur.as_millis()).unwrap_or(i64::MAX)
+        };
 
-            // A connector can report nested roots for one physical store (OMP
-            // profiles are the motivating example). Scanning every containing
-            // root derives different root-relative external IDs for the same
-            // transcript, so retain only the deepest root per connector and
-            // source provenance. Distinct sources remain distinct scans.
-            let mut matching_roots: Vec<(ConnectorKind, &ScanRoot)> = Vec::new();
-            for (kind, root) in roots {
-                if let Some(hinted_kind) = hinted_kind
-                    && *kind != hinted_kind
+        // A connector can report nested roots for one physical store (OMP
+        // profiles are the motivating example). Scanning every containing
+        // root derives different root-relative external IDs for the same
+        // transcript, so retain only the deepest root per connector and
+        // source provenance. Distinct sources remain distinct scans.
+        let mut matching_roots: Vec<(ConnectorKind, &ScanRoot)> = Vec::new();
+        for (kind, root) in roots {
+            if let Some(hinted_kind) = hinted_kind
+                && *kind != hinted_kind
+            {
+                continue;
+            }
+            // A removed Cursor reconstruction sidecar belongs only to Cursor;
+            // otherwise a shared mirror root would wake every connector.
+            if removed_workspace_sidecar && *kind != ConnectorKind::Cursor {
+                continue;
+            }
+            if p.starts_with(&root.path)
+                || (is_devin_database_watch_root(*kind, root)
+                    && database_sidecar_paths(&root.path).contains(&p))
+            {
+                if let Some(index) =
+                    matching_roots
+                        .iter()
+                        .position(|(selected_kind, selected_root)| {
+                            *selected_kind == *kind && selected_root.origin == root.origin
+                        })
                 {
-                    continue;
-                }
-                if p.starts_with(&root.path) {
-                    if let Some(index) =
-                        matching_roots
-                            .iter()
-                            .position(|(selected_kind, selected_root)| {
-                                *selected_kind == *kind && selected_root.origin == root.origin
-                            })
+                    if root.path.components().count()
+                        > matching_roots[index].1.path.components().count()
                     {
-                        if root.path.components().count()
-                            > matching_roots[index].1.path.components().count()
-                        {
-                            matching_roots[index].1 = root;
-                        }
-                    } else {
-                        matching_roots.push((*kind, root));
+                        matching_roots[index].1 = root;
                     }
+                } else {
+                    matching_roots.push((*kind, root));
                 }
             }
-            let matched_root = !matching_roots.is_empty();
-            for (kind, root) in matching_roots {
-                let scan_path = if prefer_explicit_paths {
-                    explicit_watch_once_scan_path(kind, &p)
-                } else {
-                    root.path.clone()
-                };
-                let mut scan_root = root.clone();
-                scan_root.path = scan_path.clone();
-                let key = (
-                    kind,
+        }
+        let matched_root = !matching_roots.is_empty();
+        for (kind, root) in matching_roots {
+            let scan_path = if prefer_explicit_paths && !is_devin_database_watch_root(kind, root) {
+                explicit_watch_once_scan_path(kind, &p)
+            } else {
+                root.path.clone()
+            };
+            let mut scan_root = root.clone();
+            scan_root.path = scan_path.clone();
+            let key = (
+                kind,
+                scan_root.origin.kind,
+                scan_root.origin.source_id.clone(),
+                scan_root.origin.host.clone(),
+                scan_path,
+            );
+            let entry = batch_map.entry(key).or_insert((scan_root, None, None));
+
+            // Update MinTS (for scan window start). A removed sidecar uses the
+            // sentinel so watch_scan_lower_bound can request an uncapped scan.
+            entry.1 = Some(entry.1.map_or(ts, |prev| prev.min(ts)));
+
+            // Update MaxTS (for state high-water mark). A removal has no
+            // meaningful mtime, so leave the persistent event watermark alone.
+            if !removed_workspace_sidecar {
+                entry.2 = Some(entry.2.map_or(ts, |prev| prev.max(ts)));
+            }
+        }
+        if prefer_explicit_paths
+            && !matched_root
+            && let Some(hinted_kind) = hinted_kind
+        {
+            let scan_path = explicit_watch_once_scan_path(hinted_kind, &p);
+            let scan_root = ScanRoot::local(scan_path.clone());
+            let entry = batch_map
+                .entry((
+                    hinted_kind,
                     scan_root.origin.kind,
                     scan_root.origin.source_id.clone(),
                     scan_root.origin.host.clone(),
                     scan_path,
-                );
-                let entry = batch_map.entry(key).or_insert((scan_root, None, None));
-
-                // Update MinTS (for scan window start)
-                entry.1 = match (entry.1, ts) {
-                    (Some(prev), Some(cur)) => Some(prev.min(cur)),
-                    (None, Some(cur)) => Some(cur),
-                    _ => entry.1,
-                };
-
-                // Update MaxTS (for state high-water mark)
-                entry.2 = match (entry.2, ts) {
-                    (Some(prev), Some(cur)) => Some(prev.max(cur)),
-                    (None, Some(cur)) => Some(cur),
-                    _ => entry.2,
-                };
-            }
-            if prefer_explicit_paths
-                && !matched_root
-                && let Some(hinted_kind) = hinted_kind
-            {
-                let scan_path = explicit_watch_once_scan_path(hinted_kind, &p);
-                let scan_root = ScanRoot::local(scan_path.clone());
-                let entry = batch_map
-                    .entry((
-                        hinted_kind,
-                        scan_root.origin.kind,
-                        scan_root.origin.source_id.clone(),
-                        scan_root.origin.host.clone(),
-                        scan_path,
-                    ))
-                    .or_insert((scan_root, None, None));
-                entry.1 = match (entry.1, ts) {
-                    (Some(prev), Some(cur)) => Some(prev.min(cur)),
-                    (None, Some(cur)) => Some(cur),
-                    _ => entry.1,
-                };
-                entry.2 = match (entry.2, ts) {
-                    (Some(prev), Some(cur)) => Some(prev.max(cur)),
-                    (None, Some(cur)) => Some(cur),
-                    _ => entry.2,
-                };
+                ))
+                .or_insert((scan_root, None, None));
+            entry.1 = Some(entry.1.map_or(ts, |prev| prev.min(ts)));
+            if !removed_workspace_sidecar {
+                entry.2 = Some(entry.2.map_or(ts, |prev| prev.max(ts)));
             }
         }
     }
@@ -27267,11 +29497,13 @@ fn watch_event_should_trigger_reindex(event: &notify::Event) -> bool {
         notify::event::EventKind::Create(_)
         | notify::event::EventKind::Any
         | notify::event::EventKind::Other => true,
-        // Incremental watch indexing is append-only today: once a path is gone,
-        // classify_paths() cannot derive a scan window from it and the ingest
-        // path cannot delete the stale conversation rows it previously indexed.
-        // Treat remove events as noise until delete-aware rebuilds exist.
-        notify::event::EventKind::Remove(_) => false,
+        // Conversation sources remain append-only, but a removed Cursor
+        // reconstruction sidecar changes the authority of existing transcripts
+        // and must trigger a Cursor rescan so attribution can become unresolved.
+        notify::event::EventKind::Remove(_) => event
+            .paths
+            .iter()
+            .any(|path| is_workspace_trust_sidecar(path)),
         notify::event::EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)) => false,
         notify::event::EventKind::Modify(_) => true,
     }
@@ -28366,6 +30598,7 @@ pub mod persist {
     pub(super) struct PersistBatchOutcome {
         pub inserted_conversations: usize,
         pub inserted_messages: usize,
+        pub workspace_changes: usize,
         pub semantic_delta_max_message_id: Option<i64>,
         pub semantic_delta_inputs: Vec<EmbeddingInput>,
         pub lexical_update_deferred: bool,
@@ -28380,6 +30613,12 @@ pub mod persist {
             self.inserted_messages = self
                 .inserted_messages
                 .saturating_add(outcome.inserted_indices.len());
+            if outcome.workspace_changed {
+                self.workspace_changes = self.workspace_changes.saturating_add(1);
+                self.lexical_update_deferred = true;
+                self.lexical_update_error =
+                    Some("canonical Cursor workspace attribution changed".to_string());
+            }
         }
 
         fn extend_semantic_delta(
@@ -28404,6 +30643,9 @@ pub mod persist {
         }
 
         pub(super) fn merge(&mut self, other: Self) {
+            self.workspace_changes = self
+                .workspace_changes
+                .saturating_add(other.workspace_changes);
             self.inserted_conversations = self
                 .inserted_conversations
                 .saturating_add(other.inserted_conversations);
@@ -28529,10 +30771,8 @@ pub mod persist {
             Item = (&'a NormalizedConversation, &'a InsertOutcome),
         >,
     ) {
-        let mut links_by_manifest: BTreeMap<
-            String,
-            Vec<crate::raw_mirror::RawMirrorDbLink>,
-        > = BTreeMap::new();
+        let mut links_by_manifest: BTreeMap<String, Vec<crate::raw_mirror::RawMirrorDbLink>> =
+            BTreeMap::new();
         for (conv, outcome) in conversations_and_outcomes {
             let Some(manifest_relative_path) = raw_mirror_manifest_relative_path(conv) else {
                 continue;
@@ -28567,10 +30807,7 @@ pub mod persist {
         let Some(data_dir) = data_dir else {
             return;
         };
-        record_persisted_raw_mirror_db_link_groups(
-            data_dir,
-            convs.iter().zip(outcomes.iter()),
-        );
+        record_persisted_raw_mirror_db_link_groups(data_dir, convs.iter().zip(outcomes.iter()));
     }
 
     fn begin_concurrent_writes_enabled() -> bool {
@@ -29493,9 +31730,9 @@ pub mod persist {
         if let Some(data_dir) = raw_mirror_data_dir {
             record_persisted_raw_mirror_db_link_groups(
                 data_dir,
-                ordered.iter().filter_map(|(idx, outcome)| {
-                    convs.get(*idx).map(|conv| (conv, outcome))
-                }),
+                ordered
+                    .iter()
+                    .filter_map(|(idx, outcome)| convs.get(*idx).map(|conv| (conv, outcome))),
             );
         }
 
@@ -29813,11 +32050,13 @@ pub mod persist {
         conv: &NormalizedConversation,
     ) -> Result<()> {
         tracing::info!(agent = %conv.agent_slug, messages = conv.messages.len(), "persist_conversation");
+        prepare_cursor_workspace_repair(storage, None, std::slice::from_ref(conv))?;
         let internal_conv = map_to_internal(conv);
         let InsertOutcome {
             conversation_id,
             conversation_inserted: _conversation_inserted,
             inserted_indices,
+            workspace_changed: _,
         } = with_ephemeral_writer(storage, false, "persist_conversation", |writer| {
             let agent = Agent {
                 id: None,
@@ -29865,11 +32104,13 @@ pub mod persist {
     ) -> Result<()> {
         let total_started = Instant::now();
         let db_started = Instant::now();
+        prepare_cursor_workspace_repair(storage, None, std::slice::from_ref(conv))?;
         let internal_conv = map_to_internal(conv);
         let InsertOutcome {
             conversation_id,
             conversation_inserted: _conversation_inserted,
             inserted_indices,
+            workspace_changed: _,
         } = with_ephemeral_writer(storage, false, "persist_conversation", |writer| {
             let agent = Agent {
                 id: None,
@@ -29996,6 +32237,44 @@ pub mod persist {
         )
     }
 
+    pub(super) fn prepare_cursor_workspace_repair(
+        storage: &FrankenStorage,
+        data_dir: Option<&Path>,
+        convs: &[NormalizedConversation],
+    ) -> Result<()> {
+        for conv in convs {
+            if conv.agent_slug != "cursor" {
+                continue;
+            }
+            let (source_id, _) = extract_provenance(&conv.metadata);
+            if !storage.cursor_workspace_repair_needed(
+                &conv.agent_slug,
+                &source_id,
+                conv.external_id.as_deref(),
+                conv.workspace.as_deref(),
+                &conv.metadata,
+            )? {
+                continue;
+            }
+            let data_dir = data_dir
+                .context("Cursor workspace repair requires the canonical index data directory")?;
+            let index_path = crate::search::tantivy::index_dir(data_dir)?;
+            let db_path = storage.database_path()?;
+            let mut state = super::LexicalRebuildState::new(
+                super::deferred_lexical_rebuild_db_state(
+                    &db_path,
+                    super::count_total_conversations_exact(storage)?,
+                ),
+                super::LEXICAL_REBUILD_PAGE_SIZE,
+            );
+            state.set_execution_mode(super::LexicalRebuildExecutionMode::CanonicalMetadataRepair);
+            super::persist_lexical_rebuild_state(&index_path, &state)?;
+            super::sync_parent_directory(&super::lexical_rebuild_state_path(&index_path))?;
+            return Ok(());
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn persist_conversations_batched_inner(
         storage: &FrankenStorage,
@@ -30010,6 +32289,10 @@ pub mod persist {
         if convs.is_empty() {
             return Ok(PersistBatchOutcome::default());
         }
+        // GH459: revoke completed lexical authority durably BEFORE any writer
+        // transaction can change workspace associations. A crash or failed
+        // publication is then recovered by the existing full canonical rebuild.
+        prepare_cursor_workspace_repair(storage, raw_mirror_data_dir, convs)?;
         if lexical_population_strategy_requires_inline_tantivy(lexical_strategy)
             && t_index.is_none()
         {
@@ -33303,6 +35586,18 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
+    #[test]
+    fn closed_world_connector_roots_skip_default_detection() {
+        let closed_world = Some(Arc::new(HashMap::new()));
+        let result = detect_for_local_scan(&closed_world, || {
+            panic!("closed-world indexing must not run default detection")
+        });
+        assert!(result.is_none());
+
+        let result = detect_for_local_scan(&None, DetectionResult::not_found);
+        assert!(result.is_some_and(|detection| !detection.detected));
+    }
+
     /// #366: waiting↔waiting park flaps are scheduler churn a livelocked
     /// pipeline can sustain forever; they must not reset the stall clock.
     /// Every transition through a working site is genuine progress.
@@ -34331,6 +36626,7 @@ mod tests {
             None,
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             Vec::new(),
+            None,
             vec![("codex", failing_explicit_file_root_connector_factory)],
             FrankenStorage::now_millis(),
             None,
@@ -34509,11 +36805,7 @@ mod tests {
             &source_path
         ));
         assert!(
-            !should_skip_active_session_source(
-                &active_filter,
-                SourceKind::Ssh,
-                &source_path
-            ),
+            !should_skip_active_session_source(&active_filter, SourceKind::Ssh, &source_path),
             "remote mirrors are immutable local copies, not live provider writers"
         );
     }
@@ -34825,6 +37117,38 @@ mod tests {
     }
 
     #[test]
+    fn index_run_lock_guard_drop_releases_lock_for_immediate_reacquire() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"placeholder")?;
+
+        let first = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)?;
+        assert!(
+            acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index).is_err(),
+            "a second owner must not acquire the lock while the first guard is alive"
+        );
+
+        drop(first);
+        let second = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)?;
+        drop(second);
+
+        let lock_path = tmp.path().join("index-run.lock");
+        assert!(
+            read_index_run_lock_metadata_for_test(&lock_path)?
+                .trim()
+                .is_empty(),
+            "dropping the guard must clear the lock metadata before reacquire"
+        );
+        let sidecar_path =
+            crate::search::asset_state::index_run_lock_metadata_sidecar_path(&lock_path);
+        assert!(
+            !sidecar_path.exists(),
+            "dropping the guard must remove the metadata sidecar before reacquire"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn issue_342_semantic_index_lock_identifies_rebuild_job_and_phase() -> Result<()> {
         use crate::search::asset_state::read_search_maintenance_snapshot;
 
@@ -34977,6 +37301,71 @@ mod tests {
         Ok(())
     }
 
+    /// Regression for GH #443.
+    ///
+    /// A plain incremental run (`mode=index`) used to write only the
+    /// `classify_nonresumable_checkpoint` breadcrumb and then leave it in
+    /// place for every later preflight step, so a wedge inside the writable
+    /// storage open was reported against a sidecar read that had already
+    /// returned. Every taxonomy step must now be visible in every mode.
+    #[test]
+    fn preflight_breadcrumbs_are_visible_in_every_index_mode() {
+        for mode in [
+            SearchMaintenanceMode::Index,
+            SearchMaintenanceMode::WatchStartup,
+            SearchMaintenanceMode::Watch,
+            SearchMaintenanceMode::WatchOnce,
+        ] {
+            for sub_phase in super::WATCH_STARTUP_SUB_PHASE_TAXONOMY {
+                assert!(
+                    super::preflight_breadcrumb_visible(mode, sub_phase),
+                    "{sub_phase} must be written to the lock file under mode {:?}; a breadcrumb \
+                     that stops advancing after classify_nonresumable_checkpoint misattributes \
+                     an open_storage wedge (GH #443)",
+                    mode.as_lock_value()
+                );
+            }
+        }
+    }
+
+    /// GH #443 companion: under `mode=index` the lock file carries the
+    /// sub-phase string while `mode=` stays `index`, so `cass status` shows
+    /// the running preflight step for a plain incremental run and does not
+    /// mistake it for a watch-startup job.
+    #[test]
+    fn set_phase_under_plain_index_mode_keeps_mode_index_and_advances_breadcrumb() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"placeholder")?;
+        let mut guard = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)?;
+        let lock_path = tmp.path().join("index-run.lock");
+
+        for sub_phase in [
+            "watch_startup:classify_nonresumable_checkpoint",
+            "watch_startup:open_storage",
+            "watch_startup:writable_preflight",
+            "watch_startup:count_total_conversations",
+        ] {
+            guard.set_phase(SearchMaintenanceMode::Index, sub_phase)?;
+            let raw = read_index_run_lock_metadata_for_test(&lock_path)?;
+            let phase_line = raw.lines().find_map(|line| line.strip_prefix("phase="));
+            assert_eq!(
+                phase_line,
+                Some(sub_phase),
+                "plain index mode must advance the on-disk phase= breadcrumb; got {raw:?}"
+            );
+            let mode_line = raw.lines().find_map(|line| line.strip_prefix("mode="));
+            assert_eq!(
+                mode_line,
+                Some("index"),
+                "sub-phase breadcrumbs must not rewrite mode= for a plain index run; got {raw:?}"
+            );
+        }
+
+        drop(guard);
+        Ok(())
+    }
+
     /// Regression for cass#265.
     ///
     /// The `IndexStallWatchdog` resets its `last_progress_advance`
@@ -35018,6 +37407,7 @@ mod tests {
             "watch_startup:reclassify_legacy_omp",
             "watch_startup:classify_nonresumable_checkpoint",
             "watch_startup:count_nonresumable_checkpoint_conversations",
+            "watch_startup:fts_shadow_viability",
         ];
         for sub_phase in documented_sub_phases {
             assert!(
@@ -35411,6 +37801,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn cleanup_orphan_fk_rows_preflight_is_opt_in() {
         {
             let _guard = unset_env_var("CASS_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS");
@@ -35717,6 +38108,144 @@ mod tests {
             metadata: serde_json::json!({}),
             messages: msgs,
         }
+    }
+
+    #[test]
+    fn gh459_workspace_repair_checkpoint_precedes_mutation_and_survives_reopen() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "cursor".into(),
+                name: "Cursor".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let mut conv = norm_conv(Some("gh459-durable"), vec![norm_msg(0, 100)]);
+        conv.agent_slug = "cursor".into();
+        conv.workspace = Some(PathBuf::from("/workspace/my/app"));
+        conv.metadata = serde_json::json!({"cursor_format":"agent"});
+        let wrong_id = storage
+            .ensure_workspace(conv.workspace.as_ref().unwrap(), None)
+            .unwrap();
+        let original = storage
+            .insert_conversation_tree(agent_id, Some(wrong_id), &persist::map_to_internal(&conv))
+            .unwrap();
+        let messages =
+            serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
+                .unwrap();
+        rebuild_tantivy_from_db_deferred_startup(&db_path, &data_dir, 1, None).unwrap();
+        let index_path = crate::search::tantivy::index_dir(&data_dir).unwrap();
+        let published = index_meta_fingerprint(&index_path).unwrap();
+        conv.workspace = Some(PathBuf::from("/workspace/my-app"));
+        conv.metadata["cursor_workspace_attribution"] = serde_json::json!("workspace_trusted");
+        persist::prepare_cursor_workspace_repair(
+            &storage,
+            Some(&data_dir),
+            std::slice::from_ref(&conv),
+        )
+        .unwrap();
+        let pending = load_lexical_rebuild_state(&index_path).unwrap().unwrap();
+        assert!(!pending.completed);
+        assert_eq!(
+            pending.effective_execution_mode(),
+            LexicalRebuildExecutionMode::CanonicalMetadataRepair
+        );
+        assert!(pending.requires_restart_from_zero_on_resume());
+        assert_eq!(
+            storage.list_conversations(10, 0).unwrap()[0].workspace,
+            Some(PathBuf::from("/workspace/my/app")),
+            "pending state must precede the canonical mutation"
+        );
+        let outcome = persist::persist_conversations_batched_with_raw_mirror_links(
+            &storage,
+            None,
+            &data_dir,
+            std::slice::from_ref(&conv),
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            false,
+            persist::PersistHeartbeat::NONE,
+        )
+        .unwrap();
+        assert_eq!(outcome.workspace_changes, 1);
+        assert_eq!(outcome.inserted_conversations, 0);
+        assert_eq!(outcome.inserted_messages, 0);
+        assert!(outcome.lexical_update_deferred);
+        storage.close().unwrap();
+        // Stop before publication and reopen the real database and sidecar.
+        assert_eq!(index_meta_fingerprint(&index_path).unwrap(), published);
+        assert!(
+            !load_lexical_rebuild_state(&index_path)
+                .unwrap()
+                .unwrap()
+                .completed
+        );
+        assert!(
+            nonresumable_pending_lexical_rebuild_status_without_fingerprint(
+                &index_path,
+                &db_path,
+                2
+            )
+            .unwrap()
+            .unwrap()
+            .has_pending_resume,
+            "intervening inserts cannot erase metadata repair debt"
+        );
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(
+            storage.list_conversations(10, 0).unwrap()[0].workspace,
+            conv.workspace
+        );
+        assert_eq!(
+            serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
+                .unwrap(),
+            messages
+        );
+        rebuild_tantivy_from_db_deferred_startup(&db_path, &data_dir, 1, None).unwrap();
+        assert!(
+            load_lexical_rebuild_state(&index_path)
+                .unwrap()
+                .unwrap()
+                .completed
+        );
+        assert_ne!(index_meta_fingerprint(&index_path).unwrap(), published);
+
+        // A real checkpoint write failure must reject the batch before UPDATE.
+        let checkpoint_path = lexical_rebuild_state_path(&index_path);
+        fs::rename(
+            &checkpoint_path,
+            index_path.join("retained-gh459-checkpoint.json"),
+        )
+        .unwrap();
+        fs::create_dir(&checkpoint_path).unwrap();
+        conv.metadata["cursor_workspace_attribution"] = serde_json::json!("unresolved");
+        conv.workspace = None;
+        assert!(
+            persist::persist_conversations_batched_with_raw_mirror_links(
+                &storage,
+                None,
+                &data_dir,
+                &[conv],
+                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                false,
+                persist::PersistHeartbeat::NONE,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            storage.list_conversations(10, 0).unwrap()[0].workspace,
+            Some(PathBuf::from("/workspace/my-app"))
+        );
+        assert_eq!(
+            serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
+                .unwrap(),
+            messages
+        );
     }
 
     fn seed_lexical_rebuild_fixture(storage: &FrankenStorage) {
@@ -39677,6 +42206,247 @@ mod tests {
         assert_eq!(controller.current_budget(), steady_budget);
     }
 
+    /// GH #445 fixtures: a 24-core Linux host (high watermark 22.0, low 21.0)
+    /// with plenty of memory, in steady mode, hold/samples pinned directly so
+    /// no env var is touched.
+    fn gh445_controller() -> (
+        LexicalRebuildResponsivenessController,
+        LexicalRebuildPipelineBudgetSnapshot,
+        LexicalRebuildPipelineBudgetSnapshot,
+    ) {
+        // Byte limits mirror production shape (startup: 640 MiB inflight,
+        // 128 MiB page fetch; steady: ~2.2 GiB inflight, 512 MiB page fetch)
+        // so a 100 MB pending batch is routine, not a saturation trigger.
+        let startup_budget = LexicalRebuildPipelineBudgetSnapshot::new(
+            32,
+            64,
+            128 << 20,
+            640 << 20,
+            2_048,
+            128,
+            4_096,
+        );
+        let steady_budget = LexicalRebuildPipelineBudgetSnapshot::new(
+            256,
+            512,
+            512 << 20,
+            2_357_809_664,
+            10_000,
+            8_192,
+            65_536,
+        );
+        let mut controller = LexicalRebuildResponsivenessController::new(
+            LexicalRebuildResponsivenessPolicy::Auto,
+            startup_budget,
+            steady_budget,
+            8,
+            false,
+            Some(22_000),
+            Some(21_000),
+        );
+        controller.restore_clear_samples = 3;
+        controller.restore_hold = Duration::from_millis(1);
+        controller.memory_reserve_bytes = 11 << 30;
+        controller.emergency_memory_reserve_bytes = 4 << 30;
+        (controller, startup_budget, steady_budget)
+    }
+
+    /// The reporter's mid-rebuild shape: pending batch, bytes in flight at
+    /// ~82% of the cap, a routine loadavg of 12.72 on 24 cores, 51 GB free.
+    fn gh445_busy_runtime(loadavg_1m_milli: u32) -> LexicalRebuildPipelineRuntimeSnapshot {
+        LexicalRebuildPipelineRuntimeSnapshot {
+            queue_depth: 0,
+            inflight_message_bytes: 524_666_240,
+            max_message_bytes_in_flight: 640 << 20,
+            pending_batch_conversations: 15,
+            pending_batch_message_bytes: 104_771_393,
+            producer_budget_wait_count: 355,
+            producer_budget_waiter_count: 1,
+            host_loadavg_1m_milli: Some(loadavg_1m_milli),
+            host_available_memory_bytes: Some(51_625_844_736),
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn gh445_controller_restores_mid_rebuild_with_in_flight_work_once_host_is_calm() {
+        let (mut controller, startup_budget, steady_budget) = gh445_controller();
+        assert_eq!(controller.mode(), "steady");
+
+        // A genuine host trigger demotes: loadavg over the high watermark.
+        let overloaded = LexicalRebuildPipelineRuntimeSnapshot {
+            host_loadavg_1m_milli: Some(25_000),
+            ..gh445_busy_runtime(25_000)
+        };
+        let transition = controller
+            .observe_runtime(&overloaded)
+            .expect("host loadavg over the high watermark must demote");
+        assert_eq!(transition.mode, "pressure_limited");
+        assert!(
+            transition
+                .reason
+                .starts_with("host_loadavg_1m_25.000_reached_high_watermark")
+        );
+        assert_eq!(controller.current_budget(), startup_budget);
+
+        // Load drops to routine levels while the pipeline is still full of
+        // work. The old gate needed an EMPTY pipeline (queue, pending batch,
+        // inflight <= 50%) for three samples — never true mid-rebuild — and
+        // pinned the run to the startup budget for good.
+        controller.last_transition_at = Instant::now() - Duration::from_secs(1);
+        let busy = gh445_busy_runtime(12_720);
+        assert!(controller.observe_runtime(&busy).is_none());
+        assert_eq!(controller.reason(), "awaiting_clear_pressure_window_1/3");
+        assert!(controller.observe_runtime(&busy).is_none());
+        assert_eq!(controller.reason(), "awaiting_clear_pressure_window_2/3");
+        let restore = controller
+            .observe_runtime(&busy)
+            .expect("three calm host samples must restore the steady budget mid-rebuild");
+        assert_eq!(restore.old_budget, startup_budget);
+        assert_eq!(restore.new_budget, steady_budget);
+        assert_eq!(restore.mode, "steady");
+        assert_eq!(
+            restore.reason,
+            "restored_steady_budget_after_3_clear_samples"
+        );
+        assert_eq!(controller.current_budget(), steady_budget);
+    }
+
+    #[test]
+    fn gh445_inflight_near_cap_is_backpressure_not_pressure_when_host_is_calm() {
+        let (mut controller, _, steady_budget) = gh445_controller();
+        // The healthy steady run on the reporting archive sat at 93% of the
+        // inflight cap with loadavg ~12 on 24 cores. That must not demote.
+        let saturated = LexicalRebuildPipelineRuntimeSnapshot {
+            inflight_message_bytes: 2_196_486_820,
+            max_message_bytes_in_flight: steady_budget.max_message_bytes_in_flight,
+            pending_batch_conversations: 63,
+            queue_depth: 8,
+            ordered_buffered_pages: 2,
+            producer_handoff_wait_count: 1,
+            ..gh445_busy_runtime(12_720)
+        };
+        assert!(controller.observe_runtime(&saturated).is_none());
+        assert_eq!(controller.mode(), "steady");
+        assert_eq!(controller.reason(), "steady_budget_with_headroom");
+        assert_eq!(controller.current_budget(), steady_budget);
+    }
+
+    #[test]
+    fn gh445_saturation_still_demotes_when_loadavg_is_above_the_low_watermark() {
+        let (mut controller, startup_budget, steady_budget) = gh445_controller();
+        // Between the low (21.0) and high (22.0) watermarks the host is not
+        // demonstrably calm, so a saturated pipeline keeps its say.
+        let saturated_under_load = LexicalRebuildPipelineRuntimeSnapshot {
+            inflight_message_bytes: 2_196_486_820,
+            max_message_bytes_in_flight: steady_budget.max_message_bytes_in_flight,
+            ..gh445_busy_runtime(21_500)
+        };
+        let transition = controller
+            .observe_runtime(&saturated_under_load)
+            .expect("inflight near the cap under load must demote");
+        assert!(
+            transition
+                .reason
+                .starts_with("inflight_message_bytes_2196486820_near_limit_")
+        );
+        assert_eq!(controller.current_budget(), startup_budget);
+
+        // Restore is blocked while loadavg stays above the low watermark —
+        // and the reason names the actual blocker, not a generic
+        // "pressure_signals_not_yet_clear".
+        controller.last_transition_at = Instant::now() - Duration::from_secs(1);
+        let busy_under_load = gh445_busy_runtime(21_500);
+        assert!(controller.observe_runtime(&busy_under_load).is_none());
+        assert_eq!(
+            controller.reason(),
+            "host_loadavg_1m_21.500_above_low_watermark_21.000"
+        );
+        assert_eq!(controller.mode(), "pressure_limited");
+
+        // Memory below the reserve blocks restore too (hysteresis on the
+        // memory demote), then a calm streak restores.
+        let low_memory = LexicalRebuildPipelineRuntimeSnapshot {
+            host_available_memory_bytes: Some(10 << 30),
+            ..gh445_busy_runtime(12_000)
+        };
+        assert!(controller.observe_runtime(&low_memory).is_none());
+        assert!(
+            controller
+                .reason()
+                .starts_with("host_available_memory_bytes_"),
+            "{}",
+            controller.reason()
+        );
+        let calm = gh445_busy_runtime(12_000);
+        assert!(controller.observe_runtime(&calm).is_none());
+        assert!(controller.observe_runtime(&calm).is_none());
+        let restore = controller
+            .observe_runtime(&calm)
+            .expect("calm host restores");
+        assert_eq!(restore.new_budget, steady_budget);
+    }
+
+    #[test]
+    fn gh445_saturation_demotes_without_host_telemetry_and_restore_hold_backs_off() {
+        // No loadavg reading (non-Linux, or no watermark): the pipeline shape
+        // is the only signal, so saturation demotes as before — and because
+        // the steady budget saturates again as soon as it returns, the hold
+        // doubles per demotion (capped at 8x) so the budgets cannot flap
+        // every few seconds.
+        let startup_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 2_048, 16, 128, 4_096);
+        let steady_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(256, 512, 4096, 8_192, 1_024, 8_192, 65_536);
+        let mut controller = LexicalRebuildResponsivenessController::new(
+            LexicalRebuildResponsivenessPolicy::Auto,
+            startup_budget,
+            steady_budget,
+            2,
+            false,
+            None,
+            None,
+        );
+        controller.restore_clear_samples = 1;
+        controller.restore_hold = Duration::from_millis(10);
+        assert_eq!(
+            controller.restore_hold_after_demotions(),
+            Duration::from_millis(10)
+        );
+
+        let saturated = LexicalRebuildPipelineRuntimeSnapshot {
+            queue_depth: 2,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        };
+        let calm = LexicalRebuildPipelineRuntimeSnapshot::default();
+        let expected_holds_ms = [10u64, 20, 40, 80, 80, 80];
+        for (demotion, expected_hold_ms) in expected_holds_ms.iter().enumerate() {
+            let transition = controller
+                .observe_runtime(&saturated)
+                .unwrap_or_else(|| panic!("saturation demotes (demotion #{})", demotion + 1));
+            assert_eq!(transition.mode, "pressure_limited");
+            assert_eq!(
+                controller.restore_hold_after_demotions(),
+                Duration::from_millis(*expected_hold_ms),
+                "hold after demotion #{}",
+                demotion + 1
+            );
+            // Inside the hold: no restore, even though nothing is pressuring.
+            assert!(controller.observe_runtime(&calm).is_none());
+            assert!(
+                controller
+                    .reason()
+                    .starts_with("holding_conservative_budget_after_pressure_demote_for_")
+            );
+            controller.last_transition_at =
+                Instant::now() - Duration::from_millis(*expected_hold_ms);
+            let restore = controller
+                .observe_runtime(&calm)
+                .expect("one calm sample after the hold restores");
+            assert_eq!(restore.new_budget, steady_budget);
+        }
+    }
+
     #[test]
     #[serial]
     fn lexical_rebuild_responsiveness_controller_demotes_on_new_handoff_wait_delta() {
@@ -40176,7 +42946,21 @@ mod tests {
         drop(storage);
 
         let (tx, rx) = bounded::<LexicalRebuildPipelineMessage>(4);
-        let flow_limiter = Arc::new(StreamingByteLimiter::new(8 * 1024));
+        // Keep the lookup fixture at one three-conversation page. The live
+        // governor may shrink a runtime request under load, so inject the
+        // fixed page budget and use its matching in-flight limit.
+        let pipeline_budget = LexicalRebuildPipelineBudgetSnapshot::new(
+            3,
+            32,
+            3 * 8 * 1024 * 1024,
+            15 * 8 * 1024 * 1024,
+            3,
+            32,
+            3 * 8 * 1024 * 1024,
+        );
+        let flow_limiter = Arc::new(StreamingByteLimiter::new(
+            pipeline_budget.max_message_bytes_in_flight,
+        ));
         let handle = spawn_lexical_rebuild_packet_producer(
             db_path,
             None,
@@ -40184,33 +42968,24 @@ mod tests {
             LEXICAL_REBUILD_PAGE_SIZE,
             4,
             None,
-            Arc::new(LexicalRebuildPipelineBudgetController::new(
-                lexical_rebuild_runtime_pipeline_budget_snapshot(3, 32, 1024, 4, 3, 32, 1024),
-            )),
+            Arc::new(LexicalRebuildPipelineBudgetController::new(pipeline_budget)),
             tx,
             flow_limiter.clone(),
             None,
             Arc::new(LexicalRebuildProducerTelemetry::default()),
         );
 
-        let mut packets = Vec::new();
-        loop {
-            match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-                LexicalRebuildPipelineMessage::Batch(batch) => {
-                    release_lexical_rebuild_prepared_page_reservation(
-                        &batch,
-                        flow_limiter.as_ref(),
-                    );
-                    packets.extend(batch.packets);
-                }
-                LexicalRebuildPipelineMessage::Done => break,
-                LexicalRebuildPipelineMessage::Error(error) => {
-                    panic!("producer returned error: {error}")
-                }
-            }
+        let batch = match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+            LexicalRebuildPipelineMessage::Batch(batch) => batch,
+            other => panic!("expected prepared batch, got {other:?}"),
+        };
+        match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+            LexicalRebuildPipelineMessage::Done => {}
+            other => panic!("expected pipeline completion, got {other:?}"),
         }
         handle.join().unwrap();
 
+        let packets = &batch.packets;
         assert_eq!(packets.len(), 3);
         let remote_packet = packets
             .iter()
@@ -40231,6 +43006,7 @@ mod tests {
             packets.iter().all(|packet| packet.message_count > 0),
             "fixture pages should still carry grouped messages after producer-owned lookup warmup"
         );
+        release_lexical_rebuild_prepared_page_reservation(&batch, flow_limiter.as_ref());
         assert_eq!(flow_limiter.bytes_in_flight(), 0);
     }
 
@@ -40718,10 +43494,32 @@ mod tests {
         let planned_shard_plan =
             plan_lexical_rebuild_shards_from_storage_with_settings(&storage, &planned_settings, 6)
                 .unwrap();
+        assert_eq!(
+            planned_shard_plan
+                .shards
+                .iter()
+                .map(|shard| shard.conversation_count)
+                .collect::<Vec<_>>(),
+            vec![3, 3]
+        );
         storage.close_without_checkpoint().unwrap();
 
         let (tx, rx) = bounded::<LexicalRebuildPipelineMessage>(2);
-        let flow_limiter = Arc::new(StreamingByteLimiter::new(256 * 1024));
+        // This test exercises exact shard boundaries, so inject a fixed
+        // budget. The runtime helper applies live machine pressure and can
+        // reduce the requested three-conversation page to a smaller page.
+        let pipeline_budget = LexicalRebuildPipelineBudgetSnapshot::new(
+            64,
+            256,
+            3 * 8 * 1024 * 1024,
+            9 * 8 * 1024 * 1024,
+            64,
+            256,
+            3 * 8 * 1024 * 1024,
+        );
+        let flow_limiter = Arc::new(StreamingByteLimiter::new(
+            pipeline_budget.max_message_bytes_in_flight,
+        ));
         let handle = spawn_lexical_rebuild_packet_producer(
             db_path,
             None,
@@ -40729,17 +43527,7 @@ mod tests {
             LEXICAL_REBUILD_PAGE_SIZE,
             2,
             None,
-            Arc::new(LexicalRebuildPipelineBudgetController::new(
-                lexical_rebuild_runtime_pipeline_budget_snapshot(
-                    64,
-                    256,
-                    256 * 1024,
-                    2,
-                    64,
-                    256,
-                    256 * 1024,
-                ),
-            )),
+            Arc::new(LexicalRebuildPipelineBudgetController::new(pipeline_budget)),
             tx,
             flow_limiter.clone(),
             None,
@@ -41510,8 +44298,7 @@ mod tests {
                 assert_eq!(conversations[0].external_id.as_deref(), Some("huge"));
                 assert_eq!(message_count, 1);
                 assert_eq!(
-                    byte_reservation,
-                    expected_reservation,
+                    byte_reservation, expected_reservation,
                     "the limiter must charge the full retained object graph, not content alone"
                 );
             }
@@ -42025,6 +44812,7 @@ mod tests {
             work_rx,
             msg_tx,
             Arc::clone(&flow_limiter),
+            None,
             None,
         );
 
@@ -42988,6 +45776,9 @@ mod tests {
             assert_eq!(outcome.inserted_messages, 0);
             assert!(outcome.lexical_update_deferred);
             assert_eq!(outcome.quarantined_conversations, 1);
+            assert!(outcome.scan_had_errors);
+            assert!(outcome.scanned_connectors.is_empty());
+            assert_eq!(storage.get_connector_last_scan_ts("codex").unwrap(), None);
 
             let quarantine_path = data_dir.join("quarantine/index_ingest_poison.jsonl");
             let contents = std::fs::read_to_string(&quarantine_path).unwrap();
@@ -43029,7 +45820,7 @@ mod tests {
     #[test]
     #[serial]
     fn streaming_consumer_defers_small_non_watch_oom_without_quarantine() {
-        let _oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        let oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
         // Pin the pressure probe to "never real pressure" so the size gate is
         // what decides, deterministically, on any host.
         let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
@@ -43043,34 +45834,86 @@ mod tests {
         let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
         let progress = Arc::new(IndexingProgress::default());
         let conv = norm_conv(Some("defer-single"), vec![norm_msg(0, 1_700_000_000_000)]);
+        let prior_watermark = 1_600_000_000_000;
+        let scan_watermark = 1_700_000_123_456;
+        storage
+            .set_connector_last_scan_ts("codex", prior_watermark)
+            .unwrap();
 
         let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
-        send_conversation_batches(&tx, "codex", vec![conv], true);
+        send_conversation_batches(&tx, "codex", vec![conv.clone()], true);
         send_done(&tx, "codex", true);
+        send_done(&tx, "claude", true);
         drop(tx);
 
         let (_discovered, outcome) = run_streaming_consumer(
             rx,
-            1,
+            2,
             &storage,
             &data_dir,
             Some(&mut index),
             Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
-            Some(FrankenStorage::now_millis()),
+            Some(scan_watermark),
             None,
         )
         .expect("small-conversation NoMem without real pressure should defer, not fail");
 
         assert_eq!(outcome.quarantined_conversations, 0);
         assert!(outcome.lexical_update_deferred);
+        assert!(outcome.scan_had_errors);
+        assert_eq!(
+            outcome.deferred_sources,
+            BTreeSet::from([conv.source_path.clone()])
+        );
+        assert_eq!(
+            outcome.scanned_connectors,
+            BTreeSet::from(["claude".to_string()])
+        );
+        assert_eq!(
+            storage.get_connector_last_scan_ts("codex").unwrap(),
+            Some(prior_watermark)
+        );
+        assert_eq!(
+            storage.get_connector_last_scan_ts("claude").unwrap(),
+            Some(scan_watermark)
+        );
         assert!(
             !data_dir
                 .join("quarantine/index_ingest_poison.jsonl")
                 .exists(),
             "a small conversation with no real memory pressure must be deferred, not quarantined (#298)"
         );
+
+        drop(oom_guard);
+        for expected_inserted in [1, 0] {
+            let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
+            send_conversation_batches(&tx, "codex", vec![conv.clone()], true);
+            send_done(&tx, "codex", true);
+            drop(tx);
+            let (_, retried) = run_streaming_consumer(
+                rx,
+                1,
+                &storage,
+                &data_dir,
+                Some(&mut index),
+                Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+                &Some(progress.clone()),
+                LexicalPopulationStrategy::IncrementalInline,
+                Some(scan_watermark),
+                None,
+            )
+            .unwrap();
+            assert!(!retried.scan_had_errors);
+            assert!(retried.deferred_sources.is_empty());
+            assert_eq!(retried.inserted_messages, expected_inserted);
+            assert_eq!(
+                storage.get_connector_last_scan_ts("codex").unwrap(),
+                Some(scan_watermark)
+            );
+            assert_eq!(storage.total_message_count().unwrap(), 1);
+        }
     }
 
     /// #290: a stable, already-triaged backlog of *same-version* irreducible
@@ -43141,11 +45984,16 @@ mod tests {
             "malformed structured quarantine must retain a diagnostic"
         );
         anyhow::ensure!(
-            summary.recommended_action.as_deref().is_some_and(|action| action
-                .contains("malformed or unreadable")),
+            summary
+                .recommended_action
+                .as_deref()
+                .is_some_and(|action| action.contains("malformed or unreadable")),
             "malformed structured quarantine must route to an explicit repair action"
         );
-        anyhow::ensure!(state_path.exists(), "health inspection must preserve the bad file");
+        anyhow::ensure!(
+            state_path.exists(),
+            "health inspection must preserve the bad file"
+        );
         Ok(())
     }
 
@@ -43419,27 +46267,160 @@ mod tests {
         Ok(())
     }
 
-    /// #422: a watchdog-confirmed wedge must still terminate even when the
-    /// fresh checkpoint attempt blocks behind the wedged writer. Before the
-    /// checkpoint was separately supervised, this pre-exit cleanup could
-    /// itself hang forever and nullify the watchdog's abort guarantee.
+    /// #422: a watchdog-confirmed wedge must terminate the checkpoint
+    /// attempt without leaving a DB/WAL-holding worker behind. The cooperative
+    /// test callback observes cancellation, exits, and is joined before the
+    /// timeout result is returned; the next attempt can start immediately.
     #[test]
-    fn abort_wal_checkpoint_wait_is_bounded_when_the_worker_blocks() {
-        let started = Instant::now();
+    fn abort_wal_checkpoint_timeout_cancels_and_joins_before_immediate_rerun() {
+        let worker_started = Arc::new(AtomicBool::new(false));
+        let worker_finished = Arc::new(AtomicBool::new(false));
+        let started = Arc::clone(&worker_started);
+        let finished = Arc::clone(&worker_finished);
+        let started_at = Instant::now();
+
         let attempt = run_bounded_abort_wal_checkpoint(
-            PathBuf::from("unused-by-planted-blocking-checkpoint"),
+            PathBuf::from("unused-by-cooperative-checkpoint"),
             Duration::from_millis(5),
-            |_| {
-                std::thread::sleep(Duration::from_secs(1));
+            move |_, cancellation| {
+                started.store(true, Ordering::Release);
+                while !cancellation.is_cancelled() {
+                    std::thread::yield_now();
+                }
+                finished.store(true, Ordering::Release);
                 Ok(FinalWalCheckpointOutcome::Completed)
             },
         );
 
         assert!(matches!(attempt, AbortWalCheckpointAttempt::TimedOut));
         assert!(
-            started.elapsed() < Duration::from_millis(500),
-            "checkpoint supervision must return at its own deadline, not wait for the blocked worker"
+            started_at.elapsed() < Duration::from_millis(500),
+            "checkpoint supervision must return promptly after cancellation"
         );
+        assert!(
+            worker_started.load(Ordering::Acquire),
+            "the worker should have started before the timeout result"
+        );
+        assert!(
+            worker_finished.load(Ordering::Acquire),
+            "timeout must join the canceled worker before returning"
+        );
+
+        let rerun = run_bounded_abort_wal_checkpoint(
+            PathBuf::from("immediate-rerun"),
+            Duration::from_secs(1),
+            move |_, cancellation| {
+                assert!(
+                    !cancellation.is_cancelled(),
+                    "each finalization attempt must receive a fresh cancellation token"
+                );
+                Ok(FinalWalCheckpointOutcome::Completed)
+            },
+        );
+        assert!(matches!(
+            rerun,
+            AbortWalCheckpointAttempt::Finished(Ok(FinalWalCheckpointOutcome::Completed))
+        ));
+    }
+
+    #[test]
+    fn bounded_native_wal_checkpoint_reports_worker_unavailable_without_spawned_worker() {
+        let attempt = run_bounded_native_wal_checkpoint_with_executable(
+            Path::new("/cass/does/not/exist/final-wal-worker"),
+            PathBuf::from("missing-worker"),
+            Duration::from_millis(5),
+            "spawn failure",
+        );
+
+        match attempt {
+            AbortWalCheckpointAttempt::WorkerUnavailable(error) => {
+                assert!(
+                    error.contains("spawning final WAL checkpoint worker"),
+                    "spawn failures must be reported as WorkerUnavailable: {error}"
+                );
+            }
+            other => panic!("expected WorkerUnavailable, got {other:?}"),
+        }
+    }
+
+    /// A native checkpoint worker is a separate process because fsqlite does
+    /// not expose a cancellation hook for a blocked WAL checkpoint. Exercise
+    /// the timeout path with a deliberately sleeping worker and verify that
+    /// the child has been killed and reaped before the timeout result returns.
+    #[cfg(unix)]
+    #[test]
+    fn bounded_native_wal_checkpoint_timeout_kills_and_reaps_worker() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new()?;
+        let worker = temp.path().join("sleeping-wal-worker.sh");
+        let pid_file = temp.path().join("worker.pid");
+        std::fs::write(
+            &worker,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{}'\nexec /bin/sleep 60\n",
+                pid_file.display()
+            ),
+        )?;
+        let mut permissions = std::fs::metadata(&worker)?.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&worker, permissions)?;
+
+        let started_at = Instant::now();
+        let attempt = run_bounded_native_wal_checkpoint_with_executable(
+            &worker,
+            temp.path().join("unused.sqlite"),
+            Duration::from_secs(1),
+            "child timeout test",
+        );
+        assert!(matches!(attempt, AbortWalCheckpointAttempt::TimedOut));
+        assert!(
+            started_at.elapsed() < Duration::from_secs(5),
+            "timed-out child must be terminated promptly"
+        );
+
+        let pid_deadline = Instant::now() + Duration::from_secs(1);
+        let pid = loop {
+            if let Ok(raw_pid) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = raw_pid.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < pid_deadline,
+                "sleeping worker did not record its pid"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let status = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()?;
+        assert!(
+            !status.success(),
+            "timed-out worker pid {pid} is still alive; timeout detached the DB owner"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_abort_wal_checkpoint_joins_worker_without_an_outcome() {
+        let attempt = run_bounded_abort_wal_checkpoint(
+            PathBuf::from("panic-without-outcome"),
+            Duration::from_secs(1),
+            |_, _| -> Result<FinalWalCheckpointOutcome> {
+                panic!("planted checkpoint worker panic")
+            },
+        );
+
+        match attempt {
+            AbortWalCheckpointAttempt::WorkerUnavailable(error) => {
+                assert!(
+                    error.contains("planted checkpoint worker panic"),
+                    "worker panic must be surfaced after join: {error}"
+                );
+            }
+            other => panic!("expected WorkerUnavailable, got {other:?}"),
+        }
     }
 
     /// #321: a `wal_checkpoint(TRUNCATE)` that SQLite reports as blocked
@@ -43460,6 +46441,19 @@ mod tests {
                 checkpointed_frames: 0,
             },
             "busy=1 checkpoint must classify as Blocked, never Completed"
+        );
+
+        // Unexpected negative counters are malformed engine output. They are
+        // not evidence that the WAL was truncated, so preserve a blocked
+        // terminal state rather than reporting a false success.
+        assert_eq!(
+            classify_final_wal_checkpoint(0, -1, -1),
+            FinalWalCheckpointOutcome::Blocked {
+                busy: 0,
+                log_frames: -1,
+                checkpointed_frames: -1,
+            },
+            "invalid checkpoint counters must not be reported as completed"
         );
 
         // A clean TRUNCATE: not busy, every logged frame backfilled.
@@ -43487,6 +46481,64 @@ mod tests {
             FinalWalCheckpointOutcome::Completed,
             "an already-empty WAL is a completed no-op"
         );
+    }
+
+    #[test]
+    fn final_wal_checkpoint_report_is_structured_and_fail_closed() {
+        assert!(
+            FinalWalCheckpointReport::Completed
+                .require_success("report test")
+                .is_ok()
+        );
+        assert!(
+            FinalWalCheckpointReport::NotNeeded {
+                reason: "empty input".to_string(),
+            }
+            .require_success("report test")
+            .is_ok()
+        );
+
+        let blocked = FinalWalCheckpointReport::from_attempt(
+            AbortWalCheckpointAttempt::Finished(Ok(FinalWalCheckpointOutcome::Blocked {
+                busy: 1,
+                log_frames: 289_842,
+                checkpointed_frames: 0,
+            })),
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            blocked,
+            FinalWalCheckpointReport::Blocked {
+                busy: 1,
+                log_frames: 289_842,
+                checkpointed_frames: 0,
+            }
+        );
+        assert!(blocked.require_success("report test").is_err());
+        assert_eq!(
+            serde_json::to_value(&blocked).unwrap(),
+            serde_json::json!({
+                "status": "blocked",
+                "busy": 1,
+                "log_frames": 289842,
+                "checkpointed_frames": 0,
+            })
+        );
+
+        for report in [
+            FinalWalCheckpointReport::TimedOut { timeout_secs: 1 },
+            FinalWalCheckpointReport::WorkerUnavailable {
+                error: "spawn failed".to_string(),
+            },
+            FinalWalCheckpointReport::Failed {
+                error: "checkpoint failed".to_string(),
+            },
+        ] {
+            assert!(
+                report.require_success("report test").is_err(),
+                "{report:?} must not be accepted as a successful close"
+            );
+        }
     }
 
     #[test]
@@ -44026,11 +47078,84 @@ mod tests {
             None,
             "full scans already have no cutoff"
         );
+        for has_conversations in [false, true] {
+            for watermark in [0, 2000, i64::MAX] {
+                assert_eq!(
+                    connector_local_scan_since_ts_from_state(
+                        None,
+                        Some(watermark),
+                        has_conversations
+                    ),
+                    None,
+                    "a saved connector watermark must not restrict a full or repair scan"
+                );
+            }
+        }
         assert_eq!(
             connector_local_scan_since_ts_from_state(global_incremental_since_ts, Some(0), false),
             Some(0),
             "saturating subtraction must not underflow old or corrupt zero-valued markers"
         );
+    }
+
+    #[test]
+    fn devin_non_watch_scan_ignores_lossy_provider_timestamp_watermarks() -> Result<()> {
+        let temp = TempDir::new()?;
+        let storage = FrankenStorage::open(&temp.path().join("cass.db"))?;
+        storage.set_connector_last_scan_ts("devin", i64::MAX)?;
+        let factories = get_connector_factories();
+        let local_since_by_connector =
+            connector_local_scan_since_ts_map(&storage, Some(1234), &factories)?;
+
+        assert_eq!(
+            local_since_by_connector.get("devin").copied().flatten(),
+            None,
+            "Devin must re-read its SQLite/WAL source because whole-second provider timestamps cannot be bounded by millisecond scan watermarks"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_configured_roots_retain_incremental_watermarks() -> Result<()> {
+        let temp = TempDir::new()?;
+        let storage = FrankenStorage::open(&temp.path().join("cass.db"))?;
+        storage.set_connector_last_scan_ts("cursor", 9876)?;
+        let local_since_by_connector = connector_local_scan_since_ts_map(
+            &storage,
+            Some(1234),
+            &[(
+                "cursor",
+                never_constructed_connector_factory as ConnectorFactory,
+            )],
+        )?;
+        assert_eq!(
+            local_since_by_connector.get("cursor").copied().flatten(),
+            Some(9875),
+            "a saved Cursor watermark must bound the next connector scan"
+        );
+
+        let root = ScanRoot::local(PathBuf::from("/tmp/cursor-history"));
+        assert_eq!(
+            connector_explicit_scan_root_since_ts(
+                "cursor",
+                &root,
+                Path::new("/tmp/cass-data"),
+                local_since_by_connector.get("cursor").copied().flatten(),
+            ),
+            Some(9875),
+            "Cursor adapter handles sidecar-only changes without disabling root cutoffs"
+        );
+        assert_eq!(
+            connector_explicit_scan_root_since_ts(
+                "claude",
+                &root,
+                Path::new("/tmp/cass-data"),
+                Some(1234),
+            ),
+            Some(1234),
+            "other configured local connectors retain their incremental cutoff"
+        );
+        Ok(())
     }
 
     #[test]
@@ -44304,23 +47429,7 @@ mod tests {
             .execute("INSERT INTO checkpoint_probe VALUES (42);")
             .unwrap();
 
-        let progress = Arc::new(IndexingProgress::default());
-        progress.finalizing.store(true, Ordering::Relaxed);
-        close_storage_after_index(storage, &db_path, "test index run", Some(&progress)).unwrap();
-        assert!(
-            !progress.finalizing.load(Ordering::Relaxed),
-            "finalizing must be cleared after the final close"
-        );
-        assert_eq!(
-            progress
-                .stats
-                .lock()
-                .unwrap()
-                .final_wal_checkpoint
-                .as_ref()
-                .map(|status| status.status.as_str()),
-            Some("completed")
-        );
+        close_storage_after_index(storage, &db_path, "test index run", None).unwrap();
 
         let conn = crate::franken_sync::Connection::open(db_path_str).unwrap();
         let rows = conn.query("PRAGMA wal_checkpoint(FULL);").unwrap();
@@ -44753,6 +47862,7 @@ mod tests {
                     Origin::remote("fixture-host"),
                     Some(crate::sources::config::Platform::Linux),
                 )],
+                local_connector_roots: None,
                 since_ts: None,
                 local_since_ts_by_connector: Arc::new(HashMap::new()),
                 progress: Some(progress.clone()),
@@ -44838,6 +47948,7 @@ mod tests {
                 Origin::remote("fixture-host"),
                 Some(Platform::Linux),
             )],
+            None,
             vec![("claude", watermark_sensitive_remote_connector_factory)],
             FrankenStorage::now_millis(),
             None,
@@ -44919,6 +48030,7 @@ mod tests {
             Some(i64::MAX),
             LexicalPopulationStrategy::IncrementalInline,
             vec![configured_local_scan_root(local_root_path)],
+            None,
             vec![("claude", watermark_sensitive_remote_connector_factory)],
             FrankenStorage::now_millis(),
             None,
@@ -44965,6 +48077,7 @@ mod tests {
             None,
             LexicalPopulationStrategy::IncrementalInline,
             Vec::new(),
+            None,
             vec![("claude", panic_connector_factory)],
             FrankenStorage::now_millis(),
             None,
@@ -45031,6 +48144,7 @@ mod tests {
                 Origin::remote("fixture-host"),
                 Some(Platform::Linux),
             )],
+            None,
             vec![("claude", watermark_sensitive_remote_connector_factory)],
             FrankenStorage::now_millis(),
             None,
@@ -45110,6 +48224,7 @@ mod tests {
             Some(i64::MAX),
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             vec![configured_local_scan_root(local_root_path)],
+            None,
             vec![("claude", watermark_sensitive_remote_connector_factory)],
             FrankenStorage::now_millis(),
             None,
@@ -45162,6 +48277,7 @@ mod tests {
                 None,
                 LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
                 Vec::new(),
+                None,
                 vec![("codex", failing_explicit_file_root_connector_factory)],
                 FrankenStorage::now_millis(),
                 None,
@@ -45244,6 +48360,7 @@ mod tests {
             None,
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             Vec::new(),
+            None,
             vec![
                 ("claude", active_batch_watermark_connector_factory),
                 ("codex", safe_batch_watermark_connector_factory),
@@ -45263,6 +48380,51 @@ mod tests {
             Some(scan_start_ts),
             "batch mode must persist each safe connector watermark only after its rows commit"
         );
+        let oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        let _pressure_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
+        let next_scan_ts = scan_start_ts + 1;
+        let deferred = run_batch_index_with_connector_factories(
+            &storage,
+            None,
+            &opts,
+            None,
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            Vec::new(),
+            None,
+            vec![("codex", safe_batch_watermark_connector_factory)],
+            next_scan_ts,
+            None,
+        )?;
+        assert!(deferred.scan_had_errors);
+        assert!(deferred.scanned_connectors.is_empty());
+        assert_eq!(deferred.deferred_sources, BTreeSet::from([safe_path]));
+        assert_eq!(
+            storage.get_connector_last_scan_ts("codex")?,
+            Some(scan_start_ts)
+        );
+        drop(oom_guard);
+        let retried = run_batch_index_with_connector_factories(
+            &storage,
+            None,
+            &opts,
+            None,
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            Vec::new(),
+            None,
+            vec![("codex", safe_batch_watermark_connector_factory)],
+            next_scan_ts,
+            None,
+        )?;
+        assert!(!retried.scan_had_errors);
+        assert_eq!(
+            retried.scanned_connectors,
+            BTreeSet::from(["codex".to_string()])
+        );
+        assert_eq!(
+            storage.get_connector_last_scan_ts("codex")?,
+            Some(next_scan_ts)
+        );
+        assert_eq!(storage.total_message_count()?, 1);
         Ok(())
     }
 
@@ -45297,6 +48459,7 @@ mod tests {
             None,
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             Vec::new(),
+            None,
             vec![("codex", deferred_batch_connector_factory)],
             FrankenStorage::now_millis(),
             None,
@@ -45358,6 +48521,7 @@ mod tests {
                     Origin::remote("fixture-host"),
                     Some(crate::sources::config::Platform::Linux),
                 )],
+                local_connector_roots: None,
                 since_ts: None,
                 local_since_ts_by_connector: Arc::new(HashMap::new()),
                 progress: None,
@@ -45564,6 +48728,221 @@ mod tests {
         );
     }
 
+    /// Build a real Quill index at the data dir's expected lexical path with
+    /// `rounds` single-document commits, then fold them into one segment so
+    /// the folded inputs sit on disk unreferenced by the MANIFEST (#453).
+    fn plant_merged_quill_index(data_dir: &Path, rounds: u64) -> PathBuf {
+        use crate::search::quill_bridge::QuillCassIndex;
+        use frankensearch::quill::cass::CassDocument;
+
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        std::fs::create_dir_all(&index_path).unwrap();
+        let mut index = QuillCassIndex::open_or_create(&index_path).expect("open or create");
+        for round in 0..rounds {
+            index
+                .add_cass_documents(&[CassDocument {
+                    agent: "claude".to_owned(),
+                    workspace: Some("cass".to_owned()),
+                    workspace_original: Some("cass".to_owned()),
+                    source_path: format!("/transcripts/session-{round}.jsonl"),
+                    msg_idx: 0,
+                    created_at: Some(1_700_000_000),
+                    title: Some("footprint fixture".to_owned()),
+                    content: format!("footprint fixture round {round} with distinct tokens"),
+                    source_id: format!("session-{round}"),
+                    origin_kind: "local".to_owned(),
+                    origin_host: None,
+                    conversation_id: Some(1),
+                }])
+                .expect("index batch");
+            index.commit().expect("commit batch");
+        }
+        index.force_merge().expect("force merge");
+        assert_eq!(
+            index.segment_count(),
+            1,
+            "merge must leave one live segment"
+        );
+        index_path
+    }
+
+    /// #453: the headroom projection doubles only the live lexical bytes.
+    /// Merge-retired segment files and retained publish backups are already
+    /// on disk and are not rewritten by a rebuild, so they are reported but
+    /// excluded from the requirement.
+    #[test]
+    fn full_rebuild_headroom_excludes_retired_segments_and_retained_backups() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::File::create(&db_path)
+            .unwrap()
+            .set_len(300 * 1024 * 1024)
+            .unwrap();
+        let index_path = plant_merged_quill_index(&data_dir, 4);
+
+        let footprint = lexical_index_footprint(&data_dir);
+        let quill = crate::search::quill_bridge::quill_directory_footprint(&index_path)
+            .expect("published Quill index");
+        assert_eq!(footprint.live_bytes, quill.live_bytes);
+        assert_eq!(footprint.retired_segment_bytes, quill.retired_bytes);
+        assert_eq!(footprint.retired_segment_files, quill.retired_segment_files);
+        assert_eq!(
+            footprint.retired_segment_files, 4,
+            "four folded inputs remain on disk"
+        );
+        assert!(footprint.retired_segment_bytes > 0);
+        assert_eq!(footprint.retained_backup_bytes, 0);
+
+        // A retained prior generation and a stray file next to the index.
+        let backup_dir = data_dir
+            .join(LEXICAL_INDEX_ROOT_DIR)
+            .join(LEXICAL_PUBLISH_BACKUPS_DIR_NAME)
+            .join("2026-09-05T00-00-00Z");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::File::create(backup_dir.join("seg-000000000000abcd.fslx"))
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        std::fs::write(
+            backup_dir.join("MANIFEST"),
+            b"not parsed: backups are never split",
+        )
+        .unwrap();
+        std::fs::write(
+            data_dir
+                .join(LEXICAL_INDEX_ROOT_DIR)
+                .join("schema_hash.json"),
+            vec![b'x'; 40],
+        )
+        .unwrap();
+
+        let with_extras = lexical_index_footprint(&data_dir);
+        assert_eq!(with_extras.live_bytes, footprint.live_bytes + 40);
+        assert_eq!(
+            with_extras.retired_segment_bytes,
+            footprint.retired_segment_bytes
+        );
+        assert_eq!(
+            with_extras.retained_backup_bytes,
+            64 * 1024 * 1024 + "not parsed: backups are never split".len() as u64
+        );
+        assert_eq!(
+            with_extras.total_bytes(),
+            recursive_size_for_test(&data_dir.join(LEXICAL_INDEX_ROOT_DIR)),
+            "the classification is exhaustive over the index tree"
+        );
+
+        let projection = full_rebuild_headroom_projection(&data_dir, &db_path);
+        assert_eq!(projection.lexical_index_bytes, with_extras.live_bytes);
+        assert_eq!(
+            projection.retired_segment_bytes,
+            with_extras.retired_segment_bytes
+        );
+        assert_eq!(projection.retired_segment_files, 4);
+        assert_eq!(
+            projection.retained_backup_bytes,
+            with_extras.retained_backup_bytes
+        );
+        // db(300 MiB)*2 clears the floor, so the requirement is exactly the
+        // rule over live bytes: the 64 MiB backup and the retired inputs are
+        // not doubled into it.
+        assert_eq!(
+            projection.required_bytes,
+            projection.db_bundle_bytes * 2 + with_extras.live_bytes * 2
+        );
+        assert!(
+            projection.required_bytes
+                < projection.db_bundle_bytes * 2 + with_extras.total_bytes() * 2,
+            "the recursive size would have demanded more"
+        );
+    }
+
+    /// An unreadable MANIFEST must make the walk conservative: every byte in
+    /// that directory counts as live.
+    #[test]
+    fn lexical_footprint_treats_an_unreadable_manifest_as_all_live() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+        std::fs::create_dir_all(&index_path).unwrap();
+        std::fs::write(index_path.join("MANIFEST"), b"garbage").unwrap();
+        std::fs::write(
+            index_path.join("seg-0000000000000001.fslx"),
+            vec![0u8; 1000],
+        )
+        .unwrap();
+        std::fs::write(
+            index_path.join("seg-0000000000000001.fslx.retired"),
+            vec![0u8; 40],
+        )
+        .unwrap();
+        let footprint = lexical_index_footprint(&data_dir);
+        assert_eq!(footprint.live_bytes, 1000 + 40 + "garbage".len() as u64);
+        assert_eq!(footprint.retired_segment_bytes, 0);
+        assert_eq!(footprint.retired_segment_files, 0);
+    }
+
+    /// `cass index --gc` plumbing (#453): the sweep opens the writer, reports
+    /// the footprint on both sides, and cannot reclaim inside the engine's
+    /// grace period (the folded inputs were retired seconds ago).
+    #[test]
+    fn lexical_segment_gc_reports_the_footprint_and_respects_the_grace_period() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        assert!(
+            run_lexical_segment_gc(&data_dir)
+                .unwrap_err()
+                .to_string()
+                .contains("no published lexical index"),
+            "a missing index is a typed refusal, not a create"
+        );
+        let index_path = plant_merged_quill_index(&data_dir, 3);
+        let before = crate::search::quill_bridge::quill_directory_footprint(&index_path)
+            .expect("published Quill index");
+
+        let report = run_lexical_segment_gc(&data_dir).expect("sweep");
+        assert_eq!(report.index_path, index_path);
+        assert_eq!(report.live_segments, 1);
+        assert_eq!(
+            report.segment_files_before, 4,
+            "three inputs plus the merge output"
+        );
+        assert_eq!(
+            report.segment_files_after, 4,
+            "inputs are inside the grace period"
+        );
+        assert_eq!(report.retired_bytes_before, before.retired_bytes);
+        assert_eq!(report.retired_bytes_after, before.retired_bytes);
+        assert_eq!(report.reclaimed_files, 0);
+        assert_eq!(report.reclaimed_bytes, 0);
+        assert_eq!(
+            report.grace_secs,
+            frankensearch::quill::DEFAULT_GARBAGE_GRACE.as_secs()
+        );
+        let json = serde_json::to_value(&report).expect("serialize");
+        assert_eq!(json["live_segments"], 1);
+        assert_eq!(json["reclaimed_files"], 0);
+    }
+
+    fn recursive_size_for_test(root: &Path) -> u64 {
+        let mut total = 0u64;
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.is_file() {
+                total += metadata.len();
+            } else if metadata.is_dir() {
+                for entry in std::fs::read_dir(&path).unwrap().flatten() {
+                    stack.push(entry.path());
+                }
+            }
+        }
+        total
+    }
+
     #[test]
     fn headroom_probe_checks_data_dir_and_custom_db_parent_when_distinct() {
         let tmp = TempDir::new().unwrap();
@@ -45585,6 +48964,31 @@ mod tests {
 
         assert_eq!(wal, PathBuf::from("/tmp/cass.db-wal"));
         assert_eq!(shm, PathBuf::from("/tmp/cass.db-shm"));
+    }
+
+    /// GH #450: the storage-open liveness probe must watch the frankensqlite
+    /// migration-repair artifacts, not just the live archive — writing the
+    /// `.pre-migration-bak` copy is the longest, most opaque part of the open
+    /// and is the only footprint that grows while it runs.
+    #[test]
+    fn storage_open_liveness_targets_cover_the_migration_repair_artifacts() {
+        let db_path = PathBuf::from("/tmp/cass.db");
+        let targets = storage_open_liveness_targets(&db_path);
+
+        for expected in [
+            "/tmp/cass.db",
+            "/tmp/cass.db-wal",
+            "/tmp/cass.db-shm",
+            "/tmp/cass.db.pre-migration-bak",
+            "/tmp/cass.db.pre-migration-bak-wal",
+            "/tmp/cass.db.pre-migration-bak-shm",
+            "/tmp/cass.db.fsqlite-migration-state",
+        ] {
+            assert!(
+                targets.contains(&PathBuf::from(expected)),
+                "missing liveness watch target {expected}: {targets:?}"
+            );
+        }
     }
 
     #[test]
@@ -45688,9 +49092,10 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn full_rebuild_integrity_preflight_large_archive_stops_before_fsqlite_open() {
-        let _max_bytes = set_env("CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES", "4096");
+        // bet45/qu81y: the 4096-byte cap is INJECTED instead of set via
+        // process-global env — the env guard leaked into parallel sibling
+        // preflight tests and made their engine-backed detection skip.
         let tmp = TempDir::new().unwrap();
         let seed_path = tmp.path().join("seed.db");
         let seed = FrankenStorage::open(&seed_path).unwrap();
@@ -45704,7 +49109,8 @@ mod tests {
         drop(large);
 
         assert_eq!(
-            full_rebuild_existing_archive_integrity_preflight(&db_path).unwrap(),
+            full_rebuild_existing_archive_integrity_preflight_with_max_bytes(&db_path, 4096)
+                .unwrap(),
             None,
             "a large archive must defer engine-backed integrity work instead of opening fsqlite"
         );
@@ -45747,6 +49153,42 @@ mod tests {
     }
 
     #[test]
+    fn full_rebuild_integrity_preflight_allows_interrupted_fresh_schema_bootstrap() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("interrupted-fresh-schema.db");
+        let conn =
+            crate::franken_sync::Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute(
+            "CREATE TABLE _schema_migrations (
+                 version INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+             )",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            full_rebuild_existing_archive_integrity_preflight(&db_path).unwrap(),
+            None,
+            "an empty migration marker must be resumable after SIGKILL"
+        );
+
+        let (storage, rebuilt, opened_fresh_for_full) =
+            open_storage_for_index(&db_path, true).unwrap();
+        assert!(!rebuilt);
+        assert!(!opened_fresh_for_full);
+        assert!(
+            storage
+                .raw()
+                .query("SELECT id FROM conversations LIMIT 1")
+                .is_ok(),
+            "resumed migration must restore the canonical conversations table"
+        );
+        storage.close().unwrap();
+    }
+
+    #[test]
     fn full_rebuild_integrity_preflight_rejects_corrupt_fts_structure_record() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("corrupt-fts-segment.db");
@@ -45759,6 +49201,8 @@ mod tests {
             storage
                 .raw()
                 .execute(
+                    // bet45: the contentless fts_messages shadow no longer
+                    // carries a message_id column; the rowid IS the message id.
                     "INSERT INTO fts_messages(
                          rowid, content, title, agent, workspace, source_path, created_at
                      ) VALUES(
@@ -45770,14 +49214,16 @@ mod tests {
         }
 
         {
-            let conn = crate::franken_sync::Connection::open(
-                db_path.to_string_lossy().into_owned(),
-            )
-            .unwrap();
+            let conn =
+                crate::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())
+                    .unwrap();
+            // bet45: target the newest structure record instead of the old
+            // magic id=10 — the contentless shadow's row layout changed and
+            // the fixture's single segment no longer lands on that id.
             conn.execute(
                 "UPDATE fts_messages_data
                  SET block = X'FFFFFFFFFFFFFFFFFFFFFFFF'
-                 WHERE id = 10",
+                 WHERE id = (SELECT MAX(id) FROM fts_messages_data)",
             )
             .expect("corrupt the persisted FTS structure record");
         }
@@ -45825,10 +49271,8 @@ mod tests {
 
     #[test]
     fn full_rebuild_integrity_preflight_recognizes_legacy_fts_shadow_ddl() {
-        let legacy_config =
-            "CREATE TABLE fts_messages_config(k TEXT PRIMARY KEY, v)";
-        let legacy_idx =
-            "CREATE TABLE fts_messages_idx(segid INTEGER, term BLOB, pgno INTEGER)";
+        let legacy_config = "CREATE TABLE fts_messages_config(k TEXT PRIMARY KEY, v)";
+        let legacy_idx = "CREATE TABLE fts_messages_idx(segid INTEGER, term BLOB, pgno INTEGER)";
         for (table, ddl) in [
             ("fts_messages_config", legacy_config),
             ("fts_messages_idx", legacy_idx),
@@ -46821,6 +50265,29 @@ mod tests {
         );
     }
 
+    /// #440: the resume fence owes the upsert path exactly the documents the
+    /// published authority holds beyond the checkpoint (plus slack), nothing
+    /// for a from-zero build, and everything for a resume into the live index.
+    #[test]
+    fn resume_reconcile_upsert_budget_matches_the_authority_gap() {
+        // From zero: never upsert, whatever the index holds.
+        assert_eq!(resume_reconcile_upsert_budget(false, false, 0, 0), 0);
+        assert_eq!(resume_reconcile_upsert_budget(false, false, 0, 500), 0);
+        // Resume into staging: authority at or behind the checkpoint owes nothing.
+        assert_eq!(resume_reconcile_upsert_budget(false, true, 300, 300), 0);
+        assert_eq!(resume_reconcile_upsert_budget(false, true, 300, 120), 0);
+        // Resume into staging with the authority ahead: gap plus slack.
+        assert_eq!(
+            resume_reconcile_upsert_budget(false, true, 316_934, 320_000),
+            3_066 + RESUME_RECONCILE_SLACK_DOCS
+        );
+        // Resume into the live index: every replayed document is upserted.
+        assert_eq!(
+            resume_reconcile_upsert_budget(true, true, 300, 300),
+            usize::MAX
+        );
+    }
+
     #[test]
     fn fallback_fts_repair_is_skipped_for_canonical_only_full_rebuild() {
         assert!(!should_repair_fallback_fts_after_full_index_run(true, true));
@@ -46862,7 +50329,7 @@ mod tests {
         seed_lexical_rebuild_fixture(&storage);
 
         let repair =
-            repair_fallback_fts_after_full_index_run(&storage, &db_path, true, false, None)
+            repair_fallback_fts_after_full_index_run(&storage, &db_path, true, false, None, None)
                 .unwrap();
         assert_eq!(
             repair,
@@ -46880,7 +50347,7 @@ mod tests {
         seed_lexical_rebuild_fixture(&storage);
 
         let repair =
-            repair_fallback_fts_after_full_index_run(&storage, &db_path, true, false, None)
+            repair_fallback_fts_after_full_index_run(&storage, &db_path, true, false, None, None)
                 .unwrap();
         assert_eq!(
             repair,
@@ -46910,6 +50377,7 @@ mod tests {
             true,
             false,
             Some(&archive_fingerprint),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -46919,6 +50387,42 @@ mod tests {
                     archive_fingerprint
                 }
             )
+        );
+    }
+
+    /// #439: the fallback-FTS shadow maintenance must report liveness per
+    /// streamed page, otherwise the post-publish `--full` tail looks like a
+    /// finalize wedge to the stall watchdog.
+    #[test]
+    fn fallback_fts_repair_after_full_run_ticks_its_heartbeat_per_page() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("fts-heartbeat.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        // No shadow at all, so the repair has to stream every canonical row.
+        seed_lexical_rebuild_fixture(&storage);
+
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let heartbeat_ticks = Arc::clone(&ticks);
+        let repair = repair_fallback_fts_after_full_index_run(
+            &storage,
+            &db_path,
+            true,
+            false,
+            None,
+            Some(Box::new(move || {
+                heartbeat_ticks.fetch_add(1, Ordering::Relaxed);
+            })),
+        )
+        .unwrap();
+        assert_eq!(
+            repair,
+            Some(FallbackFtsRepairOutcome::Repaired(
+                FtsConsistencyRepair::Rebuilt { inserted_rows: 4 }
+            ))
+        );
+        assert!(
+            ticks.load(Ordering::Relaxed) >= 1,
+            "streaming the shadow rows must tick the liveness heartbeat"
         );
     }
 
@@ -48077,10 +51581,23 @@ mod tests {
             assert!(rebuild.exact_checkpoint_persisted);
         });
 
+        // bet45: startup->steady promotion has two legitimate triggers that
+        // race on tiny budgets. The startup flow budget IS the initial
+        // commit-bytes interval (startup_commit_interval_message_bytes feeds
+        // the startup pipeline budget's batch-fetch bytes and in-flight cap),
+        // and the prep worker's working-set reservation is budget-limit
+        // derived, so a page-prep budget wait before the first durable commit
+        // is inherent here — when the controller samples that waiter first it
+        // promotes with a `startup_*_promoted_steady_budget_before_first_
+        // durable_commit` reason and the later commit-side
+        // record_first_durable_commit correctly becomes a no-op. Both paths
+        // prove the invariant under test: the startup budget was promoted to
+        // the steady budget exactly once, with the budget-update log emitted.
         assert!(
             logs.contains("updated lexical rebuild pipeline budgets")
-                && logs.contains("controller_reason=first_durable_commit_promoted_steady_budget"),
-            "expected budget-promotion log, got:
+                && (logs.contains("controller_reason=first_durable_commit_promoted_steady_budget")
+                    || logs.contains("promoted_steady_budget_before_first_durable_commit")),
+            "expected a startup->steady budget-promotion log, got:
 {logs}"
         );
         assert!(
@@ -48148,24 +51665,17 @@ mod tests {
             "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
             "2",
         );
-        let _steady_commit_conversations = set_env(
-            "CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS",
-            "4096",
-        );
+        let _steady_commit_conversations =
+            set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS", "4096");
         let _startup_commit_conversations = set_env(
             "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS",
             "4096",
         );
-        let _steady_commit_messages =
-            set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES", "4096");
-        let _startup_commit_messages = set_env(
-            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGES",
-            "4096",
-        );
-        let _steady_commit_bytes = set_env(
-            "CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES",
-            "4096",
-        );
+        let _steady_commit_messages = set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES", "4096");
+        let _startup_commit_messages =
+            set_env("CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGES", "4096");
+        let _steady_commit_bytes =
+            set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES", "4096");
         let _startup_commit_bytes = set_env(
             "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGE_BYTES",
             "4096",
@@ -48178,16 +51688,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         ensure_fts_schema(&storage);
         let conversations = (0..12)
-            .map(|idx| {
-                large_startup_conv(
-                    "codex",
-                    "gh382-reduced",
-                    idx,
-                    2,
-                    128,
-                    1_700_500_000_000,
-                )
-            })
+            .map(|idx| large_startup_conv("codex", "gh382-reduced", idx, 2, 128, 1_700_500_000_000))
             .collect::<Vec<_>>();
         ingest_batch(
             &storage,
@@ -51037,6 +54538,62 @@ mod tests {
     }
 
     #[test]
+    fn devin_watch_scan_lower_bound_does_not_filter_delayed_provider_commits() {
+        assert_eq!(watch_scan_lower_bound(ConnectorKind::Devin, None), None);
+        for input in [0, 1, 999, 1000, 1001, 1_700_000_000_999, i64::MAX] {
+            assert_eq!(
+                watch_scan_lower_bound(ConnectorKind::Devin, Some(input)),
+                None,
+                "a filesystem watermark must not exclude an older provider activity timestamp"
+            );
+            assert_eq!(
+                watch_scan_lower_bound(ConnectorKind::Codex, Some(input)),
+                Some(input),
+                "other connectors retain their existing millisecond scan bound"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_devin_database_sidecars_preserves_root_and_rejects_neighbors() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("sessions.db");
+        fs::write(&db, b"source database").unwrap();
+        let root = ScanRoot::remote(db.clone(), Origin::remote("devin-host"), None);
+        let roots = vec![(ConnectorKind::Devin, root.clone())];
+        for sidecar in database_sidecar_paths(&db) {
+            fs::write(&sidecar, b"sidecar event").unwrap();
+            for explicit in [false, true] {
+                let classified = classify_paths(vec![sidecar.clone()], &roots, explicit);
+                assert_eq!(classified.len(), 1);
+                assert_eq!(classified[0].0, ConnectorKind::Devin);
+                assert_eq!(classified[0].1.path, db);
+                assert_eq!(classified[0].1.origin, root.origin);
+                assert_eq!(classified[0].1.platform, root.platform);
+            }
+            assert!(
+                classify_paths(
+                    vec![sidecar],
+                    &[(ConnectorKind::Codex, root.clone())],
+                    false,
+                )
+                .is_empty(),
+                "SQLite sidecar routing must stay scoped to Devin"
+            );
+        }
+        for name in ["other.db-wal", "sessions.db-wal-extra", "sessions.db2-wal"] {
+            let neighbor = tmp.path().join(name);
+            fs::write(&neighbor, b"unrelated event").unwrap();
+            for explicit in [false, true] {
+                assert!(
+                    classify_paths(vec![neighbor.clone()], &roots, explicit).is_empty(),
+                    "unrelated neighbor must not trigger Devin: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn classify_paths_uses_latest_mtime_per_connector() {
         let tmp = TempDir::new().unwrap();
         let codex = tmp.path().join(".codex/sessions/rollout-1.jsonl");
@@ -51216,6 +54773,60 @@ mod tests {
     }
 
     #[test]
+    fn classify_paths_hints_codex_for_relocated_rollout_file_without_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp
+            .path()
+            .join("archived_sessions/2026/09/09/rollout-relocated.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(&session, b"{}\n").unwrap();
+
+        let classified = classify_paths(vec![session.clone()], &[], true);
+
+        assert_eq!(classified.len(), 1);
+        assert_eq!(classified[0].0, ConnectorKind::Codex);
+        assert_eq!(classified[0].1.path, session);
+        assert!(classified[0].2.is_some());
+        assert!(classified[0].3.is_some());
+    }
+
+    #[test]
+    fn classify_paths_hints_codex_for_relocated_rollout_json_file_without_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp
+            .path()
+            .join("archived_sessions/2026/09/09/rollout-relocated.json");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(&session, b"{}\n").unwrap();
+
+        let classified = classify_paths(vec![session.clone()], &[], true);
+
+        assert_eq!(classified.len(), 1);
+        assert_eq!(classified[0].0, ConnectorKind::Codex);
+        assert_eq!(classified[0].1.path, session);
+        assert!(classified[0].2.is_some());
+        assert!(classified[0].3.is_some());
+    }
+
+    #[test]
+    fn classify_paths_hints_chatgpt_for_explicit_app_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp
+            .path()
+            .join("Library/Application Support/com.openai.chat/v1/conversation.json");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"{}\n").unwrap();
+
+        let classified = classify_paths(vec![file.clone()], &[], true);
+
+        assert_eq!(classified.len(), 1);
+        assert_eq!(classified[0].0, ConnectorKind::ChatGpt);
+        assert_eq!(classified[0].1.path, file);
+        assert!(classified[0].2.is_some());
+        assert!(classified[0].3.is_some());
+    }
+
+    #[test]
     fn classify_paths_keeps_omp_xdg_sessions_root_for_watch_once() {
         let tmp = tempfile::tempdir().unwrap();
         let sessions_root = tmp.path().join("share/omp/sessions");
@@ -51319,6 +54930,121 @@ mod tests {
         assert_eq!(conversations.len(), 1);
         assert_eq!(conversations[0].agent_slug, "omp");
         assert_eq!(conversations[0].metadata_json["profile"], "review");
+    }
+
+    #[test]
+    #[serial]
+    fn reindex_paths_watch_once_indexes_relocated_rollout_and_chatgpt_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let codex_session = tmp
+            .path()
+            .join("relocated-home/archived-rollouts/2026/09/09/rollout-relocated-watch-once.jsonl");
+        std::fs::create_dir_all(codex_session.parent().unwrap()).unwrap();
+        std::fs::write(
+            &codex_session,
+            r#"{"timestamp":"2026-09-09T06:00:00.000Z","type":"session_meta","payload":{"id":"relocated-rollout-watch-once","cwd":"/workspace/relocated"}}
+{"timestamp":"2026-09-09T06:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"relocated rollout watch once"}]}}
+{"timestamp":"2026-09-09T06:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"codex relocation indexed"}]}}
+"#,
+        )
+        .unwrap();
+
+        let chatgpt_root = tmp
+            .path()
+            .join("relocated-home/Library/Application Support/com.openai.chat");
+        let chatgpt_dir = chatgpt_root.join("conversations-relocated");
+        let chatgpt_file = chatgpt_dir.join("chatgpt-relocated.json");
+        std::fs::create_dir_all(&chatgpt_dir).unwrap();
+        std::fs::write(
+            &chatgpt_file,
+            r#"{
+  "id": "chatgpt-relocated-watch-once",
+  "title": "Relocated ChatGPT watch once",
+  "mapping": {
+    "user": {
+      "parent": null,
+      "message": {
+        "author": {"role": "user"},
+        "content": {"parts": ["chatgpt relocated watch once"]},
+        "create_time": 1788900000.0
+      }
+    },
+    "assistant": {
+      "parent": "user",
+      "message": {
+        "author": {"role": "assistant"},
+        "content": {"parts": ["chatgpt relocation indexed"]},
+        "create_time": 1788900001.0
+      }
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let opts = super::IndexOptions {
+            full: false,
+            watch: false,
+            force_rebuild: false,
+            watch_once_paths: Some(vec![codex_session.clone(), chatgpt_root.clone()]),
+            db_path: data_dir.join("db.sqlite"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        };
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let state = Mutex::new(HashMap::new());
+        let storage = Mutex::new(storage);
+        let t_index = Mutex::new(None);
+
+        let indexed = reindex_paths(
+            &opts,
+            vec![codex_session.clone(), chatgpt_root],
+            &[],
+            &state,
+            &storage,
+            &t_index,
+            &index_path,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(indexed, 2);
+        let conversations = storage.lock().unwrap().list_conversations(10, 0).unwrap();
+        assert_eq!(conversations.len(), 2);
+        let mut agents: Vec<&str> = conversations
+            .iter()
+            .map(|conversation| conversation.agent_slug.as_str())
+            .collect();
+        agents.sort_unstable();
+        assert_eq!(agents, vec!["chatgpt", "codex"]);
+        assert!(
+            conversations.iter().any(|conversation| {
+                conversation.agent_slug == "codex" && conversation.source_path == codex_session
+            }),
+            "relocated rollout should be persisted through the watch-once path"
+        );
+        assert!(
+            conversations.iter().any(|conversation| {
+                conversation.agent_slug == "chatgpt" && conversation.source_path == chatgpt_file
+            }),
+            "relocated ChatGPT root should be persisted through the watch-once path"
+        );
+
+        let message_count: i64 = storage
+            .lock()
+            .unwrap()
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(message_count, 4);
     }
 
     #[test]
@@ -52223,6 +55949,42 @@ mod tests {
     }
 
     #[test]
+    fn classify_removed_cursor_workspace_sidecar_forces_cursor_rescan() {
+        let tmp = TempDir::new().unwrap();
+        let projects = tmp.path().join("projects");
+        let sidecar = projects.join("project/.workspace-trusted");
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+
+        let roots = vec![
+            (ConnectorKind::Cursor, ScanRoot::local(projects.clone())),
+            (
+                ConnectorKind::Claude,
+                ScanRoot::local(tmp.path().join("other")),
+            ),
+        ];
+        let classified = classify_paths(vec![sidecar], &roots, false);
+
+        assert_eq!(classified.len(), 1);
+        assert_eq!(classified[0].0, ConnectorKind::Cursor);
+        assert_eq!(classified[0].1.path, projects);
+        assert_eq!(classified[0].2, Some(WATCH_FORCE_FULL_SCAN_TS));
+        assert_eq!(
+            classified[0].3, None,
+            "a removed sidecar has no event mtime to persist"
+        );
+        assert_eq!(
+            watch_scan_lower_bound(ConnectorKind::Cursor, Some(WATCH_FORCE_FULL_SCAN_TS)),
+            None,
+            "sidecar deletion must force reconstruction of old transcripts"
+        );
+        assert_eq!(
+            watch_scan_lower_bound(ConnectorKind::Cursor, Some(1234)),
+            Some(1234),
+            "ordinary Cursor events retain their incremental cutoff"
+        );
+    }
+
+    #[test]
     fn watch_event_filter_ignores_remove_events_without_delete_support() {
         let event = notify::Event::new(notify::event::EventKind::Remove(
             notify::event::RemoveKind::File,
@@ -52231,6 +55993,20 @@ mod tests {
         assert!(
             !watch_event_should_trigger_reindex(&event),
             "remove events should be ignored until watch mode can remove stale indexed rows"
+        );
+    }
+
+    #[test]
+    fn watch_event_filter_keeps_cursor_workspace_sidecar_removals() {
+        let event = notify::Event::new(notify::event::EventKind::Remove(
+            notify::event::RemoveKind::File,
+        ))
+        .add_path(PathBuf::from(
+            "/tmp/.cursor/projects/project/.workspace-trusted",
+        ));
+        assert!(
+            watch_event_should_trigger_reindex(&event),
+            "removing a Cursor workspace sidecar changes existing attribution"
         );
     }
 
@@ -53295,6 +57071,7 @@ mod tests {
             &index_path,
             false,
             Some(&mut first_delta),
+            &ActiveSessionSourceFilter::new(false),
         )
         .unwrap();
         assert_eq!(indexed, 1);
@@ -53336,6 +57113,7 @@ mod tests {
             &index_path,
             false,
             Some(&mut second_delta),
+            &ActiveSessionSourceFilter::new(false),
         )
         .unwrap();
         assert_eq!(indexed, 1);
@@ -54695,8 +58473,10 @@ mod tests {
         );
 
         assert_eq!(
-            indexed, 0,
-            "failed watch reindex should report zero indexed"
+            indexed
+                .expect_err("failed watch reindex must remain retryable")
+                .to_string(),
+            "boom"
         );
         assert_eq!(
             detector.stats().consecutive_zero_scans,
@@ -54717,6 +58497,39 @@ mod tests {
             Some("watch incremental reindex: boom"),
             "failed watch reindex should surface the real error"
         );
+    }
+
+    #[test]
+    fn watch_retains_pending_sources_when_reindex_finalization_fails() {
+        let source = PathBuf::from("sessions/rollout-deferred.jsonl");
+        let root = ScanRoot::local(PathBuf::from("sessions"));
+        let roots = [(ConnectorKind::Codex, root)];
+        let detector = StaleDetector::new(StaleConfig::default());
+
+        for is_rebuild in [false, true] {
+            let mut pending = BTreeSet::from([source.clone()]);
+            dispatch_watch_callback(&mut pending, &roots, is_rebuild, &|paths, _, rebuilding| {
+                assert_eq!(rebuilding, is_rebuild);
+                if !rebuilding {
+                    assert_eq!(paths, vec![source.clone()]);
+                }
+                finalize_watch_reindex_result(
+                    Err(anyhow::anyhow!("retryable storage failure")),
+                    &detector,
+                    None,
+                    "watch reindex",
+                )?;
+                Ok(BTreeSet::new())
+            });
+            assert!(
+                pending.contains(&source),
+                "a failed scan must retain its source"
+            );
+            if is_rebuild {
+                assert!(pending.contains(&roots[0].1.path));
+            }
+        }
+        assert_eq!(detector.stats().consecutive_zero_scans, 2);
     }
 
     #[test]
@@ -56036,6 +59849,223 @@ mod tests {
             "pending indexed doc counts should stay visible to status/health readers"
         );
     }
+
+    #[test]
+    fn status_skip_open_lane_sees_checkpoint_fingerprint_mismatch_from_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let agent = crate::model::types::Agent {
+            id: None,
+            slug: "tester".into(),
+            name: "Tester".into(),
+            version: None,
+            kind: crate::model::types::AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let insert_one = |external: &str, idx: i64| {
+            let conv = norm_conv(Some(external), vec![norm_msg(idx, 1_700_000_000_000 + idx)]);
+            storage
+                .insert_conversation_tree(
+                    agent_id,
+                    None,
+                    &crate::model::types::Conversation {
+                        id: None,
+                        agent_slug: conv.agent_slug.clone(),
+                        workspace: conv.workspace.clone(),
+                        external_id: conv.external_id.clone(),
+                        title: conv.title.clone(),
+                        source_path: conv.source_path.clone(),
+                        started_at: conv.started_at,
+                        ended_at: conv.ended_at,
+                        approx_tokens: None,
+                        metadata_json: conv.metadata.clone(),
+                        messages: conv
+                            .messages
+                            .iter()
+                            .map(|m| crate::model::types::Message {
+                                id: None,
+                                idx: m.idx,
+                                role: crate::model::types::MessageRole::User,
+                                author: m.author.clone(),
+                                created_at: m.created_at,
+                                content: m.content.clone(),
+                                extra_json: m.extra.clone(),
+                                snippets: Vec::new(),
+                            })
+                            .collect(),
+                        source_id: "local".to_string(),
+                        origin_host: None,
+                    },
+                )
+                .unwrap();
+        };
+        insert_one("gh353-a", 0);
+
+        let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+        fs::create_dir_all(&index_path).unwrap();
+        fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .unwrap();
+        fs::write(index_path.join("meta.json"), b"stable-meta").unwrap();
+
+        // A completed checkpoint frozen at the one-conversation fingerprint.
+        let mut state = LexicalRebuildState::new(
+            lexical_rebuild_db_state(&storage, &db_path).unwrap(),
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+        state.mark_completed(index_meta_fingerprint(&index_path).unwrap());
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+        let checkpoint_fingerprint = load_lexical_rebuild_checkpoint(&index_path)
+            .unwrap()
+            .expect("checkpoint")
+            .storage_fingerprint;
+
+        // New canonical rows land afterwards: the checkpoint fingerprint is
+        // now stale, which is exactly the GH #353 drift.
+        insert_one("gh353-b", 1);
+        // Search runs, computes the current fingerprint through the cached
+        // path, and primes the identity-keyed sidecar.
+        let current = lexical_storage_fingerprint_for_db_cached(&db_path, &index_path).unwrap();
+        assert_ne!(current, checkpoint_fingerprint);
+
+        // The status skip-open lane (db_available, no fingerprint compute)
+        // must see the same mismatch without opening the archive.
+        let readonly = lexical_storage_fingerprint_for_db_cached_readonly(&db_path, &index_path);
+        assert_eq!(readonly.as_deref(), Some(current.as_str()));
+        let snapshot = crate::search::asset_state::inspect_search_assets(
+            crate::search::asset_state::InspectSearchAssetsInput {
+                data_dir: &data_dir,
+                db_path: &db_path,
+                stale_threshold: 3600,
+                last_indexed_at_ms: Some(FrankenStorage::now_millis()),
+                now_ms: FrankenStorage::now_millis(),
+                maintenance: crate::search::asset_state::SearchMaintenanceSnapshot::default(),
+                semantic_preference: crate::search::asset_state::SemanticPreference::HashFallback,
+                db_available: true,
+                compute_lexical_fingerprint: false,
+                inspect_semantic: false,
+            },
+        )
+        .unwrap();
+        let lexical = &snapshot.lexical;
+        assert_eq!(
+            lexical.fingerprint.current_db_fingerprint.as_deref(),
+            Some(current.as_str()),
+            "skip-open status must surface the sidecar fingerprint search uses"
+        );
+        assert_eq!(
+            lexical.fingerprint.matches_current_db_fingerprint,
+            Some(false),
+            "GH #353: the fingerprint comparison must be truthful, not null"
+        );
+        assert_eq!(lexical.status, "stale");
+        assert_eq!(
+            lexical.checkpoint.db_matches,
+            Some(true),
+            "checkpoint.db_matches stays path-scoped; the fingerprint truth lives in the fingerprint block"
+        );
+        let reason = lexical.status_reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains("fingerprint"),
+            "stale reason should name the fingerprint mismatch, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn status_skip_open_lane_stays_null_when_sidecar_does_not_describe_archive() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let agent = crate::model::types::Agent {
+            id: None,
+            slug: "tester".into(),
+            name: "Tester".into(),
+            version: None,
+            kind: crate::model::types::AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conv = norm_conv(Some("gh353-c"), vec![norm_msg(0, 1_700_000_000_000)]);
+        storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &crate::model::types::Conversation {
+                    id: None,
+                    agent_slug: conv.agent_slug.clone(),
+                    workspace: conv.workspace.clone(),
+                    external_id: conv.external_id.clone(),
+                    title: conv.title.clone(),
+                    source_path: conv.source_path.clone(),
+                    started_at: conv.started_at,
+                    ended_at: conv.ended_at,
+                    approx_tokens: None,
+                    metadata_json: conv.metadata.clone(),
+                    messages: conv
+                        .messages
+                        .iter()
+                        .map(|m| crate::model::types::Message {
+                            id: None,
+                            idx: m.idx,
+                            role: crate::model::types::MessageRole::User,
+                            author: m.author.clone(),
+                            created_at: m.created_at,
+                            content: m.content.clone(),
+                            extra_json: m.extra.clone(),
+                            snippets: Vec::new(),
+                        })
+                        .collect(),
+                    source_id: "local".to_string(),
+                    origin_host: None,
+                },
+            )
+            .unwrap();
+        drop(storage);
+
+        // No sidecar was ever primed for this archive: the skip-open lane
+        // must report an honestly null comparison, never an assumed-good one.
+        assert_eq!(
+            lexical_storage_fingerprint_for_db_cached_readonly(
+                &db_path,
+                &crate::search::tantivy::expected_index_dir(&data_dir),
+            ),
+            None,
+        );
+        let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+        fs::create_dir_all(&index_path).unwrap();
+        fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .unwrap();
+        let snapshot = crate::search::asset_state::inspect_search_assets(
+            crate::search::asset_state::InspectSearchAssetsInput {
+                data_dir: &data_dir,
+                db_path: &db_path,
+                stale_threshold: 3600,
+                last_indexed_at_ms: Some(FrankenStorage::now_millis()),
+                now_ms: FrankenStorage::now_millis(),
+                maintenance: crate::search::asset_state::SearchMaintenanceSnapshot::default(),
+                semantic_preference: crate::search::asset_state::SemanticPreference::HashFallback,
+                db_available: true,
+                compute_lexical_fingerprint: false,
+                inspect_semantic: false,
+            },
+        )
+        .unwrap();
+        let lexical = &snapshot.lexical;
+        assert_eq!(lexical.fingerprint.current_db_fingerprint, None);
+        assert_eq!(lexical.fingerprint.matches_current_db_fingerprint, None);
+        assert_ne!(lexical.status, "error");
+    }
     #[test]
     fn refresh_completed_lexical_rebuild_checkpoint_preserves_content_fingerprint_across_meta_only_writes()
      {
@@ -56879,8 +60909,7 @@ mod tests {
             total_messages: 0,
             storage_fingerprint: lexical_rebuild_deferred_content_fingerprint(0),
         };
-        let mut state =
-            LexicalRebuildState::new(checkpoint_db_state, LEXICAL_REBUILD_PAGE_SIZE);
+        let mut state = LexicalRebuildState::new(checkpoint_db_state, LEXICAL_REBUILD_PAGE_SIZE);
         state.execution_mode = None;
         persist_lexical_rebuild_state(&index_path, &state).unwrap();
 
@@ -56914,6 +60943,186 @@ mod tests {
         assert_eq!(
             completed.storage_fingerprint,
             lexical_rebuild_storage_fingerprint(&db_path).unwrap()
+        );
+    }
+
+    /// GH #457 follow-on: only the PRE-scan authoritative repair can be
+    /// outrun by the rest of its own run, and only when that run's scan
+    /// actually moved the canonical COUNT/MAX(id) content fingerprint.
+    #[test]
+    fn redrive_final_checkpoint_refresh_only_when_a_pre_scan_repair_is_outrun_by_its_own_scan() {
+        let unchanged = CanonicalMutationCounts::default();
+        let inserted_messages = CanonicalMutationCounts {
+            inserted_conversations: 0,
+            inserted_messages: 1,
+        };
+        let inserted_conversations = CanonicalMutationCounts {
+            inserted_conversations: 1,
+            inserted_messages: 0,
+        };
+
+        assert!(
+            should_redrive_final_lexical_checkpoint_refresh_after_pre_scan_repair(
+                true,
+                inserted_messages
+            )
+        );
+        assert!(
+            should_redrive_final_lexical_checkpoint_refresh_after_pre_scan_repair(
+                true,
+                inserted_conversations
+            )
+        );
+        // A pre-scan repair whose follow-up scan ingested nothing still
+        // certifies the live database, so the cheaper skip stays correct.
+        assert!(
+            !should_redrive_final_lexical_checkpoint_refresh_after_pre_scan_repair(true, unchanged)
+        );
+        // The canonical-only full rebuild runs no scan and the post-scan
+        // rebuilds run after ingest, so neither is ever redriven regardless of
+        // what the scan did.
+        assert!(
+            !should_redrive_final_lexical_checkpoint_refresh_after_pre_scan_repair(
+                false,
+                inserted_messages
+            )
+        );
+        assert!(
+            !should_redrive_final_lexical_checkpoint_refresh_after_pre_scan_repair(
+                false, unchanged
+            )
+        );
+    }
+
+    /// GH #457 follow-on regression: the pre-scan authoritative repair rebuilds
+    /// the lexical index from SQLite and persists an EXACT completed
+    /// checkpoint, and then the same run continues into the incremental source
+    /// scan. The end-of-run refresh used to be skipped outright (the
+    /// authoritative rebuild already persisted exact completed state), so a
+    /// scan that ingested a new session left the checkpoint carrying the
+    /// PRE-scan COUNT/MAX(id) fingerprint and reported the lexical assets stale
+    /// until a later run rewrote the checkpoint.
+    #[test]
+    #[serial]
+    fn pre_scan_sparse_repair_refreshes_the_checkpoint_fingerprint_within_the_same_run() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+        let codex_home = tmp.path().join(".codex");
+
+        let write_session = |name: &str, text: &str| {
+            let sessions = codex_home.join("sessions/2026/09/09");
+            fs::create_dir_all(&sessions).unwrap();
+            let now_ms = FrankenStorage::now_millis();
+            let stamp = |offset: i64| {
+                chrono::DateTime::from_timestamp_millis(now_ms + offset)
+                    .unwrap_or_else(chrono::Utc::now)
+                    .to_rfc3339()
+            };
+            let lines = [
+                serde_json::json!({
+                    "timestamp": stamp(0),
+                    "type": "session_meta",
+                    "payload": { "id": name, "cwd": "/data/projects/cass", "cli_version": "0.42.0" }
+                }),
+                serde_json::json!({
+                    "timestamp": stamp(1_000),
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": text }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": stamp(2_000),
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "text", "text": format!("{text} response") }]
+                    }
+                }),
+            ];
+            let mut body = String::new();
+            for line in lines {
+                body.push_str(&serde_json::to_string(&line).unwrap());
+                body.push('\n');
+            }
+            fs::write(sessions.join(format!("rollout-{name}.jsonl")), body).unwrap();
+        };
+        write_session("sparse-seed-one", "sparserepair seed one");
+        write_session("sparse-seed-two", "sparserepair seed two");
+
+        let opts = || IndexOptions {
+            full: false,
+            force_rebuild: false,
+            watch: false,
+            watch_once_paths: None,
+            db_path: db_path.clone(),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "hash".to_string(),
+            // A real progress handle is load-bearing here: the authoritative
+            // rebuild records exact canonical row counts through progress, and
+            // the final refresh decision reads them back from it.
+            progress: Some(Arc::new(IndexingProgress::default())),
+            watch_interval_secs: 30,
+        };
+        let roots = || HashMap::from([("codex".to_string(), vec![codex_home.clone()])]);
+
+        run_index_with_local_connector_roots(opts(), roots(), None).unwrap();
+
+        let index_path = index_dir(&data_dir).unwrap();
+        let baseline = load_lexical_rebuild_checkpoint(&index_path)
+            .unwrap()
+            .expect("baseline completed checkpoint");
+        assert!(baseline.completed);
+        assert_eq!(
+            baseline.total_conversations, 2,
+            "the baseline run must ingest both seed sessions: {baseline:?}"
+        );
+        assert_eq!(
+            baseline.storage_fingerprint,
+            lexical_rebuild_storage_fingerprint(&db_path).unwrap(),
+            "the baseline run must leave a checkpoint matching its own database"
+        );
+
+        // Hollow the live generation out from under that still-completed
+        // checkpoint. The replacement is a valid but empty index, which makes
+        // the planner take the sparse branch rather than the missing/invalid
+        // one; the populated generation remains inspectable on failure.
+        let sparse_backup = data_dir.join("index-before-sparse-repair");
+        fs::rename(&index_path, &sparse_backup).unwrap();
+        fs::create_dir_all(&index_path).unwrap();
+        let mut hollow = TantivyIndex::open_or_create(&index_path).unwrap();
+        hollow.commit().unwrap();
+        drop(hollow);
+        fs::copy(
+            lexical_rebuild_state_path(&sparse_backup),
+            lexical_rebuild_state_path(&index_path),
+        )
+        .unwrap();
+
+        // Give the repair's follow-up scan real canonical work to do.
+        write_session("sparse-post-repair", "sparserepair follow up");
+
+        run_index_with_local_connector_roots(opts(), roots(), None).unwrap();
+
+        let after = load_lexical_rebuild_checkpoint(&index_path)
+            .unwrap()
+            .expect("completed checkpoint after the repair run");
+        assert!(after.completed);
+        assert_eq!(
+            after.total_conversations, 3,
+            "the follow-up scan must have ingested the new session: {after:?}"
+        );
+        assert_eq!(
+            after.storage_fingerprint,
+            lexical_rebuild_storage_fingerprint(&db_path).unwrap(),
+            "the pre-scan repair's checkpoint predates its own follow-up scan, so the run must refresh it before exiting"
         );
     }
 
@@ -57183,6 +61392,13 @@ mod tests {
         assert_eq!(names, vec!["codex"]);
     }
 
+    /// The cass registry mirrors the upstream one entry for entry: the three
+    /// cass adapters (codex, omp, pi_agent) replace the upstream factory, and
+    /// every other entry behaves like the upstream connector. The pass-through
+    /// half is asserted behaviorally — same detection result and streaming
+    /// capability from both factories — because function-pointer identity
+    /// (`fn_addr_eq`) is not guaranteed across codegen units and failed on two
+    /// otherwise-green fleet runs (bead zgzva).
     #[test]
     fn cass_connector_registry_installs_every_cass_adapter() {
         let upstream = franken_agent_detection::get_connector_factories();
@@ -57193,10 +61409,56 @@ mod tests {
             configured.into_iter().zip(upstream)
         {
             assert_eq!(configured_name, upstream_name);
+            let kind = ConnectorKind::from_slug(configured_name)
+                .unwrap_or_else(|| panic!("{configured_name}: missing watch/quarantine route"));
+            assert_eq!(kind.slug(), configured_name);
+            let serialized = serde_json::to_string(&kind).expect("serialize connector kind");
+            assert_eq!(
+                serde_json::from_str::<ConnectorKind>(&serialized).expect("read connector kind"),
+                kind
+            );
+            let routed = kind.create_connector();
+            let expected = configured_factory();
+            let routed_detection = routed.detect();
+            let expected_detection = expected.detect();
+            assert_eq!(
+                (
+                    routed_detection.detected,
+                    routed_detection.root_paths,
+                    routed.supports_streaming_scan()
+                ),
+                (
+                    expected_detection.detected,
+                    expected_detection.root_paths,
+                    expected.supports_streaming_scan()
+                ),
+                "{configured_name}: watch/quarantine must use the configured connector"
+            );
             if matches!(configured_name, "codex" | "omp" | "pi_agent") {
-                assert!(!std::ptr::fn_addr_eq(configured_factory, upstream_factory));
+                assert!(
+                    !std::ptr::fn_addr_eq(configured_factory, upstream_factory),
+                    "{configured_name}: cass must install its own adapter, not the upstream one"
+                );
             } else {
-                assert!(std::ptr::fn_addr_eq(configured_factory, upstream_factory));
+                let configured_connector = configured_factory();
+                let upstream_connector = upstream_factory();
+                let configured_detection = configured_connector.detect();
+                let upstream_detection = upstream_connector.detect();
+                assert_eq!(
+                    (
+                        configured_detection.detected,
+                        &configured_detection.evidence,
+                        &configured_detection.root_paths,
+                        configured_connector.supports_streaming_scan(),
+                    ),
+                    (
+                        upstream_detection.detected,
+                        &upstream_detection.evidence,
+                        &upstream_detection.root_paths,
+                        upstream_connector.supports_streaming_scan(),
+                    ),
+                    "{configured_name}: the pass-through entry must behave like the upstream connector"
+                );
             }
         }
     }
@@ -57345,6 +61607,7 @@ mod tests {
             None,
             LexicalPopulationStrategy::IncrementalInline,
             Vec::new(),
+            None,
             vec![("codex", factory)],
             FrankenStorage::now_millis(),
             None,
@@ -57931,7 +62194,7 @@ mod tests {
             "watch incremental reindex",
         );
 
-        assert_eq!(indexed, 3);
+        assert_eq!(indexed.expect("successful watch reindex"), 3);
         assert_eq!(detector.stats().total_ingests, 1);
         assert_eq!(
             progress
@@ -58234,5 +62497,127 @@ mod tests {
         assert_eq!(state.committed_conversation_id, Some(999));
         assert_eq!(state.processed_conversations, 5);
         assert_eq!(state.committed_offset, 5);
+    }
+
+    fn seed_archive_conversation(storage: &FrankenStorage, external_id: &str) {
+        let agent = crate::model::types::Agent {
+            id: None,
+            slug: "tester".into(),
+            name: "Tester".into(),
+            version: None,
+            kind: crate::model::types::AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conversation = crate::model::types::Conversation {
+            id: None,
+            agent_slug: "tester".into(),
+            workspace: Some(std::path::PathBuf::from("/tmp/workspace")),
+            external_id: Some(external_id.into()),
+            title: Some(external_id.into()),
+            source_path: std::path::PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![crate::model::types::Message {
+                id: None,
+                idx: 0,
+                role: crate::model::types::MessageRole::User,
+                author: Some("user".into()),
+                created_at: Some(1_700_000_000_050),
+                content: format!("fingerprint cache seed {external_id}"),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: crate::sources::provenance::LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &conversation)])
+            .unwrap();
+    }
+
+    /// The on-disk archive fingerprint sidecar is served while the archive's
+    /// physical identity is unchanged, and recomputed once the archive
+    /// changes. Positive observable: a planted sentinel fingerprint in the
+    /// sidecar is returned verbatim (proving the DB was not consulted).
+    /// Planted negative: after a write, the sentinel is discarded and the
+    /// real fingerprint comes back — through the disk layer and through the
+    /// in-process memo wrapper alike. No-claim: this does not measure the
+    /// WAL-replay cost the sidecar exists to avoid.
+    #[test]
+    fn cached_archive_fingerprint_hits_on_unchanged_identity_and_misses_after_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("db.sqlite");
+        let cache_dir = tmp.path().join("index");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        storage.run_migrations().unwrap();
+        seed_archive_conversation(&storage, "first");
+        storage.close_without_checkpoint().unwrap();
+
+        let authoritative = lexical_storage_fingerprint_for_db_strict(&db_path).unwrap();
+        assert!(authoritative.starts_with("content-v1:"));
+        let identity = lexical_storage_physical_identity(&db_path).expect("archive identity");
+        let first = lexical_storage_fingerprint_for_db_disk_cached(&db_path, &identity, &cache_dir)
+            .unwrap();
+        assert_eq!(first, authoritative);
+        let cache_path = cache_dir.join(ARCHIVE_FINGERPRINT_CACHE_FILE);
+        assert!(cache_path.is_file(), "miss must populate the sidecar");
+        assert_eq!(
+            lexical_storage_fingerprint_for_db_cached(&db_path, &cache_dir).unwrap(),
+            authoritative,
+            "the memo wrapper must agree with the disk layer"
+        );
+
+        // Plant a sentinel under the SAME identity: the disk layer must
+        // return it without touching the database.
+        let mut cached: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
+        cached["fingerprint"] = serde_json::Value::String("content-v1:sentinel".into());
+        std::fs::write(&cache_path, cached.to_string()).unwrap();
+        let hit = lexical_storage_fingerprint_for_db_disk_cached(&db_path, &identity, &cache_dir)
+            .unwrap();
+        assert_eq!(
+            hit, "content-v1:sentinel",
+            "unchanged identity must be served from the sidecar"
+        );
+
+        // A sidecar from a different schema version is ignored, not trusted.
+        cached["schema_version"] = serde_json::Value::from(999);
+        std::fs::write(&cache_path, cached.to_string()).unwrap();
+        assert_eq!(
+            lexical_storage_fingerprint_for_db_disk_cached(&db_path, &identity, &cache_dir)
+                .unwrap(),
+            authoritative,
+            "an unknown sidecar schema must fall back to the strict computation"
+        );
+
+        // Change the archive: the identity moves and the sentinel is discarded
+        // by both layers.
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        seed_archive_conversation(&storage, "second");
+        storage.close_without_checkpoint().unwrap();
+        let changed = lexical_storage_physical_identity(&db_path).expect("archive identity");
+        assert_ne!(
+            changed, identity,
+            "a committed write must move the identity"
+        );
+        let recomputed =
+            lexical_storage_fingerprint_for_db_disk_cached(&db_path, &changed, &cache_dir).unwrap();
+        assert_ne!(recomputed, "content-v1:sentinel");
+        assert_eq!(
+            recomputed,
+            lexical_storage_fingerprint_for_db_strict(&db_path).unwrap()
+        );
+        assert_ne!(
+            recomputed, authoritative,
+            "a second conversation changes the fingerprint"
+        );
+        assert_eq!(
+            lexical_storage_fingerprint_for_db_cached(&db_path, &cache_dir).unwrap(),
+            recomputed,
+            "the memo wrapper must not serve the pre-write fingerprint"
+        );
     }
 }

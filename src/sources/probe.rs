@@ -40,8 +40,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    config::DiscoveredHost, configure_child_process_group, host_key_verification_error,
-    is_host_key_verification_failure, strict_ssh_cli_tokens, wait_for_child_output_with_timeout,
+    config::DiscoveredHost, configure_child_process_group, file_backed_child_stdin,
+    host_key_verification_error, is_host_key_verification_failure, strict_ssh_cli_tokens,
+    wait_for_child_output_with_timeout,
 };
 
 /// Default connection timeout in seconds.
@@ -215,6 +216,37 @@ fn collect_probe_dirs(probe_paths: Vec<(&'static str, Vec<String>)>) -> Vec<Stri
     dir_list
 }
 
+/// Return true when `parent` is a path ancestor of `child`.
+///
+/// The probe list deliberately contains both source roots and their parent
+/// configuration directories (for example `~/.claude/projects` and
+/// `~/.claude`). Comparing complete path components keeps a parent such as
+/// `~/.claude` from being confused with an unrelated path like
+/// `~/.claude-work`.
+fn is_path_ancestor(parent: &str, child: &str) -> bool {
+    child
+        .strip_prefix(parent)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+/// Select only the leaf paths for recursive statistics probes.
+///
+/// Parent paths remain in `PROBE_DIRS` so setup can still discover an
+/// installed agent whose session directory is not present yet. They are
+/// presence probes only; recursively walking them would count caches and
+/// transcripts repeatedly and can make a read-only SSH probe unbounded.
+fn recursive_probe_dirs(dir_list: &[String]) -> Vec<String> {
+    dir_list
+        .iter()
+        .filter(|candidate| {
+            !dir_list
+                .iter()
+                .any(|child| is_path_ancestor(candidate, child))
+        })
+        .cloned()
+        .collect()
+}
+
 fn probe_dir_array_entries(dir_list: &[String]) -> String {
     dir_list
         .iter()
@@ -231,11 +263,21 @@ fn probe_dir_array_entries(dir_list: &[String]) -> String {
 /// Output format is key=value pairs, with special markers for sections.
 fn build_probe_script() -> String {
     let dir_list = collect_probe_dirs(franken_agent_detection::default_probe_paths_tilde());
-    build_probe_script_for_dirs(&dir_list)
+    let recursive_dirs = recursive_probe_dirs(&dir_list);
+    build_probe_script_for_dir_modes(&dir_list, &recursive_dirs)
 }
 
+#[cfg(test)]
 fn build_probe_script_for_dirs(dir_list: &[String]) -> String {
+    // This helper is used by focused tests with an explicit path list. Treat
+    // those paths as source roots so the tests exercise the same bounded
+    // recursive branch as a dynamically discovered leaf path.
+    build_probe_script_for_dir_modes(dir_list, dir_list)
+}
+
+fn build_probe_script_for_dir_modes(dir_list: &[String], recursive_dirs: &[String]) -> String {
     let dirs_str = probe_dir_array_entries(dir_list);
+    let recursive_dirs_str = probe_dir_array_entries(recursive_dirs);
 
     format!(
         r#"#!/bin/bash
@@ -341,6 +383,106 @@ fi
 PROBE_DIRS=(
 {dirs}
 )
+RECURSIVE_PROBE_DIRS=(
+{recursive_dirs}
+)
+
+# Recursive source statistics are deliberately path-specific. Parent config
+# roots (for example ~/.claude) are presence probes only, while leaf session
+# roots (for example ~/.claude/projects) get a bounded metadata scan. This
+# keeps setup from traversing caches and from walking an ancestor twice.
+is_recursive_probe_path() {{
+    local candidate=$1
+    local recursive_dir
+    for recursive_dir in "${{RECURSIVE_PROBE_DIRS[@]}}"; do
+        if [ "$candidate" = "$recursive_dir" ]; then
+            return 0
+        fi
+    done
+    return 1
+}}
+
+# Return "size_mb|file_count" for session-shaped files under one source root.
+# The timeout wraps both find and the stat aggregation. Hosts without either
+# helper still report the path's presence, but deliberately skip the recursive
+# walk rather than falling back to an unbounded find.
+probe_tree_stats() {{
+    local root=$1
+    local timeout_bin
+    local stats
+    local status
+    local worker_script
+
+    if command -v timeout &> /dev/null; then
+        timeout_bin=timeout
+    elif command -v gtimeout &> /dev/null; then
+        timeout_bin=gtimeout
+    else
+        return 125
+    fi
+
+    # Keep find's NUL-delimited output safe for arbitrary filenames and do
+    # portable per-file stat calls in the same timed worker. pipefail carries a
+    # find/stat failure through the aggregation instead of letting awk hide it.
+    worker_script='
+# Keep the worker shell alive after TERM so the timeout kill-after signal reaches
+# the complete process group, including descendants that ignore TERM.
+trap "" TERM
+set -o pipefail
+# Use find primaries shared by GNU and BSD implementations. The enclosing
+# timeout supplies the traversal bound instead of nonportable depth options.
+find "$1" -type f \
+    \( -name "*.jsonl" -o -name "*.json" -o -name "*.claude" -o -name "*.db" -o -name "*.md" \) \
+    -print0 2>/dev/null |
+(
+    bytes=0
+    count=0
+    while IFS= read -r -d "" file; do
+        if size=$(stat -c "%s" "$file" 2>/dev/null); then
+            :
+        elif size=$(stat -f "%z" "$file" 2>/dev/null); then
+            :
+        else
+            continue
+        fi
+        [ -n "$size" ] || continue
+        case "$size" in
+            *[!0-9]*) continue ;;
+        esac
+        bytes=$((bytes + size))
+        count=$((count + 1))
+    done
+    printf "%s|%s\n" "$((bytes / 1048576))" "$count"
+)
+'
+
+    if stats=$("$timeout_bin" --signal=TERM --kill-after=1s 5s \
+        bash -c "$worker_script" probe-tree-stats "$root"); then
+        status=0
+    else
+        status=$?
+    fi
+    if [ "$status" -ne 0 ]; then
+        return "$status"
+    fi
+    if [ -n "$stats" ]; then
+        printf '%s\n' "$stats"
+    else
+        return 1
+    fi
+}}
+
+probe_file_size_mb() {{
+    local bytes
+    if bytes=$(stat -c '%s' "$1" 2>/dev/null); then
+        printf '%s\n' "$((bytes / 1048576))"
+    elif bytes=$(stat -f '%z' "$1" 2>/dev/null); then
+        printf '%s\n' "$((bytes / 1048576))"
+    else
+        printf '0\n'
+    fi
+}}
+
 for dir in "${{PROBE_DIRS[@]}}"; do
     # Expand only the leading tilde marker from our static probe list. Do not
     # eval paths: connector-owned paths can contain shell metacharacters.
@@ -350,19 +492,25 @@ for dir in "${{PROBE_DIRS[@]}}"; do
         *) expanded_dir="$dir" ;;
     esac
     if [ -e "$expanded_dir" ]; then
-        SIZE=$(du -sm "$expanded_dir" 2>/dev/null | cut -f1)
-        # Count JSONL files for session estimate
-        if [ -d "$expanded_dir" ]; then
-            # Keep probe bounded for very large trees: depth-limit and timeout when available.
-            if command -v timeout &> /dev/null; then
-                COUNT=$(timeout 5s find "$expanded_dir" -maxdepth 8 \( -name "*.jsonl" -o -name "*.json" \) 2>/dev/null | wc -l | tr -d ' ')
-            elif command -v gtimeout &> /dev/null; then
-                COUNT=$(gtimeout 5s find "$expanded_dir" -maxdepth 8 \( -name "*.jsonl" -o -name "*.json" \) 2>/dev/null | wc -l | tr -d ' ')
+        if [ -f "$expanded_dir" ]; then
+            SIZE=$(probe_file_size_mb "$expanded_dir")
+            COUNT=1  # A direct source file is a single session candidate.
+        elif is_recursive_probe_path "$dir"; then
+            STATS=$(probe_tree_stats "$expanded_dir")
+            if [ $? -eq 0 ] && [ -n "$STATS" ]; then
+                IFS='|' read -r SIZE COUNT <<< "$STATS"
             else
-                COUNT=$(find "$expanded_dir" -maxdepth 8 \( -name "*.jsonl" -o -name "*.json" \) 2>/dev/null | wc -l | tr -d ' ')
+                # Preserve discovery while making an incomplete estimate
+                # explicit and cheap after a timeout or missing helper.
+                SIZE=0
+                COUNT=0
             fi
         else
-            COUNT=1  # Single file
+            # Ancestor/config roots are intentionally not traversed. Their
+            # existence is enough for setup to offer the source path; the
+            # connector-specific leaf path carries the actual transcripts.
+            SIZE=0
+            COUNT=0
         fi
         echo "AGENT_DATA=$dir|${{SIZE:-0}}|${{COUNT:-0}}"
     fi
@@ -370,7 +518,8 @@ done
 
 echo "===PROBE_END==="
 "#,
-        dirs = dirs_str
+        dirs = dirs_str,
+        recursive_dirs = recursive_dirs_str
     )
 }
 
@@ -393,18 +542,29 @@ pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
     // Build SSH command with strict host key verification.
     // Security-first: do not auto-trust unknown hosts during probing.
     // Use the host alias directly (SSH config handles Port, User, IdentityFile, ProxyJump, etc.)
+    let probe_script = build_probe_script();
+    let child_stdin = match file_backed_child_stdin(probe_script.as_bytes()) {
+        Ok(stdin) => stdin,
+        Err(e) => {
+            return HostProbeResult::unreachable(
+                &host.name,
+                format!("Failed to prepare SSH probe input: {e}"),
+            );
+        }
+    };
     let mut cmd = Command::new("ssh");
     cmd.args(strict_ssh_cli_tokens(timeout_secs))
         .arg("--")
         .arg(&host.name)
         .arg("bash -s")
-        .stdin(Stdio::piped())
+        .stdin(child_stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_child_process_group(&mut cmd);
 
-    // Spawn the process and write probe script to stdin
-    let mut child = match cmd.spawn() {
+    // Spawn the process; the probe script reaches bash through the
+    // file-backed stdin above (no pipe write from cass — ztlan/gh#358).
+    let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             return HostProbeResult::unreachable(
@@ -412,15 +572,6 @@ pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
                 format!("Failed to execute ssh: {}", e),
             );
         }
-    };
-
-    // Write probe script to stdin
-    let probe_script = build_probe_script();
-    let write_error = if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        stdin.write_all(probe_script.as_bytes()).err()
-    } else {
-        None
     };
 
     // Wait for completion
@@ -458,13 +609,6 @@ pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
 
         return HostProbeResult::unreachable(&host.name, error_msg);
     }
-    if let Some(e) = write_error {
-        return HostProbeResult::unreachable(
-            &host.name,
-            format!("Failed to write probe script: {}", e),
-        );
-    }
-
     // Parse successful output
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_probe_output(&host.name, &stdout, connection_time_ms)
@@ -638,15 +782,18 @@ fn infer_agent_type(path: &str) -> String {
         "codex".to_string()
     } else if path.contains(".cursor") || path.contains("Cursor") {
         "cursor".to_string()
-    } else if path.contains("antigravity-cli") || path.contains("antigravity") {
-        // Antigravity (agy) lives under ~/.gemini/antigravity-cli/, which also
-        // contains ".gemini" — so it MUST be matched before the gemini branch
-        // below, or agy roots would be mislabeled as legacy Gemini CLI.
+    } else if path.contains("antigravity") {
+        // Antigravity lives under ~/.gemini/antigravity/ (IDE) and
+        // ~/.gemini/antigravity-cli/ (agy CLI), which also contain ".gemini"
+        // — so it MUST be matched before the gemini branch below, or those
+        // roots would be mislabeled as legacy Gemini CLI.
         "antigravity".to_string()
     } else if path.contains(".gemini") {
         "gemini".to_string()
     } else if path.contains("/.pi/") || path.ends_with("/.pi") {
         "pi_agent".to_string()
+    } else if path.contains("/.prime/agent/") || path.ends_with("/.prime/agent") {
+        "prime_agent".to_string()
     } else if path.contains("/.omp/")
         || path.ends_with("/.omp")
         || path.contains("/omp/sessions")
@@ -930,6 +1077,12 @@ mod tests {
             infer_agent_type("~/.gemini/antigravity-cli/brain/abc/.system_generated/logs"),
             "antigravity"
         );
+        // The Antigravity IDE store (#454) shares the same parent.
+        assert_eq!(infer_agent_type("~/.gemini/antigravity"), "antigravity");
+        assert_eq!(
+            infer_agent_type("~/.gemini/antigravity/brain/abc/.system_generated/logs"),
+            "antigravity"
+        );
         assert_eq!(
             infer_agent_type("~/.config/Code/User/globalStorage/saoudrizwan.claude-dev"),
             "cline"
@@ -1185,6 +1338,58 @@ CASS_VERSION=0.4.2
         String::from_utf8_lossy(&output.stdout).to_string()
     }
 
+    #[cfg(unix)]
+    fn run_probe_script_with_path_value(
+        script: &str,
+        home: &std::path::Path,
+        path_value: &str,
+        timeout: Duration,
+    ) -> Option<std::process::Output> {
+        use std::io::Write;
+
+        let mut cmd = Command::new("bash");
+        cmd.arg("-s")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("HOME", home)
+            .env("PATH", path_value);
+        configure_child_process_group(&mut cmd);
+
+        let mut child = cmd.spawn().expect("bash should be available");
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(script.as_bytes())
+                .expect("write probe script");
+        }
+        wait_for_child_output_with_timeout(child, timeout)
+            .expect("probe script should finish or hit its deadline")
+    }
+    #[cfg(unix)]
+    fn write_test_executable(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, body).expect("write test executable");
+        let mut permissions = std::fs::metadata(path)
+            .expect("test executable metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("set test executable permissions");
+    }
+
+    #[cfg(unix)]
+    fn link_system_tools(tool_dir: &std::path::Path, names: &[&str]) {
+        let current_path = std::env::var_os("PATH").expect("test PATH");
+        for name in names {
+            let source = std::env::split_paths(&current_path)
+                .map(|directory| directory.join(name))
+                .find(|candidate| candidate.is_file())
+                .unwrap_or_else(|| panic!("missing system tool {name}"));
+            std::os::unix::fs::symlink(source, tool_dir.join(name))
+                .unwrap_or_else(|error| panic!("link system tool {name}: {error}"));
+        }
+    }
+
     /// Execute PROBE_SCRIPT on the local system via bash, returning stdout.
     fn run_probe_script_locally() -> String {
         run_probe_script_with_home(&build_probe_script(), None)
@@ -1209,6 +1414,294 @@ CASS_VERSION=0.4.2
         assert!(
             !script.contains("eval echo"),
             "probe paths must not be expanded through eval"
+        );
+    }
+
+    #[test]
+    fn recursive_probe_dirs_walks_only_component_descendant_leaves() {
+        let dirs = vec![
+            "~/.claude".to_string(),
+            "~/.claude/projects".to_string(),
+            "~/.claude-work".to_string(),
+            "~/.codex/sessions".to_string(),
+        ];
+
+        assert_eq!(
+            recursive_probe_dirs(&dirs),
+            vec![
+                "~/.claude/projects".to_string(),
+                "~/.claude-work".to_string(),
+                "~/.codex/sessions".to_string(),
+            ]
+        );
+        assert!(is_path_ancestor("~/.claude", "~/.claude/projects"));
+        assert!(!is_path_ancestor("~/.claude", "~/.claude-work"));
+        assert!(!is_path_ancestor("~/.claude", "~/.claude"));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn probe_script_marks_parent_as_presence_only_and_counts_leaf_sessions() {
+        let home = tempfile::tempdir().expect("temp home");
+        let parent = home.path().join(".claude");
+        let leaf = parent.join("projects");
+        std::fs::create_dir_all(parent.join("cache")).expect("create parent cache");
+        std::fs::create_dir_all(&leaf).expect("create leaf");
+        std::fs::write(parent.join("cache").join("unrelated.json"), b"{}")
+            .expect("write parent-only file");
+        std::fs::write(leaf.join("session.jsonl"), b"turn\n").expect("write leaf session");
+
+        let dirs = vec!["~/.claude".to_string(), "~/.claude/projects".to_string()];
+        let recursive_dirs = recursive_probe_dirs(&dirs);
+        let script = build_probe_script_for_dir_modes(&dirs, &recursive_dirs);
+        let output = run_probe_script_with_home(&script, Some(home.path()));
+
+        assert!(
+            output.contains("AGENT_DATA=~/.claude|0|0"),
+            "parent config root must be presence-only: {output}"
+        );
+        assert!(
+            output.contains("AGENT_DATA=~/.claude/projects|0|1"),
+            "leaf source must count its transcript without the parent cache: {output}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_script_hard_kills_term_ignoring_find_and_classifies_timeout() {
+        struct PidCleanup(Vec<i32>);
+
+        impl Drop for PidCleanup {
+            fn drop(&mut self) {
+                for pid in &self.0 {
+                    let _ = Command::new("kill")
+                        .args(["-KILL", &pid.to_string()])
+                        .status();
+                }
+            }
+        }
+
+        let home = tempfile::tempdir().expect("temp home");
+        let leaf = home.path().join(".claude/projects");
+        std::fs::create_dir_all(&leaf).expect("create leaf");
+
+        let fake_tools = tempfile::tempdir().expect("fake tools");
+        let find_path = fake_tools.path().join("find");
+        let fifo_path = find_path.with_extension("pipe");
+        let pid_path = find_path.with_extension("pid");
+        let mkfifo = Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("mkfifo should run");
+        assert!(mkfifo.success(), "mkfifo should succeed");
+        write_test_executable(
+            &find_path,
+            r#"#!/bin/bash
+exec 9<> "$0.pipe"
+(
+    trap '' TERM
+    while :; do
+        read -r -t 1 _ <&9 || true
+    done
+) &
+worker=$!
+printf '%s\n%s\n' "$$" "$worker" > "$0.pid"
+trap '' TERM
+while :; do
+    read -r -t 1 _ <&9 || true
+done
+"#,
+        );
+
+        let script = build_probe_script_for_dirs(&["~/.claude/projects".to_string()]);
+        let path_value = format!("{}:/usr/bin:/bin", fake_tools.path().display());
+        let output = run_probe_script_with_path_value(
+            &script,
+            home.path(),
+            &path_value,
+            Duration::from_secs(12),
+        );
+        let pids = std::fs::read_to_string(&pid_path)
+            .expect("fake find should record its PIDs")
+            .lines()
+            .map(|line| line.parse::<i32>().expect("valid fake find PID"))
+            .collect::<Vec<_>>();
+        assert_eq!(pids.len(), 2, "fake find should record parent and child");
+        let _cleanup = PidCleanup(pids.clone());
+
+        let mut live_pids = pids.clone();
+        for _ in 0..30 {
+            live_pids = pids
+                .iter()
+                .copied()
+                .filter(|pid| {
+                    Command::new("kill")
+                        .args(["-0", &pid.to_string()])
+                        .status()
+                        .is_ok_and(|status| status.success())
+                })
+                .collect();
+            if live_pids.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let output = output.expect("outer probe shell should finish");
+        assert!(output.status.success(), "probe shell failed");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("AGENT_DATA=~/.claude/projects|0|0"),
+            "timeout must classify the recursive estimate as incomplete: {stdout}"
+        );
+        assert!(
+            live_pids.is_empty(),
+            "timeout must kill find and its child; leaked PIDs: {live_pids:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn probe_script_uses_bsd_stat_and_gtimeout_and_preserves_find_failure_status() {
+        let home = tempfile::tempdir().expect("temp home");
+        let leaf = home.path().join(".codex/sessions");
+        std::fs::create_dir_all(&leaf).expect("create leaf");
+        let weird_name = r#"session space;$(touch "$HOME/SHOULD_NOT_EXIST").jsonl"#;
+        let weird_path = leaf.join(weird_name);
+        if let Some(parent) = weird_path.parent() {
+            std::fs::create_dir_all(parent).expect("create literal path parent");
+        }
+        std::fs::write(&weird_path, b"session").expect("write literal session");
+
+        let fake_tools = tempfile::tempdir().expect("fake tools");
+        let tool_bin = tempfile::tempdir().expect("system tool links");
+        link_system_tools(
+            tool_bin.path(),
+            &[
+                "bash", "uname", "tr", "cat", "df", "awk", "grep", "sed", "head",
+            ],
+        );
+
+        let find_path = fake_tools.path().join("find");
+        write_test_executable(
+            &find_path,
+            r##"#!/bin/bash
+if [ -e "$0.fail" ]; then
+    exit 73
+fi
+printf '%s\n' "$@" > "$0.args"
+for arg in "$@"; do
+    [ "$arg" = "-printf" ] && exit 97
+done
+file="$1/session space;\$(touch \"\$HOME/SHOULD_NOT_EXIST\").jsonl"
+printf '%s\0' "$file"
+"##,
+        );
+
+        let stat_path = fake_tools.path().join("stat");
+        write_test_executable(
+            &stat_path,
+            r#"#!/bin/bash
+if [ "$1" = "-c" ]; then
+    exit 2
+fi
+if [ "$1" = "-f" ] && [ "$2" = "%z" ]; then
+    printf '%s\n' "$3" > "$0.path"
+    printf '2097152\n'
+    exit 0
+fi
+exit 3
+"#,
+        );
+
+        let gtimeout_path = fake_tools.path().join("gtimeout");
+        write_test_executable(
+            &gtimeout_path,
+            r#"#!/bin/bash
+printf '%s\n' "$@" > "$0.args"
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --signal=*|--kill-after=*) shift ;;
+        *) break ;;
+    esac
+done
+shift
+"$@"
+status=$?
+printf '%s\n' "$status" > "$0.status"
+exit "$status"
+"#,
+        );
+
+        let path_value = format!(
+            "{}:{}",
+            fake_tools.path().display(),
+            tool_bin.path().display()
+        );
+        let script = build_probe_script_for_dirs(&["~/.codex/sessions".to_string()]);
+        let output = run_probe_script_with_path_value(
+            &script,
+            home.path(),
+            &path_value,
+            Duration::from_secs(8),
+        )
+        .expect("portable probe shell should finish");
+        assert!(output.status.success(), "portable probe shell failed");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("AGENT_DATA=~/.codex/sessions|2|1"),
+            "BSD stat fallback should count the literal session: {stdout}"
+        );
+
+        let find_args =
+            std::fs::read_to_string(find_path.with_extension("args")).expect("find args");
+        assert!(find_args.contains("-print0"));
+        assert!(!find_args.contains("-printf"));
+        let timeout_args =
+            std::fs::read_to_string(gtimeout_path.with_extension("args")).expect("gtimeout args");
+        assert!(timeout_args.contains("--signal=TERM"));
+        assert!(timeout_args.contains("--kill-after=1s"));
+        assert!(timeout_args.contains("5s"));
+        assert_eq!(
+            std::fs::read_to_string(gtimeout_path.with_extension("status"))
+                .expect("gtimeout status")
+                .trim(),
+            "0"
+        );
+        assert_eq!(
+            std::fs::read_to_string(stat_path.with_extension("path"))
+                .expect("stat path")
+                .trim_end(),
+            weird_path.to_string_lossy()
+        );
+        assert!(
+            !home.path().join("SHOULD_NOT_EXIST").exists(),
+            "literal metacharacters from find must not execute"
+        );
+
+        std::fs::write(find_path.with_extension("fail"), b"fail").expect("enable find failure");
+        let failure = run_probe_script_with_path_value(
+            &script,
+            home.path(),
+            &path_value,
+            Duration::from_secs(8),
+        )
+        .expect("failed find probe shell should finish");
+        assert!(
+            failure.status.success(),
+            "outer probe should preserve discovery"
+        );
+        let failure_stdout = String::from_utf8_lossy(&failure.stdout);
+        assert!(
+            failure_stdout.contains("AGENT_DATA=~/.codex/sessions|0|0"),
+            "find failure must classify the estimate as incomplete: {failure_stdout}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(gtimeout_path.with_extension("status"))
+                .expect("failed gtimeout status")
+                .trim(),
+            "73",
+            "find's nonzero status must survive the aggregation pipeline"
         );
     }
 
@@ -1434,6 +1927,9 @@ CASS_VERSION=0.4.2
             "amp"
         );
         assert_eq!(infer_agent_type("~/.pi/agent/sessions"), "pi_agent");
+        assert_eq!(infer_agent_type("~/.prime/agent/sessions"), "prime_agent");
+        assert_eq!(infer_agent_type("/home/user/.prime/agent"), "prime_agent");
+        assert_eq!(infer_agent_type("/home/user/.prime/agent-other"), "unknown");
         assert_eq!(infer_agent_type("~/.omp/agent/sessions"), "omp");
         assert_eq!(
             infer_agent_type("~/.omp/profiles/work/agent/sessions"),

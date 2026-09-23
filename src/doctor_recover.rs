@@ -28,6 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::storage::sqlite::{
     FrankenStorage, FtsConsistencyRepair, FtsDryRunParity, FtsShadowParity, FtsShadowParityStatus,
+    RecoveryConversationRow,
 };
 use crate::{CliError, CliResult, RobotFormat, default_data_dir};
 
@@ -36,7 +37,22 @@ use crate::{CliError, CliResult, RobotFormat, default_data_dir};
 const RECOVER_CONVERSATION_PAGE: i64 = 256;
 /// Maximum canonical and FTS row IDs inspected by a read-only dry-run. The
 /// mutating path still performs exact parity validation before changing data.
+/// #345 plan of record: when the divergence scan hits this cap the dry-run
+/// stops and reports ">= N divergent" instead of paying for an exact count on
+/// a multi-million-row archive. Override with `CASS_FTS_DRYRUN_CAP`.
 const FTS_DRY_RUN_ROWID_COMPARISON_CAP: usize = 4_096;
+
+/// #345: the effective dry-run cap — `CASS_FTS_DRYRUN_CAP` (positive integer)
+/// or the default. Pure parse half kept separate for unit testing.
+fn parse_fts_dry_run_cap(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|cap| *cap > 0)
+        .unwrap_or(FTS_DRY_RUN_ROWID_COMPARISON_CAP)
+}
+
+fn fts_dry_run_rowid_comparison_cap() -> usize {
+    parse_fts_dry_run_cap(dotenvy::var("CASS_FTS_DRYRUN_CAP").ok().as_deref())
+}
 
 fn now_unix_ms() -> i64 {
     SystemTime::now()
@@ -109,6 +125,25 @@ fn is_fts5_shadow_open_corruption_error(err: &anyhow::Error) -> bool {
     rendered.contains("corrupt %_data record") && !is_fts5_oversized_leaf_error(err)
 }
 
+/// #434 defect 2: schema-level open refusals that name a derived FTS5 shadow
+/// object — the reported shape is `database disk image is malformed:
+/// sqlite_master is missing implicit autoindex slot 1 for table
+/// \`fts_messages_config\``, which fails during the schema reload BEFORE the
+/// ordinary FTS5 deferral applies, so `--rebuild-canonical-fts` used to refuse
+/// to open the very archive it exists to repair. Every `fts_messages*` object
+/// is fully derived from canonical rows, so the right repair is the same
+/// deferred-open drop+recreate the corrupt-`%_data` class uses — attempted
+/// below; when even the deferred open cannot get past the schema reload,
+/// doctor now says so explicitly and routes to the raw-mirror recovery path
+/// instead of repeating the refusal.
+fn is_fts_shadow_schema_level_open_failure(err: &anyhow::Error) -> bool {
+    let rendered = format!("{err:#}");
+    rendered.contains("fts_messages")
+        && (rendered.contains("missing implicit autoindex slot")
+            || (rendered.contains("database disk image is malformed")
+                && rendered.contains("sqlite_master")))
+}
+
 /// The distinct, non-alarming diagnostic for the GH #369 oversized-leaf case:
 /// canonical rows and the Tantivy index are intact and fully serve search; only
 /// the optional SQLite-side FTS5 shadow cannot be materialized for this corpus.
@@ -151,12 +186,16 @@ fn print_json(envelope: &serde_json::Value) -> CliResult<()> {
 /// One reconstructed session file (or a skip with the reason).
 #[derive(Debug)]
 struct ReconstructedSession {
-    conversation_id: i64,
+    /// `None` when the canonical row's `id` itself was unreadable (#391).
+    conversation_id: Option<i64>,
     external_id: Option<String>,
     relative_or_source_path: String,
     written_path: Option<PathBuf>,
     line_count: usize,
     skipped_reason: Option<String>,
+    /// Columns whose stored type disagreed with the schema and were coerced
+    /// while reading the canonical row (empty for a healthy row).
+    coercions: Vec<String>,
 }
 
 /// Compute the on-disk output path for a reconstructed session.
@@ -247,9 +286,12 @@ pub fn run_doctor_recover_from_archive(
         )
     })?;
 
-    let total = storage
-        .total_conversation_count()
-        .map_err(|e| storage_error(format!("counting conversations: {e:#}"), None))?;
+    // The count is reporting only; on a damaged tree it may itself fail, and
+    // that must not stop the row-by-row export below (#391).
+    let (total, total_count_error) = match storage.total_conversation_count() {
+        Ok(total) => (Some(total), None),
+        Err(e) => (None, Some(format!("{e:#}"))),
+    };
 
     std::fs::create_dir_all(&target_dir).map_err(|e| {
         io_error(
@@ -264,27 +306,87 @@ pub fn run_doctor_recover_from_archive(
     let mut results: Vec<ReconstructedSession> = Vec::new();
     let mut written = 0usize;
     let mut skipped = 0usize;
+    let mut unreadable_rows = 0usize;
+    let mut quarantined_rows = 0usize;
+    let mut coerced_rows = 0usize;
     let mut total_lines = 0usize;
 
-    let mut offset: i64 = 0;
+    // Keyset pagination by `id`: no `ORDER BY started_at` sort over a possibly
+    // damaged tree, and a page is never re-read after a partial failure.
+    let mut after_id: i64 = 0;
     loop {
-        let conversations = storage
-            .list_conversations(RECOVER_CONVERSATION_PAGE, offset)
+        let rows = storage
+            .list_conversations_for_recovery(after_id, RECOVER_CONVERSATION_PAGE)
             .map_err(|e| {
                 storage_error(
-                    format!("listing conversations at offset {offset}: {e:#}"),
-                    None,
+                    format!("listing conversations after id {after_id}: {e:#}"),
+                    Some(
+                        "The page walk itself failed inside the engine, so the rows after this id cannot be reached read-only. Sessions already written are complete; recover the rest from a backup ('cass doctor backups list') or a remote mirror.",
+                    ),
                 )
             })?;
-        if conversations.is_empty() {
+        if rows.is_empty() {
             break;
         }
-        let page_len = conversations.len() as i64;
+        let page_len = rows.len() as i64;
+        let page_start_id = after_id;
+        let mut page_saw_unreadable = false;
 
-        for conversation in conversations {
+        for row in rows {
+            let (conversation, coercions) = match row {
+                RecoveryConversationRow::Readable {
+                    conversation,
+                    coercions,
+                } => (*conversation, coercions),
+                RecoveryConversationRow::Quarantined { id, coercions } => {
+                    // #391: identity types are inconsistent with CASS's
+                    // contract, so messages cannot safely be attributed to
+                    // this row. The types alone do not diagnose page aliasing.
+                    // Count it, keep paging past its id, export nothing.
+                    after_id = after_id.max(id);
+                    skipped += 1;
+                    quarantined_rows += 1;
+                    results.push(ReconstructedSession {
+                        conversation_id: Some(id),
+                        external_id: None,
+                        relative_or_source_path: format!("<quarantined row: id {id}>"),
+                        written_path: None,
+                        line_count: 0,
+                        skipped_reason: Some(
+                            "quarantined canonical row: identity columns violate the text/path \
+                             contract; message ownership cannot be verified"
+                                .to_string(),
+                        ),
+                        coercions,
+                    });
+                    continue;
+                }
+                RecoveryConversationRow::Unreadable { stored_id, reason } => {
+                    // #391: a row whose id is not an integer cannot be addressed
+                    // for message reconstruction. Record it and keep exporting
+                    // the rest instead of aborting with nothing written.
+                    skipped += 1;
+                    unreadable_rows += 1;
+                    page_saw_unreadable = true;
+                    results.push(ReconstructedSession {
+                        conversation_id: None,
+                        external_id: None,
+                        relative_or_source_path: format!("<unreadable row: id {stored_id}>"),
+                        written_path: None,
+                        line_count: 0,
+                        skipped_reason: Some(format!("unreadable canonical row: {reason}")),
+                        coercions: Vec::new(),
+                    });
+                    continue;
+                }
+            };
             let Some(conversation_id) = conversation.id else {
                 continue;
             };
+            after_id = after_id.max(conversation_id);
+            if !coercions.is_empty() {
+                coerced_rows += 1;
+            }
             let source_path_display = conversation.source_path.display().to_string();
 
             let lines = match storage.reconstruct_source_jsonl_for_conversation(conversation_id) {
@@ -292,12 +394,13 @@ pub fn run_doctor_recover_from_archive(
                 Err(e) => {
                     skipped += 1;
                     results.push(ReconstructedSession {
-                        conversation_id,
+                        conversation_id: Some(conversation_id),
                         external_id: conversation.external_id.clone(),
                         relative_or_source_path: source_path_display,
                         written_path: None,
                         line_count: 0,
                         skipped_reason: Some(format!("reconstruct failed: {e:#}")),
+                        coercions,
                     });
                     continue;
                 }
@@ -306,7 +409,7 @@ pub fn run_doctor_recover_from_archive(
             if lines.is_empty() {
                 skipped += 1;
                 results.push(ReconstructedSession {
-                    conversation_id,
+                    conversation_id: Some(conversation_id),
                     external_id: conversation.external_id.clone(),
                     relative_or_source_path: source_path_display,
                     written_path: None,
@@ -315,6 +418,7 @@ pub fn run_doctor_recover_from_archive(
                         "no preserved source events (extra_json/extra_bin) to reconstruct"
                             .to_string(),
                     ),
+                    coercions,
                 });
                 continue;
             }
@@ -341,17 +445,24 @@ pub fn run_doctor_recover_from_archive(
             written += 1;
             total_lines += lines.len();
             results.push(ReconstructedSession {
-                conversation_id,
+                conversation_id: Some(conversation_id),
                 external_id: conversation.external_id.clone(),
                 relative_or_source_path: source_path_display,
                 written_path: Some(out_path),
                 line_count: lines.len(),
                 skipped_reason: None,
+                coercions,
             });
         }
 
-        offset += page_len;
         if page_len < RECOVER_CONVERSATION_PAGE {
+            break;
+        }
+        // `ORDER BY c.id` sorts every non-integer id after all integer ids,
+        // so a page that carried an unreadable row has already reached the
+        // end of the addressable rows; and a page that advanced nothing would
+        // be re-read forever. Stop rather than loop or double-report.
+        if page_saw_unreadable || after_id == page_start_id {
             break;
         }
     }
@@ -363,8 +474,13 @@ pub fn run_doctor_recover_from_archive(
         "db_path": db_path.display().to_string(),
         "target_dir": target_dir.display().to_string(),
         "conversations_total": total,
+        "conversations_total_error": total_count_error,
         "sessions_written": written,
         "sessions_skipped": skipped,
+        // #391: rows the strict reader would have aborted the export on.
+        "rows_unreadable": unreadable_rows,
+        "rows_quarantined": quarantined_rows,
+        "rows_coerced": coerced_rows,
         "lines_written": total_lines,
         "sessions": results
             .iter()
@@ -375,6 +491,7 @@ pub fn run_doctor_recover_from_archive(
                 "written_path": r.written_path.as_ref().map(|p| p.display().to_string()),
                 "line_count": r.line_count,
                 "skipped_reason": r.skipped_reason,
+                "coercions": r.coercions,
             }))
             .collect::<Vec<_>>(),
         "next_action": format!(
@@ -392,7 +509,14 @@ pub fn run_doctor_recover_from_archive(
             target_dir.display()
         );
         if skipped > 0 {
-            println!("  {skipped} conversation(s) had no preserved events and were skipped.");
+            println!(
+                "  {skipped} conversation(s) were skipped (no preserved events, unreadable, or quarantined)."
+            );
+        }
+        if unreadable_rows > 0 || quarantined_rows > 0 || coerced_rows > 0 {
+            println!(
+                "  Damaged canonical rows tolerated: {unreadable_rows} unreadable, {quarantined_rows} quarantined (identity columns mis-typed), {coerced_rows} with coerced column types (see --json for details)."
+            );
         }
         println!(
             "Next: re-ingest with 'cass index --full' over {} into a fresh data dir.",
@@ -447,6 +571,7 @@ fn fts_dry_run_parity_json(parity: &FtsDryRunParity) -> serde_json::Value {
         "indexed_ids_examined": parity.indexed_ids_examined,
         "observed_missing_canonical_rowids_at_least": parity.observed_missing_canonical_rowids_at_least,
         "observed_excess_fts_rowids_at_least": parity.observed_excess_fts_rowids_at_least,
+        "divergent_rowids_at_least": parity.divergent_rowids_at_least(),
         "detail": parity.detail,
     })
 }
@@ -519,12 +644,16 @@ pub fn run_doctor_rebuild_canonical_fts(
     };
     let storage = match storage_open {
         Ok(storage) => storage,
-        // #368 defect 3: the FTS5 shadow structure is corrupt enough that the
-        // archive cannot be opened normally (the schema reload decodes the
-        // corrupt %_data). Open with FTS5 hydration DEFERRED and rebuild the
-        // shadow by dropping + recreating it from canonical rows — the shadow is
-        // fully derived and canonical rows are never touched.
-        Err(open_err) if is_fts5_shadow_open_corruption_error(&open_err) => {
+        // #368 defect 3 / #434 defect 2: the FTS5 shadow is corrupt enough that
+        // the archive cannot be opened normally (the schema reload decodes the
+        // corrupt %_data, or refuses a shadow object's sqlite_master state).
+        // Open with FTS5 hydration DEFERRED and rebuild the shadow by dropping
+        // + recreating it from canonical rows — the shadow is fully derived
+        // and canonical rows are never touched.
+        Err(open_err)
+            if is_fts5_shadow_open_corruption_error(&open_err)
+                || is_fts_shadow_schema_level_open_failure(&open_err) =>
+        {
             if dry_run {
                 // A dry-run must stay read-only and non-locking: report the
                 // planned repair straight from the open error, WITHOUT opening
@@ -546,12 +675,17 @@ pub fn run_doctor_rebuild_canonical_fts(
                 return Ok(());
             }
             let deferred = FrankenStorage::open_deferred_fts5_for_repair(&db_path).map_err(|e| {
+                // #434 defect 2: BOTH structured opens failed. Say so
+                // explicitly instead of repeating the refusal, and route to
+                // the checksum-verified raw-mirror recovery path.
                 storage_error(
                     format!(
-                        "opening canonical archive {} with deferred FTS5 validation for corrupt-shadow repair: {e:#}",
+                        "no structured open of {} is possible: the ordinary open failed ({open_err:#}) and the deferred-FTS5 repair open also failed ({e:#})",
                         db_path.display()
                     ),
-                    Some("Preserve the archive bundle and run 'cass doctor check --json'."),
+                    Some(
+                        "The archive's schema state is damaged beyond what the deferred-FTS5 repair open tolerates, so doctor cannot repair the derived shadow in place. Preserve the complete archive bundle (db + -wal + -shm + sidecars) and recover instead: 'cass doctor check --json' ranks the recovery authorities, 'cass doctor --fix --json' verifies the checksum-verified raw mirror and stages an isolated reconstruct candidate, and 'cass doctor --recover-from-archive <DIR>' rebuilds the source tree from the archive's preserved events when the archive is still readable read-only.",
+                    ),
                 )
             })?;
             let inserted = deferred
@@ -586,15 +720,22 @@ pub fn run_doctor_rebuild_canonical_fts(
                     db_path.display()
                 ),
                 Some(
-                    "If the archive cannot be opened at all, the canonical rows are unreadable — use \
-                     'cass doctor --recover-from-archive <DIR>' to rebuild the source tree instead.",
+                    // #434 defect 1: an open failure proves a schema-level open
+                    // failure, NOT that canonical rows are unreadable (stock
+                    // readers served every canonical row of the #434 archive).
+                    "The archive failed to open at the schema level; that does not by itself mean \
+                     the canonical rows are unreadable. Run 'cass doctor check --json' to see what \
+                     is actually readable and which recovery authority doctor ranks first. If \
+                     doctor confirms the canonical rows are unreadable, 'cass doctor \
+                     --recover-from-archive <DIR>' rebuilds the source tree from the archive's \
+                     preserved events.",
                 ),
             ));
         }
     };
     if dry_run {
         let before = storage
-            .inspect_search_fallback_fts_parity_dry_run(FTS_DRY_RUN_ROWID_COMPARISON_CAP)
+            .inspect_search_fallback_fts_parity_dry_run(fts_dry_run_rowid_comparison_cap())
             .map_err(|e| {
                 storage_error(
                     format!("performing bounded canonical/FTS5 row-parity inspection: {e:#}"),
@@ -608,13 +749,19 @@ pub fn run_doctor_rebuild_canonical_fts(
             print_json(&envelope)?;
         } else {
             println!(
-                "Canonical FTS5 dry-run: status={}, inspection_complete={}, canonical={}, indexable={}, indexed={:?}, rowid_cap={}",
+                "Canonical FTS5 dry-run: status={}, inspection_complete={}, canonical={}, indexable={}, indexed={:?}, rowid_cap={}, divergent>={}{}",
                 before.status_as_str(),
                 before.inspection_complete,
                 before.canonical_messages,
                 before.indexable_messages,
                 before.indexed_messages,
                 before.comparison_cap,
+                before.divergent_rowids_at_least(),
+                if before.inspection_complete {
+                    ""
+                } else {
+                    " (capped; a divergence floor, not an exact count — raise CASS_FTS_DRYRUN_CAP or run --yes for exact parity)"
+                },
             );
         }
         return Ok(());
@@ -1218,6 +1365,63 @@ mod tests {
         assert_eq!(envelope["apply_command"], serde_json::Value::Null);
     }
 
+    /// #345: `CASS_FTS_DRYRUN_CAP` truthiness/validity contract (pure parse
+    /// half — the env wrapper only feeds it the raw string).
+    #[test]
+    fn gh345_dry_run_cap_env_parsing() {
+        assert_eq!(
+            parse_fts_dry_run_cap(None),
+            FTS_DRY_RUN_ROWID_COMPARISON_CAP
+        );
+        assert_eq!(parse_fts_dry_run_cap(Some("512")), 512);
+        assert_eq!(parse_fts_dry_run_cap(Some(" 8 ")), 8);
+        // Zero and garbage fall back to the default (a zero cap would make
+        // every dry-run indeterminate and trip the storage-layer ensure).
+        assert_eq!(
+            parse_fts_dry_run_cap(Some("0")),
+            FTS_DRY_RUN_ROWID_COMPARISON_CAP
+        );
+        assert_eq!(
+            parse_fts_dry_run_cap(Some("not-a-number")),
+            FTS_DRY_RUN_ROWID_COMPARISON_CAP
+        );
+        assert_eq!(
+            parse_fts_dry_run_cap(Some("")),
+            FTS_DRY_RUN_ROWID_COMPARISON_CAP
+        );
+    }
+
+    /// #345: a capped dry-run envelope must carry the ">= N divergent" floor
+    /// while staying indeterminate and deferring exact parity to the apply.
+    #[test]
+    fn gh345_capped_dry_run_envelope_reports_divergence_floor() {
+        let parity = FtsDryRunParity {
+            exact_status: None,
+            canonical_messages: 2_000_000,
+            indexable_messages: 2_000_000,
+            indexed_messages: Some(1_395_000),
+            inspection_complete: false,
+            comparison_cap: 4_096,
+            canonical_ids_examined: 4_096,
+            indexed_ids_examined: 4_096,
+            observed_missing_canonical_rowids_at_least: 7,
+            observed_excess_fts_rowids_at_least: 2,
+            detail: Some(
+                "bounded dry-run stopped after at most 4096 row IDs per domain (>= 9 divergent row ID(s) observed within the cap: missing >= 7, excess >= 2); exact parity is deferred to --yes before any mutation".to_string(),
+            ),
+        };
+        assert_eq!(parity.divergent_rowids_at_least(), 9);
+        let envelope = fts_rebuild_dry_run_envelope(Path::new("/tmp/large.db"), &parity);
+        assert_eq!(envelope["parity"]["status"], "indeterminate");
+        assert_eq!(envelope["parity"]["inspection_complete"], false);
+        assert_eq!(envelope["parity"]["divergent_rowids_at_least"], 9);
+        assert_eq!(
+            envelope["planned_action"],
+            "exact_parity_inspection_deferred_to_apply"
+        );
+        assert_eq!(envelope["would_mutate"], serde_json::Value::Null);
+    }
+
     #[test]
     fn gh345_indeterminate_fts_dry_run_defers_exact_parity_without_claiming_mutation() {
         let parity = FtsDryRunParity {
@@ -1436,6 +1640,49 @@ mod tests {
         );
     }
 
+    /// GH #434 defect 2: the schema-level open refusal reported against real
+    /// archives (both the 0.6.26 read-path refusal and the doctor
+    /// `--rebuild-canonical-fts` inspection refusal carried the identical
+    /// engine string) must route into the deferred-FTS5 drop+recreate repair
+    /// branch instead of the generic "cannot open" wall, while failures naming
+    /// canonical (non-shadow) objects keep the generic routing.
+    #[test]
+    fn gh434_schema_level_shadow_open_failures_route_to_deferred_repair() {
+        // Verbatim shapes from the #434 report (index refusal + doctor refusal).
+        let index_refusal = anyhow::anyhow!(
+            "opening raw frankensqlite db readonly at /home/claude/.local/share/coding-agent-search/agent_search.db: \
+             database disk image is malformed: sqlite_master is missing implicit autoindex slot 1 for table `fts_messages_config`"
+        );
+        assert!(is_fts_shadow_schema_level_open_failure(&index_refusal));
+
+        let doctor_refusal = anyhow::anyhow!(
+            "opening frankensqlite db readonly at /tmp/cass-check/agent_search.db: \
+             database disk image is malformed: sqlite_master is missing implicit autoindex slot 1 for table `fts_messages_config`"
+        );
+        assert!(is_fts_shadow_schema_level_open_failure(&doctor_refusal));
+
+        // The same autoindex failure on a CANONICAL table is not repairable by
+        // recreating the derived shadow — it must keep the generic routing.
+        let canonical_refusal = anyhow::anyhow!(
+            "database disk image is malformed: sqlite_master is missing implicit autoindex slot 1 for table `conversations`"
+        );
+        assert!(!is_fts_shadow_schema_level_open_failure(&canonical_refusal));
+
+        // The %_data structure class keeps its own predicate; neither predicate
+        // swallows the other.
+        let data_corruption = anyhow::anyhow!(
+            "fts5: corrupt %_data record: structure segment count exceeds FTS5 maximum"
+        );
+        assert!(!is_fts_shadow_schema_level_open_failure(&data_corruption));
+        assert!(is_fts5_shadow_open_corruption_error(&data_corruption));
+
+        // The gh#369 oversized-leaf shape is a write-time engine limitation,
+        // not an open-blocking schema failure.
+        let oversized =
+            anyhow::anyhow!("fts5: corrupt %_data record: segment leaf term offset exceeds u16");
+        assert!(!is_fts_shadow_schema_level_open_failure(&oversized));
+    }
+
     /// GH #369: the cumulative oversized-leaf failure (many in-cap terms in one
     /// batch, not a single overlong token) must be recognized so the operator
     /// gets a reassuring "search still works via Tantivy" diagnostic rather than
@@ -1495,6 +1742,294 @@ mod tests {
         assert!(
             hint.contains("Tantivy") && hint.contains("No action is needed"),
             "hint must state search still works and no action is needed"
+        );
+    }
+    #[test]
+    fn recovery_listing_tolerates_type_mismatched_rows() {
+        // #391: a page-aliasing corruption leaves integers where TEXT is
+        // declared. The strict lister failed the whole page with
+        // `type mismatch: expected text, got integer`; the recovery lister
+        // must coerce, report the coercion, and keep going.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        let agent_id = seed_agent(&storage);
+        let healthy = seed_conversation(&storage, agent_id, "sess-ok", "/orig/ok.jsonl");
+        let damaged = seed_conversation(&storage, agent_id, "sess-bad", "/orig/bad.jsonl");
+        // TEXT affinity rewrites an integer to text on INSERT/UPDATE, so the
+        // mismatch (what stock SQLite's integrity_check reports as "NUMERIC
+        // value in conversations.title") cannot be planted through SQL.
+        // Exercise the mapper directly with a SELECT shaped exactly like the
+        // listing projection, presenting the values a damaged page would.
+        let rows: Vec<RecoveryConversationRow> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT ?1, 'claude', NULL, 'sess-bad', 7, ?2, 1000, 'not-a-timestamp', 1.5,
+                        NULL, 'local', NULL, NULL",
+                &[
+                    ParamValue::from(damaged),
+                    ParamValue::from("/orig/bad.jsonl"),
+                ] as &[ParamValue],
+                |row| {
+                    Ok(crate::storage::sqlite::recovery_conversation_row_from_lenient_columns(row))
+                },
+            )
+            .expect("query");
+        assert_eq!(rows.len(), 1);
+        match &rows[0] {
+            RecoveryConversationRow::Readable {
+                conversation,
+                coercions,
+            } => {
+                assert_eq!(conversation.id, Some(damaged));
+                assert_eq!(conversation.external_id.as_deref(), Some("sess-bad"));
+                assert_eq!(conversation.title.as_deref(), Some("7"));
+                assert_eq!(conversation.started_at, Some(1000));
+                assert_eq!(conversation.ended_at, None, "unparseable text is dropped");
+                assert_eq!(conversation.approx_tokens, Some(1), "real truncates");
+                assert_eq!(coercions.len(), 3, "{coercions:?}");
+                assert!(coercions[0].starts_with("title: integer 7"));
+                assert!(coercions[1].contains("ended_at: text \"not-a-timestamp\""));
+                assert!(coercions[1].ends_with("(dropped)"));
+                assert!(coercions[2].starts_with("approx_tokens: real 1.5"));
+            }
+            other => panic!("expected a readable row, got {other:?}"),
+        }
+
+        // An id that is not an integer is reported, not fatal.
+        let rows: Vec<RecoveryConversationRow> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT 'garbage', 'claude', NULL, NULL, NULL, '/p', NULL, NULL, NULL,
+                        NULL, 'local', NULL, NULL",
+                &[] as &[ParamValue],
+                |row| {
+                    Ok(crate::storage::sqlite::recovery_conversation_row_from_lenient_columns(row))
+                },
+            )
+            .expect("query");
+        match &rows[0] {
+            RecoveryConversationRow::Unreadable { stored_id, reason } => {
+                assert_eq!(stored_id, "text");
+                assert!(reason.contains("not an integer"));
+            }
+            other => panic!("expected an unreadable row, got {other:?}"),
+        }
+
+        // The real listing pages by id and reads healthy rows unchanged.
+        let page = storage
+            .list_conversations_for_recovery(0, 1)
+            .expect("first page");
+        assert_eq!(page.len(), 1);
+        let RecoveryConversationRow::Readable {
+            conversation,
+            coercions,
+        } = &page[0]
+        else {
+            panic!("healthy row must be readable");
+        };
+        assert_eq!(conversation.id, Some(healthy));
+        assert_eq!(conversation.external_id.as_deref(), Some("sess-ok"));
+        assert!(coercions.is_empty());
+        let page = storage
+            .list_conversations_for_recovery(healthy, 10)
+            .expect("second page");
+        assert_eq!(page.len(), 1);
+        let RecoveryConversationRow::Readable { conversation, .. } = &page[0] else {
+            panic!("second row must be readable");
+        };
+        assert_eq!(conversation.id, Some(damaged));
+        assert!(
+            storage
+                .list_conversations_for_recovery(damaged, 10)
+                .expect("past the end")
+                .is_empty()
+        );
+    }
+
+    /// Plant a BLOB in a declared-TEXT column. TEXT affinity converts numerics
+    /// on write but stores a blob as-is, so this is the one mis-typed value
+    /// that can be planted through SQL (the shape stock SQLite reports as
+    /// "NUMERIC value in conversations.title" otherwise needs a damaged page).
+    fn plant_blob(storage: &FrankenStorage, conversation_id: i64, column: &str) {
+        storage
+            .raw()
+            .execute_compat(
+                &format!("UPDATE conversations SET {column} = X'DEADBEEF' WHERE id = ?1"),
+                &[ParamValue::from(conversation_id)] as &[ParamValue],
+            )
+            .expect("plant blob");
+    }
+
+    #[test]
+    fn recovery_listing_quarantines_rows_with_mistyped_identity_columns() {
+        // #391: an aliased page decodes a foreign cell through the
+        // `conversations` schema, so an identity column (`source_path`,
+        // `external_id`, ...) holds a non-text value. Such a row is not a
+        // conversation with one damaged cell — its `id` would address some
+        // other conversation's messages — so it is quarantined, while a row
+        // whose only coercions are title/timestamps still exports.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        let agent_id = seed_agent(&storage);
+        let healthy = seed_conversation(&storage, agent_id, "sess-ok", "/orig/ok.jsonl");
+        let coerced = seed_conversation(&storage, agent_id, "sess-title", "/orig/title.jsonl");
+        let aliased = seed_conversation(&storage, agent_id, "sess-alias", "/orig/alias.jsonl");
+        plant_blob(&storage, coerced, "title");
+        plant_blob(&storage, aliased, "source_path");
+
+        let page = storage
+            .list_conversations_for_recovery(0, 10)
+            .expect("page");
+        assert_eq!(page.len(), 3, "{page:?}");
+        let RecoveryConversationRow::Readable {
+            conversation,
+            coercions,
+        } = &page[0]
+        else {
+            panic!("healthy row must be readable: {:?}", page[0]);
+        };
+        assert_eq!(conversation.id, Some(healthy));
+        assert!(coercions.is_empty());
+        let RecoveryConversationRow::Readable {
+            conversation,
+            coercions,
+        } = &page[1]
+        else {
+            panic!(
+                "a row with only a coerced title must stay readable: {:?}",
+                page[1]
+            );
+        };
+        assert_eq!(conversation.id, Some(coerced));
+        assert_eq!(conversation.source_path, Path::new("/orig/title.jsonl"));
+        assert_eq!(coercions.len(), 1, "{coercions:?}");
+        assert!(coercions[0].starts_with("title: 4-byte blob"));
+        let RecoveryConversationRow::Quarantined { id, coercions } = &page[2] else {
+            panic!(
+                "a row with a mis-typed source_path must be quarantined: {:?}",
+                page[2]
+            );
+        };
+        assert_eq!(*id, aliased);
+        assert_eq!(coercions.len(), 1, "{coercions:?}");
+        assert!(coercions[0].starts_with("source_path: 4-byte blob"));
+
+        // Paging by id continues past a quarantined row.
+        let rest = storage
+            .list_conversations_for_recovery(aliased, 10)
+            .expect("past the end");
+        assert!(rest.is_empty(), "{rest:?}");
+
+        // The other shapes an aliased page presents, exercised on the mapper
+        // with the listing projection: an integer or NULL where `source_path`
+        // is declared, an integer `external_id`, an integer `source_id`.
+        let mapper = |row: &crate::franken_sync::Row| {
+            Ok(crate::storage::sqlite::recovery_conversation_row_from_lenient_columns(row))
+        };
+        for (sql, expect) in [
+            (
+                "SELECT ?1, 'claude', NULL, 'sess-x', 7, 1700000000, 1000, NULL, NULL,
+                        NULL, 'local', NULL, NULL",
+                "source_path: integer 1700000000",
+            ),
+            (
+                "SELECT ?1, 'claude', NULL, 'sess-x', NULL, NULL, 1000, NULL, NULL,
+                        NULL, 'local', NULL, NULL",
+                "source_path: NULL or empty",
+            ),
+            (
+                "SELECT ?1, 'claude', NULL, 4242, NULL, '/p', 1000, NULL, NULL,
+                        NULL, 'local', NULL, NULL",
+                "external_id: integer 4242",
+            ),
+            (
+                "SELECT ?1, 'claude', NULL, 'sess-x', NULL, '/p', 1000, NULL, NULL,
+                        NULL, 99, NULL, NULL",
+                "source_id: integer 99",
+            ),
+        ] {
+            let rows: Vec<RecoveryConversationRow> = storage
+                .raw()
+                .query_map_collect(sql, &[ParamValue::from(aliased)] as &[ParamValue], mapper)
+                .expect("query");
+            match &rows[0] {
+                RecoveryConversationRow::Quarantined { id, coercions } => {
+                    assert_eq!(*id, aliased);
+                    assert!(coercions[0].starts_with(expect), "{sql}: {coercions:?}");
+                }
+                other => panic!("{sql}: expected a quarantined row, got {other:?}"),
+            }
+        }
+        // Identity coercions are listed before content coercions on the same row.
+        let rows: Vec<RecoveryConversationRow> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT ?1, 'claude', NULL, 'sess-x', 7, 1700000000, 1000, NULL, NULL,
+                        NULL, 'local', NULL, NULL",
+                &[ParamValue::from(aliased)] as &[ParamValue],
+                mapper,
+            )
+            .expect("query");
+        let RecoveryConversationRow::Quarantined { coercions, .. } = &rows[0] else {
+            panic!("expected a quarantined row, got {:?}", rows[0]);
+        };
+        assert_eq!(coercions.len(), 2, "{coercions:?}");
+        assert!(coercions[0].starts_with("source_path: integer 1700000000"));
+        assert!(coercions[1].starts_with("title: integer 7"));
+    }
+
+    #[test]
+    fn recover_from_archive_quarantines_mistyped_rows_and_exports_coerced_ones() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("agent_search.db");
+        let target = tmp.path().join("recovered");
+        {
+            let storage = FrankenStorage::open(&db_path).expect("open db");
+            let agent_id = seed_agent(&storage);
+            let healthy = seed_conversation(&storage, agent_id, "sess-ok", "/orig/ok.jsonl");
+            let coerced = seed_conversation(&storage, agent_id, "sess-title", "/orig/title.jsonl");
+            let aliased = seed_conversation(&storage, agent_id, "sess-alias", "/orig/alias.jsonl");
+            for cid in [healthy, coerced, aliased] {
+                write_message(
+                    &storage,
+                    cid,
+                    0,
+                    &format!(r#"{{"type":"user","uuid":"u{cid}","text":"hi"}}"#),
+                );
+            }
+            plant_blob(&storage, coerced, "title");
+            plant_blob(&storage, aliased, "source_path");
+        }
+
+        run_doctor_recover_from_archive(
+            Some(tmp.path().to_path_buf()),
+            Some(db_path.clone()),
+            target.clone(),
+            Some(RobotFormat::Json),
+        )
+        .expect("recover");
+
+        let mut written: Vec<String> = std::fs::read_dir(&target)
+            .expect("read recovered dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".jsonl"))
+            .collect();
+        written.sort();
+        assert_eq!(written.len(), 2, "{written:?}");
+        assert!(
+            written.iter().any(|n| n.starts_with("sess-ok")),
+            "{written:?}"
+        );
+        assert!(
+            written.iter().any(|n| n.starts_with("sess-title")),
+            "a row with only a coerced title still exports: {written:?}"
+        );
+        assert!(
+            !written.iter().any(|n| n.starts_with("sess-alias")),
+            "a quarantined row must not be exported: {written:?}"
         );
     }
 }

@@ -2,11 +2,11 @@ use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-use coding_agent_search::connectors::{Connector, ScanContext, pi_agent::PiAgentConnector};
-use serial_test::serial;
+use coding_agent_search::connectors::{
+    Connector, ScanContext, ScanRoot, pi_agent::PiAgentConnector,
+};
 
 #[test]
-#[serial]
 fn pi_agent_connector_reads_session_jsonl() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/--test-project--");
@@ -19,17 +19,14 @@ fn pi_agent_connector_reads_session_jsonl() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
     let connector = PiAgentConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir pi-agent home is passed as an EXPLICIT scan root
+    // instead of mutating process-global PI_CODING_AGENT_DIR.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
         convs.len(),
@@ -67,7 +64,6 @@ fn pi_agent_connector_reads_session_jsonl() {
 }
 
 #[test]
-#[serial]
 fn pi_agent_connector_includes_thinking_content() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/--test--");
@@ -80,17 +76,14 @@ fn pi_agent_connector_includes_thinking_content() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
     let connector = PiAgentConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir pi-agent home is passed as an EXPLICIT scan root
+    // instead of mutating process-global PI_CODING_AGENT_DIR.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
         convs.len(),
@@ -122,7 +115,6 @@ fn pi_agent_connector_includes_thinking_content() {
 }
 
 #[test]
-#[serial]
 fn pi_agent_connector_handles_tool_calls() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/--tools-test--");
@@ -136,17 +128,14 @@ fn pi_agent_connector_handles_tool_calls() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
     let connector = PiAgentConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir pi-agent home is passed as an EXPLICIT scan root
+    // instead of mutating process-global PI_CODING_AGENT_DIR.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
         convs.len(),
@@ -185,7 +174,6 @@ fn pi_agent_connector_handles_tool_calls() {
 }
 
 #[test]
-#[serial]
 fn pi_agent_connector_handles_model_change() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/--model-change--");
@@ -200,17 +188,14 @@ fn pi_agent_connector_handles_model_change() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
     let connector = PiAgentConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir pi-agent home is passed as an EXPLICIT scan root
+    // instead of mutating process-global PI_CODING_AGENT_DIR.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
         convs.len(),
@@ -248,48 +233,60 @@ fn pi_agent_connector_handles_model_change() {
 }
 
 #[test]
-#[serial]
 fn pi_agent_connector_detection_with_sessions_dir() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions");
     fs::create_dir_all(&sessions).unwrap();
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
-    let connector = PiAgentConnector::new();
-    let result = connector.detect();
+    // qu81y: detection is exercised through FAD's explicit root-override
+    // input (the same <dir>/sessions root PI_CODING_AGENT_DIR used to
+    // resolve to) instead of mutating process-global env.
+    let report = franken_agent_detection::detect_installed_agents(
+        &franken_agent_detection::AgentDetectOptions {
+            only_connectors: Some(vec!["pi_agent".to_string()]),
+            include_undetected: true,
+            root_overrides: vec![franken_agent_detection::AgentDetectRootOverride {
+                slug: "pi_agent".to_string(),
+                root: sessions,
+            }],
+        },
+    )
+    .expect("pi_agent detection report");
+    let entry = &report.installed_agents[0];
     assert!(
-        result.detected,
+        entry.detected,
         "connector should detect pi_agent when sessions dir exists"
     );
     assert!(
-        !result.evidence.is_empty(),
+        !entry.evidence.is_empty(),
         "detection evidence should be non-empty when detected"
     );
 }
 
 #[test]
-#[serial]
 fn pi_agent_connector_detection_without_sessions_dir() {
     let dir = TempDir::new().unwrap();
-    // Don't create sessions directory
-
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
-    let connector = PiAgentConnector::new();
-    let result = connector.detect();
+    // Don't create the sessions directory: the overridden probe root does
+    // not exist, so detection must report not-found.
+    let report = franken_agent_detection::detect_installed_agents(
+        &franken_agent_detection::AgentDetectOptions {
+            only_connectors: Some(vec!["pi_agent".to_string()]),
+            include_undetected: true,
+            root_overrides: vec![franken_agent_detection::AgentDetectRootOverride {
+                slug: "pi_agent".to_string(),
+                root: dir.path().join("sessions"),
+            }],
+        },
+    )
+    .expect("pi_agent detection report");
+    let entry = &report.installed_agents[0];
     assert!(
-        !result.detected,
+        !entry.detected,
         "connector should not detect pi_agent when sessions dir is missing"
     );
 }
 
 #[test]
-#[serial]
 fn pi_agent_connector_skips_malformed_lines() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/--malformed--");
@@ -304,17 +301,14 @@ also not valid
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
     let connector = PiAgentConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir pi-agent home is passed as an EXPLICIT scan root
+    // instead of mutating process-global PI_CODING_AGENT_DIR.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
         convs.len(),
@@ -332,7 +326,6 @@ also not valid
 }
 
 #[test]
-#[serial]
 fn pi_agent_connector_handles_string_content() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/--string-content--");
@@ -346,17 +339,14 @@ fn pi_agent_connector_handles_string_content() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
     let connector = PiAgentConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir pi-agent home is passed as an EXPLICIT scan root
+    // instead of mutating process-global PI_CODING_AGENT_DIR.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
         convs.len(),
@@ -381,7 +371,6 @@ fn pi_agent_connector_handles_string_content() {
 }
 
 #[test]
-#[serial]
 fn pi_agent_connector_filters_empty_content() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/--empty--");
@@ -395,17 +384,14 @@ fn pi_agent_connector_filters_empty_content() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
     let connector = PiAgentConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir pi-agent home is passed as an EXPLICIT scan root
+    // instead of mutating process-global PI_CODING_AGENT_DIR.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
         convs.len(),
@@ -427,7 +413,6 @@ fn pi_agent_connector_filters_empty_content() {
 }
 
 #[test]
-#[serial]
 fn pi_agent_connector_extracts_title_from_first_user_message() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/--title--");
@@ -440,17 +425,14 @@ fn pi_agent_connector_extracts_title_from_first_user_message() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
     let connector = PiAgentConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir pi-agent home is passed as an EXPLICIT scan root
+    // instead of mutating process-global PI_CODING_AGENT_DIR.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
         convs.len(),
@@ -468,7 +450,6 @@ fn pi_agent_connector_extracts_title_from_first_user_message() {
 }
 
 #[test]
-#[serial]
 fn pi_agent_connector_truncates_long_title() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/--long-title--");
@@ -483,17 +464,14 @@ fn pi_agent_connector_truncates_long_title() {
     );
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
     let connector = PiAgentConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir pi-agent home is passed as an EXPLICIT scan root
+    // instead of mutating process-global PI_CODING_AGENT_DIR.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
         convs.len(),
@@ -514,7 +492,6 @@ fn pi_agent_connector_truncates_long_title() {
 }
 
 #[test]
-#[serial]
 fn pi_agent_connector_assigns_sequential_indices() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/--indices--");
@@ -528,17 +505,14 @@ fn pi_agent_connector_assigns_sequential_indices() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
     let connector = PiAgentConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir pi-agent home is passed as an EXPLICIT scan root
+    // instead of mutating process-global PI_CODING_AGENT_DIR.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
         convs.len(),
@@ -558,7 +532,6 @@ fn pi_agent_connector_assigns_sequential_indices() {
 }
 
 #[test]
-#[serial]
 fn pi_agent_connector_metadata_includes_provider_info() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/--metadata--");
@@ -570,17 +543,14 @@ fn pi_agent_connector_metadata_includes_provider_info() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
     let connector = PiAgentConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir pi-agent home is passed as an EXPLICIT scan root
+    // instead of mutating process-global PI_CODING_AGENT_DIR.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
         convs.len(),
@@ -612,7 +582,6 @@ fn pi_agent_connector_metadata_includes_provider_info() {
 }
 
 #[test]
-#[serial]
 fn pi_agent_connector_ignores_files_without_underscore() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/--filter--");
@@ -631,17 +600,14 @@ fn pi_agent_connector_ignores_files_without_underscore() {
     fs::write(&other1, sample).unwrap();
     fs::write(&other2, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
     let connector = PiAgentConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir pi-agent home is passed as an EXPLICIT scan root
+    // instead of mutating process-global PI_CODING_AGENT_DIR.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     // Only the file with underscore pattern should be processed
     assert_eq!(
@@ -652,24 +618,20 @@ fn pi_agent_connector_ignores_files_without_underscore() {
 }
 
 #[test]
-#[serial]
 fn pi_agent_connector_handles_empty_sessions() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions");
     fs::create_dir_all(&sessions).unwrap();
     // No files in sessions
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
     let connector = PiAgentConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir pi-agent home is passed as an EXPLICIT scan root
+    // instead of mutating process-global PI_CODING_AGENT_DIR.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert!(
         convs.is_empty(),
@@ -678,7 +640,6 @@ fn pi_agent_connector_handles_empty_sessions() {
 }
 
 #[test]
-#[serial]
 fn pi_agent_connector_skips_thinking_level_change() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/--thinking--");
@@ -692,17 +653,14 @@ fn pi_agent_connector_skips_thinking_level_change() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
     let connector = PiAgentConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir pi-agent home is passed as an EXPLICIT scan root
+    // instead of mutating process-global PI_CODING_AGENT_DIR.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
         convs.len(),
@@ -726,7 +684,6 @@ fn pi_agent_connector_skips_thinking_level_change() {
 }
 
 #[test]
-#[serial]
 fn pi_agent_connector_populates_author_for_assistant_messages() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/--author--");
@@ -740,17 +697,14 @@ fn pi_agent_connector_populates_author_for_assistant_messages() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
     let connector = PiAgentConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir pi-agent home is passed as an EXPLICIT scan root
+    // instead of mutating process-global PI_CODING_AGENT_DIR.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
         convs.len(),
@@ -803,7 +757,6 @@ fn pi_agent_connector_populates_author_for_assistant_messages() {
 // =============================================================================
 
 #[test]
-#[serial]
 fn pi_agent_connector_handles_multiple_model_changes() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/--multi-model--");
@@ -823,17 +776,14 @@ fn pi_agent_connector_handles_multiple_model_changes() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
     let connector = PiAgentConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir pi-agent home is passed as an EXPLICIT scan root
+    // instead of mutating process-global PI_CODING_AGENT_DIR.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
         convs.len(),
@@ -879,7 +829,6 @@ fn pi_agent_connector_handles_multiple_model_changes() {
 }
 
 #[test]
-#[serial]
 fn pi_agent_connector_handles_empty_thinking_block() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/--empty-thinking--");
@@ -893,17 +842,14 @@ fn pi_agent_connector_handles_empty_thinking_block() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
     let connector = PiAgentConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir pi-agent home is passed as an EXPLICIT scan root
+    // instead of mutating process-global PI_CODING_AGENT_DIR.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
         convs.len(),
@@ -929,7 +875,6 @@ fn pi_agent_connector_handles_empty_thinking_block() {
 }
 
 #[test]
-#[serial]
 fn pi_agent_connector_handles_nested_tool_calls() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/--nested-tools--");
@@ -947,17 +892,14 @@ fn pi_agent_connector_handles_nested_tool_calls() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
     let connector = PiAgentConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir pi-agent home is passed as an EXPLICIT scan root
+    // instead of mutating process-global PI_CODING_AGENT_DIR.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
         convs.len(),
@@ -1013,7 +955,6 @@ fn pi_agent_connector_handles_nested_tool_calls() {
 }
 
 #[test]
-#[serial]
 fn pi_agent_connector_handles_very_long_session() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/--long-session--");
@@ -1043,17 +984,14 @@ fn pi_agent_connector_handles_very_long_session() {
 
     fs::write(&file, lines.join("\n")).unwrap();
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
     let connector = PiAgentConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir pi-agent home is passed as an EXPLICIT scan root
+    // instead of mutating process-global PI_CODING_AGENT_DIR.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
 
     let start = std::time::Instant::now();
     let convs = connector.scan(&ctx).unwrap();
@@ -1097,7 +1035,6 @@ fn pi_agent_connector_handles_very_long_session() {
 }
 
 #[test]
-#[serial]
 fn pi_agent_connector_handles_unicode_content() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/--unicode--");
@@ -1114,17 +1051,14 @@ fn pi_agent_connector_handles_unicode_content() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
     let connector = PiAgentConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir pi-agent home is passed as an EXPLICIT scan root
+    // instead of mutating process-global PI_CODING_AGENT_DIR.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
         convs.len(),
@@ -1189,7 +1123,6 @@ fn pi_agent_connector_handles_unicode_content() {
 }
 
 #[test]
-#[serial]
 fn pi_agent_connector_handles_null_thinking_content() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/--null-thinking--");
@@ -1203,17 +1136,14 @@ fn pi_agent_connector_handles_null_thinking_content() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
     let connector = PiAgentConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir pi-agent home is passed as an EXPLICIT scan root
+    // instead of mutating process-global PI_CODING_AGENT_DIR.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
         convs.len(),
@@ -1237,7 +1167,6 @@ fn pi_agent_connector_handles_null_thinking_content() {
 }
 
 #[test]
-#[serial]
 fn pi_agent_connector_handles_tool_call_with_null_arguments() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/--null-args--");
@@ -1251,17 +1180,14 @@ fn pi_agent_connector_handles_tool_call_with_null_arguments() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
-    }
-
     let connector = PiAgentConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir pi-agent home is passed as an EXPLICIT scan root
+    // instead of mutating process-global PI_CODING_AGENT_DIR.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
         convs.len(),

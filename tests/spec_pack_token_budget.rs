@@ -9,18 +9,18 @@
 //!      `kind` is `"pack-invalid-limit"` and whose `retryable` is `false`.
 //!      Per `AGENTS.md` "Robot Mode Etiquette", stdout stays data-only;
 //!      diagnostics (including this validation error) live on stderr.
-//!   2. **Budget respect** — for any accepted budget `N`, the realized
-//!      `limits.estimated_tokens` is `<= N`. Pack is the *soft*-budget
-//!      planner (`pack --help` says "Soft pack token budget") so the
-//!      planner must clamp at-or-below the requested cap.
+//!   2. **Budget respect** — the excerpt sum `limits.estimated_tokens` is
+//!      `<= N`, and the complete encoded stdout, including its newline,
+//!      costs at most `N + floor(N / 20)` under the char-count estimator.
+//!      Metadata, citations and formatting must fit this final 5% tolerance.
 //!   3. **Per-evidence summation consistency** — the per-evidence
 //!      `estimated_tokens` field sums to the same `limits.estimated_tokens`
-//!      that the budget-respect check guards. Without this, the cap is a
-//!      lie: the per-item field could be small while the realized total
-//!      exceeds the cap (or vice versa).
+//!      field. This is excerpt accounting; the complete-output bound is
+//!      checked independently rather than inferred from that sum.
 //!
 //! Verified against the checked-in `search_demo_data` fixture with the
-//! query `"the"` (yields 2 evidence items totaling 20 estimated tokens).
+//! query `"the"`. Selected evidence can vary when a smaller output budget
+//! must also accommodate citations and metadata.
 //! The budget-respect check sweeps a small set of valid budgets so a
 //! regression that pinned `estimated_tokens` to a hardcoded constant would
 //! fail. The validation check probes both the lower (1023) and upper
@@ -34,6 +34,8 @@ use assert_cmd::Command;
 use serde_json::Value;
 use tempfile::TempDir;
 use walkdir::WalkDir;
+
+mod util;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -244,6 +246,13 @@ fn check_budget_respected(data_dir: &Path, budget: i64) -> TestResult {
         est >= 0,
         format!("budget={budget}: estimated_tokens={est} is negative"),
     )?;
+    let output_tokens = outcome.stdout.chars().count().div_ceil(4) as i64;
+    ensure(
+        output_tokens <= budget + budget / 20,
+        format!(
+            "budget={budget}: complete stdout costs {output_tokens} tokens, exceeding the 5% tolerance"
+        ),
+    )?;
     Ok(())
 }
 
@@ -251,6 +260,7 @@ fn check_budget_respected(data_dir: &Path, budget: i64) -> TestResult {
 fn pack_estimated_tokens_never_exceeds_max_tokens_budget() -> TestResult {
     let tmp = TempDir::new()?;
     let data_dir = copy_search_demo_fixture(tmp.path())?;
+    util::prepare_copied_search_fixture(&data_dir)?;
 
     // Sweep several valid budgets. Each must produce a pack whose realized
     // `estimated_tokens` is at or below the requested cap. The min-bound
@@ -266,6 +276,7 @@ fn pack_estimated_tokens_never_exceeds_max_tokens_budget() -> TestResult {
 fn pack_per_evidence_estimated_tokens_sum_matches_limits_total() -> TestResult {
     let tmp = TempDir::new()?;
     let data_dir = copy_search_demo_fixture(tmp.path())?;
+    util::prepare_copied_search_fixture(&data_dir)?;
     // Pick a comfortably large budget so the planner is not the binding
     // constraint; we are checking sum consistency, not budget pressure.
     let outcome = run_pack(&data_dir, 50000)?;

@@ -924,19 +924,39 @@ pub fn searchable_index_exists(index_path: &Path) -> bool {
         || federated_search_manifest_path(index_path).exists()
 }
 
+/// Readers and their source path travel together from admission into search.
+/// Retaining these owners avoids reopening (and revalidating) every segment
+/// after the strict read-only contract check has already succeeded.
+pub(crate) struct OpenedLexicalIndex {
+    pub(crate) path: PathBuf,
+    pub(crate) reader: Option<(frankensearch::quill::QuillSearchIndex, Fields)>,
+    pub(crate) federated_readers: Option<Vec<(frankensearch::quill::QuillSearchIndex, Fields)>>,
+}
+
+impl std::fmt::Debug for OpenedLexicalIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenedLexicalIndex")
+            .field("path", &self.path)
+            .field("standard_reader", &self.reader.is_some())
+            .field(
+                "federated_readers",
+                &self.federated_readers.as_ref().map(Vec::len),
+            )
+            .finish()
+    }
+}
+
 pub fn validate_searchable_index_contract(index_path: &Path) -> Result<()> {
-    if let Some(manifest) = load_federated_search_manifest_internal(index_path)? {
-        validate_federated_search_manifest(index_path, &manifest, true)?;
-        for shard in manifest.shards {
-            let shard_path = index_path.join(&shard.relative_path);
-            crate::search::quill_bridge::open_cass_reader(&shard_path).with_context(|| {
-                format!(
-                    "opening federated lexical shard reader {}",
-                    shard_path.display()
-                )
-            })?;
-        }
-        return Ok(());
+    open_validated_lexical_index(index_path).map(|_| ())
+}
+
+pub(crate) fn open_validated_lexical_index(index_path: &Path) -> Result<OpenedLexicalIndex> {
+    if let Some(readers) = open_federated_search_readers(index_path)? {
+        return Ok(OpenedLexicalIndex {
+            path: index_path.to_path_buf(),
+            reader: None,
+            federated_readers: Some(readers),
+        });
     }
 
     // No `meta.json` fallback here, unlike `searchable_index_exists` — the
@@ -957,13 +977,17 @@ pub fn validate_searchable_index_contract(index_path: &Path) -> Result<()> {
         ));
     }
     current_schema_hash_file_matches(index_path)?;
-    crate::search::quill_bridge::open_cass_reader(index_path).with_context(|| {
+    let reader = crate::search::quill_bridge::open_cass_reader(index_path).with_context(|| {
         format!(
             "opening standard lexical index reader {}",
             index_path.display()
         )
     })?;
-    Ok(())
+    Ok(OpenedLexicalIndex {
+        path: index_path.to_path_buf(),
+        reader: Some((reader, cass_field_handles())),
+        federated_readers: None,
+    })
 }
 
 pub fn searchable_index_modified_time(index_path: &Path) -> Option<SystemTime> {
@@ -1070,6 +1094,27 @@ pub fn searchable_index_summary(index_path: &Path) -> Result<Option<SearchableIn
             .sum(),
         segments: segment_metas.len(),
     }))
+}
+
+/// Live-document count of a searchable lexical generation from manifest
+/// metadata alone (GH #457): the Quill MANIFEST of a single generation, or
+/// the sum over every shard of a federated bundle. Never opens a segment.
+///
+/// `None` for a Tantivy-era directory (no live count without an engine open)
+/// and when no manifest decodes.
+#[must_use]
+pub fn searchable_index_live_doc_count(index_path: &Path) -> Option<u64> {
+    if let Ok(Some(manifest)) = load_federated_search_manifest_internal(index_path) {
+        let mut total = 0_u64;
+        for shard in &manifest.shards {
+            let shard_live = crate::search::quill_bridge::manifest_live_doc_count(
+                &index_path.join(&shard.relative_path),
+            )?;
+            total = total.saturating_add(shard_live.live_docs);
+        }
+        return Some(total);
+    }
+    crate::search::quill_bridge::manifest_live_doc_count(index_path).map(|live| live.live_docs)
 }
 
 fn searchable_index_summary_from_tantivy_meta(
@@ -1446,6 +1491,11 @@ pub struct TantivyIndex {
     /// [`crate::search::quill_bridge`].
     inner: crate::search::quill_bridge::QuillCassIndex,
     pub fields: Fields,
+    /// #440: documents still owed to the identity-idempotent (upsert) path
+    /// because a resumed rebuild found the published authority ahead of its
+    /// durable cursor. `add_prebuilt_document_refs_slice` routes this many
+    /// leading documents through upsert, then reverts to plain adds.
+    resume_reconcile_docs_remaining: usize,
 }
 
 impl TantivyIndex {
@@ -1461,7 +1511,11 @@ impl TantivyIndex {
         // The compiled CASS schema is fixed, so field handles no longer come
         // from a runtime schema read; they are the pinned ordinals.
         let fields = cass_field_handles();
-        Ok(Self { inner, fields })
+        Ok(Self {
+            inner,
+            fields,
+            resume_reconcile_docs_remaining: 0,
+        })
     }
 
     pub fn open_or_create_with_writer_parallelism(
@@ -1482,7 +1536,11 @@ impl TantivyIndex {
         let inner = crate::search::quill_bridge::QuillCassIndex::open_or_create(path)?;
         write_root_schema_hash_file(path)?;
         let fields = cass_field_handles();
-        Ok(Self { inner, fields })
+        Ok(Self {
+            inner,
+            fields,
+            resume_reconcile_docs_remaining: 0,
+        })
     }
 
     pub fn add_conversation(&mut self, conv: &NormalizedConversation) -> Result<()> {
@@ -1518,14 +1576,18 @@ impl TantivyIndex {
         self.inner.commit()
     }
 
-    pub fn configure_bulk_load_merge_policy(&mut self) {
-        self.inner.configure_bulk_load_merge_policy();
+    /// GH #446: route the stall watchdog's liveness signal into the Quill
+    /// sink so accumulate / commit / merge work ticks `activity` — see
+    /// `quill_bridge::EngineLivenessProbe`.
+    pub fn set_heartbeat(
+        &mut self,
+        heartbeat: Option<crate::search::quill_bridge::EngineHeartbeat>,
+    ) {
+        self.inner.set_heartbeat(heartbeat);
     }
 
-    /// An interrupted staged rebuild may have published documents beyond its
-    /// checkpoint. Replaying that tail must replace those ids, then continue.
-    pub fn enable_resume_upsert(&mut self) {
-        self.inner.enable_resume_upsert();
+    pub fn configure_bulk_load_merge_policy(&mut self) {
+        self.inner.configure_bulk_load_merge_policy();
     }
 
     pub fn reader(&self) -> Result<frankensearch::quill::QuillSearchIndex> {
@@ -1550,9 +1612,7 @@ impl TantivyIndex {
     /// Force immediate segment merge and wait for completion.
     /// Use sparingly - blocks until merge finishes.
     pub fn force_merge(&mut self) -> Result<()> {
-        self.inner.force_merge()?;
-        self.inner.note_merged(now_unix_millis());
-        Ok(())
+        self.inner.force_merge()
     }
 
     pub fn merge_compatible_index_directories<P: AsRef<Path>>(
@@ -1885,6 +1945,82 @@ impl TantivyIndex {
         }
     }
 
+    /// Total live documents in the published snapshot.
+    pub fn doc_count(&self) -> Result<u64> {
+        self.inner.doc_count()
+    }
+
+    /// Build every lexical document for one packet without writing anything.
+    ///
+    /// The projection and noise filter are identical to
+    /// [`Self::add_messages_from_packet`]; callers that need identity-stable
+    /// writes (qhiv2 targeted reconcile) feed the result to
+    /// [`Self::upsert_prebuilt_documents_slice`].
+    #[must_use]
+    pub fn build_packet_documents(
+        packet: &ConversationPacket,
+        conversation_id_override: Option<i64>,
+    ) -> Vec<FsCassDocument> {
+        let mut context = cass_doc_context_from_packet(packet);
+        if let Some(id) = conversation_id_override {
+            context.conversation_id = Some(id);
+        }
+        packet
+            .payload
+            .messages
+            .iter()
+            .filter_map(|msg| cass_document_for_packet_message(&context, msg))
+            .collect()
+    }
+
+    /// Upsert prebuilt documents in bounded batches under their stable
+    /// identities (see `QuillCassIndex::upsert_cass_documents`); a retry of
+    /// the same set converges to exactly one live document per identity
+    /// instead of appending duplicates.
+    pub fn upsert_prebuilt_documents_slice(
+        &mut self,
+        documents: &[FsCassDocument],
+    ) -> Result<usize> {
+        let max_messages = tantivy_prebuilt_add_batch_max_messages();
+        let max_chars = tantivy_add_batch_max_chars();
+        let mut upserted_docs = 0usize;
+        let mut batch_start = 0usize;
+        let mut pending_chars = 0usize;
+
+        for (idx, doc) in documents.iter().enumerate() {
+            pending_chars = pending_chars.saturating_add(doc.content.len());
+            let batch_len = idx + 1 - batch_start;
+            if batch_len >= max_messages || pending_chars >= max_chars {
+                let batch_end = idx + 1;
+                upserted_docs = upserted_docs.saturating_add(batch_end - batch_start);
+                let Some(batch) = documents.get(batch_start..batch_end) else {
+                    anyhow::bail!(
+                        "invalid Tantivy upsert document batch range {}..{} for {} documents",
+                        batch_start,
+                        batch_end,
+                        documents.len()
+                    );
+                };
+                self.inner.upsert_cass_documents(batch)?;
+                batch_start = batch_end;
+                pending_chars = 0;
+            }
+        }
+
+        if batch_start < documents.len() {
+            upserted_docs = upserted_docs.saturating_add(documents.len() - batch_start);
+            let Some(batch) = documents.get(batch_start..) else {
+                anyhow::bail!(
+                    "invalid Tantivy upsert document tail range {}.. for {} documents",
+                    batch_start,
+                    documents.len()
+                );
+            };
+            self.inner.upsert_cass_documents(batch)?;
+        }
+        Ok(upserted_docs)
+    }
+
     pub fn add_prebuilt_documents_slice(&mut self, documents: &[FsCassDocument]) -> Result<usize> {
         let max_messages = tantivy_prebuilt_add_batch_max_messages();
         let max_chars = tantivy_add_batch_max_chars();
@@ -1927,10 +2063,85 @@ impl TantivyIndex {
         Ok(indexed_docs)
     }
 
+    /// #440: arm the identity-idempotent resume path. The next `docs`
+    /// documents handed to [`Self::add_prebuilt_document_refs_slice`] are
+    /// upserted instead of added, so a resumed rebuild whose published
+    /// authority already holds them converges to exactly one live document
+    /// per identity instead of being refused as a duplicate.
+    pub fn arm_resume_reconcile(&mut self, docs: usize) {
+        self.resume_reconcile_docs_remaining = docs;
+    }
+
+    /// Documents still owed to the upsert path by [`Self::arm_resume_reconcile`].
+    #[must_use]
+    pub fn resume_reconcile_docs_remaining(&self) -> usize {
+        self.resume_reconcile_docs_remaining
+    }
+
+    /// Upsert prebuilt borrowed documents in bounded batches under their
+    /// stable identities (see [`Self::upsert_prebuilt_documents_slice`]).
+    pub fn upsert_prebuilt_document_refs_slice<'a>(
+        &mut self,
+        documents: &[FsCassDocumentRef<'a>],
+    ) -> Result<usize> {
+        let max_messages = tantivy_prebuilt_add_batch_max_messages();
+        let max_chars = tantivy_add_batch_max_chars();
+        let mut upserted_docs = 0usize;
+        let mut batch_start = 0usize;
+        let mut pending_chars = 0usize;
+
+        for (idx, doc) in documents.iter().enumerate() {
+            pending_chars = pending_chars.saturating_add(doc.content.len());
+            let batch_len = idx + 1 - batch_start;
+            if batch_len >= max_messages || pending_chars >= max_chars {
+                let batch_end = idx + 1;
+                upserted_docs = upserted_docs.saturating_add(batch_end - batch_start);
+                let Some(batch) = documents.get(batch_start..batch_end) else {
+                    anyhow::bail!(
+                        "invalid Tantivy upsert document ref batch range {}..{} for {} documents",
+                        batch_start,
+                        batch_end,
+                        documents.len()
+                    );
+                };
+                self.inner.upsert_cass_document_refs(batch)?;
+                batch_start = batch_end;
+                pending_chars = 0;
+            }
+        }
+
+        if batch_start < documents.len() {
+            upserted_docs = upserted_docs.saturating_add(documents.len() - batch_start);
+            let Some(batch) = documents.get(batch_start..) else {
+                anyhow::bail!(
+                    "invalid Tantivy upsert document ref tail range {}.. for {} documents",
+                    batch_start,
+                    documents.len()
+                );
+            };
+            self.inner.upsert_cass_document_refs(batch)?;
+        }
+        Ok(upserted_docs)
+    }
+
     pub fn add_prebuilt_document_refs_slice<'a>(
         &mut self,
         documents: &[FsCassDocumentRef<'a>],
     ) -> Result<usize> {
+        // #440: a resumed rebuild owes its leading documents to the upsert
+        // path (see `arm_resume_reconcile`). Split the slice at the owed
+        // boundary so the reconcile window is exact rather than "this whole
+        // batch", then fall through to the ordinary add for the remainder.
+        if self.resume_reconcile_docs_remaining > 0 {
+            let owed = self.resume_reconcile_docs_remaining.min(documents.len());
+            let (reconcile, rest) = documents.split_at(owed);
+            let upserted = self.upsert_prebuilt_document_refs_slice(reconcile)?;
+            self.resume_reconcile_docs_remaining -= owed;
+            if rest.is_empty() {
+                return Ok(upserted);
+            }
+            return Ok(upserted.saturating_add(self.add_prebuilt_document_refs_slice(rest)?));
+        }
         let max_messages = tantivy_prebuilt_add_batch_max_messages();
         let max_chars = tantivy_add_batch_max_chars();
         let mut indexed_docs = 0usize;
@@ -2336,6 +2547,73 @@ mod tests {
             cooldown_ms: 300_000,
         };
         assert!(status.should_merge());
+    }
+
+    /// #440: an armed resume reconcile routes exactly the owed leading
+    /// documents through the upsert path and plain-adds the rest, so a replay
+    /// over a published prefix converges without a duplicate-identity refusal
+    /// and without paying identity probes for the whole remainder.
+    #[test]
+    fn armed_resume_reconcile_upserts_only_the_owed_prefix() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut index = TantivyIndex::open_or_create(dir.path()).expect("open");
+        let doc = |msg_idx: u64, content: &str| FsCassDocument {
+            agent: "claude".to_owned(),
+            workspace: Some("cass".to_owned()),
+            workspace_original: Some("cass".to_owned()),
+            source_path: "/transcripts/resume.jsonl".to_owned(),
+            msg_idx,
+            created_at: Some(1_700_000_000),
+            title: Some("resume".to_owned()),
+            content: content.to_owned(),
+            source_id: "local".to_owned(),
+            origin_kind: "local".to_owned(),
+            origin_host: None,
+            conversation_id: Some(7),
+        };
+        // The "published before the interruption" prefix.
+        let published = [doc(0, "alpha published"), doc(1, "beta published")];
+        let refs: Vec<FsCassDocumentRef<'_>> =
+            published.iter().map(FsCassDocument::as_ref).collect();
+        index
+            .add_prebuilt_document_refs_slice(&refs)
+            .expect("publish prefix");
+        index.commit().expect("commit prefix");
+        assert_eq!(index.doc_count().expect("doc count"), 2);
+
+        // The replay from the stale cursor re-sends the prefix plus new docs.
+        let replay = [
+            doc(0, "alpha published"),
+            doc(1, "beta published"),
+            doc(2, "gamma new"),
+            doc(3, "delta new"),
+        ];
+        let refs: Vec<FsCassDocumentRef<'_>> = replay.iter().map(FsCassDocument::as_ref).collect();
+        index.arm_resume_reconcile(2);
+        assert_eq!(index.resume_reconcile_docs_remaining(), 2);
+        let written = index
+            .add_prebuilt_document_refs_slice(&refs)
+            .expect("replay converges through the reconcile window");
+        assert_eq!(written, 4);
+        assert_eq!(
+            index.resume_reconcile_docs_remaining(),
+            0,
+            "the owed prefix is consumed exactly once"
+        );
+        index.commit().expect("commit replay");
+        assert_eq!(index.doc_count().expect("doc count"), 4);
+
+        // With the window consumed, a further duplicate is refused again —
+        // the reconcile is a bounded window, not a permanent mode switch.
+        let dup = [doc(2, "gamma new")];
+        let refs: Vec<FsCassDocumentRef<'_>> = dup.iter().map(FsCassDocument::as_ref).collect();
+        let refused = index.add_prebuilt_document_refs_slice(&refs);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("duplicate live document id")),
+            "expected the duplicate refusal after the window closed: {refused:?}"
+        );
     }
 
     /// A published Quill index must produce a fingerprint the daemon can parse.

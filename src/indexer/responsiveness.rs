@@ -559,12 +559,12 @@ fn read_loadavg() -> Option<f32> {
 /// stack samples of long test runs, so the subprocess is now only a fallback
 /// for the (practically unreachable) case where `getloadavg` reports nothing.
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 fn read_loadavg() -> Option<f32> {
     let mut samples = [0f64; 3];
     // SAFETY: `getloadavg` writes at most `nelem` doubles into the buffer, and
     // we pass the true length of a stack array we exclusively own.
-    let filled =
-        unsafe { libc::getloadavg(samples.as_mut_ptr(), samples.len() as libc::c_int) };
+    let filled = unsafe { libc::getloadavg(samples.as_mut_ptr(), samples.len() as libc::c_int) };
     if filled >= 1 {
         let one_minute = samples[0] as f32;
         if one_minute.is_finite() && one_minute >= 0.0 {
@@ -1684,8 +1684,7 @@ pub(crate) fn process_resident_memory_bytes() -> Option<u64> {
             }
         }
 
-        let bytes = read_macos_process_phys_footprint_bytes()
-            .or_else(read_macos_process_rss_bytes);
+        let bytes = read_macos_process_phys_footprint_bytes().or_else(read_macos_process_rss_bytes);
         let mut sample = MACOS_PROCESS_MEMORY_SAMPLE
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -1714,15 +1713,15 @@ fn read_macos_process_phys_footprint_bytes() -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 fn read_macos_process_rss_bytes() -> Option<u64> {
-        let pid = std::process::id().to_string();
-        let output = std::process::Command::new("ps")
-            .args(["-o", "rss=", "-p", &pid])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        macos_rss_kib_to_bytes(&String::from_utf8_lossy(&output.stdout))
+    let pid = std::process::id().to_string();
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    macos_rss_kib_to_bytes(&String::from_utf8_lossy(&output.stdout))
 }
 
 #[cfg(any(target_os = "linux", test))]

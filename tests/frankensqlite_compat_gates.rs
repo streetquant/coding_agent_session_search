@@ -40,15 +40,18 @@ fn rusqlite_is_dev_dependency_only() {
     );
 }
 
-/// The fsqlite engine family resolves from one exact registry release. Freeze
-/// the complete source identity across the manifest, lockfile, build-time
-/// validator, and user-facing dependency contract so a partial bump cannot
+/// The fsqlite engine family resolves from one exact crates.io release for
+/// every direct and transitive consumer (registry-only since the 0.3.14
+/// pin, 5acc0dc6 — no git source, no patch redirect; build.rs rejects
+/// fsqlite-family registry patches and duplicate family resolution).
+/// Freeze the complete source identity across the manifest, lockfile,
+/// build-time validator, and dependency contract so a partial bump cannot
 /// silently bifurcate the engine family.
 #[test]
 fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
-    const VERSION: &str = "0.3.17";
-    const EXACT_REQUIREMENT: &str = "=0.3.17";
-    const REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+    const VERSION: &str = "0.3.18";
+    const EXACT_REQUIREMENT: &str = "=0.3.18";
+    const EXPECTED_FACADE_FEATURES: &[&str] = &["fts5", "async-api"];
 
     let manifest: toml::Table =
         toml::from_str(include_str!("../Cargo.toml")).expect("parse Cargo.toml");
@@ -74,32 +77,45 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
             "{dependency_name} declared version drifted in [{table_name}]"
         );
         assert!(
-            dependency.get("git").is_none() && dependency.get("rev").is_none(),
-            "{dependency_name} in [{table_name}] must use the reviewed registry release"
-        );
-        assert!(
-            dependency.get("path").is_none()
+            dependency.get("git").is_none()
+                && dependency.get("rev").is_none()
+                && dependency.get("path").is_none()
                 && dependency.get("branch").is_none()
                 && dependency.get("tag").is_none(),
-            "{dependency_name} in [{table_name}] must be a pure exact registry pin"
+            "{dependency_name} in [{table_name}] must resolve from the exact \
+             crates.io release, not a source override"
         );
     }
 
-    // No fsqlite-family patch entry may redirect the registry family
-    // (build.rs enforces the same).
-    if let Some(crates_io_patch) = manifest
-        .get("patch")
+    // The facade keeps its reviewed feature set.
+    let facade = manifest
+        .get("dependencies")
         .and_then(toml::Value::as_table)
-        .and_then(|patches| patches.get("crates-io"))
+        .and_then(|table| table.get("frankensqlite"))
         .and_then(toml::Value::as_table)
-    {
-        for dependency_name in crates_io_patch.keys() {
-            assert!(
-                dependency_name != "fsqlite" && !dependency_name.starts_with("fsqlite-"),
-                "[patch.crates-io].{dependency_name} must not redirect the registry fsqlite family"
-            );
-        }
-    }
+        .expect("missing frankensqlite facade entry");
+    let features: Vec<&str> = facade
+        .get("features")
+        .and_then(toml::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        features, EXPECTED_FACADE_FEATURES,
+        "fsqlite facade feature set drifted"
+    );
+
+    // No [patch] section may redirect the fsqlite family (build.rs rejects
+    // fsqlite-family registry patches too).
+    assert!(
+        manifest.get("patch").is_none(),
+        "a [patch] section bifurcates the fsqlite family; the family must \
+         resolve from crates.io"
+    );
 
     let lockfile: toml::Value =
         toml::from_str(include_str!("../Cargo.lock")).expect("parse Cargo.lock");
@@ -132,24 +148,26 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
             Some(VERSION),
             "{name} resolved at a different version than the pinned engine release"
         );
-        assert_eq!(
-            package.get("source").and_then(toml::Value::as_str),
-            Some(REGISTRY_SOURCE),
+        let source = package
+            .get("source")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            source.starts_with("registry+https://github.com/rust-lang/crates.io-index"),
             "{name} resolved away from the pinned crates.io release"
         );
     }
 
     let build_contract = include_str!("../build.rs");
     assert!(
-        build_contract.contains("expected_version: \"0.3.17\"")
-            && build_contract.contains("EXPECTED_REGISTRY_SOURCE")
-            && build_contract.contains("fn validate_fsqlite_source_pin"),
-        "build.rs must validate the exact FrankenSQLite source identity"
+        build_contract.contains("expected_version: \"0.3.18\"")
+            && build_contract.contains("expected_features: &[\"fts5\", \"async-api\"]"),
+        "build.rs must validate the exact FrankenSQLite crates.io identity"
     );
     let readme = include_str!("../README.md");
     assert!(
-        readme.contains("=0.3.17") && readme.contains("registry"),
-        "README must document the exact registry fsqlite engine pin"
+        readme.contains(EXACT_REQUIREMENT),
+        "README must document the exact fsqlite engine pin"
     );
 }
 
@@ -321,6 +339,77 @@ fn frankensqlite_existing_schema_only_reopens_large_archive_without_truncation()
         "existing-only large-archive reopen must not replace, truncate, or rewrite \
          the database's durable main/journal/WAL artifact bundle"
     );
+}
+
+/// GH#415/cass#382: bound rowids must seek and retain exact hydration results.
+/// Include duplicate, missing, NULL and non-integral values so a fast plan
+/// cannot pass by returning a different set of messages.
+#[test]
+fn frankensqlite_parameterized_rowid_hydration_seeks_and_preserves_exact_rows() {
+    let conn = Connection::open(":memory:").expect("in-memory connection");
+    conn.execute("CREATE TABLE messages(id INTEGER PRIMARY KEY, content TEXT NOT NULL)")
+        .expect("create hydration fixture");
+    // A stored row 2 makes truncating the bound 2.5 a visible wrong result.
+    conn.execute(
+        "INSERT INTO messages VALUES (2, 'must not match 2.5'), (3, 'three'), (7, 'seven'), (99, 'ninety-nine')",
+    )
+    .expect("insert hydration rows");
+    let params = [
+        SqliteValue::Integer(99),
+        SqliteValue::Integer(3),
+        SqliteValue::Integer(3),
+        SqliteValue::Null,
+        SqliteValue::Integer(100_000),
+        SqliteValue::Text("7".into()),
+        SqliteValue::Float(2.5),
+    ];
+    for key in ["id", "rowid"] {
+        let sql = format!(
+            "SELECT id, content FROM messages WHERE {key} IN (?1, ?2, ?3, ?4, ?5, ?6, ?7) ORDER BY id"
+        );
+        let plan = conn
+            .query_with_params(&format!("EXPLAIN QUERY PLAN {sql}"), &params)
+            .expect("explain parameterized hydration");
+        let details = plan
+            .iter()
+            .map(|row| row.get_typed::<String>(3).expect("query plan detail"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            details.contains("SEARCH")
+                && details.contains("INTEGER PRIMARY KEY")
+                && !details.contains("SCAN"),
+            "bound {key} hydration must seek instead of scanning: {details}"
+        );
+        let rows = conn
+            .query_with_params(&sql, &params)
+            .expect("execute parameterized hydration");
+        let actual = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get_typed::<i64>(0).expect("hydrated id"),
+                    row.get_typed::<String>(1).expect("hydrated content"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                (3, "three".to_owned()),
+                (7, "seven".to_owned()),
+                (99, "ninety-nine".to_owned()),
+            ],
+            "bound {key} hydration must preserve exact ordered, unique rows"
+        );
+        let missing = vec![SqliteValue::Null; params.len()];
+        assert!(
+            conn.query_with_params(&sql, &missing)
+                .expect("hydrate all-NULL rowids")
+                .is_empty(),
+            "a new execution must not reuse the previous bound rowid set"
+        );
+    }
 }
 
 // ============================================================================
@@ -542,6 +631,8 @@ fn gate1_fts5_bm25_rank_function() {
             r0 <= r1,
             "GATE 1.8 FAIL: rank should be ordered (more negative first), got {r0} vs {r1}"
         );
+    } else {
+        panic!("GATE 1.8 FAIL: bm25() should return float scores, got {rank0:?} and {rank1:?}");
     }
 }
 
@@ -1179,14 +1270,16 @@ fn gate3_migration_transition_from_rusqlite_meta_to_schema_migrations() {
     );
 }
 
+// Verified against the pinned 0.3.18 engine: keep this migration regression
+// in the default suite so schema/autoindex inconsistencies cannot regress silently.
 #[test]
-#[ignore = "Blocked by upstream frankensqlite sqlite_master/autoindex inconsistency on fresh migration path"]
 fn gate3_schema_parity_transitioned_db_matches_fresh_frankensqlite_db() {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let db_a_path = dir.path().join("db_a_rusqlite_then_transition.db");
     let db_b_path = dir.path().join("db_b_fresh_frankensqlite.db");
 
-    // DB-A: create with rusqlite-backed cass storage, then transition via FrankenStorage.
+    // DB-A: create through CASS's established storage path, then reopen through
+    // FrankenStorage. Both paths now use FrankenSQLite; gate2 covers C-SQLite interop.
     {
         let storage = SqliteStorage::open(&db_a_path).expect("create db-a with SqliteStorage");
         assert_eq!(

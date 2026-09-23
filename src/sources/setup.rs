@@ -24,8 +24,8 @@ use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 
+use super::config::discover_fleet_hosts;
 use super::config::{SourceConfigGenerator, SourcesConfig};
-use super::discover_ssh_hosts;
 use super::index::{IndexProgress, RemoteIndexer};
 use super::install::{InstallProgress, RemoteInstaller};
 use super::interactive::{confirm_action, run_host_selection};
@@ -40,6 +40,8 @@ pub struct SetupOptions {
     pub non_interactive: bool,
     /// Specific hosts to configure (skips discovery/selection).
     pub hosts: Option<Vec<String>>,
+    /// Include online peers from local Tailscale status during discovery.
+    pub tailscale: bool,
     /// Skip cass installation on remotes.
     pub skip_install: bool,
     /// Skip indexing on remotes.
@@ -62,6 +64,7 @@ impl Default for SetupOptions {
             dry_run: false,
             non_interactive: false,
             hosts: None,
+            tailscale: false,
             skip_install: false,
             skip_index: false,
             skip_sync: false,
@@ -433,6 +436,12 @@ pub struct SetupResult {
     pub total_sessions: u64,
     /// Whether this was a dry run.
     pub dry_run: bool,
+    /// The final sync is owed: setup configured or installed remotes and
+    /// neither `--skip-sync` nor `--dry-run` was given. The CLI runs
+    /// `cass sources sync` right after setup and only then records the sync
+    /// as complete; setup itself never claims a sync it did not run
+    /// (reality check 2026-09-01, WS-G.1).
+    pub sync_pending: bool,
 }
 
 /// Print a phase header.
@@ -528,8 +537,11 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
                 })
                 .collect()
         } else {
-            // Auto-discover from SSH config
-            discover_ssh_hosts()
+            let (hosts, warning) = discover_fleet_hosts(opts.tailscale);
+            if let Some(warning) = warning {
+                eprintln!("{warning}");
+            }
+            hosts
         };
 
         state.discovered_hosts = hosts.len();
@@ -541,7 +553,10 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
             if opts.hosts.is_some() {
                 print_phase_done(&format!("Using {} specified host(s)", hosts.len()));
             } else {
-                print_phase_done(&format!("Found {} SSH hosts in ~/.ssh/config", hosts.len()));
+                print_phase_done(&format!(
+                    "Found {} SSH hosts from enabled discovery providers",
+                    hosts.len()
+                ));
             }
         }
 
@@ -792,6 +807,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
             hosts_indexed: 0,
             total_sessions: 0,
             dry_run: opts.dry_run,
+            sync_pending: false,
         });
     }
 
@@ -1142,20 +1158,22 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
     // =========================================================================
     // Phase 7: Sync
     // =========================================================================
-    if !opts.skip_sync && !opts.dry_run && !state.sync_complete {
+    // The sync itself runs in the CLI right after this function returns
+    // (`run_sources_setup` → `run_sources_sync`): the sync engine lives with
+    // the `sources sync` command, and that step is what records
+    // `sync_complete` in the saved state. Setup used to set the flag here
+    // without syncing anything, which left `--resume` believing the final
+    // sync had happened (reality check 2026-09-01, WS-G.1).
+    let sync_pending = !opts.skip_sync && !opts.dry_run && !state.sync_complete;
+    if sync_pending {
         check_interrupted()?;
 
         if !opts.json {
             print_phase_header("Phase 7: Syncing data");
-            println!("│ Run 'cass sources sync' to sync session data from remotes.");
+            println!("│ Running 'cass sources sync' for the configured remotes next.");
+            println!("│ (--skip-sync leaves this step for later.)");
             println!("└{}", "─".repeat(70).dimmed());
         }
-
-        // Note: We don't actually run sync here because it can be long-running
-        // and the user might want to control when it happens. We just mark it
-        // as skipped and let them run it manually.
-        state.sync_complete = true;
-        state.save()?;
     }
 
     // =========================================================================
@@ -1227,6 +1245,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
         hosts_indexed,
         total_sessions,
         dry_run: opts.dry_run,
+        sync_pending,
     })
 }
 
@@ -1517,6 +1536,7 @@ mod tests {
             hosts_indexed: 2,
             total_sessions: 150,
             dry_run: false,
+            sync_pending: false,
         };
         assert_eq!(result.sources_added, 3);
         assert_eq!(result.hosts_installed, 1);
@@ -1533,6 +1553,7 @@ mod tests {
             hosts_indexed: 0,
             total_sessions: 0,
             dry_run: true,
+            sync_pending: false,
         };
         assert!(result.dry_run);
         assert_eq!(result.sources_added, 5);

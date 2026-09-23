@@ -226,6 +226,7 @@ pub struct PackCandidate {
     pub line_end: Option<usize>,
     pub conversation_id: Option<i64>,
     pub message_index: Option<usize>,
+    pub citation_verified: bool,
     pub content_hash: String,
     pub span_hash: String,
     pub created_at_ms: Option<i64>,
@@ -250,7 +251,9 @@ impl PackCandidate {
         query_term_count: usize,
         query_phrase_count: usize,
     ) -> Self {
-        let line_start = hit.line_number;
+        // Search navigation uses normalized message ordinals. Physical source
+        // lines are assigned only after reading and matching the source record.
+        let message_index = hit.line_number.and_then(|line| line.checked_sub(1));
         let source_id = if hit.source_id.trim().is_empty() {
             "local".to_string()
         } else {
@@ -266,7 +269,7 @@ impl PackCandidate {
             "{}:{}:{}",
             source_id,
             hit.source_path,
-            line_start.unwrap_or_default()
+            hit.line_number.unwrap_or_default()
         );
         Self {
             candidate_id,
@@ -277,10 +280,11 @@ impl PackCandidate {
             workspace: hit.workspace.clone(),
             workspace_original: hit.workspace_original.clone(),
             agent: hit.agent.clone(),
-            line_start,
-            line_end: line_start,
+            line_start: None,
+            line_end: None,
             conversation_id: hit.conversation_id,
-            message_index: None,
+            message_index,
+            citation_verified: false,
             content_hash: content_hash.clone(),
             span_hash: content_hash,
             created_at_ms: hit.created_at,
@@ -328,6 +332,7 @@ pub struct PackPlanRequest {
     pub freshness_window_seconds: i64,
     pub candidates: Vec<PackCandidate>,
     pub explain_selection: bool,
+    pub include_skill_content: bool,
 }
 
 impl Default for PackPlanRequest {
@@ -339,6 +344,7 @@ impl Default for PackPlanRequest {
             freshness_window_seconds: DEFAULT_FRESHNESS_WINDOW_SECONDS,
             candidates: Vec::new(),
             explain_selection: false,
+            include_skill_content: false,
         }
     }
 }
@@ -352,6 +358,65 @@ pub struct PlannedAnswerPack {
     pub diagnostics: PackPlannerDiagnostics,
     pub evidence: Vec<PlannedPackEvidence>,
     pub omitted: Vec<OmittedPackCandidate>,
+}
+
+impl PlannedAnswerPack {
+    /// Make progress toward a measured final-output bound without changing
+    /// citation identity. Rendering must be repeated after each reduction:
+    /// escaping, handoff text and format overhead affect the actual savings.
+    pub(crate) fn reduce_for_output_budget(
+        &mut self,
+        excess_tokens: usize,
+        require_evidence: bool,
+    ) -> bool {
+        let Some(item) = self.evidence.last_mut() else {
+            return false;
+        };
+        let chars = item.excerpt.chars().count();
+        let max_chars = chars
+            .saturating_sub(
+                excess_tokens
+                    .max(1)
+                    .saturating_mul(TOKEN_ESTIMATE_CHARS_PER_TOKEN),
+            )
+            .max(4);
+        if max_chars < chars
+            && item
+                .excerpt
+                .chars()
+                .take(max_chars - 3)
+                .any(|character| !character.is_whitespace())
+        {
+            let (excerpt, _) = truncate_excerpt(&item.excerpt, max_chars);
+            self.estimated_tokens = self.estimated_tokens.saturating_sub(item.estimated_tokens);
+            item.excerpt = excerpt;
+            item.excerpt_truncated = true;
+            item.estimated_tokens = estimated_tokens(&item.excerpt);
+            item.selection.token_cost = item.estimated_tokens;
+            self.estimated_tokens += item.estimated_tokens;
+            return true;
+        }
+        if require_evidence && self.evidence.len() == 1 {
+            return false;
+        }
+        let Some(item) = self.evidence.pop() else {
+            return false;
+        };
+        self.estimated_tokens = self.estimated_tokens.saturating_sub(item.estimated_tokens);
+        self.omitted.push(omitted_candidate(
+            &item.candidate,
+            PackOmittedReason::TokenBudgetExhausted,
+            item.selection,
+        ));
+        self.selected_evidence_count = self.evidence.len();
+        self.selected_session_count = self
+            .evidence
+            .iter()
+            .map(|item| item.candidate.session_key())
+            .collect::<HashSet<_>>()
+            .len();
+        true
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -374,11 +439,13 @@ pub struct PackPlannerBudget {
 pub struct PlannedPackEvidence {
     pub id: String,
     pub rank: usize,
+    /// Redacted and truncated output whose exact text was charged to the budget.
     pub excerpt: String,
     pub excerpt_truncated: bool,
     pub estimated_tokens: usize,
     pub candidate: PackCandidate,
     pub selection: PackSelectionScore,
+    redactions: Vec<RenderedRedaction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -469,7 +536,6 @@ pub struct PackRenderRequest {
     pub freshness_window_seconds: i64,
     pub redaction_policy: String,
     pub sensitive_output: bool,
-    pub skill_content_included: bool,
     pub explain_selection: bool,
     pub readiness: PackReadinessSnapshot,
 }
@@ -498,7 +564,6 @@ impl Default for PackRenderRequest {
             freshness_window_seconds: DEFAULT_FRESHNESS_WINDOW_SECONDS,
             redaction_policy: "strict".to_string(),
             sensitive_output: false,
-            skill_content_included: false,
             explain_selection: false,
             readiness: PackReadinessSnapshot::default(),
         }
@@ -708,7 +773,7 @@ struct RenderedSelection {
     duplicate_penalty: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct RenderedRedaction {
     kind: String,
     start_char: usize,
@@ -843,6 +908,27 @@ pub fn plan_answer_pack(
             .iter()
             .filter_map(|candidate| finite_score(candidate.semantic_score)),
     );
+    // Redact before truncation: cutting a credential first can hide its shape
+    // from the detector. Budget the actual output, including expanding markers,
+    // and prepare it once rather than repeating regex work during selection.
+    let prepared_excerpts = request
+        .candidates
+        .iter()
+        .map(|candidate| {
+            if !request.include_skill_content
+                && crate::export::is_skill_injection(&candidate.excerpt)
+            {
+                // Reuse the export default unless the operator opted in.
+                // Credential redaction still applies to included skills.
+                return (String::new(), false, Vec::new());
+            }
+            let mut redactions = Vec::new();
+            let redacted = redact_pack_output_text(&candidate.excerpt, &mut redactions);
+            let (excerpt, truncated) =
+                truncate_excerpt(&redacted, request.limits.max_excerpt_chars);
+            (excerpt, truncated, redactions)
+        })
+        .collect::<Vec<_>>();
 
     let mut remaining: Vec<usize> = (0..request.candidates.len()).collect();
     let mut selected = Vec::new();
@@ -869,8 +955,7 @@ pub fn plan_answer_pack(
                 continue;
             }
 
-            let (excerpt, excerpt_truncated) =
-                truncate_excerpt(&candidate.excerpt, request.limits.max_excerpt_chars);
+            let (excerpt, excerpt_truncated, _) = &prepared_excerpts[candidate_index];
             if excerpt.trim().is_empty() {
                 let score = score_candidate(
                     candidate,
@@ -889,7 +974,7 @@ pub fn plan_answer_pack(
             }
 
             next_remaining.push(candidate_index);
-            let token_cost = estimated_tokens(&excerpt);
+            let token_cost = estimated_tokens(excerpt);
             let score = score_candidate(
                 candidate,
                 &request,
@@ -901,8 +986,8 @@ pub fn plan_answer_pack(
             let scored = ScoredCandidate {
                 index: candidate_index,
                 score,
-                excerpt,
-                excerpt_truncated,
+                excerpt: excerpt.clone(),
+                excerpt_truncated: *excerpt_truncated,
             };
 
             if best.as_ref().is_none_or(|current| {
@@ -918,7 +1003,7 @@ pub fn plan_answer_pack(
             }
         }
 
-        let Some(best_candidate) = best else {
+        let Some(mut best_candidate) = best else {
             remaining = next_remaining;
             break;
         };
@@ -927,6 +1012,27 @@ pub fn plan_answer_pack(
         remaining = next_remaining;
         let candidate = &request.candidates[best_candidate.index];
 
+        let remaining_tokens = diagnostics
+            .budget
+            .evidence_tokens
+            .saturating_sub(used_tokens);
+        if best_candidate.score.token_cost > remaining_tokens {
+            let max_chars = remaining_tokens.saturating_mul(TOKEN_ESTIMATE_CHARS_PER_TOKEN);
+            let retained_chars = max_chars.saturating_sub(3);
+            // Fit the already-redacted excerpt before dropping relevant
+            // evidence. Keep real source text, never just an ellipsis.
+            if best_candidate
+                .excerpt
+                .chars()
+                .take(retained_chars)
+                .any(|character| !character.is_whitespace())
+            {
+                let (excerpt, _) = truncate_excerpt(&best_candidate.excerpt, max_chars);
+                best_candidate.score.token_cost = estimated_tokens(&excerpt);
+                best_candidate.excerpt = excerpt;
+                best_candidate.excerpt_truncated = true;
+            }
+        }
         if used_tokens.saturating_add(best_candidate.score.token_cost)
             > diagnostics.budget.evidence_tokens
         {
@@ -979,6 +1085,7 @@ pub fn plan_answer_pack(
             estimated_tokens: best_candidate.score.token_cost,
             candidate: candidate.clone(),
             selection: best_candidate.score,
+            redactions: prepared_excerpts[best_candidate.index].2.clone(),
         });
     }
 
@@ -990,7 +1097,7 @@ pub fn plan_answer_pack(
             &selected_state,
             lexical_range,
             semantic_range,
-            estimated_tokens(&candidate.excerpt),
+            estimated_tokens(&prepared_excerpts[candidate_index].0),
         );
         omitted.push(omitted_candidate(
             candidate,
@@ -1008,6 +1115,142 @@ pub fn plan_answer_pack(
         evidence: selected,
         omitted,
     })
+}
+
+/// Verify modern Codex citations using the same record parser as ingestion.
+/// Unknown formats, remote paths, missing files and ambiguous records keep
+/// their archived excerpts, with no invented source coordinates or verification.
+/// Called inside the CLI's existing bounded planner worker.
+pub(crate) fn verify_pack_source_citations(
+    plan: &mut PlannedAnswerPack,
+    deadline: std::time::Instant,
+) {
+    use std::io::Read as _;
+
+    const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+    let mut remaining_bytes = 32 * 1024 * 1024u64;
+    let mut by_path: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, item) in plan.evidence.iter_mut().enumerate() {
+        let candidate = &mut item.candidate;
+        candidate.citation_verified = false;
+        candidate.line_start = None;
+        candidate.line_end = None;
+        candidate.source_readiness = PackSourceReadiness::IncompleteMetadata;
+        let path = std::path::Path::new(&candidate.source_path);
+        if candidate.agent == "codex"
+            && candidate.source_id == "local"
+            && candidate.origin_kind == "local"
+            && path.is_absolute()
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+        {
+            by_path
+                .entry(candidate.source_path.clone())
+                .or_default()
+                .push(index);
+        }
+    }
+    'source_files: for (path, indices) in by_path {
+        if std::time::Instant::now() >= deadline || remaining_bytes == 0 {
+            break;
+        }
+        let Ok(before) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !before.is_file() || before.len() > MAX_FILE_BYTES.min(remaining_bytes) {
+            continue;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            // Do not block if a regular file is replaced by a FIFO, or follow a
+            // replacement symlink between the metadata probe and the open.
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let Ok(file) = options.open(&path) else {
+            continue;
+        };
+        let Ok(metadata) = file.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES.min(remaining_bytes) {
+            continue;
+        }
+        let read_limit = metadata.len().saturating_add(1).min(remaining_bytes);
+        let mut bytes = Vec::new();
+        let read_result = (&file).take(read_limit).read_to_end(&mut bytes);
+        remaining_bytes = remaining_bytes.saturating_sub(bytes.len() as u64);
+        if read_result.is_err()
+            || bytes.len() as u64 != metadata.len()
+            || !file.metadata().is_ok_and(|after| {
+                after.len() == metadata.len() && after.modified().ok() == metadata.modified().ok()
+            })
+        {
+            continue;
+        }
+        let mut matches = vec![(0usize, 0usize, None); indices.len()];
+        for (line_index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+            if std::time::Instant::now() >= deadline {
+                break 'source_files;
+            }
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let Ok(raw) = serde_json::from_slice(line) else {
+                continue;
+            };
+            let Some(message) = crate::connectors::codex::modern_codex_message(&raw) else {
+                continue;
+            };
+            let mut redacted_content = None;
+            for (slot, evidence_index) in matches.iter_mut().zip(&indices) {
+                let candidate = &plan.evidence[*evidence_index].candidate;
+                if candidate
+                    .created_at_ms
+                    .is_some_and(|created| message.created_at != Some(created))
+                {
+                    continue;
+                }
+                // The modern Codex parser trims message boundaries, while
+                // archived FAD messages can retain that whitespace. Ingestion
+                // can also redact credentials before storing the message.
+                // Compare that exact transform, never the shortened excerpt;
+                // still require a unique record and hash its original bytes.
+                let excerpt = candidate.excerpt.trim();
+                let same_content = if message.content == excerpt {
+                    true
+                } else {
+                    let redacted =
+                        redacted_content.get_or_insert_with(|| redact_text(&message.content));
+                    redacted.as_ref() == excerpt
+                };
+                if same_content {
+                    slot.0 += 1;
+                    slot.1 = line_index + 1;
+                    slot.2 = Some(blake3::hash(line));
+                }
+            }
+        }
+        for (evidence_index, (count, line, hash)) in indices.into_iter().zip(matches) {
+            if count == 1 {
+                let candidate = &mut plan.evidence[evidence_index].candidate;
+                candidate.line_start = Some(line);
+                candidate.line_end = Some(line);
+                candidate.citation_verified = true;
+                candidate.source_readiness = PackSourceReadiness::Healthy;
+                if let Some(hash) = hash {
+                    candidate.span_hash = hash.to_hex().to_string();
+                }
+            }
+        }
+    }
+    // Verification can replace both physical coordinates and the span hash.
+    // Bind IDs to the resulting citation, including unverified deadline exits,
+    // before renderers use them in evidence, outlines and handoffs.
+    for item in &mut plan.evidence {
+        item.id = evidence_id(&item.candidate);
+    }
 }
 
 fn hard_omission_reason(
@@ -1389,7 +1632,25 @@ fn evidence_id(candidate: &PackCandidate) -> String {
     hasher_input.push('\n');
     hasher_input.push_str(&candidate.span_hash);
     let hash = blake3::hash(hasher_input.as_bytes());
-    format!("ev_{}", &hash.to_hex()[..16])
+    encoded_evidence_id(hash.as_bytes())
+}
+
+fn encoded_evidence_id(hash: &[u8; 32]) -> String {
+    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut id = String::with_capacity(55);
+    id.push_str("ev_");
+    // RFC 4648 base32, without '=' padding: the digest is always 256 bits.
+    // Keep the entire hash, including its final bit in the last character.
+    for chunk in hash.chunks(5) {
+        let mut block = [0u8; 8];
+        block[3..3 + chunk.len()].copy_from_slice(chunk);
+        let word = u64::from_be_bytes(block);
+        for shift in (0..chunk.len() * 8).step_by(5) {
+            let digit = ((word >> (35 - shift)) & 31) as usize;
+            id.push(char::from(ALPHABET[digit]));
+        }
+    }
+    id
 }
 
 pub fn render_answer_pack(
@@ -1429,7 +1690,15 @@ pub fn render_answer_pack_without_trust_correlation(
     request: &PackRenderRequest,
 ) -> Result<String, PackRenderError> {
     let correlation = crate::search::trust_correlation::CorrelationIndex::default();
-    let envelope = rendered_answer_pack_with_correlation(plan, request, &correlation);
+    render_answer_pack_with_correlation(plan, request, &correlation)
+}
+
+pub(crate) fn render_answer_pack_with_correlation(
+    plan: &PlannedAnswerPack,
+    request: &PackRenderRequest,
+    correlation: &crate::search::trust_correlation::CorrelationIndex,
+) -> Result<String, PackRenderError> {
+    let envelope = rendered_answer_pack_with_correlation(plan, request, correlation);
     match request.format {
         PackRenderFormat::Json => {
             serde_json::to_string_pretty(&envelope).map_err(|err| render_error(request, err))
@@ -1452,10 +1721,18 @@ pub fn render_answer_pack_value_without_trust_correlation(
     request: &PackRenderRequest,
 ) -> Result<serde_json::Value, PackRenderError> {
     let correlation = crate::search::trust_correlation::CorrelationIndex::default();
+    render_answer_pack_value_with_correlation(plan, request, &correlation)
+}
+
+pub(crate) fn render_answer_pack_value_with_correlation(
+    plan: &PlannedAnswerPack,
+    request: &PackRenderRequest,
+    correlation: &crate::search::trust_correlation::CorrelationIndex,
+) -> Result<serde_json::Value, PackRenderError> {
     serde_json::to_value(rendered_answer_pack_with_correlation(
         plan,
         request,
-        &correlation,
+        correlation,
     ))
     .map_err(|err| render_error(request, err))
 }
@@ -1615,7 +1892,10 @@ fn rendered_answer_pack_with_correlation(
             redaction_policy: request.redaction_policy.clone(),
             redaction_applied,
             sensitive_output: request.sensitive_output,
-            skill_content_included: request.skill_content_included,
+            skill_content_included: plan
+                .evidence
+                .iter()
+                .any(|item| crate::export::is_skill_injection(&item.candidate.excerpt)),
             redaction_counts,
         },
         warnings,
@@ -1936,7 +2216,11 @@ fn pack_trust_assessment(
         now_ms: request.generated_at_ms,
         workspace,
         query_workspace: None,
-        source_kind: pack_trust_source_kind(candidate.source_readiness, &candidate.origin_kind),
+        source_kind: if candidate.citation_verified {
+            pack_trust_source_kind(candidate.source_readiness, &candidate.origin_kind)
+        } else {
+            crate::search::trust_scoring::SourceTrustKind::ArchiveOnly
+        },
         realized_mode: pack_trust_realized_mode(
             &request.search_mode,
             request.fallback_mode.as_deref(),
@@ -1973,8 +2257,10 @@ fn rendered_evidence(
     query_workspace: Option<&str>,
 ) -> RenderedEvidence {
     let candidate = &item.candidate;
-    let mut redactions = Vec::new();
-    let excerpt = redact_pack_output_text(&item.excerpt, &mut redactions);
+    let mut redactions = item.redactions.clone();
+    // Selection already sanitized and budgeted this text. Secret patterns are
+    // not idempotent: another pass can rewrite markers and count events twice.
+    let excerpt = item.excerpt.clone();
     let source_id = redacted_source_label(
         &candidate.source_id,
         &candidate.origin_kind,
@@ -2001,14 +2287,14 @@ fn rendered_evidence(
         conversation_id: candidate.conversation_id,
         content_hash: candidate.content_hash.clone(),
         span_hash: candidate.span_hash.clone(),
-        excerpt_sha256: sha256_hex(&item.excerpt),
+        excerpt_sha256: sha256_hex(&excerpt),
         created_at_ms: candidate.created_at_ms,
         indexed_at_ms: candidate.indexed_at_ms,
         freshness_age_seconds: candidate
             .created_at_ms
             .map(|created| request.generated_at_ms.saturating_sub(created).max(0) / 1_000),
         match_type: candidate.match_type.clone(),
-        verified: candidate.line_start.is_some() && !candidate.source_path.trim().is_empty(),
+        verified: candidate.citation_verified,
     };
     let trust = pack_trust_assessment(candidate, request, correlation, query_workspace);
     RenderedEvidence {
@@ -2326,12 +2612,12 @@ fn json_line(
 fn render_answer_pack_markdown(envelope: &RenderedAnswerPack) -> String {
     let mut out = String::new();
     out.push_str("# ");
-    out.push_str(&markdown_line(&envelope.pack.title));
+    out.push_str(&markdown_literal_line(&envelope.pack.title));
     if !envelope.warnings.is_empty() {
         out.push_str("\n\n## Warnings\n");
         for warning in &envelope.warnings {
             out.push_str("- ");
-            out.push_str(&markdown_line(warning));
+            out.push_str(&markdown_literal_line(warning));
             out.push('\n');
         }
     }
@@ -2341,7 +2627,7 @@ fn render_answer_pack_markdown(envelope: &RenderedAnswerPack) -> String {
     } else {
         for item in &envelope.pack.handoff {
             out.push_str("- ");
-            out.push_str(&markdown_line(&item.text));
+            out.push_str(&markdown_literal_line(&item.text));
             out.push_str(" [");
             out.push_str(&item.evidence_ids.join(", "));
             out.push_str("]\n");
@@ -2356,11 +2642,11 @@ fn render_answer_pack_markdown(envelope: &RenderedAnswerPack) -> String {
             out.push('[');
             out.push_str(&item.id);
             out.push_str("] ");
-            out.push_str(&markdown_line(&item.citation.agent));
+            out.push_str(&markdown_literal_line(&item.citation.agent));
             out.push(' ');
-            out.push_str(&markdown_line(&item.citation.source_id));
+            out.push_str(&markdown_literal_line(&item.citation.source_id));
             out.push(' ');
-            out.push_str(&markdown_line(&item.citation.source_path));
+            out.push_str(&markdown_literal_line(&item.citation.source_path));
             if let Some(line_start) = item.citation.line_start {
                 out.push(':');
                 out.push_str(&line_start.to_string());
@@ -2372,7 +2658,26 @@ fn render_answer_pack_markdown(envelope: &RenderedAnswerPack) -> String {
                     out.push_str(&line_end.to_string());
                 }
             }
-            out.push('\n');
+            out.push_str("\n\n");
+            // Preserve the complete prepared excerpt, including blank lines.
+            // A longer fence keeps source fences, links and HTML literal.
+            let fence_length = item
+                .excerpt
+                .split(|character| character != '`')
+                .map(str::len)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1)
+                .max(3);
+            let fence = "`".repeat(fence_length);
+            out.push_str(&fence);
+            out.push_str("text\n");
+            out.push_str(&item.excerpt);
+            if !item.excerpt.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&fence);
+            out.push_str("\n\n");
         }
     }
 
@@ -2382,7 +2687,7 @@ fn render_answer_pack_markdown(envelope: &RenderedAnswerPack) -> String {
             out.push_str("- ");
             out.push_str(omitted_reason_label(item.reason));
             out.push_str(": ");
-            out.push_str(&markdown_line(&item.source_path));
+            out.push_str(&markdown_literal_line(&item.source_path));
             if let Some(line_start) = item.line_start {
                 out.push(':');
                 out.push_str(&line_start.to_string());
@@ -2408,6 +2713,20 @@ fn compact_excerpt(excerpt: &str, max_chars: usize) -> String {
 
 fn markdown_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn markdown_literal_line(text: &str) -> String {
+    let mut out = String::new();
+    for character in markdown_line(text).chars() {
+        if matches!(
+            character,
+            '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '!' | '|' | '~' | '&' | '#'
+        ) {
+            out.push('\\');
+        }
+        out.push(character);
+    }
+    out
 }
 
 fn sha256_hex(text: &str) -> String {
@@ -2547,6 +2866,7 @@ mod tests {
             line_end: Some(12),
             conversation_id: None,
             message_index: None,
+            citation_verified: true,
             content_hash: format!("{id}_content"),
             span_hash: format!("{id}_span"),
             created_at_ms: Some(1_000_000),
@@ -2580,6 +2900,7 @@ mod tests {
             freshness_window_seconds: 60,
             candidates,
             explain_selection: false,
+            include_skill_content: false,
         }
     }
 
@@ -2612,7 +2933,6 @@ mod tests {
             freshness_window_seconds: 60,
             redaction_policy: "strict".to_string(),
             sensitive_output: false,
-            skill_content_included: false,
             explain_selection: false,
             readiness: PackReadinessSnapshot::default(),
         }
@@ -2629,6 +2949,112 @@ mod tests {
             ],
             recommended_next_probe: Some("cass health --json".to_string()),
         }
+    }
+
+    #[test]
+    fn pack_omits_skill_injections_before_truncation_and_preserves_safe_evidence() {
+        let mut safe = candidate("safe", "local", "/work/safe.jsonl", 1.0);
+        safe.excerpt = "Ordinary skill design discussion stays useful.".to_string();
+        let mut candidates = vec![safe.clone()];
+        for (index, marker) in [
+            "Base directory for this skill:",
+            "<system-reminder>",
+            "The following skills are available for use with the Skill tool:",
+            "skillInjection: matchedSkills",
+            "<!-- skillInjection:",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut injected = candidate(
+                &format!("skill-{index}"),
+                "local",
+                &format!("/work/skill-{index}.jsonl"),
+                100.0,
+            );
+            injected.excerpt = format!("PROPRIETARY PLAYBOOK {} {marker}", "界".repeat(120));
+            candidates.push(injected);
+        }
+        let plan = plan_answer_pack(request(candidates.clone())).unwrap();
+        assert_eq!(plan.candidate_count, 6);
+        assert_eq!(plan.selected_evidence_count, 1);
+        assert_eq!(plan.evidence[0].candidate, safe);
+        assert_eq!(plan.evidence[0].excerpt, safe.excerpt);
+        assert_eq!(plan.omitted.len(), 5);
+        let mut omitted_ids = HashSet::new();
+        for omitted in &plan.omitted {
+            assert_eq!(omitted.reason, PackOmittedReason::RedactedToEmpty);
+            assert_eq!(omitted.estimated_tokens, 0);
+            assert!(omitted_ids.insert(&omitted.candidate_id));
+        }
+        let value = render_answer_pack_value_without_trust_correlation(
+            &plan,
+            &render_request(PackRenderFormat::Json),
+        )
+        .unwrap();
+        assert_eq!(value["privacy"]["redaction_applied"], true);
+        assert_eq!(value["privacy"]["skill_content_included"], false);
+        assert_eq!(value["privacy"]["redaction_counts"]["redacted_to_empty"], 5);
+        assert!(!value.to_string().contains("PROPRIETARY PLAYBOOK"));
+
+        candidates.remove(0);
+        let excluded = plan_answer_pack(request(candidates)).unwrap();
+        assert!(excluded.evidence.is_empty());
+        assert_eq!(excluded.omitted.len(), 5);
+        assert_eq!(excluded.estimated_tokens, 0);
+    }
+
+    #[test]
+    fn pack_skill_opt_in_keeps_credentials_redacted_and_reports_retained_evidence() {
+        let credential = "abcdefghijklmnopqrst";
+        let mut injected = candidate("skill", "local", "/work/skill.jsonl", 1.0);
+        injected.excerpt = format!(
+            "Base directory for this skill: /work/playbook\nUseful skill instructions.\nAuthorization: Bearer {credential}"
+        );
+        let mut plan_request = request(vec![injected]);
+        plan_request.limits.max_excerpt_chars = 800;
+        let excluded = plan_answer_pack(plan_request.clone()).unwrap();
+        assert!(excluded.evidence.is_empty());
+        assert_eq!(
+            excluded.omitted[0].reason,
+            PackOmittedReason::RedactedToEmpty
+        );
+
+        plan_request.include_skill_content = true;
+        let plan = plan_answer_pack(plan_request).unwrap();
+        assert_eq!(plan.selected_evidence_count, 1);
+        assert!(plan.omitted.is_empty());
+        assert!(
+            plan.evidence[0]
+                .excerpt
+                .contains("Useful skill instructions.")
+        );
+        assert!(!plan.evidence[0].excerpt.contains(credential));
+        assert!(plan.evidence[0].excerpt.contains(REDACTED_VALUE_MARKER));
+
+        let render_request = render_request(PackRenderFormat::Json);
+        let value =
+            render_answer_pack_value_without_trust_correlation(&plan, &render_request).unwrap();
+        assert_eq!(value["privacy"]["skill_content_included"], true);
+        assert_eq!(value["privacy"]["redaction_applied"], true);
+        assert!(!value.to_string().contains(credential));
+
+        // Rendering is repeated after output-budget trimming. An opt-in alone
+        // cannot claim that a fallback or reduced pack still contains skills.
+        let empty = budget_fallback_answer_pack(&render_request.limits, 1).unwrap();
+        let value =
+            render_answer_pack_value_without_trust_correlation(&empty, &render_request).unwrap();
+        assert_eq!(value["privacy"]["skill_content_included"], false);
+        let ordinary = plan_answer_pack(request(vec![candidate(
+            "ordinary",
+            "local",
+            "/work/ordinary.jsonl",
+            1.0,
+        )]))
+        .unwrap();
+        let value =
+            render_answer_pack_value_without_trust_correlation(&ordinary, &render_request).unwrap();
+        assert_eq!(value["privacy"]["skill_content_included"], false);
     }
 
     #[test]
@@ -2655,6 +3081,335 @@ mod tests {
         let candidate = PackCandidate::from_search_hit(&hit, 1, 0);
 
         assert_eq!(candidate.match_type, "implicit_wildcard");
+        assert_eq!(candidate.message_index, Some(11));
+        assert_eq!(candidate.line_start, None);
+        assert_eq!(candidate.line_end, None);
+        assert!(!candidate.citation_verified);
+    }
+
+    #[test]
+    fn source_citations_require_a_unique_matching_record_and_preserve_archived_evidence() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("rollout-citation.jsonl");
+        let raw = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "verifiedneedle"}]
+            }
+        })
+        .to_string();
+        let source = format!("{{\"type\":\"session_meta\"}}\n\ninvalid json\n{raw}\n");
+        let mut item = candidate("verify", "local", path.to_str().unwrap(), 10.0);
+        item.created_at_ms = None;
+        item.excerpt = "verifiedneedle".to_string();
+        item.message_index = Some(0);
+        let base = plan_answer_pack(request(vec![item])).unwrap();
+
+        for (contents, expected_line) in [
+            (source.clone(), Some(4)),
+            (source.replace('\n', "\r\n"), Some(4)),
+            (format!("{raw}\n{raw}\n"), None),
+            (source.replace("verifiedneedle", "changed source"), None),
+            (String::new(), None),
+        ] {
+            std::fs::write(&path, &contents).unwrap();
+            let mut plan = base.clone();
+            verify_pack_source_citations(
+                &mut plan,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            );
+            assert_eq!(plan.evidence.len(), 1);
+            assert_eq!(plan.evidence[0].excerpt, "verifiedneedle");
+            let citation = &plan.evidence[0].candidate;
+            assert_eq!(citation.line_start, expected_line);
+            assert_eq!(citation.line_end, expected_line);
+            assert_eq!(citation.citation_verified, expected_line.is_some());
+            assert_eq!(citation.message_index, Some(0));
+            if expected_line.is_some() {
+                assert_eq!(
+                    citation.span_hash,
+                    blake3::hash(raw.as_bytes()).to_hex().to_string()
+                );
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+        }
+
+        std::fs::write(&path, source).unwrap();
+        let future = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        for (agent, origin, deadline) in [
+            ("claude_code", "local", future),
+            ("codex", "remote", future),
+            ("codex", "local", std::time::Instant::now()),
+        ] {
+            let mut plan = base.clone();
+            plan.evidence[0].candidate.agent = agent.to_string();
+            plan.evidence[0].candidate.origin_kind = origin.to_string();
+            verify_pack_source_citations(&mut plan, deadline);
+            assert!(!plan.evidence[0].candidate.citation_verified);
+            assert_eq!(plan.evidence[0].candidate.line_start, None);
+            assert_eq!(plan.evidence[0].excerpt, "verifiedneedle");
+        }
+        std::fs::rename(&path, temp.path().join("retained-source.jsonl")).unwrap();
+        let mut missing = base.clone();
+        verify_pack_source_citations(
+            &mut missing,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        assert!(!missing.evidence[0].candidate.citation_verified);
+        assert_eq!(missing.evidence[0].candidate.line_start, None);
+        assert_eq!(missing.evidence[0].excerpt, "verifiedneedle");
+
+        std::fs::File::create_new(&path)
+            .unwrap()
+            .set_len(8 * 1024 * 1024 + 1)
+            .unwrap();
+        let mut oversized = base;
+        verify_pack_source_citations(
+            &mut oversized,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        assert!(!oversized.evidence[0].candidate.citation_verified);
+        assert_eq!(oversized.evidence[0].candidate.line_start, None);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 8 * 1024 * 1024 + 1);
+    }
+
+    #[test]
+    fn source_citations_normalize_only_message_boundary_whitespace() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("rollout-whitespace.jsonl");
+        let excerpt = "\n\nverified needle \t\n";
+        let record = |text: &str| {
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}]
+                }
+            })
+            .to_string()
+        };
+        let mut item = candidate("whitespace", "local", path.to_str().unwrap(), 10.0);
+        item.created_at_ms = None;
+        item.excerpt = excerpt.to_string();
+        let base = plan_answer_pack(request(vec![item])).unwrap();
+        let raw = record(excerpt);
+        for (source, verified) in [
+            (raw.clone(), true),
+            (record("verified needle"), true),
+            (record("verified  needle"), false),
+            (format!("{raw}\n{}", record("verified needle")), false),
+        ] {
+            std::fs::write(&path, &source).unwrap();
+            let mut plan = base.clone();
+            verify_pack_source_citations(
+                &mut plan,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            );
+            let evidence = &plan.evidence[0];
+            assert_eq!(evidence.excerpt, excerpt);
+            assert_eq!(evidence.candidate.excerpt, excerpt);
+            assert_eq!(evidence.candidate.citation_verified, verified);
+            assert_eq!(evidence.candidate.line_start, verified.then_some(1));
+            assert_eq!(evidence.candidate.line_end, verified.then_some(1));
+            if verified {
+                assert_eq!(
+                    evidence.candidate.span_hash,
+                    blake3::hash(source.as_bytes()).to_hex().to_string()
+                );
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn source_citations_match_ingestion_redaction_without_ignoring_ambiguity() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("rollout-redacted.jsonl");
+        let first = format!("verifiedneedle sk-{}", "A".repeat(40));
+        let second = format!("verifiedneedle sk-{}", "B".repeat(40));
+        let archived = "verifiedneedle [REDACTED]";
+        let record = |text: &str| {
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}]
+                }
+            })
+            .to_string()
+        };
+        let raw = record(&first);
+        for (excerpt, source, timestamp, verified) in [
+            (archived, raw.clone(), None, true),
+            (first.as_str(), raw.clone(), None, true),
+            (first.as_str(), record(&second), None, false),
+            (archived, format!("{raw}\n{}", record(&second)), None, false),
+            (archived, record("different content"), None, false),
+            (archived, raw.clone(), Some(1), false),
+        ] {
+            std::fs::write(&path, &source).unwrap();
+            let mut item = candidate("redacted", "local", path.to_str().unwrap(), 10.0);
+            item.excerpt = excerpt.to_string();
+            item.created_at_ms = timestamp;
+            let mut plan = plan_answer_pack(request(vec![item])).unwrap();
+            let prepared = plan.evidence[0].excerpt.clone();
+            verify_pack_source_citations(
+                &mut plan,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            );
+            let evidence = &plan.evidence[0];
+            assert_eq!(evidence.candidate.citation_verified, verified);
+            assert_eq!(evidence.candidate.line_start, verified.then_some(1));
+            assert_eq!(evidence.candidate.line_end, verified.then_some(1));
+            assert_eq!(evidence.candidate.excerpt, excerpt);
+            assert_eq!(evidence.excerpt, prepared);
+            assert_eq!(evidence.id, evidence_id(&evidence.candidate));
+            if verified {
+                assert_eq!(
+                    evidence.candidate.span_hash,
+                    blake3::hash(raw.as_bytes()).to_hex().to_string()
+                );
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn evidence_ids_encode_the_full_digest_as_base32() {
+        // Independent known answers from Python's base64.b32encode, with
+        // padding removed because these IDs always carry a 32-byte digest.
+        for (hash, expected) in [
+            (
+                [0u8; 32],
+                "ev_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ),
+            (
+                [255u8; 32],
+                "ev_777777777777777777777777777777777777777777777777777Q",
+            ),
+            (
+                std::array::from_fn(|index| index as u8),
+                "ev_AAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPQ",
+            ),
+            (
+                std::array::from_fn(|index| (31 - index) as u8),
+                "ev_D4PB2HA3DIMRQFYWCUKBGEQRCAHQ4DIMBMFASCAHAYCQIAYCAEAA",
+            ),
+        ] {
+            assert_eq!(encoded_evidence_id(&hash), expected);
+        }
+        let first = [0u8; 32];
+        let mut last_bit_changed = first;
+        last_bit_changed[31] = 1;
+        assert_ne!(
+            encoded_evidence_id(&first),
+            encoded_evidence_id(&last_bit_changed),
+            "IDs must distinguish hashes sharing their first 255 bits"
+        );
+    }
+
+    #[test]
+    fn source_citation_ids_follow_verified_spans_and_unverified_exits() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("rollout-identity.jsonl");
+        let raw = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "identity needle"}]
+            }
+        })
+        .to_string();
+        let mut item = candidate("identity", "local", path.to_str().unwrap(), 10.0);
+        item.created_at_ms = None;
+        item.excerpt = "identity needle".to_string();
+        let base = plan_answer_pack(request(vec![item])).unwrap();
+        let mut verified_ids = Vec::new();
+        for prefix in ["", "\n"] {
+            let source = format!("{prefix}{raw}\n");
+            std::fs::write(&path, &source).unwrap();
+            let mut plan = base.clone();
+            let expected_line = prefix.len() + 1;
+            for _ in 0..2 {
+                verify_pack_source_citations(
+                    &mut plan,
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                );
+                let evidence = &plan.evidence[0];
+                assert!(evidence.candidate.citation_verified);
+                assert_eq!(evidence.candidate.line_start, Some(expected_line));
+                assert_eq!(evidence.id, evidence_id(&evidence.candidate));
+                assert_ne!(evidence.id, base.evidence[0].id);
+                assert_eq!(evidence.excerpt, base.evidence[0].excerpt);
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+                verified_ids.push(evidence.id.clone());
+            }
+
+            let verified = plan.clone();
+            for unavailable in [false, true] {
+                let mut plan = verified.clone();
+                if unavailable {
+                    plan.evidence[0].candidate.agent = "unsupported".to_string();
+                }
+                verify_pack_source_citations(&mut plan, std::time::Instant::now());
+                let evidence = &plan.evidence[0];
+                assert!(!evidence.candidate.citation_verified);
+                assert_eq!(evidence.candidate.line_start, None);
+                assert_eq!(evidence.id, evidence_id(&evidence.candidate));
+                assert_ne!(evidence.id, verified.evidence[0].id);
+                assert_eq!(evidence.excerpt, verified.evidence[0].excerpt);
+            }
+        }
+        assert_eq!(verified_ids[0], verified_ids[1]);
+        assert_eq!(verified_ids[2], verified_ids[3]);
+        assert_ne!(verified_ids[0], verified_ids[2]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_citations_do_not_follow_symlinks_or_wait_for_fifo_writers() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source.jsonl");
+        std::fs::write(
+            &source,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"verifiedneedle"}]}}"#,
+        )
+        .unwrap();
+        let link = temp.path().join("link.jsonl");
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        let fifo = temp.path().join("fifo.jsonl");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        for path in [link, fifo] {
+            let mut item = candidate("special", "local", path.to_str().unwrap(), 10.0);
+            item.created_at_ms = None;
+            item.excerpt = "verifiedneedle".to_string();
+            let mut plan = plan_answer_pack(request(vec![item])).unwrap();
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                verify_pack_source_citations(
+                    &mut plan,
+                    std::time::Instant::now() + std::time::Duration::from_millis(100),
+                );
+                let _ = sender.send(plan);
+            });
+            let plan = receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("citation verification must not wait for a FIFO writer");
+            assert!(!plan.evidence[0].candidate.citation_verified);
+            assert_eq!(plan.evidence[0].candidate.line_start, None);
+            assert_eq!(plan.evidence[0].excerpt, "verifiedneedle");
+        }
     }
 
     #[test]
@@ -2823,14 +3578,109 @@ mod tests {
             format!(
                 "# pack handoff\n\n\
                  ## Warnings\n\
-                 - semantic_fallback_lexical\n\n\
+                 - semantic\\_fallback\\_lexical\n\n\
                  ## Handoff\n\
                  - 0123456789abcdef [{evidence_id}]\n\n\
                  ## Evidence\n\
                  [{evidence_id}] codex local /s/a.jsonl:10-12\n\n\
+                 ```text\n0123456789abcdef\n```\n\n\n\
                  ## Omitted\n\
                  - duplicate_content: /s/b.jsonl:10\n"
             )
+        );
+    }
+
+    #[test]
+    fn render_markdown_preserves_complete_redacted_excerpts_as_literal_code() {
+        use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+
+        let mut first = candidate("literal", "local", "/s/[literal].jsonl", 10.0);
+        first.excerpt = format!(
+            "\n\n<script>alert(1)</script> [link](https://example.invalid)\n{}\n\n\
+             ```rust\nfn main() {{}}\n```\n~~~\n# source heading\n\
+             Authorization: Bearer abcdefghijklmnopqrst\nfinal preserved context",
+            "Unicode αβ 🚀 context. ".repeat(25)
+        );
+        let mut second = candidate("second", "local", "/s/second.jsonl", 9.0);
+        second.excerpt =
+            "Second record\n    original indentation\n\ttab and trailing spaces  \n\n".into();
+        let mut plan_request = request(vec![first, second]);
+        plan_request.limits.max_tokens = 12_000;
+        plan_request.limits.max_excerpt_chars = 1_600;
+        let plan = plan_answer_pack(plan_request).expect("plan literal excerpts");
+        assert_eq!(plan.evidence.len(), 2);
+        assert!(plan.evidence[0].excerpt.chars().count() > 220);
+        assert!(plan.evidence[0].excerpt.starts_with("\n\n"));
+        assert!(
+            plan.evidence[0]
+                .excerpt
+                .ends_with("final preserved context")
+        );
+        assert!(plan.evidence[1].excerpt.ends_with("\n\n"));
+        let mut req = render_request(PackRenderFormat::Markdown);
+        req.limits.max_tokens = 12_000;
+        req.limits.max_excerpt_chars = 1_600;
+        req.query_text = "handoff <img src=x> [query](https://example.invalid)".into();
+
+        for rendered in [
+            render_answer_pack(&plan, &req).expect("render Markdown"),
+            render_answer_pack_without_trust_correlation(&plan, &req)
+                .expect("render Markdown without advisory correlation"),
+        ] {
+            assert!(!rendered.contains("abcdefghijklmnopqrst"));
+            let mut excerpts = Vec::new();
+            let mut current_excerpt = None::<String>;
+            for event in Parser::new(&rendered) {
+                match event {
+                    Event::Start(Tag::CodeBlock(_)) => {
+                        current_excerpt = Some(String::new());
+                    }
+                    Event::Text(text) => {
+                        if let Some(excerpt) = current_excerpt.as_mut() {
+                            excerpt.push_str(&text);
+                        }
+                    }
+                    Event::End(TagEnd::CodeBlock) => {
+                        excerpts.push(current_excerpt.take().expect("open evidence block"));
+                    }
+                    Event::Html(_)
+                    | Event::InlineHtml(_)
+                    | Event::Start(Tag::Link { .. } | Tag::Image { .. }) => {
+                        panic!("source markup must remain literal text");
+                    }
+                    _ => {}
+                }
+            }
+            let expected = plan
+                .evidence
+                .iter()
+                .map(|item| {
+                    if item.excerpt.ends_with('\n') {
+                        item.excerpt.clone()
+                    } else {
+                        format!("{}\n", item.excerpt)
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                excerpts, expected,
+                "each complete excerpt must survive Markdown parsing"
+            );
+        }
+    }
+
+    #[test]
+    fn render_markdown_empty_pack_does_not_invent_evidence_blocks() {
+        let plan = plan_answer_pack(request(Vec::new())).expect("empty plan");
+        let rendered = render_answer_pack(&plan, &render_request(PackRenderFormat::Markdown))
+            .expect("empty Markdown pack");
+        assert!(rendered.contains("No evidence selected."));
+        assert!(rendered.contains("No cited evidence."));
+        assert!(
+            !pulldown_cmark::Parser::new(&rendered).any(|event| matches!(
+                event,
+                pulldown_cmark::Event::Start(pulldown_cmark::Tag::CodeBlock(_))
+            ))
         );
     }
 
@@ -3185,10 +4035,90 @@ mod tests {
         assert_eq!(value["privacy"]["redaction_applied"], true);
         assert_eq!(value["privacy"]["redaction_counts"]["secret"], 1);
         assert_eq!(value["evidence"][0]["redactions"][0]["kind"], "secret");
+        let emitted_excerpt = value["evidence"][0]["excerpt"].as_str().unwrap();
+        assert_ne!(emitted_excerpt, plan.evidence[0].candidate.excerpt);
+        assert_eq!(emitted_excerpt, plan.evidence[0].excerpt);
+        let emitted_digest = <sha2::Sha256 as sha2::Digest>::digest(emitted_excerpt.as_bytes());
+        assert_eq!(
+            hex::decode(
+                value["evidence"][0]["citation"]["excerpt_sha256"]
+                    .as_str()
+                    .unwrap()
+            )
+            .unwrap(),
+            emitted_digest.to_vec(),
+            "the citation hash must verify the bytes the consumer actually receives"
+        );
+    }
+
+    #[test]
+    fn pack_redacts_credentials_before_excerpt_truncation() {
+        let mut secret = candidate("cut-secret", "local", "/s/cut-secret.jsonl", 10.0);
+        secret.excerpt = format!(
+            "{} sk-12345678901234567890 trailing context",
+            "x".repeat(68)
+        );
+        let mut request = request(vec![secret]);
+        request.limits.max_excerpt_chars = 80;
+        let plan = plan_answer_pack(request).unwrap();
+        assert_eq!(plan.evidence.len(), 1);
+        for format in [PackRenderFormat::Json, PackRenderFormat::Markdown] {
+            let mut render_request = render_request(format);
+            render_request.limits.max_excerpt_chars = 80;
+            let output = render_answer_pack(&plan, &render_request).unwrap();
+            assert!(!output.contains("sk-12345"), "partial credential leaked");
+        }
+        let excerpt = &plan.evidence[0].excerpt;
+        assert!(!excerpt.contains("sk-"));
+        assert!(excerpt.chars().count() <= 80);
+        assert!(plan.evidence[0].excerpt_truncated);
+        let value =
+            render_answer_pack_value(&plan, &render_request(PackRenderFormat::Json)).unwrap();
+        assert_eq!(value["privacy"]["redaction_counts"]["secret"], 1);
+    }
+
+    #[test]
+    fn pack_budgets_emitted_text_after_redaction_expansion_and_unicode() {
+        for max_excerpt_chars in [80, 8_000] {
+            let candidates = (0..8)
+                .map(|index| {
+                    let mut item = candidate(
+                        &format!("expanded-{index}"),
+                        "local",
+                        &format!("/s/expanded-{index}.jsonl"),
+                        10.0,
+                    );
+                    item.excerpt = format!("{}界e\u{301}", "~/x ".repeat(100));
+                    item
+                })
+                .collect();
+            let mut request = request(candidates);
+            request.limits.max_tokens = 1_024;
+            request.limits.max_excerpt_chars = max_excerpt_chars;
+            let plan = plan_answer_pack(request).unwrap();
+            assert!(!plan.evidence.is_empty());
+            let value =
+                render_answer_pack_value(&plan, &render_request(PackRenderFormat::Json)).unwrap();
+            let mut emitted_total = 0;
+            for item in value["evidence"].as_array().unwrap() {
+                let excerpt = item["excerpt"].as_str().unwrap();
+                assert!(!excerpt.contains("~/x"));
+                assert!(excerpt.chars().count() <= max_excerpt_chars);
+                let estimated = excerpt.chars().count().div_ceil(4);
+                assert_eq!(item["estimated_tokens"], estimated);
+                assert_eq!(item["selection"]["token_cost"], estimated);
+                emitted_total += estimated;
+            }
+            assert_eq!(value["limits"]["estimated_tokens"], emitted_total);
+            assert_eq!(plan.estimated_tokens, emitted_total);
+            assert!(emitted_total <= plan.diagnostics.budget.evidence_tokens);
+        }
     }
 
     #[test]
     fn render_pack_redacts_home_directory_paths_in_evidence_and_omitted_output() {
+        use pulldown_cmark::{Event, Parser};
+
         let source_path = "/home/alice/projects/private/session.jsonl";
         let duplicate_path = "/Users/alice/projects/private/duplicate.jsonl";
         let mut first = candidate("private-path", "local", source_path, 10.0);
@@ -3205,10 +4135,20 @@ mod tests {
         let json_rendered = render_answer_pack(&plan, &json_req).unwrap();
         let markdown_rendered = render_answer_pack(&plan, &markdown_req).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json_rendered).unwrap();
+        let markdown_text = Parser::new(&markdown_rendered)
+            .filter_map(|event| match event {
+                Event::Text(text) | Event::Code(text) => Some(text),
+                _ => None,
+            })
+            .fold(String::new(), |mut output, text| {
+                output.push_str(&text);
+                output
+            });
 
         for raw in ["/home/alice", "/Users/alice", "~/notes", "old-laptop"] {
             assert!(!json_rendered.contains(raw));
             assert!(!markdown_rendered.contains(raw));
+            assert!(!markdown_text.contains(raw));
         }
         assert_eq!(
             value["evidence"][0]["citation"]["source_path"],
@@ -3224,8 +4164,8 @@ mod tests {
                 .unwrap()
                 .starts_with("omitted_")
         );
-        assert!(markdown_rendered.contains("[REDACTED_PATH]/session.jsonl"));
-        assert!(markdown_rendered.contains("[REDACTED_PATH]/duplicate.jsonl"));
+        assert!(markdown_text.contains("[REDACTED_PATH]/session.jsonl"));
+        assert!(markdown_text.contains("[REDACTED_PATH]/duplicate.jsonl"));
         assert_eq!(value["privacy"]["redaction_applied"], true);
         assert!(
             value["privacy"]["redaction_counts"]["private_path"]
@@ -3503,7 +4443,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_high_score_candidate_can_be_skipped_for_budget_fit() {
+    fn oversized_high_score_candidate_is_shortened_before_lower_ranked_evidence() {
         let mut oversized = candidate("oversized", "local", "/s/oversized.jsonl", 10.0);
         let mut fitting = candidate("fit", "remote", "/s/fit.jsonl", 9.0);
 
@@ -3512,12 +4452,148 @@ mod tests {
         let evidence_budget = pack_planner_budget(&req.limits).unwrap().evidence_tokens;
         oversized.excerpt = "x".repeat((evidence_budget + 1) * TOKEN_ESTIMATE_CHARS_PER_TOKEN);
         fitting.excerpt = "y".repeat(TOKEN_ESTIMATE_CHARS_PER_TOKEN);
-        req.candidates = vec![oversized, fitting];
+        req.candidates = vec![oversized.clone(), fitting];
 
         let plan = plan_answer_pack(req).unwrap();
 
-        assert_eq!(plan.evidence[0].candidate.candidate_id, "fit");
+        let selected = &plan.evidence[0];
+        assert_eq!(selected.candidate, oversized);
+        assert_eq!(selected.id, evidence_id(&oversized));
+        assert_eq!(selected.estimated_tokens, evidence_budget);
+        assert_eq!(selected.selection.token_cost, evidence_budget);
+        assert!(selected.excerpt_truncated);
+        assert_eq!(
+            selected.excerpt,
+            format!("{}...", "x".repeat(evidence_budget * 4 - 3))
+        );
         assert_eq!(plan.omitted.len(), 1);
+        assert_eq!(plan.omitted[0].candidate_id, "fit");
+        assert_eq!(
+            plan.omitted[0].reason,
+            PackOmittedReason::TokenBudgetExhausted
+        );
+    }
+
+    #[test]
+    fn final_output_reduction_preserves_citations_and_reconciles_dropped_evidence() {
+        let first = candidate("first", "local", "/s/first.jsonl", 10.0);
+        let mut last = candidate("last", "remote", "/s/last.jsonl", 9.0);
+        last.excerpt = "界😀e\u{301}".repeat(20);
+        let mut plan = plan_answer_pack(request(vec![first, last.clone()])).unwrap();
+        let original_first = plan.evidence[0].clone();
+        let original_last_id = plan.evidence[1].id.clone();
+        assert!(plan.reduce_for_output_budget(10_000, true));
+        assert_eq!(plan.evidence[0], original_first);
+        assert_eq!(plan.evidence[1].candidate, last);
+        assert_eq!(plan.evidence[1].id, original_last_id);
+        assert_eq!(plan.evidence[1].excerpt, "界...");
+        assert_eq!(plan.evidence[1].estimated_tokens, 1);
+        assert_eq!(plan.evidence[1].selection.token_cost, 1);
+        assert_eq!(plan.estimated_tokens, original_first.estimated_tokens + 1);
+        assert!(plan.omitted.is_empty());
+
+        assert!(plan.reduce_for_output_budget(10_000, true));
+        assert_eq!(plan.evidence, vec![original_first.clone()]);
+        assert_eq!(plan.selected_evidence_count, 1);
+        assert_eq!(plan.selected_session_count, 1);
+        assert_eq!(plan.estimated_tokens, original_first.estimated_tokens);
+        assert_eq!(plan.omitted.len(), 1);
+        assert_eq!(plan.omitted[0].candidate_id, last.candidate_id);
+        assert_eq!(
+            plan.omitted[0].reason,
+            PackOmittedReason::TokenBudgetExhausted
+        );
+        let rendered = render_answer_pack_value_without_trust_correlation(
+            &plan,
+            &render_request(PackRenderFormat::Json),
+        )
+        .unwrap();
+        assert_eq!(
+            rendered["pack"]["answer_outline"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            rendered["pack"]["handoff"][0]["evidence_ids"][0],
+            original_first.id
+        );
+        assert_eq!(
+            rendered["pack"]["source_summary"].as_array().unwrap().len(),
+            1
+        );
+
+        assert!(plan.reduce_for_output_budget(10_000, true));
+        assert!(!plan.reduce_for_output_budget(10_000, true));
+        assert_eq!(plan.evidence.len(), 1, "required evidence cannot disappear");
+        assert!(plan.reduce_for_output_budget(10_000, false));
+        assert!(plan.evidence.is_empty());
+        assert_eq!(plan.selected_session_count, 0);
+        assert_eq!(plan.selected_evidence_count, 0);
+        assert_eq!(plan.estimated_tokens, 0);
+        assert_eq!(plan.omitted.len(), 2);
+        assert!(!plan.reduce_for_output_budget(10_000, false));
+    }
+
+    #[test]
+    fn final_output_reduction_drops_whitespace_prefix_without_fabricating_text() {
+        let mut item = candidate("space", "local", "/s/space.jsonl", 10.0);
+        item.excerpt = " \t\n meaningful text".to_string();
+        let mut plan = plan_answer_pack(request(vec![item])).unwrap();
+        let before = plan.clone();
+        assert!(!plan.reduce_for_output_budget(10_000, true));
+        assert_eq!(plan, before);
+        assert!(plan.reduce_for_output_budget(10_000, false));
+        assert!(plan.evidence.is_empty());
+        assert_eq!(plan.omitted.len(), 1);
+    }
+
+    #[test]
+    fn budget_truncation_uses_remaining_tokens_and_preserves_unicode_citations() {
+        for remaining_tokens in [1, 2, 20] {
+            let mut first = candidate("first", "local", "/s/first.jsonl", 10.0);
+            let mut second = candidate("second", "remote", "/s/second.jsonl", 9.0);
+            let mut req = request(Vec::new());
+            req.limits.max_excerpt_chars = 8_000;
+            let budget = pack_planner_budget(&req.limits).unwrap().evidence_tokens;
+            first.excerpt = "x".repeat((budget - remaining_tokens) * 4);
+            second.excerpt = "界😀e\u{301}".repeat(100);
+            req.candidates = vec![first, second.clone()];
+
+            let plan = plan_answer_pack(req).unwrap();
+            assert_eq!(plan.evidence.len(), 2);
+            let selected = &plan.evidence[1];
+            let expected: String = second
+                .excerpt
+                .chars()
+                .take(remaining_tokens * 4 - 3)
+                .collect();
+            assert_eq!(selected.excerpt, format!("{expected}..."));
+            assert!(selected.excerpt_truncated);
+            assert_eq!(selected.candidate, second);
+            assert_eq!(selected.id, evidence_id(&second));
+            assert_eq!(selected.estimated_tokens, remaining_tokens);
+            assert_eq!(selected.selection.token_cost, remaining_tokens);
+            assert_eq!(plan.estimated_tokens, budget);
+            assert!(plan.omitted.is_empty());
+        }
+    }
+
+    #[test]
+    fn budget_truncation_does_not_replace_source_text_with_only_an_ellipsis() {
+        let mut first = candidate("first", "local", "/s/first.jsonl", 10.0);
+        let mut whitespace = candidate("whitespace", "remote", "/s/space.jsonl", 9.0);
+        let mut req = request(Vec::new());
+        req.limits.max_excerpt_chars = 8_000;
+        let budget = pack_planner_budget(&req.limits).unwrap().evidence_tokens;
+        first.excerpt = "x".repeat((budget - 1) * 4);
+        whitespace.excerpt = " \t\n meaningful evidence".to_string();
+        req.candidates = vec![first, whitespace];
+
+        let plan = plan_answer_pack(req).unwrap();
+        assert_eq!(plan.evidence.len(), 1);
+        assert!(!plan.evidence[0].excerpt_truncated);
+        assert_eq!(plan.estimated_tokens, budget - 1);
+        assert_eq!(plan.omitted.len(), 1);
+        assert_eq!(plan.omitted[0].candidate_id, "whitespace");
         assert_eq!(
             plan.omitted[0].reason,
             PackOmittedReason::TokenBudgetExhausted
