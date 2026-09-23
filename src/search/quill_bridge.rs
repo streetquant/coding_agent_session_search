@@ -37,9 +37,20 @@ use frankensearch::quill::{QuillConfig, QuillIndex, QuillSearchIndex, SchemaDocu
 /// search and indexing observe the same admission policy.
 const CASS_QUERY_FUEL_BUDGET: u64 = 64_000_000;
 
+/// Quill's tier concat merge caps positions for one term at 2^24. The shared
+/// CASS corpus has enough repeated terms that an automatic merge can exceed
+/// that cap and fail an otherwise successful index commit. Keep published
+/// segments separate until Quill can skip an over-limit merge safely.
+const CASS_TIER_FANOUT: usize = usize::MAX;
+// CASS publishes explicitly alongside its rebuild checkpoint. A visibility
+// lag publish can get ahead of that checkpoint and break replay on resume.
+const CASS_MAX_VISIBILITY_LAG_MS: u64 = u64::MAX;
+
 fn cass_quill_config() -> QuillConfig {
     QuillConfig {
         query_fuel_budget: CASS_QUERY_FUEL_BUDGET,
+        tier_fanout: CASS_TIER_FANOUT,
+        max_visibility_lag_ms: CASS_MAX_VISIBILITY_LAG_MS,
         ..QuillConfig::default()
     }
 }
@@ -405,6 +416,7 @@ impl Default for QuillCassFields {
 pub struct QuillCassIndex {
     index: QuillIndex,
     directory: PathBuf,
+    upsert_on_resume: bool,
     /// Epoch milliseconds of the last compaction, 0 when never compacted.
     last_merge_ts: i64,
 }
@@ -465,6 +477,7 @@ impl QuillCassIndex {
         let mut index = Self {
             index,
             directory: path.to_path_buf(),
+            upsert_on_resume: false,
             last_merge_ts: 0,
         };
         // A freshly created index has a writer but no published manifest, so
@@ -492,12 +505,25 @@ impl QuillCassIndex {
             .iter()
             .map(QuillCassDocument::to_schema_document)
             .collect();
+        let upsert_on_resume = self.upsert_on_resume;
         drive(|cx| {
             let projected = &projected;
             let index = &self.index;
-            async move { index.index_schema_documents(&cx, projected).await }
+            async move {
+                if upsert_on_resume {
+                    index.upsert_schema_documents(&cx, projected).await
+                } else {
+                    index.index_schema_documents(&cx, projected).await
+                }
+            }
         })
         .map_err(|error| anyhow!("indexing CASS documents into Quill: {error}"))
+    }
+
+    /// Reconcile an interrupted staged rebuild against documents already
+    /// published ahead of its checkpoint without creating duplicate ids.
+    pub fn enable_resume_upsert(&mut self) {
+        self.upsert_on_resume = true;
     }
 
     /// Publish everything staged since the last commit.
@@ -710,6 +736,9 @@ mod tests {
             config.query_fuel_budget > default_budget,
             "CASS needs more bounded query work than Quill's fixture default"
         );
+        assert_eq!(config.tier_fanout, CASS_TIER_FANOUT);
+        assert_eq!(config.max_visibility_lag_ms, CASS_MAX_VISIBILITY_LAG_MS);
+        config.validate().expect("CASS Quill config is valid");
     }
 
     /// The bridge must drive a full write/commit/read cycle from sync code.
@@ -729,6 +758,22 @@ mod tests {
             .expect("index documents");
         index.commit().expect("commit");
         assert_eq!(index.doc_count().expect("doc count"), 2);
+    }
+
+    #[test]
+    fn resumed_staged_rebuild_replays_a_published_document() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let document = sample("alpha", 0, "original historical content");
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("create index");
+        index.add_cass_documents(&[document.clone()]).expect("first insert");
+        index.commit().expect("publish first insert");
+        drop(index);
+
+        let mut resumed = QuillCassIndex::open_or_create(directory.path()).expect("reopen index");
+        resumed.enable_resume_upsert();
+        resumed.add_cass_documents(&[document]).expect("replay same id");
+        resumed.commit().expect("publish replay");
+        assert_eq!(resumed.doc_count().expect("doc count"), 1);
     }
 
     /// A reentrant bridge call must not re-enter `block_on` on one runtime.

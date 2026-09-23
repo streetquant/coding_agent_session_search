@@ -6143,13 +6143,15 @@ fn commit_lexical_rebuild_progress(
     mut perf_profile: Option<&mut LexicalRebuildPerfProfile>,
 ) -> Result<()> {
     let pending_progress_started = perf_profile.as_ref().map(|_| Instant::now());
-    persist_pending_lexical_rebuild_progress(
+    let content_base_meta_fingerprint = index_meta_fingerprint(content_path)?;
+    persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
         state_path,
         rebuild_state,
         next_conversation_id,
         processed_conversations,
         indexed_docs,
         runtime,
+        content_base_meta_fingerprint.as_deref(),
     )?;
     if let (Some(profile), Some(started)) = (perf_profile.as_mut(), pending_progress_started) {
         profile.pending_progress_duration += started.elapsed();
@@ -8744,7 +8746,18 @@ fn reconcile_pending_lexical_commit(
         return Ok(state);
     };
 
-    let current_meta_fingerprint = index_meta_fingerprint(index_path)?;
+    // A full rebuild publishes into a scratch sibling while its checkpoint
+    // remains beside the live index. The pending fingerprint was taken from
+    // that scratch content, so compare against the same directory on resume.
+    // Comparing it with the untouched live generation would falsely promote
+    // a heartbeat for uncommitted documents and skip them on the next run.
+    let scratch_path = staged_lexical_rebuild_scratch_path(index_path);
+    let content_path = if state.is_incomplete() && scratch_path.is_dir() {
+        scratch_path.as_path()
+    } else {
+        index_path
+    };
+    let current_meta_fingerprint = index_meta_fingerprint(content_path)?;
     if pending_commit_landed(
         pending.base_meta_fingerprint.as_deref(),
         current_meta_fingerprint.as_deref(),
@@ -8954,6 +8967,7 @@ fn persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
     persist_lexical_rebuild_state(index_path, state)
 }
 
+#[cfg(test)]
 fn persist_pending_lexical_rebuild_progress(
     index_path: &Path,
     state: &mut LexicalRebuildState,
@@ -22385,6 +22399,9 @@ fn rebuild_tantivy_from_db_with_options(
         log_prep_step("open_tantivy", &mut prep_step_started);
 
         t_index.configure_bulk_load_merge_policy();
+        if staged_build_path.is_some() && rebuild_state.committed_offset > 0 {
+            t_index.enable_resume_upsert();
+        }
 
         // Keep the persisted checkpoint aligned with the in-memory active-run
         // state before any producer heartbeat arrives. This closes attach/resume
@@ -22413,6 +22430,7 @@ fn rebuild_tantivy_from_db_with_options(
             return Err(err);
         }
     };
+    let resumed_staged_replay = staged_build_path.is_some() && rebuild_state.committed_offset > 0;
 
     if let Some(p) = &progress {
         p.phase.store(2, Ordering::Relaxed);
@@ -22689,13 +22707,15 @@ fn rebuild_tantivy_from_db_with_options(
                             pending_batch_message_bytes,
                         ),
                     );
-                    persist_pending_lexical_rebuild_progress(
+                    let content_base_meta_fingerprint = index_meta_fingerprint(&build_path)?;
+                    persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
                         &index_path,
                         &mut rebuild_state,
                         last_processed_conversation_id,
                         processed_conversations,
                         indexed_docs,
                         &latest_pipeline_runtime,
+                        content_base_meta_fingerprint.as_deref(),
                     )?;
                     if let (Some(profile), Some(started)) =
                         (perf_profile.as_mut(), heartbeat_progress_started)
@@ -23026,11 +23046,35 @@ fn rebuild_tantivy_from_db_with_options(
     if let Some(observed_tantivy_docs) = live_tantivy_doc_count(&index_path)?
         && observed_tantivy_docs != indexed_docs
     {
-        return Err(anyhow::anyhow!(
-            "lexical rebuild committed {} docs but a fresh Tantivy reader only sees {}",
-            indexed_docs,
-            observed_tantivy_docs
-        ));
+        // An older Quill writer may have published documents ahead of the
+        // durable CASS checkpoint. Resuming that staged generation upserts the
+        // replayed tail, so its old running counter can be low even when the
+        // final index is exact. Accept the reader's count only after comparing
+        // it with the same noise-adjusted canonical count used by the sink.
+        if resumed_staged_replay {
+            let expected_docs = expected_live_lexical_doc_count(&storage)?;
+            if observed_tantivy_docs == expected_docs {
+                tracing::warn!(
+                    checkpoint_docs = indexed_docs,
+                    observed_tantivy_docs,
+                    "reconciled resumed lexical accounting with the complete canonical corpus"
+                );
+                indexed_docs = observed_tantivy_docs;
+            } else {
+                return Err(anyhow::anyhow!(
+                    "resumed lexical rebuild committed {} docs, a fresh reader sees {}, and the canonical archive expects {}",
+                    indexed_docs,
+                    observed_tantivy_docs,
+                    expected_docs
+                ));
+            }
+        } else {
+            return Err(anyhow::anyhow!(
+                "lexical rebuild committed {} docs but a fresh Tantivy reader only sees {}",
+                indexed_docs,
+                observed_tantivy_docs
+            ));
+        }
     }
 
     storage.close_without_checkpoint().with_context(|| {
@@ -54855,6 +54899,41 @@ mod tests {
             persisted.runtime,
             LexicalRebuildPipelineRuntimeSnapshot::default()
         );
+    }
+
+    #[test]
+    fn reconcile_pending_staged_rebuild_uses_scratch_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let index_path = tmp.path().join("index");
+        let scratch_path = staged_lexical_rebuild_scratch_path(&index_path);
+        fs::create_dir_all(&index_path).unwrap();
+        fs::create_dir_all(&scratch_path).unwrap();
+        fs::write(index_path.join("meta.json"), b"older live generation").unwrap();
+        fs::write(scratch_path.join("meta.json"), b"staged generation").unwrap();
+
+        let db_state = LexicalRebuildDbState {
+            db_path: "/tmp/agent_search.db".to_string(),
+            total_conversations: 2,
+            total_messages: 2,
+            storage_fingerprint: "seed:2".to_string(),
+        };
+        let mut state = LexicalRebuildState::new(db_state, LEXICAL_REBUILD_PAGE_SIZE);
+        state.committed_offset = 1;
+        state.committed_conversation_id = Some(1);
+        state.processed_conversations = 1;
+        state.indexed_docs = 1;
+        state.record_pending_commit(
+            Some(2),
+            2,
+            2,
+            index_meta_fingerprint(&scratch_path).unwrap(),
+        );
+
+        let reconciled = reconcile_pending_lexical_commit(&index_path, state).unwrap();
+        assert!(reconciled.pending.is_none());
+        assert_eq!(reconciled.committed_offset, 1);
+        assert_eq!(reconciled.committed_conversation_id, Some(1));
+        assert_eq!(reconciled.indexed_docs, 1);
     }
 
     #[test]

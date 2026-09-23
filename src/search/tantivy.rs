@@ -1522,6 +1522,12 @@ impl TantivyIndex {
         self.inner.configure_bulk_load_merge_policy();
     }
 
+    /// An interrupted staged rebuild may have published documents beyond its
+    /// checkpoint. Replaying that tail must replace those ids, then continue.
+    pub fn enable_resume_upsert(&mut self) {
+        self.inner.enable_resume_upsert();
+    }
+
     pub fn reader(&self) -> Result<frankensearch::quill::QuillSearchIndex> {
         self.inner.reader()
     }
