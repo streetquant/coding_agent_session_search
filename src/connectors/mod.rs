@@ -265,6 +265,10 @@ fn claude_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(claude_code::ClaudeCodeConnector::new())
 }
 
+fn antigravity_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(antigravity::AntigravityConnector::new())
+}
+
 fn codex_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(codex::CodexConnector::new())
 }
@@ -295,6 +299,7 @@ pub fn get_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
         .into_iter()
         .map(|(name, factory)| {
             let factory = match name {
+                "antigravity" => antigravity_connector_factory as ConnectorFactory,
                 "claude" => claude_connector_factory as ConnectorFactory,
                 "codex" => codex_connector_factory as ConnectorFactory,
                 "cursor" => cursor_connector_factory as ConnectorFactory,

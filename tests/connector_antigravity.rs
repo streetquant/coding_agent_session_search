@@ -212,13 +212,62 @@ fn antigravity_ignores_legacy_gemini_layout_under_shared_dot_gemini() {
     let base = dot_gemini.clone();
     let ctx = ScanContext {
         data_dir: base.clone(),
-        scan_roots: vec![ScanRoot::local(base)],
+        scan_roots: vec![ScanRoot::local(base.clone())],
         since_ts: None,
         progress_tick: None,
     };
     let convs = AntigravityConnector::new().scan(&ctx).expect("scan");
     assert_eq!(convs.len(), 1, "only the agy conversation should be found");
     assert_eq!(convs[0].agent_slug, "antigravity");
+}
+
+#[test]
+fn antigravity_prunes_non_session_trees_in_production_factory() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().join("antigravity-cli");
+    let conversation = base.join("brain").join(FIXTURE_UUID);
+    let real_logs = conversation.join(".system_generated/logs");
+    fs::create_dir_all(&real_logs).unwrap();
+    let fixture_transcript = fixture_base()
+        .join("brain")
+        .join(FIXTURE_UUID)
+        .join(".system_generated/logs/transcript.jsonl");
+    fs::copy(&fixture_transcript, real_logs.join("transcript.jsonl")).unwrap();
+
+    for excluded in [".git/objects/decoy", "skills/decoy"] {
+        let decoy_logs = conversation.join(excluded).join(".system_generated/logs");
+        fs::create_dir_all(&decoy_logs).unwrap();
+        fs::copy(&fixture_transcript, decoy_logs.join("transcript.jsonl")).unwrap();
+    }
+
+    let ctx = ScanContext {
+        data_dir: base.clone(),
+        scan_roots: vec![ScanRoot::local(base.clone())],
+        since_ts: None,
+        progress_tick: None,
+    };
+    let connector = coding_agent_search::connectors::get_connector_factories()
+        .into_iter()
+        .find(|(name, _)| *name == "antigravity")
+        .map(|(_, factory)| factory())
+        .expect("production antigravity factory");
+    let conversations = connector.scan(&ctx).unwrap();
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(conversations[0].external_id.as_deref(), Some(FIXTURE_UUID));
+
+    let discovered = connector.discover_source_files(&ctx).unwrap();
+    assert!(
+        discovered.iter().all(|source| source.scan_root == base),
+        "source provenance must retain the original scan root"
+    );
+    assert_eq!(
+        discovered
+            .iter()
+            .filter(|source| source.role == DiscoveredSourceRole::PrimarySessionLog)
+            .count(),
+        1,
+        "decoy transcripts below .git and skills must not be discovered"
+    );
 }
 
 /// The migration must not regress the legacy Gemini CLI connector: its own
