@@ -53,8 +53,8 @@ def install(source: Path, directory: Path, name: str, bootstrap_regular: bool) -
     if name in {"", ".", ".."} or Path(name).name != name:
         raise ValueError("name must be one filename")
     source = source.resolve(strict=True)
-    if not source.is_file():
-        raise ValueError("source must be a regular file")
+    if not source.is_file() or not os.access(source, os.X_OK):
+        raise ValueError("source must be an executable regular file")
     directory.mkdir(parents=True, exist_ok=True)
     link = directory / name
     previous_target = None
@@ -127,6 +127,10 @@ def install(source: Path, directory: Path, name: str, bootstrap_regular: bool) -
     finally:
         staged_link.unlink(missing_ok=True)
     fsync_directory(directory)
+    if not link.is_symlink() or os.readlink(link) != target.name:
+        raise RuntimeError("installed pointer does not reference the verified target")
+    if digest(link) != source_digest:
+        raise RuntimeError("installed pointer does not resolve to source bytes")
     return {
         "schema": "cass.immutable-shared-install.v1",
         "status": "INSTALLED",
