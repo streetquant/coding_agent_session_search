@@ -32268,7 +32268,7 @@ pub mod persist {
         convs: &[NormalizedConversation],
     ) -> Result<()> {
         for conv in convs {
-            if conv.agent_slug != "cursor" {
+            if !matches!(conv.agent_slug.as_str(), "cursor" | "antigravity") {
                 continue;
             }
             let (source_id, _) = extract_provenance(&conv.metadata);
@@ -32282,7 +32282,7 @@ pub mod persist {
                 continue;
             }
             let data_dir = data_dir
-                .context("Cursor workspace repair requires the canonical index data directory")?;
+                .context("Provider workspace repair requires the canonical index data directory")?;
             let index_path = crate::search::tantivy::index_dir(data_dir)?;
             let db_path = storage.database_path()?;
             let mut state = super::LexicalRebuildState::new(
@@ -38137,6 +38137,15 @@ mod tests {
 
     #[test]
     fn gh459_workspace_repair_checkpoint_precedes_mutation_and_survives_reopen() {
+        workspace_repair_checkpoint_precedes_mutation_and_survives_reopen("cursor");
+    }
+
+    #[test]
+    fn native_agy_workspace_repair_checkpoint_precedes_mutation_and_survives_reopen() {
+        workspace_repair_checkpoint_precedes_mutation_and_survives_reopen("antigravity");
+    }
+
+    fn workspace_repair_checkpoint_precedes_mutation_and_survives_reopen(agent_slug: &str) {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir_all(&data_dir).unwrap();
@@ -38145,14 +38154,14 @@ mod tests {
         let agent_id = storage
             .ensure_agent(&Agent {
                 id: None,
-                slug: "cursor".into(),
-                name: "Cursor".into(),
+                slug: agent_slug.into(),
+                name: agent_slug.into(),
                 version: None,
                 kind: AgentKind::Cli,
             })
             .unwrap();
         let mut conv = norm_conv(Some("gh459-durable"), vec![norm_msg(0, 100)]);
-        conv.agent_slug = "cursor".into();
+        conv.agent_slug = agent_slug.into();
         conv.workspace = Some(PathBuf::from("/workspace/my/app"));
         conv.metadata = serde_json::json!({"cursor_format":"agent"});
         let wrong_id = storage
@@ -38169,6 +38178,13 @@ mod tests {
         let published = index_meta_fingerprint(&index_path).unwrap();
         conv.workspace = Some(PathBuf::from("/workspace/my-app"));
         conv.metadata["cursor_workspace_attribution"] = serde_json::json!("workspace_trusted");
+        // ubs:ignore -- Public fixture provider name, not a secret comparison.
+        if agent_slug == "antigravity" {
+            conv.metadata = serde_json::json!({"workspace_binding": {
+                "state": "bound", "source": "native_conversation_summaries",
+                "native_conversation_id": "gh459-durable"
+            }});
+        }
         persist::prepare_cursor_workspace_repair(
             &storage,
             Some(&data_dir),
@@ -38249,6 +38265,10 @@ mod tests {
         .unwrap();
         fs::create_dir(&checkpoint_path).unwrap();
         conv.metadata["cursor_workspace_attribution"] = serde_json::json!("unresolved");
+        // ubs:ignore -- Public fixture provider name, not a secret comparison.
+        if agent_slug == "antigravity" {
+            conv.metadata["workspace_binding"]["state"] = serde_json::json!("missing");
+        }
         conv.workspace = None;
         assert!(
             persist::persist_conversations_batched_with_raw_mirror_links(

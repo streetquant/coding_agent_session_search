@@ -7646,6 +7646,30 @@ fn cursor_workspace_attribution_is_authoritative(
         }
 }
 
+fn provider_workspace_attribution_is_authoritative(
+    agent_slug: &str,
+    external_id: Option<&str>,
+    workspace: Option<&Path>,
+    metadata: &serde_json::Value,
+) -> bool {
+    let Some(external_id) = external_id else {
+        return false;
+    };
+    if cursor_workspace_attribution_is_authoritative(agent_slug, workspace, metadata) {
+        return true;
+    }
+    let binding = &metadata["workspace_binding"];
+    agent_slug == "antigravity"
+        && binding["source"] == "native_conversation_summaries"
+        && binding["native_conversation_id"].as_str() == Some(external_id)
+        && match binding["state"].as_str() {
+            Some("bound") => workspace.is_some_and(Path::is_absolute),
+            Some("missing" | "ambiguous" | "invalid") => workspace.is_none(),
+            // A failed native metadata read is not authority to erase a binding.
+            _ => false,
+        }
+}
+
 /// Reconcile only the provider-owned attribution fields. A missing workspace
 /// in an ordinary partial packet must never erase a known association.
 fn franken_reconcile_cursor_workspace(
@@ -7655,13 +7679,12 @@ fn franken_reconcile_cursor_workspace(
     workspace_id: Option<i64>,
     conv: &Conversation,
 ) -> Result<bool> {
-    if conv.external_id.is_none()
-        || !cursor_workspace_attribution_is_authoritative(
-            &conv.agent_slug,
-            conv.workspace.as_deref(),
-            &conv.metadata_json,
-        )
-    {
+    if !provider_workspace_attribution_is_authoritative(
+        &conv.agent_slug,
+        conv.external_id.as_deref(),
+        conv.workspace.as_deref(),
+        &conv.metadata_json,
+    ) {
         return Ok(false);
     }
     let (previous_workspace, mut metadata): (Option<i64>, serde_json::Value) = tx.query_row_map(
@@ -7673,10 +7696,15 @@ fn franken_reconcile_cursor_workspace(
     if !metadata.is_object() {
         // Preserve non-object legacy metadata rather than replacing it blindly.
         anyhow::bail!(
-            "cannot reconcile Cursor workspace for conversation {conversation_id}: canonical metadata is not an object"
+            "cannot reconcile provider workspace for conversation {conversation_id}: canonical metadata is not an object"
         );
     }
-    for field in ["cursor_workspace_attribution", "cursor_project_dir"] {
+    let fields: &[&str] = if conv.agent_slug == "antigravity" {
+        &["workspace_binding"]
+    } else {
+        &["cursor_workspace_attribution", "cursor_project_dir"]
+    };
+    for &field in fields {
         if let Some(value) = conv.metadata_json.get(field)
             && metadata.get(field) != Some(value)
         {
@@ -8738,7 +8766,7 @@ pub struct MessageForEmbedding {
 
 impl FrankenStorage {
     /// Read-only admission for the indexer's durable pre-mutation checkpoint.
-    /// Cursor Agent external IDs are stable across workspace attribution changes.
+    /// Native provider external IDs are stable across workspace attribution changes.
     pub(crate) fn cursor_workspace_repair_needed(
         &self,
         agent_slug: &str,
@@ -8747,7 +8775,12 @@ impl FrankenStorage {
         workspace: Option<&Path>,
         metadata: &serde_json::Value,
     ) -> Result<bool> {
-        if !cursor_workspace_attribution_is_authoritative(agent_slug, workspace, metadata) {
+        if !provider_workspace_attribution_is_authoritative(
+            agent_slug,
+            external_id,
+            workspace,
+            metadata,
+        ) {
             return Ok(false);
         }
         let Some(external_id) = external_id else {
@@ -8758,8 +8791,8 @@ impl FrankenStorage {
             .query_row_map(
                 "SELECT (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id)
              FROM conversations c WHERE c.source_id = ?1 AND c.external_id = ?2
-             AND c.agent_id = (SELECT id FROM agents WHERE slug = 'cursor')",
-                fparams![source_id, external_id],
+             AND c.agent_id = (SELECT id FROM agents WHERE slug = ?3)",
+                fparams![source_id, external_id, agent_slug],
                 |row| row.get_typed(0),
             )
             .optional()?;
@@ -15683,13 +15716,12 @@ impl FrankenStorage {
         // after those buffers are flushed, using the final canonical identity.
         let mut reassociated = HashSet::new();
         for ((_, _, conv), outcome) in conversations.iter().zip(&outcomes) {
-            if conv.external_id.is_some()
-                && cursor_workspace_attribution_is_authoritative(
-                    &conv.agent_slug,
-                    conv.workspace.as_deref(),
-                    &conv.metadata_json,
-                )
-                && reassociated.insert(outcome.conversation_id)
+            if provider_workspace_attribution_is_authoritative(
+                &conv.agent_slug,
+                conv.external_id.as_deref(),
+                conv.workspace.as_deref(),
+                &conv.metadata_json,
+            ) && reassociated.insert(outcome.conversation_id)
             {
                 franken_reassociate_cursor_analytics_workspace(&tx, outcome.conversation_id, conv)?;
             }
@@ -18356,13 +18388,12 @@ fn franken_reassociate_cursor_analytics_workspace(
     conversation_id: i64,
     conv: &Conversation,
 ) -> Result<()> {
-    if conv.external_id.is_none()
-        || !cursor_workspace_attribution_is_authoritative(
-            &conv.agent_slug,
-            conv.workspace.as_deref(),
-            &conv.metadata_json,
-        )
-    {
+    if !provider_workspace_attribution_is_authoritative(
+        &conv.agent_slug,
+        conv.external_id.as_deref(),
+        conv.workspace.as_deref(),
+        &conv.metadata_json,
+    ) {
         return Ok(());
     }
     let workspace_id: Option<i64> = tx.query_row_map(
@@ -32713,28 +32744,64 @@ mod tests {
     }
 
     #[test]
-    fn gh459_cursor_workspace_repair_preserves_rows_and_requires_explicit_authority() {
+    fn native_agy_workspace_repair_preserves_existing_messages_and_replay_identity() -> Result<()> {
+        workspace_repair_preserves_rows_and_requires_explicit_authority("antigravity")
+    }
+
+    #[test]
+    fn gh459_cursor_workspace_repair_preserves_rows_and_requires_explicit_authority() -> Result<()>
+    {
+        workspace_repair_preserves_rows_and_requires_explicit_authority("cursor")
+    }
+
+    fn workspace_repair_preserves_rows_and_requires_explicit_authority(
+        agent_slug: &str,
+    ) -> Result<()> {
+        let native_id = "provider-stable-id";
+        let (bound, unresolved, invalid_packets) = match agent_slug {
+            "antigravity" => (
+                serde_json::json!({"workspace_binding": {"state":"bound", "source":"native_conversation_summaries", "native_conversation_id":native_id}, "cass":{"workspace_original":"/remote/my-app"}}),
+                serde_json::json!({"workspace_binding": {"state":"ambiguous", "source":"native_conversation_summaries", "native_conversation_id":native_id}}),
+                [
+                    serde_json::json!({"workspace_binding": {"state":"unavailable", "source":"native_conversation_summaries", "native_conversation_id":native_id}}),
+                    serde_json::json!({"workspace_binding": {"state":"ambiguous", "source":"native_conversation_summaries", "native_conversation_id":"other-session"}}),
+                    serde_json::json!({"workspace_binding": {"state":"missing", "source":"unknown", "native_conversation_id":native_id}}),
+                ],
+            ),
+            _ => (
+                serde_json::json!({"cursor_format":"agent", "cursor_workspace_attribution":"workspace_trusted", "cursor_project_dir":"parent-project-my-app", "cass":{"workspace_original":"/remote/my-app"}}),
+                serde_json::json!({"cursor_format":"agent", "cursor_workspace_attribution":"unresolved"}),
+                [
+                    serde_json::json!({"cursor_format":"agent"}),
+                    serde_json::json!({"cursor_format":"agent", "cursor_workspace_attribution":"workspace_trusted"}),
+                    serde_json::json!({"cursor_format":"ide", "cursor_workspace_attribution":"unresolved"}),
+                ],
+            ),
+        };
         for batched in [false, true] {
-            let dir = TempDir::new().unwrap();
-            let storage = FrankenStorage::open(&dir.path().join("cursor.db")).unwrap();
-            let agent = storage
-                .ensure_agent(&Agent {
-                    id: None,
-                    slug: "cursor".into(),
-                    name: "Cursor".into(),
-                    version: None,
-                    kind: AgentKind::Cli,
-                })
-                .unwrap();
+            let dir = TempDir::new()?;
+            let storage = FrankenStorage::open(&dir.path().join("provider.db"))?;
+            let agent = storage.ensure_agent(&Agent {
+                id: None,
+                slug: agent_slug.into(),
+                name: agent_slug.into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })?;
             let wrong = PathBuf::from("/parent/project/my/app");
             let correct = PathBuf::from("/parent-project/my-app");
-            let wrong_id = storage.ensure_workspace(&wrong, None).unwrap();
-            let correct_id = storage.ensure_workspace(&correct, None).unwrap();
+            let wrong_id = storage.ensure_workspace(&wrong, None)?;
+            let correct_id = storage.ensure_workspace(&correct, None)?;
+            let previous_workspace = match agent_slug {
+                "antigravity" => None,
+                _ => Some(wrong),
+            };
+            let previous_id = previous_workspace.as_ref().map(|_| wrong_id);
             let mut conv = Conversation {
                 id: None,
-                agent_slug: "cursor".into(),
-                workspace: Some(wrong),
-                external_id: Some("cursor-agent-stable-id".into()),
+                agent_slug: agent_slug.into(),
+                workspace: previous_workspace,
+                external_id: Some(native_id.into()),
                 title: Some("unchanged title".into()),
                 source_path: PathBuf::from("/cursor/transcript.jsonl"),
                 started_at: Some(100),
@@ -32754,43 +32821,56 @@ mod tests {
                 source_id: "local".into(),
                 origin_host: None,
             };
-            let original = storage
-                .insert_conversation_tree(agent, Some(wrong_id), &conv)
-                .unwrap();
-            let messages =
-                serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
-                    .unwrap();
+            let original = storage.insert_conversation_tree_with_analytics(
+                agent,
+                previous_id,
+                &conv,
+                false,
+            )?;
+            let messages = serde_json::to_value(storage.fetch_messages(original.conversation_id)?)?;
             storage
-                .set_last_embedded_message_id(storage.max_message_id().unwrap().unwrap())
-                .unwrap();
+                .set_last_embedded_message_id(storage.max_message_id()?.context("seed message")?)?;
             let mut repair_generation = None;
             conv.workspace = Some(correct.clone());
-            conv.metadata_json = serde_json::json!({"cursor_format":"agent", "cursor_workspace_attribution":"workspace_trusted", "cursor_project_dir":"parent-project-my-app", "cass":{"workspace_original":"/remote/my-app"}});
+            conv.metadata_json = bound.clone();
             for expected_change in [true, false] {
+                assert_eq!(
+                    storage.cursor_workspace_repair_needed(
+                        &conv.agent_slug,
+                        &conv.source_id,
+                        conv.external_id.as_deref(),
+                        conv.workspace.as_deref(),
+                        &conv.metadata_json,
+                    )?,
+                    expected_change
+                );
                 let outcome = if batched {
                     storage
-                        .insert_conversations_batched(&[(agent, Some(correct_id), &conv)])
-                        .unwrap()
+                        .insert_conversations_batched_with_analytics(
+                            &[(agent, Some(correct_id), &conv)],
+                            false,
+                        )?
                         .pop()
-                        .unwrap()
+                        .context("single batch outcome")?
                 } else {
-                    storage
-                        .insert_conversation_tree(agent, Some(correct_id), &conv)
-                        .unwrap()
+                    storage.insert_conversation_tree_with_analytics(
+                        agent,
+                        Some(correct_id),
+                        &conv,
+                        false,
+                    )?
                 };
                 assert_eq!(outcome.conversation_id, original.conversation_id);
                 assert!(!outcome.conversation_inserted);
                 assert!(outcome.inserted_indices.is_empty());
                 assert_eq!(outcome.workspace_changed, expected_change);
-                assert_eq!(storage.get_last_embedded_message_id().unwrap(), None);
+                assert_eq!(storage.get_last_embedded_message_id()?, None);
                 let generation = storage
-                    .semantic_identity_rebuild_generation(SemanticIdentityTier::Fast)
-                    .unwrap()
-                    .expect("fast identity debt");
+                    .semantic_identity_rebuild_generation(SemanticIdentityTier::Fast)?
+                    .context("fast identity debt")?;
                 assert_eq!(
                     storage
-                        .semantic_identity_rebuild_generation(SemanticIdentityTier::Quality)
-                        .unwrap()
+                        .semantic_identity_rebuild_generation(SemanticIdentityTier::Quality)?
                         .as_ref(),
                     Some(&generation)
                 );
@@ -32803,7 +32883,7 @@ mod tests {
                         "idempotent replay must retain pending semantic generation"
                     );
                 }
-                let rows = storage.list_conversations(10, 0).unwrap();
+                let rows = storage.list_conversations(10, 0)?;
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].workspace.as_ref(), Some(&correct));
                 assert_eq!(rows[0].metadata_json["keep"]["nested"], 7);
@@ -32813,114 +32893,96 @@ mod tests {
                     "/remote/my-app"
                 );
                 assert_eq!(
-                    serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
-                        .unwrap(),
+                    serde_json::to_value(storage.fetch_messages(original.conversation_id)?)?,
                     messages
                 );
             }
-            storage.close().unwrap();
-            let storage = FrankenStorage::open(&dir.path().join("cursor.db")).unwrap();
+            storage.close()?;
+            let storage = FrankenStorage::open(&dir.path().join("provider.db"))?;
             for tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
                 assert_eq!(
-                    storage.semantic_identity_rebuild_generation(tier).unwrap(),
+                    storage.semantic_identity_rebuild_generation(tier)?,
                     repair_generation,
                     "identity debt must survive reopen"
                 );
             }
             conv.workspace = None;
-            for metadata in [
-                serde_json::json!({"cursor_format":"agent"}),
-                serde_json::json!({"cursor_format":"agent", "cursor_workspace_attribution":"workspace_trusted"}),
-                serde_json::json!({"cursor_format":"ide", "cursor_workspace_attribution":"unresolved"}),
-            ] {
-                conv.metadata_json = metadata;
-                let outcome = storage
-                    .insert_conversation_tree(agent, None, &conv)
-                    .unwrap();
+            for metadata in &invalid_packets {
+                conv.metadata_json = metadata.clone();
+                let outcome =
+                    storage.insert_conversation_tree_with_analytics(agent, None, &conv, false)?;
                 assert!(!outcome.workspace_changed);
                 assert_eq!(
-                    storage.list_conversations(10, 0).unwrap()[0]
-                        .workspace
-                        .as_ref(),
+                    storage.list_conversations(10, 0)?[0].workspace.as_ref(),
                     Some(&correct)
                 );
             }
-            conv.metadata_json = serde_json::json!({"cursor_format":"agent", "cursor_workspace_attribution":"unresolved"});
-            assert!(!cursor_workspace_attribution_is_authoritative(
+            conv.metadata_json = unresolved.clone();
+            assert!(!provider_workspace_attribution_is_authoritative(
                 "codex",
+                conv.external_id.as_deref(),
                 None,
                 &conv.metadata_json
             ));
             let cleared = storage
-                .insert_conversations_batched(&[(agent, None, &conv)])
-                .unwrap()
+                .insert_conversations_batched_with_analytics(&[(agent, None, &conv)], false)?
                 .pop()
-                .unwrap();
+                .context("single clear outcome")?;
             assert!(cleared.workspace_changed);
             assert_eq!(cleared.conversation_id, original.conversation_id);
             assert!(cleared.inserted_indices.is_empty());
+            assert_eq!(storage.list_conversations(10, 0)?[0].workspace, None);
             assert_eq!(
-                storage.list_conversations(10, 0).unwrap()[0].workspace,
-                None
-            );
-            assert_eq!(
-                serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
-                    .unwrap(),
+                serde_json::to_value(storage.fetch_messages(original.conversation_id)?)?,
                 messages
             );
-            let cleared_generation = storage
-                .semantic_identity_rebuild_generation(SemanticIdentityTier::Fast)
-                .unwrap();
+            let cleared_generation =
+                storage.semantic_identity_rebuild_generation(SemanticIdentityTier::Fast)?;
             assert_ne!(
                 cleared_generation, repair_generation,
                 "a second change needs a new semantic generation"
             );
             conv.workspace = Some(correct.clone());
-            conv.metadata_json["cursor_workspace_attribution"] =
-                serde_json::json!("workspace_trusted");
+            conv.metadata_json = bound.clone();
             {
-                let mut tx = storage.conn.transaction().unwrap();
-                assert!(
-                    franken_reconcile_cursor_workspace(
-                        &tx,
-                        agent,
-                        original.conversation_id,
-                        Some(correct_id),
-                        &conv
-                    )
-                    .unwrap()
-                );
-                tx.rollback().unwrap();
+                let mut tx = storage.conn.transaction()?;
+                assert!(franken_reconcile_cursor_workspace(
+                    &tx,
+                    agent,
+                    original.conversation_id,
+                    Some(correct_id),
+                    &conv
+                )?);
+                tx.rollback()?;
             }
-            assert_eq!(
-                storage.list_conversations(10, 0).unwrap()[0].workspace,
-                None
-            );
+            assert_eq!(storage.list_conversations(10, 0)?[0].workspace, None);
             for tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
                 assert_eq!(
-                    storage.semantic_identity_rebuild_generation(tier).unwrap(),
+                    storage.semantic_identity_rebuild_generation(tier)?,
                     cleared_generation,
                     "workspace and both debts must roll back together"
                 );
             }
-            let changed_back = storage
-                .insert_conversation_tree(agent, Some(correct_id), &conv)
-                .unwrap();
+            let changed_back = storage.insert_conversation_tree_with_analytics(
+                agent,
+                Some(correct_id),
+                &conv,
+                false,
+            )?;
             assert!(changed_back.workspace_changed);
-            let returned_generation = storage
-                .semantic_identity_rebuild_generation(SemanticIdentityTier::Fast)
-                .unwrap();
+            let returned_generation =
+                storage.semantic_identity_rebuild_generation(SemanticIdentityTier::Fast)?;
             assert_ne!(
                 returned_generation, repair_generation,
                 "returning to an earlier workspace must not revive an old checkpoint"
             );
             assert_ne!(returned_generation, cleared_generation);
             assert_eq!(
-                serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
-                    .unwrap(),
+                serde_json::to_value(storage.fetch_messages(original.conversation_id)?)?,
                 messages
             );
         }
+        Ok(())
     }
 
     #[test]
