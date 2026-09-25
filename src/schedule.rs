@@ -791,6 +791,7 @@ fn with_state_lock<T>(
     std::fs::create_dir_all(&dir)?;
     let lock = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(state_lock_path(data_dir))?;
@@ -817,6 +818,7 @@ fn save_state_unlocked(data_dir: &Path, state: &ScheduleState) -> std::io::Resul
     std::fs::rename(&tmp, &path)
 }
 
+#[cfg(test)]
 fn save_state(data_dir: &Path, state: &ScheduleState) -> std::io::Result<()> {
     with_state_lock(data_dir, || save_state_unlocked(data_dir, state))
 }

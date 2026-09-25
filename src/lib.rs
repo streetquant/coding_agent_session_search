@@ -21505,9 +21505,8 @@ fn state_meta_json_inner(
         assets.lexical.fresh = true;
         assets.lexical.stale = false;
         assets.lexical.last_indexed_at_ms = Some(manifest_watermark);
-        assets.lexical.age_seconds = Some(
-            now_secs.saturating_sub((manifest_watermark.max(0) as u64) / 1000),
-        );
+        assets.lexical.age_seconds =
+            Some(now_secs.saturating_sub((manifest_watermark.max(0) as u64) / 1000));
         assets.lexical.status_reason = None;
     }
     if !assets.lexical.rebuilding
@@ -91906,6 +91905,10 @@ pub(crate) fn run_doctor_impl(
 
 #[derive(Debug)]
 struct SessionSummaryRecord {
+    conversation_id: i64,
+    external_id: Option<String>,
+    content_hash: Option<String>,
+    source_path_session_count: Option<usize>,
     agent: String,
     workspace: Option<PathBuf>,
     workspace_match_distance: Option<usize>,
@@ -91922,6 +91925,10 @@ struct SessionSummaryRecord {
 
 #[derive(Debug, Serialize)]
 struct SessionSummaryEntry {
+    conversation_id: i64,
+    external_id: Option<String>,
+    content_hash: Option<String>,
+    source_path_session_count: Option<usize>,
     path: String,
     workspace: Option<String>,
     agent: String,
@@ -92037,7 +92044,8 @@ fn run_sessions(
                 c.origin_host,
                 s.kind,
                 c.started_at,
-                c.ended_at
+                c.ended_at,
+                c.external_id
          FROM conversations c
          LEFT JOIN agents a ON c.agent_id = a.id
          LEFT JOIN workspaces w ON c.workspace_id = w.id
@@ -92059,6 +92067,7 @@ fn run_sessions(
         Option<String>,
         Option<i64>,
         Option<i64>,
+        Option<String>,
     )> = conn
         .query_map_collect(&sessions_sql, params, |row: &crate::franken_sync::Row| {
             Ok((
@@ -92072,6 +92081,7 @@ fn run_sessions(
                 row.get_typed(7)?,
                 row.get_typed(8)?,
                 row.get_typed(9)?,
+                row.get_typed(10)?,
             ))
         })
         .map_err(|e| CliError {
@@ -92096,6 +92106,7 @@ fn run_sessions(
                 origin_kind,
                 started_at,
                 ended_at,
+                external_id,
             )| {
                 let source_path_buf = PathBuf::from(&source_path);
                 let origin_host = normalized_provenance_origin_host(origin_host.as_deref());
@@ -92122,6 +92133,10 @@ fn run_sessions(
                     conversation_id,
                     has_recorded_timestamp,
                     SessionSummaryRecord {
+                        conversation_id,
+                        external_id,
+                        content_hash: None,
+                        source_path_session_count: None,
                         agent,
                         workspace: workspace.map(PathBuf::from),
                         workspace_match_distance: None,
@@ -92139,6 +92154,21 @@ fn run_sessions(
             },
         )
         .collect();
+
+    // Importers may already have a legacy path-keyed record. Report whether
+    // that path is unambiguous across this archive, before workspace/limit
+    // filtering. A date-filtered SQL result cannot establish uniqueness.
+    if since_ms.is_none() {
+        let mut path_counts = std::collections::HashMap::new();
+        for (_, _, session) in &sessions {
+            *path_counts
+                .entry(session.source_path.clone()) // ubs:ignore -- Counts own path keys before the subsequent mutable session pass.
+                .or_insert(0_usize) += 1;
+        }
+        for (_, _, session) in &mut sessions {
+            session.source_path_session_count = path_counts.get(&session.source_path).copied();
+        }
+    }
 
     if let Some(since_ms) = since_ms {
         // Rows with a recorded timestamp already satisfied the SQL window
@@ -92187,24 +92217,40 @@ fn run_sessions(
     // PLAN contract test in storage::sqlite), so each lookup is an indexed
     // range scan on messages(conversation_id, idx) and the roles are
     // tallied in Rust — cost scales with the returned page, not the corpus.
-    let count_session_messages =
-        |conversation_id: i64| -> Result<(i64, i64), crate::franken_sync::FrankenError> {
+    let summarize_session_messages =
+        |conversation_id: i64| -> Result<(i64, i64, String), crate::franken_sync::FrankenError> {
+            let mut content_hash = blake3::Hasher::new();
+            content_hash.update(b"cass-archived-message-content-v1\0");
             let roles: Vec<String> = conn.query_map_collect(
-                "SELECT role
+                "SELECT idx, role, content
                  FROM messages INDEXED BY sqlite_autoindex_messages_1
-                 WHERE conversation_id = ?1",
+                 WHERE conversation_id = ?1 ORDER BY idx",
                 &[ParamValue::from(conversation_id)],
-                |row: &crate::franken_sync::Row| row.get_typed::<String>(0),
+                |row: &crate::franken_sync::Row| {
+                    let index: i64 = row.get_typed(0)?;
+                    let role: String = row.get_typed(1)?;
+                    let content: String = row.get_typed(2)?;
+                    content_hash.update(&index.to_le_bytes());
+                    for field in [&role, &content] {
+                        content_hash.update(&(field.len() as u64).to_le_bytes()); // ubs:ignore -- Byte lengths fit u64 on every supported 32/64-bit target; the hash format uses fixed-width lengths.
+                        content_hash.update(field.as_bytes());
+                    }
+                    Ok(role)
+                },
             )?;
             let message_count = roles.len() as i64;
             let human_turns = roles.iter().filter(|role| role.as_str() == "user").count() as i64;
-            Ok((message_count, human_turns))
+            Ok((
+                message_count,
+                human_turns,
+                content_hash.finalize().to_hex().to_string(),
+            ))
         };
     let sessions: Vec<SessionSummaryRecord> = sessions
         .into_iter()
         .map(|(conversation_id, _, mut session)| {
-            let (message_count, human_turns) =
-                count_session_messages(conversation_id).map_err(|e| CliError {
+            let (message_count, human_turns, content_hash) =
+                summarize_session_messages(conversation_id).map_err(|e| CliError {
                     code: 9,
                     kind: CliErrorKind::DbQuery.kind_str(),
                     message: format!("Failed to count session messages: {e}"),
@@ -92213,6 +92259,7 @@ fn run_sessions(
                 })?;
             session.message_count = message_count;
             session.human_turns = human_turns;
+            session.content_hash = Some(content_hash);
             Ok(session)
         })
         .collect::<CliResult<Vec<_>>>()?;
@@ -92220,6 +92267,10 @@ fn run_sessions(
     let entries: Vec<SessionSummaryEntry> = sessions
         .into_iter()
         .map(|session| SessionSummaryEntry {
+            conversation_id: session.conversation_id,
+            external_id: session.external_id,
+            content_hash: session.content_hash,
+            source_path_session_count: session.source_path_session_count,
             path: session.source_path.to_string_lossy().into_owned(),
             workspace: session
                 .workspace
@@ -100668,6 +100719,7 @@ mod response_schema_tests {
         std::fs::create_dir_all(lock_path.parent().expect("lock parent")).expect("lock parent");
         let holder = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)
@@ -102037,6 +102089,7 @@ struct ResolvedView {
     total_lines: usize,
     source_exists: bool,
     archive_only: bool,
+    archive_identity: Option<serde_json::Value>,
 }
 
 enum BoundedViewResolution {
@@ -102128,6 +102181,14 @@ fn resolve_view(
         });
     };
     let archive_only = archive_used && !source_exists;
+    let archive_identity = indexed_view.as_ref().filter(|_| archive_used).map(|view| {
+        serde_json::json!({
+            "conversation_id": view.convo.id,
+            "external_id": view.convo.external_id,
+            "source_id": view.convo.source_id,
+            "agent": view.convo.agent_slug,
+        })
+    });
 
     if lines.is_empty() {
         return Err(CliError {
@@ -102175,6 +102236,7 @@ fn resolve_view(
         total_lines,
         source_exists,
         archive_only,
+        archive_identity,
     })
 }
 
@@ -102417,6 +102479,7 @@ fn run_bounded_view(
                 "total_lines": resolved.total_lines,
                 "source_exists": resolved.source_exists,
                 "archive_only": resolved.archive_only,
+                "archive_identity": resolved.archive_identity,
                 "budget": budget,
             }),
             format,
@@ -106246,17 +106309,18 @@ fn run_index_with_data(
                 ))
             })
             .unwrap_or((0, 0));
-        let (quarantined_conversations, lexical_update_deferred, final_wal_checkpoint) = index_progress
-            .stats
-            .lock()
-            .map(|stats| {
-                (
-                    stats.quarantined_conversations,
-                    stats.lexical_update_deferred,
-                    stats.final_wal_checkpoint.clone(),
-                )
-            })
-            .unwrap_or_default();
+        let (quarantined_conversations, lexical_update_deferred, final_wal_checkpoint) =
+            index_progress
+                .stats
+                .lock()
+                .map(|stats| {
+                    (
+                        stats.quarantined_conversations,
+                        stats.lexical_update_deferred,
+                        stats.final_wal_checkpoint.clone(),
+                    )
+                })
+                .unwrap_or_default();
         let mut payload = serde_json::json!({
             "success": true,
             "elapsed_ms": elapsed_ms,

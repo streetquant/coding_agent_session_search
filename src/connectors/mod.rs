@@ -238,6 +238,7 @@ pub mod chatgpt;
 pub mod claude_code;
 pub mod clawdbot;
 pub mod cline;
+pub mod cloudmcp;
 pub mod codex;
 pub mod copilot;
 pub mod copilot_cli;
@@ -248,6 +249,7 @@ pub mod gemini;
 pub mod goose;
 pub mod grok;
 pub mod hermes;
+pub mod kilo;
 pub mod kimi;
 pub mod muse;
 pub mod omp;
@@ -263,6 +265,10 @@ pub type ConnectorFactory = fn() -> Box<dyn Connector + Send>;
 
 fn claude_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(claude_code::ClaudeCodeConnector::new())
+}
+
+fn cline_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(cline::ClineConnector::new())
 }
 
 fn antigravity_connector_factory() -> Box<dyn Connector + Send> {
@@ -295,19 +301,24 @@ fn pi_agent_connector_factory() -> Box<dyn Connector + Send> {
 /// that prevents broad explicit roots from indexing the same store twice.
 #[must_use]
 pub fn get_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
-    franken_agent_detection::get_connector_factories()
-        .into_iter()
-        .map(|(name, factory)| {
-            let factory = match name {
-                "antigravity" => antigravity_connector_factory as ConnectorFactory,
-                "claude" => claude_connector_factory as ConnectorFactory,
-                "codex" => codex_connector_factory as ConnectorFactory,
-                "cursor" => cursor_connector_factory as ConnectorFactory,
-                "omp" => omp_connector_factory as ConnectorFactory,
-                "pi_agent" => pi_agent_connector_factory as ConnectorFactory,
-                _ => factory,
-            };
-            (name, factory)
-        })
-        .collect()
+    let mut factories: Vec<(&'static str, ConnectorFactory)> =
+        franken_agent_detection::get_connector_factories()
+            .into_iter()
+            .map(|(name, factory)| {
+                let factory = match name {
+                    "antigravity" => antigravity_connector_factory as ConnectorFactory,
+                    "claude" => claude_connector_factory as ConnectorFactory,
+                    "cline" => cline_connector_factory as ConnectorFactory,
+                    "codex" => codex_connector_factory as ConnectorFactory,
+                    "cursor" => cursor_connector_factory as ConnectorFactory,
+                    "omp" => omp_connector_factory as ConnectorFactory,
+                    "pi_agent" => pi_agent_connector_factory as ConnectorFactory,
+                    _ => factory,
+                };
+                (name, factory)
+            })
+            .collect();
+    factories.push(("kilo", || Box::new(kilo::KiloConnector::new())));
+    factories.push(("cloudmcp", || Box::new(cloudmcp::CloudMcpConnector::new())));
+    factories
 }

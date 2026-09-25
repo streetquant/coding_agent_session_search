@@ -10,11 +10,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use serde_json::json;
 use walkdir::WalkDir;
 
 use super::{
-    Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation, ScanContext, ScanRoot,
+    Connector, DetectionResult, DiscoveredSourceFile, DiscoveredSourceRole, NormalizedConversation,
+    ScanContext, ScanRoot, file_modified_since,
 };
+use crate::franken_sync::compat::{ConnectionExt, OpenFlags, RowExt, open_with_flags};
 
 pub struct AntigravityConnector {
     inner: franken_agent_detection::AntigravityConnector,
@@ -23,6 +26,63 @@ pub struct AntigravityConnector {
 struct SelectedContext {
     scan: ScanContext,
     original_roots: HashMap<PathBuf, PathBuf>,
+    workspace_metadata: HashMap<PathBuf, Option<HashMap<String, String>>>,
+}
+
+impl SelectedContext {
+    fn bind_workspace(&self, conversation: &mut NormalizedConversation) {
+        let Some(dir) =
+            AntigravityConnector::conversation_dir_for_transcript(&conversation.source_path)
+        else {
+            return;
+        };
+        let Some(database) = AntigravityConnector::summary_database(dir) else {
+            return;
+        };
+        let native_id = dir.file_name().and_then(|name| name.to_str());
+        let rows = self
+            .workspace_metadata
+            .get(&database)
+            .and_then(Option::as_ref);
+        let raw = native_id.and_then(|id| rows.and_then(|rows| rows.get(id)));
+        let mut state = if rows.is_some() {
+            "missing"
+        } else {
+            "unavailable"
+        };
+        if let Some(raw) = raw {
+            match serde_json::from_str::<Vec<String>>(raw) {
+                Ok(uris) => {
+                    let paths: Option<HashSet<PathBuf>> = uris
+                        .iter()
+                        .map(|uri| {
+                            let url = url::Url::parse(uri).ok()?;
+                            if url.query().is_some() || url.fragment().is_some() {
+                                return None;
+                            }
+                            url.to_file_path().ok().filter(|path| path.is_absolute())
+                        })
+                        .collect();
+                    match paths {
+                        Some(paths) if paths.len() == 1 => {
+                            conversation.workspace = paths.into_iter().next();
+                            state = "bound";
+                        }
+                        Some(paths) if paths.is_empty() => state = "missing",
+                        Some(_) => state = "ambiguous",
+                        None => state = "invalid",
+                    }
+                }
+                Err(_) => state = "invalid",
+            }
+        }
+        conversation.metadata["workspace_binding"] = json!({
+            "state": state,
+            "source": "native_conversation_summaries",
+            "source_path": database,
+            "native_conversation_id": native_id,
+        });
+    }
 }
 
 impl Default for AntigravityConnector {
@@ -78,6 +138,25 @@ impl AntigravityConnector {
             .and_then(Path::parent)
     }
 
+    fn summary_database(conversation_dir: &Path) -> Option<PathBuf> {
+        conversation_dir
+            .parent()
+            .filter(|parent| parent.file_name().is_some_and(|name| name == "brain"))
+            .and_then(Path::parent)
+            .map(|root| root.join("conversation_summaries.db"))
+    }
+
+    fn read_workspaces(path: &Path) -> Result<HashMap<String, String>> {
+        // This is agent-owned state. Never create, migrate, checkpoint, or write it.
+        let db = open_with_flags(&path.to_string_lossy(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let rows = db.query_map_collect(
+            "SELECT conversation_id, workspace_uris FROM conversation_summaries",
+            &[],
+            |row| Ok((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?)),
+        )?;
+        Ok(rows.into_iter().collect())
+    }
+
     fn selected_context(&self, ctx: &ScanContext) -> SelectedContext {
         let mut roots = if ctx.use_default_detection() {
             Self::default_roots(ctx)
@@ -89,7 +168,18 @@ impl AntigravityConnector {
         let mut selected = Vec::new();
         let mut seen = HashSet::new();
         let mut original_roots = HashMap::new();
-        for root in roots {
+        for mut root in roots {
+            if root.path.is_file()
+                && root
+                    .path
+                    .file_name()
+                    .is_some_and(|name| name == "transcript.jsonl")
+                && let Some(conversation_dir) = Self::conversation_dir_for_transcript(&root.path)
+            {
+                let path = conversation_dir.to_path_buf();
+                original_roots.insert(path.clone(), root.path.clone());
+                root = root.with_path(path);
+            }
             if Self::transcript_for_conversation(&root.path).is_file() {
                 if seen.insert(root.path.clone()) {
                     selected.push(root);
@@ -121,9 +211,25 @@ impl AntigravityConnector {
         }
         let mut selected_ctx = ctx.clone();
         selected_ctx.scan_roots = selected;
+        let mut workspace_metadata = HashMap::new();
+        for root in &selected_ctx.scan_roots {
+            if let Some(database) = Self::summary_database(&root.path) {
+                if ctx.since_ts.is_some()
+                    && (file_modified_since(&database, ctx.since_ts)
+                        || file_modified_since(&database.with_extension("db-wal"), ctx.since_ts))
+                {
+                    // A metadata change can bind an unchanged transcript to its workspace.
+                    selected_ctx.since_ts = None;
+                }
+                workspace_metadata
+                    .entry(database)
+                    .or_insert_with_key(|path| Self::read_workspaces(path).ok());
+            }
+        }
         SelectedContext {
             scan: selected_ctx,
             original_roots,
+            workspace_metadata,
         }
     }
 }
@@ -138,7 +244,11 @@ impl Connector for AntigravityConnector {
         if selected.scan.scan_roots.is_empty() {
             return Ok(Vec::new());
         }
-        self.inner.scan(&selected.scan)
+        let mut conversations = self.inner.scan(&selected.scan)?;
+        for conversation in &mut conversations {
+            selected.bind_workspace(conversation);
+        }
+        Ok(conversations)
     }
 
     fn supports_streaming_scan(&self) -> bool {
@@ -156,6 +266,48 @@ impl Connector for AntigravityConnector {
                 source.scan_root = original_root.clone();
             }
         }
+        let mut seen: HashSet<PathBuf> = discovered
+            .iter()
+            .map(|source| source.source_path.clone())
+            .collect();
+        for root in &selected.scan.scan_roots {
+            if let Some(database) = Self::summary_database(&root.path)
+                && database.is_file()
+                && seen.insert(database.clone())
+            {
+                let original = selected
+                    .original_roots
+                    .get(&root.path)
+                    .unwrap_or(&root.path);
+                let source_root = root.with_path(original.clone());
+                discovered.push(
+                    DiscoveredSourceFile::new(
+                        "antigravity",
+                        &source_root,
+                        database,
+                        DiscoveredSourceRole::MetadataSidecar,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                );
+                let wal =
+                    Self::summary_database(&root.path).map(|path| path.with_extension("db-wal"));
+                if let Some(wal) = wal
+                    && wal.is_file()
+                {
+                    discovered.push(
+                        DiscoveredSourceFile::new(
+                            "antigravity",
+                            &source_root,
+                            wal,
+                            DiscoveredSourceRole::MetadataSidecar,
+                            false,
+                        )
+                        .with_fs_metadata(),
+                    );
+                }
+            }
+        }
         Ok(discovered)
     }
 
@@ -169,6 +321,9 @@ impl Connector for AntigravityConnector {
             return Ok(());
         }
         self.inner
-            .scan_with_callback(&selected.scan, on_conversation)
+            .scan_with_callback(&selected.scan, &mut |mut conversation| {
+                selected.bind_workspace(&mut conversation);
+                on_conversation(conversation)
+            })
     }
 }

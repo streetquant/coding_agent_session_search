@@ -8,7 +8,7 @@
 //! self-contained HTML document with no script or network dependency.
 
 use crate::pages::redact::redact_swarm_text;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Stable schema identifier for the normalized dashboard model.
 pub const SCHEMA_VERSION: &str = "cass.swarm.operations_dashboard.v1";

@@ -54,12 +54,12 @@ use crate::connector_ingest_diagnostics::{
 use crate::connectors::{
     Connector, ScanRoot, aider::AiderConnector, amp::AmpConnector,
     antigravity::AntigravityConnector, chatgpt::ChatGptConnector, claude_code::ClaudeCodeConnector,
-    clawdbot::ClawdbotConnector, cline::ClineConnector, codex::CodexConnector,
-    copilot::CopilotConnector, copilot_cli::CopilotCliConnector, cursor::CursorConnector,
-    factory::FactoryConnector, gemini::GeminiConnector, grok::GrokConnector, kimi::KimiConnector,
-    muse::MuseConnector, omp::OmpConnector, openclaw::OpenClawConnector,
-    opencode::OpenCodeConnector, pi_agent::PiAgentConnector, qwen::QwenConnector,
-    vibe::VibeConnector,
+    clawdbot::ClawdbotConnector, cline::ClineConnector, cloudmcp::CloudMcpConnector,
+    codex::CodexConnector, copilot::CopilotConnector, copilot_cli::CopilotCliConnector,
+    cursor::CursorConnector, factory::FactoryConnector, gemini::GeminiConnector,
+    grok::GrokConnector, kilo::KiloConnector, kimi::KimiConnector, muse::MuseConnector,
+    omp::OmpConnector, openclaw::OpenClawConnector, opencode::OpenCodeConnector,
+    pi_agent::PiAgentConnector, qwen::QwenConnector, vibe::VibeConnector,
 };
 use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
 use crate::model::conversation_packet::{
@@ -27724,6 +27724,8 @@ impl ConnectorKind {
             "vibe" => Some(Self::Vibe),
             "amp" => Some(Self::Amp),
             "opencode" => Some(Self::OpenCode),
+            "kilo" => Some(Self::Kilo),
+            "cloudmcp" => Some(Self::CloudMcp),
             "aider" => Some(Self::Aider),
             "cursor" => Some(Self::Cursor),
             "chatgpt" => Some(Self::ChatGpt),
@@ -27759,6 +27761,8 @@ impl ConnectorKind {
             Self::Vibe => "vibe",
             Self::Amp => "amp",
             Self::OpenCode => "opencode",
+            Self::Kilo => "kilo",
+            Self::CloudMcp => "cloudmcp",
             Self::Aider => "aider",
             Self::Cursor => "cursor",
             Self::ChatGpt => "chatgpt",
@@ -27795,6 +27799,8 @@ impl ConnectorKind {
             Self::Vibe => Box::new(VibeConnector::new()),
             Self::Amp => Box::new(AmpConnector::new()),
             Self::OpenCode => Box::new(OpenCodeConnector::new()),
+            Self::Kilo => Box::new(KiloConnector::new()),
+            Self::CloudMcp => Box::new(CloudMcpConnector::new()),
             Self::Aider => Box::new(AiderConnector::new()),
             Self::Cursor => Box::new(CursorConnector::new()),
             Self::ChatGpt => Box::new(ChatGptConnector::new()),
@@ -28979,6 +28985,10 @@ enum ConnectorKind {
     Vibe,
     #[serde(rename = "am", alias = "Amp")]
     Amp,
+    #[serde(rename = "kl", alias = "Kilo")]
+    Kilo,
+    #[serde(rename = "mc", alias = "CloudMcp")]
+    CloudMcp,
     #[serde(rename = "oc", alias = "OpenCode")]
     OpenCode,
     #[serde(rename = "ai", alias = "Aider")]
@@ -29298,7 +29308,22 @@ fn explicit_watch_once_connector_hint(path: &Path) -> Option<ConnectorKind> {
             .any(|window| window[0] == left && window[1] == right)
     };
 
-    if has_pair(".codex", "sessions") {
+    if crate::connectors::cloudmcp::rollout_header(path).is_some() {
+        Some(ConnectorKind::CloudMcp)
+    // ubs:ignore -- This compares a public database filename, not a credential.
+    } else if path.file_name().is_some_and(|name| name == "kilo.db")
+        // ubs:ignore -- This compares a public extension directory name, not a credential.
+        || components.iter().any(|name| name == "kilocode.kilo-code")
+    {
+        Some(ConnectorKind::Kilo)
+    } else if has_pair("contextos", "transcripts")
+        && path
+            .file_name()
+            // ubs:ignore -- These are public transcript filenames, not credentials.
+            .is_some_and(|name| name == "manifest.json" || name == "transcript.jsonl")
+    {
+        Some(ConnectorKind::CloudMcp)
+    } else if has_pair(".codex", "sessions") {
         Some(ConnectorKind::Codex)
     } else if has_pair(".claude", "projects") {
         Some(ConnectorKind::Claude)
@@ -61392,18 +61417,39 @@ mod tests {
         assert_eq!(names, vec!["codex"]);
     }
 
-    /// The cass registry mirrors the upstream one entry for entry: the three
-    /// cass adapters (codex, omp, pi_agent) replace the upstream factory, and
-    /// every other entry behaves like the upstream connector. The pass-through
+    /// Upstream entries retain their routing, and CASS-native providers append
+    /// explicit factories. The pass-through
     /// half is asserted behaviorally — same detection result and streaming
     /// capability from both factories — because function-pointer identity
     /// (`fn_addr_eq`) is not guaranteed across codegen units and failed on two
     /// otherwise-green fleet runs (bead zgzva).
     #[test]
-    fn cass_connector_registry_installs_every_cass_adapter() {
+    fn cass_connector_registry_installs_every_cass_adapter() -> anyhow::Result<()> {
         let upstream = franken_agent_detection::get_connector_factories();
         let configured = get_connector_factories();
-        assert_eq!(configured.len(), upstream.len());
+        anyhow::ensure!(configured.len() == upstream.len() + 2);
+
+        for native in ["kilo", "cloudmcp"] {
+            anyhow::ensure!(
+                configured
+                    .iter()
+                    // ubs:ignore -- Compare public connector slugs, not authentication tokens.
+                    .filter(|(name, _)| *name == native)
+                    .count()
+                    == 1,
+                "native connector {native} must be registered exactly once"
+            );
+            let kind = ConnectorKind::from_slug(native)
+                .ok_or_else(|| anyhow::anyhow!("missing native watch route {native}"))?;
+            // ubs:ignore -- This verifies a public connector route, not a credential.
+            anyhow::ensure!(kind.slug() == native);
+            let serialized = serde_json::to_string(&kind)?;
+            anyhow::ensure!(
+                // ubs:ignore -- This verifies connector enum serialization, not a secret.
+                serde_json::from_str::<ConnectorKind>(&serialized)? == kind,
+                "native route must survive serialization"
+            );
+        }
 
         for ((configured_name, configured_factory), (upstream_name, upstream_factory)) in
             configured.into_iter().zip(upstream)
@@ -61434,7 +61480,7 @@ mod tests {
                 ),
                 "{configured_name}: watch/quarantine must use the configured connector"
             );
-            if matches!(configured_name, "codex" | "omp" | "pi_agent") {
+            if matches!(configured_name, "cline" | "codex" | "omp" | "pi_agent") {
                 assert!(
                     !std::ptr::fn_addr_eq(configured_factory, upstream_factory),
                     "{configured_name}: cass must install its own adapter, not the upstream one"
@@ -61461,6 +61507,7 @@ mod tests {
                 );
             }
         }
+        Ok(())
     }
 
     #[test]

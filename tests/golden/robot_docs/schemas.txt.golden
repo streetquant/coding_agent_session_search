@@ -401,6 +401,8 @@ schemas: (auto-generated from contract)
       - fresh: boolean
       - hollow: boolean
       - last_indexed_at: ?
+      - lexical_last_merge_at: ?
+      - lexical_segment_count: ?
       - live_documents: ?
       - partial: boolean
       - partial_reason: ?
@@ -408,6 +410,10 @@ schemas: (auto-generated from contract)
       - reason: ?
       - rebuilding: boolean
       - segment_files: ?
+      - segment_pressure: ?
+        - active: boolean
+        - count: integer
+        - threshold: integer
       - stale: boolean
       - stale_threshold_seconds: integer
       - stalled: boolean
@@ -3005,6 +3011,8 @@ schemas: (auto-generated from contract)
         - fresh: boolean
         - hollow: boolean
         - last_indexed_at: ?
+        - lexical_last_merge_at: ?
+        - lexical_segment_count: ?
         - live_documents: ?
         - partial: boolean
         - partial_reason: ?
@@ -3012,6 +3020,7 @@ schemas: (auto-generated from contract)
         - reason: ?
         - rebuilding: boolean
         - segment_files: ?
+        - segment_pressure: ?
         - stale: boolean
         - stale_threshold_seconds: integer
         - stalled: boolean
@@ -3507,6 +3516,8 @@ schemas: (auto-generated from contract)
       - fresh: boolean
       - hollow: boolean
       - last_indexed_at: ?
+      - lexical_last_merge_at: ?
+      - lexical_segment_count: ?
       - live_documents: ?
       - partial: boolean
       - partial_reason: ?
@@ -3514,6 +3525,10 @@ schemas: (auto-generated from contract)
       - reason: ?
       - rebuilding: boolean
       - segment_files: ?
+      - segment_pressure: ?
+        - active: boolean
+        - count: integer
+        - threshold: integer
       - stale: boolean
       - stale_threshold_seconds: integer
       - stalled: boolean
@@ -3901,6 +3916,8 @@ schemas: (auto-generated from contract)
       - fresh: boolean
       - hollow: boolean
       - last_indexed_at: ?
+      - lexical_last_merge_at: ?
+      - lexical_segment_count: ?
       - live_documents: ?
       - partial: boolean
       - partial_reason: ?
@@ -3908,6 +3925,10 @@ schemas: (auto-generated from contract)
       - reason: ?
       - rebuilding: boolean
       - segment_files: ?
+      - segment_pressure: ?
+        - active: boolean
+        - count: integer
+        - threshold: integer
       - stale: boolean
       - stale_threshold_seconds: integer
       - stalled: boolean
@@ -4170,6 +4191,8 @@ schemas: (auto-generated from contract)
         - hollow: boolean
         - inspected: boolean
         - last_indexed_at: ?
+        - lexical_last_merge_at: ?
+        - lexical_segment_count: ?
         - live_documents: ?
         - partial: boolean
         - partial_reason: ?
@@ -4177,6 +4200,7 @@ schemas: (auto-generated from contract)
         - reason: ?
         - rebuilding: boolean
         - segment_files: ?
+        - segment_pressure: ?
         - stale: boolean
         - stale_threshold_seconds: integer
         - stalled: boolean

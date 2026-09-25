@@ -129,7 +129,6 @@ fn isolated_search_demo_data() -> Result<TempDir, Box<dyn Error>> {
         .truncate(false)
         .read(true)
         .write(true)
-        .truncate(false)
         .open(&snapshot_lock_path)?;
     snapshot_lock.lock_shared()?;
 
@@ -1230,6 +1229,142 @@ fn current_session_aliases_route_to_sessions_current() -> Result<(), Box<dyn Err
             sessions[0]["workspace"].as_str(),
             Some(expected_workspace.as_str())
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn sessions_preserve_distinct_archive_identity_for_a_shared_source_path()
+-> Result<(), Box<dyn Error>> {
+    use coding_agent_search::franken_sync::compat::ConnectionExt;
+
+    fn require(condition: bool, message: &str) -> Result<(), Box<dyn Error>> {
+        if condition {
+            Ok(())
+        } else {
+            Err(message.into())
+        }
+    }
+
+    let data_dir = isolated_search_demo_data_for_current_workspace()?;
+    let db_path = data_dir.path().join("agent_search.db");
+    let conn = coding_agent_search::franken_sync::Connection::open(
+        db_path.to_string_lossy().into_owned(),
+    )?;
+    conn.execute_compat(
+        "INSERT INTO conversations (id, agent_id, workspace_id, external_id, title, source_path, source_id)
+         SELECT 900001, agent_id, workspace_id, 'shared-path-second-session', title, source_path, source_id
+         FROM conversations WHERE workspace_id = 1 LIMIT 1",
+        &[],
+    )?;
+    conn.execute_compat(
+        "INSERT INTO messages (conversation_id, idx, role, content)
+         VALUES (900001, 0, 'user', 'Distinct shared-path session content')",
+        &[],
+    )?;
+    drop(conn);
+
+    let list = || -> Result<Value, Box<dyn Error>> {
+        let output = base_cmd()
+            .args([
+                "sessions",
+                "--current",
+                "--limit",
+                "0",
+                "--json",
+                "--data-dir",
+            ])
+            .arg(data_dir.path())
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "sessions failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(serde_json::from_slice(&output.stdout)?)
+    };
+    let first = list()?;
+    require(
+        first == list()?,
+        "unchanged archive retains identities and hashes",
+    )?;
+    let sessions = first
+        .get("sessions")
+        .and_then(Value::as_array)
+        .ok_or("sessions array missing")?;
+    let [left, right] = sessions.as_slice() else {
+        return Err("expected exactly two shared-path sessions".into());
+    };
+    require(
+        left.get("path").ok_or("left path missing")?
+            == right.get("path").ok_or("right path missing")?,
+        "fixture sessions must share one source path",
+    )?;
+    for key in ["external_id", "conversation_id", "content_hash"] {
+        require(
+            left.get(key).ok_or("left identity field missing")?
+                != right.get(key).ok_or("right identity field missing")?,
+            "distinct sessions must have distinct native and archive identities and content hashes",
+        )?;
+    }
+    for session in sessions {
+        require(
+            session
+                .get("source_path_session_count")
+                .and_then(Value::as_u64)
+                == Some(2),
+            "summary must report both sessions sharing the path",
+        )?;
+        let hash = session
+            .get("content_hash")
+            .and_then(Value::as_str)
+            .ok_or("content hash missing")?;
+        require(
+            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "content hash must be 64 hexadecimal digits",
+        )?;
+    }
+    let second = sessions
+        .iter()
+        // ubs:ignore -- This compares a fixed fixture row ID, not a session credential.
+        .find(|session| session.get("conversation_id").and_then(Value::as_i64) == Some(900001))
+        .ok_or("second session missing")?;
+    let output = base_cmd()
+        .arg("--db")
+        .arg(&db_path)
+        .args(["view", "--json", "--conversation-id", "900001"])
+        .arg("--")
+        .arg(
+            second
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or("source path missing")?,
+        )
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("view failed: {}", String::from_utf8_lossy(&output.stderr)).into());
+    }
+    let view: Value = serde_json::from_slice(&output.stdout)?;
+    require(
+        view.to_string()
+            .contains("Distinct shared-path session content"),
+        "view must select the exact second session content",
+    )?;
+    let identity = view
+        .get("archive_identity")
+        .ok_or("archive identity missing")?;
+    require(
+        identity.get("conversation_id").and_then(Value::as_i64) == Some(900001),
+        "view must return the requested archive conversation identity",
+    )?;
+    for key in ["external_id", "source_id", "agent"] {
+        require(
+            identity.get(key).ok_or("view identity field missing")?
+                == second.get(key).ok_or("summary identity field missing")?,
+            "view and summary must agree on native source and agent identity",
+        )?;
     }
     Ok(())
 }

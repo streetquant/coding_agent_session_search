@@ -39,6 +39,9 @@ impl Connector for CodexConnector {
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let mut conversations = self.inner.scan(ctx)?;
+        conversations.retain(|conversation| {
+            super::cloudmcp::rollout_header(&conversation.source_path).is_none()
+        });
         for conversation in &mut conversations {
             augment_modern_codex_messages(conversation, ctx.progress_tick.as_deref());
         }
@@ -50,7 +53,9 @@ impl Connector for CodexConnector {
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        self.inner.discover_source_files(ctx)
+        let mut sources = self.inner.discover_source_files(ctx)?;
+        sources.retain(|source| super::cloudmcp::rollout_header(&source.source_path).is_none());
+        Ok(sources)
     }
 
     fn scan_with_callback(
@@ -59,6 +64,9 @@ impl Connector for CodexConnector {
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
         self.inner.scan_with_callback(ctx, &mut |mut conversation| {
+            if super::cloudmcp::rollout_header(&conversation.source_path).is_some() {
+                return Ok(());
+            }
             augment_modern_codex_messages(&mut conversation, ctx.progress_tick.as_deref());
             on_conversation(conversation)
         })

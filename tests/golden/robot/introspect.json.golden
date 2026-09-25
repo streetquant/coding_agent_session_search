@@ -5792,6 +5792,35 @@
                 "null"
               ]
             },
+            "lexical_segment_count": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "lexical_last_merge_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "segment_pressure": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "active": {
+                  "type": "boolean"
+                },
+                "count": {
+                  "type": "integer"
+                },
+                "threshold": {
+                  "type": "integer"
+                }
+              }
+            },
             "empty_with_messages": {
               "type": "boolean"
             },
@@ -29552,6 +29581,35 @@
                     "null"
                   ]
                 },
+                "lexical_segment_count": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "lexical_last_merge_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "segment_pressure": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "properties": {
+                    "active": {
+                      "type": "boolean"
+                    },
+                    "count": {
+                      "type": "integer"
+                    },
+                    "threshold": {
+                      "type": "integer"
+                    }
+                  }
+                },
                 "empty_with_messages": {
                   "type": "boolean"
                 },
@@ -32085,6 +32143,35 @@
                         "null"
                       ]
                     },
+                    "lexical_segment_count": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "lexical_last_merge_at": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "segment_pressure": {
+                      "type": [
+                        "object",
+                        "null"
+                      ],
+                      "properties": {
+                        "active": {
+                          "type": "boolean"
+                        },
+                        "count": {
+                          "type": "integer"
+                        },
+                        "threshold": {
+                          "type": "integer"
+                        }
+                      }
+                    },
                     "empty_with_messages": {
                       "type": "boolean"
                     },
@@ -33326,6 +33413,35 @@
                 "integer",
                 "null"
               ]
+            },
+            "lexical_segment_count": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "lexical_last_merge_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "segment_pressure": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "active": {
+                  "type": "boolean"
+                },
+                "count": {
+                  "type": "integer"
+                },
+                "threshold": {
+                  "type": "integer"
+                }
+              }
             },
             "empty_with_messages": {
               "type": "boolean"
@@ -35422,6 +35538,35 @@
                 "null"
               ]
             },
+            "lexical_segment_count": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "lexical_last_merge_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "segment_pressure": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "active": {
+                  "type": "boolean"
+                },
+                "count": {
+                  "type": "integer"
+                },
+                "threshold": {
+                  "type": "integer"
+                }
+              }
+            },
             "empty_with_messages": {
               "type": "boolean"
             },
@@ -37517,6 +37662,35 @@
                     "integer",
                     "null"
                   ]
+                },
+                "lexical_segment_count": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "lexical_last_merge_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "segment_pressure": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "properties": {
+                    "active": {
+                      "type": "boolean"
+                    },
+                    "count": {
+                      "type": "integer"
+                    },
+                    "threshold": {
+                      "type": "integer"
+                    }
+                  }
                 },
                 "empty_with_messages": {
                   "type": "boolean"

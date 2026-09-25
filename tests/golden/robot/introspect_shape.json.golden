@@ -4271,6 +4271,68 @@
                             }
                           }
                         },
+                        "lexical_segment_count": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "lexical_last_merge_at": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "segment_pressure": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "properties": {
+                              "type": "object",
+                              "properties": {
+                                "active": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "count": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "threshold": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        },
                         "empty_with_messages": {
                           "type": "object",
                           "properties": {
@@ -54832,6 +54894,68 @@
                                     }
                                   }
                                 },
+                                "lexical_segment_count": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "lexical_last_merge_at": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "segment_pressure": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "properties": {
+                                      "type": "object",
+                                      "properties": {
+                                        "active": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "count": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "threshold": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                },
                                 "empty_with_messages": {
                                   "type": "object",
                                   "properties": {
@@ -60650,6 +60774,68 @@
                                             }
                                           }
                                         },
+                                        "lexical_segment_count": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "lexical_last_merge_at": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "segment_pressure": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            },
+                                            "properties": {
+                                              "type": "object",
+                                              "properties": {
+                                                "active": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                },
+                                                "count": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                },
+                                                "threshold": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                }
+                                              }
+                                            }
+                                          }
+                                        },
                                         "empty_with_messages": {
                                           "type": "object",
                                           "properties": {
@@ -63329,6 +63515,68 @@
                               "type": "array",
                               "items": {
                                 "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "lexical_segment_count": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "lexical_last_merge_at": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "segment_pressure": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "properties": {
+                              "type": "object",
+                              "properties": {
+                                "active": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "count": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "threshold": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                }
                               }
                             }
                           }
@@ -67852,6 +68100,68 @@
                             }
                           }
                         },
+                        "lexical_segment_count": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "lexical_last_merge_at": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "segment_pressure": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "properties": {
+                              "type": "object",
+                              "properties": {
+                                "active": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "count": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "threshold": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        },
                         "empty_with_messages": {
                           "type": "object",
                           "properties": {
@@ -72322,6 +72632,68 @@
                                       "type": "array",
                                       "items": {
                                         "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "lexical_segment_count": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "lexical_last_merge_at": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "segment_pressure": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "properties": {
+                                      "type": "object",
+                                      "properties": {
+                                        "active": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "count": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "threshold": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        }
                                       }
                                     }
                                   }

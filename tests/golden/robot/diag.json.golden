@@ -164,6 +164,16 @@
       "name": "hermes",
       "path": "(not detected)",
       "found": false
+    },
+    {
+      "name": "kilo",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "cloudmcp",
+      "path": "(not detected)",
+      "found": false
     }
   ]
 }

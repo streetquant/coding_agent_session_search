@@ -13,11 +13,15 @@
 //! `scan_roots` is empty, so every test passes an explicit `ScanRoot` at the
 //! fixture base — never relying on default detection.
 
+use anyhow::{Context, Result, ensure};
 use coding_agent_search::connectors::antigravity::AntigravityConnector;
 use coding_agent_search::connectors::gemini::GeminiConnector;
 use coding_agent_search::connectors::{Connector, DiscoveredSourceRole, ScanContext, ScanRoot};
+use coding_agent_search::franken_sync::Connection;
+use coding_agent_search::franken_sync::compat::ConnectionExt;
+use coding_agent_search::franken_sync::params;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const FIXTURE_UUID: &str = "aaaa1111-bbbb-2222-cccc-333344445555";
 
@@ -283,4 +287,194 @@ fn legacy_gemini_connector_still_indexes() {
     let convs = GeminiConnector::new().scan(&ctx).expect("gemini scan");
     assert!(!convs.is_empty(), "legacy gemini fixture must still index");
     assert!(convs.iter().all(|c| c.agent_slug == "gemini"));
+}
+
+fn workspace_fixture(base: &Path, native_id: &str, workspace_uris: &str) -> Result<ScanContext> {
+    let logs = base
+        .join("brain")
+        .join(FIXTURE_UUID)
+        .join(".system_generated/logs");
+    fs::create_dir_all(&logs)?;
+    fs::copy(
+        fixture_base()
+            .join("brain")
+            .join(FIXTURE_UUID)
+            .join(".system_generated/logs/transcript.jsonl"),
+        logs.join("transcript.jsonl"),
+    )?;
+    let db = Connection::open(
+        base.join("conversation_summaries.db")
+            .to_string_lossy()
+            .to_string(),
+    )?;
+    db.execute("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, workspace_uris TEXT NOT NULL)")?;
+    db.execute_compat(
+        "INSERT INTO conversation_summaries VALUES (?1, ?2)",
+        params![native_id, workspace_uris],
+    )?;
+    Ok(ScanContext::with_roots(
+        base.to_path_buf(),
+        vec![ScanRoot::local(base.to_path_buf())],
+        None,
+    ))
+}
+
+#[test]
+fn native_workspace_binding_is_read_only_and_streaming_matches_scan() -> Result<()> {
+    let tmp = tempfile::TempDir::new()?;
+    let base = tmp.path().join("antigravity-cli");
+    let ctx = workspace_fixture(&base, FIXTURE_UUID, r#"["file:///work/exact%20workspace"]"#)?;
+    let database = base.join("conversation_summaries.db");
+    let original = fs::read(&database)?;
+    let connector = AntigravityConnector::new();
+    let conversations = connector.scan(&ctx)?;
+    let conversation = conversations
+        .first()
+        .context("native conversation missing")?;
+    ensure!(conversation.workspace.as_deref() == Some(Path::new("/work/exact workspace")));
+    ensure!(conversation.metadata["workspace_binding"]["state"] == "bound");
+    let mut streamed = Vec::new();
+    connector.scan_with_callback(&ctx, &mut |c| {
+        streamed.push(c);
+        Ok(())
+    })?;
+    ensure!(serde_json::to_value(&streamed)? == serde_json::to_value(&conversations)?);
+    ensure!(
+        fs::read(&database)? == original,
+        "agent-owned summary database changed"
+    );
+    let sources = connector.discover_source_files(&ctx)?;
+    ensure!(sources.iter().any(|source| source.source_path == database
+        && source.role == DiscoveredSourceRole::MetadataSidecar
+        && source.scan_root == base));
+    Ok(())
+}
+
+#[test]
+fn explicit_native_transcript_root_preserves_workspace_and_discovery() -> Result<()> {
+    let tmp = tempfile::TempDir::new()?;
+    let base = tmp.path().join(".gemini/antigravity-cli");
+    let mut ctx = workspace_fixture(&base, FIXTURE_UUID, r#"["file:///work/exact"]"#)?;
+    let transcript = base
+        .join("brain")
+        .join(FIXTURE_UUID)
+        .join(".system_generated/logs/transcript.jsonl");
+    ctx.scan_roots = vec![ScanRoot::local(transcript.clone())];
+    let connector = AntigravityConnector::new();
+    let conversations = connector.scan(&ctx)?;
+    ensure!(conversations.len() == 1);
+    ensure!(conversations[0].workspace.as_deref() == Some(Path::new("/work/exact")));
+    let sources = connector.discover_source_files(&ctx)?;
+    ensure!(
+        sources
+            .iter()
+            .any(|source| source.source_path == transcript)
+    );
+    ensure!(
+        sources
+            .iter()
+            .any(|source| source.source_path == base.join("conversation_summaries.db"))
+    );
+    ensure!(sources.iter().all(|source| source.scan_root == transcript));
+    let mut streamed = Vec::new();
+    connector.scan_with_callback(&ctx, &mut |c| {
+        streamed.push(c);
+        Ok(())
+    })?;
+    ensure!(serde_json::to_value(&streamed)? == serde_json::to_value(&conversations)?);
+    Ok(())
+}
+
+#[test]
+fn workspace_binding_does_not_guess_missing_ambiguous_or_invalid_roots() -> Result<()> {
+    for (native_id, uris, state) in [
+        (
+            "different-session",
+            r#"["file:///work/elsewhere"]"#,
+            "missing",
+        ),
+        (
+            FIXTURE_UUID,
+            r#"["file:///work/a","file:///work/b"]"#,
+            "ambiguous",
+        ),
+        (FIXTURE_UUID, "[]", "missing"),
+        (FIXTURE_UUID, "not-json", "invalid"),
+        (
+            FIXTURE_UUID,
+            r#"["https://example.invalid/workspace"]"#,
+            "invalid",
+        ),
+        (
+            FIXTURE_UUID,
+            r#"["file:///work/a","file://remote-host/work/b"]"#,
+            "invalid",
+        ),
+    ] {
+        let tmp = tempfile::TempDir::new()?;
+        let ctx = workspace_fixture(&tmp.path().join("antigravity-cli"), native_id, uris)?;
+        let conversations = AntigravityConnector::new().scan(&ctx)?;
+        let c = conversations
+            .first()
+            .context("native conversation missing")?;
+        ensure!(c.workspace.is_none(), "unexpected binding for {uris}");
+        ensure!(
+            c.metadata["workspace_binding"]["state"] == state,
+            "wrong state for {uris}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn native_workspace_binding_preserves_ide_and_cli_identity() -> Result<()> {
+    let tmp = tempfile::TempDir::new()?;
+    let cli = workspace_fixture(
+        &tmp.path().join(".gemini/antigravity-cli"),
+        FIXTURE_UUID,
+        r#"["file:///work/cli"]"#,
+    )?;
+    let ide = workspace_fixture(
+        &tmp.path().join(".gemini/antigravity"),
+        FIXTURE_UUID,
+        r#"["file:///work/ide"]"#,
+    )?;
+    let mut ctx = cli;
+    ctx.scan_roots.extend(ide.scan_roots);
+    let conversations = AntigravityConnector::new().scan(&ctx)?;
+    ensure!(conversations.len() == 2);
+    let ide_id = format!("ide/{FIXTURE_UUID}");
+    ensure!(
+        conversations
+            .iter()
+            .any(|c| c.external_id.as_deref() == Some(FIXTURE_UUID)
+                && c.workspace.as_deref() == Some(Path::new("/work/cli")))
+    );
+    ensure!(
+        conversations
+            .iter()
+            .any(|c| c.external_id.as_deref() == Some(ide_id.as_str())
+                && c.workspace.as_deref() == Some(Path::new("/work/ide")))
+    );
+    Ok(())
+}
+
+#[test]
+fn changed_native_metadata_reindexes_an_unchanged_transcript() -> Result<()> {
+    let tmp = tempfile::TempDir::new()?;
+    let base = tmp.path().join("antigravity-cli");
+    let mut ctx = workspace_fixture(&base, FIXTURE_UUID, r#"["file:///work/bound"]"#)?;
+    let transcript = base
+        .join("brain")
+        .join(FIXTURE_UUID)
+        .join(".system_generated/logs/transcript.jsonl");
+    fs::File::open(&transcript)?
+        .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1))?;
+    ctx.since_ts = Some(2000);
+    let conversations = AntigravityConnector::new().scan(&ctx)?;
+    let c = conversations
+        .first()
+        .context("metadata change failed to refresh old transcript")?;
+    ensure!(c.workspace.as_deref() == Some(Path::new("/work/bound")));
+    Ok(())
 }

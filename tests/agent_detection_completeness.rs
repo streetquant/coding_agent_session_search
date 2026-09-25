@@ -53,6 +53,12 @@ fn probe_slugs() -> HashSet<String> {
 /// no parser implementation (no entry in `get_connector_factories()`).
 const DETECTION_ONLY: &[&str] = &["continue", "windsurf"];
 
+// Native CASS readers are not part of the pinned FAD remote probe registry.
+// In particular, a live Kilo SQLite/WAL must not be rsync-copied as though it
+// were an immutable transcript. Local detection and explicit exported roots
+// are supported; automatic SSH discovery is not advertised for these readers.
+const CASS_NATIVE: &[&str] = &["kilo", "cloudmcp"];
+
 /// Extract a function body from source code, including the braces.
 fn extract_function_body(source: &str, fn_prefix: &str) -> String {
     let start = source
@@ -164,7 +170,17 @@ fn feature_gated_connectors_available() {
              Check Cargo.toml enables the feature for franken-agent-detection"
         );
     }
-    assert_eq!(slugs.len(), 29, "Expected 29 connector factories");
+    assert_eq!(
+        slugs.len(),
+        31,
+        "Expected 29 FAD and 2 native CASS factories"
+    );
+    for native in CASS_NATIVE {
+        assert!(
+            slugs.contains(*native),
+            "Native CASS connector {native} missing"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +198,7 @@ fn probe_paths_cover_all_factory_connectors() {
     // Note: "copilot" factory slug maps to "github-copilot" in KNOWN_CONNECTORS.
     let factory_mapped: HashSet<String> = factory
         .iter()
+        .filter(|s| !CASS_NATIVE.contains(&s.as_str()))
         .map(|s| match s.as_str() {
             "copilot" => "github-copilot".to_string(),
             other => other.to_string(),
@@ -340,6 +357,7 @@ fn agent_counts_consistent_across_apis() {
     // Factory must be a strict subset of detection (after slug mapping)
     let factory_mapped: HashSet<String> = factory
         .iter()
+        .filter(|s| !CASS_NATIVE.contains(&s.as_str()))
         .map(|s| match s.as_str() {
             "copilot" => "github-copilot".to_string(),
             other => other.to_string(),
