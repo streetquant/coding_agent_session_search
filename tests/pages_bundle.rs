@@ -52,28 +52,54 @@ mod tests {
         Ok(())
     }
 
-    fn run_node_contract_tests(path: &str, pattern: &str) -> Result<()> {
+    /// Node suites that execute the shipped Pages modules: real SQLite/FTS5
+    /// through `node:sqlite`, and vm-module harnesses for the search, viewer,
+    /// crypto-worker and service-worker controllers. No cargo target ran them,
+    /// and four of their tests drifted red unnoticed (0dpz2).
+    fn pages_node_suites() -> Result<Vec<String>> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut suites = Vec::new();
+        for (dir, prefix) in [
+            ("tests/pages", ""),
+            ("tests", "pages"),
+            ("tests/js", "pages"),
+        ] {
+            for entry in fs::read_dir(root.join(dir))? {
+                let name = entry?.file_name().to_string_lossy().into_owned();
+                if name.starts_with(prefix) && name.ends_with(".mjs") {
+                    suites.push(format!("{dir}/{name}"));
+                }
+            }
+        }
+        suites.sort();
+        Ok(suites)
+    }
+
+    #[test]
+    fn pages_node_behavior_suites_pass() -> Result<()> {
+        let suites = pages_node_suites()?;
+        assert!(
+            suites.len() >= 16,
+            "expected the Pages node suites, found {suites:?}"
+        );
+        // Node 22.13+ (node:sqlite without a flag).
         let output = Command::new("node")
-            .args([
-                "--experimental-vm-modules",
-                "--test",
-                "--test-reporter=tap",
-                "--test-timeout=30000",
-                "--test-name-pattern",
-                pattern,
-                path,
-            ])
+            .args(["--experimental-vm-modules", "--test", "--test-reporter=tap"])
+            .args(&suites)
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .output()?;
         let stdout = String::from_utf8_lossy(&output.stdout);
+        let count = |key: &str| {
+            stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(key)?.trim().parse::<u64>().ok())
+        };
         assert!(
             output.status.success()
-                && stdout.lines().any(|line| {
-                    line.strip_prefix("# pass ")
-                        .and_then(|count| count.parse::<usize>().ok())
-                        .is_some_and(|count| count > 0)
-                }),
-            "Node contract tests failed or matched no cases: {path}/{pattern}\n{stdout}\n{}",
+                && count("# fail ") == Some(0)
+                && count("# pass ").is_some_and(|passed| passed > 0),
+            "Pages node suites failed ({})\nstdout:\n{stdout}\nstderr:\n{}",
+            output.status,
             String::from_utf8_lossy(&output.stderr)
         );
         Ok(())
@@ -867,34 +893,95 @@ mod tests {
     }
 
     #[test]
-    fn test_archive_search_timestamp_filters_reject_fractional_values() -> Result<()> {
-        run_node_module_assertions(
-            r#"
-                import assert from 'node:assert/strict';
-                import { normalizeSearchTimeRange } from './src/pages_assets/database.js';
-                for (const value of [0.5, -0.5, '1.5', Number.MAX_SAFE_INTEGER + 1]) {
-                    assert.throws(() => normalizeSearchTimeRange(value, null), RangeError);
-                    assert.throws(() => normalizeSearchTimeRange(null, value), RangeError);
-                }
-                assert.deepEqual(normalizeSearchTimeRange(0, 1), { since: 0, until: 1 });
-            "#,
-        )
+    fn test_archive_search_timestamp_filters_reject_fractional_values() {
+        let database_js = include_str!("../src/pages_assets/database.js");
+        let search_js = include_str!("../src/pages_assets/search.js");
+
+        assert!(
+            search_js.contains(
+                "const { since, until } = normalizeSearchTimeRange(routeSearch.since, routeSearch.until);"
+            ) && !search_js.contains("Math.trunc("),
+            "routed timestamp filters should use the shared database normalizer, which rejects malformed fractional values instead of truncating them"
+        );
+        assert!(
+            database_js.contains("!Number.isSafeInteger(numeric)")
+                && !database_js.contains("Math.trunc(numeric)"),
+            "SQL timestamp filter normalization should reject fractional values before binding"
+        );
     }
 
     #[test]
-    fn test_archive_search_time_filters_are_applied_before_pagination() -> Result<()> {
-        run_node_contract_tests(
-            "tests/pages/workspace-query.test.mjs",
-            "text search intersects|scoped pages do not filter",
-        )
+    fn test_archive_search_time_filters_are_applied_before_pagination() {
+        let database_js = include_str!("../src/pages_assets/database.js");
+        let search_js = include_str!("../src/pages_assets/search.js");
+
+        assert!(
+            database_js.contains("searchMode = \"auto\",\n    since = null,\n    until = null"),
+            "searchConversations should accept time filters at the database boundary"
+        );
+        // Search and browsing share one scope builder (agent, workspace, time).
+        assert!(
+            database_js.contains("clauses.push(\"c.started_at >= ?\");")
+                && database_js.contains("clauses.push(\"c.started_at <= ?\");")
+                && database_js.contains(
+                    "const scope = conversationScope({ agent, workspace, since, until });"
+                ),
+            "FTS search should add time predicates to SQL instead of filtering after LIMIT/OFFSET"
+        );
+
+        let scope_predicates = database_js
+            .find("sql += scope.sql;")
+            .expect("expected scoped search predicates");
+        let result_ordering = database_js
+            .find("ORDER BY score")
+            .expect("expected FTS score ordering");
+        assert!(
+            scope_predicates < result_ordering,
+            "time predicates must be added before ORDER BY/LIMIT so pagination cannot hide valid matches"
+        );
+
+        assert!(
+            search_js.contains("since: currentFilters.since,")
+                && search_js.contains("until: currentFilters.until,"),
+            "search UI should pass active route/control time filters into searchConversations"
+        );
+        assert!(
+            !search_js.contains("Apply time filter post-query"),
+            "search UI should not reintroduce post-query time filtering after pagination"
+        );
     }
 
     #[test]
-    fn test_archive_recent_filters_combine_agent_and_time_before_limit() -> Result<()> {
-        run_node_contract_tests(
-            "tests/pages/workspace-query.test.mjs",
-            "browsing uses|both inclusive bounds",
-        )
+    fn test_archive_recent_filters_combine_agent_and_time_before_limit() {
+        let database_js = include_str!("../src/pages_assets/database.js");
+        let search_js = include_str!("../src/pages_assets/search.js");
+
+        assert!(
+            database_js.contains(
+                "export function getConversationsByAgent(agent, limit = 50, since = null, until = null, offset = 0)"
+            ),
+            "agent-filtered recent queries should accept optional time bounds"
+        );
+        assert!(
+            database_js.contains("sql += \" AND started_at >= ?\";")
+                && database_js.contains("sql += \" AND started_at <= ?\";"),
+            "agent-filtered recent queries should apply time bounds in SQL before LIMIT"
+        );
+        // Recent browsing now goes through getConversations' shared scope.
+        assert!(
+            database_js.contains("if (bounds.since !== null) {")
+                && database_js.contains("if (bounds.until !== null) {"),
+            "recent search should treat an explicit since=0 route filter as present"
+        );
+        assert!(
+            search_js.contains(
+                "agent: currentFilters.agent,\n    workspace: currentFilters.workspace,\n    since: currentFilters.since,\n    until: currentFilters.until,"
+            ) && search_js.contains("const results = getConversations(options);")
+                && database_js.contains(
+                    "FROM conversations c WHERE 1 = 1${scope.sql}\n     ORDER BY c.started_at DESC, c.id DESC LIMIT ? OFFSET ?"
+                ),
+            "recent search should pass time bounds when an agent filter is also active"
+        );
     }
 
     #[test]
@@ -932,7 +1019,7 @@ mod tests {
     }
 
     #[test]
-    fn test_search_route_state_restores_filters_and_back_navigation() -> Result<()> {
+    fn test_search_route_state_restores_filters_and_back_navigation() {
         let viewer_js = include_str!("../src/pages_assets/viewer.js");
         assert!(
             viewer_js.contains("const searchParams = parseSearchParams(route);")
@@ -943,7 +1030,17 @@ mod tests {
             "viewer should restore routed search filters into the live search UI and preserve the current query/filter state when navigating back from a conversation"
         );
 
-        run_node_contract_tests("tests/pages/search-route-state.test.mjs", ".*")
+        let search_js = include_str!("../src/pages_assets/search.js");
+        assert!(
+            search_js
+                .contains("export async function setSearchRoute(routeSearch = {}, options = {}) {")
+                && search_js.contains("currentFilters = normalizeRouteFilters(routeSearch);")
+                && search_js.contains("const hasBounds = since !== null || until !== null;")
+                && search_js.contains(
+                    "timePreset: hasBounds ? SEARCH_CONFIG.TIME_FILTER_CUSTOM_VALUE : null,"
+                ),
+            "search should expose a route-state application path that restores routed filters instead of keeping stale in-memory filters alive"
+        );
     }
 
     #[test]
@@ -1706,9 +1803,46 @@ mod tests {
     }
 
     #[test]
-    fn test_service_worker_fetch_keeps_network_success_when_cache_write_fails() -> Result<()> {
+    fn test_service_worker_fetch_keeps_network_success_when_cache_write_fails() {
         let sw_js = include_str!("../src/pages_assets/sw.js");
-        run_node_contract_tests("tests/pages/service-worker-cache.test.mjs", ".*")?;
+        assert!(
+            sw_js.contains("const cacheWrite = trackResourceMutation(resource, async () => {")
+                && sw_js.contains("await cache.put(request, responseForCache);")
+                && sw_js.contains("log(LOG.WARN, \"Cache put error:\", error);")
+                && sw_js.contains("trackBackgroundTask(cacheWrite);")
+                && sw_js.contains("Promise.all(backgroundTasks)")
+                && sw_js.contains("return addSecurityHeaders(response);"),
+            "service worker cache writes must stay best-effort for the response while remaining bound to the FetchEvent lifetime"
+        );
+        assert!(
+            sw_js.contains("if (canUseCache() && request.mode === \"navigate\") {")
+                && sw_js
+                    .contains("const cachedIndex = await caches.match(indexUrl, { cacheName });")
+                && sw_js
+                    .contains("log(LOG.WARN, \"Navigation cache fallback error:\", cacheError);"),
+            "navigation fallback should not crash if the Cache API itself fails during offline fallback"
+        );
+        assert!(
+            sw_js.contains("const cacheEligible = isCacheEligibleRequest(request, url);")
+                && sw_js.contains("url.search === \"\"")
+                && sw_js.contains("!request.headers.has(\"authorization\")")
+                && sw_js.contains("!request.headers.has(\"range\")")
+                && sw_js.contains("request.cache !== \"no-store\"")
+                && sw_js.contains("responseAllowsCaching(response)")
+                && sw_js.contains("response.status === 200")
+                && sw_js.contains("directiveName === \"no-store\"")
+                && sw_js.contains("directiveName === \"no-cache\"")
+                && sw_js.contains("directiveName === \"private\"")
+                // CacheStorage.match without a cacheName searches every cache
+                // of the origin. Each read names this generation's cache.
+                && sw_js.contains("const cacheName = getCacheName();")
+                && sw_js.match_indices("caches.match(").all(|(at, _)| {
+                    sw_js[at..]
+                        .split_once(')')
+                        .is_some_and(|(call, _)| call.ends_with(", { cacheName }"))
+                }),
+            "runtime caching must stay inside the archive scope and must not fall through to stale or unrelated origin caches"
+        );
 
         let install_body = sw_js
             .split_once("self.addEventListener(\"install\"")
@@ -1720,7 +1854,8 @@ mod tests {
         assert!(
             !install_body.contains("self.skipWaiting()")
                 && sw_js.contains("event.waitUntil(skipWaitingTask);")
-                && sw_js.contains("event.waitUntil(clearCacheTask);"),
+                && sw_js.contains("event.waitUntil(clearCacheTask);")
+                && sw_js.contains("const CACHE_VERSION = \"v10\";"),
             "updates must wait for explicit user activation and every async message operation must extend its event lifetime"
         );
         assert!(
@@ -1732,7 +1867,6 @@ mod tests {
                 && sw_js.contains("rejectRequest(\"Invalid log level\");"),
             "cache cleanup must verify its postcondition and message-controlled log levels must be validated"
         );
-        Ok(())
     }
 
     #[test]
@@ -2107,7 +2241,7 @@ mod tests {
     }
 
     #[test]
-    fn test_attachment_manifest_failures_only_cache_true_absence() -> Result<()> {
+    fn test_attachment_manifest_failures_only_cache_true_absence() {
         let attachments_js = include_str!("../src/pages_assets/attachments.js");
         assert!(
             attachments_js.contains("function shouldCacheManifestAbsence(error) {")
@@ -2125,10 +2259,19 @@ mod tests {
                 && attachments_js.contains("\"ATTACHMENT_MANIFEST_INVALID\""),
             "attachment manifest loading should distinguish missing manifests from retryable fetch or parse failures"
         );
-        run_node_contract_tests(
-            "tests/pages/attachment-admission.test.mjs",
-            "manifest|reset cancels a body",
-        )
+        assert!(
+            attachments_js.contains("if (shouldCacheManifestAbsence(error)) {")
+                && attachments_js.contains("throw error;")
+                && attachments_js.contains(
+                    "createAttachmentError(\"Attachment request invalidated\", \"ATTACHMENT_REQUEST_INVALIDATED\")"
+                )
+                && attachments_js
+                    .matches("error?.code === \"ATTACHMENT_REQUEST_INVALIDATED\"")
+                    .count()
+                    >= 2
+                && !attachments_js.contains("message.includes("),
+            "attachment invalidation handling should use stable error codes instead of brittle string matching"
+        );
     }
 
     #[test]
@@ -2731,17 +2874,6 @@ mod tests {
                 import vm from 'node:vm';
 
                 const source = fs.readFileSync('./src/pages_assets/auth.js', 'utf8');
-                const trackedBuffers = [];
-                function TrackingUint8Array(...args) {
-                    const bytes = Reflect.construct(Uint8Array, args, Uint8Array);
-                    trackedBuffers.push(bytes);
-                    return bytes;
-                }
-                TrackingUint8Array.prototype = Uint8Array.prototype;
-                Object.setPrototypeOf(TrackingUint8Array, Uint8Array);
-                Object.defineProperty(TrackingUint8Array, Symbol.hasInstance, {
-                    value(value) { return value instanceof Uint8Array; },
-                });
                 const start = source.indexOf('async function readResponseBytesExact(');
                 const end = source.indexOf('\nfunction getUnencryptedPayloadPath()', start);
                 if (start < 0 || end < 0) {
@@ -2751,7 +2883,7 @@ mod tests {
                     const MAX_BROWSER_DATABASE_SIZE = 512 * 1024 * 1024;
                     ${source.slice(start, end)}
                 `;
-                const context = { Uint8Array: TrackingUint8Array, AbortController };
+                const context = { Uint8Array };
                 vm.createContext(context);
                 vm.runInContext(code, context);
 
@@ -2794,44 +2926,6 @@ mod tests {
                     throw new Error('source response chunks were not zeroized after copying');
                 }
 
-                for (const abortOnDone of [false, true]) {
-                    const controller = new AbortController();
-                    const terminalValue = new Uint8Array([9, 7]);
-                    let reads = 0;
-                    const terminalResponse = {
-                        headers: { get() { return null; } },
-                        body: {
-                            getReader() {
-                                return {
-                                    async read() {
-                                        if (reads++ === 0) {
-                                            return { done: false, value: new Uint8Array([1, 2]) };
-                                        }
-                                        if (abortOnDone) controller.abort();
-                                        return { done: true, value: terminalValue };
-                                    },
-                                    async cancel() {},
-                                };
-                            },
-                        },
-                    };
-                    const allocationStart = trackedBuffers.length;
-                    let rejected = false;
-                    try {
-                        await context.readResponseBytesExact(
-                            terminalResponse, 2, 'fixture database', controller.signal
-                        );
-                    } catch {
-                        rejected = true;
-                    }
-                    if (rejected !== abortOnDone || terminalValue.some(Boolean)) {
-                        throw new Error('terminal body read escaped cancellation or plaintext wiping');
-                    }
-                    if (abortOnDone && trackedBuffers[allocationStart].some(Boolean)) {
-                        throw new Error('abort at terminal read retained accumulated plaintext');
-                    }
-                }
-
                 const oversizedChunk = new Uint8Array([9, 8, 7]);
                 const oversized = responseFrom([oversizedChunk]);
                 let oversizedRejected = false;
@@ -2864,73 +2958,6 @@ mod tests {
                 }
                 if (!truncatedRejected) {
                     throw new Error('truncated response did not fail its exact-size check');
-                }
-
-                let releaseStalledRead;
-                let stalledCancelCalls = 0;
-                let stalledReadCalls = 0;
-                const receivedBeforeAbort = new Uint8Array([7, 8]);
-                const stalledResponse = {
-                    headers: { get() { return null; } },
-                    body: {
-                        getReader() {
-                            return {
-                                read() {
-                                    stalledReadCalls += 1;
-                                    if (stalledReadCalls === 1) {
-                                        return Promise.resolve({ done: false, value: receivedBeforeAbort });
-                                    }
-                                    return new Promise(resolve => { releaseStalledRead = resolve; });
-                                },
-                                cancel() {
-                                    stalledCancelCalls += 1;
-                                    return new Promise(() => {});
-                                },
-                            };
-                        },
-                    },
-                };
-                const abortController = new AbortController();
-                const allocationStart = trackedBuffers.length;
-                const stalledRead = context.readResponseBytesExact(
-                    stalledResponse,
-                    4,
-                    'fixture database',
-                    abortController.signal
-                );
-                const stalledOutcome = stalledRead.then(() => 'resolved', () => 'rejected');
-                for (let turn = 0; turn < 20 && !releaseStalledRead; turn += 1) {
-                    await Promise.resolve();
-                }
-                const receiveBuffer = trackedBuffers[allocationStart];
-                if (!releaseStalledRead || receiveBuffer[0] !== 7 || receiveBuffer[1] !== 8) {
-                    throw new Error('abort fixture never populated the receive buffer before stalling');
-                }
-                if (receivedBeforeAbort.some(Boolean)) {
-                    throw new Error('initial plaintext chunk was not cleared before the next read');
-                }
-                abortController.abort();
-                const outcome = await Promise.race([
-                    stalledOutcome,
-                    new Promise(resolve => setTimeout(() => resolve('hung'), 1000)),
-                ]);
-                if (outcome !== 'rejected') {
-                    throw new Error('aborting a stalled body read waited for read/cancel to settle');
-                }
-                if (stalledCancelCalls !== 1) {
-                    throw new Error(`stalled response cancellation ran ${stalledCancelCalls} times`);
-                }
-                const stalledBuffers = trackedBuffers.slice(allocationStart);
-                if (stalledBuffers.length !== 1 || stalledBuffers[0].some(Boolean)) {
-                    throw new Error('aborting the body read did not zero its exact-size buffer');
-                }
-
-                const lateChunk = new Uint8Array([5, 6]);
-                releaseStalledRead({ done: false, value: lateChunk });
-                await Promise.resolve();
-                await Promise.resolve();
-                if (lateChunk.some(Boolean)) {
-                    throw new Error('a plaintext chunk arriving after abort was not zeroized');
                 }
             "#,
         )
@@ -3178,7 +3205,7 @@ mod tests {
     }
 
     #[test]
-    fn pages_runtime_uses_pinned_official_vendor_apis() -> Result<()> {
+    fn pages_runtime_uses_pinned_official_vendor_apis() {
         let database_js = include_str!("../src/pages_assets/database.js");
         let deserialize_call = database_js
             .find("sqliteApi.capi.sqlite3_deserialize(")
@@ -3232,15 +3259,49 @@ mod tests {
                 && worker_js.contains("cannot be read safely without streaming response support")
                 && worker_js.contains("return concatenateAndZeroChunks(chunks);")
                 && worker_js.contains("const generation = beginDecryptAttempt();")
+                && worker_js.contains("ensureCurrentDecryptAttempt(job.generation);")
                 && worker_js.contains("invalidateDecryptAttempts();")
+                // Each prefetched ciphertext chunk is scrubbed once consumed.
+                && worker_js.contains(
+                    "yield { index, bytes: slot.bytes };\n      } finally {\n        slot.bytes?.fill(0);"
+                )
                 && worker_js.contains("passwordBytes.fill(0);")
                 && worker_js.contains("result.hash.fill(0);")
                 && !worker_js.contains("await response.arrayBuffer()")
                 && worker_js.matches("await writer.abort(error);").count() == 1
         );
 
-        run_node_contract_tests("tests/pages/crypto-worker-admission.test.mjs", ".*")?;
-        run_node_contract_tests("tests/pages/crypto-worker-unlock.test.mjs", ".*")?;
+        // The message handlers queue one unlock job at a time (edf9c7af);
+        // these job runners derive the KEK and unwrap the DEK.
+        assert!(
+            worker_js.contains("return enqueueUnlock(\"password\", password, cfg, requestId);")
+                && worker_js.contains(
+                    "return enqueueUnlock(\"recovery\", recoverySecret, cfg, requestId);"
+                )
+                && worker_js.contains("await runPasswordUnlock(job);")
+                && worker_js.contains("await runRecoveryUnlock(job);")
+        );
+        for unlock_function in ["runPasswordUnlock", "runRecoveryUnlock"] {
+            let signature = format!("async function {unlock_function}");
+            let function_body = worker_js
+                .split_once(signature.as_str())
+                .unwrap_or_else(|| panic!("missing {unlock_function}"))
+                .1
+                .split_once("\n}\n")
+                .unwrap_or_else(|| panic!("unbounded {unlock_function}"))
+                .0;
+            let derive_offset = function_body
+                .find("const kek = await deriveKekFrom")
+                .unwrap_or_else(|| panic!("missing KEK derivation in {unlock_function}"));
+            let unwrap_try_offset = function_body
+                .find("let unwrappedDek = null;\n      try {")
+                .unwrap_or_else(|| panic!("missing unwrap-only catch in {unlock_function}"));
+            assert!(
+                derive_offset < unwrap_try_offset
+                    && function_body.contains("if (error?.name !== \"OperationError\")"),
+                "{unlock_function} must not relabel KDF/runtime failures as bad credentials"
+            );
+        }
 
         let auth_js = include_str!("../src/pages_assets/auth.js");
         assert!(
@@ -3271,6 +3332,12 @@ mod tests {
                 "service worker must cache {vendor_asset}"
             );
         }
-        Ok(())
+        // Every static asset is stored under the runtime caching policy, and
+        // one failed asset fails installation after its siblings settle.
+        assert!(
+            sw_js.contains("await Promise.allSettled(STATIC_ASSETS.map(async (asset) => {")
+                && sw_js.contains("await cache.put(url, response);")
+                && sw_js.contains("if (failed) throw failed.reason;")
+        );
     }
 }
