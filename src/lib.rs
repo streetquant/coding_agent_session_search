@@ -46361,6 +46361,11 @@ struct DoctorStoragePressureReport {
     safe_cleanup_scope: Vec<String>,
     precious_evidence_classes: Vec<String>,
     classification_warnings: Vec<String>,
+    /// k2k20: whether the storage inventory walk saw the whole data
+    /// directory. A truncated walk leaves every byte count as a lower bound.
+    inventory_complete: bool,
+    /// Entries the storage inventory inspected before it stopped.
+    inventory_scanned_entries: usize,
     recommended_action: String,
     notes: Vec<String>,
 }
@@ -46580,23 +46585,86 @@ fn doctor_record_storage_bytes(
     }
 }
 
+/// Wall-clock budget for the doctor's storage inventory walk (k2k20).
+///
+/// The walk stats every file under the data directory, so its cost is
+/// O(files in the archive) with no natural ceiling. On the owner archive it
+/// held `cass doctor --check` for over 30 minutes with zero bytes of output
+/// (k2k20), because the walk was unbounded and the heartbeat kept naming the
+/// previously completed phase. The walk is now bounded and reports the
+/// truncation instead of hiding it.
+const DOCTOR_STORAGE_INVENTORY_DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+/// Hard ceiling on the entries the doctor's storage inventory inspects.
+const DOCTOR_STORAGE_INVENTORY_MAX_ENTRIES: usize = 200_000;
+
+/// The budget the doctor's storage inventory walk runs under.
+///
+/// `CASS_DOCTOR_STORAGE_INVENTORY_TIMEOUT_SECS` overrides the wall-clock
+/// budget; `0` is treated as "unset", so the default bound always applies.
+fn doctor_storage_inventory_budget() -> crate::raw_mirror::RawMirrorInventoryBudget {
+    let timeout_secs = dotenvy::var("CASS_DOCTOR_STORAGE_INVENTORY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .unwrap_or(DOCTOR_STORAGE_INVENTORY_DEFAULT_TIMEOUT_SECS);
+    crate::raw_mirror::RawMirrorInventoryBudget::bounded(
+        DOCTOR_STORAGE_INVENTORY_MAX_ENTRIES,
+        std::time::Duration::from_secs(timeout_secs),
+    )
+}
+
+/// The doctor's byte-per-class inventory of the data directory.
+struct DoctorStorageInventory {
+    bytes_by_class: BTreeMap<String, DoctorStorageAssetClassBreakdown>,
+    warnings: Vec<String>,
+    scanned_entries: usize,
+    /// Whether the walk saw the whole data directory. A truncated walk leaves
+    /// every byte count as a lower bound, and the report must say so.
+    complete: bool,
+    truncated_reason: Option<String>,
+}
+
 fn doctor_collect_storage_bytes_by_class(
     data_dir: &Path,
-) -> (
-    BTreeMap<String, DoctorStorageAssetClassBreakdown>,
-    Vec<String>,
-) {
+    budget: &crate::raw_mirror::RawMirrorInventoryBudget,
+) -> DoctorStorageInventory {
     let mut bytes_by_class = BTreeMap::new();
     let mut warnings = Vec::new();
     if !data_dir.exists() {
-        return (bytes_by_class, warnings);
+        return DoctorStorageInventory {
+            bytes_by_class,
+            warnings,
+            scanned_entries: 0,
+            complete: true,
+            truncated_reason: None,
+        };
     }
 
     let scan_root = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
-    for entry in walkdir::WalkDir::new(&scan_root)
+    let mut scanned_entries = 0usize;
+    let mut accounted_bytes = 0u64;
+    let mut complete = true;
+    let mut truncated_reason: Option<String> = None;
+    for (index, entry) in walkdir::WalkDir::new(&scan_root)
         .follow_links(false)
         .into_iter()
+        .enumerate()
     {
+        if index >= budget.max_entries() {
+            complete = false;
+            truncated_reason = Some(format!(
+                "the inventory stopped at its {}-entry ceiling",
+                budget.max_entries()
+            ));
+            break;
+        }
+        if budget.expired() {
+            complete = false;
+            truncated_reason = Some("the inventory stopped at its time budget".to_string());
+            break;
+        }
+        scanned_entries = index.saturating_add(1);
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
@@ -46631,8 +46699,78 @@ fn doctor_collect_storage_bytes_by_class(
             relative_path,
             metadata.len(),
         );
+        accounted_bytes = accounted_bytes.saturating_add(metadata.len());
+        // k2k20 ask #1: the heartbeat reports the bytes the walk has seen
+        // so far, so a long inventory shows progress and not just a phase.
+        doctor_publish_inventory_bytes(accounted_bytes);
     }
-    (bytes_by_class, warnings)
+    if let Some(reason) = &truncated_reason {
+        warnings.push(format!(
+            "storage inventory stopped early after {scanned_entries} entries: {reason}; the per-class byte totals are lower bounds"
+        ));
+    }
+    DoctorStorageInventory {
+        bytes_by_class,
+        warnings,
+        scanned_entries,
+        complete,
+        truncated_reason,
+    }
+}
+
+#[cfg(test)]
+mod doctor_storage_inventory_tests {
+    use super::doctor_collect_storage_bytes_by_class;
+    use crate::raw_mirror::RawMirrorInventoryBudget;
+    use std::time::Duration;
+
+    fn seed_files(root: &std::path::Path, count: usize) {
+        for index in 0..count {
+            std::fs::write(root.join(format!("file-{index}.bin")), b"cass")
+                .expect("seed inventory file");
+        }
+    }
+
+    // k2k20: the doctor's inventory walk must be bounded and must say so.
+    // An unbounded walk held the doctor check open for over 30 minutes on a
+    // large archive with no output at all.
+    #[test]
+    fn truncated_inventory_reports_itself_as_incomplete() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        seed_files(temp.path(), 32);
+        let budget = RawMirrorInventoryBudget::bounded(1, Duration::from_secs(30));
+        let inventory = doctor_collect_storage_bytes_by_class(temp.path(), &budget);
+        assert!(
+            !inventory.complete,
+            "a walk stopped by its entry ceiling must not claim completeness"
+        );
+        assert!(inventory.truncated_reason.is_some());
+        assert!(
+            inventory
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("lower bounds")),
+            "a truncated inventory must disclose that its totals are lower bounds: {:?}",
+            inventory.warnings
+        );
+    }
+
+    #[test]
+    fn complete_inventory_sees_the_whole_tree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        seed_files(temp.path(), 8);
+        let budget = RawMirrorInventoryBudget::bounded(10_000, Duration::from_secs(30));
+        let inventory = doctor_collect_storage_bytes_by_class(temp.path(), &budget);
+        assert!(inventory.complete, "an untruncated walk must be complete");
+        assert!(inventory.scanned_entries >= 8);
+        assert!(inventory.truncated_reason.is_none());
+        assert!(
+            inventory
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("lower bounds"))
+        );
+    }
 }
 
 fn doctor_storage_pressure_action(
@@ -46662,8 +46800,15 @@ fn build_doctor_storage_pressure_report(
     available_space: io::Result<u64>,
     used_test_override: bool,
     full_rebuild_readiness: DoctorFullRebuildReadinessReport,
+    inventory: DoctorStorageInventory,
 ) -> DoctorStoragePressureReport {
-    let (bytes_by_class, classification_warnings) = doctor_collect_storage_bytes_by_class(data_dir);
+    let DoctorStorageInventory {
+        bytes_by_class,
+        warnings: classification_warnings,
+        scanned_entries,
+        complete: inventory_complete,
+        truncated_reason,
+    } = inventory;
     let mut total_accounted_bytes = 0_u64;
     let mut reclaimable_derived_bytes = 0_u64;
     let mut precious_evidence_bytes = 0_u64;
@@ -46741,6 +46886,16 @@ fn build_doctor_storage_pressure_report(
     notes.push(format!(
         "Storage inventory accounted for {total_accounted_bytes} bytes: {reclaimable_derived_bytes} derived-reclaimable bytes and {precious_evidence_bytes} precious evidence bytes."
     ));
+    if inventory_complete {
+        notes.push(format!(
+            "Storage inventory inspected {scanned_entries} entries under the data directory."
+        ));
+    } else {
+        notes.push(format!(
+            "Storage inventory was truncated after {scanned_entries} entries ({}); the per-class byte totals are lower bounds, not the archive's exact size.",
+            truncated_reason.unwrap_or_else(|| "the walk stopped early".to_string())
+        ));
+    }
     if precious_evidence_bytes > 0 {
         notes.push(
             "Precious evidence bytes are not cleanup candidates; use verified export, backup, or relocation workflows instead."
@@ -46764,7 +46919,7 @@ fn build_doctor_storage_pressure_report(
     );
 
     DoctorStoragePressureReport {
-        schema_version: 3,
+        schema_version: 4,
         status,
         data_dir_exists: data_dir.exists(),
         probe_path: probe_path.display().to_string(),
@@ -46784,22 +46939,32 @@ fn build_doctor_storage_pressure_report(
         safe_cleanup_scope,
         precious_evidence_classes,
         classification_warnings,
+        inventory_complete,
+        inventory_scanned_entries: scanned_entries,
         recommended_action,
         notes,
     }
 }
 
 fn collect_doctor_storage_pressure(data_dir: &Path, db_path: &Path) -> DoctorStoragePressureReport {
+    // k2k20: name the phase while it runs. The inventory walk below is the
+    // step that can take minutes on a large archive, and a heartbeat that
+    // only names *completed* phases left the operator staring at a stale
+    // phase for the whole run.
+    doctor_set_heartbeat_phase("storage_pressure_inventory");
     let probe_path = doctor_storage_probe_path(data_dir);
     let used_test_override = dotenvy::var(CASS_TEST_DOCTOR_STORAGE_AVAILABLE_BYTES).is_ok();
     let available_space = doctor_available_space(&probe_path);
     let full_rebuild_readiness = collect_doctor_full_rebuild_readiness(data_dir, db_path);
+    let inventory =
+        doctor_collect_storage_bytes_by_class(data_dir, &doctor_storage_inventory_budget());
     build_doctor_storage_pressure_report(
         data_dir,
         probe_path,
         available_space,
         used_test_override,
         full_rebuild_readiness,
+        inventory,
     )
 }
 
@@ -51552,7 +51717,19 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
         return report;
     }
 
-    let physical_inventory = crate::raw_mirror::storage_summary(data_dir);
+    // k2k20: the mirror's physical inventory is a walk of the whole blob
+    // store, so it runs under the same budget as the data-directory
+    // inventory. A truncated walk leaves the orphan counts as lower bounds
+    // and the report says so instead of presenting them as exact.
+    let (physical_inventory, physical_inventory_complete) =
+        crate::raw_mirror::storage_summary_bounded(data_dir, &doctor_storage_inventory_budget());
+    if !physical_inventory_complete {
+        report.status = "warn".to_string();
+        report.warnings.push(
+            "raw mirror inventory was truncated by the doctor's inventory budget; the reported mirror byte and blob counts are lower bounds"
+                .to_string(),
+        );
+    }
     report.summary.orphan_blob_count = physical_inventory.orphan_blob_count;
     report.summary.orphan_blob_bytes = physical_inventory.orphan_blob_bytes;
     if report.summary.orphan_blob_count > 0 {
@@ -51584,10 +51761,32 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
     let bounded_inventory_entry_limit = bounded_manifest_limit
         .map(|limit| limit.max(DOCTOR_RAW_MIRROR_BOUNDED_AMPLIFICATION_MANIFEST_LIMIT));
     if manifest_root.exists() {
-        for entry in walkdir::WalkDir::new(&manifest_root)
+        // k2k20: the manifest walk is bounded too, so a mirror with a huge
+        // manifest tree cannot hold the doctor open indefinitely.
+        let manifest_budget = doctor_storage_inventory_budget();
+        for (index, entry) in walkdir::WalkDir::new(&manifest_root)
             .follow_links(false)
             .into_iter()
+            .enumerate()
         {
+            if index >= manifest_budget.max_entries() {
+                report.status = "warn".to_string();
+                report.warnings.push(
+                    "raw mirror manifest scan stopped at the doctor's inventory entry ceiling; the reported mirror manifests are a lower bound"
+                        .to_string(),
+                );
+                full_verification_deferred = true;
+                break;
+            }
+            if manifest_budget.expired() {
+                report.status = "warn".to_string();
+                report.warnings.push(
+                    "raw mirror manifest scan stopped at the doctor's inventory time budget; the reported mirror manifests are a lower bound"
+                        .to_string(),
+                );
+                full_verification_deferred = true;
+                break;
+            }
             match entry {
                 Ok(entry) if entry.file_type().is_file() || entry.file_type().is_symlink() => {
                     let path = entry.path();
@@ -51612,9 +51811,21 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
         }
     }
 
-    let physical_storage_bytes = bounded_byte_limit
-        .map(|_| crate::raw_mirror::physical_storage_bytes(data_dir))
-        .unwrap_or(0);
+    let (physical_storage_bytes, physical_storage_bytes_complete) = bounded_byte_limit
+        .map(|_| {
+            crate::raw_mirror::physical_storage_bytes_bounded(
+                data_dir,
+                &doctor_storage_inventory_budget(),
+            )
+        })
+        .unwrap_or((0, true));
+    if !physical_storage_bytes_complete {
+        report.status = "warn".to_string();
+        report.warnings.push(
+            "raw mirror physical storage was truncated by the doctor's inventory budget; the reported mirror size is a lower bound"
+                .to_string(),
+        );
+    }
     let physical_limit_exceeded =
         bounded_byte_limit.is_some_and(|limit| physical_storage_bytes > limit);
     let verification_work_computed =
@@ -66099,15 +66310,49 @@ fn build_doctor_lock_diagnostics(
         .collect()
 }
 
-/// siekg: last doctor phase that completed, read by the stderr liveness
-/// heartbeat so a multi-minute run says *where* it is, not just that it is
-/// alive. Process-global on purpose: doctor runs once per process and the
-/// value is advisory message text only.
-static DOCTOR_HEARTBEAT_LAST_PHASE: Mutex<String> = Mutex::new(String::new());
+/// siekg: the phase the run is in, read by the stderr liveness heartbeat so a
+/// multi-minute run says *where* it is, not just that it is alive. Set at the
+/// START of a phase (so a slow phase names itself while it runs) and again
+/// when the phase completes. Process-global on purpose: doctor runs once per
+/// process and the value is advisory message text only.
+///
+/// k2k20: this used to be set only when a phase *completed*, so a run stuck
+/// inside a slow phase kept reporting the previous phase for the whole run
+/// (a 30-minute doctor check reported `lock_state_probe` throughout, because
+/// the phase it was actually stuck in had not completed yet).
+static DOCTOR_HEARTBEAT_PHASE: Mutex<String> = Mutex::new(String::new());
+
+/// Name the phase the run is in right now, so the liveness heartbeat can say
+/// what the run is doing instead of what it last finished.
+fn doctor_set_heartbeat_phase(phase: &str) {
+    if let Ok(mut current) = DOCTOR_HEARTBEAT_PHASE.lock() {
+        current.clear();
+        current.push_str(phase);
+    }
+}
+
+/// k2k20 ask #1: the bytes the storage inventory has accounted for so far.
+///
+/// The ask is for a progress line with "phase, bytes, elapsed"; the phase
+/// and the elapsed time are known to the heartbeat thread, and this counter
+/// carries the byte half of the same line out of the inventory walk.
+static DOCTOR_HEARTBEAT_INVENTORY_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Publish the bytes the storage inventory has accounted for so far.
+fn doctor_publish_inventory_bytes(bytes: u64) {
+    DOCTOR_HEARTBEAT_INVENTORY_BYTES.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Default liveness cadence for long doctor runs; `CASS_DOCTOR_HEARTBEAT_SECS`
 /// overrides it (`0` disables).
 const DOCTOR_HEARTBEAT_DEFAULT_SECS: u64 = 15;
+
+/// Delay before the FIRST liveness line (k2k20 ask #1: "status/health/doctor
+/// must emit a progress line within ~1 s of starting"). The steady cadence
+/// stays at [`DOCTOR_HEARTBEAT_DEFAULT_SECS`]; only the first tick is early,
+/// so a run that finishes inside a second still writes nothing to stderr.
+const DOCTOR_HEARTBEAT_FIRST_TICK_SECS: u64 = 1;
 
 fn doctor_heartbeat_interval() -> Option<std::time::Duration> {
     doctor_heartbeat_interval_from(std::env::var("CASS_DOCTOR_HEARTBEAT_SECS").ok().as_deref())
@@ -66122,9 +66367,23 @@ fn doctor_heartbeat_interval_from(raw: Option<&str>) -> Option<std::time::Durati
     (secs > 0).then(|| std::time::Duration::from_secs(secs))
 }
 
+/// Pure resolver for the delay before the FIRST liveness line (k2k20 ask
+/// #1: a stuck run must say so within ~1 s). The first tick is early even
+/// when the steady cadence is longer; a cadence shorter than the first-tick
+/// delay keeps its own shorter delay, so `CASS_DOCTOR_HEARTBEAT_SECS=1`
+/// still fires at 1 s and never faster than asked.
+fn doctor_heartbeat_first_tick_delay(interval: std::time::Duration) -> std::time::Duration {
+    interval.min(std::time::Duration::from_secs(
+        DOCTOR_HEARTBEAT_FIRST_TICK_SECS,
+    ))
+}
+
 #[cfg(test)]
 mod doctor_heartbeat_tests {
-    use super::{DOCTOR_HEARTBEAT_DEFAULT_SECS, doctor_heartbeat_interval_from};
+    use super::{
+        DOCTOR_HEARTBEAT_DEFAULT_SECS, DOCTOR_HEARTBEAT_FIRST_TICK_SECS,
+        doctor_heartbeat_first_tick_delay, doctor_heartbeat_interval_from,
+    };
     use std::time::Duration;
 
     #[test]
@@ -66144,6 +66403,23 @@ mod doctor_heartbeat_tests {
                 .is_some_and(|d| d.as_secs().cmp(&3).is_eq())
         );
     }
+
+    // k2k20 ask #1: a stuck run must emit a liveness line within ~1 s, not
+    // after a full 15 s cadence interval.
+    #[test]
+    fn first_liveness_line_lands_within_one_second() {
+        let default_cadence = Duration::from_secs(DOCTOR_HEARTBEAT_DEFAULT_SECS);
+        assert!(default_cadence > Duration::from_secs(DOCTOR_HEARTBEAT_FIRST_TICK_SECS));
+        assert_eq!(
+            doctor_heartbeat_first_tick_delay(default_cadence),
+            Duration::from_secs(DOCTOR_HEARTBEAT_FIRST_TICK_SECS)
+        );
+        // A cadence at or below the first-tick delay is never shortened.
+        assert_eq!(
+            doctor_heartbeat_first_tick_delay(Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+    }
 }
 
 /// siekg (bead `doctor-check-no-progress-output-siekg`) + k2k20 ask #1: `cass doctor --check`
@@ -66152,8 +66428,10 @@ mod doctor_heartbeat_tests {
 /// indistinguishable from a hang and operators killed it. This guard prints a
 /// one-line heartbeat to stderr (the diagnostics channel in every output
 /// mode; stdout stays data-only) at a fixed cadence while the run is live,
-/// naming elapsed time and the last completed phase. First tick fires only
-/// after one full interval, so quick runs stay byte-identical on stderr.
+/// naming elapsed time and the phase the run is in. k2k20: the first tick
+/// fires after ~1s (not one full interval) so a stuck run says so within a
+/// second, and a run that finishes inside a second still writes nothing to
+/// stderr.
 struct CliHeartbeat {
     /// Dropping the sender wakes the thread immediately, so retiring the
     /// heartbeat never adds latency to a fast `status`/`doctor` exit.
@@ -66164,16 +66442,18 @@ struct CliHeartbeat {
 impl CliHeartbeat {
     fn start(surface: &str) -> Option<Self> {
         let interval = doctor_heartbeat_interval()?;
-        if let Ok(mut last) = DOCTOR_HEARTBEAT_LAST_PHASE.lock() {
-            last.clear();
-        }
+        doctor_set_heartbeat_phase("");
+        doctor_publish_inventory_bytes(0);
         let (stop, wake) = std::sync::mpsc::channel::<()>();
         let surface = surface.to_string();
         let handle = std::thread::Builder::new()
             .name("cass-doctor-heartbeat".to_string())
             .spawn(move || {
                 let started = std::time::Instant::now();
-                let mut next = interval;
+                // k2k20: the first liveness line lands at ~1s so a run that
+                // is stuck is never indistinguishable from a silent hang;
+                // the steady cadence after that is unchanged.
+                let mut next = doctor_heartbeat_first_tick_delay(interval);
                 loop {
                     // Sleep until the next tick or until the owner drops the
                     // sender (disconnect), whichever comes first.
@@ -66187,18 +66467,25 @@ impl CliHeartbeat {
                         continue;
                     }
                     next += interval;
-                    let last_phase = DOCTOR_HEARTBEAT_LAST_PHASE
+                    let phase = DOCTOR_HEARTBEAT_PHASE
                         .lock()
                         .map(|p| p.clone())
                         .unwrap_or_default();
-                    let phase_note = if last_phase.is_empty() {
+                    let phase_note = if phase.is_empty() {
                         String::new()
                     } else {
-                        format!("; last completed phase: {last_phase}")
+                        format!("; phase: {phase}")
+                    };
+                    let bytes = DOCTOR_HEARTBEAT_INVENTORY_BYTES
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let bytes_note = if bytes > 0 {
+                        format!("; bytes: {bytes}")
+                    } else {
+                        String::new()
                     };
                     eprintln!(
-                        "[cass {surface}] still running ({}s elapsed{phase_note}). Multi-minute runs are normal on multi-GB or corrupt archives; set CASS_DOCTOR_HEARTBEAT_SECS=0 to silence.",
-                        elapsed.as_secs()
+                        "[cass {surface}] still running ({}s elapsed{phase_note}{bytes_note}). Multi-minute runs are normal on multi-GB or corrupt archives; set CASS_DOCTOR_HEARTBEAT_SECS=0 to silence.",
+                        elapsed.as_secs(),
                     );
                 }
             })
@@ -66229,10 +66516,7 @@ fn doctor_push_timing_span(
     threshold_ms: u64,
     notes: Vec<String>,
 ) {
-    if let Ok(mut last) = DOCTOR_HEARTBEAT_LAST_PHASE.lock() {
-        last.clear();
-        last.push_str(name);
-    }
+    doctor_set_heartbeat_phase(name);
     let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     spans.push(DoctorTimingSpanReport {
         schema_version: 1,
@@ -87276,6 +87560,7 @@ fn run_status(
     // for 13+ minutes on a 9.3GB corpus; share the doctor liveness heartbeat
     // (stderr only, first tick after one full interval).
     let _heartbeat = CliHeartbeat::start("status");
+    doctor_set_heartbeat_phase("status_probe");
     let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     // Bounded execution budget for the robot surface (uojcg.2.2): when the
@@ -93414,6 +93699,7 @@ pub(crate) fn run_doctor_impl(
     let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
     let lock_path = data_dir.join(".index.lock");
     let mut timing_spans: Vec<DoctorTimingSpanReport> = Vec::new();
+    doctor_set_heartbeat_phase("lock_state_probe");
     let lock_probe_started = Instant::now();
     let maintenance_snapshot = probe_index_run_lock(&data_dir, &db_path, true);
     let rebuild_active = maintenance_snapshot.active;
@@ -93927,6 +94213,7 @@ pub(crate) fn run_doctor_impl(
     // 3. Check database exists and is readable
     // Fix #128: use the CLI read-only opener with a timeout to prevent hanging on degraded
     // databases without dirtying precious archive evidence during a read-only doctor check.
+    doctor_set_heartbeat_phase("archive_db_probe");
     let archive_db_probe_started = Instant::now();
     if db_path.exists() {
         if dedicated_storage_probe.busy_or_locked {
@@ -94925,6 +95212,7 @@ pub(crate) fn run_doctor_impl(
         );
     }
 
+    doctor_set_heartbeat_phase("raw_mirror_scan");
     let raw_mirror_scan_started = Instant::now();
     let mut raw_mirror = collect_doctor_raw_mirror_report_for_doctor(&data_dir, fix_can_mutate);
     doctor_push_timing_span(
@@ -106941,6 +107229,18 @@ mod response_schema_tests {
         std::fs::write(path, vec![b'x'; bytes]).expect("write storage fixture file");
     }
 
+    /// The storage inventory a real run would collect for `root`.
+    ///
+    /// The doctor bounds this walk in production (k2k20); the fixture roots
+    /// are a handful of files, so an unbounded budget gives the test the
+    /// exact inventory the report is built from.
+    fn test_storage_inventory(root: &Path) -> DoctorStorageInventory {
+        doctor_collect_storage_bytes_by_class(
+            root,
+            &crate::raw_mirror::RawMirrorInventoryBudget::unbounded(),
+        )
+    }
+
     #[test]
     fn doctor_storage_pressure_classifies_precious_and_reclaimable_bytes() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -106960,9 +107260,10 @@ mod response_schema_tests {
             Ok(1024),
             true,
             test_full_rebuild_readiness(root, 1024),
+            test_storage_inventory(root),
         );
 
-        assert_eq!(report.schema_version, 3);
+        assert_eq!(report.schema_version, 4);
         assert_eq!(report.full_rebuild_readiness.status, "blocked");
         assert!(
             report
@@ -107030,6 +107331,7 @@ mod response_schema_tests {
             Ok(DOCTOR_STORAGE_MIN_FREE_BYTES),
             false,
             test_full_rebuild_readiness(&link_root, DOCTOR_STORAGE_MIN_FREE_BYTES),
+            test_storage_inventory(&link_root),
         );
 
         assert!(report.data_dir_exists);
@@ -107196,6 +107498,7 @@ mod response_schema_tests {
                 vec![(root.to_path_buf(), Ok(available))],
                 true,
             ),
+            test_storage_inventory(root),
         );
         assert_eq!(report.status, "ok", "general pressure floor is satisfied");
         assert_eq!(report.low_disk_risk, "none");

@@ -121,7 +121,64 @@ pub struct RawMirrorStorageSummary {
     pub newest_source_mtime_ms: Option<i64>,
 }
 
+/// Wall-clock and entry budget for a filesystem inventory walk.
+///
+/// An inventory walk costs O(files in the archive) with no natural ceiling.
+/// On the owner archive (a 12 GB database plus a large content-addressed
+/// mirror) the doctor's inventory walk held `cass doctor --check` for more
+/// than 30 minutes with no output at all (k2k20). Every walk that can run
+/// against a user's archive takes a budget and reports the truncation
+/// instead of hiding it.
+#[derive(Debug, Clone, Copy)]
+pub struct RawMirrorInventoryBudget {
+    max_entries: usize,
+    deadline: Option<std::time::Instant>,
+}
+
+impl RawMirrorInventoryBudget {
+    /// A budget that never truncates, for callers that require an exact
+    /// figure (the indexer's own accounting, the prune planner).
+    pub const fn unbounded() -> Self {
+        Self {
+            max_entries: usize::MAX,
+            deadline: None,
+        }
+    }
+
+    /// A budget that stops after `max_entries` entries or `timeout`, whichever
+    /// comes first.
+    pub fn bounded(max_entries: usize, timeout: std::time::Duration) -> Self {
+        Self {
+            max_entries,
+            deadline: std::time::Instant::now().checked_add(timeout),
+        }
+    }
+
+    /// Whether the walk must stop now.
+    pub fn expired(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    }
+
+    /// The entry ceiling this walk enforces.
+    pub const fn max_entries(&self) -> usize {
+        self.max_entries
+    }
+}
+
 pub fn storage_summary(data_dir: &Path) -> RawMirrorStorageSummary {
+    storage_summary_bounded(data_dir, &RawMirrorInventoryBudget::unbounded()).0
+}
+
+/// The exact storage summary, walked under `budget`.
+///
+/// Returns the summary plus whether the walk saw the whole mirror: a
+/// truncated walk yields lower bounds, and the caller must say so rather than
+/// present a partial figure as the archive's size.
+pub(crate) fn storage_summary_bounded(
+    data_dir: &Path,
+    budget: &RawMirrorInventoryBudget,
+) -> (RawMirrorStorageSummary, bool) {
     let root = raw_mirror_root(data_dir);
     let mut summary = RawMirrorStorageSummary {
         root_path: root.display().to_string(),
@@ -129,28 +186,31 @@ pub fn storage_summary(data_dir: &Path) -> RawMirrorStorageSummary {
     };
     let root_metadata = match fs::symlink_metadata(&root) {
         Ok(metadata) => metadata,
-        Err(_) => return summary,
+        Err(_) => return (summary, true),
     };
     summary.initialized = true;
     if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
         summary.invalid_manifest_count = 1;
-        return summary;
+        return (summary, true);
     }
 
-    summary.total_storage_bytes = raw_mirror_dir_file_bytes(&root);
+    let (total_storage_bytes, storage_bytes_complete) = raw_mirror_dir_file_bytes(&root, budget);
+    summary.total_storage_bytes = total_storage_bytes;
+    let mut complete = storage_bytes_complete;
 
     let manifests_dir = root.join("manifests");
     let Ok(manifests_metadata) = fs::symlink_metadata(&manifests_dir) else {
-        populate_raw_mirror_orphan_summary(&root, &HashSet::new(), &mut summary);
-        return summary;
+        let orphan_summary_complete =
+            populate_raw_mirror_orphan_summary(&root, &HashSet::new(), &mut summary, budget);
+        return (summary, complete && orphan_summary_complete);
     };
     if manifests_metadata.file_type().is_symlink() || !manifests_metadata.is_dir() {
         summary.invalid_manifest_count = summary.invalid_manifest_count.saturating_add(1);
-        return summary;
+        return (summary, complete);
     }
     let entries = match fs::read_dir(&manifests_dir) {
         Ok(entries) => entries,
-        Err(_) => return summary,
+        Err(_) => return (summary, complete),
     };
     let mut seen_blobs = HashSet::new();
     for entry in entries {
@@ -226,19 +286,26 @@ pub fn storage_summary(data_dir: &Path) -> RawMirrorStorageSummary {
     }
 
     if summary.invalid_manifest_count == 0 {
-        populate_raw_mirror_orphan_summary(&root, &seen_blobs, &mut summary);
+        let orphan_summary_complete =
+            populate_raw_mirror_orphan_summary(&root, &seen_blobs, &mut summary, budget);
+        complete = complete && orphan_summary_complete;
     }
 
-    summary
+    (summary, complete)
 }
 
+/// Adds the unreferenced-blob counts to `summary`.
+///
+/// Returns whether the blob walk saw the whole mirror: a truncated walk
+/// leaves the orphan counts as lower bounds.
 fn populate_raw_mirror_orphan_summary(
     root: &Path,
     referenced_blob_paths: &HashSet<String>,
     summary: &mut RawMirrorStorageSummary,
-) {
-    let Ok(physical_blobs) = collect_raw_mirror_physical_blobs(root) else {
-        return;
+    budget: &RawMirrorInventoryBudget,
+) -> bool {
+    let Ok((physical_blobs, complete)) = collect_raw_mirror_physical_blobs(root, budget) else {
+        return false;
     };
     for blob in physical_blobs {
         if !referenced_blob_paths.contains(&blob.relative_path) {
@@ -246,10 +313,21 @@ fn populate_raw_mirror_orphan_summary(
             summary.orphan_blob_bytes = summary.orphan_blob_bytes.saturating_add(blob.size_bytes);
         }
     }
+    complete
 }
 
 pub(crate) fn physical_storage_bytes(data_dir: &Path) -> u64 {
-    raw_mirror_dir_file_bytes(&raw_mirror_root(data_dir))
+    physical_storage_bytes_bounded(data_dir, &RawMirrorInventoryBudget::unbounded()).0
+}
+
+/// The mirror's on-disk bytes, walked under `budget`.
+///
+/// Returns the bytes plus whether the walk saw the whole mirror.
+pub(crate) fn physical_storage_bytes_bounded(
+    data_dir: &Path,
+    budget: &RawMirrorInventoryBudget,
+) -> (u64, bool) {
+    raw_mirror_dir_file_bytes(&raw_mirror_root(data_dir), budget)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -433,7 +511,11 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
 
     let manifests = collect_prune_manifests(&root)?;
     report.manifest_count = manifests.len() as u64;
-    let physical_blobs = collect_raw_mirror_physical_blobs(&root)?;
+    let (physical_blobs, physical_blobs_complete) =
+        collect_raw_mirror_physical_blobs(&root, &RawMirrorInventoryBudget::unbounded())?;
+    if !physical_blobs_complete {
+        anyhow::bail!("refusing to prune: the raw mirror blob inventory was truncated");
+    }
     let physical_blob_by_relative = physical_blobs
         .iter()
         .map(|blob| (blob.relative_path.clone(), blob))
@@ -1102,11 +1184,18 @@ fn load_keep_tag_conversation_ids(
     Ok(pinned)
 }
 
-fn collect_raw_mirror_physical_blobs(root: &Path) -> Result<Vec<RawMirrorPhysicalBlob>> {
+/// The blobs physically present under `root`, walked under `budget`.
+///
+/// Returns the blobs plus whether the walk saw the whole blob store: a
+/// truncated walk leaves the caller's orphan accounting as a lower bound.
+fn collect_raw_mirror_physical_blobs(
+    root: &Path,
+    budget: &RawMirrorInventoryBudget,
+) -> Result<(Vec<RawMirrorPhysicalBlob>, bool)> {
     let blobs_root = root.join("blobs").join(RAW_MIRROR_HASH_ALGORITHM);
     let metadata = match fs::symlink_metadata(&blobs_root) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), true)),
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("stat raw mirror blob root {}", blobs_root.display()));
@@ -1121,10 +1210,15 @@ fn collect_raw_mirror_physical_blobs(root: &Path) -> Result<Vec<RawMirrorPhysica
 
     let mut stack = vec![blobs_root];
     let mut blobs = Vec::new();
+    let mut scanned = 0usize;
     while let Some(directory) = stack.pop() {
         for entry in fs::read_dir(&directory)
             .with_context(|| format!("read raw mirror blob directory {}", directory.display()))?
         {
+            if scanned >= budget.max_entries() || budget.expired() {
+                return Ok((blobs, false));
+            }
+            scanned = scanned.saturating_add(1);
             let entry = entry?;
             let path = entry.path();
             let metadata = fs::symlink_metadata(&path).with_context(|| {
@@ -1183,7 +1277,7 @@ fn collect_raw_mirror_physical_blobs(root: &Path) -> Result<Vec<RawMirrorPhysica
             .cmp(&right.modified_at_ms.unwrap_or(i64::MAX))
             .then_with(|| left.relative_path.cmp(&right.relative_path))
     });
-    Ok(blobs)
+    Ok((blobs, true))
 }
 
 fn validate_prune_target_file(root: &Path, path: &Path) -> Result<bool> {
@@ -1663,10 +1757,22 @@ fn merge_min_max(min: &mut Option<i64>, max: &mut Option<i64>, value: Option<i64
     *max = Some(max.map_or(value, |current| current.max(value)));
 }
 
-fn raw_mirror_dir_file_bytes(root: &Path) -> u64 {
+/// The bytes stored under `root`, walked under `budget`.
+///
+/// Returns the bytes plus whether the walk saw the whole tree: a truncated
+/// walk yields a lower bound.
+fn raw_mirror_dir_file_bytes(
+    root: &Path,
+    budget: &RawMirrorInventoryBudget,
+) -> (u64, bool) {
     let mut total = 0u64;
     let mut stack = vec![root.to_path_buf()];
+    let mut scanned = 0usize;
     while let Some(path) = stack.pop() {
+        if scanned >= budget.max_entries() || budget.expired() {
+            return (total, false);
+        }
+        scanned = scanned.saturating_add(1);
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
@@ -1684,7 +1790,7 @@ fn raw_mirror_dir_file_bytes(root: &Path) -> u64 {
             }
         }
     }
-    total
+    (total, true)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

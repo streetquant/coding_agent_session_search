@@ -168,7 +168,12 @@ fn maintain(data_dir: &Path, policy: &RawMirrorAutomaticRetention, now: i64) -> 
         ..RawMirrorMaintenanceReport::default()
     };
     let inventory = collect_prune_manifests(&root)?;
-    let physical: HashMap<_, _> = collect_raw_mirror_physical_blobs(&root)?.into_iter()
+    let (physical_blobs, physical_blobs_complete) =
+        collect_raw_mirror_physical_blobs(&root, &RawMirrorInventoryBudget::unbounded())?;
+    if !physical_blobs_complete {
+        anyhow::bail!("automatic retention refused: the raw mirror blob inventory was truncated");
+    }
+    let physical: HashMap<_, _> = physical_blobs.into_iter()
         .map(|blob| (blob.relative_path.clone(), blob)).collect();
     for manifest in &inventory {
         for reference in &manifest.blob_references {
