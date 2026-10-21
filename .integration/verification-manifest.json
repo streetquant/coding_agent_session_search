@@ -3,7 +3,9 @@
     {
       "allow_worktree_change": false,
       "argv": [
-        "git", "diff", "--check"
+        "git",
+        "diff",
+        "--check"
       ],
       "category": "tests",
       "cwd": ".",
@@ -17,7 +19,9 @@
     {
       "allow_worktree_change": false,
       "argv": [
-        "git", "diff", "--check"
+        "git",
+        "diff",
+        "--check"
       ],
       "category": "tests",
       "cwd": ".",
@@ -31,12 +35,13 @@
     {
       "allow_worktree_change": false,
       "argv": [
-        "bash", "scripts/gate.sh", "--local", "--lib-filter",
-        "field_mask_resolution_tests",
+        "bash",
+        "scripts/gate.sh",
+        "--local",
         "--integration",
-        "spec_robot_docs_topics,e2e_lexical_fail_open,cli_view_budget",
+        "cli_robot,bookmarks_cli,search_metamorphic,pages_bundle,search_service,connector_kilo,connector_cloudmcp,connector_cline_cli,connector_opencode2,connector_openwebui,native_history_acceptance,cli_sessions_exact,spec_view_expand_error_envelopes,agent_detection_completeness,frankensqlite_compat_gates,e2e_repro_capsule_gate,e2e_lexical_fail_open,cli_index,spec_robot_docs_topics,cli_view_budget,semantic_generation_manifest,semantic_reader_ann,e2e_semantic_one_shot_delta_gate",
         "--ubs-files",
-        "src/recipes_robot_docs.rs,tests/spec_robot_docs_topics.rs,tests/e2e_lexical_fail_open.rs,README.md,SKILL.md,tests/golden/robot_docs/recipes.txt.golden"
+        ".github/workflows/apply-gh523-diag-once.yml,docs/LEXICAL_QUARANTINE_MOUNT_SAFETY.md,scripts/apply_gh523_diag_integration.py,scripts/gate.sh,scripts/test_apply_gh523_diag_integration.py,src/connectors/codex/discovery/tests.rs,src/indexer/lexical_publish.rs,src/indexer/lexical_publish/failure_evidence.rs,src/indexer/lexical_publish/failure_evidence/tests.rs,src/search/lexical_quarantine.rs,src/search/lexical_quarantine/mounts.rs,src/search/lexical_quarantine/mounts/tests.rs,src/search/lexical_quarantine/retention.rs,src/search/lexical_quarantine/retention/mount_tests.rs,src/search/lexical_quarantine_diagnostics.rs,src/search/lexical_quarantine_diagnostics/tests.rs,src/search/mod.rs,tests/pages_bundle.rs"
       ],
       "category": "regression",
       "cwd": ".",
@@ -45,10 +50,10 @@
         "CARGO_BUILD_JOBS": "4",
         "GATE_BUILD_JOBS": "4",
         "GATE_UBS_TIMEOUT_SECS": "1800",
-        "GATE_UBS_MODULE_SEED_DIR": "/warp/projects/softwares/cass/.local-state/t01a15ab7/cass-gate-ubs.90Hwc0/modules",
+        "GATE_UBS_MODULE_SEED_DIR": "/warp/projects/softwares/cass/.local-state/t01a15ab7/cass-gate-ubs.FjpmRc/modules",
         "GATE_TARGET_DIR": "/warp/projects/softwares/cass/.local-state/upstream-integration-01a15ab7/target",
         "TMPDIR": "/warp/projects/softwares/cass/.local-state/t01a15ab7",
-        "GATE_RECEIPT_FILE": "/warp/projects/softwares/cass/.local-state/upstream-integration-01a15ab7/gate-local-r19.receipt"
+        "GATE_RECEIPT_FILE": "/warp/projects/softwares/cass/.local-state/upstream-integration-01a15ab7/gate-local-r26.receipt"
       },
       "expected_exit_code": 0,
       "id": "final-full",
