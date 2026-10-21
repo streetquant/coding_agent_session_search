@@ -18843,6 +18843,11 @@ fn open_franken_cli_read_db(
     ) {
         Ok(storage) => storage.into_raw(),
         Err(err) => {
+            if let Some(marker) =
+                crate::storage::sqlite::conflicting_fts_schema_repair_required_from_error(&err)
+            {
+                return Err(schema_repair_required_cli_error(reason, marker));
+            }
             let readonly_retryable = crate::storage::sqlite::retryable_franken_anyhow(&err);
             match crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(
                 &path,
@@ -18850,6 +18855,13 @@ fn open_franken_cli_read_db(
             ) {
                 Ok(conn) => conn,
                 Err(raw_readonly_err) => {
+                    if let Some(marker) =
+                        crate::storage::sqlite::conflicting_fts_schema_repair_required_from_error(
+                            &raw_readonly_err,
+                        )
+                    {
+                        return Err(schema_repair_required_cli_error(reason, marker));
+                    }
                     let raw_readonly_retryable =
                         crate::storage::sqlite::retryable_franken_anyhow(&raw_readonly_err);
                     let message = format!(
@@ -18936,6 +18948,11 @@ fn open_franken_cli_owner_read_db(
         busy_timeout,
     )
     .map_err(|err| {
+        if let Some(marker) =
+            crate::storage::sqlite::conflicting_fts_schema_repair_required_from_error(&err)
+        {
+            return schema_repair_required_cli_error(reason, marker);
+        }
         let retryable = crate::storage::sqlite::retryable_franken_anyhow(&err);
         let message = format!(
             "Failed to open {reason} database at {}: dedicated-owner readonly open failed ({err})",
@@ -19093,6 +19110,25 @@ fn fts_messages_integrity_cli_error(surface: &str, err: anyhow::Error) -> CliErr
         kind: CliErrorKind::Storage.kind_str(),
         message: format!("{surface} cannot continue: {err:#}"),
         hint: Some(crate::storage::sqlite::FTS_MESSAGES_CORRUPTION_RECOVERY_HINT.to_string()),
+        retryable: false,
+    }
+}
+
+/// An archive whose `sqlite_master` carries duplicate `fts_messages`
+/// virtual-table rows cannot be opened by frankensqlite. Ordinary opens never
+/// repair it, so the CLI reports the typed `schema-repair-required` condition
+/// and points the operator at the doctor repair (2l1b0.65).
+fn schema_repair_required_cli_error(
+    surface: &str,
+    marker: &crate::storage::sqlite::ConflictingFtsSchemaRepairRequired,
+) -> CliError {
+    CliError {
+        code: 7,
+        kind: CliErrorKind::SchemaRepairRequired.kind_str(),
+        message: format!("{surface} cannot continue: {marker}"),
+        hint: Some(
+            "Run 'cass doctor --fix' to repair the archive's derived FTS schema rows.".into(),
+        ),
         retryable: false,
     }
 }
@@ -93519,6 +93555,61 @@ pub(crate) fn run_doctor_impl(
                 fix_applied: false,
             });
         };
+    }
+
+    // 2l1b0.65: frankensqlite refuses to open a catalog whose sqlite_master
+    // carries duplicate `fts_messages` virtual-table rows, and no ordinary
+    // open repairs it any more. `cass doctor --fix` is the one surface that
+    // may: it holds the doctor mutation lock, and the repair touches only the
+    // derived schema rows.
+    let conflicting_fts_schema_probe = if db_path.exists() {
+        crate::storage::sqlite::probe_conflicting_fts_schema_rows(&db_path)
+    } else {
+        crate::storage::sqlite::ConflictingFtsSchemaProbe::Clean
+    };
+    if conflicting_fts_schema_probe
+        == crate::storage::sqlite::ConflictingFtsSchemaProbe::RepairRequired
+    {
+        let repair_outcome = if fix_can_mutate {
+            match crate::storage::sqlite::repair_conflicting_fts_schema_rows_via_sqlite3(&db_path) {
+                Ok(()) => Ok(()),
+                Err(err) => Err(format!("{err:#}")),
+            }
+        } else {
+            Err("the repair is only performed by 'cass doctor --fix'".to_string())
+        };
+        match repair_outcome {
+            Ok(()) => {
+                checks.push(Check {
+                    name: "conflicting_fts_schema_rows".to_string(),
+                    status: "pass".to_string(),
+                    message: format!(
+                        "Repaired duplicate `fts_messages` sqlite_master rows in {}",
+                        db_path.display()
+                    ),
+                    fix_available: true,
+                    fix_applied: true,
+                });
+                auto_fix_actions.push(format!(
+                    "Repaired duplicate `fts_messages` sqlite_master rows in {}",
+                    db_path.display()
+                ));
+                auto_fix_applied = true;
+            }
+            Err(reason) => {
+                add_check!(
+                    "conflicting_fts_schema_rows",
+                    "fail",
+                    format!(
+                        "The archive at {} carries duplicate `fts_messages` sqlite_master rows, \
+                         which frankensqlite refuses to open: {reason}. Run 'cass doctor --fix' to \
+                         repair it.",
+                        db_path.display()
+                    ),
+                    true
+                );
+            }
+        }
     }
 
     if let Some(reason) = operation_state.mutation_blocked_reason.as_deref() {

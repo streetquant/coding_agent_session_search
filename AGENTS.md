@@ -393,9 +393,18 @@ Use `FrankenConnectionManager` for concurrent access:
 
 - **File format interop:** As of rev `9cedb30b`, frankensqlite databases are
   readable by C SQLite (rusqlite) and vice versa. Historical bundle salvage
-  still uses rusqlite as a proven read bridge for pre-migration databases.
-- **`PRAGMA writable_schema`:** Not supported for write operations (INSERT/UPDATE
-  on sqlite_master). SELECT from sqlite_master works.
+  uses the external `sqlite3` CLI's `.recover` (frankensqlite has no
+  equivalent) and re-imports the recovered rows into a fresh frankensqlite
+  database; `rusqlite` is a dev-dependency only and is never linked into the
+  shipped binary.
+- **`PRAGMA writable_schema`:** Supported for writes since fsqlite 0.4.12
+  (`INSERT`/`DELETE` on `sqlite_master` both work). The one thing it still
+  cannot do is *open* a catalog whose `sqlite_master` carries conflicting
+  virtual-table entries (for example two `fts_messages` rows): the schema
+  load rejects it before any statement runs. Repairing that shape therefore
+  needs the stock `sqlite3` CLI, and cass only ever runs it from
+  `cass doctor --fix` (2l1b0.65). Ordinary opens report the typed
+  `schema-repair-required` condition and never mutate the archive.
 
 ### General Rules
 

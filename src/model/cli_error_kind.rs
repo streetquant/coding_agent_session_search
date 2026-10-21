@@ -122,6 +122,9 @@ pub enum ErrorKind {
     /// Snake-case wire literal (legacy): `retained_publish_backup`.
     RetainedPublishBackup,
     Schedule,
+    /// An archive needs an operator-driven schema repair before it can be
+    /// opened (`cass doctor --fix`). 2l1b0.65.
+    SchemaRepairRequired,
     Search,
     SemanticBackfill,
     SemanticManifest,
@@ -224,6 +227,7 @@ impl ErrorKind {
             Self::ResumeExecFailed => "resume-exec-failed",
             Self::RetainedPublishBackup => "retained-publish-backup",
             Self::Schedule => "schedule",
+            Self::SchemaRepairRequired => "schema-repair-required",
             Self::Search => "search",
             Self::SemanticBackfill => "semantic-backfill",
             Self::SemanticManifest => "semantic-manifest",
@@ -325,6 +329,7 @@ impl ErrorKind {
             "resume-exec-failed" => Self::ResumeExecFailed,
             "retained-publish-backup" => Self::RetainedPublishBackup,
             "schedule" => Self::Schedule,
+            "schema-repair-required" => Self::SchemaRepairRequired,
             "search" => Self::Search,
             "semantic-backfill" => Self::SemanticBackfill,
             "semantic-manifest" => Self::SemanticManifest,
@@ -426,6 +431,7 @@ impl ErrorKind {
             Self::ResumeExecFailed,
             Self::RetainedPublishBackup,
             Self::Schedule,
+            Self::SchemaRepairRequired,
             Self::Search,
             Self::SemanticBackfill,
             Self::SemanticManifest,
@@ -508,13 +514,14 @@ mod tests {
     /// drift immediately at CI time.
     #[test]
     fn variant_count_matches_audited_lib_rs_kind_literals() {
-        // 92 unique kinds: GH #450 added `migration-repair-pending` (95), then
+        // 93 unique kinds: GH #450 added `migration-repair-pending` (95), then
         // 2l1b0.58 folded the duplicate spellings `index-missing` into
         // `missing-index` and `io-error` into `io`, and dropped `update-check`,
         // whose only producer (the pre-TUI update prompt) 2l1b0.56 removed.
+        // 2l1b0.65 added `schema-repair-required` (93).
         // If lib.rs grows a new kind, bump this count AND add the variant +
         // arms above.
-        const AUDITED_KIND_COUNT: usize = 92;
+        const AUDITED_KIND_COUNT: usize = 93;
         assert_eq!(
             ErrorKind::all_variants().len(),
             AUDITED_KIND_COUNT,

@@ -1045,7 +1045,6 @@ pub(crate) fn open_franken_async_readonly_connection_with_timeout(
     let deadline = Instant::now() + timeout;
     let mut backoff = Duration::from_millis(4);
     let mut wal_recovery_attempted = false;
-    let mut duplicate_fts_repair_attempted = false;
     loop {
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
         match FrankenAsyncConnection::open_schema_only_with_wal_index_recovery_sync(&path_str)
@@ -1072,18 +1071,17 @@ pub(crate) fn open_franken_async_readonly_connection_with_timeout(
                     Duration::from_millis(128),
                 );
             }
-            // ubs:ignore -- The duplicate-schema repair guard allows this error rendering once per open operation.
-            Err(err)
-                if !duplicate_fts_repair_attempted
-                    && format!("{err:#}").contains("conflicting virtual-table entries") =>
-            {
+            // A read-only open never repairs the archive: it reports the
+            // typed repair-required condition and leaves the bytes alone
+            // (2l1b0.65). `cass doctor --fix` performs the repair.
+            Err(err) if is_conflicting_virtual_table_entries_error(&err) => {
                 tracing::warn!(
                     db = %path.display(),
                     error = %err,
-                    "dedicated-owner readonly open found duplicate fts_messages schema rows; deduplicating through the sanctioned sqlite3 bridge"
+                    "dedicated-owner readonly open found duplicate fts_messages schema rows; \
+                     reporting schema repair required without mutating the archive"
                 );
-                dedupe_conflicting_fts_schema_rows_via_sqlite3(path)?;
-                duplicate_fts_repair_attempted = true;
+                return Err(conflicting_fts_schema_repair_required(path));
             }
             Err(err)
                 if !wal_recovery_attempted && attempt_dirty_wal_recovery_checkpoint(path, &err) =>
@@ -1143,6 +1141,12 @@ pub(crate) fn open_franken_async_strict_readonly_connection_with_timeout(
                     remaining,
                     Duration::from_millis(128),
                 );
+            }
+            // A strict readonly open never mutates the archive, so a catalog
+            // carrying conflicting `fts_messages` rows is reported as the
+            // typed repair-required condition (2l1b0.65).
+            Err(err) if is_conflicting_virtual_table_entries_error(&err) => {
+                return Err(conflicting_fts_schema_repair_required(path));
             }
             Err(err) => {
                 return Err(context_franken_open_error(
@@ -2186,17 +2190,71 @@ pub(crate) fn validate_fts_messages_integrity_for_async_connection(
     )
 }
 
+/// Typed marker for an archive whose `sqlite_master` carries duplicate
+/// `fts_messages` virtual-table rows.
+///
+/// frankensqlite refuses to *open* such a catalog at all ("conflicting
+/// virtual-table entries"), so no cass open path can repair it while opening
+/// it. An ordinary open — read-only or read-write — therefore never spawns a
+/// repair: it returns this typed error, and the CLI surfaces it as the
+/// `schema-repair-required` kind pointing at `cass doctor --fix` (2l1b0.65).
+/// The repair itself lives in
+/// [`repair_conflicting_fts_schema_rows_via_sqlite3`] and is doctor-only.
+#[derive(Debug, Clone)]
+pub(crate) struct ConflictingFtsSchemaRepairRequired {
+    pub(crate) db_path: PathBuf,
+}
+
+impl std::fmt::Display for ConflictingFtsSchemaRepairRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the archive at {} carries duplicate `fts_messages` virtual-table rows in \
+             sqlite_master, which frankensqlite refuses to open; run 'cass doctor --fix' \
+             to repair it",
+            self.db_path.display()
+        )
+    }
+}
+
+impl std::error::Error for ConflictingFtsSchemaRepairRequired {}
+
+/// Build the typed repair-required error for `db_path`.
+pub(crate) fn conflicting_fts_schema_repair_required(db_path: &Path) -> anyhow::Error {
+    anyhow::Error::new(ConflictingFtsSchemaRepairRequired {
+        db_path: db_path.to_path_buf(),
+    })
+}
+
+/// Recover the typed repair-required marker from an error chain, if present.
+pub(crate) fn conflicting_fts_schema_repair_required_from_error(
+    err: &anyhow::Error,
+) -> Option<&ConflictingFtsSchemaRepairRequired> {
+    err.downcast_ref::<ConflictingFtsSchemaRepairRequired>()
+}
+
+/// Whether an error means "the catalog carries conflicting virtual-table
+/// entries", the shape frankensqlite refuses to open.
+pub(crate) fn is_conflicting_virtual_table_entries_error(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains("conflicting virtual-table entries")
+}
+
 /// Remove historical duplicate `fts_messages` rows from `sqlite_master`,
 /// keeping the earliest (canonical) row.
 ///
-/// fsqlite 0.3.x refuses to open a database whose sqlite_master carries the
-/// pre-fix duplicate `fts_messages` virtual-table row ("conflicting
-/// virtual-table entries"), so this repair must run before the engine open.
-/// writable_schema WRITES are the one documented operation frankensqlite does
-/// not support (AGENTS.md: "PRAGMA writable_schema: Not supported for write
-/// operations"), so the surgery shells to the `sqlite3` CLI — the same
-/// production pattern `scrub_staged_derived_fts_metadata_via_sqlite3` uses
-/// for staged-seed sqlite_master repair.
+/// frankensqlite can *write* `sqlite_master` under `PRAGMA writable_schema`
+/// (fsqlite 0.4.12), but it cannot *open* a catalog that carries conflicting
+/// virtual-table entries, so it can never run this surgery itself. The stock
+/// `sqlite3` CLI is the only engine that opens such a catalog, which is why
+/// this shell-out exists at all — and why it is called from exactly one place:
+/// the `cass doctor --fix` repair path. Ordinary opens return the typed
+/// [`ConflictingFtsSchemaRepairRequired`] error instead of mutating the
+/// archive behind the caller's back (2l1b0.65).
+///
+/// The call is a documented, test-covered fallback: `rg 'Command::new("sqlite3")'
+/// src` still reports this one, the historical-bundle metadata probe and the
+/// historical `.recover` salvage, and no other production path spawns an
+/// external SQLite engine.
 /// Error for a failed launch of the external `sqlite3` CLI. A host without it
 /// (Windows by default, minimal containers) used to see only "No such file or
 /// directory"; say which tool is missing and what needed it (2l1b0.65).
@@ -2211,32 +2269,25 @@ fn sqlite3_cli_launch_error(error: std::io::Error, action: &str) -> anyhow::Erro
     }
 }
 
-pub(crate) fn dedupe_conflicting_fts_schema_rows_via_sqlite3(db_path: &Path) -> Result<()> {
-    let dedupe_sql = "PRAGMA writable_schema = ON;
-         DELETE FROM sqlite_master
-          WHERE type = 'table'
-            AND name = 'fts_messages'
-            AND rowid NOT IN (
-                SELECT MIN(rowid) FROM sqlite_master
-                 WHERE type = 'table' AND name = 'fts_messages'
-            );
-         PRAGMA writable_schema = OFF;";
-
+pub(crate) fn repair_conflicting_fts_schema_rows_via_sqlite3(db_path: &Path) -> Result<()> {
     let run_dedupe = |disable_defensive: bool| -> Result<std::process::Output> {
         let mut command = Command::new("sqlite3");
         command.arg("-batch").arg(db_path);
         if disable_defensive {
             command.arg(".dbconfig defensive off");
         }
-        command.arg(dedupe_sql).output().map_err(|error| {
-            sqlite3_cli_launch_error(
-                error,
-                &format!(
-                    "the duplicate fts schema-row repair of {}",
-                    db_path.display()
-                ),
-            )
-        })
+        command
+            .arg(DEDUPE_SQLITE_MASTER_SQL)
+            .output()
+            .map_err(|error| {
+                sqlite3_cli_launch_error(
+                    error,
+                    &format!(
+                        "the duplicate fts schema-row repair of {}",
+                        db_path.display()
+                    ),
+                )
+            })
     };
     let render_output = |output: &std::process::Output| -> String {
         format!(
@@ -2271,6 +2322,72 @@ pub(crate) fn dedupe_conflicting_fts_schema_rows_via_sqlite3(db_path: &Path) -> 
     );
     Ok(())
 }
+
+/// The outcome of probing an archive for the conflicting `fts_messages`
+/// catalog shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConflictingFtsSchemaProbe {
+    /// The archive opens and carries at most one `fts_messages` catalog row.
+    Clean,
+    /// The archive carries duplicate `fts_messages` catalog rows, so
+    /// frankensqlite refuses to open it and the repair is required.
+    RepairRequired,
+    /// The archive could not be probed for this shape at all.
+    Undetermined,
+}
+
+/// Probe an archive for the conflicting `fts_messages` catalog shape.
+///
+/// The probe never mutates the archive and never spawns an external engine:
+/// frankensqlite either opens the catalog (then the `fts_messages` row count
+/// answers the question) or refuses it with the conflicting-virtual-table
+/// error (then the repair is required by construction).
+pub(crate) fn probe_conflicting_fts_schema_rows(db_path: &Path) -> ConflictingFtsSchemaProbe {
+    if !db_path.exists() {
+        return ConflictingFtsSchemaProbe::Clean;
+    }
+    let path_str = db_path.to_string_lossy().to_string();
+    match FrankenConnection::open_schema_only_with_wal_index_recovery(&path_str) {
+        Ok(conn) => {
+            let rows = conn
+                .query_row_map(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                    fparams![],
+                    |row| row.get_typed::<i64>(0),
+                )
+                .ok();
+            match rows {
+                Some(count) if count > 1 => ConflictingFtsSchemaProbe::RepairRequired,
+                _ => ConflictingFtsSchemaProbe::Clean,
+            }
+        }
+        Err(err)
+            if err
+                .to_string()
+                .contains("conflicting virtual-table entries") =>
+        {
+            ConflictingFtsSchemaProbe::RepairRequired
+        }
+        Err(_) => ConflictingFtsSchemaProbe::Undetermined,
+    }
+}
+
+/// The `sqlite_master` surgery that removes the duplicate `fts_messages`
+/// virtual-table rows, keeping the earliest (canonical) row.
+///
+/// The stock CLI refuses a plain `DELETE FROM sqlite_master` on a catalog with
+/// conflicting virtual-table rows while its defensive mode is on, so the
+/// surgery runs with `.dbconfig defensive off` first and retries without it
+/// only as a fallback.
+const DEDUPE_SQLITE_MASTER_SQL: &str = "PRAGMA writable_schema = ON;
+     DELETE FROM sqlite_master
+      WHERE type = 'table'
+        AND name = 'fts_messages'
+        AND rowid NOT IN (
+            SELECT MIN(rowid) FROM sqlite_master
+             WHERE type = 'table' AND name = 'fts_messages'
+        );
+     PRAGMA writable_schema = OFF;";
 
 #[cfg(test)]
 pub(crate) fn materialize_fresh_fts_schema_via_rusqlite(db_path: &Path) -> Result<()> {
@@ -3232,6 +3349,12 @@ fn probe_historical_bundle_via_sqlite3_metadata(root_path: &Path) -> Option<Hist
         .arg("-batch")
         .arg("-noheader")
         .arg(&bundle_uri)
+        // `.dbconfig defensive off` is deliberate: the stock CLI's defensive
+        // mode refuses to open a bundle whose sqlite_master carries
+        // conflicting virtual-table entries, and that is exactly the shape
+        // this probe exists to inspect. The connection stays `?immutable=1`,
+        // so the probe still cannot write to the bundle.
+        .arg(".dbconfig defensive off")
         // `writable_schema=ON` is deliberate: it relaxes schema-integrity
         // enforcement so this probe can still read `schema_version` out of a
         // bundle whose sqlite_master is damaged. Nothing here writes, and the
@@ -3239,11 +3362,18 @@ fn probe_historical_bundle_via_sqlite3_metadata(root_path: &Path) -> Option<Hist
         // corrupt anything — but it is bracketed with an explicit OFF so a
         // future edit that adds a statement here does not silently inherit an
         // unprotected connection.
+        //
+        // The three values share one row because the CLI prints lines of its
+        // own: `.dbconfig defensive off` echoes the setting it just changed.
+        // Taking the first three lines positionally would read that echo as
+        // `schema_version` and shift every later value by one.
         .arg(
             "PRAGMA writable_schema=ON;
-             SELECT COALESCE((SELECT value FROM meta WHERE key = 'schema_version'), '');
-             SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages';
-             SELECT COALESCE(MAX(id), 0) FROM messages;
+             SELECT COALESCE((SELECT value FROM meta WHERE key = 'schema_version'), '')
+                  || '|' ||
+                  (SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages')
+                  || '|' ||
+                  COALESCE((SELECT MAX(id) FROM messages), 0);
              PRAGMA writable_schema=OFF;",
         )
         .output()
@@ -3253,13 +3383,13 @@ fn probe_historical_bundle_via_sqlite3_metadata(root_path: &Path) -> Option<Hist
     }
 
     let stdout = String::from_utf8(output.stdout).ok()?;
-    let mut lines = stdout.lines();
-    let schema_version = lines.next().and_then(|raw| raw.trim().parse::<i64>().ok());
-    let fts_schema_rows = lines.next().and_then(|raw| raw.trim().parse::<i64>().ok());
-    let max_message_id = lines
-        .next()
-        .and_then(|raw| raw.trim().parse::<i64>().ok())
-        .unwrap_or(0);
+    // Read the single row the probe asked for, not a fixed line offset: the
+    // CLI's own output (the `.dbconfig` echo) is not part of the answer.
+    let row = stdout.lines().find(|line| line.contains('|'))?;
+    let mut fields = row.split('|');
+    let schema_version = fields.next()?.trim().parse::<i64>().ok();
+    let fts_schema_rows = fields.next()?.trim().parse::<i64>().ok();
+    let max_message_id = fields.next()?.trim().parse::<i64>().ok().unwrap_or(0);
 
     Some(HistoricalBundleProbe {
         schema_version,
@@ -3350,6 +3480,15 @@ fn is_recoverable_insert_line(line: &str) -> bool {
     })
 }
 
+/// Salvage a damaged historical bundle through the stock `sqlite3` CLI's
+/// `.recover` mode.
+///
+/// This is a documented, test-covered fallback: frankensqlite has no
+/// equivalent of `.recover`, so a bundle whose pages are damaged beyond a
+/// plain open is recovered by the external engine and re-imported into a
+/// fresh frankensqlite database. It never runs on a healthy bundle, and a
+/// host without the `sqlite3` tool gets the typed missing-tool error from
+/// [`sqlite3_cli_launch_error`] instead of a spawn failure (2l1b0.65).
 fn recover_historical_bundle_via_sqlite3(
     bundle: &HistoricalDatabaseBundle,
 ) -> Result<HistoricalReadConnection> {
@@ -3537,7 +3676,14 @@ fn record_historical_bundle_import(
     Ok(())
 }
 
-fn scrub_staged_derived_fts_metadata_via_sqlite3(staged_db_path: &Path) -> Result<()> {
+/// Remove the derived FTS5 metadata rows from a staged archive's
+/// `sqlite_master` so the FTS rebuild can recreate them cleanly.
+///
+/// The staged copy is a cass-owned file whose catalog frankensqlite can open,
+/// and frankensqlite writes `sqlite_master` under `PRAGMA writable_schema`,
+/// so the surgery runs on the pinned engine instead of shelling out to the
+/// external `sqlite3` CLI (2l1b0.65).
+fn scrub_staged_derived_fts_metadata(staged_db_path: &Path) -> Result<()> {
     let scrub_sql = "PRAGMA writable_schema = ON;
          DELETE FROM sqlite_master
           WHERE name = 'fts_messages'
@@ -3558,45 +3704,41 @@ fn scrub_staged_derived_fts_metadata_via_sqlite3(staged_db_path: &Path) -> Resul
              );
          PRAGMA writable_schema = OFF;";
 
-    let run_scrub = |disable_defensive: bool| -> Result<std::process::Output> {
-        let mut command = Command::new("sqlite3");
-        command.arg("-batch").arg(staged_db_path);
-        if disable_defensive {
-            command.arg(".dbconfig defensive off");
-        }
-        command.arg(scrub_sql).output().map_err(|error| {
-            sqlite3_cli_launch_error(
-                error,
-                &format!(
-                    "the staged FTS metadata scrub of {}",
-                    staged_db_path.display()
-                ),
+    let path_str = staged_db_path.to_string_lossy().to_string();
+    let conn = FrankenConnection::open_existing_schema_only(&path_str)
+        .or_else(|_| FrankenConnection::open_existing_schema_only_deferred_fts5(&path_str))
+        .with_context(|| {
+            format!(
+                "opening staged frankensqlite db at {} for the derived FTS metadata scrub",
+                staged_db_path.display()
             )
-        })
-    };
-    let render_output = |output: &std::process::Output| -> String {
+        })?;
+    conn.execute("PRAGMA writable_schema = ON;")
+        .with_context(|| {
+            format!(
+                "enabling writable_schema for the staged FTS metadata scrub of {}",
+                staged_db_path.display()
+            )
+        })?;
+    let scrubbed = conn.execute(scrub_sql).with_context(|| {
         format!(
-            "status {}; stdout: {}; stderr: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim()
+            "scrubbing staged derived FTS metadata of {}",
+            staged_db_path.display()
         )
-    };
-
-    let defensive_off_output = run_scrub(true)?;
-    if defensive_off_output.status.success() {
-        return Ok(());
-    }
-
-    let fallback_output = run_scrub(false)?;
-    if !fallback_output.status.success() {
-        anyhow::bail!(
-            "sqlite3 staged FTS metadata scrub failed for {}; defensive-off attempt {}; fallback without .dbconfig {}",
-            staged_db_path.display(),
-            render_output(&defensive_off_output),
-            render_output(&fallback_output)
-        );
-    }
+    });
+    let writable_schema_restored = conn.execute("PRAGMA writable_schema = OFF;");
+    let scrubbed = scrubbed?;
+    writable_schema_restored.with_context(|| {
+        format!(
+            "restoring writable_schema after the staged FTS metadata scrub of {}",
+            staged_db_path.display()
+        )
+    })?;
+    tracing::info!(
+        db = %staged_db_path.display(),
+        rows = scrubbed,
+        "removed staged derived FTS metadata rows via frankensqlite"
+    );
     Ok(())
 }
 
@@ -3618,7 +3760,7 @@ fn ensure_seeded_canonical_fts_consistency(staged_db_path: &Path) -> Result<FtsC
                 error = %err,
                 "staged historical seed has malformed derived FTS metadata; scrubbing and rebuilding FTS on staged copy"
             );
-            scrub_staged_derived_fts_metadata_via_sqlite3(staged_db_path).with_context(|| {
+            scrub_staged_derived_fts_metadata(staged_db_path).with_context(|| {
                 format!(
                     "scrubbing malformed staged FTS metadata before finalization: {}",
                     staged_db_path.display()
@@ -5463,12 +5605,12 @@ impl FrankenStorage {
             // archives.
             match FrankenConnection::open_existing_schema_only(&path_str) {
                 Ok(conn) => conn,
-                // fsqlite 0.3.x validates sqlite_master at schema load and
-                // refuses the historical duplicate `fts_messages` row debris
-                // that 0.2.x tolerated (and that cass used to dedupe lazily in
-                // `ensure_search_fallback_fts_consistency`). Repair the
-                // duplicate rows through the rusqlite salvage bridge, then
-                // retry the open once.
+                // fsqlite validates sqlite_master at schema load and refuses
+                // the historical duplicate `fts_messages` row debris that
+                // older engines tolerated. A canonical open never repairs the
+                // archive behind the caller's back: it reports the typed
+                // repair-required condition and `cass doctor --fix` performs
+                // the repair (2l1b0.65).
                 Err(err)
                     if err
                         .to_string()
@@ -5478,16 +5620,10 @@ impl FrankenStorage {
                         db = %path.display(),
                         error = %err,
                         "frankensqlite refused open due to duplicate fts_messages \
-                         schema rows; deduplicating via sqlite3 bridge and retrying"
+                         schema rows; reporting schema repair required without \
+                         mutating the archive"
                     );
-                    dedupe_conflicting_fts_schema_rows_via_sqlite3(path)?;
-                    FrankenConnection::open_existing_schema_only(&path_str).with_context(|| {
-                        format!(
-                            "opening existing frankensqlite db at {} after \
-                                 duplicate fts schema-row repair",
-                            path.display()
-                        )
-                    })?
+                    return Err(conflicting_fts_schema_repair_required(path));
                 }
                 Err(err) => {
                     return Err(err).with_context(|| {
@@ -5871,20 +6007,18 @@ impl FrankenStorage {
         }) {
             Ok(conn) => conn,
             // Same duplicate-fts_messages debris handling as the canonical
-            // open: fsqlite 0.3.x refuses the historical duplicate schema row
-            // at load. The dedupe is a sanctioned mutation from an ordinary
-            // read lane — it repairs sqlite_master metadata only (the lexical
-            // self-healing contract), then the readonly open is retried.
+            // open: fsqlite refuses the historical duplicate schema row at
+            // load. A readonly open never mutates the archive, so it reports
+            // the typed repair-required condition instead (2l1b0.65).
             Err(err) if format!("{err:#}").contains("conflicting virtual-table entries") => {
                 tracing::warn!(
                     db = %path.display(),
                     error = %err,
                     "frankensqlite refused readonly open due to duplicate \
-                     fts_messages schema rows; deduplicating via sqlite3 bridge"
+                     fts_messages schema rows; reporting schema repair required \
+                     without mutating the archive"
                 );
-                dedupe_conflicting_fts_schema_rows_via_sqlite3(path)?;
-                FrankenConnection::open_schema_only_with_wal_index_recovery(&path_str)
-                    .map_err(anyhow::Error::new)?
+                return Err(conflicting_fts_schema_repair_required(path));
             }
             // gh #389: a hard (non-busy) readonly failure with a non-empty
             // `-wal` present is the unclean-shutdown dirty-WAL shape — the
@@ -16200,6 +16334,14 @@ impl FrankenStorage {
     }
 
     pub(crate) fn rebuild_fts_via_frankensqlite(&self) -> Result<usize> {
+        // 2l1b0.65: a catalog that carries duplicate `fts_messages`
+        // virtual-table rows cannot be rebuilt, and an ordinary rebuild never
+        // repairs it. Report the typed repair-required condition instead of
+        // failing later with a raw "malformed database schema" corruption
+        // error, so every lane points the operator at `cass doctor --fix`.
+        if self.conflicting_fts_schema_rows_present() {
+            return Err(conflicting_fts_schema_repair_required(&self.db_path));
+        }
         self.invalidate_fts_messages_present_cache();
         let mut before = self
             .inspect_search_fallback_fts_parity()
@@ -16319,6 +16461,21 @@ impl FrankenStorage {
                 }
             }
         }
+    }
+
+    /// Whether the catalog carries more than one `fts_messages` row in
+    /// `sqlite_master` — the historical duplicate-registration debris that
+    /// frankensqlite refuses to open or rebuild (2l1b0.65).
+    fn conflicting_fts_schema_rows_present(&self) -> bool {
+        let count = self
+            .conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                fparams![],
+                |row| row.get_typed::<i64>(0),
+            )
+            .ok();
+        matches!(count, Some(count) if count > 1)
     }
 
     /// `coding_agent_session_search-uhhxy`: rebuild the in-DB FTS5 shadow
@@ -24318,7 +24475,6 @@ mod tests {
         }
         available
     }
-
     #[test]
     fn sqlite3_cli_launch_error_names_the_missing_tool() {
         let missing = sqlite3_cli_launch_error(
@@ -24342,6 +24498,167 @@ mod tests {
                 && !message.contains("not installed"),
             "{message}"
         );
+    }
+
+    /// Reproduce the historical duplicate `fts_messages` `sqlite_master` rows.
+    ///
+    /// The two rows carry different FTS5 argument lists, which is the legacy
+    /// V13 shape cass's own historical-seed test builds. frankensqlite
+    /// refuses to open a catalog that carries both, which is the condition
+    /// under test.
+    fn inject_duplicate_fts_messages_rows(db_path: &Path) {
+        const LEGACY_V13_FTS_SQL: &str = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, content='', tokenize='porter')";
+        const DUPLICATE_FTS_SQL: &str = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
+        let conn = rusqlite_test_fixture_conn(db_path);
+        conn.execute_batch("PRAGMA writable_schema = ON;").unwrap();
+        for sql in [LEGACY_V13_FTS_SQL, DUPLICATE_FTS_SQL] {
+            conn.execute(
+                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                 VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
+                [sql],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("PRAGMA writable_schema = OFF;").unwrap();
+    }
+
+    fn fts_messages_catalog_row_count(db_path: &Path) -> i64 {
+        let conn = rusqlite_test_fixture_conn(db_path);
+        conn.execute_batch("PRAGMA writable_schema = ON;").unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// 2l1b0.65: a read-only open of an archive whose catalog carries
+    /// duplicate `fts_messages` rows reports the typed repair-required
+    /// condition and leaves the archive byte-identical. No external engine is
+    /// spawned and no `sqlite_master` row is rewritten behind the caller's
+    /// back.
+    #[test]
+    fn conflicting_fts_schema_rows_are_reported_without_mutating_the_archive() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        drop(storage);
+        inject_duplicate_fts_messages_rows(&db_path);
+
+        let before = fs::read(&db_path).unwrap();
+        assert_eq!(
+            probe_conflicting_fts_schema_rows(&db_path),
+            ConflictingFtsSchemaProbe::RepairRequired,
+            "the probe must report the conflicting catalog shape"
+        );
+
+        let err = match SqliteStorage::open_readonly(&db_path) {
+            Ok(_) => panic!("a conflicting catalog must not open"), // ubs:ignore -- Negative test: the read-only open must refuse the conflicting catalog.
+            Err(err) => err,
+        };
+        let marker = conflicting_fts_schema_repair_required_from_error(&err)
+            .expect("the open must carry the typed repair-required marker");
+        assert_eq!(marker.db_path, db_path);
+        assert!(format!("{err:#}").contains("cass doctor --fix"), "{err:#}");
+
+        let after = fs::read(&db_path).unwrap();
+        assert_eq!(
+            before, after,
+            "the read-only open must leave the archive byte-identical"
+        );
+        assert_eq!(
+            fts_messages_catalog_row_count(&db_path),
+            2,
+            "the read-only open must not remove any sqlite_master row"
+        );
+    }
+
+    /// 2l1b0.65: the doctor-owned repair removes the duplicate catalog rows
+    /// and hands the archive back to frankensqlite.
+    #[test]
+    fn sqlite3_repair_removes_the_duplicate_rows_and_reopens_the_archive() {
+        if !sqlite3_cli_available_or_skip(
+            "sqlite3_repair_removes_the_duplicate_rows_and_reopens_the_archive",
+        ) {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        drop(storage);
+        inject_duplicate_fts_messages_rows(&db_path);
+        assert_eq!(
+            probe_conflicting_fts_schema_rows(&db_path),
+            ConflictingFtsSchemaProbe::RepairRequired
+        );
+
+        repair_conflicting_fts_schema_rows_via_sqlite3(&db_path).unwrap();
+
+        assert_eq!(
+            fts_messages_catalog_row_count(&db_path),
+            1,
+            "the repair must keep exactly the canonical row"
+        );
+        assert_eq!(
+            probe_conflicting_fts_schema_rows(&db_path),
+            ConflictingFtsSchemaProbe::Clean
+        );
+        let reopened =
+            SqliteStorage::open_readonly(&db_path).expect("the repaired archive must open again");
+        drop(reopened);
+    }
+
+    /// 2l1b0.65: the staged derived-FTS metadata scrub runs on the pinned
+    /// engine (frankensqlite) instead of the external `sqlite3` CLI, and it
+    /// removes every derived row it is asked to remove.
+    #[test]
+    fn staged_derived_fts_metadata_scrub_runs_through_frankensqlite() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("staged.db");
+        let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("CREATE TABLE messages(id INTEGER PRIMARY KEY, content TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE fts_messages(id INTEGER PRIMARY KEY, content TEXT)")
+            .unwrap();
+        for shadow in [
+            "fts_messages_config",
+            "fts_messages_content",
+            "fts_messages_data",
+            "fts_messages_docsize",
+            "fts_messages_idx",
+        ] {
+            conn.execute(&format!(
+                "CREATE TABLE {shadow}(id INTEGER PRIMARY KEY, payload TEXT)"
+            ))
+            .unwrap();
+        }
+        drop(conn);
+
+        let before = fts_messages_catalog_row_count(&db_path);
+        assert_eq!(before, 1, "the fixture carries the fts_messages row");
+
+        scrub_staged_derived_fts_metadata(&db_path).unwrap();
+
+        let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let remaining: i64 = conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE name LIKE 'fts_messages%' OR tbl_name LIKE 'fts_messages%'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "the scrub must remove every derived fts_messages row"
+        );
+        let messages: i64 = conn
+            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(messages, 0, "the canonical table must survive the scrub");
     }
 
     struct EnvGuard {
@@ -36734,9 +37051,9 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
     }
 
     #[test]
-    fn rebuild_fts_via_rusqlite_cleans_duplicate_legacy_schema_rows() {
+    fn rebuild_fts_via_rusqlite_requires_the_duplicate_legacy_schema_rows_to_be_repaired_first() {
         if !sqlite3_cli_available_or_skip(
-            "rebuild_fts_via_rusqlite_cleans_duplicate_legacy_schema_rows",
+            "rebuild_fts_via_rusqlite_requires_the_duplicate_legacy_schema_rows_to_be_repaired_first",
         ) {
             return;
         }
@@ -36802,6 +37119,36 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             .unwrap();
         assert_eq!(duplicate_rows, 2);
         drop(conn);
+
+        // 2l1b0.65: an ordinary rebuild never repairs the conflicting catalog
+        // behind the caller's back. It reports the typed repair-required
+        // condition and leaves the archive bytes alone; `cass doctor --fix`
+        // performs the one sanctioned mutation.
+        let rebuild_err = match rebuild_fts_via_rusqlite(&db_path) {
+            Ok(inserted) => panic!(
+                // ubs:ignore -- Negative test: the rebuild must refuse the conflicting catalog.
+                "the rebuild must not succeed against a conflicting catalog, inserted {inserted}"
+            ),
+            Err(err) => err,
+        };
+        assert!(
+            conflicting_fts_schema_repair_required_from_error(&rebuild_err).is_some(),
+            "the rebuild must report the typed repair requirement, got: {rebuild_err:#}"
+        );
+
+        assert_eq!(
+            probe_conflicting_fts_schema_rows(&db_path),
+            ConflictingFtsSchemaProbe::RepairRequired,
+            "the failed rebuild must leave the duplicate sqlite_master rows in place"
+        );
+
+        // The doctor repair is the one sanctioned mutation.
+        repair_conflicting_fts_schema_rows_via_sqlite3(&db_path).unwrap();
+        assert_eq!(
+            probe_conflicting_fts_schema_rows(&db_path),
+            ConflictingFtsSchemaProbe::Clean,
+            "the doctor repair must leave exactly one fts_messages catalog row"
+        );
 
         let inserted = rebuild_fts_via_rusqlite(&db_path).unwrap();
         // The frankensqlite loader discards the stale rootpage-zero duplicate
@@ -44643,14 +44990,12 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
     }
 
     #[test]
-    fn franken_storage_open_repairs_duplicate_fts_messages_schema_rows() {
-        if !sqlite3_cli_available_or_skip(
-            "franken_storage_open_repairs_duplicate_fts_messages_schema_rows",
-        ) {
-            return;
-        }
+    fn franken_storage_open_reports_the_duplicate_fts_schema_repair_requirement() {
+        // 2l1b0.65: an ordinary open never repairs a conflicting catalog. It
+        // reports the typed repair-required condition and leaves the archive
+        // alone; `cass doctor --fix` is the one surface that repairs.
         let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test_open_repairs_duplicate_fts_schema.db");
+        let db_path = dir.path().join("test_open_reports_duplicate_fts_schema.db");
 
         let storage = FrankenStorage::open(&db_path).unwrap();
         let agent = Agent {
@@ -44719,20 +45064,55 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(duplicate_rows, 2);
         drop(conn);
 
+        // The dedicated-owner readonly open reports the repair requirement
+        // instead of rewriting the archive behind the caller's back.
+        let open_result =
+            open_franken_async_readonly_connection_with_timeout(&db_path, Duration::from_secs(5));
+        let open_err = match open_result {
+            Ok(_) => panic!("the dedicated-owner readonly open must not repair the archive"), // ubs:ignore -- Negative test: the dedicated-owner read-only open must refuse the conflicting catalog.
+            Err(err) => err,
+        };
+        assert!(
+            conflicting_fts_schema_repair_required_from_error(&open_err).is_some(),
+            "the open must report the typed repair requirement, got: {open_err:#}"
+        );
+        let conn = rusqlite_test_fixture_conn(&db_path);
+        conn.execute_batch("PRAGMA writable_schema = ON;").unwrap();
+        let rows_after_open: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(
+            rows_after_open, 2,
+            "the open must not remove any sqlite_master row"
+        );
+
+        if !sqlite3_cli_available_or_skip(
+            "franken_storage_open_reports_the_duplicate_fts_schema_repair_requirement",
+        ) {
+            return;
+        }
+        // The doctor repair is the one sanctioned mutation.
+        repair_conflicting_fts_schema_rows_via_sqlite3(&db_path).unwrap();
+
         let mut owner_reader =
             open_franken_async_readonly_connection_with_timeout(&db_path, Duration::from_secs(5))
-                .expect("dedicated-owner readonly open should repair duplicate FTS schema rows");
+                .expect("the archive opens once the doctor repaired the schema rows");
         let message_rows = owner_reader
             .query_sync("SELECT COUNT(*) FROM messages")
-            .expect("canonical messages must remain readable after schema-row dedupe");
+            .expect("canonical messages must remain readable after the schema-row repair");
         assert_eq!(
             message_rows[0].get_typed::<i64>(0).unwrap(),
             1,
-            "dedupe must preserve canonical archive rows"
+            "the repair must preserve canonical archive rows"
         );
         owner_reader
             .close_without_checkpoint_sync()
-            .expect("dedicated-owner duplicate-schema probe should close cleanly");
+            .expect("the repaired archive should close cleanly");
 
         let reopened = FrankenStorage::open(&db_path).unwrap();
         assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
