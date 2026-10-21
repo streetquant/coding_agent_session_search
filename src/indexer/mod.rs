@@ -1174,6 +1174,15 @@ pub struct IndexingProgress {
     pub discovered_agents: AtomicUsize,
     /// Names of discovered agents (protected by mutex for concurrent access)
     pub discovered_agent_names: Mutex<Vec<String>>,
+    /// Connectors whose scan is in flight right now.
+    ///
+    /// The index-run lock's `phase=` breadcrumb names the *stage* of a run
+    /// (`index:scan`), not the connector that is wedged inside it. This set
+    /// is the per-connector view: an operator reading a stalled run sees
+    /// exactly which connectors were still scanning when the run stopped
+    /// making forward progress, instead of inferring it from a heartbeat that
+    /// only proves the process is alive.
+    pub active_scan_connectors: Mutex<BTreeSet<String>>,
     /// Last error message from background indexer, if any
     pub last_error: Mutex<Option<String>>,
     /// Final WAL checkpoint result for the current index invocation.
@@ -1456,6 +1465,11 @@ impl IndexingProgress {
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
+        let active_scan_connectors: Vec<String> = self
+            .active_scan_connectors
+            .lock()
+            .map(|connectors| connectors.iter().cloned().collect())
+            .unwrap_or_default();
         let last_error: Option<String> = self.last_error.lock().ok().and_then(|g| g.clone());
         let rebuild_pipeline_queue_depth =
             self.rebuild_pipeline_queue_depth.load(Ordering::Relaxed);
@@ -1650,6 +1664,11 @@ impl IndexingProgress {
             "activity": activity,
             "discovered_agents": agents,
             "agent_names": agent_names,
+            // The connectors whose scan is in flight right now. The lock
+            // file's `phase=` breadcrumb names the run's stage, not the
+            // connector that is wedged inside the scan stage; this is the
+            // per-connector view of the same run.
+            "active_scan_connectors": active_scan_connectors,
             "is_rebuilding": is_rebuilding,
             // #319: true while the indexer is inside the post-publish finalize
             // WAL checkpoint (close_storage_after_index). A quiescent, phase-0,
@@ -1981,6 +2000,36 @@ fn lexical_population_strategy_requires_inline_tantivy(
     strategy: LexicalPopulationStrategy,
 ) -> bool {
     !matches!(
+        strategy,
+        LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild
+    )
+}
+
+/// Whether the resolved lexical population strategy lets this run's connector
+/// scan keep its incremental cutoff.
+///
+/// The derived lexical index and the source scan answer two different
+/// questions, and only one of them is about coverage:
+///
+/// * `InlineRebuildFromScan` populates the derived index FROM this run's scan
+///   output, so a partial scan would publish a partial index. The scan has to
+///   cover the whole source.
+/// * `DeferredAuthoritativeDbRebuild` rebuilds the derived index FROM the
+///   canonical database instead. The scan output does not determine the index
+///   content, so the scan only has to advance the canonical rows and may stay
+///   incremental.
+///
+/// Dropping the cutoff for a deferred authoritative rebuild re-reads every
+/// connector source from scratch. On a large archive that is what turned a
+/// pending derived-asset rebuild (the legacy OMP identity publication) into a
+/// full materialization of every retired connector store: the retired
+/// OpenCode v1 store alone exhausted memory, and the run that survived it
+/// wedged inside the store's legacy JSON tree, leaving the index-run lock
+/// held for hours with a stale phase breadcrumb.
+fn lexical_population_strategy_allows_incremental_scan_cutoff(
+    strategy: LexicalPopulationStrategy,
+) -> bool {
+    matches!(
         strategy,
         LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild
     )
@@ -15120,6 +15169,107 @@ struct StreamingProducerConfig {
     local_since_ts_by_connector: Arc<HashMap<&'static str, Option<i64>>>,
     progress: Option<Arc<IndexingProgress>>,
     active_source_filter: Arc<ActiveSessionSourceFilter>,
+    /// Atomic forward-progress mirror owned by the indexer. The producers
+    /// bump it at their scan boundaries so the index-run lock's
+    /// `last_progress_at_ms` reflects real scan progress and not only the
+    /// background heartbeat.
+    progress_bump: Option<Arc<AtomicI64>>,
+}
+
+/// Default per-connector scan budget in seconds.
+///
+/// A connector that never yields — a directory walk on a saturated disk, a
+/// store whose decode never finishes — must not hold the index-run lock
+/// forever. The budget is generous enough that a legitimately slow archive
+/// on a busy disk still completes, and short enough that a wedged connector
+/// is reported instead of holding the lock for the rest of the day.
+const DEFAULT_INDEX_CONNECTOR_TIMEOUT_SECS: u64 = 7_200;
+
+/// A bounded per-connector scan budget.
+///
+/// The budget is observed in two places:
+///
+/// * the connector's progress tick flips `expired` once the deadline
+///   passes, so a connector that ticks but never yields is detected as soon
+///   as it yields again (and a connector that never yields at all is
+///   detected when it finally returns);
+/// * the per-conversation callback turns the expiry into a typed error, so a
+///   streaming connector stops promptly instead of finishing a scan nobody
+///   is waiting for.
+///
+/// An expired connector is reported as a failed scan and its watermark is NOT
+/// advanced, so the next run retries it from the connector's previous
+/// watermark instead of silently skipping the turns it never read. The run
+/// itself keeps going: one slow connector must not discard the work of every
+/// other connector.
+#[derive(Clone)]
+struct ConnectorScanBudget {
+    deadline: Option<Instant>,
+    expired: Arc<AtomicBool>,
+}
+
+impl ConnectorScanBudget {
+    /// The configured per-connector budget. `CASS_INDEX_CONNECTOR_TIMEOUT_SECS=0`
+    /// disables the bound for operators who knowingly run unbounded scans.
+    fn from_env() -> Self {
+        let timeout_secs = dotenvy::var("CASS_INDEX_CONNECTOR_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_INDEX_CONNECTOR_TIMEOUT_SECS);
+        Self::with_timeout(timeout_secs)
+    }
+
+    fn with_timeout(timeout_secs: u64) -> Self {
+        let deadline =
+            (timeout_secs > 0).then(|| Instant::now() + Duration::from_secs(timeout_secs));
+        Self {
+            deadline,
+            expired: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Record that the budget expired. Idempotent and cheap: the progress
+    /// tick calls it on every progress event.
+    fn observe(&self) {
+        if let Some(deadline) = self.deadline
+            && Instant::now() >= deadline
+        {
+            self.expired.store(true, Ordering::Release);
+        }
+    }
+
+    fn expired(&self) -> bool {
+        self.expired.load(Ordering::Acquire)
+    }
+
+    /// Fail the scan when the budget expired.
+    fn check(&self, connector: &str) -> Result<()> {
+        if self.expired() {
+            anyhow::bail!("{connector} scan exceeded its bounded time budget");
+        }
+        Ok(())
+    }
+}
+
+/// Register a connector as scanning so an operator can see which connector a
+/// stalled run was inside.
+fn mark_scan_connector_active(progress: Option<&Arc<IndexingProgress>>, connector: &str) {
+    let Some(progress) = progress else {
+        return;
+    };
+    if let Ok(mut connectors) = progress.active_scan_connectors.lock() {
+        connectors.insert(connector.to_string());
+    }
+}
+
+/// Clear a connector from the active-scan set.
+fn mark_scan_connector_finished(progress: Option<&Arc<IndexingProgress>>, connector: &str) {
+    let Some(progress) = progress else {
+        return;
+    };
+    if let Ok(mut connectors) = progress.active_scan_connectors.lock() {
+        connectors.remove(connector);
+    }
 }
 
 /// Spawn a producer thread that scans a connector and sends batches through the channel.
@@ -15146,6 +15296,13 @@ where
         let mut scan_succeeded = true;
         let mut active_source_skipped = false;
 
+        // A connector must not be able to hold the index-run lock forever.
+        // The budget is observed by the progress tick (a connector that
+        // yields but never finishes trips it) and by the per-conversation
+        // callback (a connector that keeps yielding is stopped promptly).
+        let scan_budget = ConnectorScanBudget::from_env();
+        mark_scan_connector_active(config.progress.as_ref(), name);
+
         // #373 Variant A: give the connector a liveness tick so a long internal
         // scan (e.g. decoding a large opencode.db) advances the watchdog's
         // `activity` signal BEFORE the first conversation is yielded — otherwise
@@ -15154,7 +15311,11 @@ where
         let scan_progress_tick: Option<Arc<dyn Fn() + Send + Sync>> =
             config.progress.as_ref().map(|progress| {
                 let progress = Arc::clone(progress);
-                Arc::new(move || progress.tick_activity()) as Arc<dyn Fn() + Send + Sync>
+                let budget = scan_budget.clone();
+                Arc::new(move || {
+                    budget.observe();
+                    progress.tick_activity();
+                }) as Arc<dyn Fn() + Send + Sync>
             });
         let with_scan_tick = |ctx: crate::connectors::ScanContext| match &scan_progress_tick {
             Some(tick) => ctx.with_progress_tick(Arc::clone(tick)),
@@ -15233,6 +15394,10 @@ where
                 &config,
                 &mut batch_sender,
                 |mut conversation| {
+                    // The bounded per-connector budget: stop a connector
+                    // that keeps yielding but never finishes instead of
+                    // holding the index-run lock for the rest of the day.
+                    scan_budget.check(name)?;
                     if should_skip_active_session_source(
                         config.active_source_filter.as_ref(),
                         SourceKind::Local,
@@ -15265,6 +15430,23 @@ where
                 },
             ) {
                 Ok(()) => {
+                    // A connector that yielded nothing but ran past its
+                    // budget is a failed scan, not a successful one: its
+                    // watermark must not advance, or the next run would skip
+                    // the turns this run never read.
+                    if scan_budget.expired() {
+                        scan_succeeded = false;
+                        tracing::warn!(
+                            connector = name,
+                            "local scan exceeded its bounded time budget; the connector's scan watermark was not advanced"
+                        );
+                        let _ = tx.send(IndexMessage::ScanError {
+                            connector_name: name,
+                            error: format!(
+                                "local scan for {name} exceeded its bounded time budget"
+                            ),
+                        });
+                    }
                     if let Err(error) = batch_sender.flush() {
                         if is_streaming_consumer_disconnected(&error) {
                             tracing::info!(
@@ -15358,6 +15540,9 @@ where
                 &config,
                 &mut batch_sender,
                 |mut conversation| {
+                    // The bounded per-connector budget applies to configured
+                    // roots exactly as it applies to the local roots.
+                    scan_budget.check(name)?;
                     if should_skip_active_session_source(
                         config.active_source_filter.as_ref(),
                         root.origin.kind,
@@ -15396,6 +15581,20 @@ where
                 },
             ) {
                 Ok(()) => {
+                    if scan_budget.expired() {
+                        scan_succeeded = false;
+                        tracing::warn!(
+                            connector = name,
+                            root = %root.path.display(),
+                            "remote scan exceeded its bounded time budget; the connector's scan watermark was not advanced"
+                        );
+                        let _ = tx.send(IndexMessage::ScanError {
+                            connector_name: name,
+                            error: format!(
+                                "remote scan for {name} exceeded its bounded time budget"
+                            ),
+                        });
+                    }
                     if let Err(error) = batch_sender.flush() {
                         if is_streaming_consumer_disconnected(&error) {
                             tracing::info!(
@@ -15464,6 +15663,13 @@ where
             scan_ms,
             "streaming_scan_complete"
         );
+
+        // The connector's scan is over: it is no longer one of the connectors
+        // a stalled run could be inside, and its completion is real forward
+        // progress for the index-run lock (independent of the background
+        // heartbeat, which only proves the process is alive).
+        mark_scan_connector_finished(config.progress.as_ref(), name);
+        bump_index_run_lock_progress_if_present(config.progress_bump.as_ref());
 
         // Signal completion with timing
         let _ = tx.send(IndexMessage::Done {
@@ -16341,6 +16547,7 @@ where
         active_source_filter: Arc::new(ActiveSessionSourceFilter::new(
             opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
         )),
+        progress_bump: progress_bump.cloned(),
     };
 
     // Spawn producer threads for each connector
@@ -16659,8 +16866,22 @@ where
                 let mut scan_succeeded = true;
                 let mut active_source_skipped = false;
                 let mut scan_errors = Vec::new();
+                // The bounded per-connector budget (see
+                // `ConnectorScanBudget`): a connector must not be able to
+                // hold the index-run lock forever.
+                let scan_budget = ConnectorScanBudget::from_env();
+                mark_scan_connector_active(progress_ref, name);
+                let connector_tick: Option<Arc<dyn Fn() + Send + Sync>> =
+                    scan_progress_tick.as_ref().map(|tick| {
+                        let tick = Arc::clone(tick);
+                        let budget = scan_budget.clone();
+                        Arc::new(move || {
+                            budget.observe();
+                            tick();
+                        }) as Arc<dyn Fn() + Send + Sync>
+                    });
                 let with_scan_tick = |ctx: crate::connectors::ScanContext| {
-                    match &scan_progress_tick {
+                    match &connector_tick {
                         Some(tick) => ctx.with_progress_tick(Arc::clone(tick)),
                         None => ctx,
                     }
@@ -16733,6 +16954,9 @@ where
                     // reporting another transcript's failure. Keep those
                     // chats and retain the failure to hold the watermark.
                     if let Err(e) = conn.scan_with_callback(&ctx, &mut |mut conversation| {
+                        // The bounded per-connector budget: stop a connector
+                        // that keeps yielding but never finishes.
+                        scan_budget.check(name)?;
                         if should_skip_active_session_source(
                             active_source_filter.as_ref(),
                             SourceKind::Local,
@@ -16768,6 +16992,20 @@ where
                         ingest_diagnostics.observe_connector_scan_error(scanned_root, &e);
                         scan_errors.push(format!("{e:#}"));
                         tracing::warn!("scan failed for {}: {}", name, e);
+                    }
+                    // A connector that finished its scan but ran past its
+                    // budget is a failed scan: its watermark must not
+                    // advance, or the next run would skip the turns this run
+                    // never read.
+                    if scan_budget.expired() {
+                        scan_succeeded = false;
+                        scan_errors.push(format!(
+                            "scan for {name} exceeded its bounded time budget"
+                        ));
+                        tracing::warn!(
+                            connector = name,
+                            "scan exceeded its bounded time budget; the connector's scan watermark was not advanced"
+                        );
                     }
                     record_connector_ingest_report(
                         progress_ref,
@@ -16815,6 +17053,7 @@ where
                         );
                         active_source_skipped |= preparse_active_source_skipped;
                         if let Err(e) = conn.scan_with_callback(&ctx, &mut |mut conversation| {
+                            scan_budget.check(name)?;
                             if should_skip_active_session_source(
                                 active_source_filter.as_ref(),
                                 root.origin.kind,
@@ -16858,6 +17097,10 @@ where
                         );
                     }
                 }
+
+                // The connector's scan is over: it is no longer one of the
+                // connectors a stalled run could be inside.
+                mark_scan_connector_finished(progress_ref, name);
 
                 // Agent discovered via remote scan (wasn't detected locally but has conversations)
                 if !was_detected && !convs.is_empty() {
@@ -17043,11 +17286,11 @@ where
 
 fn non_watch_scan_since_ts(
     full: bool,
-    needs_rebuild: bool,
+    scan_must_cover_whole_source: bool,
     retry_stale_index_ingest_quarantine: bool,
     last_scan_ts: Option<i64>,
 ) -> Option<i64> {
-    if full || needs_rebuild || retry_stale_index_ingest_quarantine {
+    if full || scan_must_cover_whole_source || retry_stale_index_ingest_quarantine {
         None
     } else {
         last_scan_ts.map(|ts| ts.saturating_sub(1))
@@ -18923,9 +19166,27 @@ fn run_index_with_storage_ownership(
                     );
                     Some(scan_start_ts.saturating_sub(1).max(0))
                 } else {
+                    // A pending derived-asset rebuild is a statement about the
+                    // derived index, not about the source scan. When the
+                    // rebuild is deferred to the canonical database, the scan
+                    // output never populates the derived index, so the scan
+                    // only has to advance the canonical rows: it keeps its
+                    // incremental cutoff. Only a scan whose output DOES
+                    // populate the derived index (or an explicit full scan,
+                    // a rebuilt canonical archive, or a deliberate repair
+                    // retry) still has to cover the whole source.
+                    //
+                    // Dropping the cutoff here is what made every scheduled
+                    // run re-read every retired connector store in full, which
+                    // exhausted memory and wedged the index run.
+                    let scan_must_cover_whole_source = canonical_storage_rebuilt
+                        || (needs_rebuild
+                            && !lexical_population_strategy_allows_incremental_scan_cutoff(
+                                lexical_strategy,
+                            ));
                     non_watch_scan_since_ts(
                         opts.full,
-                        needs_rebuild,
+                        scan_must_cover_whole_source,
                         stale_index_ingest_quarantine_retry.is_some(),
                         last_scan_ts,
                     )
@@ -55758,6 +56019,47 @@ mod tests {
         );
         assert_eq!(
             non_watch_scan_since_ts(false, true, false, Some(1234)),
+            None
+        );
+    }
+
+    #[test]
+    fn deferred_authoritative_rebuild_keeps_the_incremental_scan_cutoff() {
+        // A rebuild that is deferred to the canonical database does not
+        // populate the derived index from this run's scan output, so the scan
+        // may stay incremental. Dropping the cutoff here re-read every
+        // retired connector store in full on every scheduled run.
+        assert!(lexical_population_strategy_allows_incremental_scan_cutoff(
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild
+        ));
+        assert!(!lexical_population_strategy_allows_incremental_scan_cutoff(
+            LexicalPopulationStrategy::InlineRebuildFromScan
+        ));
+        assert!(!lexical_population_strategy_allows_incremental_scan_cutoff(
+            LexicalPopulationStrategy::IncrementalInline
+        ));
+    }
+
+    #[test]
+    fn scan_cutoff_survives_a_deferred_authoritative_rebuild() {
+        let needs_rebuild = true;
+        let strategy = LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild;
+        let scan_must_cover_whole_source =
+            needs_rebuild && !lexical_population_strategy_allows_incremental_scan_cutoff(strategy);
+        assert!(!scan_must_cover_whole_source);
+        assert_eq!(
+            non_watch_scan_since_ts(false, scan_must_cover_whole_source, false, Some(1234)),
+            Some(1233)
+        );
+
+        // A scan whose output populates the derived index must still cover
+        // the whole source.
+        let strategy = LexicalPopulationStrategy::InlineRebuildFromScan;
+        let scan_must_cover_whole_source =
+            needs_rebuild && !lexical_population_strategy_allows_incremental_scan_cutoff(strategy);
+        assert!(scan_must_cover_whole_source);
+        assert_eq!(
+            non_watch_scan_since_ts(false, scan_must_cover_whole_source, false, Some(1234)),
             None
         );
     }
