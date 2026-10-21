@@ -776,6 +776,7 @@
     "hnsw_present": false,
     "hnsw_state": "not_inspected",
     "hnsw_ready": false,
+    "hnsw_reason_code": null,
     "progressive_ready": false,
     "progressive_reason_code": null,
     "feature_compiled_in": true,
@@ -867,6 +868,7 @@
       "current_db_matches": null,
       "ready": false,
       "present": null,
+      "reason_code": null,
       "note": "model cache is opt-in; doctor reports state without downloading or deleting model files"
     },
     "vector_index": {
@@ -883,6 +885,7 @@
       "current_db_matches": null,
       "ready": false,
       "present": false,
+      "reason_code": null,
       "note": "semantic/vector indexes are derived from the canonical archive and explicit model policy"
     },
     "hnsw_index": {
@@ -899,6 +902,7 @@
       "current_db_matches": null,
       "ready": false,
       "present": false,
+      "reason_code": null,
       "note": "HNSW/mmap accelerators are optional derived assets and must not block lexical search"
     },
     "memoization_cache": {
@@ -915,6 +919,7 @@
       "current_db_matches": null,
       "ready": null,
       "present": null,
+      "reason_code": null,
       "note": "memoization caches are derived and can be rebuilt or reclaimed only through explicit safe plans"
     },
     "notes": [

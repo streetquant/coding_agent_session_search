@@ -53,6 +53,32 @@ impl std::fmt::Display for NativeAnnSearchFailure {
 impl std::error::Error for NativeAnnSearchFailure {}
 
 impl SemanticAnnShardSet {
+    /// The cohort's native-admission verdict.
+    ///
+    /// This is the *same* decision the serving path makes, so a readiness
+    /// surface and a real approximate search can never disagree:
+    /// `NativeReady` means the cohort would serve native ANN right now, and
+    /// `Rejected` carries the exact reason a search would fall back to exact
+    /// retrieval. The probe never rebuilds a graph and never writes.
+    pub(super) fn admission(artifacts: &[SemanticIndexArtifact]) -> SemanticAnnReadiness {
+        if artifacts.is_empty() {
+            return SemanticAnnReadiness::Absent;
+        }
+        // The cheap pairing check runs first: a cohort without a paired
+        // sidecar never allocates a native graph, so it is absent rather than
+        // rejected.
+        if let Some(reason) = Self::unavailable_reason(artifacts) {
+            return match reason {
+                SemanticAnnUnavailableReason::SidecarMissing => SemanticAnnReadiness::Absent,
+                other => SemanticAnnReadiness::Rejected(other),
+            };
+        }
+        match Self::open(Arc::new(artifacts.to_vec())) {
+            Ok(_) => SemanticAnnReadiness::NativeReady,
+            Err(failure) => SemanticAnnReadiness::Rejected(failure.reason),
+        }
+    }
+
     /// Cheap whole-cohort unavailability, before allocating any native graph.
     /// One potentially usable pairing keeps mixed admission possible.
     pub(super) fn unavailable_reason(
@@ -1167,5 +1193,145 @@ mod tests {
             AnnExactFallbackReason::NativeSearchFailed
         );
         assert_eq!(snapshot(dir.path()), before);
+    }
+
+    // --- Native-admission readiness ------------------------------------
+
+    /// Create an exact FSVI without any sidecar and return its path.
+    fn exact_source(dir: &Path, name: &str, rows: &[(String, [f32; 2])]) -> PathBuf {
+        let path = dir.join(format!("{name}.fsvi"));
+        let mut writer = FsVectorIndex::create_with_revision(
+            &path,
+            "fnv1a-2",
+            "ann-shard-test",
+            2,
+            Quantization::F32,
+        )
+        .unwrap();
+        for (id, vector) in rows {
+            writer.write_record(id, vector).unwrap();
+        }
+        writer.finish().unwrap();
+        path
+    }
+
+    /// Every file's bytes, mtime and mode under `dir`, for a no-write proof.
+    fn file_state(dir: &Path) -> Vec<(PathBuf, Vec<u8>, Option<std::time::SystemTime>, u32)> {
+        let mut state = Vec::new();
+        for entry in walkdir::WalkDir::new(dir) {
+            let entry = entry.unwrap();
+            if entry.file_type().is_file() {
+                let metadata = entry.metadata().unwrap();
+                #[cfg(unix)]
+                let mode = std::os::unix::fs::PermissionsExt::mode(&metadata.permissions());
+                #[cfg(not(unix))]
+                let mode = 0;
+                state.push((
+                    entry.path().to_path_buf(),
+                    std::fs::read(entry.path()).unwrap(),
+                    metadata.modified().ok(),
+                    mode,
+                ));
+            }
+        }
+        state.sort_by(|left, right| left.0.cmp(&right.0));
+        state
+    }
+
+    #[test]
+    fn admission_reports_absent_without_a_paired_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = records(1, 0.9);
+        let fsvi = exact_source(dir.path(), "unpaired", &rows);
+        let unpaired = SemanticIndexArtifact::open(&fsvi, None).unwrap();
+        let missing =
+            SemanticIndexArtifact::open(&fsvi, Some(dir.path().join("absent.chsw"))).unwrap();
+        assert_eq!(
+            SemanticAnnShardSet::admission(&[]),
+            SemanticAnnReadiness::Absent
+        );
+        assert_eq!(
+            SemanticAnnShardSet::admission(&[unpaired]),
+            SemanticAnnReadiness::Absent
+        );
+        assert_eq!(
+            SemanticAnnShardSet::admission(&[missing]),
+            SemanticAnnReadiness::Absent
+        );
+    }
+
+    #[test]
+    fn admission_admits_a_native_cohort_without_touching_the_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = records(1, 0.9);
+        let artifact = shard(dir.path(), "native", &rows);
+        let before = file_state(dir.path());
+        assert_eq!(
+            SemanticAnnShardSet::admission(&[artifact]),
+            SemanticAnnReadiness::NativeReady
+        );
+        assert_eq!(
+            file_state(dir.path()),
+            before,
+            "the readiness probe must not write, retime or chmod the artifact"
+        );
+    }
+
+    #[test]
+    fn admission_rejects_a_corrupt_sidecar_with_the_serving_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = records(1, 0.9);
+        let fsvi = exact_source(dir.path(), "corrupt", &rows);
+        let ann = dir.path().join("corrupt.chsw");
+        std::fs::write(&ann, b"not an hnsw sidecar").unwrap();
+        let artifact = SemanticIndexArtifact::open(&fsvi, Some(ann)).unwrap();
+        // The same reason the serving path reports when it falls back to
+        // exact retrieval: the sidecar metadata could not be parsed.
+        assert_eq!(
+            SemanticAnnShardSet::admission(&[artifact]),
+            SemanticAnnReadiness::Rejected(SemanticAnnUnavailableReason::SidecarOpenFailed)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn admission_rejects_a_symlinked_sidecar_and_a_cross_role_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = records(1, 0.9);
+        let fsvi = exact_source(dir.path(), "alias", &rows);
+
+        let target = dir.path().join("external-sidecar");
+        std::fs::write(&target, b"unrelated retained data").unwrap();
+        let link = dir.path().join("linked.chsw");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let linked = SemanticIndexArtifact::open(&fsvi, Some(link)).unwrap();
+        assert_eq!(
+            SemanticAnnShardSet::admission(&[linked]),
+            SemanticAnnReadiness::Rejected(SemanticAnnUnavailableReason::SidecarOpenFailed)
+        );
+
+        // The exact artifact may never double as its own ANN sidecar.
+        let aliased = SemanticIndexArtifact::open(&fsvi, Some(fsvi.clone())).unwrap();
+        assert_eq!(
+            SemanticAnnShardSet::admission(&[aliased]),
+            SemanticAnnReadiness::Rejected(SemanticAnnUnavailableReason::SidecarOpenFailed)
+        );
+    }
+
+    #[test]
+    fn admission_admits_a_mixed_cohort_when_one_shard_is_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = records(1, 0.9);
+        let usable = shard(dir.path(), "usable", &rows);
+        let broken_fsvi = exact_source(dir.path(), "broken", &rows);
+        let broken =
+            SemanticIndexArtifact::open(&broken_fsvi, Some(dir.path().join("broken.chsw")))
+                .unwrap();
+        // One usable pairing keeps mixed admission possible: the unusable
+        // shard degrades to exact retrieval instead of disabling the cohort.
+        assert_eq!(
+            SemanticAnnShardSet::admission(&[usable, broken]),
+            SemanticAnnReadiness::NativeReady
+        );
     }
 }

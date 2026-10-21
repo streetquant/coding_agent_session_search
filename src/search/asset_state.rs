@@ -20,7 +20,7 @@ use crate::indexer::{
     LEXICAL_REBUILD_PAGE_SIZE_PUBLIC, LexicalRebuildCheckpoint,
     lexical_rebuild_page_size_is_compatible, load_lexical_rebuild_checkpoint,
 };
-use crate::search::ann_index::hnsw_index_path;
+use crate::search::ann_index::{SemanticAnnReadiness, hnsw_index_path};
 use crate::search::embedder::Embedder;
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::hash_embedder::HashEmbedder;
@@ -476,6 +476,21 @@ pub(crate) enum SemanticPreference {
     HashFallback,
 }
 
+/// How deeply a readiness surface inspects the optional ANN accelerator.
+///
+/// `Bounded` is the default everywhere: it reports that a sidecar is present
+/// without deserializing a graph, so it never advertises native readiness.
+/// `Deep` performs the exact native admission against the retained exact
+/// owner, which is the only thing allowed to report `hnsw_ready`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SemanticAnnProbeMode {
+    /// Cheap filesystem-only presence inspection. Never loads a graph.
+    #[default]
+    Bounded,
+    /// Exact native admission against the production-selected cohort.
+    Deep,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SearchAssetSnapshot {
     pub lexical: LexicalAssetState,
@@ -565,6 +580,12 @@ pub(crate) struct SemanticAssetState {
     pub hnsw_present: bool,
     pub hnsw_state: &'static str,
     pub hnsw_ready: bool,
+    /// Stable reason code for a refused ANN cohort.
+    ///
+    /// `None` while the cohort is unprobed or admitted. When set, it is the
+    /// same `SemanticAnnUnavailableReason` code the serving path reports when
+    /// it falls back to exact search, so no surface invents its own vocabulary.
+    pub hnsw_reason_code: Option<&'static str>,
     pub progressive_ready: bool,
     pub progressive_reason_code: Option<&'static str>,
     /// Sub-fix 3 for cass#257: true when a quality-tier vector index is
@@ -682,6 +703,11 @@ pub(crate) struct InspectSearchAssetsInput<'a> {
     pub db_available: bool,
     pub compute_lexical_fingerprint: bool,
     pub inspect_semantic: bool,
+    /// How deeply the optional ANN accelerator is inspected.
+    ///
+    /// The default bounded mode reports presence without loading a graph.
+    /// Only the deep mode may report native ANN readiness.
+    pub probe_semantic_ann: SemanticAnnProbeMode,
 }
 
 const LEXICAL_STORAGE_FINGERPRINT_MTIME_TOLERANCE_MS: i64 = 1_000;
@@ -741,6 +767,7 @@ pub(crate) fn inspect_search_assets(
         db_available,
         compute_lexical_fingerprint,
         inspect_semantic,
+        probe_semantic_ann,
     } = input;
 
     let lexical = inspect_lexical_assets(InspectLexicalAssetsInput {
@@ -761,6 +788,7 @@ pub(crate) fn inspect_search_assets(
             semantic_preference,
             current_db_fingerprint,
             db_available,
+            probe_semantic_ann,
         )
     } else {
         semantic_state_not_inspected(data_dir, semantic_preference, current_db_fingerprint)
@@ -793,6 +821,7 @@ fn semantic_state_not_inspected(
         hnsw_present: false,
         hnsw_state: "not_inspected",
         hnsw_ready: false,
+        hnsw_reason_code: None,
         progressive_ready: false,
         progressive_reason_code: None,
         // The fast-path skip-DB-open lane doesn't have an
@@ -819,18 +848,23 @@ pub(crate) fn inspect_semantic_assets(
     preference: SemanticPreference,
     current_db_fingerprint: Option<&str>,
     db_available: bool,
+    ann_probe: SemanticAnnProbeMode,
 ) -> SemanticAssetState {
     if !db_available {
         let availability = SemanticAvailability::DatabaseUnavailable {
             db_path: db_path.to_path_buf(),
             error: "database unavailable during asset inspection".to_string(),
         };
-        return semantic_state_from_availability(
+        let mut state = semantic_state_from_availability(
             data_dir,
             &availability,
             preference,
             current_db_fingerprint,
         );
+        if ann_probe == SemanticAnnProbeMode::Deep {
+            apply_deep_semantic_ann_probe(&mut state, data_dir, db_path, current_db_fingerprint);
+        }
+        return state;
     }
 
     let availability = match preference {
@@ -838,7 +872,16 @@ pub(crate) fn inspect_semantic_assets(
         SemanticPreference::HashFallback => probe_hash_semantic_availability(data_dir),
     };
     let availability = apply_semantic_identity_invalidation(db_path, availability, preference);
-    semantic_state_from_availability(data_dir, &availability, preference, current_db_fingerprint)
+    let mut state = semantic_state_from_availability(
+        data_dir,
+        &availability,
+        preference,
+        current_db_fingerprint,
+    );
+    if ann_probe == SemanticAnnProbeMode::Deep {
+        apply_deep_semantic_ann_probe(&mut state, data_dir, db_path, current_db_fingerprint);
+    }
+    state
 }
 
 fn apply_semantic_identity_invalidation(
@@ -955,11 +998,18 @@ pub(crate) fn semantic_state_from_availability(
     } else {
         runtime.model_dir.or(base_model_dir)
     };
-    let hnsw_path = if use_runtime_paths {
-        runtime.hnsw_path
-    } else {
-        runtime.hnsw_path.or(base_hnsw_path)
-    };
+    // The shard manifest is the owner contract: a sharded generation names its
+    // own per-shard sidecars, so the conventional monolithic filename does not
+    // exist for it. Resolving through the manifest keeps bounded status honest
+    // about what is actually present.
+    let hnsw_path =
+        selected_ann_sidecar_path(data_dir, embedder_id.as_deref(), current_db_fingerprint).or(
+            if use_runtime_paths {
+                runtime.hnsw_path
+            } else {
+                runtime.hnsw_path.or(base_hnsw_path)
+            },
+        );
     let (hnsw_present, hnsw_state) = bounded_ann_presence(hnsw_path.as_deref());
 
     // Sub-fix 3 for cass#257: report quality-tier readiness as a
@@ -988,6 +1038,7 @@ pub(crate) fn semantic_state_from_availability(
         // advertise native readiness. A metadata entry alone proves nothing
         // about graph integrity, completeness, or source identity.
         hnsw_ready: false,
+        hnsw_reason_code: None,
         progressive_ready,
         progressive_reason_code,
         quality_tier_published,
@@ -1011,6 +1062,110 @@ fn bounded_ann_presence(path: Option<&Path>) -> (bool, &'static str) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (false, "absent"),
         Err(_) => (false, "inspection_failed"),
     }
+}
+
+/// Resolve the ANN sidecar the production selection pairs with the current
+/// exact generation.
+///
+/// The shard manifest names the sidecar for every shard of a sharded
+/// generation. Guessing the conventional monolithic filename would report an
+/// absent accelerator for a fully built sharded generation, so the manifest
+/// is consulted first and the conventional path is only the monolithic
+/// fallback the serving path itself uses.
+fn selected_ann_sidecar_path(
+    data_dir: &Path,
+    embedder_id: Option<&str>,
+    db_fingerprint: Option<&str>,
+) -> Option<PathBuf> {
+    let embedder_id = embedder_id?;
+    let db_fingerprint = db_fingerprint?;
+    for tier in [TierKind::Quality, TierKind::Fast] {
+        let Some(records) =
+            complete_shard_records_for_state(data_dir, tier, embedder_id, db_fingerprint)
+        else {
+            continue;
+        };
+        if let Some(path) = records.iter().find_map(|shard| {
+            if !shard.ann_ready {
+                return None;
+            }
+            let recorded = shard.ann_index_path.as_deref()?;
+            resolve_semantic_artifact_path(data_dir, recorded)
+        }) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// The output dimension of a known embedder, without loading a model.
+fn semantic_embedder_dimension(embedder_id: &str) -> Option<usize> {
+    if embedder_id == HashEmbedder::default().id() {
+        return Some(HashEmbedder::default().dimension());
+    }
+    FastEmbedder::config_for(embedder_id).map(|config| config.dimension)
+}
+
+/// Replace the bounded ANN projection with an exact native-admission verdict.
+///
+/// The probe resolves the production-selected cohort through the owner
+/// contract and then performs the very admission the serving path performs,
+/// so `hnsw_ready` is true only when a real approximate search would use
+/// native ANN. It never rebuilds a graph, never writes, and reports only
+/// bounded reason codes.
+fn apply_deep_semantic_ann_probe(
+    state: &mut SemanticAssetState,
+    data_dir: &Path,
+    db_path: &Path,
+    current_db_fingerprint: Option<&str>,
+) {
+    let Some(readiness) = probe_semantic_ann_readiness(
+        data_dir,
+        db_path,
+        state.embedder_id.as_deref(),
+        current_db_fingerprint,
+    ) else {
+        // The probe could not resolve an exact cohort at all. The bounded
+        // verdict stays authoritative: reporting `absent` here would turn a
+        // sidecar that is demonstrably present into a false negative.
+        return;
+    };
+    state.hnsw_state = readiness.state();
+    state.hnsw_ready = readiness.is_ready();
+    state.hnsw_reason_code = readiness.reason_code();
+}
+
+/// Perform the exact native admission for the production-selected cohort.
+///
+/// Returns `None` when no cohort could be resolved at all, so the caller
+/// keeps the bounded presence verdict instead of inventing one.
+fn probe_semantic_ann_readiness(
+    data_dir: &Path,
+    db_path: &Path,
+    embedder_id: Option<&str>,
+    current_db_fingerprint: Option<&str>,
+) -> Option<SemanticAnnReadiness> {
+    let embedder_id = embedder_id?;
+    let dimension = semantic_embedder_dimension(embedder_id)?;
+    // The probe must select the same generation the serving path selects, and
+    // that selection is keyed by the current database fingerprint. A deep
+    // probe may read the archive strictly read-only to obtain it; the bounded
+    // path never does, and the strict opener never checkpoints or repairs.
+    let fingerprint = current_db_fingerprint
+        .map(ToOwned::to_owned)
+        .or_else(|| crate::indexer::lexical_storage_fingerprint_for_db_strict(db_path).ok());
+    let cohort = crate::search::model_manager::selected_semantic_ann_cohort(
+        data_dir,
+        embedder_id,
+        dimension,
+        fingerprint.as_deref(),
+    );
+    if cohort.is_empty() {
+        // No exact cohort resolved. There is nothing to admit, and the
+        // bounded presence verdict already describes what is on disk.
+        return None;
+    }
+    Some(crate::search::query::semantic_ann_readiness(&cohort))
 }
 
 fn semantic_preference_surface(
@@ -3844,6 +3999,7 @@ mod tests {
             db_available: false,
             compute_lexical_fingerprint: false,
             inspect_semantic: true,
+            probe_semantic_ann: SemanticAnnProbeMode::Bounded,
         })
         .expect("asset inspection should not fail when db availability is already known");
 
@@ -3884,6 +4040,7 @@ mod tests {
             db_available: false,
             compute_lexical_fingerprint: false,
             inspect_semantic: false,
+            probe_semantic_ann: SemanticAnnProbeMode::Bounded,
         })
         .expect("asset inspection should not open semantic DB when semantic inspection is skipped");
 
@@ -3941,6 +4098,7 @@ mod tests {
             db_available: true,
             compute_lexical_fingerprint: false,
             inspect_semantic: true,
+            probe_semantic_ann: SemanticAnnProbeMode::Bounded,
         })
         .expect("semantic metadata inspection should degrade without failing the whole snapshot");
 

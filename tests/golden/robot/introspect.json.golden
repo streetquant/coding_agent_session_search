@@ -2207,6 +2207,17 @@
           ]
         },
         {
+          "name": "deep",
+          "description": "Deep readiness probe: admit the optional native ANN graph against the selected exact owner so the report can state `ready` or `rejected` with its stable reason code. Off by default: the bounded surface is the documented sub-50ms probe and never loads a graph",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",
@@ -2432,6 +2443,17 @@
         {
           "name": "check",
           "description": "Run the bounded read-only doctor truth surface (`cass doctor check --json`)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "deep",
+          "description": "Deep readiness probe: admit the optional native ANN graph against the selected exact owner so the report can state `ready` or `rejected` with its stable reason code. Off by default: the bounded surface stays fast and never loads a graph",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -6429,6 +6451,12 @@
             },
             "hnsw_ready": {
               "type": "boolean"
+            },
+            "hnsw_reason_code": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "progressive_ready": {
               "type": "boolean"
@@ -27005,6 +27033,12 @@
             "hnsw_ready": {
               "type": "boolean"
             },
+            "hnsw_reason_code": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "progressive_ready": {
               "type": "boolean"
             },
@@ -30436,6 +30470,12 @@
                 "hnsw_ready": {
                   "type": "boolean"
                 },
+                "hnsw_reason_code": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "progressive_ready": {
                   "type": "boolean"
                 },
@@ -33353,6 +33393,12 @@
                     "hnsw_ready": {
                       "type": "boolean"
                     },
+                    "hnsw_reason_code": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
                     "progressive_ready": {
                       "type": "boolean"
                     },
@@ -34800,6 +34846,12 @@
             },
             "hnsw_ready": {
               "type": "boolean"
+            },
+            "hnsw_reason_code": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "progressive_ready": {
               "type": "boolean"
@@ -36976,6 +37028,12 @@
             },
             "hnsw_ready": {
               "type": "boolean"
+            },
+            "hnsw_reason_code": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "progressive_ready": {
               "type": "boolean"
@@ -39168,6 +39226,12 @@
                 },
                 "hnsw_ready": {
                   "type": "boolean"
+                },
+                "hnsw_reason_code": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "progressive_ready": {
                   "type": "boolean"

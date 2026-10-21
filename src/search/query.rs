@@ -758,6 +758,7 @@ fn semantic_doc_component_id_from_db(raw: Option<i64>) -> u32 {
         .unwrap_or(0)
 }
 
+use crate::search::ann_index::SemanticAnnReadiness;
 use crate::search::canonicalize::{canonicalize_for_embedding, content_hash, is_search_noise_text};
 use crate::search::embedder::Embedder;
 use crate::search::vector_index::{
@@ -3008,6 +3009,16 @@ fn open_fs_semantic_ann_index(
             diagnostic: "selected_graph_open_failed",
         }),
     }
+}
+
+/// The exact native-admission verdict for one selected exact FSVI cohort.
+///
+/// Readiness surfaces call this instead of inspecting paths, so
+/// `hnsw_ready` is true only when the very decision the serving path makes
+/// would admit native ANN. The probe loads and validates the graph but never
+/// rebuilds it, never writes, and reports only bounded reason codes.
+pub fn semantic_ann_readiness(artifacts: &[SemanticIndexArtifact]) -> SemanticAnnReadiness {
+    ann_shards::SemanticAnnShardSet::admission(artifacts)
 }
 
 struct SemanticSearchState {
