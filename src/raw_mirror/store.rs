@@ -160,6 +160,11 @@ impl RawMirrorInventoryBudget {
             .is_some_and(|deadline| std::time::Instant::now() >= deadline)
     }
 
+    /// The wall-clock deadline this budget enforces, if it has one.
+    pub fn deadline(&self) -> Option<std::time::Instant> {
+        self.deadline
+    }
+
     /// The entry ceiling this walk enforces.
     pub const fn max_entries(&self) -> usize {
         self.max_entries
@@ -213,7 +218,18 @@ pub(crate) fn storage_summary_bounded(
         Err(_) => return (summary, complete),
     };
     let mut seen_blobs = HashSet::new();
-    for entry in entries {
+    let mut manifest_scan_truncated = false;
+    for (manifest_entries_scanned, entry) in entries.enumerate() {
+        // k2k20: reading and validating a manifest is a file read plus a
+        // hash, and every referenced blob adds a path walk and a stat. On a
+        // mirror with thousands of manifests that is unbounded work, and it
+        // is what held `cass doctor` open for minutes with no output. The
+        // walk stops at the inventory budget and the caller reports the
+        // manifest set as a lower bound instead of an exact count.
+        if manifest_entries_scanned >= budget.max_entries() || budget.expired() {
+            manifest_scan_truncated = true;
+            break;
+        }
         let Ok(entry) = entry else {
             summary.invalid_manifest_count = summary.invalid_manifest_count.saturating_add(1);
             continue;
@@ -283,6 +299,14 @@ pub(crate) fn storage_summary_bounded(
                 }
             }
         }
+    }
+
+    if manifest_scan_truncated {
+        // A partial manifest set means a partial referenced-blob set, so the
+        // orphan counts cannot be computed: a blob that a truncated manifest
+        // referenced would be counted as an orphan. The counts stay unset
+        // and the caller reports the whole inventory as a lower bound.
+        return (summary, false);
     }
 
     if summary.invalid_manifest_count == 0 {
@@ -1195,7 +1219,9 @@ fn collect_raw_mirror_physical_blobs(
     let blobs_root = root.join("blobs").join(RAW_MIRROR_HASH_ALGORITHM);
     let metadata = match fs::symlink_metadata(&blobs_root) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), true)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), true));
+        }
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("stat raw mirror blob root {}", blobs_root.display()));
@@ -1761,10 +1787,7 @@ fn merge_min_max(min: &mut Option<i64>, max: &mut Option<i64>, value: Option<i64
 ///
 /// Returns the bytes plus whether the walk saw the whole tree: a truncated
 /// walk yields a lower bound.
-fn raw_mirror_dir_file_bytes(
-    root: &Path,
-    budget: &RawMirrorInventoryBudget,
-) -> (u64, bool) {
+fn raw_mirror_dir_file_bytes(root: &Path, budget: &RawMirrorInventoryBudget) -> (u64, bool) {
     let mut total = 0u64;
     let mut stack = vec![root.to_path_buf()];
     let mut scanned = 0usize;

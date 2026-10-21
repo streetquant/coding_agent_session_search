@@ -46625,6 +46625,15 @@ struct DoctorStorageInventory {
     truncated_reason: Option<String>,
 }
 
+/// Why a doctor's storage inventory walk stopped before it saw the whole
+/// tree. The walk records the cause without formatting a message, so the
+/// message is built once after the walk instead of once per iteration.
+#[derive(Clone, Copy)]
+enum DoctorInventoryStop {
+    EntryCeiling(usize),
+    TimeBudget,
+}
+
 fn doctor_collect_storage_bytes_by_class(
     data_dir: &Path,
     budget: &crate::raw_mirror::RawMirrorInventoryBudget,
@@ -46644,24 +46653,18 @@ fn doctor_collect_storage_bytes_by_class(
     let scan_root = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
     let mut scanned_entries = 0usize;
     let mut accounted_bytes = 0u64;
-    let mut complete = true;
-    let mut truncated_reason: Option<String> = None;
+    let mut stopped_at: Option<DoctorInventoryStop> = None;
     for (index, entry) in walkdir::WalkDir::new(&scan_root)
         .follow_links(false)
         .into_iter()
         .enumerate()
     {
         if index >= budget.max_entries() {
-            complete = false;
-            truncated_reason = Some(format!(
-                "the inventory stopped at its {}-entry ceiling",
-                budget.max_entries()
-            ));
+            stopped_at = Some(DoctorInventoryStop::EntryCeiling(budget.max_entries()));
             break;
         }
         if budget.expired() {
-            complete = false;
-            truncated_reason = Some("the inventory stopped at its time budget".to_string());
+            stopped_at = Some(DoctorInventoryStop::TimeBudget);
             break;
         }
         scanned_entries = index.saturating_add(1);
@@ -46704,6 +46707,14 @@ fn doctor_collect_storage_bytes_by_class(
         // so far, so a long inventory shows progress and not just a phase.
         doctor_publish_inventory_bytes(accounted_bytes);
     }
+    // The stop cause is recorded inside the walk, but the message is built
+    // once here so the walk itself allocates no per-iteration string.
+    let truncated_reason = stopped_at.map(|stop| match stop {
+        DoctorInventoryStop::EntryCeiling(max_entries) => {
+            format!("the inventory stopped at its {max_entries}-entry ceiling")
+        }
+        DoctorInventoryStop::TimeBudget => "the inventory stopped at its time budget".to_string(),
+    });
     if let Some(reason) = &truncated_reason {
         warnings.push(format!(
             "storage inventory stopped early after {scanned_entries} entries: {reason}; the per-class byte totals are lower bounds"
@@ -46713,7 +46724,7 @@ fn doctor_collect_storage_bytes_by_class(
         bytes_by_class,
         warnings,
         scanned_entries,
-        complete,
+        complete: truncated_reason.is_none(),
         truncated_reason,
     }
 }
@@ -51428,6 +51439,7 @@ fn doctor_raw_mirror_bounded_amplification_reports(
     inventory_truncated: bool,
     ratio_warn_threshold_milli: u64,
     excess_warn_threshold_bytes: u64,
+    deadline: Option<std::time::Instant>,
 ) -> DoctorRawMirrorBoundedAmplificationScan {
     doctor_raw_mirror_bounded_amplification_reports_with_limits(
         data_dir,
@@ -51439,6 +51451,7 @@ fn doctor_raw_mirror_bounded_amplification_reports(
         DoctorRawMirrorBoundedScanLimits {
             manifest_count: DOCTOR_RAW_MIRROR_BOUNDED_AMPLIFICATION_MANIFEST_LIMIT,
             byte_count: DOCTOR_RAW_MIRROR_BOUNDED_AMPLIFICATION_BYTE_LIMIT,
+            deadline,
         },
     )
 }
@@ -51447,6 +51460,17 @@ fn doctor_raw_mirror_bounded_amplification_reports(
 struct DoctorRawMirrorBoundedScanLimits {
     manifest_count: usize,
     byte_count: u64,
+    /// k2k20: the manifest and byte ceilings bound how much is read, not how
+    /// long the disk needs to answer, so the scan also stops at a wall-clock
+    /// deadline and reports a partial scan.
+    deadline: Option<std::time::Instant>,
+}
+
+impl DoctorRawMirrorBoundedScanLimits {
+    fn expired(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    }
 }
 
 fn doctor_raw_mirror_bounded_amplification_reports_with_limits(
@@ -51480,6 +51504,10 @@ fn doctor_raw_mirror_bounded_amplification_reports_with_limits(
         };
         if scanned_manifest_count >= limits.manifest_count || next_scanned_bytes > limits.byte_count
         {
+            truncated = true;
+            break;
+        }
+        if limits.expired() {
             truncated = true;
             break;
         }
@@ -51760,16 +51788,21 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
     let mut full_verification_deferred = false;
     let bounded_inventory_entry_limit = bounded_manifest_limit
         .map(|limit| limit.max(DOCTOR_RAW_MIRROR_BOUNDED_AMPLIFICATION_MANIFEST_LIMIT));
+    // k2k20: the manifest walk, the physical-byte walk, the amplification
+    // scan and the verification loop all read the mirror. They share one
+    // budget so the whole raw-mirror phase is bounded, and the cheap
+    // manifest enumeration runs first so a truncated phase still reports
+    // how many manifests the mirror holds.
+    let mirror_budget = doctor_storage_inventory_budget();
     if manifest_root.exists() {
         // k2k20: the manifest walk is bounded too, so a mirror with a huge
         // manifest tree cannot hold the doctor open indefinitely.
-        let manifest_budget = doctor_storage_inventory_budget();
         for (index, entry) in walkdir::WalkDir::new(&manifest_root)
             .follow_links(false)
             .into_iter()
             .enumerate()
         {
-            if index >= manifest_budget.max_entries() {
+            if index >= mirror_budget.max_entries() {
                 report.status = "warn".to_string();
                 report.warnings.push(
                     "raw mirror manifest scan stopped at the doctor's inventory entry ceiling; the reported mirror manifests are a lower bound"
@@ -51778,7 +51811,7 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
                 full_verification_deferred = true;
                 break;
             }
-            if manifest_budget.expired() {
+            if mirror_budget.expired() {
                 report.status = "warn".to_string();
                 report.warnings.push(
                     "raw mirror manifest scan stopped at the doctor's inventory time budget; the reported mirror manifests are a lower bound"
@@ -51812,12 +51845,7 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
     }
 
     let (physical_storage_bytes, physical_storage_bytes_complete) = bounded_byte_limit
-        .map(|_| {
-            crate::raw_mirror::physical_storage_bytes_bounded(
-                data_dir,
-                &doctor_storage_inventory_budget(),
-            )
-        })
+        .map(|_| crate::raw_mirror::physical_storage_bytes_bounded(data_dir, &mirror_budget))
         .unwrap_or((0, true));
     if !physical_storage_bytes_complete {
         report.status = "warn".to_string();
@@ -51851,6 +51879,7 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
             manifest_entries.len() < manifest_entry_count,
             source_amplification_ratio_warn_threshold_milli,
             source_amplification_excess_warn_threshold_bytes,
+            mirror_budget.deadline(),
         );
         doctor_raw_mirror_apply_source_amplification_reports(
             &mut report,
@@ -51881,7 +51910,7 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
             amplification_scan.scanned_manifest_count,
             manifest_entry_count,
             if amplification_scan.truncated {
-                "; the evidence is partial because the metadata scan cap was reached"
+                "; the evidence is partial because the metadata scan cap or the doctor's inventory time budget was reached"
             } else {
                 ""
             }
@@ -51889,7 +51918,21 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
         return report;
     }
 
+    // k2k20: the verification loop reads and checksums every manifest and
+    // the blob it references. The entry and byte ceilings bound how much is
+    // verified, not how long the disk needs to answer, so a mirror with
+    // thousands of manifests keeps the doctor open for as long as the host
+    // is slow. The same wall-clock budget that bounds the storage
+    // inventory bounds this loop, and a truncated verification is reported
+    // as a lower bound instead of a complete one.
+    doctor_set_heartbeat_phase("raw_mirror_verify");
+    let verification_budget = mirror_budget;
+    let mut verification_truncated = false;
     for (path, is_symlink) in manifest_entries {
+        if verification_budget.expired() {
+            verification_truncated = true;
+            break;
+        }
         let report_entry = if is_symlink {
             doctor_raw_mirror_invalid_manifest_report(
                 data_dir,
@@ -51923,6 +51966,17 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
             }
         };
         report.manifests.push(report_entry);
+    }
+    if verification_truncated {
+        report.status = "warn".to_string();
+        report.warnings.push(
+            "raw mirror manifest verification stopped at the doctor's verification time budget; the verified mirror manifests are a lower bound"
+                .to_string(),
+        );
+        report.notes.push(
+            "The manifest verification budget expired before every manifest was checksum-verified, so the verified manifest set is a lower bound."
+                .to_string(),
+        );
     }
 
     report
@@ -83607,6 +83661,7 @@ paths = ["~/.claude/projects"]
             DoctorRawMirrorBoundedScanLimits {
                 manifest_count: 2,
                 byte_count: u64::MAX,
+                deadline: None,
             },
         );
         assert_eq!(capped_scan.scanned_manifest_count, 2);
@@ -95225,6 +95280,7 @@ pub(crate) fn run_doctor_impl(
         vec!["raw mirror manifests and blob checksums were summarized".to_string()],
     );
     let raw_mirror_backfill_started = Instant::now();
+    doctor_set_heartbeat_phase("raw_mirror_backfill");
     let raw_mirror_backfill = collect_doctor_raw_mirror_backfill_report_for_doctor(
         &data_dir,
         &db_path,
@@ -95505,6 +95561,7 @@ pub(crate) fn run_doctor_impl(
         );
     }
     let source_authority_started = Instant::now();
+    doctor_set_heartbeat_phase("source_authority");
     let source_authority = {
         let report = build_doctor_source_authority_report(&db_path, &source_inventory, &raw_mirror);
         if let Some(reason) = recovery_evidence_deferred_reason.as_deref() {
@@ -95563,6 +95620,7 @@ pub(crate) fn run_doctor_impl(
         }
     }
     let candidate_staging_started = Instant::now();
+    doctor_set_heartbeat_phase("candidate_staging");
     let mut candidate_staging =
         collect_doctor_candidate_staging_report(&data_dir, &db_path, &index_path);
     if candidate_repair_authority_complete
@@ -95703,6 +95761,7 @@ pub(crate) fn run_doctor_impl(
     }
 
     let semantic_probe_started = Instant::now();
+    doctor_set_heartbeat_phase("semantic_probe");
     let readiness_snapshot = state_meta_json_inner(
         &data_dir,
         &db_path,
