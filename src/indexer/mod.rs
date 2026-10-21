@@ -15175,7 +15175,7 @@ struct StreamingProducerConfig {
     progress: Option<Arc<IndexingProgress>>,
     active_source_filter: Arc<ActiveSessionSourceFilter>,
     /// Atomic forward-progress mirror owned by the indexer. The producers
-    /// bump it at their scan boundaries so the index-run lock's
+    /// bump it when a connector's scan finishes so the index-run lock's
     /// `last_progress_at_ms` reflects real scan progress and not only the
     /// background heartbeat.
     progress_bump: Option<Arc<AtomicI64>>,
@@ -15196,6 +15196,21 @@ struct StreamingProducerConfig {
 /// `TimeoutStartSec`, the stall watchdog) remain the outer bound for a hard
 /// wedge. The budget does not claim to shorten a hard wedge on its own.
 const DEFAULT_INDEX_CONNECTOR_TIMEOUT_SECS: u64 = 7_200;
+
+/// The per-connector scan timeout in seconds, read once per process.
+///
+/// `dotenvy::var` re-parses the `.env` file, so it is called once here
+/// instead of once per connector inside the parallel producer closure. It
+/// also keeps every connector in a run on the same configured bound.
+fn connector_scan_timeout_secs() -> u64 {
+    static TIMEOUT_SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TIMEOUT_SECS.get_or_init(|| {
+        dotenvy::var("CASS_INDEX_CONNECTOR_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_INDEX_CONNECTOR_TIMEOUT_SECS)
+    })
+}
 
 /// A bounded per-connector scan budget.
 ///
@@ -15227,16 +15242,28 @@ impl ConnectorScanBudget {
     /// The configured per-connector budget. `CASS_INDEX_CONNECTOR_TIMEOUT_SECS=0`
     /// disables the bound for operators who knowingly run unbounded scans.
     fn from_env() -> Self {
-        let timeout_secs = dotenvy::var("CASS_INDEX_CONNECTOR_TIMEOUT_SECS")
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_INDEX_CONNECTOR_TIMEOUT_SECS);
-        Self::with_timeout(timeout_secs)
+        Self::with_timeout(connector_scan_timeout_secs())
     }
 
     fn with_timeout(timeout_secs: u64) -> Self {
-        let deadline =
-            (timeout_secs > 0).then(|| Instant::now() + Duration::from_secs(timeout_secs));
+        let deadline = if timeout_secs == 0 {
+            None
+        } else {
+            let now = Instant::now();
+            match now.checked_add(Duration::from_secs(timeout_secs)) {
+                Some(deadline) => Some(deadline),
+                None => {
+                    // A deadline the platform cannot represent is not a bound
+                    // that can expire. Disable the bound and say so, instead
+                    // of panicking the producer thread and aborting the run.
+                    tracing::warn!(
+                        timeout_secs,
+                        "CASS_INDEX_CONNECTOR_TIMEOUT_SECS is outside the platform's instant range; the per-connector scan bound is disabled for this run"
+                    );
+                    None
+                }
+            }
+        };
         Self::with_deadline(deadline)
     }
 
@@ -15346,22 +15373,21 @@ where
 {
     thread::spawn(move || {
         let scan_start = std::time::Instant::now();
+        // A connector must not be able to hold the index-run lock forever.
+        // The budget and the active-scan mark both start before the
+        // connector is even constructed, so a connector wedged in detection
+        // or in its factory is bounded and visible too.
+        let scan_budget = ConnectorScanBudget::from_env();
+        // The guard clears the active-scan entry on every exit path, so an
+        // early return cannot leave a connector reported as still scanning.
+        let progress_for_guard = config.progress.clone();
+        let _active_scan_guard = ActiveScanConnectorGuard::new(progress_for_guard.as_ref(), name);
         let conn = factory();
         let detect = detect_for_local_scan(&config.local_connector_roots, || conn.detect());
         let was_detected = detect.as_ref().is_some_and(|result| result.detected);
         let mut is_discovered = false;
         let mut scan_succeeded = true;
         let mut active_source_skipped = false;
-
-        // A connector must not be able to hold the index-run lock forever.
-        // The budget is observed by the progress tick (a connector that
-        // yields but never finishes trips it) and by the per-conversation
-        // callback (a connector that keeps yielding is stopped promptly).
-        let scan_budget = ConnectorScanBudget::from_env();
-        // The guard clears the active-scan entry on every exit path, so an
-        // early return cannot leave a connector reported as still scanning.
-        let progress_for_guard = config.progress.clone();
-        let _active_scan_guard = ActiveScanConnectorGuard::new(progress_for_guard.as_ref(), name);
 
         // #373 Variant A: give the connector a liveness tick so a long internal
         // scan (e.g. decoding a large opencode.db) advances the watchdog's
@@ -16918,6 +16944,14 @@ where
                 if progress_ref.is_some_and(|progress| progress.stop_requested()) {
                     return None;
                 }
+                // The budget and the active-scan mark both start before the
+                // connector is even constructed, so a connector wedged in
+                // detection or in its factory is bounded and visible too.
+                let scan_budget = ConnectorScanBudget::from_env();
+                // The guard clears the active-scan entry on every exit path,
+                // so an early return cannot leave a connector reported as
+                // still scanning.
+                let _active_scan_guard = ActiveScanConnectorGuard::new(progress_ref, name);
                 let conn = factory();
                 let detect = detect_for_local_scan(&local_connector_roots, || conn.detect());
                 let was_detected = detect.as_ref().is_some_and(|result| result.detected);
@@ -16926,14 +16960,6 @@ where
                 let mut scan_succeeded = true;
                 let mut active_source_skipped = false;
                 let mut scan_errors = Vec::new();
-                // The bounded per-connector budget (see
-                // `ConnectorScanBudget`): a connector must not be able to
-                // hold the index-run lock forever.
-                let scan_budget = ConnectorScanBudget::from_env();
-                // The guard clears the active-scan entry on every exit path,
-                // so an early return cannot leave a connector reported as
-                // still scanning.
-                let _active_scan_guard = ActiveScanConnectorGuard::new(progress_ref, name);
                 let connector_tick: Option<Arc<dyn Fn() + Send + Sync>> =
                     scan_progress_tick.as_ref().map(|tick| {
                         let tick = Arc::clone(tick);
@@ -19721,7 +19747,7 @@ fn run_index_with_storage_ownership(
         if one_shot_delta_eligible {
             prepare_progress_for_semantic_build(opts.progress.as_ref());
             if let Err(err) = index_run_lock.set_phase(initial_lock_mode, "semantic:incremental") {
-                tracing::debug!(
+                tracing::warn!(
                     error = %err,
                     "semantic incremental phase breadcrumb write failed (continuing)"
                 );
@@ -19817,7 +19843,7 @@ fn run_index_with_storage_ownership(
             prepare_progress_for_semantic_build(opts.progress.as_ref());
             let mut set_semantic_phase = |phase: &'static str| {
                 if let Err(err) = index_run_lock.set_phase(initial_lock_mode, phase) {
-                    tracing::debug!(
+                    tracing::warn!(
                         sub_phase = phase,
                         error = %err,
                         "semantic index phase breadcrumb write failed (continuing)"
@@ -20292,7 +20318,7 @@ fn run_index_with_storage_ownership(
             progress.tick_activity();
         }
         if let Err(err) = index_run_lock.set_phase(initial_lock_mode, "fts:fallback_repair") {
-            tracing::debug!(
+            tracing::warn!(
                 error = %err,
                 "fallback FTS repair phase breadcrumb write failed (continuing)"
             );
