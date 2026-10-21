@@ -6858,4 +6858,56 @@ mod tests {
             "paused capture must not publish manifests"
         );
     }
+
+    /// k2k20: the manifest read and validation loop is bounded, so a mirror
+    /// with many manifests cannot hold the doctor open. A truncated scan
+    /// reports the manifest set as a lower bound and leaves the orphan
+    /// counts unset, because a partial manifest set would count referenced
+    /// blobs as orphans.
+    #[test]
+    fn storage_summary_bounded_truncates_the_manifest_scan_at_the_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("archive");
+        let first_path = temp.path().join("first.jsonl");
+        let second_path = temp.path().join("second.jsonl");
+        fs::write(&first_path, b"{\"first\":1}\n").unwrap();
+        fs::write(&second_path, b"{\"second\":2}\n").unwrap();
+        for source_path in [&first_path, &second_path] {
+            capture_source_file(RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "codex",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path,
+                db_links: &[],
+            })
+            .expect("capture a source into the raw mirror");
+        }
+
+        let (unbounded_summary, unbounded_complete) =
+            storage_summary_bounded(&data_dir, &RawMirrorInventoryBudget::unbounded());
+        assert!(
+            unbounded_complete,
+            "an unbounded budget must see the whole mirror"
+        );
+        assert_eq!(unbounded_summary.manifest_count, 2);
+
+        let expired_budget =
+            RawMirrorInventoryBudget::bounded(usize::MAX, std::time::Duration::from_secs(0));
+        let (truncated_summary, truncated_complete) =
+            storage_summary_bounded(&data_dir, &expired_budget);
+        assert!(
+            !truncated_complete,
+            "an expired budget must report an incomplete inventory"
+        );
+        assert_eq!(
+            truncated_summary.manifest_count, 0,
+            "a truncated manifest scan must report the manifest set as a lower bound"
+        );
+        assert_eq!(
+            truncated_summary.orphan_blob_count, 0,
+            "a truncated manifest scan must not guess orphan counts from a partial referenced-blob set"
+        );
+    }
 }

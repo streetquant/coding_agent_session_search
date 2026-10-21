@@ -51895,8 +51895,16 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
         } else {
             format!("{estimated_verification_bytes} bytes")
         };
+        // k2k20: a truncated physical walk returns the bytes it managed to
+        // count, which can be zero. Printing that as a plain byte count
+        // reads as an empty mirror, so a truncated walk says "at least".
+        let physical_storage_bytes_text = if physical_storage_bytes_complete {
+            format!("{physical_storage_bytes}")
+        } else {
+            format!("at least {physical_storage_bytes}")
+        };
         report.warnings.push(format!(
-            "Raw mirror verification deferred: inventory has {manifest_entry_count} manifest(s) and {physical_storage_bytes} physical bytes across blobs, manifests, logs, and interrupted temp artifacts; estimated full verification work is {verification_work}. Bounded doctor limits are {limit} manifests, {byte_limit} physical bytes, and {byte_limit} estimated verification-work bytes. Set {CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY}=1 to run a full blob checksum verification."
+            "Raw mirror verification deferred: inventory has {manifest_entry_count} manifest(s) and {physical_storage_bytes_text} physical bytes across blobs, manifests, logs, and interrupted temp artifacts; estimated full verification work is {verification_work}. Bounded doctor limits are {limit} manifests, {byte_limit} physical bytes, and {byte_limit} estimated verification-work bytes. Set {CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY}=1 to run a full blob checksum verification."
         ));
         report.notes.push(
             "Bounded doctor mode does not claim raw mirror blobs are verified until full checksum verification runs."
