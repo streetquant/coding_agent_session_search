@@ -486,6 +486,7 @@ fn gh512_real_connectors_complete_during_growth_without_redundant_discovery() ->
             local_since_ts_by_connector: Arc::new(HashMap::new()),
             progress: None,
             active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
+            progress_bump: None,
         };
         let connector = LedgerDiscoveryCounter {
             inner: factory(),
@@ -818,6 +819,7 @@ fn gh512_real_sidecar_appearance_before_admission_cannot_certify_an_untracked_fi
         local_since_ts_by_connector: Arc::new(HashMap::new()),
         progress: None,
         active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
+        progress_bump: None,
     };
     let connector = GrokSummaryAtAdmission {
         summary: directory.join("summary.json"),
