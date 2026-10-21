@@ -2259,6 +2259,11 @@ fn reset_progress_to_idle(progress: Option<&Arc<IndexingProgress>>) {
     progress.phase.store(0, Ordering::Relaxed);
     progress.is_rebuilding.store(false, Ordering::Relaxed);
     progress.finalizing.store(false, Ordering::Relaxed);
+    // A connector that was still marked active when the previous run stopped
+    // would otherwise be reported as scanning in the next run as well.
+    if let Ok(mut connectors) = progress.active_scan_connectors.lock() {
+        connectors.clear();
+    }
     progress
         .rebuild_pipeline_queue_depth
         .store(0, Ordering::Relaxed);
@@ -15178,11 +15183,18 @@ struct StreamingProducerConfig {
 
 /// Default per-connector scan budget in seconds.
 ///
-/// A connector that never yields — a directory walk on a saturated disk, a
-/// store whose decode never finishes — must not hold the index-run lock
-/// forever. The budget is generous enough that a legitimately slow archive
-/// on a busy disk still completes, and short enough that a wedged connector
-/// is reported instead of holding the lock for the rest of the day.
+/// A connector that keeps yielding but never finishes must not hold the
+/// index-run lock forever. The budget is generous enough that a legitimately
+/// slow archive on a busy disk still completes, and short enough that a
+/// wedged connector is reported instead of holding the lock for the rest of
+/// the day.
+///
+/// This budget is a detector at the connector's yield boundaries, not an
+/// interrupt. A connector wedged inside a single blocking read - a store
+/// whose decode never finishes, a directory walk on a saturated disk - is
+/// noticed when that read returns, and the run-level bounds (the unit's
+/// `TimeoutStartSec`, the stall watchdog) remain the outer bound for a hard
+/// wedge. The budget does not claim to shorten a hard wedge on its own.
 const DEFAULT_INDEX_CONNECTOR_TIMEOUT_SECS: u64 = 7_200;
 
 /// A bounded per-connector scan budget.
@@ -15191,11 +15203,14 @@ const DEFAULT_INDEX_CONNECTOR_TIMEOUT_SECS: u64 = 7_200;
 ///
 /// * the connector's progress tick flips `expired` once the deadline
 ///   passes, so a connector that ticks but never yields is detected as soon
-///   as it yields again (and a connector that never yields at all is
-///   detected when it finally returns);
+///   as it yields again;
 /// * the per-conversation callback turns the expiry into a typed error, so a
 ///   streaming connector stops promptly instead of finishing a scan nobody
 ///   is waiting for.
+///
+/// A connector that consumed the rest of its budget and still returned `Ok`
+/// is caught by a post-scan check, so the budget cannot be defeated by a
+/// connector that stops yielding just before the deadline.
 ///
 /// An expired connector is reported as a failed scan and its watermark is NOT
 /// advanced, so the next run retries it from the connector's previous
@@ -15222,6 +15237,11 @@ impl ConnectorScanBudget {
     fn with_timeout(timeout_secs: u64) -> Self {
         let deadline =
             (timeout_secs > 0).then(|| Instant::now() + Duration::from_secs(timeout_secs));
+        Self::with_deadline(deadline)
+    }
+
+    /// A budget with an explicit deadline. `None` disables the bound.
+    fn with_deadline(deadline: Option<Instant>) -> Self {
         Self {
             deadline,
             expired: Arc::new(AtomicBool::new(false)),
@@ -15239,6 +15259,14 @@ impl ConnectorScanBudget {
     }
 
     fn expired(&self) -> bool {
+        if self.expired.load(Ordering::Acquire) {
+            return true;
+        }
+        // The flag is the fast path (the progress tick sets it), but the
+        // deadline itself is authoritative: a connector whose scan returns
+        // without ever ticking must still be reported as expired, or its
+        // watermark would advance over the turns it never read.
+        self.observe();
         self.expired.load(Ordering::Acquire)
     }
 
@@ -15272,6 +15300,35 @@ fn mark_scan_connector_finished(progress: Option<&Arc<IndexingProgress>>, connec
     }
 }
 
+/// RAII guard for the active-scan set.
+///
+/// A producer can leave its scan early - a disconnected consumer, a failed
+/// flush - without reaching the "scan finished" line. Without this guard the
+/// connector would stay in `active_scan_connectors` for the rest of the
+/// process, so an operator would read a connector that is not scanning as the
+/// one a stalled run is inside. Dropping the guard clears the entry on every
+/// exit path, including an early return and a panic.
+struct ActiveScanConnectorGuard<'a> {
+    progress: Option<&'a Arc<IndexingProgress>>,
+    connector: &'static str,
+}
+
+impl<'a> ActiveScanConnectorGuard<'a> {
+    fn new(progress: Option<&'a Arc<IndexingProgress>>, connector: &'static str) -> Self {
+        mark_scan_connector_active(progress, connector);
+        Self {
+            progress,
+            connector,
+        }
+    }
+}
+
+impl Drop for ActiveScanConnectorGuard<'_> {
+    fn drop(&mut self) {
+        mark_scan_connector_finished(self.progress, self.connector);
+    }
+}
+
 /// Spawn a producer thread that scans a connector and sends batches through the channel.
 ///
 /// Each connector runs in its own thread, scanning the built-in local roots plus
@@ -15301,7 +15358,10 @@ where
         // yields but never finishes trips it) and by the per-conversation
         // callback (a connector that keeps yielding is stopped promptly).
         let scan_budget = ConnectorScanBudget::from_env();
-        mark_scan_connector_active(config.progress.as_ref(), name);
+        // The guard clears the active-scan entry on every exit path, so an
+        // early return cannot leave a connector reported as still scanning.
+        let progress_for_guard = config.progress.clone();
+        let _active_scan_guard = ActiveScanConnectorGuard::new(progress_for_guard.as_ref(), name);
 
         // #373 Variant A: give the connector a liveness tick so a long internal
         // scan (e.g. decoding a large opencode.db) advances the watchdog's
@@ -16870,7 +16930,10 @@ where
                 // `ConnectorScanBudget`): a connector must not be able to
                 // hold the index-run lock forever.
                 let scan_budget = ConnectorScanBudget::from_env();
-                mark_scan_connector_active(progress_ref, name);
+                // The guard clears the active-scan entry on every exit path,
+                // so an early return cannot leave a connector reported as
+                // still scanning.
+                let _active_scan_guard = ActiveScanConnectorGuard::new(progress_ref, name);
                 let connector_tick: Option<Arc<dyn Fn() + Send + Sync>> =
                     scan_progress_tick.as_ref().map(|tick| {
                         let tick = Arc::clone(tick);
@@ -17089,6 +17152,23 @@ where
                                 connector = name,
                                 root = %root.path.display(),
                                 "remote scan failed: {e}"
+                            );
+                        }
+                        // A connector that finished this root's scan but ran
+                        // past its budget is a failed scan: its watermark must
+                        // not advance, or the next run would skip the turns
+                        // this run never read. The local scan and the
+                        // additional roots are one budget, so the check has to
+                        // follow every root, not only the local one.
+                        if scan_budget.expired() {
+                            scan_succeeded = false;
+                            scan_errors.push(format!(
+                                "scan for {name} exceeded its bounded time budget"
+                            ));
+                            tracing::warn!(
+                                connector = name,
+                                root = %root.path.display(),
+                                "scan exceeded its bounded time budget; the connector's scan watermark was not advanced"
                             );
                         }
                         record_connector_ingest_report(
@@ -17816,7 +17896,11 @@ fn run_index_with_storage_ownership(
             }
             if phase_visible {
                 if let Err(err) = index_run_lock.set_phase(initial_lock_mode, $phase) {
-                    tracing::debug!(
+                    // A breadcrumb that cannot be written is exactly the
+                    // condition that leaves an operator reading a stale
+                    // phase for a run that is still moving. It is a
+                    // diagnosability defect, not a cosmetic one.
+                    tracing::warn!(
                         sub_phase = $phase,
                         error = %err,
                         "index preflight phase breadcrumb write failed (continuing)"
@@ -17846,7 +17930,9 @@ fn run_index_with_storage_ownership(
                 progress.check_stop()?;
             }
             if let Err(err) = index_run_lock.set_phase(initial_lock_mode, $phase) {
-                tracing::debug!(
+                // See the preflight breadcrumb above: a failed phase write
+                // makes a live run look stuck on an old phase.
+                tracing::warn!(
                     phase = $phase,
                     error = %err,
                     "index work phase breadcrumb write failed (continuing)"
@@ -53697,7 +53783,7 @@ mod tests {
 
     #[test]
     fn snapshot_json_phase_label_matches_phase_code_sample() {
-        let progress = IndexingProgress::default();
+        let progress = Arc::new(IndexingProgress::default());
         progress.phase.store(2, Ordering::Relaxed);
         let snapshot = progress.snapshot_json(2500);
 
@@ -56065,6 +56151,63 @@ mod tests {
     }
 
     #[test]
+    fn connector_scan_budget_expires_and_fails_the_scan() {
+        // A budget with no deadline is unbounded: the operator asked for an
+        // unbounded scan, so the connector is never failed on time.
+        let unbounded = ConnectorScanBudget::with_timeout(0);
+        assert!(!unbounded.expired());
+        assert!(unbounded.check("opencode").is_ok());
+
+        // A budget whose deadline is still in the future does not fail a
+        // healthy connector.
+        let live =
+            ConnectorScanBudget::with_deadline(Some(Instant::now() + Duration::from_secs(60)));
+        assert!(!live.expired());
+        assert!(live.check("opencode").is_ok());
+
+        // A budget whose deadline has passed fails the scan and names the
+        // connector. The check is authoritative even when the progress tick
+        // never ran, so a connector that returns without ticking cannot
+        // advance its watermark over the turns it never read.
+        let expired =
+            ConnectorScanBudget::with_deadline(Some(Instant::now() - Duration::from_secs(1)));
+        assert!(expired.expired());
+        let error = expired
+            .check("opencode")
+            .expect_err("an expired budget must fail the scan");
+        assert!(
+            error.to_string().contains("opencode"),
+            "the typed error must name the connector: {error}"
+        );
+    }
+
+    #[test]
+    fn active_scan_connectors_are_reported_in_the_progress_snapshot() {
+        let progress = Arc::new(IndexingProgress::default());
+        mark_scan_connector_active(Some(&progress), "opencode");
+        mark_scan_connector_active(Some(&progress), "codex");
+
+        let snapshot = progress.snapshot_json(0);
+        let active = snapshot["active_scan_connectors"]
+            .as_array()
+            .expect("active_scan_connectors must be an array");
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().any(|value| value == "opencode"));
+        assert!(active.iter().any(|value| value == "codex"));
+
+        // A finished connector leaves the active set: a stalled run is
+        // reported as the connectors that are still in flight, not the ones
+        // that already completed.
+        mark_scan_connector_finished(Some(&progress), "opencode");
+        let snapshot = progress.snapshot_json(0);
+        let active = snapshot["active_scan_connectors"]
+            .as_array()
+            .expect("active_scan_connectors must be an array");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0], "codex");
+    }
+
+    #[test]
     fn connector_local_scan_since_ts_protects_newly_enabled_connector_backlog() {
         let global_incremental_since_ts = Some(1233);
 
@@ -56960,6 +57103,7 @@ mod tests {
                 local_since_ts_by_connector: Arc::new(HashMap::new()),
                 progress: Some(progress.clone()),
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
+                progress_bump: None,
             },
         );
 
@@ -57882,6 +58026,7 @@ mod tests {
                 local_since_ts_by_connector: Arc::new(HashMap::new()),
                 progress: None,
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
+                progress_bump: None,
             },
         );
 
