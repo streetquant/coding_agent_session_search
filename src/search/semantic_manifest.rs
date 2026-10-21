@@ -2844,6 +2844,7 @@ impl SemanticGenerationManifestV1 {
                     }
                 })?;
                 let binding =
+                    // ubs:ignore[rust.collections.clone-in-loop] -- The binding owns the identity it authenticates.
                     FsviV2IdentityBinding::new(generation, artifact.embedding_identity.clone())
                         .map_err(|error| SemanticGenerationError::InvalidManifest {
                             class: SemanticManifestInvariantClass::Identity,

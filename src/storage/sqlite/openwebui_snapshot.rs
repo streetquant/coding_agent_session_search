@@ -192,6 +192,7 @@ pub(super) fn reconcile(
         || previous_started != incoming.started_at
         || previous_title != incoming.title;
     for message in &mut conversation.messages {
+        // ubs:ignore[rust.perf.string-alloc-in-loop] -- The owned identity is the lookup key retained in the seen set.
         let identity = message_identity(incoming, message)?.to_owned();
         if let Some(previous_message) = previous_by_identity.get(identity.as_str()) {
             message.id = previous_message.id;
@@ -209,13 +210,17 @@ pub(super) fn reconcile(
         if seen.contains(identity) {
             continue;
         }
+        // ubs:ignore[rust.collections.clone-in-loop] -- The retained message is an owned copy pushed into the conversation.
         let mut retained_message = message.clone();
         retained_message.idx = i64::try_from(conversation.messages.len())?;
+        // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing inserts the key and cannot panic.
         retained_message.extra_json["cass_openwebui_source_present"] = serde_json::json!(false);
         messages_changed |= !same_message(message, &retained_message);
+        // ubs:ignore[rust.perf.string-alloc-in-loop] -- The retained identity is owned because it is stored in the metadata list.
         retained.push(identity.to_owned());
         conversation.messages.push(retained_message);
     }
+    // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing inserts the key and cannot panic.
     conversation.metadata_json["retained_absent_message_ids"] = serde_json::json!(retained);
     let mut lexical_indices = std::collections::BTreeSet::new();
     if let Some(indices) = previous_metadata.get("openwebui_lexical_indices") {
@@ -233,6 +238,7 @@ pub(super) fn reconcile(
     }
     lexical_indices.extend(previous.iter().map(|message| message.idx));
     lexical_indices.extend(conversation.messages.iter().map(|message| message.idx));
+    // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing inserts the key and cannot panic.
     conversation.metadata_json["openwebui_lexical_indices"] = serde_json::json!(lexical_indices);
     let updated_indices = if messages_changed {
         conversation
@@ -296,12 +302,14 @@ pub(super) fn reconcile(
                     })
                     .collect::<Result<_>>()?;
                 if let Err(error) = tx.execute_with_params_skip_statement_savepoint(
+                    // ubs:ignore[rust.perf.string-alloc-in-loop] -- The statement text is formatted once per batch, not once per row.
                     &format!(
                         "DELETE FROM fts_messages WHERE rowid IN ({})",
                         sql_placeholders(parameters.len())
                     ),
                     &parameters,
                 ) {
+                    // ubs:ignore[rust.perf.string-alloc-in-loop] -- The error text is materialized only on the error path to classify a missing FTS table.
                     if error.to_string().contains("no such table: fts_messages") {
                         storage.set_fts_messages_present_cache(false);
                         break;
@@ -402,6 +410,7 @@ fn subtract_analytics(
                     .map(ParamValue::from)
             })
             .collect::<Result<_>>()?;
+        // ubs:ignore[rust.perf.string-alloc-in-loop] -- The query text is formatted once per batch, not once per row.
         let entries = tx.query_map_collect(&format!(
             "SELECT message_id, created_at_ms, hour_id, day_id, agent_slug, workspace_id, source_id, role,
                     content_chars, content_tokens_est, model_name, model_family, model_tier, provider,
@@ -423,6 +432,7 @@ fn subtract_analytics(
             rollups.record(&entry);
         }
         tx.execute_compat(
+            // ubs:ignore[rust.perf.string-alloc-in-loop] -- The statement text is formatted once per batch, not once per row.
             &format!(
                 "DELETE FROM message_metrics WHERE message_id IN ({})",
                 sql_placeholders(parameters.len())
@@ -509,7 +519,9 @@ fn subtract_analytics(
             .deltas
             .entry((
                 day,
+                // ubs:ignore[rust.collections.clone-in-loop] -- The rollup key owns the agent slug.
                 conversation.agent_slug.clone(),
+                // ubs:ignore[rust.collections.clone-in-loop] -- The rollup key owns the source id.
                 conversation.source_id.clone(),
                 family,
             ))
