@@ -199,6 +199,7 @@ LOCAL=0
 REGEN_GOLDENS=0
 RUN_DOCS_TRUTH=0
 UBS_FILES=()
+VERIFY_UBS_FILES=()
 # Each entry is `<test-binary>` or `<test-binary>:<filter words>`; the filter
 # is passed after `--` so one admission can run only the tests a change touches.
 # search_metamorphic is the set-algebra oracle for search semantics (terms,
@@ -215,6 +216,11 @@ while [ $# -gt 0 ]; do
         --no-lib) RUN_LIB=0; shift ;;
         --local) LOCAL=1; shift ;;
         --ubs-files) IFS=',' read -r -a UBS_FILES <<<"$2"; shift 2 ;;
+        # Run the strict UBS stage alone over the named files, with the same
+        # pinned runner, delta baseline and negative control the admission
+        # runs. The stage itself is dispatched after its functions are
+        # defined.
+        --verify-ubs) shift; VERIFY_UBS_FILES=("$@"); break ;;
         --integration) IFS=',' read -r -a INTEGRATION_TESTS <<<"$2"; shift 2 ;;
         # Regenerate goldens (UPDATE_GOLDENS=1) before verifying them. The
         # verify stage still runs, and every resulting diff under tests/golden
@@ -256,7 +262,11 @@ if [[ ! "$UBS_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
 fi
 SOURCE_HEAD="$(git rev-parse HEAD)" || exit 1
 if [ "${#UBS_FILES[@]}" -eq 0 ]; then
-    UBS_BASE="${GATE_BASE:-$(git merge-base origin/main "$SOURCE_HEAD")}" || exit 1
+    # The branch's own changes are measured against the upstream base this
+    # branch merged, not against a remote-tracking ref that is thousands of
+    # commits behind. The delta baseline in ubs_delta_gate uses the same
+    # commit, so the scanned set and the baseline always agree.
+    UBS_BASE="${GATE_BASE:-$(git merge-base "$SOURCE_HEAD" upstream/main 2>/dev/null || git merge-base origin/main "$SOURCE_HEAD")}" || exit 1
     while IFS= read -r -d '' path; do
         [ -f "$path" ] && UBS_FILES+=("$path")
     done < <({
@@ -406,9 +416,649 @@ run_ubs() {
         return 0
     fi
     printf 'UBS_FILE=%s\n' "$@"
-    # Text retains categories and source samples needed to diagnose a red gate.
-    UBS_ALLOW_UNVERIFIED_HELPERS=0 bash "$scanner" --module-dir="$tool_dir/modules" --no-auto-update --format=text --ci --fail-on-warning "$@"
+    # A delta gate, not a whole-file gate: see ubs_delta_gate below.
+    ubs_delta_gate "$tool_dir" "$@"
 }
+
+# Strict UBS delta gate (bead 5v57k).
+#
+# The pinned runner scans every file it is named and refuses the admission on
+# any warning it finds. The files this branch touches already carry the
+# upstream base's own findings, so a whole-file gate reports tens of
+# thousands of pre-existing warnings on every change: the gate can never
+# pass, and no bead can close on its receipt. This gate still scans every
+# named file and still refuses findings the branch introduced; it stops
+# refusing on findings that already existed at the base commit.
+#
+# The baseline is derived from git history and never checked in. The base is
+# the merge base with upstream/main, so a baseline that is stale or
+# regenerated cannot quietly excuse a finding the branch introduced. Three
+# runner properties make the delta usable, all measured against the pinned
+# v5.4.4 release:
+#
+#   * `--format=text` never writes the findings sink a delta reads, so a
+#     text-format delta reports nothing and exits 0 even with a planted
+#     production unwrap in the scanned set. The delta therefore runs in JSON
+#     format, and the stage's exit code is that run's exit code.
+#   * finding fingerprints exclude the absolute path, so a base tree unpacked
+#     in a temporary directory compares against a baseline scanned in the
+#     working tree.
+#   * a finding's fingerprint covers the statement it points at, so the base
+#     tree is normalized with rustfmt before it is scanned. A base tree that
+#     cannot be normalized is a loud failure, never a noisier delta.
+ubs_delta_gate() {
+    local tool_dir="$1"; shift
+    local scanner="$tool_dir/ubs"
+    local modules="$tool_dir/modules"
+    local head_commit base_commit repo_root base_tree
+    local cache_dir cache_key baseline_json base_scan_json delta_json
+    local base_rc delta_rc clean_rc planted_rc control_rel rel f d
+    local control_clean_json="" control_planted_json="" control_probe="" filter_rc
+    local fmt_rc rustfmt_bin rustfmt_version
+    local -a base_files=() fmt_roots=()
+
+    head_commit="$(git rev-parse HEAD 2>/dev/null)" || head_commit="${SOURCE_HEAD:-HEAD}"
+    repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || repo_root="$PWD"
+    base_commit="$(git merge-base "$head_commit" upstream/main 2>/dev/null)" || base_commit=""
+    if [ -z "$base_commit" ]; then
+        base_commit="$(git merge-base "$head_commit" origin/main 2>/dev/null)" || base_commit=""
+    fi
+    if [ -z "$base_commit" ]; then
+        echo "gate: UBS delta found no base commit (no upstream/main or origin/main merge base)" >&2
+        return 1
+    fi
+    echo "UBS_DELTA_BASE=${base_commit}"
+    echo "UBS_DELTA_HEAD=${head_commit}"
+    if [ "$base_commit" = "$head_commit" ]; then
+        echo "UBS_DELTA_NEW=0 (HEAD is the base commit: this branch introduced no finding)"
+        return 0
+    fi
+
+    # The base tree carries every file the named set had at the base commit.
+    # It is unpacked on every run because the negative control below needs it
+    # even when the baseline scan itself is served from the cache.
+    base_tree="$(mktemp -d -t cass-gate-ubs-base.XXXXXX)" || return 1
+    if ! ( cd "$repo_root" && git archive "$base_commit" -- . ':(exclude).beads' 2>/dev/null ) | tar -x -C "$base_tree"; then
+        echo "gate: UBS delta could not unpack the base tree at ${base_commit}" >&2
+        return 1
+    fi
+    rustfmt_bin="${RUSTFMT:-rustfmt}"
+    for f in src/lib.rs src/main.rs; do
+        [ -f "$base_tree/$f" ] && fmt_roots+=("$base_tree/$f")
+    done
+    for d in src/bin tests benches examples; do
+        [ -d "$base_tree/$d" ] || continue
+        while IFS= read -r f; do fmt_roots+=("$f"); done < <(find "$base_tree/$d" -maxdepth 1 -name '*.rs' | sort)
+    done
+    fmt_rc=0
+    ( cd "$base_tree" && "$rustfmt_bin" --edition 2024 "${fmt_roots[@]}" ) >/dev/null 2>"$base_tree/rustfmt.err" || fmt_rc=$?
+    if [ "$fmt_rc" -ne 0 ]; then
+        echo "gate: UBS delta base tree could not be rustfmt-normalized" >&2
+        sed -n '1,20p' "$base_tree/rustfmt.err" >&2
+        return 1
+    fi
+
+    # The baseline depends on the base commit, the named file set and the
+    # rustfmt that normalized the base, and the base moves far less often
+    # than the branch does. Cache it under the gate's target dir so a
+    # repeated admission does not rescan the base.
+    rustfmt_version="$("$rustfmt_bin" --version 2>/dev/null)"
+    cache_dir="${GATE_UBS_BASELINE_CACHE:-${CARGO_TARGET_DIR:-$repo_root/.local-state}/ubs-baseline}"
+    cache_key="$( { printf '%s\n' "$base_commit" "$rustfmt_version"; printf '%s\n' "$@"; } | sha256sum | cut -d' ' -f1)"
+    baseline_json="$cache_dir/$cache_key.json"
+    mkdir -p "$cache_dir" 2>/dev/null || true
+
+    if [ -s "$baseline_json" ]; then
+        echo "UBS_DELTA_BASELINE=cache"
+    else
+        for rel in "$@"; do
+            rel="${rel#./}"
+            [ -f "$base_tree/$rel" ] && base_files+=("$rel")
+        done
+        echo "UBS_DELTA_BASE_FILES=${#base_files[@]}"
+        if [ "${#base_files[@]}" -gt 0 ]; then
+            base_scan_json="$base_tree/base.json"
+            ( cd "$base_tree" && UBS_ALLOW_UNVERIFIED_HELPERS=0 bash "$scanner" --module-dir="$modules" --no-auto-update --format=json --ci --save-baseline="$baseline_json" "${base_files[@]}" ) >"$base_scan_json" 2>"$base_tree/base.err"
+            base_rc=$?
+            # The scanner exits non-zero when it finds anything, so the exit
+            # code is not a failure signal here: the baseline file is.
+            if [ ! -s "$baseline_json" ]; then
+                echo "gate: UBS delta baseline scan produced no baseline (exit ${base_rc})" >&2
+                sed -n '1,20p' "$base_tree/base.err" >&2
+                return 1
+            fi
+            echo "UBS_DELTA_BASELINE_SCAN_EXIT=${base_rc} (findings in the base are expected)"
+        else
+            # Every named file is new in this branch, so every finding in it
+            # is new. There is no base content to compare against.
+            echo "UBS_DELTA_BASE_FILES=0 (every named file is new in this branch)"
+            baseline_json=""
+        fi
+    fi
+
+    delta_json="$(mktemp -t cass-gate-ubs-delta.XXXXXX)" || return 1
+    if [ -n "$baseline_json" ]; then
+        # Negative control: a delta gate that cannot fail proves nothing.
+        # The base version of one production file is already in the baseline,
+        # so scanning it must report no new finding; the same file with one
+        # planted production unwrap must report one. The only difference
+        # between the two runs is the plant.
+        # Pick a production file from the scanned set. The baseline records
+        # findings per occurrence (rust.ownership.unwrap-expect alone carries
+        # ~20k occurrences across the tree), so a planted unwrap is a new
+        # finding rather than a repeat of a file-level finding.
+        control_rel=""
+        for rel in "$@"; do
+            rel="${rel#./}"
+            case "$rel" in
+                src/*) : ;;
+                *) continue ;;
+            esac
+            case "$rel" in
+                */tests/*|*/tests.rs) continue ;;
+            esac
+            [ -f "$base_tree/$rel" ] || continue
+            control_rel="$rel"
+            break
+        done
+        if [ -n "$control_rel" ]; then
+            ( cd "$base_tree" && UBS_ALLOW_UNVERIFIED_HELPERS=0 bash "$scanner" --module-dir="$modules" --no-auto-update --format=json --ci --baseline="$baseline_json" --new-only --fail-on-warning "$control_rel" ) >"$base_tree/control_clean.json" 2>"$base_tree/control_clean.err"
+            clean_rc=$?
+            cp "$base_tree/$control_rel" "$base_tree/control_rel.orig" || return 1
+            # The probe is planted above the file's first #[cfg(test)] or
+            # `mod tests` boundary, never appended after it: the boundary
+            # heuristic treats everything from that line on as test code, so a
+            # probe appended at the end of a file that has one would be
+            # excluded as test code and the control would prove nothing. The
+            # insertion point is after the file's leading inner attributes
+            # and inner doc comments, which is always a top-level position.
+            python3 - "$base_tree/$control_rel" "$base_tree/control_probe.txt" <<'PYPLANT'
+import sys
+from pathlib import Path
+
+target = Path(sys.argv[1])
+probe_lines = [
+    "// cass-gate 5v57k negative control: a production unwrap the delta must",
+    "// report as a new finding. Planted by scripts/gate.sh in a temporary tree.",
+    "fn __cass_ubs_gate_control_probe() -> usize {",
+    "    let value: Option<usize> = Some(1);",
+    "    value.unwrap()",
+    "}",
+]
+text = target.read_text(encoding="utf-8")
+lines = text.splitlines(keepends=True)
+insert_at = 0
+for index, line in enumerate(lines):
+    stripped = line.lstrip()
+    if stripped.startswith("#!") or stripped.startswith("//!"):
+        insert_at = index + 1
+    else:
+        break
+planted = [line + "\n" for line in probe_lines]
+target.write_text("".join(lines[:insert_at] + planted + lines[insert_at:]), encoding="utf-8")
+Path(sys.argv[2]).write_text("%d %d\n" % (insert_at + 1, insert_at + len(planted)), encoding="utf-8")
+PYPLANT
+            ( cd "$base_tree" && UBS_ALLOW_UNVERIFIED_HELPERS=0 bash "$scanner" --module-dir="$modules" --no-auto-update --format=json --ci --baseline="$baseline_json" --new-only --fail-on-warning "$control_rel" ) >"$base_tree/control_planted.json" 2>"$base_tree/control_planted.err"
+            planted_rc=$?
+            mv "$base_tree/control_rel.orig" "$base_tree/$control_rel"
+            control_clean_json="$base_tree/control_clean.json"
+            control_planted_json="$base_tree/control_planted.json"
+            control_probe="$base_tree/control_probe.txt"
+            if [ "$clean_rc" -ne 0 ] || [ "$planted_rc" -eq 0 ]; then
+                echo "gate: UBS delta negative control failed (clean=${clean_rc} planted=${planted_rc})" >&2
+                echo "gate: the delta must report no new finding for the base file and one for the planted file" >&2
+                return 1
+            fi
+            echo "UBS_DELTA_CONTROL=ok (base file clean exit=${clean_rc}, planted unwrap detected exit=${planted_rc})"
+        else
+            echo "UBS_DELTA_CONTROL=skipped (no production file in the scanned set to control)"
+        fi
+        ( cd "$repo_root" && UBS_ALLOW_UNVERIFIED_HELPERS=0 bash "$scanner" --module-dir="$modules" --no-auto-update --format=json --ci --baseline="$baseline_json" --new-only --fail-on-warning "$@" ) >"$delta_json" 2>"${delta_json}.err"
+    else
+        ( cd "$repo_root" && UBS_ALLOW_UNVERIFIED_HELPERS=0 bash "$scanner" --module-dir="$modules" --no-auto-update --format=json --ci --fail-on-warning "$@" ) >"$delta_json" 2>"${delta_json}.err"
+    fi
+    delta_rc=$?
+    # The JSON delta is the verdict: a text-format delta reports nothing and
+    # exits 0, which is exactly the gate that never fails.
+    # The verdict is the filtered delta, not the scanner's exit code. The
+    # pinned v5.4.4 meta-runner rejects --exclude-tests, so the rule is
+    # applied gate-side. A finding counts as test code only when Rust itself
+    # does not compile it without `cfg(test)`:
+    #   a tests//benches/ path component, a file that is only reachable
+    #   through cfg(test)-gated `mod` declarations
+    #   (ubs_core.analyzers.cfg_test_only_rust.compute_test_only), or a line
+    #   inside a cfg(test)-gated item.
+    # Upstream's own --exclude-tests also drops everything at or after a
+    # file's first `#[cfg(test)]` or `mod tests` line. Upstream's docstring
+    # warns that this heuristic "can encompass later production code", so
+    # that part is reported as the win/lose split instead of being excluded:
+    # the receipt names every finding upstream would drop and this gate
+    # keeps. The rule is Rust-only, exactly as upstream's flag is. The
+    # test-only set is computed over the whole repository rather than the
+    # scanned set: a wider reference universe can only remove exclusions,
+    # never add one, so it cannot hide production code that a narrower
+    # universe would expose.
+    filter_rc=0
+    python3 - "$delta_json" "$repo_root" "$modules" "$control_clean_json" "$control_planted_json" "$control_probe" <<'PYSUM' || filter_rc=$?
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+delta_path = sys.argv[1]
+repo_root = Path(sys.argv[2])
+modules_dir = Path(sys.argv[3])
+control_clean_path = sys.argv[4] if len(sys.argv) > 4 else ""
+control_planted_path = sys.argv[5] if len(sys.argv) > 5 else ""
+control_probe_path = sys.argv[6] if len(sys.argv) > 6 else ""
+
+BLOCKING = ("critical", "warning")
+MOD_TESTS_RE = re.compile(r"^\s*mod tests(\s|\{|;|$)")
+INCLUDE_RE = re.compile(r'include!\s*\(\s*"([^"]+)"')
+SKIP_DIRS = {".git", "target", ".local-state", "node_modules", "vendor", ".venv"}
+ATTR_RE = re.compile(r"^\s*#\[([^\]]*)\]")
+CFG_TEST_RE = re.compile(r"^\s*cfg\s*\(\s*(?:test\s*\)|all\s*\(\s*test\s*[,)])")
+# The items whose body a cfg(test) attribute gates. A cfg(test) attribute on
+# anything else (a statement, a use, a const) never widens the excluded
+# region past its own line.
+ITEM_SIG_RE = re.compile(
+    r"^(?:pub(?:\s*\([^)]*\))?\s+)?(?:default\s+)?(?:const\s+)?(?:async\s+)?"
+    r"(?:unsafe\s+)?(?:extern\s+\"[^\"]*\"\s+)?"
+    r"(?:fn|mod|struct|enum|impl|trait|union)\b"
+)
+# How far a cfg(test) item's signature may run before its body must open.
+ITEM_BODY_LOOKAHEAD = 200
+
+
+def repo_rust_files(root):
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        for name in sorted(filenames):
+            if name.endswith(".rs"):
+                found.append(str(Path(dirpath) / name))
+    return found
+
+
+def test_boundary(path_str):
+    """Upstream ubs_core.rust_scan.Scan.test_boundary, unchanged.
+
+    Kept for the win/lose comparison only. Upstream's own docstring warns
+    that this heuristic "can encompass later production code", so it is not
+    the rule this gate excludes with.
+    """
+    try:
+        lines = Path(path_str).read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return 0
+    b1 = b2 = 0
+    for idx, line in enumerate(lines, start=1):
+        if b1 == 0 and "#[cfg(test)]" in line:
+            b1 = idx
+        if b2 == 0 and MOD_TESTS_RE.match(line):
+            b2 = idx
+        if b1 and b2:
+            break
+    if b1 and b2:
+        return min(b1, b2)
+    return b1 or b2
+
+
+def strip_rust(text):
+    """Blank out comments and literals so brace counting sees code only."""
+    def blank(chunk):
+        return "".join(ch if ch == "\n" else " " for ch in chunk)
+
+    out = []
+    index = 0
+    size = len(text)
+    while index < size:
+        ch = text[index]
+        if ch == "/" and index + 1 < size and text[index + 1] == "/":
+            stop = text.find("\n", index)
+            stop = size if stop < 0 else stop
+            out.append(blank(text[index:stop]))
+            index = stop
+            continue
+        if ch == "/" and index + 1 < size and text[index + 1] == "*":
+            depth = 1
+            stop = index + 2
+            while stop < size and depth:
+                if text.startswith("/*", stop):
+                    depth += 1
+                    stop += 2
+                elif text.startswith("*/", stop):
+                    depth -= 1
+                    stop += 2
+                else:
+                    stop += 1
+            out.append(blank(text[index:stop]))
+            index = stop
+            continue
+        if ch == "r" and index + 1 < size and text[index + 1] in "#\"":
+            stop = index + 1
+            hashes = 0
+            while stop < size and text[stop] == "#":
+                hashes += 1
+                stop += 1
+            if stop < size and text[stop] == "\"":
+                stop += 1
+                term = "\"" + "#" * hashes
+                found = text.find(term, stop)
+                stop = size if found < 0 else found + len(term)
+                out.append(blank(text[index:stop]))
+                index = stop
+                continue
+        if ch == "\"":
+            stop = index + 1
+            while stop < size:
+                if text[stop] == "\\":
+                    stop += 2
+                    continue
+                if text[stop] == "\"":
+                    stop += 1
+                    break
+                stop += 1
+            out.append(blank(text[index:stop]))
+            index = stop
+            continue
+        if ch == "'":
+            match = re.match(r"'(\\.|[^\\'])'", text[index:])
+            if match:
+                stop = index + match.end()
+                out.append(blank(text[index:stop]))
+                index = stop
+                continue
+        out.append(ch)
+        index += 1
+    return "".join(out)
+
+
+def cfg_test_regions(path_str):
+    """Lines that sit inside a #[cfg(test)]-gated item.
+
+    This is the sound part of upstream's test classification: a finding is
+    test code only when the file is a test-only file or the line is inside an
+    item that Rust itself does not compile without `cfg(test)`. Upstream's
+    boundary heuristic also drops everything after a file's first
+    `#[cfg(test)]` or `mod tests` line, which can hide production code that
+    follows the test module; that part is reported, not excluded.
+    """
+    try:
+        raw = Path(path_str).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return set(), False
+    lines = raw.splitlines()
+    stripped = strip_rust(raw).splitlines()
+    if len(stripped) != len(lines):
+        return set(), False
+    before = []
+    after = []
+    depth = 0
+    for line in stripped:
+        before.append(depth)
+        depth += line.count("{") - line.count("}")
+        after.append(depth)
+    if depth != 0:
+        # An unbalanced file is not classifiable; keep every finding in it.
+        return set(), False
+    marked = set()
+    pending = False
+    for index, line in enumerate(lines):
+        match = ATTR_RE.match(line)
+        if match:
+            if CFG_TEST_RE.match(match.group(1)):
+                pending = True
+            continue
+        text = line.strip()
+        if not text or text.startswith("//"):
+            continue
+        if pending:
+            if after[index] > before[index]:
+                stop = index + 1
+                while stop < len(lines) and before[stop] > before[index]:
+                    stop += 1
+            elif ITEM_SIG_RE.match(text) and not text.endswith(";"):
+                # The attributed item opens its body on a later line (a
+                # multi-line signature or a where clause), so the body
+                # extent starts at the first following line that opens a
+                # brace. The item signature is required first, so a
+                # cfg(test) attribute on a plain statement never widens the
+                # excluded region past its own line.
+                body = index
+                while (
+                    body < len(lines)
+                    and body <= index + ITEM_BODY_LOOKAHEAD
+                    and after[body] <= before[body]
+                ):
+                    body += 1
+                if body < len(lines) and after[body] > before[body]:
+                    stop = body + 1
+                    while stop < len(lines) and before[stop] > before[body]:
+                        stop += 1
+                else:
+                    stop = index
+            else:
+                stop = index
+            for number in range(index + 1, stop + 2):
+                if number <= len(lines):
+                    marked.add(number)
+            pending = False
+    return marked, True
+
+
+def in_test_path(path_str, test_only):
+    norm = path_str.replace("\\", "/")
+    parts = norm.split("/")
+    for i in range(len(parts) - 1):
+        if parts[i] in ("tests", "benches"):
+            return True
+    if path_str in test_only:
+        return True
+    try:
+        if str(Path(path_str).resolve()) in test_only:
+            return True
+    except OSError:
+        pass
+    return False
+
+
+REGIONS = {}
+
+
+def is_test_line(path_str, line_no, test_only):
+    """Sound test-code classification: test-only file or cfg(test) region."""
+    if in_test_path(path_str, test_only):
+        return True
+    if path_str not in REGIONS:
+        REGIONS[path_str] = cfg_test_regions(path_str)
+    marked, sound = REGIONS[path_str]
+    if not sound:
+        return False
+    return line_no in marked
+
+
+def is_test_line_upstream(path_str, line_no, test_only):
+    """Upstream ubs_core.rust_scan.Scan._is_test_line, unchanged."""
+    if in_test_path(path_str, test_only):
+        return True
+    boundary = test_boundary(path_str)
+    return boundary > 0 and line_no >= boundary
+
+
+def finding_line(item):
+    raw = item.get("line") or item.get("line_number") or item.get("line_start") or 0
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
+def finding_path(item):
+    return item.get("file") or item.get("path") or ""
+
+
+def finding_severity(item):
+    return (item.get("severity") or item.get("level") or "").lower()
+
+
+def finding_rule(item):
+    return item.get("rule") or item.get("rule_id") or item.get("id") or "?"
+
+
+def finding_message(item):
+    return (item.get("message") or item.get("title") or item.get("description") or "")
+
+
+def load_findings(path):
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            doc = json.load(handle)
+    except Exception:
+        return None
+    return doc.get("findings") or []
+
+
+def classify(findings, test_only):
+    excluded = []
+    production = []
+    upstream_excluded = []
+    for item in findings:
+        path = finding_path(item)
+        lang = (item.get("lang") or "").lower()
+        rust = lang == "rust" or path.endswith(".rs")
+        if rust and is_test_line_upstream(path, finding_line(item), test_only):
+            upstream_excluded.append(item)
+        if rust and is_test_line(path, finding_line(item), test_only):
+            excluded.append(item)
+        else:
+            production.append(item)
+    return excluded, production, upstream_excluded
+
+
+universe = repo_rust_files(repo_root)
+sys.path.insert(0, str(modules_dir / "helpers"))
+try:
+    from ubs_core.analyzers.cfg_test_only_rust import compute_test_only
+except Exception as exc:
+    print("gate: UBS delta could not load the upstream test-only classifier: %s" % exc)
+    sys.exit(3)
+try:
+    test_only_list = compute_test_only(universe)
+except Exception as exc:
+    print("gate: UBS delta test-only classification failed: %s" % exc)
+    sys.exit(3)
+test_only = set(test_only_list)
+for entry in test_only_list:
+    try:
+        test_only.add(str(Path(entry).resolve()))
+    except OSError:
+        pass
+
+# An include! target that the exclusion covers would silently drop
+# production code from the gate, so the exclusion must not cover one.
+included = set()
+for entry in universe:
+    try:
+        text = Path(entry).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        continue
+    for match in INCLUDE_RE.finditer(text):
+        try:
+            included.add(str((Path(entry).parent / match.group(1)).resolve()))
+        except OSError:
+            continue
+clash = sorted(included & test_only)
+if clash:
+    print("gate: UBS delta test exclusion would hide an include! target: %s" % ", ".join(clash[:5]))
+    sys.exit(3)
+print("UBS_DELTA_TEST_ONLY_FILES=%d (repo-wide reference universe of %d rust files)" % (
+    len(test_only_list), len(universe)))
+
+doc = json.load(open(delta_path, encoding="utf-8"))
+findings = doc.get("findings") or []
+totals = doc.get("totals") or {}
+status = doc.get("status")
+failed_modules = doc.get("failed_modules") or []
+excluded, production, upstream_excluded = classify(findings, test_only)
+blocking = [item for item in production if finding_severity(item) in BLOCKING]
+print("UBS_DELTA_NEW=%d critical=%s warning=%s info=%s" % (
+    len(findings), totals.get("critical", 0), totals.get("warning", 0), totals.get("info", 0)))
+print("UBS_DELTA_TEST_EXCLUDED=%d (test-only file or #[cfg(test)] region, rust only)" % len(excluded))
+print("UBS_DELTA_UPSTREAM_TEST_EXCLUDED=%d (upstream --exclude-tests boundary rule, for the win/lose split)" % len(upstream_excluded))
+print("UBS_DELTA_PRODUCTION_BLOCKING=%d" % len(blocking))
+upstream_only = [item for item in upstream_excluded if item not in excluded]
+print("UBS_DELTA_UPSTREAM_ONLY=%d (findings upstream --exclude-tests would drop that this gate keeps)" % len(upstream_only))
+for item in upstream_only[:50]:
+    print("UBS_DELTA_UPSTREAM_ONLY_FINDING=%s | %s:%s | %s" % (
+        finding_rule(item), finding_path(item), finding_line(item), finding_severity(item)))
+for item in excluded[:20]:
+    print("UBS_DELTA_TEST_EXCLUDED_FINDING=%s | %s:%s | %s" % (
+        finding_rule(item), finding_path(item), finding_line(item), finding_severity(item)))
+for item in blocking[:50]:
+    print("UBS_DELTA_FINDING=%s | %s:%s | %s | %s" % (
+        finding_rule(item), finding_path(item), finding_line(item), finding_severity(item),
+        finding_message(item).replace("\n", " ")[:200]))
+
+verdict = 1 if blocking else 0
+print("UBS_DELTA_VERDICT=%d" % verdict)
+
+# The control must survive the filter: the base file stays clean and the
+# planted production unwrap must be reported as a production finding, not
+# excluded as test code.
+if control_clean_path and control_planted_path:
+    clean_findings = load_findings(control_clean_path)
+    planted_findings = load_findings(control_planted_path)
+    if clean_findings is None or planted_findings is None:
+        print("gate: UBS delta control findings could not be read")
+        sys.exit(3)
+    clean_excluded, clean_production, _ = classify(clean_findings, test_only)
+    planted_excluded, planted_production, _ = classify(planted_findings, test_only)
+    clean_blocking = [item for item in clean_production if finding_severity(item) in BLOCKING]
+    planted_blocking = [item for item in planted_production if finding_severity(item) in BLOCKING]
+    clean_verdict = 1 if clean_blocking else 0
+    planted_verdict = 1 if planted_blocking else 0
+    print("UBS_DELTA_CONTROL_VERDICT=clean=%d planted=%d (clean_new=%d planted_new=%d)" % (
+        clean_verdict, planted_verdict, len(clean_findings), len(planted_findings)))
+    probe_lines = None
+    if control_probe_path and os.path.exists(control_probe_path):
+        raw = open(control_probe_path, encoding="utf-8").read().split()
+        if len(raw) == 2:
+            probe_lines = (int(raw[0]), int(raw[1]))
+    if probe_lines is not None:
+        probe = [item for item in planted_findings
+                 if probe_lines[0] <= finding_line(item) <= probe_lines[1]]
+        probe_excluded = [item for item in probe if item in planted_excluded]
+        print("UBS_DELTA_CONTROL_PROBE=lines %d-%d findings=%d excluded=%d" % (
+            probe_lines[0], probe_lines[1], len(probe), len(probe_excluded)))
+        if not probe:
+            print("gate: the planted production unwrap was not reported by the delta")
+            sys.exit(3)
+        if probe_excluded:
+            print("gate: the planted production unwrap was excluded as test code")
+            sys.exit(3)
+    if clean_verdict != 0 or planted_verdict != 1:
+        print("gate: the filtered delta must pass on the base file and fail on the planted unwrap")
+        sys.exit(3)
+
+if status != "ok" or failed_modules:
+    print("gate: UBS delta scan was partial (status=%s failed_modules=%s)" % (status, failed_modules))
+    sys.exit(2)
+sys.exit(verdict)
+PYSUM
+    echo "UBS_DELTA_SCANNER_EXIT=${delta_rc}"
+    echo "UBS_DELTA_EXIT=${filter_rc}"
+    return "$filter_rc"
+}
+
+if [ "${#VERIFY_UBS_FILES[@]}" -gt 0 ]; then
+    cd "$PROJECT_ROOT" || exit 1
+    run_ubs "${VERIFY_UBS_FILES[@]}"
+    exit $?
+fi
 
 # Every stage records its own exit code and preserves complete test output.
 lib_stage=""
@@ -521,7 +1171,7 @@ fi;"
     EXPECTED_STAGES+=(docs-build docs-binary-identity docs-truth)
 fi
 
-REMOTE_SCRIPT="$(declare -f test_log_counts run_tests run_fmt run_ubs prepare_compile_inputs)
+REMOTE_SCRIPT="$(declare -f test_log_counts run_tests run_fmt run_ubs ubs_delta_gate prepare_compile_inputs)
 set -o pipefail
 echo SOURCE_HEAD=${SOURCE_HEAD}
 prepare_compile_inputs '${SOURCE_PATHS}' '${SOURCE_CONTENT}' || exit 1

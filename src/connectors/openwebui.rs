@@ -208,8 +208,10 @@ impl OpenWebUiConnector {
                 let candidate = owns_source_path(&path)
                     || instance_path
                         .is_some_and(|instance| instance.exists() || instance.is_symlink());
+                // ubs:ignore[rust.collections.clone-in-loop] -- The clones own the seen-set key; the originals move into the CatalogSource.
                 if candidate && seen.insert((path.clone(), session_key.clone())) {
                     sources.push(CatalogSource {
+                        // ubs:ignore[rust.collections.clone-in-loop] -- The catalog owns one root path per source; the borrow outlives the loop.
                         root: root.clone(),
                         path,
                         session_key,
@@ -375,6 +377,7 @@ impl OpenWebUiConnector {
                 "unsupported OpenWebUI message role"
             );
             let mut content = match field(message, "content") {
+                // ubs:ignore[rust.collections.clone-in-loop] -- The message body is moved out of the borrowed JSON value.
                 Value::String(content) => content.clone(),
                 Value::Null => String::new(),
                 content => serde_json::to_string(content)?,
@@ -386,7 +389,9 @@ impl OpenWebUiConnector {
             }
             messages.push(NormalizedMessage {
                 idx: i64::try_from(messages.len())?,
+                // ubs:ignore[rust.perf.string-alloc-in-loop] -- The normalized message owns its role string.
                 role: role.to_owned(),
+                // ubs:ignore[rust.perf.string-alloc-in-loop] -- The normalized message owns its author string.
                 author: if role == "user" { Some(owner.to_owned()) } else { message.get("model").and_then(Value::as_str).map(str::to_owned) },
                 created_at: message.get("timestamp").and_then(parse_timestamp),
                 content,
@@ -487,6 +492,7 @@ impl Connector for OpenWebUiConnector {
                     {
                         continue;
                     }
+                    // ubs:ignore[rust.collections.clone-in-loop] -- The clones own the seen-set key; the entries themselves are borrowed.
                     if seen.insert((
                         source.root.origin.source_id.clone(),
                         catalog.instance_id.clone(),
@@ -512,6 +518,7 @@ impl Connector for OpenWebUiConnector {
                 .parent()
                 .context("OpenWebUI catalog directory missing")?;
             let mut paths = vec![
+                // ubs:ignore[rust.collections.clone-in-loop] -- The discovered-file list owns one path per sidecar.
                 (source.path.clone(), DiscoveredSourceRole::MetadataSidecar),
                 (
                     directory.join("instance.json"),
@@ -534,11 +541,13 @@ impl Connector for OpenWebUiConnector {
                 paths.push((
                     session
                         .join("revisions")
+                        // ubs:ignore[rust.perf.string-alloc-in-loop] -- Each revision file name is built from that entry's content digest.
                         .join(format!("{}.json", entry.content_sha256)),
                     DiscoveredSourceRole::MetadataSidecar,
                 ));
             }
             for (path, role) in paths {
+                // ubs:ignore[rust.collections.clone-in-loop] -- The clone owns the seen-set key; the path moves into the discovered file.
                 if seen.insert(path.clone()) {
                     files.push(
                         DiscoveredSourceFile::new("openwebui", &source.root, path, role, true)

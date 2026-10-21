@@ -76,6 +76,7 @@ impl SelectedContext {
                 Err(_) => state = "invalid",
             }
         }
+        // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing inserts the key and cannot panic.
         conversation.metadata["workspace_binding"] = json!({
             "state": state,
             "source": "native_conversation_summaries",
@@ -177,10 +178,12 @@ impl AntigravityConnector {
                 && let Some(conversation_dir) = Self::conversation_dir_for_transcript(&root.path)
             {
                 let path = conversation_dir.to_path_buf();
+                // ubs:ignore[rust.collections.clone-in-loop] -- The map owns one entry per rewritten conversation root.
                 original_roots.insert(path.clone(), root.path.clone());
                 root = root.with_path(path);
             }
             if Self::transcript_for_conversation(&root.path).is_file() {
+                // ubs:ignore[rust.collections.clone-in-loop] -- The clone owns the seen-set key; the root moves into the selection.
                 if seen.insert(root.path.clone()) {
                     selected.push(root);
                 }
@@ -202,7 +205,9 @@ impl AntigravityConnector {
                 if let Some(conversation_dir) = Self::conversation_dir_for_transcript(entry.path())
                 {
                     let path = conversation_dir.to_path_buf();
+                    // ubs:ignore[rust.collections.clone-in-loop] -- The clone owns the seen-set key; the path moves into the selection.
                     if seen.insert(path.clone()) {
+                        // ubs:ignore[rust.collections.clone-in-loop] -- The map owns the original root for this rewritten path.
                         original_roots.insert(path.clone(), root.path.clone());
                         selected.push(root.with_path(path));
                     }
@@ -263,6 +268,7 @@ impl Connector for AntigravityConnector {
         let mut discovered = self.inner.discover_source_files(&selected.scan)?;
         for source in &mut discovered {
             if let Some(original_root) = selected.original_roots.get(&source.scan_root) {
+                // ubs:ignore[rust.collections.clone-in-loop] -- The discovered source owns its rewritten scan root.
                 source.scan_root = original_root.clone();
             }
         }
@@ -273,12 +279,14 @@ impl Connector for AntigravityConnector {
         for root in &selected.scan.scan_roots {
             if let Some(database) = Self::summary_database(&root.path)
                 && database.is_file()
+                // ubs:ignore[rust.collections.clone-in-loop] -- The clone owns the seen-set key; the database path moves into the discovered file.
                 && seen.insert(database.clone())
             {
                 let original = selected
                     .original_roots
                     .get(&root.path)
                     .unwrap_or(&root.path);
+                // ubs:ignore[rust.collections.clone-in-loop] -- The rewritten root is owned by the discovered source.
                 let source_root = root.with_path(original.clone());
                 discovered.push(
                     DiscoveredSourceFile::new(

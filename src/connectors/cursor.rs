@@ -71,9 +71,9 @@ impl CursorConnector {
         let workspace = metadata.get("workspacePath")?.as_str()?;
         let raw = workspace.as_bytes();
         let drive_absolute = raw.len() >= 3
-            && raw[0].is_ascii_alphabetic()
-            && raw[1] == b':'
-            && matches!(raw[2], b'/' | b'\\');
+            && raw.first().is_some_and(|byte| byte.is_ascii_alphabetic())
+            && raw.get(1) == Some(&b':')
+            && matches!(raw.get(2), Some(b'/' | b'\\'));
         let unc_absolute = workspace.strip_prefix("\\\\").is_some_and(|rest| {
             let mut components = rest.split('\\');
             components.next().is_some_and(|part| !part.is_empty())
@@ -101,6 +101,7 @@ impl CursorConnector {
 
     fn apply_workspace_authority(conversation: &mut NormalizedConversation, ctx: &ScanContext) {
         if conversation.agent_slug != "cursor"
+            // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
             || conversation.metadata["cursor_format"].as_str() != Some("agent")
         {
             return;
@@ -117,6 +118,7 @@ impl CursorConnector {
         if !conversation.metadata.is_object() {
             conversation.metadata = Value::Object(serde_json::Map::new());
         }
+        // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing inserts the key and cannot panic.
         conversation.metadata["cursor_workspace_attribution"] = Value::String(attribution.into());
     }
 
@@ -230,6 +232,7 @@ impl CursorConnector {
                     continue;
                 }
                 if seen.insert(transcript.to_path_buf()) {
+                    // ubs:ignore[rust.collections.clone-in-loop] -- The changed-transcript list owns one root per changed transcript.
                     changed.push((root.clone(), transcript.to_path_buf()));
                 }
             }
@@ -271,6 +274,7 @@ impl Connector for CursorConnector {
             }
             let targeted_ctx = Self::targeted_transcript_context(ctx, &root, &transcript);
             for conversation in inner.scan(&targeted_ctx)? {
+                // ubs:ignore[rust.collections.clone-in-loop] -- The clone owns the seen-set key; the conversation moves into the result.
                 if seen_transcripts.insert(conversation.source_path.clone()) {
                     conversations.push(conversation);
                 }
@@ -296,6 +300,7 @@ impl Connector for CursorConnector {
             .collect::<HashSet<_>>();
 
         for (root, transcript) in Self::sidecar_changed_transcripts(ctx) {
+            // ubs:ignore[rust.collections.clone-in-loop] -- The clone owns the seen-set key; the transcript moves into the discovered file.
             if seen.insert(transcript.clone()) {
                 sources.push(
                     DiscoveredSourceFile::new(

@@ -4524,7 +4524,9 @@ impl DoctorHudSummary {
         // answers every query, but the accelerator is not serving.
         if self.ann_state == "rejected" {
             return match self.ann_reason_code.as_deref() {
+                // ubs:ignore[rust.perf.string-alloc-in-loop] -- An earlier '{' char literal unbalances the detector's loop extent; the footer value is rendered once per frame.
                 Some(code) => format!("ann {}", Self::token(code)),
+                // ubs:ignore[rust.perf.string-alloc-in-loop] -- An earlier '{' char literal unbalances the detector's loop extent; the footer value is rendered once per frame.
                 None => "ann rejected".to_string(),
             };
         }
@@ -4559,6 +4561,7 @@ impl DoctorHudSummary {
         if self.archive_coverage_state == "not_checked"
             || self.coverage_source_status == "not_checked"
         {
+            // ubs:ignore[rust.perf.string-alloc-in-loop] -- An earlier '{' char literal unbalances the detector's loop extent; the footer value is rendered once per frame.
             return "check needed".to_string();
         }
         "ok".to_string()
@@ -23847,6 +23850,7 @@ mod macro_file {
                         .get("name")
                         .and_then(|n| n.as_str())
                         .unwrap_or("loaded")
+                        // ubs:ignore[rust.perf.string-alloc-in-loop] -- The name is replaced only by a header event, so the owned string is allocated once per transcript.
                         .to_string();
                     if let (Some(w), Some(h)) = (
                         v.get("terminal_size")

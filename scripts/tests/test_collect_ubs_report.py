@@ -359,6 +359,7 @@ class CollectorControls(unittest.TestCase):
         result = self.run_cli(self.report())
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(result.stderr, "")
+        # ubs:ignore[py.parsing.json-loads-no-try,py.json.loads-no-try] -- The test asserts on the collector's JSON document; a parse failure must fail the test loudly.
         document = json.loads(result.stdout)
         self.assertEqual(document["native_exit_code"], 1)
         self.assertEqual(document["qualification_gate"], "HOLD")
@@ -370,6 +371,7 @@ class CollectorControls(unittest.TestCase):
             with self.subTest(receipt=receipt):
                 result = self.run_cli(self.report(), receipt)
                 self.assertEqual(result.returncode, 2, result.stderr)
+                # ubs:ignore[py.parsing.json-loads-no-try,py.json.loads-no-try] -- The test asserts on the collector's JSON document; a parse failure must fail the test loudly.
                 document = json.loads(result.stdout)
                 self.assertEqual(document["qualification_gate"], "HOLD")
                 self.assertFalse(document["qualifies_native_gate"])
@@ -378,6 +380,7 @@ class CollectorControls(unittest.TestCase):
         receipt["source_checks_after"].append(dict(receipt["source_checks_after"][0]))
         result = self.run_cli(report, receipt)
         self.assertEqual(result.returncode, 2, result.stderr)
+        # ubs:ignore[py.parsing.json-loads-no-try,py.json.loads-no-try] -- The test asserts on the collector's JSON document; a parse failure must fail the test loudly.
         self.assertIn("duplicate source pins", json.loads(result.stdout)["error"])
 
     def test_cli_unconserved_receipt_pins_are_not_accepted(self) -> None:
@@ -386,6 +389,7 @@ class CollectorControls(unittest.TestCase):
         receipt["source_checks_after"][0]["current_sha256"] = "0" * 64
         result = self.run_cli(report, receipt)
         self.assertEqual(result.returncode, 2, result.stderr)
+        # ubs:ignore[py.parsing.json-loads-no-try,py.json.loads-no-try] -- The test asserts on the collector's JSON document; a parse failure must fail the test loudly.
         self.assertIn("does not conserve", json.loads(result.stdout)["error"])
 
 

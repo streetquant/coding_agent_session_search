@@ -1282,6 +1282,16 @@ impl std::error::Error for IndexInterrupted {}
 #[error("one or more watch source scans failed; completed conversations were retained")]
 pub(crate) struct ConnectorScanFailure(#[source] anyhow::Error);
 
+/// A persisted conversation index pointed past the loaded conversation set.
+/// The index travels in the error so the message is rendered only when the
+/// failure is reported, and the persistence loop allocates nothing per
+/// conversation on the way there.
+#[derive(Debug, thiserror::Error)]
+#[error("persisted conversation index {index} is out of range")]
+pub(crate) struct PersistedConversationIndexOutOfRange {
+    pub(crate) index: usize,
+}
+
 impl IndexingProgress {
     pub fn request_stop(&self) {
         self.stop_requested.store(true, Ordering::Release);
@@ -30778,6 +30788,7 @@ pub fn conversation_ingest_quarantine_summary(
             Ok(contents) => contents,
             Err(error) => {
                 if state_error.is_none() {
+                    // ubs:ignore[rust.perf.string-alloc-in-loop] -- The guard keeps the first failure's message, so the string is formatted once.
                     state_error = Some(format!(
                         "reading quarantine file {}: {error}",
                         path.display()
@@ -30795,6 +30806,7 @@ pub fn conversation_ingest_quarantine_summary(
                 Ok(value) => value,
                 Err(error) => {
                     if state_error.is_none() {
+                        // ubs:ignore[rust.perf.string-alloc-in-loop] -- The guard keeps the first malformed record's message, so the string is formatted once.
                         state_error = Some(format!(
                             "malformed quarantine record in {}: {error}",
                             path.display()
@@ -35136,7 +35148,10 @@ pub fn apply_workspace_rewrite(conv: &mut NormalizedConversation, root: &ScanRoo
 pub mod persist {
     #[cfg(test)]
     use super::WatchLexicalTestFault;
-    use super::{LexicalPopulationStrategy, lexical_population_strategy_requires_inline_tantivy};
+    use super::{
+        LexicalPopulationStrategy, PersistedConversationIndexOutOfRange,
+        lexical_population_strategy_requires_inline_tantivy,
+    };
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::ops::Range;
     use std::path::Path;
@@ -35603,6 +35618,7 @@ pub mod persist {
     ) -> Result<HashMap<i64, i64>> {
         let mut resolved_ids = HashMap::new();
         for indices in inserted_indices.chunks(128) {
+            // ubs:ignore[rust.perf.string-alloc-in-loop] -- The statement prefix is allocated once per 128-row chunk, not once per row.
             let mut sql = String::from(
                 "SELECT id, idx FROM messages WHERE conversation_id = ?1 AND idx IN (",
             );
@@ -36716,7 +36732,9 @@ pub mod persist {
         let mut rebuilt_conversation_ids = HashSet::new();
         let mut skip_inline_lexical_updates = false;
         for (idx, outcome) in ordered {
-            let internal_conv = &internal_convs[idx];
+            let internal_conv = internal_convs
+                .get(idx)
+                .ok_or(PersistedConversationIndexOutOfRange { index: idx })?;
             batch_outcome.record_insert_outcome(&outcome);
             if defer_lexical_updates || skip_inline_lexical_updates {
                 if capture_semantic_delta {

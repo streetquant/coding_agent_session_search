@@ -325,9 +325,15 @@ fn main() -> anyhow::Result<()> {
                 coding_agent_search::indexer::FINAL_WAL_CHECKPOINT_WORKER_ARG
             );
         }
-        let db_path = std::path::Path::new(&raw_args[2]);
+        let (Some(db_arg), Some(context_arg)) = (raw_args.get(2), raw_args.get(3)) else {
+            anyhow::bail!(
+                "{} requires exactly a database path and checkpoint context",
+                coding_agent_search::indexer::FINAL_WAL_CHECKPOINT_WORKER_ARG
+            );
+        };
+        let db_path = std::path::Path::new(db_arg);
         let worker_result =
-            coding_agent_search::indexer::run_final_wal_checkpoint_worker(db_path, &raw_args[3]);
+            coding_agent_search::indexer::run_final_wal_checkpoint_worker(db_path, context_arg);
         // Release any cached synchronous bridge runtimes even when opening or
         // checkpointing the worker DB fails, before the process tears down.
         let _ = coding_agent_search::shutdown_thread_local_bridge_runtimes();

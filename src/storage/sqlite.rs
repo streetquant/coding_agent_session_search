@@ -8272,10 +8272,14 @@ fn provider_workspace_attribution_is_authoritative(
     if provider_workspace_is_authoritative(agent_slug, workspace, metadata) {
         return true;
     }
+    // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
     let binding = &metadata["workspace_binding"];
     agent_slug == "antigravity"
+        // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
         && binding["source"] == "native_conversation_summaries"
+        // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
         && binding["native_conversation_id"].as_str() == Some(external_id)
+        // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
         && match binding["state"].as_str() {
             Some("bound") => workspace.is_some_and(Path::is_absolute),
             Some("missing" | "ambiguous" | "invalid") => workspace.is_none(),
@@ -8297,13 +8301,19 @@ fn franken_reconcile_native_snapshot_provenance(
     };
     let matches_identity = |metadata: &serde_json::Value| match conv.agent_slug.as_str() {
         "opencode" => {
+            // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
             metadata["harness"] == "opencode2"
+                // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
                 && metadata["native_format"] == "session_v2/session_message"
+                // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
                 && metadata["native_session_id"].as_str() == Some(native_id)
         }
         "cloudmcp" => {
+            // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
             metadata["source"] == "cloudmcp"
+                // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
                 && metadata["schema_version"] == "cloudmcp.conversation-manifest.v1"
+                // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
                 && metadata["conversation_id"].as_str() == Some(native_id)
         }
         _ => false,
@@ -8311,6 +8321,7 @@ fn franken_reconcile_native_snapshot_provenance(
     if !matches_identity(&conv.metadata_json) {
         return Ok(());
     }
+    // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
     let Some(content_hash) = conv.metadata_json["content_hash"]
         .as_str()
         .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
@@ -8333,6 +8344,7 @@ fn franken_reconcile_native_snapshot_provenance(
     if external_id != conv.external_id
         || source_path != path_to_string(&conv.source_path)
         || !matches_identity(&metadata)
+        // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
         || metadata["content_hash"].as_str() == Some(content_hash)
     {
         return Ok(());
@@ -8361,6 +8373,7 @@ fn franken_reconcile_native_snapshot_provenance(
     if matches.len() != conv.messages.len() || !matches.into_iter().all(|matched| matched) {
         return Ok(());
     }
+    // ubs:ignore[rust.panic.direct-indexing] -- The identity match above proved the stored metadata is a JSON object, so the key insert cannot panic.
     metadata["content_hash"] = serde_json::Value::String(content_hash.to_owned());
     if conv.agent_slug == "cloudmcp" {
         // The verified manifest and transcript describe the same complete
@@ -17463,6 +17476,7 @@ impl FrankenStorage {
                 snapshot_conv,
                 &mut codebuff_revisions,
             )?;
+            // ubs:ignore[rust.panic.direct-indexing] -- The reconcile call only pushes revisions, so the recorded start index stays inside the vector.
             let revised_indices: Vec<_> = codebuff_revisions[revision_start..]
                 .iter()
                 .map(|revision| revision.message.idx)

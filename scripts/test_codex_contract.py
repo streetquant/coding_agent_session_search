@@ -209,6 +209,7 @@ pub mod connectors {
             *(str(root / f"tests/{test}.rs") for test in tests),
         ]
         print("+ " + " ".join(command), flush=True)
+        # ubs:ignore[python.taint.command] Fixed rustfmt argv with shell=False; env supplies toolchain configuration.
         subprocess.run(command, cwd=root, env=env, check=True, timeout=120)
 
 

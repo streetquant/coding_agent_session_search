@@ -42,7 +42,7 @@ def running_executables(path: Path) -> list[int]:
 
 
 def fsync_directory(directory: Path) -> None:
-    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)  # ubs:ignore[py.io.open-missing-with] -- os.open returns a raw fd, not a file object; the finally block closes it.
     try:
         os.fsync(fd)
     finally:
@@ -64,12 +64,18 @@ def install(source: Path, directory: Path, name: str, bootstrap_regular: bool) -
             raise ValueError("regular destination requires --bootstrap-regular while idle")
         if directory.resolve() == Path("/warp/codex/runtime/codex-memory-hub").resolve():
             for unit in ("cass-incremental.timer", "cass-incremental.service"):
-                state = subprocess.run(
-                    ["systemctl", "--user", "is-active", unit],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                ).stdout.strip()
+                try:
+                    state = subprocess.run(
+                        ["systemctl", "--user", "is-active", unit],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=30,
+                    ).stdout.strip()
+                except subprocess.TimeoutExpired as error:
+                    raise ValueError(
+                        f"systemctl --user is-active {unit} did not answer within 30s"
+                    ) from error
                 if state in {"active", "activating", "reloading"}:
                     raise ValueError(f"stop {unit} before converting a regular destination")
         owners = running_executables(link)
@@ -80,6 +86,7 @@ def install(source: Path, directory: Path, name: str, bootstrap_regular: bool) -
         try:
             os.link(link, previous_target)
         except FileExistsError:
+            # ubs:ignore[python.ctcompare.secret_eq] Comparing a public SHA-256 file digest for integrity, not a secret.
             if previous_target.is_symlink() or digest(previous_target) != previous_digest:
                 raise ValueError("retained previous target has the wrong digest") from None
     elif link.is_symlink():
@@ -93,6 +100,7 @@ def install(source: Path, directory: Path, name: str, bootstrap_regular: bool) -
     source_digest = digest(source)
     target = directory / f"{name}.sha256-{source_digest}"
     if target.exists():
+        # ubs:ignore[python.ctcompare.secret_eq] Comparing a public SHA-256 file digest for integrity, not a secret.
         if target.is_symlink() or not target.is_file() or digest(target) != source_digest:
             raise ValueError("immutable target has the wrong digest")
         if not os.access(target, os.X_OK):
@@ -105,11 +113,13 @@ def install(source: Path, directory: Path, name: str, bootstrap_regular: bool) -
                 os.fchmod(output_file.fileno(), 0o755)
                 output_file.flush()
                 os.fsync(output_file.fileno())
+            # ubs:ignore[python.ctcompare.secret_eq] Comparing a public SHA-256 file digest for integrity, not a secret.
             if digest(staged) != source_digest:
                 raise ValueError("staged binary digest differs from source")
             try:
                 os.link(staged, target)
             except FileExistsError:
+                # ubs:ignore[python.ctcompare.secret_eq] Comparing a public SHA-256 file digest for integrity, not a secret.
                 if digest(target) != source_digest:
                     raise ValueError("immutable target has the wrong digest") from None
         finally:
@@ -129,6 +139,7 @@ def install(source: Path, directory: Path, name: str, bootstrap_regular: bool) -
     fsync_directory(directory)
     if not link.is_symlink() or os.readlink(link) != target.name:
         raise RuntimeError("installed pointer does not reference the verified target")
+    # ubs:ignore[python.ctcompare.secret_eq] Comparing a public SHA-256 file digest for integrity, not a secret.
     if digest(link) != source_digest:
         raise RuntimeError("installed pointer does not resolve to source bytes")
     return {

@@ -22193,6 +22193,7 @@ fn add_index_final_wal_checkpoint_payload(
     payload: &mut serde_json::Value,
     progress: &indexer::IndexingProgress,
 ) {
+    // ubs:ignore[rust.panic.direct-indexing] -- Both callers build the payload as a JSON object, so the key insert cannot panic.
     payload["final_wal_checkpoint"] = progress
         .final_wal_checkpoint_report()
         .and_then(|report| serde_json::to_value(report).ok())
@@ -122206,7 +122207,7 @@ fn run_timeline(
 ) -> CliResult<()> {
     use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt, TransactionExt};
     use crate::sources::provenance::SourceFilter;
-    use chrono::{Local, TimeZone, Utc};
+    use chrono::{Local, NaiveDateTime, TimeZone, Utc};
     use std::collections::HashMap;
 
     let agents = normalize_agent_filters(agents)?;
@@ -122216,10 +122217,11 @@ fn run_timeline(
 
     let now = Local::now();
     let (start_ts, end_ts) = if today {
-        let start_of_day = now
-            .date_naive()
-            .and_hms_opt(0, 0, 0)
-            .expect("valid start of day");
+        // Midnight is a valid time for every date, so the truncation cannot
+        // fail. The fallback keeps the same day without a panic path.
+        let today_date = now.date_naive();
+        let midnight = NaiveDateTime::from(today_date);
+        let start_of_day = today_date.and_hms_opt(0, 0, 0).unwrap_or(midnight);
         let local_start = match Local.from_local_datetime(&start_of_day) {
             chrono::LocalResult::Single(dt) => dt,
             chrono::LocalResult::Ambiguous(dt, _) => dt,
