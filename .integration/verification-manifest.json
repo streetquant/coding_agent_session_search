@@ -1,0 +1,374 @@
+{
+  "commands": [
+    {
+      "allow_worktree_change": false,
+      "argv": [
+        "git", "diff", "--check"
+      ],
+      "category": "tests",
+      "cwd": ".",
+      "env": {},
+      "expected_exit_code": 0,
+      "id": "baseline-focused",
+      "phase": "baseline",
+      "required": true,
+      "timeout_sec": 900
+    },
+    {
+      "allow_worktree_change": false,
+      "argv": [
+        "git", "diff", "--check"
+      ],
+      "category": "tests",
+      "cwd": ".",
+      "env": {},
+      "expected_exit_code": 0,
+      "id": "final-focused",
+      "phase": "final",
+      "required": true,
+      "timeout_sec": 900
+    },
+    {
+      "allow_worktree_change": false,
+      "argv": [
+        "bash", "scripts/gate.sh", "--local", "--lib-filter",
+        "field_mask_resolution_tests",
+        "--integration",
+        "spec_robot_docs_topics,e2e_lexical_fail_open,cli_view_budget",
+        "--ubs-files",
+        "src/recipes_robot_docs.rs,tests/spec_robot_docs_topics.rs,tests/e2e_lexical_fail_open.rs,README.md,SKILL.md,tests/golden/robot_docs/recipes.txt.golden"
+      ],
+      "category": "regression",
+      "cwd": ".",
+      "env": {
+        "PATH": "/home/arch/.cargo/bin:/usr/bin:/home/arch/.npm-global/bin:/home/arch/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/bin",
+        "CARGO_BUILD_JOBS": "4",
+        "GATE_BUILD_JOBS": "4",
+        "GATE_UBS_TIMEOUT_SECS": "1800",
+        "GATE_UBS_MODULE_SEED_DIR": "/warp/projects/softwares/cass/.local-state/t01a15ab7/cass-gate-ubs.90Hwc0/modules",
+        "GATE_TARGET_DIR": "/warp/projects/softwares/cass/.local-state/upstream-integration-01a15ab7/target",
+        "TMPDIR": "/warp/projects/softwares/cass/.local-state/t01a15ab7",
+        "GATE_RECEIPT_FILE": "/warp/projects/softwares/cass/.local-state/upstream-integration-01a15ab7/gate-local-r19.receipt"
+      },
+      "expected_exit_code": 0,
+      "id": "final-full",
+      "phase": "final",
+      "required": true,
+      "timeout_sec": 7200
+    }
+  ],
+  "repository_head_at_creation": "3254b9701105ccd3808bfa2c424cedc10e597a0e",
+  "schema_version": "1.3",
+  "state_artifacts": [
+    {
+      "id": "feature-map",
+      "path": ".integration/feature-map.json",
+      "required_phases": [
+        "baseline",
+        "final"
+      ]
+    },
+    {
+      "id": "spec-ledger",
+      "path": ".integration/spec-ledger.json",
+      "required_phases": [
+        "baseline",
+        "final"
+      ]
+    },
+    {
+      "id": "spec-baseline",
+      "path": ".integration/spec-baseline.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "reference-lock",
+      "path": ".integration/reference-lock.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "differential-report",
+      "path": ".integration/differential-report.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "architecture-map",
+      "path": ".integration/architecture-map.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "impact-plan",
+      "path": ".integration/impact-plan.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "oracle-audit",
+      "path": ".integration/oracle-audit.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "quality-report",
+      "path": ".integration/quality-report.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "br-bv-probe",
+      "path": ".integration/br-bv-probe.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "execution-state",
+      "path": ".integration/execution-state.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "validation-contrast",
+      "path": ".integration/validation-contrast.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "counterexample-report",
+      "path": ".integration/counterexample-report.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "environment-baseline",
+      "path": ".integration/environment-baseline.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "environment-report",
+      "path": ".integration/environment-report.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "execution-policy",
+      "path": ".integration/execution-policy.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "validation-contrast-contract",
+      "path": ".integration/validation-contrast-contract.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "counterexample-pack",
+      "path": ".integration/counterexample-pack.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "environment-policy",
+      "path": ".integration/environment-policy.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "diagnosis-contract",
+      "path": ".integration/diagnosis-contract.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "diagnosis-baseline",
+      "path": ".integration/diagnosis-baseline.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "diagnosis-report",
+      "path": ".integration/diagnosis-report.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "implementation-trace",
+      "path": ".integration/implementation-trace.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "plan-reconciliation",
+      "path": ".integration/plan-reconciliation.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "upstream-evidence-policy",
+      "path": ".integration/upstream-evidence-policy.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "upstream-evidence-mapping",
+      "path": ".integration/upstream-evidence-mapping.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "upstream-evidence-report",
+      "path": ".integration/upstream-evidence-report.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "context-portfolio-policy",
+      "path": ".integration/context-portfolio-policy.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "context-portfolio",
+      "path": ".integration/context-portfolio.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "nonfunctional-policy",
+      "path": ".integration/nonfunctional-policy.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "nonfunctional-report",
+      "path": ".integration/nonfunctional-report.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "contract-policy",
+      "path": ".integration/contract-policy.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "contract-report",
+      "path": ".integration/contract-report.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "state-evolution-policy",
+      "path": ".integration/state-evolution-policy.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "state-evolution-report",
+      "path": ".integration/state-evolution-report.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "generated-artifact-policy",
+      "path": ".integration/generated-artifact-policy.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "generated-artifact-report",
+      "path": ".integration/generated-artifact-report.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "requirement-recovery-policy",
+      "path": ".integration/requirement-recovery-policy.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "requirement-recovery-baseline",
+      "path": ".integration/requirement-recovery-baseline.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "requirement-recovery-report",
+      "path": ".integration/requirement-recovery-report.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "change-coverage-policy",
+      "path": ".integration/change-coverage-policy.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "change-coverage-report",
+      "path": ".integration/change-coverage-report.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "change-necessity-policy",
+      "path": ".integration/change-necessity-policy.json",
+      "required_phases": [
+        "final"
+      ]
+    },
+    {
+      "id": "change-necessity-report",
+      "path": ".integration/change-necessity-report.json",
+      "required_phases": [
+        "final"
+      ]
+    }
+  ]
+}

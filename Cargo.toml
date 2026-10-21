@@ -1,6 +1,6 @@
 [package]
 name = "coding-agent-search"
-version = "0.8.0"
+version = "0.10.0"
 edition = "2024"
 authors = ["Jeffrey Emanuel"]
 description = "Unified TUI search over local coding agent histories"
@@ -21,11 +21,13 @@ include = [
 ]
 
 [dependencies]
+# Resident-memory supervision reuses the sysinfo version already in Cargo.lock.
+sysinfo = { version = "*", default-features = false, features = ["system"] }
 anyhow = "1.0.102"
 thiserror = "2.0.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "ansi", "json"] }
-asupersync = { version = "=0.4.10", features = ["test-internals", "tls-native-roots"] }
+asupersync = { version = "=0.5.0", features = ["test-internals", "tls-native-roots"] }
 clap = { version = "4.6.1", features = ["derive", "cargo", "env", "unicode", "wrap_help"] }
 clap_complete = "4.6.5"
 clap_mangen = "0.3.0"
@@ -77,11 +79,34 @@ notify = "8.2.0"
 # and prepared-read schema-retry transaction cleanup. 0.3.18 adds parameterized
 # rowid IN-list seeks (GH#415/cass#382), mutation-free read-only WAL readers,
 # reader-registration error propagation and I/O buffer lifetime fixes.
-# The async API and asupersync requirement remain unchanged.
-frankensqlite = { version = "=0.3.18", package = "fsqlite", features = ["fts5", "async-api"] }
+# 0.4.1 adds GH#462's reserved-page WAL freelist repair and consumes the
+# Asupersync 0.5 runtime. The 0.4.2 candidate adds explicit derived WAL-index
+# recovery for read-only opens (GH#477). The published 0.4.4 family adds
+# durable pending-freelist repairs. 0.4.6 stops a live B-tree page from being
+# freed and granted again across a WAL generation (bd-b5vmw: integrity_check's
+# "page N is referenced multiple times") and fixes a lost-index-entry race
+# (bd-11sz4). 0.4.7 keeps index entries whole in large multi-row INSERTs
+# (register writes past 65,535 were dropped: bd-2eebi), fixes the serialized
+# DDL index race (bd-4iaoi), lets the deferred-FTS5 repair open bind a missing
+# shadow autoindex (GH#503), caps the shared page plane (5s1la) and stops a
+# connection's first sqlite_master query from reading the whole file (k2k20).
+# 0.4.7 also made strict read-only opens spend ~30 s on a stale WAL index, so
+# CASS skipped it. 0.4.9 (replacing the withdrawn 0.4.8) refuses that stale
+# index promptly again (48c6cf6b2) and lets the first write after stock
+# SQLite's empty, unindexed WAL index establish the WAL generation instead of
+# failing BusyRecovery on every later commit (GH#443 / cass#509, 4b48c95d8).
+# 0.4.12 carries the 0.4.10 data-integrity advisory fix (an explicit
+# transaction's inserts appended through a stale retained right-edge leaf and
+# corrupted the table b-tree: bd-obwsy), ROLLBACK returning the AUTOINCREMENT
+# rowids it reserved (bd-gwoit), reading a WAL a stock writer truncated to zero
+# bytes as empty (bd-yxqs9, cass GH#519), and index seeks for IN lists and
+# k = ? ORDER BY id (GH#497/#498).
+# All family packages use 0.4.12 and build.rs checks each resolved package
+# exactly.
+frankensqlite = { version = "=0.4.12", package = "fsqlite", features = ["fts5", "async-api"] }
 # The production storage-integrity probe calls FrankenSQLite's public VFS API
 # directly so it can inspect native writer locks without opening the pager.
-fsqlite-types = { version = "=0.3.18", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.4.12", package = "fsqlite-types" }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
@@ -101,7 +126,10 @@ ftui = { version = "=0.5.0" }
 ftui-runtime = { version = "=0.5.0", features = ["native-backend", "crossterm-compat"] }
 ftui-tty = { version = "=0.5.0" }
 ftui-extras = { version = "=0.5.0", default-features = false, features = ["markdown", "syntax", "charts", "canvas", "theme", "clipboard", "clipboard-fallback", "export", "visual-fx", "forms", "validation", "help"] }
-dirs = "6.0.0"
+dirs = "7.0.0"
+# Canonical paths without Windows' verbatim `\\?\` prefix where the plain
+# spelling names the same file (source identities, 9v9xi).
+dunce = "1.0.5"
 walkdir = "2.5.0"
 glob = "0.3.3"
 base64 = ">=0.21"
@@ -128,14 +156,21 @@ bytemuck = "1.25.0"
 # not run the all-MiniLM LayerNorm export, and its prebuilt AVX/AVX2 vendor
 # binaries crashed pre-AVX2 CPUs at static init (#256/#307). No ONNX means no
 # AVX-static-init hazard and no separate `-baseline` artifact is needed.
-# Registry pin (gh#453): 0.4.3 clocks retired-segment collection from each
-# receipt, so subsequent publication cannot indefinitely postpone reclamation.
-# Quill 0.2.3 uses Cx::is_cancelled from asupersync 0.4.10. It preserves
-# 0.4.2's opt-in multilingual space and the Windows Quill publication line;
-# registry 0.3.2 was a stale same-version twin and must never be resolved.
-frankensearch = { version = "=0.4.3", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
-# franken-agent-detection 0.2.4 includes the legacy Copilot CLI workspacePath alias.
-franken-agent-detection = { version = "=0.2.4", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes", "devin"] }
+# 0.7.1 (quill 0.4.0) keeps the CASS schema hash (v9-quill, no rebuild) and
+# carries the standard CASS Boolean grammar, the union seek_danger fix and the
+# GH #499 live-doc numeric scoring that the 0.3.4 hotfix published, plus
+# concurrent segment verification on open (GH #501), snippets only for
+# returned hits, and a read-only refresh that skips the reopen when nothing
+# was published.
+frankensearch = { version = "=0.7.1", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
+# Native OpenClaw transcripts and legacy VS Code Copilot sessions require SQLite.
+# Keep both readers unconditional, including --no-default-features builds.
+# codex-zstd reads Codex rollouts compressed to .jsonl.zst (GH #513).
+# pi-durable reads Pi durable-harness SQLite stores (FAD #28); pi-sqlite reads
+# pi_agent_rust SQLite sessions.
+# GH#520 needs remote-mirror source identity, added after crates.io 0.3.10.
+# Pin the exact fix until it is included in a published registry release.
+franken-agent-detection = { version = "=0.3.10", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "6b337ba434b72c65c6c5a748b7ec47885f840ac0", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes", "devin", "shelley", "grok-bot", "openclaw-sqlite", "copilot-vscdb", "codebuff", "codex-zstd", "pi-durable", "pi-sqlite"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
@@ -172,6 +207,10 @@ unicode-width = "0.2.2"
 # macOS keychain access (optional, for ChatGPT decryption)
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7.0"
+# SO_NOSIGPIPE on the clipboard socket pair: macOS has no MSG_NOSIGNAL, so a
+# write after the clipboard tool exits would raise SIGPIPE. Already built (with
+# "all") for asupersync, so this adds no crate.
+socket2 = { version = "0.6.5", features = ["all"] }
 
 # Statically link OpenSSL into Unix release binaries so they do not require a
 # matching system libssl. Windows builds use platform TLS/crypto stacks through
@@ -209,6 +248,7 @@ strict-path-dep-validation = []
 cass-layer-b-conformance = []
 
 [build-dependencies]
+blake3 = "1.8.5"
 vergen = { version = "10.0.0", default-features = false, features = ["build", "cargo"] }
 toml = "1.1.2"
 
@@ -224,15 +264,21 @@ arbitrary = { version = "1", features = ["derive"] }
 serde_yaml = "0.9.34"
 rand = "0.10"
 rand_chacha = "0.10"
+# GH513 writes rollouts the way Codex compresses them; production reads them
+# through franken-agent-detection's codex-zstd feature.
+zstd = { version = "0.13", default-features = false }
+# GH470 measures native model input tokens without padding or silent truncation.
+# Reuse the tokenizer and regex backend already resolved by native MiniLM.
+tokenizers = { version = "*", default-features = false, features = ["fancy-regex"] }
 # rusqlite is retained only for C-SQLite interop fixtures in tests; production
 # storage and historical salvage paths use frankensqlite.
 rusqlite = { version = "0.40.2", features = ["bundled", "modern_sqlite"] }
 # The manifest-policy build gate requires this explicit dev entry for compat
 # fixture assertions, even though production also uses the same pinned crate.
-fsqlite-types = { version = "=0.3.18", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.4.12", package = "fsqlite-types" }
 
-# The fsqlite family resolves from the exact registry version for every direct
-# and transitive consumer. build.rs enforces a single 0.3.18 family source.
+# The fsqlite family resolves from exact reviewed registry versions for every
+# direct and transitive consumer. build.rs rejects duplicates and mixed sources.
 
 [[bin]]
 name = "cass"
@@ -291,9 +337,9 @@ inherits = "release"
 debug = "line-tables-only"
 strip = false
 
-# The dependency graph is pinned to the asupersync 0.4.x line (0.4.10). Keep
+# The dependency graph is pinned to the asupersync 0.5.x line (0.5.0). Keep
 # the frankensqlite, frankensearch, and franken-agent-detection registry pins
-# aligned so Cargo.lock does not reintroduce a parallel asupersync 0.3.x stack.
+# aligned so Cargo.lock does not reintroduce an older parallel runtime stack.
 #
 # If you need to build against a local checkout of asupersync (sibling
 # at ../asupersync) during runtime-level hacking, add the following

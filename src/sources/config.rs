@@ -323,6 +323,14 @@ fn validate_source_name(name: &str) -> Result<(), ConfigError> {
         ));
     }
 
+    // Source names become mirror-directory components on every platform.
+    // Windows drive-relative prefixes such as C: discard the base on join.
+    if name.contains(':') {
+        return Err(ConfigError::Validation(
+            "Source name cannot contain ':'".into(),
+        ));
+    }
+
     if has_dot_components(Path::new(name)) {
         return Err(ConfigError::Validation(
             "Source name cannot be '.' or '..'".into(),
@@ -413,7 +421,7 @@ pub(crate) fn validate_optional_user_host_shape(host: &str) -> Result<(), String
 }
 
 /// Sync schedule for remote sources.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum SyncSchedule {
     /// Only sync when explicitly requested.
@@ -777,7 +785,7 @@ pub fn discover_fleet_hosts(tailscale: bool) -> (Vec<DiscoveredHost>, Option<Str
     if !tailscale {
         return (hosts, None);
     }
-    let result = (|| -> anyhow::Result<()> {
+    let result = (|| -> anyhow::Result<usize> {
         let mut command = std::process::Command::new("tailscale");
         command
             .args(["status", "--json"])
@@ -788,9 +796,12 @@ pub fn discover_fleet_hosts(tailscale: bool) -> (Vec<DiscoveredHost>, Option<Str
         let child = command
             .spawn()
             .context("could not start tailscale status")?;
-        let output =
-            super::wait_for_child_output_with_timeout(child, std::time::Duration::from_secs(5))?
-                .context("tailscale status timed out after 5 seconds")?;
+        let output = super::wait_for_child_output_with_limit(
+            child,
+            std::time::Duration::from_secs(5),
+            Some(8 * 1024 * 1024),
+        )?
+        .context("tailscale status timed out after 5 seconds")?;
         // Do not echo raw status/stderr: it can contain tailnet account data.
         anyhow::ensure!(
             output.status.success(),
@@ -798,15 +809,20 @@ pub fn discover_fleet_hosts(tailscale: bool) -> (Vec<DiscoveredHost>, Option<Str
         );
         merge_tailscale_hosts(&mut hosts, &output.stdout)
     })();
-    (
-        hosts,
-        result
-            .err()
-            .map(|error| format!("Tailscale discovery unavailable: {error}")),
-    )
+    let warning = match result {
+        Ok(0) => None,
+        Ok(skipped) => Some(format!(
+            "Tailscale discovery skipped {skipped} peer(s) whose IP addresses conflict with SSH aliases; \
+             configure an unambiguous SSH alias for each intended machine."
+        )),
+        Err(error) => Some(format!("Tailscale discovery unavailable: {error}")),
+    };
+    (hosts, warning)
 }
 
-fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyhow::Result<()> {
+/// Merge status into candidates freshly read from SSH configuration.
+/// Returns the number of peers whose direct IP target conflicts with an alias.
+fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyhow::Result<usize> {
     #[derive(Deserialize)]
     #[serde(rename_all = "PascalCase")]
     struct Status {
@@ -822,9 +838,11 @@ fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyho
         #[serde(default, rename = "DNSName")]
         dns_name: String,
         #[serde(default, rename = "TailscaleIPs")]
-        addresses: Vec<std::net::IpAddr>,
+        addresses: Option<Vec<std::net::IpAddr>>,
         #[serde(default)]
         sharee_node: bool,
+        #[serde(default)]
+        tags: Option<Vec<String>>,
     }
     anyhow::ensure!(
         bytes.len() <= 8 * 1024 * 1024,
@@ -835,41 +853,95 @@ fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyho
         status.backend_state == "Running",
         "Tailscale is not running; check local login and daemon status"
     );
-    for peer in status.peer.unwrap_or_default().into_values() {
+    // Removing a candidate does not remove its Host stanza from SSH config.
+    // Reserve the original names before pruning so a peer's numeric address
+    // cannot recreate an excluded alias and be redirected to that provider.
+    let reserved_names: HashSet<_> = hosts.iter().map(|host| host.name.clone()).collect();
+    let mut shadowed_peers = 0;
+    // GH505: Mullvad peers are provider WireGuard endpoints, not SSH hosts.
+    // Tags may be absent/null in status JSON. The provider DNS suffix is
+    // also used by Tailscale itself (cmd/tailscale/cli/status.go and
+    // wgengine/magicsock); match a full label boundary, not a substring.
+    // Location and ExitNode/ExitNodeOption alone do not identify Mullvad:
+    // ordinary tailnet machines can have those fields and still run SSH.
+    let (providers, peers): (Vec<_>, Vec<_>) = status
+        .peer
+        .unwrap_or_default()
+        .into_values()
+        .partition(|peer| {
+            let mullvad_tag = peer
+                .tags
+                .as_ref()
+                .is_some_and(|tags| tags.iter().any(|tag| tag == "tag:mullvad-exit-node"));
+            let mullvad_dns = peer
+                .dns_name
+                .trim_end_matches('.')
+                .to_ascii_lowercase()
+                .ends_with(".mullvad.ts.net");
+            mullvad_tag || mullvad_dns
+        });
+    // SSH-config discovery ran first. Skipping only the peer addition would
+    // leave aliases for the same provider endpoint in the probe set. Prune
+    // all of those aliases before deduplication: their labels must not hide
+    // legitimate peers that happen to sort before the provider in status.
+    for peer in providers {
+        let addresses = peer.addresses.unwrap_or_default();
+        let dns = peer.dns_name.trim_end_matches('.');
+        // Compare configured destinations, not alias labels: an alias named
+        // after a provider may legitimately point somewhere else. Do this
+        // even for offline/shared peers or DNS-only status records.
+        hosts.retain(|host| {
+            let destination = host.hostname.as_deref().unwrap_or(&host.name);
+            let matches_dns =
+                !dns.is_empty() && destination.trim_end_matches('.').eq_ignore_ascii_case(dns);
+            let matches_ip = destination
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| addresses.contains(&ip));
+            !matches_dns && !matches_ip
+        });
+    }
+    for peer in peers {
         if !peer.online || peer.sharee_node {
             continue;
         }
         // The existing SSH/rsync source contract accepts IPv4 and DNS names,
         // not bare IPv6 literals. Do not advertise unusable source targets.
-        let Some(address) = peer.addresses.iter().find(|ip| ip.is_ipv4()) else {
+        let addresses = peer.addresses.unwrap_or_default();
+        let Some(address) = addresses.iter().find(|ip| ip.is_ipv4()) else {
             continue;
         };
         let dns = peer.dns_name.trim_end_matches('.');
-        // Preserve explicit aliases, including their User/IdentityFile/ProxyJump.
-        // HostName from Tailscale is not unique and is never a deduplication key.
+        // Preserve aliases for this destination, including their connection
+        // options. A label matching the peer is not equivalent when HostName
+        // explicitly points elsewhere. Tailscale HostName is not unique.
         if hosts.iter().any(|host| {
-            [&host.name, host.hostname.as_ref().unwrap_or(&host.name)]
-                .into_iter()
-                .any(|name| {
-                    (!dns.is_empty() && name.trim_end_matches('.').eq_ignore_ascii_case(dns))
-                        || name
-                            .parse::<std::net::IpAddr>()
-                            .is_ok_and(|ip| peer.addresses.contains(&ip))
-                })
+            let destination = host.hostname.as_deref().unwrap_or(&host.name);
+            (!dns.is_empty() && destination.trim_end_matches('.').eq_ignore_ascii_case(dns))
+                || destination
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| addresses.contains(&ip))
         }) {
+            continue;
+        }
+        let target = address.to_string();
+        if reserved_names.contains(&target) {
+            // A usable alias for the peer would have matched above. Reusing
+            // this name instead would invoke a different configured target.
+            // Do not override SSH configuration or silently guess a DNS route.
+            shadowed_peers += 1;
             continue;
         }
         // Use the assigned address, so --accept-dns=false and disabled MagicDNS
         // do not make an otherwise reachable peer unusable. Downstream SSH uses name.
         hosts.push(DiscoveredHost {
-            name: address.to_string(),
-            hostname: Some(address.to_string()),
+            name: target.clone(),
+            hostname: Some(target),
             user: None,
             port: None,
             identity_file: None,
         });
     }
-    Ok(())
+    Ok(shadowed_peers)
 }
 
 fn discover_ssh_hosts_from_path(path: &Path, home: &Path) -> Vec<DiscoveredHost> {
@@ -982,12 +1054,23 @@ fn parse_ssh_config(content: &str) -> Vec<DiscoveredHost> {
         };
 
         match key.as_str() {
+            "match" => {
+                // Match starts a new conditional block. Its options must not
+                // become metadata for the preceding literal Host declaration.
+                hosts.append(&mut current_hosts);
+            }
             "host" => {
                 hosts.append(&mut current_hosts);
-                current_hosts = value
-                    .split_whitespace()
+                current_hosts = shell_words::split(value)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .take_while(|name| !name.starts_with('#'))
                     .filter(|name| {
-                        !name.starts_with('!') && !name.contains('*') && !name.contains('?')
+                        !name.starts_with('!')
+                            && !name.contains('*')
+                            && !name.contains('?')
+                            && ssh_host_has_safe_token_chars(name)
+                            && !name.starts_with('-')
                     })
                     .map(|name| DiscoveredHost {
                         name: name.to_string(),
@@ -1000,22 +1083,36 @@ fn parse_ssh_config(content: &str) -> Vec<DiscoveredHost> {
             }
             "hostname" => {
                 for host in &mut current_hosts {
-                    host.hostname = Some(value.to_string());
+                    if host.hostname.is_none() {
+                        host.hostname = shell_words::split(value)
+                            .ok()
+                            .and_then(|v| v.into_iter().next());
+                    }
                 }
             }
             "user" => {
                 for host in &mut current_hosts {
-                    host.user = Some(value.to_string());
+                    if host.user.is_none() {
+                        host.user = shell_words::split(value)
+                            .ok()
+                            .and_then(|v| v.into_iter().next());
+                    }
                 }
             }
             "port" => {
                 for host in &mut current_hosts {
-                    host.port = value.parse().ok();
+                    if host.port.is_none() {
+                        host.port = value.split_whitespace().next().and_then(|v| v.parse().ok());
+                    }
                 }
             }
             "identityfile" => {
                 for host in &mut current_hosts {
-                    host.identity_file = Some(value.to_string());
+                    if host.identity_file.is_none() {
+                        host.identity_file = shell_words::split(value)
+                            .ok()
+                            .and_then(|v| v.into_iter().next());
+                    }
                 }
             }
             _ => {}
@@ -1202,6 +1299,9 @@ impl SourceConfigGenerator {
         let mut paths = Vec::new();
 
         for agent in &probe.detected_agents {
+            if !super::probe::remote_probe_source_allowed(&agent.agent_type, &agent.path) {
+                continue;
+            }
             // Use the detected path directly
             paths.push(agent.path.clone());
         }
@@ -1357,9 +1457,10 @@ impl SourcesConfig {
 
         // Create backup if file exists
         let backup_path = if config_path.exists() {
-            let backup = unique_backup_path(&config_path);
-            std::fs::copy(&config_path, &backup)?;
-            Some(backup)
+            Some(copy_sources_config_backup(
+                &config_path,
+                unique_backup_path,
+            )?)
         } else {
             None
         };
@@ -1565,6 +1666,42 @@ fn write_sources_config_temp_file_at(path: &Path, contents: &[u8]) -> Result<(),
     file.sync_all()
 }
 
+fn copy_sources_config_backup(
+    source_path: &Path,
+    mut next_path: impl FnMut(&Path) -> PathBuf,
+) -> Result<PathBuf, std::io::Error> {
+    let mut source = std::fs::File::open(source_path)?;
+    let permissions = source.metadata()?.permissions();
+    for _ in 0..100 {
+        let backup_path = next_path(source_path);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Do not expose config contents while copying a private source.
+            options.mode(0o600);
+        }
+        let mut backup = match options.open(&backup_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        };
+        std::io::copy(&mut source, &mut backup)?;
+        backup.set_permissions(permissions)?;
+        backup.sync_all()?;
+        sync_parent_directory(&backup_path)?;
+        return Ok(backup_path);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "failed to allocate unique sources config backup path for {}",
+            source_path.display()
+        ),
+    ))
+}
+
 fn unique_backup_path(path: &Path) -> PathBuf {
     static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1693,6 +1830,102 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first.parent(), final_path.parent());
         assert_eq!(second.parent(), final_path.parent());
+    }
+
+    #[test]
+    fn test_sources_config_backup_retries_collision_and_preserves_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("sources.toml");
+        let occupied = temp.path().join("occupied.backup");
+        let fresh = temp.path().join("fresh.backup");
+        let contents = vec![b'x'; 131_079];
+        std::fs::write(&source, &contents).expect("write source");
+        std::fs::write(&occupied, b"existing backup").expect("write occupied backup");
+        let mut attempts = 0;
+        let backup = copy_sources_config_backup(&source, |_| {
+            attempts += 1;
+            if attempts == 1 {
+                occupied.clone()
+            } else {
+                fresh.clone()
+            }
+        })
+        .expect("retry collision and copy source");
+        assert_eq!(attempts, 2);
+        assert_eq!(backup, fresh);
+        assert_eq!(std::fs::read(&backup).expect("read backup"), contents);
+        assert_eq!(std::fs::read(&source).expect("read source"), contents);
+        assert_eq!(
+            std::fs::read(&occupied).expect("read occupied backup"),
+            b"existing backup"
+        );
+
+        let mut attempts = 0;
+        let err = copy_sources_config_backup(&source, |_| {
+            attempts += 1;
+            occupied.clone()
+        })
+        .expect_err("persistent collisions must fail after bounded retries");
+        assert_eq!(attempts, 100);
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&source).expect("read source"), contents);
+        assert_eq!(
+            std::fs::read(&occupied).expect("read occupied backup"),
+            b"existing backup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sources_config_backup_retries_symlink_without_touching_target() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("sources.toml");
+        let protected = temp.path().join("protected.toml");
+        let occupied = temp.path().join("occupied.backup");
+        let fresh = temp.path().join("fresh.backup");
+        std::fs::write(&source, b"source config").expect("write source");
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600))
+            .expect("set source permissions");
+        std::fs::write(&protected, b"protected config").expect("write protected file");
+        symlink(&protected, &occupied).expect("create occupied symlink");
+        let mut attempts = 0;
+        let backup = copy_sources_config_backup(&source, |_| {
+            attempts += 1;
+            if attempts == 1 {
+                occupied.clone()
+            } else {
+                fresh.clone()
+            }
+        })
+        .expect("retry symlink collision");
+        assert_eq!(attempts, 2);
+        assert_eq!(backup, fresh);
+        assert_eq!(
+            std::fs::read(&backup).expect("read backup"),
+            b"source config"
+        );
+        assert_eq!(
+            std::fs::read(&source).expect("read source"),
+            b"source config"
+        );
+        assert_eq!(
+            std::fs::read(&protected).expect("read protected file"),
+            b"protected config"
+        );
+        assert_eq!(
+            std::fs::read_link(&occupied).expect("read symlink"),
+            protected
+        );
+        assert_eq!(
+            std::fs::metadata(&backup)
+                .expect("backup metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[cfg(unix)]
@@ -1841,6 +2074,34 @@ mod tests {
 
         let source = SourceDefinition::local("..");
         assert!(source.validate().is_err());
+    }
+
+    #[test]
+    fn test_source_validation_portable_names_reject_drive_prefixes() {
+        let temp = tempfile::tempdir().expect("source-name fixture directory");
+        let path = temp.path().join("sources.toml");
+        for name in ["C:", "C:outside", "c:outside", "host:stream"] {
+            let source = SourceDefinition::ssh(name, "user@host");
+            assert!(source.validate().is_err(), "accepted source name {name}");
+            let mut config = SourcesConfig::default();
+            assert!(config.add_source(source.clone()).is_err());
+            config.sources.push(source);
+            assert!(config.validate().is_err());
+            // Bypass save validation to exercise the actual TOML load path.
+            std::fs::write(&path, toml::to_string(&config).expect("encode fixture"))
+                .expect("write source-name fixture");
+            assert!(SourcesConfig::load_from(&path).is_err(), "loaded {name}");
+        }
+        for name in ["laptop", "host-name.example", "build_host-1"] {
+            let source = SourceDefinition::ssh(name, "user@host");
+            assert!(source.validate().is_ok(), "rejected source name {name}");
+            let mut config = SourcesConfig::default();
+            config.add_source(source).expect("add portable source");
+            config.save_to(&path).expect("save portable source");
+            let loaded = SourcesConfig::load_from(&path).expect("load portable source");
+            assert_eq!(loaded.sources.len(), 1);
+            assert_eq!(loaded.sources[0].name, name);
+        }
     }
 
     #[test]
@@ -2383,7 +2644,8 @@ paths = ["~/.claude/projects"]
                 "c": {"Online": false, "TailscaleIPs": ["100.64.0.3"]},
                 "d": {"Online": true, "ShareeNode": true, "TailscaleIPs": ["100.64.0.4"]},
                 "e": {"Online": true, "TailscaleIPs": []},
-                "f": {"Online": true, "TailscaleIPs": ["fd7a:115c:a1e0::6"]}
+                "f": {"Online": true, "TailscaleIPs": ["fd7a:115c:a1e0::6"]},
+                "g": {"Online": true, "TailscaleIPs": null}
             }
         });
         let bytes = serde_json::to_vec(&status).unwrap();
@@ -2446,6 +2708,20 @@ paths = ["~/.claude/projects"]
         assert_eq!(hosts[0].hostname.as_deref(), Some("workstation.invalid"));
         assert_eq!(hosts[1].user.as_deref(), Some("operator"));
         assert!(super::discover_ssh_hosts_from_path(&root.join("missing"), &home).is_empty());
+    }
+
+    #[test]
+    fn test_parse_ssh_config_match_does_not_hide_a_tailnet_peer() {
+        let mut hosts = parse_ssh_config(
+            "Host \"workstation\" # not another alias\n HostName \"100.64.0.1\"\n HostName 100.64.0.2\n User developer\n User wrong\nMatch host other\n HostName 100.64.0.2\n User conditional\n",
+        );
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].name, "workstation");
+        assert_eq!(hosts[0].hostname.as_deref(), Some("100.64.0.1"));
+        assert_eq!(hosts[0].user.as_deref(), Some("developer"));
+        merge_tailscale_hosts(&mut hosts, br#"{"BackendState":"Running","Peer":{"a":{"Online":true,"TailscaleIPs":["100.64.0.2"]}}}"#).unwrap();
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[1].name, "100.64.0.2");
     }
 
     #[test]
@@ -2590,6 +2866,55 @@ Host production !legacy-prod
         assert_eq!(source.sync_schedule, SyncSchedule::Manual);
         assert!(!source.paths.is_empty());
         assert!(source.paths.contains(&"~/.claude/projects".to_string()));
+    }
+
+    #[test]
+    fn gh447_remote_autoconfig_rejects_sensitive_grok_bot_probe_reports() {
+        let generator = SourceConfigGenerator::new();
+        let report = make_test_probe(
+            true,
+            vec![
+                make_test_agent("grok_bot", "/custom/replica-root"),
+                make_test_agent("grok-bot", "/another/replica-root"),
+                make_test_agent(
+                    "unknown",
+                    "/Users/test/Library/Application Support/Grok Bot/sand-client-persistence",
+                ),
+                make_test_agent("grok", "~/.grok/sessions"),
+                make_test_agent("codex", "~/.codex/sessions"),
+            ],
+            Some(make_test_sys_info("darwin", "/Users/test")),
+        );
+        let source = generator.generate_source("laptop", &report);
+        assert_eq!(source.paths, vec!["~/.grok/sessions", "~/.codex/sessions"]);
+        assert_eq!(source.source_type, SourceKind::Ssh);
+    }
+
+    #[test]
+    fn remote_autoconfig_rejects_muse_credentials_but_keeps_sessions() {
+        let generator = SourceConfigGenerator::new();
+        let report = make_test_probe(
+            true,
+            vec![
+                make_test_agent("muse", "~/.config/muse/auth.json"),
+                make_test_agent("muse", "~/.config/muse"),
+                make_test_agent("unknown", "/home/test/.config/muse/"),
+                make_test_agent("unknown", r"C:\Users\test\.config\muse\auth.json"),
+                make_test_agent("muse", "~/.local/share/muse/sessions"),
+                make_test_agent("muse", "~/.local/share/muse"),
+                make_test_agent("unknown", "~/.config/muse-other/sessions"),
+            ],
+            Some(make_test_sys_info("linux", "/home/test")),
+        );
+        let source = generator.generate_source("workstation", &report);
+        assert_eq!(
+            source.paths,
+            vec![
+                "~/.local/share/muse/sessions",
+                "~/.local/share/muse",
+                "~/.config/muse-other/sessions",
+            ]
+        );
     }
 
     #[test]
@@ -3028,3 +3353,7 @@ Host production !legacy-prod
         );
     }
 }
+
+#[cfg(test)]
+#[path = "tailscale_tests.rs"]
+mod tailscale_tests;

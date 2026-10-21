@@ -211,6 +211,7 @@
     "current_source_newer_than_archive_count": 0,
     "raw_mirror_db_link_count": 0,
     "sole_copy_warning_count": 0,
+    "raw_mirror_capture_disabled": false,
     "recommended_action": "Run 'cass index --full' once before coverage can be assessed."
   },
   "policy_registry": {
@@ -240,14 +241,14 @@
       {
         "controller_id": "semantic_search",
         "policy_id": "semantic.hybrid_preferred.v1",
-        "policy_version": "semantic_schema_1+chunking_1",
+        "policy_version": "semantic_schema_1+chunking_2",
         "status": "fallback",
         "fallback_state": "conservative",
         "conservative_fallback": true,
         "decision_reason": "semantic unavailable; lexical fallback remains active",
         "inputs": {
           "chunk_timeout_seconds": "120",
-          "chunking_strategy_version": "1",
+          "chunking_strategy_version": "2",
           "download_policy": "opt_in",
           "fast_dimension": "256",
           "fast_tier_embedder": "hash",
@@ -274,6 +275,7 @@
     "schema_version": 1,
     "status": "ok",
     "quarantined_conversations": 0,
+    "deferred_conversations": 0,
     "recent_quarantined_conversations": 0,
     "recent_window_seconds": 3600,
     "circuit_breaker_limit": 25,
@@ -324,7 +326,8 @@
       "load_severe_q": null,
       "psi_pressured_q": null,
       "psi_severe_q": null
-    }
+    },
+    "memory": "[LIVE_SAMPLE]"
   },
   "parallel_wal_shadow": {
     "recent_chunks": [],
@@ -459,8 +462,11 @@
         "pipeline_channel_size": 4,
         "controller_loadavg_high_watermark_1m": 121.0,
         "controller_loadavg_low_watermark_1m": 120.0,
+        "startup_page_fetch_message_bytes": "[LIVE_BYTES]",
+        "steady_page_fetch_message_bytes": "[LIVE_BYTES]",
         "runtime": null
-      }
+      },
+      "expected_docs_scan": null
     },
     "semantic": {
       "status": "not_initialized",
@@ -474,6 +480,8 @@
       "vector_index_path": null,
       "model_dir": null,
       "hnsw_path": null,
+      "hnsw_present": false,
+      "hnsw_state": "not_inspected",
       "hnsw_ready": false,
       "progressive_ready": false,
       "progressive_reason_code": null,
@@ -532,6 +540,7 @@
       "schema_version": 1,
       "status": "ok",
       "quarantined_conversations": 0,
+      "deferred_conversations": 0,
       "recent_quarantined_conversations": 0,
       "recent_window_seconds": 3600,
       "circuit_breaker_limit": 25,
@@ -567,14 +576,14 @@
         {
           "controller_id": "semantic_search",
           "policy_id": "semantic.hybrid_preferred.v1",
-          "policy_version": "semantic_schema_1+chunking_1",
+          "policy_version": "semantic_schema_1+chunking_2",
           "status": "fallback",
           "fallback_state": "conservative",
           "conservative_fallback": true,
           "decision_reason": "semantic unavailable; lexical fallback remains active",
           "inputs": {
             "chunk_timeout_seconds": "120",
-            "chunking_strategy_version": "1",
+            "chunking_strategy_version": "2",
             "download_policy": "opt_in",
             "fast_dimension": "256",
             "fast_tier_embedder": "hash",

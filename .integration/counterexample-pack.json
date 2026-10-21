@@ -1,0 +1,34 @@
+{
+  "candidate_root": ".",
+  "mutants": [
+    {
+      "component_ids": [
+        "INT-001"
+      ],
+      "description": "Replace one required behavior with a plausible but wrong implementation that the assigned tests must reject.",
+      "id": "MUT-001",
+      "mutations": [
+        {
+          "after": "REPLACE_WITH_PLAUSIBLE_WRONG_TEXT",
+          "before": "REPLACE_WITH_EXACT_EXISTING_TEXT",
+          "expected_count": 1,
+          "expected_file_sha256": "",
+          "path": "REPLACE_WITH_TARGET_FILE"
+        }
+      ],
+      "preflight_command_ids": [],
+      "verification_command_ids": [
+        "final-focused"
+      ],
+      "waiver": {
+        "approval": "",
+        "reason": ""
+      }
+    }
+  ],
+  "sandbox": {
+    "attestation": "REPLACE_WITH_HOW_THE_COPY_WAS_CREATED_AND_ISOLATED",
+    "root": "REPLACE_WITH_ISOLATED_CANDIDATE_COPY"
+  },
+  "schema_version": "1.0"
+}

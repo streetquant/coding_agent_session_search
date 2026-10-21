@@ -170,6 +170,299 @@ fn pages_key_verbs_round_trip_through_the_binary_with_stdin_passwords() {
     );
 }
 
+/// 2l1b0.61: the recovery secret `key add-recovery` prints, typed into the
+/// viewer as the user copied it, unlocks the archive. The bundle's own
+/// crypto worker runs under Node (the page's worker globals are Node's; its
+/// `importScripts` loads the bundled vendor script into the global scope, as
+/// a classic worker does), receives the text the recovery-key form posts,
+/// and must return the key that decrypts the original plaintext. Planted
+/// negative: a key differing in one character is refused. No-claim: the DOM
+/// form wiring itself is not exercised (no browser run).
+#[test]
+fn a_printed_recovery_secret_unlocks_the_archive_in_the_viewer_worker() {
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path();
+    let bundle = encrypted_bundle(home);
+
+    let added = cass(home)
+        .args(["pages", "key", "add-recovery", "--archive"])
+        .arg(&bundle)
+        .args(["--password-stdin", "--json"])
+        .write_stdin(format!("{PASSWORD}\n"))
+        .output()
+        .expect("key add-recovery");
+    assert!(
+        added.status.success(),
+        "add-recovery failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&added.stdout),
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let added = json(&added);
+    let secret = added["recovery_secret"]
+        .as_str()
+        .unwrap_or_else(|| panic!("add-recovery printed no secret: {added}"));
+    assert_viewer_worker_unlocks(&bundle, secret, None);
+}
+
+/// The viewer's own crypto worker, run under Node (see the test above), must
+/// refuse `refused` (default: `secret` with its first character changed),
+/// unlock with `secret` as the recovery-key form posts it, and decrypt the
+/// fixture's plaintext with the key it returns.
+fn assert_viewer_worker_unlocks(bundle: &Path, secret: &str, refused: Option<&str>) {
+    let script = r#"
+        import { readFile } from 'node:fs/promises';
+        import { readFileSync } from 'node:fs';
+        import { join } from 'node:path';
+        import { pathToFileURL } from 'node:url';
+        import vm from 'node:vm';
+
+        const site = process.env.CASS_SITE_DIR;
+        const secret = process.env.CASS_RECOVERY_SECRET;
+        const config = JSON.parse(await readFile(join(site, 'config.json'), 'utf8'));
+        const messages = [];
+        globalThis.self = globalThis;
+        // A worker's postMessage transfers the listed buffers, which the
+        // worker then zeroizes on its side; structuredClone moves them the
+        // same way, so the zeroization cannot reach what was received.
+        globalThis.postMessage = (message, transfer) =>
+            messages.push(structuredClone(message, transfer ? { transfer } : undefined));
+        globalThis.importScripts = (path) => vm.runInThisContext(readFileSync(join(site, path), 'utf8'));
+        globalThis.fetch = async (url) => new Response(await readFile(join(site, String(url))));
+        await import(pathToFileURL(join(site, 'crypto_worker.js')).href);
+
+        const request = async (data) => {
+            messages.length = 0;
+            await self.onmessage({ data });
+            return messages.find((m) => m.requestId === data.requestId && m.type !== 'PROGRESS');
+        };
+
+        const refusedSecret = process.env.CASS_REFUSED_SECRET
+            || (secret[0] === 'A' ? 'B' : 'A') + secret.slice(1);
+        const indexHtml = await readFile(join(site, 'index.html'), 'utf8');
+        for (const requiredId of ['id="recovery-key-btn"', 'id="recovery-key-form"', 'id="recovery-key-input"', 'id="recovery-key-submit"']) {
+            if (!indexHtml.includes(requiredId)) {
+                throw new Error(`site/index.html missing ${requiredId}`);
+            }
+        }
+
+        // Exercise auth.js's recovery-key button, form submit, input zeroization,
+        // and wrong-secret error presentation before and during worker handoff.
+        const authSource = (await readFile(join(site, 'auth.js'), 'utf8'))
+            .replace(/^import\s+[\s\S]*?from\s+["'][^"']+["'];\s*$/gm, '')
+            .replace(/const ARCHIVE_SCOPE_URL =[\s\S]*?const QR_SCANNER_LIBRARY_URL =[^\n]+/m, '')
+            .replace(/if \(document\.readyState === "loading"\)[\s\S]*$/m, '');
+        const makeClassList = (initial = []) => {
+            const set = new Set(initial);
+            return {
+                contains: (c) => set.has(c),
+                add: (c) => set.add(c),
+                remove: (c) => set.delete(c),
+                toggle: (c, force) => {
+                    const shouldAdd = force === undefined ? !set.has(c) : Boolean(force);
+                    if (shouldAdd) set.add(c); else set.delete(c);
+                    return shouldAdd;
+                },
+            };
+        };
+        const makeEl = (classes = []) => {
+            const attrs = new Map();
+            const listeners = new Map();
+            return {
+                value: '',
+                disabled: false,
+                textContent: '',
+                style: {},
+                classList: makeClassList(classes),
+                setAttribute: (k, v) => attrs.set(k, String(v)),
+                getAttribute: (k) => attrs.get(k) ?? null,
+                addEventListener: (ev, fn) => listeners.set(ev, fn),
+                dispatch: (ev, payload = {}) => listeners.get(ev)?.(payload),
+                focus() { this.focused = true; },
+                querySelector() { return null; },
+            };
+        };
+        const errorMessageEl = makeEl();
+        const authErrorEl = makeEl(['hidden']);
+        authErrorEl.querySelector = (sel) => sel === '.error-message' ? errorMessageEl : null;
+        const progressFillEl = makeEl();
+        const progressTextEl = makeEl();
+        const authProgressEl = makeEl(['hidden']);
+        authProgressEl.querySelector = (sel) => {
+            if (sel === '.progress-fill') return progressFillEl;
+            if (sel === '.progress-text') return progressTextEl;
+            return null;
+        };
+        const domById = {
+            'auth-screen': makeEl(),
+            'app-screen': makeEl(['hidden']),
+            'auth-form': makeEl(),
+            'password': makeEl(),
+            'unlock-btn': makeEl(),
+            'toggle-password': makeEl(),
+            'qr-btn': makeEl(),
+            'recovery-key-btn': makeEl(),
+            'recovery-key-form': makeEl(['auth-form', 'hidden']),
+            'recovery-key-input': makeEl(),
+            'recovery-key-submit': makeEl(),
+            'qr-scanner': makeEl(['hidden']),
+            'qr-reader': makeEl(),
+            'qr-cancel-btn': makeEl(),
+            'fingerprint-value': makeEl(),
+            'fingerprint-help': makeEl(),
+            'fingerprint-tooltip': makeEl(['hidden']),
+            'auth-error': authErrorEl,
+            'auth-progress': authProgressEl,
+            'lock-btn': makeEl(),
+            'strength-meter': null,
+            'strength-label': null,
+            'strength-suggestions': null,
+        };
+        const postedToWorker = [];
+        const authContext = {
+            console,
+            window: { addEventListener() {}, cassSession: null },
+            document: {
+                getElementById: (id) => domById[id] ?? null,
+                querySelector: () => null,
+                addEventListener() {},
+            },
+            StorageMode: { MEMORY: 'memory' },
+            JSON,
+            Error,
+            String,
+            Boolean,
+        };
+        vm.createContext(authContext);
+        vm.runInContext(
+            `${authSource}\nthis.__test = { cacheElements, setupEventListeners, handleUnlockFailed, setContext: (cfg, w) => { config = cfg; worker = w; } };`,
+            authContext,
+        );
+        authContext.__test.cacheElements();
+        authContext.__test.setupEventListeners();
+        authContext.__test.setContext(config, {
+            postMessage: (msg) => postedToWorker.push(msg),
+        });
+
+        // 1. Clicking 'Use Recovery Key' reveals the form and focuses the input.
+        domById['recovery-key-btn'].dispatch('click');
+        if (domById['recovery-key-form'].classList.contains('hidden') || domById['recovery-key-btn'].getAttribute('aria-expanded') !== 'true') {
+            throw new Error('clicking Use Recovery Key must reveal #recovery-key-form');
+        }
+        // 2. Submitting an empty recovery key shows the validation prompt.
+        domById['recovery-key-form'].dispatch('submit', { preventDefault() {} });
+        if (authErrorEl.classList.contains('hidden') || errorMessageEl.textContent !== 'Enter the recovery key') {
+            throw new Error(`empty recovery submit should prompt for key: ${errorMessageEl.textContent}`);
+        }
+        // 3. Submitting a wrong recovery key clears the input, disables controls,
+        //    posts UNLOCK_RECOVERY to the worker, and surfaces the worker error.
+        domById['recovery-key-input'].value = `  ${refusedSecret}\n`;
+        domById['recovery-key-form'].dispatch('submit', { preventDefault() {} });
+        if (domById['recovery-key-input'].value !== '' || !domById['recovery-key-submit'].disabled) {
+            throw new Error('submitting recovery key must immediately clear input and disable controls');
+        }
+        const formRefusedReq = postedToWorker.pop();
+        const refused = await request(formRefusedReq);
+        if (refused?.type !== 'UNLOCK_FAILED') {
+            throw new Error(`a wrong recovery key was not refused: ${JSON.stringify(refused)}`);
+        }
+        authContext.__test.handleUnlockFailed(refused);
+        if (authErrorEl.classList.contains('hidden') || !errorMessageEl.textContent || domById['recovery-key-submit'].disabled) {
+            throw new Error(`failed unlock must show error and re-enable form: ${errorMessageEl.textContent}`);
+        }
+        // 4. Submitting the printed recovery key (with surrounding whitespace) unlocks and decrypts.
+        domById['recovery-key-input'].value = `  ${secret}\n`;
+        domById['recovery-key-form'].dispatch('submit', { preventDefault() {} });
+        const formUnlockReq = postedToWorker.pop();
+        const unlocked = await request(formUnlockReq);
+        if (unlocked?.type !== 'UNLOCK_SUCCESS') {
+            throw new Error(`the printed recovery key did not unlock: ${JSON.stringify(unlocked)}`);
+        }
+        const decrypted = await request({ type: 'DECRYPT_DATABASE', dek: unlocked.dek, config, requestId: 3 });
+        if (decrypted?.type !== 'DECRYPT_SUCCESS') {
+            throw new Error(`decrypting with the recovered key failed: ${JSON.stringify(decrypted)}`);
+        }
+        const text = new TextDecoder().decode(new Uint8Array(decrypted.dbBytes));
+        if (text !== 'pages key cli fixture') {
+            throw new Error(`the recovered key decrypted the wrong bytes: ${JSON.stringify(text)}`);
+        }
+        console.log(JSON.stringify({
+            refused: refused.type,
+            refused_error: errorMessageEl.textContent,
+            unlocked: unlocked.type,
+            decrypted: decrypted.type,
+            dom_form_verified: true,
+        }));
+    "#;
+    // No --experimental-default-type: Node 24 removed it, and the worker has no
+    // import/export, so it loads the same as CommonJS or as a module.
+    let mut node = std::process::Command::new("node");
+    node.args(["--input-type=module", "--eval", script])
+        .env("CASS_SITE_DIR", bundle.join("site"))
+        .env("CASS_RECOVERY_SECRET", secret)
+        .env_remove("CASS_REFUSED_SECRET");
+    if let Some(refused) = refused {
+        node.env("CASS_REFUSED_SECRET", refused);
+    }
+    let output = node
+        .output()
+        .expect("run the viewer crypto worker under node");
+    assert!(
+        output.status.success(),
+        "viewer recovery unlock failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    eprintln!("{}", String::from_utf8_lossy(&output.stdout).trim());
+}
+
+/// 2l1b0.61: `key rotate --keep-recovery` through the real binary
+/// re-encrypts under a fresh key and prints a new recovery secret. That
+/// secret unlocks the rotated archive in the viewer worker, and the secret
+/// printed before the rotation is refused (the negative: a rotation that kept
+/// the old recovery slot would admit it).
+#[test]
+fn a_rotated_archive_unlocks_with_its_new_recovery_secret_only() {
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path();
+    let bundle = encrypted_bundle(home);
+    let secret_from = |output: std::process::Output, verb: &str| -> String {
+        assert!(
+            output.status.success(),
+            "{verb} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value = json(&output);
+        value["recovery_secret"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{verb} printed no recovery secret: {value}"))
+            .to_string()
+    };
+
+    let before = secret_from(
+        cass(home)
+            .args(["pages", "key", "add-recovery", "--archive"])
+            .arg(&bundle)
+            .args(["--password-stdin", "--json"])
+            .write_stdin(format!("{PASSWORD}\n"))
+            .output()
+            .expect("key add-recovery"),
+        "add-recovery",
+    );
+    let after = secret_from(
+        cass(home)
+            .args(["pages", "key", "rotate", "--keep-recovery", "--archive"])
+            .arg(&bundle)
+            .args(["--password-stdin", "--json"])
+            .write_stdin(format!("{PASSWORD}\nrotated password 77\n"))
+            .output()
+            .expect("key rotate --keep-recovery"),
+        "rotate --keep-recovery",
+    );
+    assert_ne!(before, after, "rotation must mint a new recovery secret");
+    assert_viewer_worker_unlocks(&bundle, &after, Some(&before));
+}
+
 /// A password verb without `--password-stdin` and without a terminal must
 /// refuse with exit 6 (`password-required`) instead of hanging on a prompt.
 #[test]

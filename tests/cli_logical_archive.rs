@@ -1,0 +1,2354 @@
+//! Real-binary logical recovery: receipt parity, privacy, idempotence and conflicts.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::process::Output;
+use std::time::Duration;
+
+use assert_cmd::Command;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use coding_agent_search::franken_sync::compat::{
+    ConnectionExt, OpenFlags, RowExt, open_with_flags,
+};
+use coding_agent_search::franken_sync::{Connection, SqliteValue};
+use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+use coding_agent_search::storage::sqlite::SqliteStorage;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+fn command(home: &Path) -> Command {
+    // Bind this test to Cargo's freshly built executable, not a PATH installation
+    // or an external CARGO_BIN_EXE_cass override containing a stale binary.
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cass"));
+    command
+        .current_dir(home)
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("CASS_DATA_DIR", home.join("unused-default"))
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_VIEW_BUDGET_MS", "30000")
+        .env_remove("CASS_TEST_VIEW_SLOW_MS")
+        .env_remove("CASS_OUTPUT_FORMAT")
+        .env_remove("TOON_DEFAULT_FORMAT")
+        .timeout(Duration::from_secs(90));
+    command
+}
+
+fn receipt(output: Output) -> Value {
+    assert!(
+        output.status.success(),
+        "archive command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("one JSON success receipt")
+}
+
+fn export(home: &Path, source: &Path, output: &Path) -> Value {
+    export_version(home, source, output, None)
+}
+
+fn export_version(home: &Path, source: &Path, output: &Path, version: Option<u32>) -> Value {
+    let mut cmd = command(home);
+    cmd.args(["archive", "export", "--db"])
+        .arg(source)
+        .args([
+            "--archive-id",
+            "cli-archive",
+            "--include-private",
+            "--output",
+        ])
+        .arg(output);
+    if let Some(version) = version {
+        cmd.args(["--format-version", &version.to_string()]);
+    }
+    receipt(cmd.output().unwrap())
+}
+
+fn import(home: &Path, input: &Path, output: &Path, identical: bool) -> Output {
+    let mut cmd = command(home);
+    cmd.args(["archive", "import"])
+        .arg(input)
+        .args([
+            "--archive-id",
+            "cli-archive",
+            "--include-private",
+            "--output",
+        ])
+        .arg(output);
+    if identical {
+        cmd.arg("--if-identical");
+    }
+    cmd.output().unwrap()
+}
+
+const COLLECTION_ROWS: i64 = 1025;
+const RECORD_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+const PRIVATE_COLLECTION_MARKER: &str = "GH517-PRIVATE-MESSAGE";
+const PRIVATE_COLLECTION_BLOB: &[u8] = b"GH517-PRIVATE-BLOB\0\x01\xff";
+
+fn collection_body(position: i64) -> String {
+    format!(
+        "{PRIVATE_COLLECTION_MARKER} {position}: \"quote\" \\backslash \0 δ 日本語\n{}",
+        "x".repeat(8 * 1024)
+    )
+}
+
+fn collection_extra(position: i64) -> String {
+    serde_json::json!({"usage": {"input_tokens": position}, "request_id": format!("request-{position}")})
+        .to_string()
+}
+
+fn continued_message_values(raw_payload: bool) -> (String, Vec<u8>) {
+    let mut blob = PRIVATE_COLLECTION_BLOB.to_vec();
+    let content = if raw_payload {
+        // Match the reproduced failure's TEXT and duplicated BLOB dimensions.
+        // The binary suffix includes bytes that cannot be represented as TEXT.
+        let mut bytes = PRIVATE_COLLECTION_MARKER.as_bytes().to_vec();
+        bytes.resize(9_909_057, b'x');
+        blob.resize(9_909_176, 0xff);
+        String::from_utf8(bytes).unwrap()
+    } else {
+        // Each NUL/Unicode pair occupies four source bytes but nine JSON
+        // bytes, so escaping alone crosses the physical record boundary.
+        let content = format!(
+            "{PRIVATE_COLLECTION_MARKER}{}",
+            "\0雪".repeat(RECORD_LIMIT_BYTES / 9 + 1)
+        );
+        assert!(content.len() < RECORD_LIMIT_BYTES);
+        content
+    };
+    (content, blob)
+}
+
+/// Initialize the real canonical schema, then bind one row at a time in small
+/// transactions. Fixture setup must not collect a conversation or whole archive
+/// in memory, or run unrelated lexical indexing over oversized message bodies.
+fn collection_fixture(source: &Path) {
+    let connection = SqliteStorage::open(source).unwrap().into_raw();
+    connection
+        .execute_batch(
+            "INSERT INTO agents (id, slug, name, kind, created_at, updated_at)
+             VALUES (1, 'archive_fixture', 'Archive fixture', 'cli', 1733000000000, 1733000000000);
+             INSERT INTO conversations
+                 (id, agent_id, source_id, external_id, source_path, estimated_cost_usd)
+             VALUES (7, 1, 'local', 'gh517-collection', '/absent/provider/large.jsonl', 0.125);",
+        )
+        .unwrap();
+    {
+        let insert = connection
+            .prepare(
+                "INSERT INTO messages
+                 (id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
+                 VALUES (?1, 7, ?2, 'assistant', ?3, ?4, ?5, ?6, ?7)",
+            )
+            .unwrap();
+        for start in (0..COLLECTION_ROWS).step_by(32) {
+            connection.execute("BEGIN IMMEDIATE").unwrap();
+            for position in start..(start + 32).min(COLLECTION_ROWS) {
+                insert
+                    .execute_with_params(&[
+                        SqliteValue::Integer(10_000 + 3 * position),
+                        SqliteValue::Integer(2 * position),
+                        if position % 2 == 0 {
+                            SqliteValue::Null
+                        } else {
+                            SqliteValue::Text("archive_fixture".into())
+                        },
+                        SqliteValue::Integer(1_733_000_000_000 + position),
+                        SqliteValue::Text(collection_body(position).into()),
+                        SqliteValue::Text(collection_extra(position).into()),
+                        SqliteValue::Blob(PRIVATE_COLLECTION_BLOB.into()),
+                    ])
+                    .unwrap();
+            }
+            connection.execute("COMMIT").unwrap();
+        }
+    }
+    connection.close().unwrap();
+}
+
+/// Use ordinary inserts and deletes so the fixture carries real allocation
+/// history that cannot be reconstructed from the remaining canonical rows.
+fn seed_allocation_history(connection: &Connection) {
+    connection
+        .execute_batch(
+            "INSERT INTO embedding_jobs (id, db_path, model_id, status)
+             VALUES (2, '/absent/private/history.db', 'retained-job', 'completed');
+             INSERT INTO embedding_jobs (id, db_path, model_id, status)
+             VALUES (100, '/absent/private/history.db', 'deleted-job', 'completed');
+             DELETE FROM embedding_jobs WHERE id = 100;
+             INSERT INTO token_usage
+                 (id, message_id, conversation_id, agent_id, timestamp_ms, day_id, role, content_chars)
+             VALUES (7, 10000, 7, 1, 1733000000000, 20057, 'assistant', 23);
+             INSERT INTO token_usage
+                 (id, message_id, conversation_id, agent_id, timestamp_ms, day_id, role, content_chars)
+             VALUES (200, 10003, 7, 1, 1733000000001, 20057, 'assistant', 23);
+             DELETE FROM token_usage WHERE id = 200;",
+        )
+        .unwrap();
+}
+
+fn allocation_fixture(source: &Path) {
+    let connection = SqliteStorage::open(source).unwrap().into_raw();
+    connection
+        .execute_batch(
+            "INSERT INTO agents (id, slug, name, kind, created_at, updated_at)
+             VALUES (1, 'allocation_fixture', 'Allocation fixture', 'cli', 1733000000000, 1733000000000);
+             INSERT INTO conversations (id, agent_id, source_id, external_id, source_path)
+             VALUES (7, 1, 'local', 'allocation-history', '/absent/private/history.jsonl');
+             INSERT INTO messages (id, conversation_id, idx, role, content)
+             VALUES (10000, 7, 0, 'assistant', 'PRIVATE-ALLOCATION-DATA');
+             INSERT INTO messages (id, conversation_id, idx, role, content)
+             VALUES (10003, 7, 1, 'assistant', 'PRIVATE-ALLOCATION-DATA');
+             INSERT INTO messages (id, conversation_id, idx, role, content)
+             VALUES (10006, 7, 2, 'assistant', 'PRIVATE-ALLOCATION-DATA');",
+        )
+        .unwrap();
+    seed_allocation_history(&connection);
+    connection.close().unwrap();
+}
+
+fn allocation_state(database: &Path) -> BTreeMap<String, i64> {
+    let connection =
+        open_with_flags(database.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let state = connection
+        .query("SELECT name, seq FROM sqlite_sequence ORDER BY name")
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row.get_typed::<String>(0).unwrap(),
+                row.get_typed::<i64>(1).unwrap(),
+            )
+        })
+        .collect();
+    connection.close_without_checkpoint().unwrap();
+    state
+}
+
+fn wire_header(archive: &Path) -> Value {
+    let mut line = String::new();
+    BufReader::new(fs::File::open(archive).unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert!(line.len() <= RECORD_LIMIT_BYTES);
+    let record: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(record["type"], "header");
+    record["header"].clone()
+}
+
+fn assert_next_allocation(database: &Path, expected_job: i64, expected_usage: i64) {
+    // Reopen through ordinary storage, then exercise the public job API and a
+    // new usage insertion. A matching archive digest alone cannot prove these.
+    let storage = SqliteStorage::open(database).unwrap();
+    let job = storage
+        .upsert_embedding_job("/absent/recovered.db", "new-job", 3)
+        .unwrap();
+    assert_eq!(job, expected_job);
+    storage.start_embedding_job(job).unwrap();
+    storage.complete_embedding_job(job).unwrap();
+    let connection = storage.into_raw();
+    connection
+        .execute(
+            "INSERT INTO token_usage
+                 (message_id, conversation_id, agent_id, timestamp_ms, day_id, role, content_chars)
+             VALUES (10006, 7, 1, 1733000000002, 20057, 'assistant', 23)",
+        )
+        .unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT id FROM token_usage WHERE message_id = 10006")
+            .unwrap()
+            .get_typed::<i64>(0)
+            .unwrap(),
+        expected_usage
+    );
+    connection.close().unwrap();
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SourceEntryKind {
+    Directory,
+    File { bytes: u64, sha256: [u8; 32] },
+    Symlink(PathBuf),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SourceEntry {
+    kind: SourceEntryKind,
+    readonly: bool,
+    #[cfg(unix)]
+    mode: u32,
+}
+
+/// Hash files incrementally and retain directories and link targets as entries.
+/// The real initializer creates doctor/ alongside its database; silently
+/// skipping that subtree would miss changes to the source's recovery evidence.
+/// Links are recorded, never opened or traversed, including dangling links.
+fn source_file_digests(directory: &Path) -> BTreeMap<PathBuf, SourceEntry> {
+    let root = fs::symlink_metadata(directory).unwrap();
+    assert!(root.is_dir() && !root.file_type().is_symlink());
+    let mut digests = BTreeMap::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(parent) = pending.pop() {
+        for entry in fs::read_dir(parent).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            let kind = if metadata.file_type().is_symlink() {
+                SourceEntryKind::Symlink(fs::read_link(&path).unwrap())
+            } else if metadata.is_dir() {
+                pending.push(path.clone());
+                SourceEntryKind::Directory
+            } else {
+                assert!(metadata.is_file(), "unsupported source entry: {path:?}");
+                let mut file = fs::File::open(&path).unwrap();
+                let mut digest = Sha256::new();
+                let mut bytes = 0_u64;
+                loop {
+                    let read = file.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    digest.update(&buffer[..read]);
+                    bytes += read as u64;
+                }
+                assert_eq!(bytes, metadata.len(), "source changed while hashing");
+                SourceEntryKind::File {
+                    bytes,
+                    sha256: digest.finalize().into(),
+                }
+            };
+            #[cfg(unix)]
+            use std::os::unix::fs::PermissionsExt;
+            let state = SourceEntry {
+                kind,
+                readonly: metadata.permissions().readonly(),
+                #[cfg(unix)]
+                mode: metadata.permissions().mode(),
+            };
+            assert!(
+                digests
+                    .insert(path.strip_prefix(directory).unwrap().to_path_buf(), state)
+                    .is_none()
+            );
+        }
+    }
+    assert!(!digests.is_empty());
+    digests
+}
+
+#[test]
+fn source_preservation_manifest_tracks_nested_files_empty_directories_and_moves() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    fs::create_dir_all(source.join("doctor/receipts")).unwrap();
+    fs::write(source.join("agent_search.db"), b"database bytes").unwrap();
+    let evidence = source.join("doctor/evidence.json");
+    fs::write(&evidence, b"private recovery evidence").unwrap();
+    let before = source_file_digests(&source);
+    assert_eq!(before.len(), 4);
+    assert_eq!(
+        before[Path::new("doctor/receipts")].kind,
+        SourceEntryKind::Directory
+    );
+    assert_eq!(
+        before[Path::new("doctor/evidence.json")].kind,
+        SourceEntryKind::File {
+            bytes: 25,
+            sha256: Sha256::digest(b"private recovery evidence").into(),
+        }
+    );
+
+    fs::write(&evidence, b"changed recovery evidence").unwrap();
+    assert_ne!(source_file_digests(&source), before);
+    fs::write(&evidence, b"private recovery evidence").unwrap();
+    assert_eq!(source_file_digests(&source), before);
+
+    fs::rename(source.join("doctor/receipts"), source.join("doctor/moved")).unwrap();
+    assert_ne!(source_file_digests(&source), before);
+    fs::rename(source.join("doctor/moved"), source.join("doctor/receipts")).unwrap();
+    assert_eq!(source_file_digests(&source), before);
+    fs::create_dir(source.join("doctor/new-empty-directory")).unwrap();
+    assert_ne!(source_file_digests(&source), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn source_preservation_manifest_records_symlinks_without_following_them() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let external = root.path().join("external");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&external).unwrap();
+    fs::write(source.join("agent_search.db"), b"database bytes").unwrap();
+    fs::write(external.join("private.txt"), b"outside the source tree").unwrap();
+    symlink(&external, source.join("directory-link")).unwrap();
+    symlink(external.join("private.txt"), source.join("file-link")).unwrap();
+    symlink(&source, source.join("cycle")).unwrap();
+    symlink("missing-target", source.join("dangling")).unwrap();
+    let before = source_file_digests(&source);
+    assert_eq!(before.len(), 5);
+    assert_eq!(
+        before[Path::new("directory-link")].kind,
+        SourceEntryKind::Symlink(external.clone())
+    );
+    assert_eq!(
+        before[Path::new("dangling")].kind,
+        SourceEntryKind::Symlink(PathBuf::from("missing-target"))
+    );
+    assert!(!before.contains_key(Path::new("directory-link/private.txt")));
+
+    fs::write(
+        external.join("private.txt"),
+        b"external change is not followed",
+    )
+    .unwrap();
+    fs::create_dir(external.join("new-external-directory")).unwrap();
+    assert_eq!(source_file_digests(&source), before);
+}
+
+#[test]
+fn real_binary_large_collection_exports_all_typed_rows_and_verifies_the_backup() {
+    let root = tempfile::tempdir().unwrap();
+    let source_directory = root.path().join("source");
+    fs::create_dir(&source_directory).unwrap();
+    let source = source_directory.join("agent_search.db");
+    collection_fixture(&source);
+    let before = source_file_digests(&source_directory);
+    let input = root.path().join("large-collection.jsonl");
+    let exported = export(root.path(), &source, &input);
+    assert_eq!(exported["schema_version"], 3);
+    assert_eq!(exported["tables"]["messages"], COLLECTION_ROWS);
+    assert_eq!(exported["integrity_verified"], true);
+    assert_eq!(exported["contains_private_data"], true);
+    assert!(fs::metadata(&input).unwrap().len() > RECORD_LIMIT_BYTES as u64);
+    let verified = receipt(
+        command(root.path())
+            .args(["archive", "verify"])
+            .arg(&input)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(verified["operation"], "verify");
+    assert_eq!(verified["schema_version"], 3);
+    for field in ["content_sha256", "records", "tables"] {
+        assert_eq!(verified[field], exported[field], "{field}");
+    }
+
+    // Inspect actual typed cells, including escaped text, NULLs, integer IDs,
+    // metadata and BLOBs. Matching receipts alone could miss the same omitted
+    // rows in both export and verification. Retain only one wire record.
+    let mut reader = BufReader::new(fs::File::open(&input).unwrap());
+    let mut line = String::new();
+    let mut table = String::new();
+    let mut columns = Vec::new();
+    let mut counts = BTreeMap::<String, u64>::new();
+    let mut message_position = 0_i64;
+    let mut saw_real = false;
+    let mut saw_completion = false;
+    while reader.read_line(&mut line).unwrap() != 0 {
+        assert!(line.len() <= RECORD_LIMIT_BYTES);
+        let record: Value = serde_json::from_str(&line).unwrap();
+        match record["type"].as_str().unwrap() {
+            "header" => {
+                assert_eq!(record["header"]["schema_version"], 3);
+                assert_eq!(record["header"]["contains_private_data"], true);
+            }
+            "table" => {
+                table = record["table"]["name"].as_str().unwrap().to_owned();
+                columns = record["table"]["columns"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|column| column.as_str().unwrap().to_owned())
+                    .collect();
+                assert!(counts.insert(table.clone(), 0).is_none());
+            }
+            "row" => {
+                *counts.get_mut(&table).unwrap() += 1;
+                let values = record["values"].as_array().unwrap();
+                let cell =
+                    |name: &str| &values[columns.iter().position(|column| column == name).unwrap()];
+                if table == "messages" {
+                    let position = message_position;
+                    assert_eq!(
+                        cell("id"),
+                        &serde_json::json!({"kind": "integer", "value": 10_000 + 3 * position})
+                    );
+                    assert_eq!(
+                        cell("conversation_id"),
+                        &serde_json::json!({"kind": "integer", "value": 7})
+                    );
+                    assert_eq!(
+                        cell("idx"),
+                        &serde_json::json!({"kind": "integer", "value": 2 * position})
+                    );
+                    assert_eq!(
+                        cell("role"),
+                        &serde_json::json!({"kind": "text", "value": "assistant"})
+                    );
+                    let author = if position % 2 == 0 {
+                        serde_json::json!({"kind": "null"})
+                    } else {
+                        serde_json::json!({"kind": "text", "value": "archive_fixture"})
+                    };
+                    assert_eq!(cell("author"), &author);
+                    assert_eq!(
+                        cell("created_at"),
+                        &serde_json::json!({"kind": "integer", "value": 1_733_000_000_000_i64 + position})
+                    );
+                    assert_eq!(
+                        cell("content"),
+                        &serde_json::json!({"kind": "text", "value": collection_body(position)})
+                    );
+                    assert_eq!(
+                        cell("extra_json"),
+                        &serde_json::json!({"kind": "text", "value": collection_extra(position)})
+                    );
+                    assert_eq!(
+                        cell("extra_bin"),
+                        &serde_json::json!({"kind": "blob", "value": STANDARD.encode(PRIVATE_COLLECTION_BLOB)})
+                    );
+                    message_position += 1;
+                } else if table == "conversations" {
+                    assert_eq!(
+                        cell("estimated_cost_usd"),
+                        &serde_json::json!({"kind": "real", "value": "3fc0000000000000"})
+                    );
+                    saw_real = true;
+                }
+            }
+            "completion" => {
+                assert!(!saw_completion);
+                assert_eq!(
+                    record["completion"]["content_sha256"],
+                    exported["content_sha256"]
+                );
+                saw_completion = true;
+            }
+            // ubs:ignore -- intentional unit-test contract assertion.
+            other => panic!("unexpected wire record type {other}"),
+        }
+        line.clear();
+    }
+    assert_eq!(message_position, COLLECTION_ROWS);
+    assert!(saw_real && saw_completion);
+    assert_eq!(exported["tables"], serde_json::to_value(&counts).unwrap());
+    assert_eq!(exported["records"], counts.values().sum::<u64>());
+
+    // Exercise replay through its persisted publication image, across many
+    // batches. Compare every restored message independently of archive receipts
+    // while retaining only one row and its expected payload at a time.
+    let restored_directory = root.path().join("restored-collection");
+    fs::create_dir(&restored_directory).unwrap();
+    let target = restored_directory.join("agent_search.db");
+    let imported = receipt(import(root.path(), &input, &target, false));
+    assert_eq!(imported["destination_status"], "created");
+    assert_eq!(imported["integrity_verified"], true);
+    for field in ["content_sha256", "records", "tables"] {
+        assert_eq!(imported[field], exported[field], "{field}");
+    }
+    for suffix in ["-wal", "-shm", "-journal"] {
+        assert!(
+            !restored_directory
+                .join(format!("agent_search.db{suffix}"))
+                .exists()
+        );
+    }
+    let reader = coding_agent_search::franken_sync::compat::open_with_flags(
+        target.to_str().unwrap(),
+        coding_agent_search::franken_sync::compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    reader.execute("BEGIN").unwrap();
+    let mut restored_rows = 0_i64;
+    reader
+        .query_with_params_for_each(
+            "SELECT id, conversation_id, idx, role, author, created_at,
+                    content, extra_json, extra_bin FROM messages ORDER BY id",
+            &[],
+            |row| {
+                let position = restored_rows;
+                assert_eq!(row.get_typed::<i64>(0)?, 10_000 + 3 * position);
+                assert_eq!(row.get_typed::<i64>(1)?, 7);
+                assert_eq!(row.get_typed::<i64>(2)?, 2 * position);
+                assert!(row.get_typed::<String>(3)? == "assistant");
+                assert!(
+                    row.get_typed::<Option<String>>(4)?
+                        == if position % 2 == 0 {
+                            None
+                        } else {
+                            Some("archive_fixture".to_owned())
+                        }
+                );
+                assert_eq!(row.get_typed::<i64>(5)?, 1_733_000_000_000 + position);
+                assert!(
+                    row.get_typed::<String>(6)? == collection_body(position),
+                    "restored message content changed"
+                );
+                assert!(
+                    row.get_typed::<String>(7)? == collection_extra(position),
+                    "restored message metadata changed"
+                );
+                assert!(
+                    row.get_typed::<Vec<u8>>(8)?.as_slice() == PRIVATE_COLLECTION_BLOB,
+                    "restored message BLOB changed"
+                );
+                restored_rows += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(restored_rows, COLLECTION_ROWS);
+    reader.execute("ROLLBACK").unwrap();
+    reader.close_without_checkpoint().unwrap();
+    let restored_before = source_file_digests(&restored_directory);
+    let retried = receipt(import(root.path(), &input, &target, true));
+    assert_eq!(retried["destination_status"], "unchanged");
+    assert_eq!(retried["content_sha256"], exported["content_sha256"]);
+    assert_eq!(source_file_digests(&restored_directory), restored_before);
+
+    let repeated = export(root.path(), &source, &root.path().join("repeat.jsonl"));
+    assert_eq!(repeated["content_sha256"], exported["content_sha256"]);
+    assert_eq!(source_file_digests(&source_directory), before);
+    assert!(!root.path().join("unused-default").exists());
+}
+
+#[test]
+fn real_binary_continued_rows_round_trip_with_bounded_frames_and_identical_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let source_directory = root.path().join("source");
+    fs::create_dir(&source_directory).unwrap();
+    let source = source_directory.join("agent_search.db");
+    collection_fixture(&source);
+    let connection = Connection::open(source.to_str().unwrap()).unwrap();
+    seed_allocation_history(&connection);
+    connection.close().unwrap();
+    let expected_allocation = allocation_state(&source);
+    assert_eq!(expected_allocation["embedding_jobs"], 100);
+    assert_eq!(expected_allocation["token_usage"], 200);
+    for raw_payload in [true, false] {
+        let case = if raw_payload {
+            "raw-payload-and-blob"
+        } else {
+            "json-escaping"
+        };
+        // Release this case's backup and restored DB before the next case.
+        // Neither fixture construction nor wire inspection retains an archive.
+        let destination = tempfile::tempdir_in(root.path()).unwrap();
+        let (content, blob) = continued_message_values(raw_payload);
+        let connection = Connection::open(source.to_str().unwrap()).unwrap();
+        assert_eq!(
+            connection
+                .execute_with_params(
+                    "UPDATE messages SET content = ?1, extra_bin = ?2 WHERE id = ?3",
+                    &[
+                        SqliteValue::Text(content.into()),
+                        SqliteValue::Blob(blob.into()),
+                        SqliteValue::Integer(10_000 + 3 * (COLLECTION_ROWS - 1)),
+                    ],
+                )
+                .unwrap(),
+            1
+        );
+        connection.close().unwrap();
+        let before = source_file_digests(&source_directory);
+        let input = destination.path().join("continued.jsonl");
+        let exported = export(root.path(), &source, &input);
+        assert_eq!(exported["schema_version"], 3);
+        assert_eq!(exported["tables"]["messages"], COLLECTION_ROWS);
+        assert_eq!(exported["integrity_verified"], true);
+        let verified = receipt(
+            command(root.path())
+                .args(["archive", "verify"])
+                .arg(&input)
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(verified["schema_version"], 3);
+        for field in ["content_sha256", "records", "tables"] {
+            assert_eq!(verified[field], exported[field], "{case}: {field}");
+        }
+
+        // Inspect one physical frame at a time. The large row must appear
+        // after more than 8 MiB of complete, ordinary message records.
+        {
+            let mut reader = BufReader::new(fs::File::open(&input).unwrap());
+            let mut line = String::new();
+            let mut table = String::new();
+            let mut message_rows = 0;
+            let mut prefix_bytes = 0;
+            let mut starts = 0;
+            let mut chunks = 0;
+            let mut ends = 0;
+            let mut completions = 0;
+            while reader.read_line(&mut line).unwrap() != 0 {
+                assert!(line.len() <= RECORD_LIMIT_BYTES, "{case}: oversized frame");
+                let frame: Value = serde_json::from_str(&line).unwrap();
+                match frame["type"].as_str().unwrap() {
+                    "header" => {
+                        assert_eq!(frame["header"]["schema_version"], 3);
+                        assert_eq!(
+                            frame["header"]["sequences"],
+                            serde_json::json!([
+                                {"table": "embedding_jobs", "value": 100},
+                                {"table": "token_usage", "value": 200}
+                            ])
+                        );
+                    }
+                    "table" => table = frame["table"]["name"].as_str().unwrap().to_owned(),
+                    "row" if table == "messages" => {
+                        message_rows += 1;
+                        prefix_bytes += line.len();
+                    }
+                    "row" => {}
+                    "row_start" => {
+                        assert_eq!(table, "messages");
+                        assert_eq!(message_rows, COLLECTION_ROWS - 1);
+                        assert!(prefix_bytes > RECORD_LIMIT_BYTES);
+                        let bytes = frame["bytes"].as_u64().unwrap();
+                        assert!(bytes > RECORD_LIMIT_BYTES as u64);
+                        assert!(bytes <= 256 * 1024 * 1024);
+                        starts += 1;
+                    }
+                    "row_chunk" => chunks += 1,
+                    "row_end" => ends += 1,
+                    "completion" => completions += 1,
+                    // ubs:ignore -- intentional unit-test contract assertion.
+                    other => panic!("unexpected wire frame type {other}"),
+                }
+                line.clear();
+            }
+            assert_eq!(message_rows, COLLECTION_ROWS - 1);
+            assert_eq!((starts, ends, completions), (1, 1, 1));
+            assert!(chunks > 1);
+        }
+
+        let restored_directory = destination.path().join("restored");
+        fs::create_dir(&restored_directory).unwrap();
+        let target = restored_directory.join("agent_search.db");
+        let imported = receipt(import(root.path(), &input, &target, false));
+        assert_eq!(imported["schema_version"], 3);
+        assert_eq!(imported["destination_status"], "created");
+        for field in ["content_sha256", "records", "tables"] {
+            assert_eq!(imported[field], exported[field], "{case}: {field}");
+        }
+
+        // Compare restored SQLite values directly, independently of matching
+        // receipts. Assertions do not print multi-megabyte private fixtures.
+        let connection = Connection::open(target.to_str().unwrap()).unwrap();
+        {
+            let row = connection
+                .query_row("SELECT content, extra_bin FROM messages ORDER BY id DESC LIMIT 1")
+                .unwrap();
+            let (content, blob) = continued_message_values(raw_payload);
+            assert!(
+                matches!(&row.values()[0], SqliteValue::Text(actual)
+                    if actual.as_bytes_direct() == content.as_bytes()),
+                "{case}: restored TEXT bytes or storage class changed"
+            );
+            assert!(
+                matches!(&row.values()[1], SqliteValue::Blob(actual)
+                    if actual.as_ref() == blob.as_slice()),
+                "{case}: restored BLOB bytes or storage class changed"
+            );
+        }
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM messages")
+                .unwrap()
+                .get_typed::<i64>(0)
+                .unwrap(),
+            COLLECTION_ROWS
+        );
+        connection.close().unwrap();
+        assert_eq!(allocation_state(&target), expected_allocation);
+        let reexported = export(
+            root.path(),
+            &target,
+            &destination.path().join("restored.jsonl"),
+        );
+        assert_eq!(reexported["schema_version"], 3);
+        for field in ["content_sha256", "records", "tables"] {
+            assert_eq!(reexported[field], exported[field], "{case}: {field}");
+        }
+        let restored_before = source_file_digests(&restored_directory);
+        let repeated = receipt(import(root.path(), &input, &target, true));
+        assert_eq!(repeated["schema_version"], 3);
+        assert_eq!(repeated["destination_status"], "unchanged");
+        assert_eq!(repeated["content_sha256"], exported["content_sha256"]);
+        assert_eq!(source_file_digests(&restored_directory), restored_before);
+        assert_eq!(source_file_digests(&source_directory), before);
+    }
+    assert!(!root.path().join("unused-default").exists());
+}
+
+#[test]
+fn real_binary_late_invalid_text_failure_is_private_and_never_published() {
+    let root = tempfile::tempdir().unwrap();
+    let source_directory = root.path().join("source");
+    let destination = root.path().join("exports");
+    fs::create_dir(&source_directory).unwrap();
+    fs::create_dir(&destination).unwrap();
+    let source = source_directory.join("agent_search.db");
+    collection_fixture(&source);
+    let mut private = PRIVATE_COLLECTION_MARKER.as_bytes().to_vec();
+    private.extend_from_slice(&[0x80, 0xff]);
+    let connection = Connection::open(source.to_str().unwrap()).unwrap();
+    assert_eq!(
+        connection
+            .execute_with_params(
+                "UPDATE messages SET content = CAST(?1 AS TEXT) WHERE id = ?2",
+                &[
+                    SqliteValue::Blob(private.into()),
+                    SqliteValue::Integer(10_000 + 3 * (COLLECTION_ROWS - 1)),
+                ],
+            )
+            .unwrap(),
+        1
+    );
+    connection.close().unwrap();
+    let before = source_file_digests(&source_directory);
+    let output = destination.join("invalid-text.jsonl");
+    let failed = command(root.path())
+        .args(["archive", "export", "--db"])
+        .arg(&source)
+        .args([
+            "--archive-id",
+            "cli-archive",
+            "--include-private",
+            "--output",
+        ])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert_eq!(failed.status.code(), Some(9));
+    assert!(
+        failed.stdout.is_empty(),
+        "failure must emit no success receipt"
+    );
+    let payload: Value = serde_json::from_slice(&failed.stderr).expect("one JSON failure");
+    assert_eq!(payload["error"]["code"], 9);
+    assert_eq!(payload["error"]["kind"], "logical-archive-error");
+    assert_eq!(payload["error"]["retryable"], false);
+    let message = payload["error"]["message"].as_str().unwrap();
+    assert!(message.contains("logical table messages"), "{message}");
+    assert!(
+        message.contains(&format!("row {COLLECTION_ROWS}")),
+        "{message}"
+    );
+    assert!(message.contains("id=13072"), "{message}");
+    assert!(message.contains("invalid UTF-8"), "{message}");
+    assert!(failed.stderr.len() < 4096, "diagnostics must stay bounded");
+    let diagnostic = String::from_utf8_lossy(&failed.stderr);
+    for private in [
+        PRIVATE_COLLECTION_MARKER.to_owned(),
+        "GH517-PRIVATE-BLOB".to_owned(),
+        STANDARD.encode(PRIVATE_COLLECTION_BLOB),
+    ] {
+        assert!(
+            !diagnostic.contains(&private),
+            "private cell leaked in diagnostic"
+        );
+    }
+    assert!(!output.exists(), "a valid prefix is not a complete backup");
+    assert_eq!(source_file_digests(&source_directory), before);
+    let remaining: Vec<_> = fs::read_dir(&destination)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(
+        remaining,
+        [".invalid-text.jsonl.logical-archive.lock".to_owned()]
+    );
+    assert!(!root.path().join("unused-default").exists());
+}
+
+#[test]
+fn real_binary_v3_preserves_deleted_allocation_history_and_next_insertions() {
+    let root = tempfile::tempdir().unwrap();
+    let source_directory = root.path().join("source");
+    let restored_directory = root.path().join("restored");
+    fs::create_dir(&source_directory).unwrap();
+    fs::create_dir(&restored_directory).unwrap();
+    let source = source_directory.join("agent_search.db");
+    allocation_fixture(&source);
+    let expected = allocation_state(&source);
+    assert_eq!(expected["embedding_jobs"], 100);
+    assert_eq!(expected["token_usage"], 200);
+    let source_before = source_file_digests(&source_directory);
+    let input = root.path().join("history.jsonl");
+    let exported = export(root.path(), &source, &input);
+    assert_eq!(exported["schema_version"], 3);
+    assert_eq!(exported["tables"]["embedding_jobs"], 1);
+    assert_eq!(exported["tables"]["token_usage"], 1);
+    assert_eq!(
+        wire_header(&input)["sequences"],
+        serde_json::json!([
+            {"table": "embedding_jobs", "value": 100},
+            {"table": "token_usage", "value": 200}
+        ])
+    );
+    let verified = receipt(
+        command(root.path())
+            .args(["archive", "verify"])
+            .arg(&input)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(verified["schema_version"], 3);
+    assert_eq!(verified["content_sha256"], exported["content_sha256"]);
+    let target = restored_directory.join("agent_search.db");
+    let imported = receipt(import(root.path(), &input, &target, false));
+    assert_eq!(imported["schema_version"], 3);
+    assert_eq!(imported["destination_status"], "created");
+    assert_eq!(imported["content_sha256"], exported["content_sha256"]);
+    assert_eq!(allocation_state(&target), expected);
+    let before = source_file_digests(&restored_directory);
+    let repeated = receipt(import(root.path(), &input, &target, true));
+    assert_eq!(repeated["schema_version"], 3);
+    assert_eq!(repeated["destination_status"], "unchanged");
+    assert_eq!(repeated["content_sha256"], exported["content_sha256"]);
+    assert_eq!(before, source_file_digests(&restored_directory));
+    let after = root.path().join("restored.jsonl");
+    let reexported = export(root.path(), &target, &after);
+    assert_eq!(reexported["schema_version"], 3);
+    assert_eq!(reexported["content_sha256"], exported["content_sha256"]);
+    assert_eq!(
+        wire_header(&after)["sequences"],
+        wire_header(&input)["sequences"]
+    );
+    assert_next_allocation(&target, 101, 201);
+    assert_eq!(source_file_digests(&source_directory), source_before);
+    assert!(!root.path().join("unused-default").exists());
+}
+
+#[test]
+fn real_binary_v3_sequence_only_conflict_is_read_only_and_private() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.db");
+    allocation_fixture(&source);
+    let input = root.path().join("history.jsonl");
+    let exported = export(root.path(), &source, &input);
+    let restored_directory = root.path().join("restored");
+    fs::create_dir(&restored_directory).unwrap();
+    let target = restored_directory.join("agent_search.db");
+    receipt(import(root.path(), &input, &target, false));
+    let connection = Connection::open(target.to_str().unwrap()).unwrap();
+    assert_eq!(
+        connection
+            .execute("UPDATE sqlite_sequence SET seq = 101 WHERE name = 'embedding_jobs'")
+            .unwrap(),
+        1
+    );
+    connection.close().unwrap();
+    let changed = export(root.path(), &target, &root.path().join("changed.jsonl"));
+    assert_eq!(changed["tables"], exported["tables"]);
+    assert_eq!(changed["records"], exported["records"]);
+    assert_ne!(changed["content_sha256"], exported["content_sha256"]);
+    let before = source_file_digests(&restored_directory);
+    let refused = import(root.path(), &input, &target, true);
+    assert_eq!(refused.status.code(), Some(9));
+    assert!(refused.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&refused.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "logical-archive-error");
+    assert_eq!(error["error"]["retryable"], false);
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("conflict")
+    );
+    let diagnostic = String::from_utf8_lossy(&refused.stderr);
+    assert!(!diagnostic.contains("PRIVATE-ALLOCATION-DATA"));
+    assert!(!diagnostic.contains("/absent/private/"));
+    assert_eq!(before, source_file_digests(&restored_directory));
+    assert_eq!(allocation_state(&target)["embedding_jobs"], 101);
+}
+
+#[test]
+fn real_binary_v3_distinguishes_empty_missing_and_zero_allocation_state() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.db");
+    allocation_fixture(&source);
+    let connection = Connection::open(source.to_str().unwrap()).unwrap();
+    connection
+        .execute_batch("DELETE FROM embedding_jobs; DELETE FROM token_usage;")
+        .unwrap();
+    connection.close().unwrap();
+    let mut digests = Vec::new();
+    // Reuse one source so the canonical rows, including migration timestamps,
+    // are identical: any digest change must authenticate allocation state.
+    for case in ["retained", "zero", "absent"] {
+        let directory = root.path().join(case);
+        fs::create_dir(&directory).unwrap();
+        let connection = Connection::open(source.to_str().unwrap()).unwrap();
+        match case {
+            "absent" => {
+                connection.execute("DELETE FROM sqlite_sequence").unwrap();
+            }
+            "zero" => {
+                connection
+                    .execute("UPDATE sqlite_sequence SET seq = 0")
+                    .unwrap();
+            }
+            _ => {}
+        }
+        connection.close().unwrap();
+        let expected = allocation_state(&source);
+        let values = match case {
+            "retained" => (Some(100), Some(200)),
+            "zero" => (Some(0), Some(0)),
+            _ => (None, None),
+        };
+        assert_eq!(expected.get("embedding_jobs").copied(), values.0);
+        assert_eq!(expected.get("token_usage").copied(), values.1);
+        let input = directory.join("history.jsonl");
+        let exported = export(root.path(), &source, &input);
+        assert_eq!(exported["schema_version"], 3);
+        assert_eq!(exported["tables"]["embedding_jobs"], 0);
+        assert_eq!(exported["tables"]["token_usage"], 0);
+        assert_eq!(
+            wire_header(&input)["sequences"],
+            serde_json::json!([
+                {"table": "embedding_jobs", "value": values.0},
+                {"table": "token_usage", "value": values.1}
+            ])
+        );
+        let target = directory.join("restored.db");
+        let imported = receipt(import(root.path(), &input, &target, false));
+        assert_eq!(imported["content_sha256"], exported["content_sha256"]);
+        assert_eq!(allocation_state(&target), expected);
+        let restored = export(root.path(), &target, &directory.join("restored.jsonl"));
+        assert_eq!(restored["content_sha256"], exported["content_sha256"]);
+        digests.push(exported["content_sha256"].clone());
+        assert_next_allocation(
+            &target,
+            if case == "retained" { 101 } else { 1 },
+            if case == "retained" { 201 } else { 1 },
+        );
+    }
+    assert_ne!(digests[0], digests[1]);
+    assert_ne!(digests[0], digests[2]);
+    assert_ne!(digests[1], digests[2]);
+}
+
+#[test]
+fn real_binary_v1_v2_round_trips_keep_their_original_digest_and_omission_contract() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.db");
+    allocation_fixture(&source);
+    let mut legacy_digest = None;
+    for version in [1, 2] {
+        let directory = root.path().join(format!("v{version}"));
+        fs::create_dir(&directory).unwrap();
+        let input = directory.join("history.jsonl");
+        let exported = export_version(root.path(), &source, &input, Some(version));
+        assert_eq!(exported["schema_version"], version);
+        assert!(wire_header(&input).get("sequences").is_none());
+        if let Some(expected) = &legacy_digest {
+            assert_eq!(&exported["content_sha256"], expected);
+        } else {
+            legacy_digest = Some(exported["content_sha256"].clone());
+        }
+        let verified = receipt(
+            command(root.path())
+                .args(["archive", "verify"])
+                .arg(&input)
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(verified["schema_version"], version);
+        assert_eq!(verified["content_sha256"], exported["content_sha256"]);
+        let target = directory.join("restored.db");
+        let imported = receipt(import(root.path(), &input, &target, false));
+        assert_eq!(imported["schema_version"], version);
+        assert_eq!(imported["destination_status"], "created");
+        assert_eq!(imported["content_sha256"], exported["content_sha256"]);
+        // The old formats intentionally did not record deleted allocation IDs.
+        assert_eq!(allocation_state(&target)["embedding_jobs"], 2);
+        assert_eq!(allocation_state(&target)["token_usage"], 7);
+        let before = source_file_digests(&directory);
+        let repeated = receipt(import(root.path(), &input, &target, true));
+        assert_eq!(repeated["schema_version"], version);
+        assert_eq!(repeated["destination_status"], "unchanged");
+        assert_eq!(repeated["content_sha256"], exported["content_sha256"]);
+        assert_eq!(before, source_file_digests(&directory));
+        let after = export_version(
+            root.path(),
+            &target,
+            &directory.join("restored-v2.jsonl"),
+            Some(2),
+        );
+        assert_eq!(after["content_sha256"], exported["content_sha256"]);
+        let current = export(root.path(), &target, &directory.join("restored-v3.jsonl"));
+        assert_eq!(current["schema_version"], 3);
+        assert_ne!(current["content_sha256"], exported["content_sha256"]);
+        assert_next_allocation(&target, 3, 8);
+    }
+    assert!(!root.path().join("unused-default").exists());
+    assert!(!root.path().join("data/cass/models").exists());
+}
+
+#[test]
+fn restored_remote_sessions_are_readable_without_the_original_archive_or_sources() {
+    let root = tempfile::tempdir().unwrap();
+    let source_directory = root.path().join("original");
+    fs::create_dir(&source_directory).unwrap();
+    let source = source_directory.join("agent_search.db");
+    let stale_path = root.path().join("vanished/provider/session.jsonl");
+    assert!(!stale_path.exists());
+    let storage = SqliteStorage::open(&source).unwrap();
+    let mut identities = Vec::new();
+    for (agent, source_id, target) in [
+        ("claude_code", "remote-a", "restored claude evidence δ"),
+        ("codex", "remote-b", "restored codex evidence 日本語"),
+    ] {
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: agent.to_owned(),
+                name: agent.to_owned(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let external_id = format!("portable-{source_id}");
+        storage
+            .insert_conversation_tree(agent_id, None, &Conversation {
+                id: None,
+                agent_slug: agent.to_owned(),
+                workspace: None,
+                external_id: Some(external_id.clone()),
+                title: Some(format!("Recovered {source_id}")),
+                source_path: stale_path.clone(),
+                started_at: Some(1_733_000_000_000),
+                ended_at: None,
+                approx_tokens: None,
+                metadata_json: serde_json::json!({"provider_origin": source_id}),
+                // More than one private replay batch, with a sparse final ordinal.
+                messages: (0..130)
+                    .map(|position| Message {
+                        id: None,
+                        idx: if position == 129 { 1024 } else { position },
+                        role: MessageRole::Agent,
+                        author: Some(agent.to_owned()),
+                        created_at: Some(1_733_000_000_000 + position),
+                        content: if position == 129 {
+                            target.to_owned()
+                        } else {
+                            format!("{source_id} retained neighbour {position}")
+                        },
+                        extra_json: serde_json::json!({"provider_usage": {"input_tokens": position}}),
+                        snippets: Vec::new(),
+                    })
+                    .collect(),
+                source_id: source_id.to_owned(),
+                origin_host: Some(source_id.to_owned()),
+            })
+            .unwrap();
+        let ids: Vec<i64> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                coding_agent_search::franken_sync::params![external_id.as_str()],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        identities.push((source_id, ids[0], target));
+    }
+    drop(storage);
+    let input = root.path().join("portable.jsonl");
+    let exported = export(root.path(), &source, &input);
+    assert_eq!(exported["tables"]["messages"], 260);
+    let input_bytes = fs::read(&input).unwrap();
+    // Preserve the source files, but make their original names unavailable.
+    fs::rename(&source_directory, root.path().join("retired-source")).unwrap();
+    assert!(!source.exists());
+    let restored = root.path().join("restored.db");
+    let imported = receipt(import(root.path(), &input, &restored, false));
+    assert_eq!(imported["content_sha256"], exported["content_sha256"]);
+    let database_bytes = fs::read(&restored).unwrap();
+    for (source_id, cid, target) in identities {
+        for operation in ["view", "expand"] {
+            let payload = receipt(
+                command(root.path())
+                    .arg("--db")
+                    .arg(&restored)
+                    .arg(operation)
+                    .arg(&stale_path)
+                    .args([
+                        "--source",
+                        source_id,
+                        "--conversation-id",
+                        &cid.to_string(),
+                        "--message-index",
+                        "1025",
+                        "-C",
+                        "0",
+                        "--json",
+                    ])
+                    .output()
+                    .unwrap(),
+            );
+            let rows = if operation == "view" {
+                &payload["lines"]
+            } else {
+                &payload
+            };
+            let rows = rows.as_array().expect("canonical follow-up rows");
+            assert_eq!(rows.len(), 1, "{payload}");
+            assert_eq!(rows[0]["content"], target);
+            assert_eq!(rows[0]["source_id"], source_id);
+            assert_eq!(rows[0]["conversation_id"], cid);
+            assert_eq!(rows[0]["message_index"], 1025);
+            assert_eq!(rows[0]["content_source"], "archive");
+        }
+    }
+    assert!(!source.exists());
+    assert!(!stale_path.exists());
+    assert_eq!(fs::read(&input).unwrap(), input_bytes);
+    assert_eq!(fs::read(&restored).unwrap(), database_bytes);
+    assert_eq!(
+        receipt(import(root.path(), &input, &restored, true))["destination_status"],
+        "unchanged"
+    );
+    assert_eq!(
+        export(
+            root.path(),
+            &restored,
+            &root.path().join("after-followup.jsonl")
+        )["content_sha256"],
+        exported["content_sha256"]
+    );
+}
+
+#[test]
+fn real_binary_requires_privacy_acknowledgement_and_never_overwrites_conflicts() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.db");
+    drop(SqliteStorage::open(&source).unwrap());
+    let input = root.path().join("history.jsonl");
+    export(root.path(), &source, &input);
+    let target = root.path().join("restored.db");
+    let output = command(root.path())
+        .args(["archive", "import"])
+        .arg(&input)
+        .args(["--archive-id", "cli-archive", "--output"])
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(serde_json::from_slice::<Value>(&output.stderr).is_ok());
+    assert!(!target.exists());
+
+    receipt(import(root.path(), &input, &target, false));
+    let writer = Connection::open(target.to_str().unwrap()).unwrap();
+    writer
+        .execute("INSERT INTO meta (key, value) VALUES ('private_note', 'SECRET-DO-NOT-ECHO')")
+        .unwrap();
+    writer.close().unwrap();
+    let before = fs::read(&target).unwrap();
+    for identical in [false, true] {
+        let output = import(root.path(), &input, &target, identical);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(serde_json::from_slice::<Value>(&output.stderr).is_ok());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("SECRET-DO-NOT-ECHO"));
+        assert_eq!(before, fs::read(&target).unwrap());
+    }
+}
+
+/// Bead ukg62: every archive failure used to exit 2 ("usage, do not retry")
+/// with one kind, so a digest mismatch and a missing file looked like typos.
+/// Each class now has its own exit code, kind and retryability, chosen by
+/// error type; a clean export/verify round trip still exits 0.
+#[test]
+fn real_binary_failure_classes_have_distinct_exit_codes_and_kinds() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path();
+    let source = home.join("source.db");
+    drop(SqliteStorage::open(&source).unwrap());
+    let failure = |args: &[&std::ffi::OsStr]| -> (i32, String, bool) {
+        let output = command(home).arg("archive").args(args).output().unwrap();
+        assert!(output.stdout.is_empty(), "failures write no receipt");
+        let payload: Value = serde_json::from_slice(&output.stderr).expect("one JSON error");
+        let error = &payload["error"];
+        let code = output.status.code().unwrap();
+        assert_eq!(error["code"], code, "{payload}");
+        (
+            code,
+            error["kind"].as_str().unwrap().to_owned(),
+            error["retryable"].as_bool().unwrap(),
+        )
+    };
+    let usage = (2, "logical-archive-usage".to_owned(), false);
+
+    // Usage: a missing required flag, and a missing privacy acknowledgement.
+    let target = home.join("usage.jsonl");
+    assert_eq!(
+        failure(&[
+            "export".as_ref(),
+            "--db".as_ref(),
+            source.as_os_str(),
+            "--include-private".as_ref(),
+            "--output".as_ref(),
+            target.as_os_str(),
+        ]),
+        usage
+    );
+    assert_eq!(
+        failure(&[
+            "export".as_ref(),
+            "--db".as_ref(),
+            source.as_os_str(),
+            "--archive-id".as_ref(),
+            "cli-archive".as_ref(),
+            "--output".as_ref(),
+            target.as_os_str(),
+        ]),
+        usage
+    );
+    assert!(!target.exists());
+
+    // Success: a clean round trip.
+    let input = home.join("history.jsonl");
+    let exported = export(home, &source, &input);
+    receipt(
+        command(home)
+            .args(["archive", "verify"])
+            .arg(&input)
+            .output()
+            .unwrap(),
+    );
+
+    // Integrity: one flipped digest character in an otherwise valid export.
+    let text = fs::read_to_string(&input).unwrap();
+    let marker = "\"content_sha256\":\"";
+    let at = text.rfind(marker).unwrap() + marker.len();
+    let mut bytes = text.into_bytes();
+    bytes[at] = if bytes[at] == b'0' { b'1' } else { b'0' };
+    let corrupt = home.join("corrupt.jsonl");
+    fs::write(&corrupt, bytes).unwrap();
+    let integrity = (5, "logical-archive-integrity".to_owned(), false);
+    assert_eq!(
+        failure(&["verify".as_ref(), corrupt.as_os_str()]),
+        integrity
+    );
+
+    // Bead gdwzy: every reader of the same bytes reaches the same verdict, and
+    // import publishes nothing.
+    let restored = home.join("restored.db");
+    assert_eq!(
+        failure(&[
+            "import".as_ref(),
+            corrupt.as_os_str(),
+            "--archive-id".as_ref(),
+            "cli-archive".as_ref(),
+            "--include-private".as_ref(),
+            "--output".as_ref(),
+            restored.as_os_str(),
+        ]),
+        integrity
+    );
+    assert!(!restored.exists());
+    assert_eq!(
+        failure(&[
+            "search".as_ref(),
+            corrupt.as_os_str(),
+            "--contains".as_ref(),
+            "anything".as_ref(),
+            "--include-private".as_ref(),
+        ]),
+        integrity
+    );
+    let digest = exported["content_sha256"].as_str().unwrap();
+    assert_eq!(
+        failure(&[
+            "view".as_ref(),
+            corrupt.as_os_str(),
+            "--message-id".as_ref(),
+            "1".as_ref(),
+            "--content-sha256".as_ref(),
+            digest.as_ref(),
+            "--include-private".as_ref(),
+        ]),
+        integrity
+    );
+    // Negative: refusing an existing destination is not a corruption verdict,
+    // even for a valid archive.
+    let occupied = home.join("occupied.db");
+    fs::write(&occupied, b"already here").unwrap();
+    assert_eq!(
+        failure(&[
+            "import".as_ref(),
+            input.as_os_str(),
+            "--archive-id".as_ref(),
+            "cli-archive".as_ref(),
+            "--include-private".as_ref(),
+            "--output".as_ref(),
+            occupied.as_os_str(),
+        ]),
+        (9, "logical-archive-error".to_owned(), false)
+    );
+    assert_eq!(fs::read(&occupied).unwrap(), b"already here");
+
+    // I/O: the input does not exist. This is not an integrity verdict.
+    let io = (14, "logical-archive-io".to_owned(), true);
+    let missing = home.join("missing.jsonl");
+    assert_eq!(failure(&["verify".as_ref(), missing.as_os_str()]), io);
+
+    // Busy: another holder keeps the destination lock past the five-second wait.
+    let busy = home.join("busy.jsonl");
+    let lock = fs::File::create(home.join(".busy.jsonl.logical-archive.lock")).unwrap();
+    lock.lock().unwrap();
+    assert_eq!(
+        failure(&[
+            "export".as_ref(),
+            "--db".as_ref(),
+            source.as_os_str(),
+            "--archive-id".as_ref(),
+            "cli-archive".as_ref(),
+            "--include-private".as_ref(),
+            "--output".as_ref(),
+            busy.as_os_str(),
+        ]),
+        (7, "logical-archive-busy".to_owned(), true)
+    );
+    drop(lock);
+    assert!(!busy.exists());
+
+    // I/O, not usage: an unwritable destination whose path contains "usage".
+    // Root bypasses directory permissions, which would make this vacuous.
+    #[cfg(unix)]
+    if !running_as_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let sealed = home.join("usage-readonly");
+        fs::create_dir(&sealed).unwrap();
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o555)).unwrap();
+        let output = sealed.join("history.jsonl");
+        let result = failure(&[
+            "export".as_ref(),
+            "--db".as_ref(),
+            source.as_os_str(),
+            "--archive-id".as_ref(),
+            "cli-archive".as_ref(),
+            "--include-private".as_ref(),
+            "--output".as_ref(),
+            output.as_os_str(),
+        ]);
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(result, io);
+        assert!(!output.exists());
+    }
+}
+
+/// Whether the test runs as uid 0, where directory permissions are bypassed.
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .is_ok_and(|output| output.stdout.trim_ascii() == b"0")
+}
+
+#[test]
+fn real_binary_never_publishes_a_valid_prefix_or_an_unknown_version() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.db");
+    drop(SqliteStorage::open(&source).unwrap());
+    let input = root.path().join("history.jsonl");
+    export(root.path(), &source, &input);
+    let original = fs::read(&input).unwrap();
+    let newline = original.iter().position(|byte| *byte == b'\n').unwrap();
+    let mut header: Value = serde_json::from_slice(&original[..newline]).unwrap();
+    header["header"]["schema_version"] = Value::from(999);
+    let mut unknown = serde_json::to_vec(&header).unwrap();
+    unknown.extend_from_slice(&original[newline..]);
+    for (index, bytes) in [original[..original.len() - 1].to_vec(), unknown]
+        .into_iter()
+        .enumerate()
+    {
+        let invalid = root.path().join(format!("invalid-{index}.jsonl"));
+        fs::write(&invalid, bytes).unwrap();
+        let target = root.path().join(format!("target-{index}.db"));
+        let output = import(root.path(), &invalid, &target, false);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(serde_json::from_slice::<Value>(&output.stderr).is_ok());
+        assert!(!target.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn real_binary_verify_refuses_a_fifo_without_waiting_for_a_writer() {
+    use std::os::unix::fs::FileTypeExt;
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("history.fifo");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&input)
+            .status()
+            .expect("create FIFO fixture")
+            .success()
+    );
+    assert!(fs::symlink_metadata(&input).unwrap().file_type().is_fifo());
+    // No process opens the write end. The old File::open blocks indefinitely;
+    // the external deadline prevents the regression itself hanging the suite.
+    let output = command(root.path())
+        .timeout(Duration::from_secs(5))
+        .args(["archive", "verify"])
+        .arg(&input)
+        .output()
+        .expect("verification must return a diagnostic, not time out");
+    assert!(
+        output.status.code().is_some(),
+        "verifier was killed instead of refusing input"
+    );
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&output.stderr).expect("one JSON error");
+    assert!(error.to_string().contains("regular, non-symlink"));
+    assert!(fs::symlink_metadata(&input).unwrap().file_type().is_fifo());
+    assert!(!root.path().join("unused-default").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn real_binary_verify_preserves_regular_input_and_refuses_a_link_to_it() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.db");
+    drop(SqliteStorage::open(&source).unwrap());
+    let input = root.path().join("history.jsonl");
+    let exported = export(root.path(), &source, &input);
+    let before = fs::read(&input).unwrap();
+    let verified = receipt(
+        command(root.path())
+            .args(["archive", "verify"])
+            .arg(&input)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(verified["operation"], "verify");
+    assert_eq!(verified["content_sha256"], exported["content_sha256"]);
+    assert_eq!(verified["tables"], exported["tables"]);
+    let linked = root.path().join("linked.jsonl");
+    symlink(&input, &linked).unwrap();
+    let output = command(root.path())
+        .args(["archive", "verify"])
+        .arg(&linked)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&output.stderr).expect("one JSON error");
+    assert!(error.to_string().contains("regular, non-symlink"));
+    assert_eq!(fs::read(&input).unwrap(), before);
+    assert_eq!(fs::read_link(&linked).unwrap(), input);
+    assert!(!root.path().join("unused-default").exists());
+}
+
+fn import_with_lexical_rebuild(
+    home: &Path,
+    input: &Path,
+    target: &Path,
+    identical: bool,
+) -> Output {
+    let mut cmd = command(home);
+    cmd.args(["archive", "import"])
+        .arg(input)
+        .args([
+            "--archive-id",
+            "cli-archive",
+            "--include-private",
+            "--rebuild-index",
+            "--output",
+        ])
+        .arg(target);
+    if identical {
+        cmd.arg("--if-identical");
+    }
+    cmd.output().unwrap()
+}
+
+fn search_recovered(home: &Path, data_dir: &Path, query: &str) -> Value {
+    // No --db: the recovered profile must be usable by the ordinary CLI.
+    // --no-maintenance prevents a search-triggered repair from hiding a failed
+    // import-time rebuild. Explicit lexical mode needs no installed model.
+    receipt(
+        command(home)
+            .args([
+                "search",
+                query,
+                "--mode",
+                "lexical",
+                "--robot",
+                "--no-maintenance",
+                "--limit",
+                "20",
+                "--data-dir",
+            ])
+            .arg(data_dir)
+            .output()
+            .unwrap(),
+    )
+}
+
+fn portable_search_fixture(home: &Path) -> (std::path::PathBuf, Value, std::path::PathBuf) {
+    let original = home.join("original-search-source");
+    fs::create_dir(&original).unwrap();
+    let source = original.join("agent_search.db");
+    let missing_source = home.join("vanished-provider/shared.jsonl");
+    let storage = SqliteStorage::open(&source).unwrap();
+    for (agent, source_id) in [("claude_code", "remote-a"), ("codex", "remote-b")] {
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: agent.into(),
+                name: agent.into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &Conversation {
+                    id: None,
+                    agent_slug: agent.into(),
+                    workspace: None,
+                    external_id: Some(format!("indexed-{source_id}")),
+                    title: Some(format!("Portable search {source_id}")),
+                    source_path: missing_source.clone(),
+                    started_at: Some(1_733_000_000_000),
+                    ended_at: None,
+                    approx_tokens: None,
+                    metadata_json: serde_json::json!({}),
+                    messages: [0, 7]
+                        .into_iter()
+                        .map(|idx| Message {
+                            id: None,
+                            idx,
+                            role: MessageRole::User,
+                            author: None,
+                            created_at: Some(1_733_000_000_000 + idx),
+                            content: format!(
+                                "PORTABLENEEDLE complete recovered evidence {source_id} at {idx} δ"
+                            ),
+                            extra_json: serde_json::json!({}),
+                            snippets: Vec::new(),
+                        })
+                        .collect(),
+                    source_id: source_id.into(),
+                    origin_host: Some(source_id.into()),
+                },
+            )
+            .unwrap();
+    }
+    drop(storage);
+    let input = home.join("searchable-history.jsonl");
+    let exported = export(home, &source, &input);
+    fs::rename(&original, home.join("retired-search-source")).unwrap();
+    assert!(!source.exists());
+    assert!(!missing_source.exists());
+    (input, exported, missing_source)
+}
+
+#[test]
+fn indexed_import_completes_the_source_less_search_to_canonical_evidence_journey() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, missing_source) = portable_search_fixture(root.path());
+    let input_bytes = fs::read(&input).unwrap();
+    let data = root.path().join("recovered-profile");
+    fs::create_dir(&data).unwrap();
+    let target = data.join("agent_search.db");
+    let imported = receipt(import_with_lexical_rebuild(
+        root.path(),
+        &input,
+        &target,
+        false,
+    ));
+    assert_eq!(imported["content_sha256"], exported["content_sha256"]);
+    assert_eq!(imported["destination_status"], "created");
+    assert_eq!(
+        imported["derived_search_assets"],
+        "lexical_rebuilt_semantic_not_built"
+    );
+    assert_eq!(imported["lexical_rebuild"]["indexed_documents"], 4);
+    assert_eq!(
+        imported["lexical_rebuild"]["provider_scan_performed"],
+        false
+    );
+    assert_eq!(imported["lexical_rebuild"]["semantic_assets_built"], false);
+    let database_bytes = fs::read(&target).unwrap();
+    let searched = search_recovered(root.path(), &data, "PORTABLENEEDLE");
+    let hits = searched["hits"].as_array().expect("ordinary search hits");
+    assert_eq!(hits.len(), 4, "{searched}");
+    let mut coordinates = std::collections::BTreeSet::new();
+    for hit in hits {
+        let source_id = hit["source_id"].as_str().unwrap();
+        let conversation = hit["conversation_id"].as_i64().unwrap();
+        let ordinal = hit["line_number"].as_u64().unwrap();
+        assert!(matches!(source_id, "remote-a" | "remote-b"));
+        assert!(matches!(ordinal, 1 | 8));
+        assert_eq!(hit["source_path"], missing_source.to_str().unwrap());
+        assert!(coordinates.insert((source_id, conversation, ordinal)));
+        let viewed = receipt(
+            command(root.path())
+                .arg("--db")
+                .arg(&target)
+                .args([
+                    "view",
+                    missing_source.to_str().unwrap(),
+                    "--source",
+                    source_id,
+                    "--conversation-id",
+                    &conversation.to_string(),
+                    "--message-index",
+                    &ordinal.to_string(),
+                    "-C",
+                    "0",
+                    "--json",
+                ])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(viewed["lines"][0]["source_id"], source_id);
+        assert_eq!(viewed["lines"][0]["conversation_id"], conversation);
+        assert_eq!(viewed["lines"][0]["message_index"], ordinal);
+        assert_eq!(
+            viewed["lines"][0]["content"],
+            format!(
+                "PORTABLENEEDLE complete recovered evidence {source_id} at {} δ",
+                ordinal - 1
+            )
+        );
+    }
+    let repeated = receipt(import_with_lexical_rebuild(
+        root.path(),
+        &input,
+        &target,
+        true,
+    ));
+    assert_eq!(repeated["destination_status"], "unchanged");
+    assert_eq!(repeated["lexical_rebuild"]["indexed_documents"], 4);
+    assert_eq!(
+        search_recovered(root.path(), &data, "PORTABLENEEDLE")["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    assert_eq!(fs::read(&target).unwrap(), database_bytes);
+    assert_eq!(fs::read(&input).unwrap(), input_bytes);
+    assert_eq!(
+        export(root.path(), &target, &root.path().join("reindexed.jsonl"))["content_sha256"],
+        exported["content_sha256"]
+    );
+    assert!(!missing_source.exists());
+    assert!(!root.path().join("unused-default").exists());
+    assert!(!data.join("models").exists());
+    assert!(!data.join("vector_index").exists());
+}
+
+#[test]
+fn indexed_empty_archive_produces_a_readable_empty_lexical_generation() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("empty.db");
+    drop(SqliteStorage::open(&source).unwrap());
+    let input = root.path().join("empty.jsonl");
+    let exported = export(root.path(), &source, &input);
+    let data = root.path().join("empty-recovered");
+    fs::create_dir(&data).unwrap();
+    let imported = receipt(import_with_lexical_rebuild(
+        root.path(),
+        &input,
+        &data.join("agent_search.db"),
+        false,
+    ));
+    assert_eq!(imported["lexical_rebuild"]["indexed_documents"], 0);
+    assert_eq!(imported["content_sha256"], exported["content_sha256"]);
+    assert_eq!(
+        search_recovered(root.path(), &data, "unmatched")["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert!(!root.path().join("unused-default").exists());
+}
+
+#[test]
+fn failed_index_rebuild_retains_the_complete_restore_and_identical_retry_can_finish() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, _) = portable_search_fixture(root.path());
+    let data = root.path().join("retry-profile");
+    fs::create_dir(&data).unwrap();
+    // Actual filesystem refusal at index-run admission, after canonical import.
+    let obstruction = data.join("index-run.lock");
+    fs::create_dir(&obstruction).unwrap();
+    let target = data.join("agent_search.db");
+    let failed = import_with_lexical_rebuild(root.path(), &input, &target, false);
+    assert_eq!(failed.status.code(), Some(14));
+    assert!(failed.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&failed.stderr).expect("one JSON failure");
+    assert_eq!(error["error"]["kind"], "logical-archive-io");
+    assert_eq!(error["error"]["retryable"], true);
+    assert!(error.to_string().contains("is retained"), "{error}");
+    assert!(error.to_string().contains("--if-identical --rebuild-index"));
+    assert!(!error.to_string().contains("PORTABLENEEDLE"));
+    assert!(target.is_file());
+    assert_eq!(
+        export(
+            root.path(),
+            &target,
+            &root.path().join("after-rebuild-refusal.jsonl")
+        )["content_sha256"],
+        exported["content_sha256"]
+    );
+    let before = fs::read(&target).unwrap();
+    fs::rename(&obstruction, data.join("retained-lock-obstruction")).unwrap();
+    let retried = receipt(import_with_lexical_rebuild(
+        root.path(),
+        &input,
+        &target,
+        true,
+    ));
+    assert_eq!(retried["destination_status"], "unchanged");
+    assert_eq!(retried["lexical_rebuild"]["indexed_documents"], 4);
+    assert_eq!(fs::read(&target).unwrap(), before);
+    assert_eq!(
+        search_recovered(root.path(), &data, "PORTABLENEEDLE")["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+}
+
+#[test]
+fn busy_index_rebuild_retains_a_verified_database_and_identical_retry_finishes() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, _) = portable_search_fixture(root.path());
+    let input_before = fs::read(&input).unwrap();
+    let data = root.path().join("busy-recovered-profile");
+    fs::create_dir(&data).unwrap();
+    let target = data.join("agent_search.db");
+    let lock = fs::File::create(data.join("index-run.lock")).unwrap();
+    lock.lock().unwrap();
+
+    // This is genuine contention with another process, after canonical
+    // publication. The CLI must retain both the restored DB and the busy type.
+    let failed = import_with_lexical_rebuild(root.path(), &input, &target, false);
+    assert_eq!(failed.status.code(), Some(7));
+    assert!(failed.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&failed.stderr).expect("one JSON failure");
+    assert_eq!(error["error"]["kind"], "logical-archive-busy");
+    assert_eq!(error["error"]["retryable"], true);
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("created and is retained at"));
+    assert!(message.contains("lock contention"));
+    assert!(message.contains("--if-identical --rebuild-index"));
+    assert!(!message.contains("PORTABLENEEDLE"));
+    assert!(target.is_file());
+    assert!(!data.join("index").exists());
+    assert_eq!(fs::read(&input).unwrap(), input_before);
+    let database_before = fs::read(&target).unwrap();
+    assert_eq!(
+        export(
+            root.path(),
+            &target,
+            &root.path().join("busy-retained.jsonl")
+        )["content_sha256"],
+        exported["content_sha256"]
+    );
+
+    drop(lock);
+    let retried = receipt(import_with_lexical_rebuild(
+        root.path(),
+        &input,
+        &target,
+        true,
+    ));
+    assert_eq!(retried["destination_status"], "unchanged");
+    assert_eq!(retried["lexical_rebuild"]["indexed_documents"], 4);
+    assert_eq!(fs::read(&target).unwrap(), database_before);
+    assert_eq!(fs::read(&input).unwrap(), input_before);
+    assert_eq!(
+        search_recovered(root.path(), &data, "PORTABLENEEDLE")["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+}
+
+fn assert_indexed_import_preserves_aliased_input(link: impl Fn(&Path, &Path)) {
+    let root = tempfile::tempdir().unwrap();
+    let (input, _, _) = portable_search_fixture(root.path());
+    let input_before = fs::read(&input).unwrap();
+    for case in 0..5 {
+        let data = root.path().join(format!("aliased-profile-{case}"));
+        fs::create_dir(&data).unwrap();
+        let index = coding_agent_search::search::tantivy::expected_index_dir(&data);
+        let alias = match case {
+            0 => data.join("index-run.lock"),
+            1 => data.join("index-run.lock.meta"),
+            2 => data.join(".maintenance-events.jsonl"),
+            3 => index.join(".archive-fingerprint-cache.json.1.tmp"),
+            _ => data.join("index/.rebuild-staging/retained-segment"),
+        };
+        fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        link(&input, &alias);
+        let target = data.join("agent_search.db");
+        let failed = import_with_lexical_rebuild(root.path(), &input, &target, false);
+        assert!(!failed.status.success(), "maintenance alias case {case}");
+        assert!(failed.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&failed.stderr).expect("one JSON failure");
+        assert!(!error.to_string().contains("PORTABLENEEDLE"));
+        // Refuse before import acquires a destination lock or publishes a DB.
+        // In particular, index-run metadata must never truncate the JSONL.
+        assert!(!target.exists(), "maintenance alias case {case}");
+        assert!(!data.join(".agent_search.db.logical-archive.lock").exists());
+        assert_eq!(fs::read(&input).unwrap(), input_before);
+        assert_eq!(fs::read(&alias).unwrap(), input_before);
+    }
+}
+
+#[test]
+fn indexed_import_preserves_input_aliased_by_maintenance_hard_links() {
+    assert_indexed_import_preserves_aliased_input(|input, alias| {
+        fs::hard_link(input, alias).unwrap();
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn indexed_import_preserves_input_aliased_by_maintenance_symlinks() {
+    assert_indexed_import_preserves_aliased_input(|input, alias| {
+        std::os::unix::fs::symlink(input, alias).unwrap();
+    });
+}
+
+#[test]
+fn indexed_retry_preserves_database_aliased_by_a_maintenance_file() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, _) = portable_search_fixture(root.path());
+    let input_before = fs::read(&input).unwrap();
+    let data = root.path().join("aliased-database-profile");
+    fs::create_dir(&data).unwrap();
+    let target = data.join("agent_search.db");
+    receipt(import(root.path(), &input, &target, false));
+    let before = fs::read(&target).unwrap();
+    let alias = data.join("index-run.lock.meta");
+    fs::hard_link(&target, &alias).unwrap();
+
+    let failed = import_with_lexical_rebuild(root.path(), &input, &target, true);
+    assert!(!failed.status.success());
+    assert!(failed.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&failed.stderr).expect("one JSON failure");
+    assert!(!error.to_string().contains("PORTABLENEEDLE"));
+    assert!(!data.join("index-run.lock").exists());
+    assert!(!data.join("index").exists());
+    assert_eq!(fs::read(&target).unwrap(), before);
+    assert_eq!(fs::read(&alias).unwrap(), before);
+    assert_eq!(fs::read(&input).unwrap(), input_before);
+    assert_eq!(
+        export(
+            root.path(),
+            &target,
+            &root.path().join("alias-retained.jsonl")
+        )["content_sha256"],
+        exported["content_sha256"]
+    );
+}
+
+#[test]
+fn indexed_import_rejects_bad_layouts_and_invalid_streams_before_any_search_build() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.db");
+    drop(SqliteStorage::open(&source).unwrap());
+    let input = root.path().join("input.jsonl");
+    export(root.path(), &source, &input);
+    let data = root.path().join("destination");
+    fs::create_dir(&data).unwrap();
+    let wrong = data.join("not-the-profile-database.db");
+    let result = import_with_lexical_rebuild(root.path(), &input, &wrong, false);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("agent_search.db"));
+    assert_eq!(fs::read_dir(&data).unwrap().count(), 0);
+    let invalid = root.path().join("truncated.jsonl");
+    let bytes = fs::read(&input).unwrap();
+    fs::write(&invalid, &bytes[..bytes.len() - 1]).unwrap();
+    let target = data.join("agent_search.db");
+    let result = import_with_lexical_rebuild(root.path(), &invalid, &target, false);
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+    assert!(serde_json::from_slice::<Value>(&result.stderr).is_ok());
+    assert!(!target.exists());
+    assert!(!data.join("index").exists());
+    assert!(!data.join("index-run.lock").exists());
+    assert_eq!(fs::read(&input).unwrap(), bytes);
+}
+
+fn index_image(data: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let index = coding_agent_search::search::tantivy::expected_index_dir(data);
+    let mut image = std::collections::BTreeMap::new();
+    for entry in walkdir::WalkDir::new(&index).follow_links(false) {
+        let entry = entry.unwrap();
+        assert!(!entry.file_type().is_symlink(), "unexpected index link");
+        if entry.file_type().is_file() {
+            image.insert(
+                entry.path().strip_prefix(&index).unwrap().to_path_buf(),
+                fs::read(entry.path()).unwrap(),
+            );
+        }
+    }
+    assert!(!image.is_empty(), "the index snapshot must not be vacuous");
+    image
+}
+
+#[test]
+fn conflicting_indexed_import_preserves_the_previous_searchable_generation() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, _) = portable_search_fixture(root.path());
+    let data = root.path().join("preserved-profile");
+    fs::create_dir(&data).unwrap();
+    let target = data.join("agent_search.db");
+    receipt(import_with_lexical_rebuild(
+        root.path(),
+        &input,
+        &target,
+        false,
+    ));
+    assert_eq!(
+        search_recovered(root.path(), &data, "PORTABLENEEDLE")["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+
+    // Valid, complete input with the same caller-assigned archive ID but
+    // different canonical contents must not acquire rebuild authority.
+    let different = root.path().join("different.db");
+    drop(SqliteStorage::open(&different).unwrap());
+    let conflict = root.path().join("different.jsonl");
+    let changed = export(root.path(), &different, &conflict);
+    assert_ne!(changed["content_sha256"], exported["content_sha256"]);
+    let db_before = fs::read(&target).unwrap();
+    let index_before = index_image(&data);
+    let input_before = fs::read(&conflict).unwrap();
+    for identical in [false, true] {
+        let failed = import_with_lexical_rebuild(root.path(), &conflict, &target, identical);
+        assert!(!failed.status.success());
+        assert!(failed.stdout.is_empty());
+        assert!(serde_json::from_slice::<Value>(&failed.stderr).is_ok());
+        assert_eq!(fs::read(&target).unwrap(), db_before);
+        assert_eq!(index_image(&data), index_before);
+        assert_eq!(fs::read(&conflict).unwrap(), input_before);
+    }
+    assert_eq!(
+        search_recovered(root.path(), &data, "PORTABLENEEDLE")["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+}
+
+#[test]
+fn indexed_restore_ignores_discoverable_local_provider_histories() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, _) = portable_search_fixture(root.path());
+    // A real provider-shaped session in the isolated HOME is deliberately NOT
+    // part of the exported canonical archive. Recovery must not mix it in.
+    let project = root.path().join(".claude/projects/-test-local-history");
+    fs::create_dir_all(&project).unwrap();
+    let history = project.join("local-sentinel.jsonl");
+    let record = serde_json::json!({
+        "parentUuid": null, "cwd": "/test/local-history",
+        "sessionId": "local-sentinel", "version": "2.0.37",
+        "gitBranch": "main", "type": "user", "uuid": "local-message",
+        "timestamp": "2026-01-20T09:00:00.000Z",
+        "message": {"role": "user", "content": "LOCALHISTORYMUSTSTAYOUT unrelated local session"}
+    });
+    let history_bytes = format!("{record}\n").into_bytes();
+    fs::write(&history, &history_bytes).unwrap();
+    let data = root.path().join("isolated-recovered");
+    fs::create_dir(&data).unwrap();
+    let target = data.join("agent_search.db");
+    let result = receipt(import_with_lexical_rebuild(
+        root.path(),
+        &input,
+        &target,
+        false,
+    ));
+    assert_eq!(result["lexical_rebuild"]["indexed_documents"], 4);
+    assert_eq!(
+        search_recovered(root.path(), &data, "LOCALHISTORYMUSTSTAYOUT")["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        search_recovered(root.path(), &data, "PORTABLENEEDLE")["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    assert_eq!(fs::read(&history).unwrap(), history_bytes);
+    assert_eq!(
+        export(
+            root.path(),
+            &target,
+            &root.path().join("after-local-sentinel.jsonl")
+        )["content_sha256"],
+        exported["content_sha256"]
+    );
+    assert!(!root.path().join("unused-default").exists());
+}
+
+#[test]
+fn backup_search_finds_verified_evidence_without_a_database_or_provider_files() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, absent_source) = portable_search_fixture(root.path());
+    let before = fs::read(&input).unwrap();
+    let entries = fs::read_dir(root.path()).unwrap().count();
+    let output = receipt(
+        command(root.path())
+            .args(["archive", "search"])
+            .arg(&input)
+            .args([
+                "--contains",
+                "PORTABLENEEDLE",
+                "--limit",
+                "3",
+                "--include-private",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(output["content_sha256"], exported["content_sha256"]);
+    assert_eq!(output["matches"], 4);
+    assert_eq!(output["has_more"], true);
+    assert_eq!(output["database_opened"], false);
+    assert_eq!(output["provider_files_opened"], false);
+    assert_eq!(output["match_mode"], "literal_case_sensitive");
+    let hits = output["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 3);
+    for hit in hits {
+        assert_eq!(hit["source_path"], absent_source.to_str().unwrap());
+        let source = hit["source_id"].as_str().unwrap();
+        let idx = hit["message_index"].as_u64().unwrap() - 1;
+        assert!(matches!(source, "remote-a" | "remote-b"));
+        assert!(matches!(idx, 0 | 7));
+        assert_eq!(
+            hit["snippet"],
+            format!("PORTABLENEEDLE complete recovered evidence {source} at {idx} δ")
+        );
+    }
+    let scoped = receipt(
+        command(root.path())
+            .args(["archive", "search"])
+            .arg(&input)
+            .args([
+                "--contains",
+                "PORTABLENEEDLE",
+                "--include-private",
+                "--conversation-id",
+            ])
+            .arg(hits[0]["conversation_id"].as_i64().unwrap().to_string())
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(scoped["matches"], 2);
+    assert_eq!(fs::read(&input).unwrap(), before);
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), entries);
+    assert!(!root.path().join("unused-default").exists());
+    assert!(!absent_source.exists());
+}
+
+#[test]
+fn backup_search_withholds_all_results_until_complete_validation_and_private_consent() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, _, _) = portable_search_fixture(root.path());
+    let denied = command(root.path())
+        .args(["archive", "search"])
+        .arg(&input)
+        .args(["--contains", "PORTABLENEEDLE"])
+        .output()
+        .unwrap();
+    assert!(!denied.status.success());
+    assert!(denied.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("--include-private"));
+    let truncated = root.path().join("incomplete-search.jsonl");
+    let bytes = fs::read(&input).unwrap();
+    fs::write(&truncated, &bytes[..bytes.len() - 1]).unwrap();
+    let denied = command(root.path())
+        .args(["archive", "search"])
+        .arg(&truncated)
+        .args([
+            "--contains",
+            "PORTABLENEEDLE",
+            "--include-private",
+            "--limit",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(!denied.status.success());
+    assert!(denied.stdout.is_empty());
+    assert!(serde_json::from_slice::<Value>(&denied.stderr).is_ok());
+    assert!(!root.path().join("unused-default").exists());
+}
+
+#[test]
+fn backup_search_to_complete_view_preserves_snapshot_source_and_sparse_context() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, absent_source) = portable_search_fixture(root.path());
+    let before = fs::read(&input).unwrap();
+    let entries = fs::read_dir(root.path()).unwrap().count();
+    let searched = receipt(
+        command(root.path())
+            .args(["archive", "search"])
+            .arg(&input)
+            .args(["--contains", "PORTABLENEEDLE", "--include-private"])
+            .output()
+            .unwrap(),
+    );
+    let digest = searched["content_sha256"].as_str().unwrap();
+    for hit in searched["hits"].as_array().unwrap() {
+        let viewed = receipt(
+            command(root.path())
+                .args(["archive", "view"])
+                .arg(&input)
+                .args([
+                    "--message-id",
+                    &hit["message_id"].as_i64().unwrap().to_string(),
+                    "--content-sha256",
+                    digest,
+                    "--context",
+                    "1",
+                    "--include-private",
+                ])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(viewed["content_sha256"], exported["content_sha256"]);
+        assert_eq!(viewed["source_id"], hit["source_id"]);
+        assert_eq!(viewed["conversation_id"], hit["conversation_id"]);
+        assert_eq!(viewed["source_path"], absent_source.to_str().unwrap());
+        assert_eq!(viewed["preview_only"], false);
+        assert_eq!(viewed["database_opened"], false);
+        assert_eq!(viewed["provider_files_opened"], false);
+        let messages = viewed["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["message_index"], 1);
+        assert_eq!(messages[1]["message_index"], 8);
+        let target = messages
+            .iter()
+            .find(|message| message["is_target"] == true)
+            .unwrap();
+        assert_eq!(target["message_id"], hit["message_id"]);
+        assert_eq!(target["content"], hit["snippet"]);
+    }
+    assert_eq!(fs::read(&input).unwrap(), before);
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), entries);
+    assert!(!root.path().join("unused-default").exists());
+    assert!(!absent_source.exists());
+}
+
+#[test]
+fn backup_view_refuses_wrong_snapshots_missing_ids_and_private_output_without_consent() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, _) = portable_search_fixture(root.path());
+    let digest = exported["content_sha256"].as_str().unwrap();
+    for (id, hash, private) in [
+        (1, "0".repeat(64), true),
+        (i64::MAX, digest.to_owned(), true),
+        (1, digest.to_owned(), false),
+    ] {
+        let mut cmd = command(root.path());
+        cmd.args(["archive", "view"]).arg(&input).args([
+            "--message-id",
+            &id.to_string(),
+            "--content-sha256",
+            &hash,
+        ]);
+        if private {
+            cmd.arg("--include-private");
+        }
+        let result = cmd.output().unwrap();
+        assert!(!result.status.success());
+        assert!(result.stdout.is_empty());
+        assert!(serde_json::from_slice::<Value>(&result.stderr).is_ok());
+    }
+    assert!(!root.path().join("unused-default").exists());
+}
+
+#[test]
+fn backup_cursor_pages_all_matches_and_rejects_reuse_with_different_criteria() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, _) = portable_search_fixture(root.path());
+    let mut cursor: Option<String> = None;
+    let mut ids = std::collections::BTreeSet::new();
+    for page in 0..4 {
+        let mut cmd = command(root.path());
+        cmd.args(["archive", "search"]).arg(&input).args([
+            "--contains",
+            "PORTABLENEEDLE",
+            "--include-private",
+            "--limit",
+            "1",
+        ]);
+        if let Some(cursor) = &cursor {
+            cmd.args(["--cursor", cursor]);
+        }
+        let result = receipt(cmd.output().unwrap());
+        assert_eq!(result["content_sha256"], exported["content_sha256"]);
+        assert_eq!(result["matches"], 4);
+        assert_eq!(result["matches_after_cursor"], 4 - page);
+        let hits = result["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(ids.insert(hits[0]["message_id"].as_i64().unwrap()));
+        cursor = result["next_cursor"].as_str().map(str::to_owned);
+        assert_eq!(cursor.is_some(), page < 3);
+        if let Some(cursor) = &cursor {
+            let refused = command(root.path())
+                .args(["archive", "search"])
+                .arg(&input)
+                .args([
+                    "--contains",
+                    "different query",
+                    "--include-private",
+                    "--cursor",
+                    cursor,
+                ])
+                .output()
+                .unwrap();
+            assert!(!refused.status.success());
+            assert!(refused.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&refused.stderr).contains("different query"));
+        }
+    }
+    assert_eq!(ids.len(), 4);
+    assert!(!root.path().join("unused-default").exists());
+}

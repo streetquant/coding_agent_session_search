@@ -1,0 +1,61 @@
+{
+  "applicability": {
+    "status": "required",
+    "waiver": {
+      "approval": "",
+      "approved": false,
+      "evidence": [],
+      "reason": ""
+    }
+  },
+  "baseline_root": "REPLACE_WITH_CLEAN_PREFEATURE_BASELINE_ROOT",
+  "candidate_root": ".",
+  "cohorts": [
+    {
+      "component_ids": [
+        "INT-001"
+      ],
+      "expected_failure": {
+        "combined_contains": [],
+        "exit_codes": [
+          1
+        ]
+      },
+      "facet_ids": [
+        "FACET-001"
+      ],
+      "id": "NEC-001",
+      "paths": [
+        "REPLACE_WITH_EXACT_BEHAVIORAL_IMPLEMENTATION_PATH"
+      ],
+      "repetitions": 2,
+      "verification_command_ids": [
+        "final-focused"
+      ],
+      "waiver": {
+        "approval": "",
+        "approved": false,
+        "evidence": [],
+        "reason": ""
+      }
+    }
+  ],
+  "expected_component_actions": {
+    "INT-001": "change-required"
+  },
+  "limits": {
+    "max_cohorts": 32,
+    "max_output_bytes": 96000,
+    "max_subject_bytes": 2000000000,
+    "max_subject_files": 100000,
+    "whole_run_timeout_sec": 3600
+  },
+  "nonbehavioral_path_patterns": [
+    "tests/**",
+    "test/**",
+    "docs/**",
+    "**/*.md"
+  ],
+  "nonbehavioral_scope_approval": "Repository-default test and documentation evidence only.",
+  "schema_version": "1.0"
+}

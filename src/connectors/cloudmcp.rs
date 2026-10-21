@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+use crate::connector_ingest_diagnostics::UnsupportedSourceSchema;
+
 use super::{
     Connector, DetectionResult, DiscoveredSourceFile, DiscoveredSourceRole, NormalizedConversation,
     NormalizedMessage, ScanContext, ScanRoot, parse_timestamp,
@@ -127,13 +129,10 @@ impl CloudMcpConnector {
                 if !seen.insert(canonical_key) {
                     continue;
                 }
-                let manifest: Value = serde_json::from_slice(&fs::read(&path)?)?;
-                if json_field(&manifest, "schema_version").as_str()
-                    == Some("cloudmcp.conversation-manifest.v1")
-                {
-                    let source_root = root.clone(); // ubs:ignore -- Each source retains its originating scan-root provenance.
-                    out.push((source_root, path));
-                }
+                // Discovery must precede schema validation so the raw mirror
+                // retains malformed or unsupported canonical publications.
+                let source_root = root.clone(); // ubs:ignore -- Each source retains its originating scan-root provenance.
+                out.push((source_root, path));
             }
         }
         out.sort_by(|a, b| a.1.cmp(&b.1));
@@ -147,6 +146,11 @@ impl CloudMcpConnector {
             manifest.is_object(),
             "CloudMCP manifest must be a JSON object"
         );
+        if json_field(&manifest, "schema_version").as_str()
+            != Some("cloudmcp.conversation-manifest.v1")
+        {
+            return Err(UnsupportedSourceSchema::new(path, "CloudMCP manifest").into());
+        }
         let id = json_field(&manifest, "conversation_id")
             .as_str()
             .filter(|s| !s.is_empty())
@@ -174,18 +178,24 @@ impl CloudMcpConnector {
             "CloudMCP transcript digest mismatch (possibly active publication; retry after commit)"
         );
         let text = std::str::from_utf8(&bytes)?;
-        let mut messages = Vec::new();
-        let mut seen = HashMap::new();
+        let mut messages: Vec<NormalizedMessage> = Vec::new();
+        let mut seen: HashMap<String, (String, String, usize)> = HashMap::new();
         let mut previous = None;
         let mut rows = 0u64;
-        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        for (line_index, line) in text
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+        {
             let event: Value = serde_json::from_str(line)?;
             rows += 1;
-            ensure!(
-                json_field(&event, "schema_version").as_str()
-                    == Some("cloudmcp.conversation-event.v1"),
-                "unsupported CloudMCP event schema"
-            );
+            if json_field(&event, "schema_version").as_str()
+                != Some("cloudmcp.conversation-event.v1")
+            {
+                return Err(UnsupportedSourceSchema::new(&transcript, "CloudMCP event")
+                    .with_line(line_index as u64 + 1)
+                    .into());
+            }
             ensure!(
                 json_field(&event, "conversation_id").as_str() == Some(id)
                     && json_field(&event, "workspace_root").as_str() == Some(workspace),
@@ -209,18 +219,11 @@ impl CloudMcpConnector {
             previous = Some(sequence);
             let event_id = json_field(&event, "source_event_id")
                 .as_str()
+                .filter(|id| !id.is_empty())
                 .context("CloudMCP source event ID missing")?;
             let source_hash = json_field(&event, "source_event_sha256")
                 .as_str()
                 .context("CloudMCP source event digest missing")?;
-            if let Some((old_source_hash, old_hash)) = seen.get(event_id) {
-                ensure!(
-                    old_source_hash == source_hash && old_hash == &hash,
-                    "conflicting duplicate CloudMCP source event"
-                );
-                continue;
-            }
-            seen.insert(event_id.to_owned(), (source_hash.to_owned(), hash)); // ubs:ignore -- Owned keys and digests are required for cross-row duplicate conflict checks.
             let role = json_field(&event, "role")
                 .as_str()
                 .context("CloudMCP role missing")?;
@@ -228,6 +231,34 @@ impl CloudMcpConnector {
                 ["user", "assistant", "tool", "system"].contains(&role),
                 "unknown CloudMCP role"
             );
+            // Projection sequence numbers can differ on duplicate delivery;
+            // native identity, role, metadata and unknown fields cannot.
+            let event_identity = event
+                .as_object()
+                .context("CloudMCP event must be a JSON object")?;
+            if let Some((old_source_hash, old_hash, old_message_index)) = seen.get(event_id) {
+                let old_identity = messages
+                    .get(*old_message_index)
+                    .context("CloudMCP duplicate source event index missing")?
+                    .extra
+                    .as_object()
+                    .context("CloudMCP original event must be a JSON object")?;
+                ensure!(
+                    old_source_hash == source_hash
+                        && old_hash == &hash
+                        && old_identity.len() == event_identity.len()
+                        && event_identity
+                            .iter()
+                            .filter(|(key, _)| key.as_str() != "sequence")
+                            .all(|(key, value)| old_identity.get(key) == Some(value)),
+                    "conflicting duplicate CloudMCP source event"
+                );
+                continue;
+            }
+            seen.insert(
+                event_id.to_owned(),
+                (source_hash.to_owned(), hash, messages.len()),
+            ); // ubs:ignore -- Owned keys and digests are required for cross-row duplicate conflict checks.
             messages.push(NormalizedMessage {
                 idx: messages.len() as i64,
                 role: role.to_string(), // ubs:ignore -- The normalized role is owned while the source event stays in extra.
@@ -318,14 +349,17 @@ impl Connector for CloudMcpConnector {
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
         let mut out = Vec::new();
         for (root, path) in Self::sources(ctx)? {
-            let transcript = path
-                .parent()
-                .context("CloudMCP manifest parent")?
-                .join("transcript.jsonl");
+            let parent = path.parent().context("CloudMCP manifest parent")?;
+            let transcript = parent.join("transcript.jsonl");
+            // An explicit manifest/transcript root represents this adjacent
+            // canonical pair. Keep its origin while describing their shared
+            // physical containment for preparse capture.
+            let mut capture_root = root;
+            capture_root.path = parent.to_path_buf();
             out.push(
                 DiscoveredSourceFile::new(
                     "cloudmcp",
-                    &root,
+                    &capture_root,
                     transcript,
                     DiscoveredSourceRole::PrimarySessionLog,
                     true,
@@ -335,7 +369,7 @@ impl Connector for CloudMcpConnector {
             out.push(
                 DiscoveredSourceFile::new(
                     "cloudmcp",
-                    &root,
+                    &capture_root,
                     path,
                     DiscoveredSourceRole::MetadataSidecar,
                     true,

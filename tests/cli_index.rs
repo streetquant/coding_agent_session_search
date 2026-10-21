@@ -40,6 +40,17 @@ fn base_cmd(temp_home: &std::path::Path) -> Command {
     cmd.env("XDG_CONFIG_HOME", temp_home.join(".config"));
     // Specific overrides if needed (some might fallback to other paths, but HOME usually covers it)
     cmd.env("CODEX_HOME", temp_home.join(".codex"));
+    // HOME does not isolate Claude Code on Windows (its home comes from the
+    // profile known folder) or under an inherited CLAUDE_CONFIG_DIR; either
+    // way the host's real sessions would be indexed into the test archive.
+    cmd.env("CLAUDE_CONFIG_DIR", temp_home.join(".claude"));
+    // Once the data dir holds agent_search.db, the Aider connector's default
+    // roots are the working directory (depth 5) and HOME. Inheriting the test
+    // runner's cwd, the checkout root, indexed its Aider histories
+    // (tests/fixtures/aider, plus a git-ignored one a checkout may hold) into
+    // every archive here, so exact conversation counts failed. A test that
+    // needs a different working directory still sets its own.
+    cmd.current_dir(temp_home);
     cmd
 }
 
@@ -57,6 +68,79 @@ fn index_help_prints_usage() {
         .stdout(contains("--embedder"));
 }
 
+/// GH #450: a background run (stale-on-read refresh, scheduled job) must not
+/// start the engine's one-time migration repair of a large archive. It exits
+/// 7 with kind migration-repair-pending and leaves the archive untouched; once
+/// the migration marker is complete it no longer defers. The size guard is
+/// lowered for the child process only, so an 8 KiB file counts as large.
+#[test]
+fn background_index_defers_migration_repair_of_a_large_unmigrated_archive() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("agent_search.db");
+    fs::File::create(&db_path).unwrap().set_len(8192).unwrap();
+    let run = || {
+        base_cmd(tmp.path())
+            .args(["index", "--background", "--json", "--data-dir"])
+            .arg(&data_dir)
+            .env("CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES", "4096")
+            .env("CASS_AUTO_REFRESH", "0")
+            .output()
+            .unwrap()
+    };
+    let error_kind = |output: &std::process::Output| {
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .rev()
+            .find_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+            .map(|payload| payload["error"].clone())
+    };
+
+    let deferred = run();
+    assert_eq!(deferred.status.code(), Some(7), "{deferred:?}");
+    let error = error_kind(&deferred).expect("a JSON error envelope");
+    assert_eq!(error["kind"], "migration-repair-pending", "{error}");
+    assert_eq!(error["retryable"], false, "{error}");
+    assert!(
+        error["hint"]
+            .as_str()
+            .unwrap()
+            .contains("cass index --full"),
+        "{error}"
+    );
+    assert_eq!(fs::metadata(&db_path).unwrap().len(), 8192);
+    for suffix in [
+        "-wal",
+        "-fsqlite-ns-gate",
+        ".pre-migration-bak",
+        ".fsqlite-migration-state",
+    ] {
+        let mut sidecar = db_path.clone().into_os_string();
+        sidecar.push(suffix);
+        assert!(
+            !std::path::Path::new(&sidecar).exists(),
+            "a deferred run must not open the archive: {suffix} exists"
+        );
+    }
+
+    // Negative control: a completed migration marker lets the run proceed
+    // (this 8 KiB file is not a database, so it then fails differently).
+    let mut marker = db_path.clone().into_os_string();
+    marker.push(".fsqlite-migration-state");
+    fs::write(
+        &marker,
+        br#"{"last_upgrade_version":1,"last_run_at":0,"repairs_applied":[]}"#,
+    )
+    .unwrap();
+    let proceeded = run();
+    assert_ne!(
+        error_kind(&proceeded).map(|error| error["kind"].clone()),
+        Some(serde_json::Value::from("migration-repair-pending")),
+        "{proceeded:?}"
+    );
+}
+
 #[test]
 fn index_parses_semantic_flags() -> Result<(), String> {
     let cli = parse_cli_ok(
@@ -69,7 +153,7 @@ fn index_parses_semantic_flags() -> Result<(), String> {
             semantic, embedder, ..
         }) => {
             assert!(semantic, "semantic flag should be true");
-            assert_eq!(embedder, "fastembed");
+            assert_eq!(embedder.as_deref(), Some("fastembed"));
             Ok(())
         }
         other => Err(format!("expected index command, got {other:?}")),
@@ -77,12 +161,12 @@ fn index_parses_semantic_flags() -> Result<(), String> {
 }
 
 #[test]
-fn index_default_embedder_is_fastembed() -> Result<(), String> {
+fn index_default_embedder_defers_to_semantic_policy() -> Result<(), String> {
     let cli = parse_cli_ok(["cass", "index", "--semantic"], "parse index flags");
 
     match cli.command {
         Some(Commands::Index { embedder, .. }) => {
-            assert_eq!(embedder, "fastembed");
+            assert!(embedder.is_none());
             Ok(())
         }
         other => Err(format!("expected index command, got {other:?}")),
@@ -98,7 +182,17 @@ fn index_creates_db_and_index() {
     let mut cmd = base_cmd(tmp.path());
     cmd.args(["index", "--data-dir", data_dir.to_str().unwrap(), "--json"]);
 
-    cmd.assert().success();
+    let output = cmd.assert().success().get_output().stdout.clone();
+    let payload: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    #[cfg(target_os = "linux")]
+    assert!(
+        payload["indexing_stats"]["bytes_written"]
+            .as_u64()
+            .is_some(),
+        "Linux index summary must report its measured write counter"
+    );
+    #[cfg(not(target_os = "linux"))]
+    assert!(payload["indexing_stats"].get("bytes_written").is_none());
 
     assert!(data_dir.join("agent_search.db").exists(), "DB created");
     // Index dir should exist
@@ -106,8 +200,166 @@ fn index_creates_db_and_index() {
     assert!(index_path.exists(), "index dir created");
 }
 
-/// Requires `.workspace-trusted` authority semantics. The CASS adapter must
-/// preserve this contract while the upstream parser fix awaits a registry release.
+#[test]
+fn cdzcl_index_idempotency_rejects_invalid_cached_payloads() {
+    use coding_agent_search::franken_sync::compat::ConnectionExt;
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+    use frankensqlite::compat::RowExt;
+    use serde_json::{Value, json};
+    use std::io::Write;
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    fs::write(home.join(".env"), "").unwrap();
+    let data_dir = home.join("data");
+    let db_path = data_dir.join("agent_search.db");
+    let project = home.join(".claude/projects/-cache-shape");
+    fs::create_dir_all(&project).unwrap();
+    let session = project.join("cache-shape.jsonl");
+    let append_message = |ordinal: usize| {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&session)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "type": "user", "sessionId": "cache-shape",
+                "uuid": format!("cache-shape-{ordinal}"),
+                "timestamp": "2025-11-12T18:31:18.697Z",
+                "cwd": home.to_string_lossy(),
+                "message": {"role": "user", "content": format!("cache shape evidence {ordinal}")}
+            })
+        )
+        .unwrap();
+    };
+    let command = |robot: bool, full: bool| {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        cmd.env_clear();
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        cmd.current_dir(home)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("CASS_CLOUDMCP_DATA_ROOT", home.join("cloudmcp"))
+            .env("CASS_OPENWEBUI_DATA_ROOT", home.join("openwebui"))
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .args(["--db"])
+            .arg(&db_path)
+            .args([
+                "index",
+                "--no-progress-events",
+                "--idempotency-key",
+                "cache-shape",
+            ])
+            .arg("--data-dir")
+            .arg(&data_dir);
+        if robot {
+            cmd.arg("--json");
+        }
+        if full {
+            cmd.arg("--full");
+        }
+        cmd
+    };
+    let read_cache = || {
+        let storage = FrankenStorage::open_readonly(&db_path).unwrap();
+        let rows = storage
+            .raw()
+            .query(
+                "SELECT params_hash, result_json FROM idempotency_keys WHERE key = 'cache-shape'",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let result = (
+            rows[0].get_typed::<String>(0).unwrap(),
+            rows[0].get_typed::<String>(1).unwrap(),
+        );
+        storage.close_without_checkpoint().unwrap();
+        result
+    };
+
+    append_message(0);
+    let seed = command(true, true).output().unwrap();
+    assert!(
+        seed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+    let seed_payload: Value = serde_json::from_slice(&seed.stdout).unwrap();
+    assert_eq!(seed_payload["success"], true);
+    assert_eq!(seed_payload["messages"], 1);
+    assert_eq!(seed_payload["cached"], false);
+    let (params_hash, seed_json) = read_cache();
+    assert_eq!(
+        serde_json::from_str::<Value>(&seed_json).unwrap(),
+        seed_payload
+    );
+
+    let replay = command(true, true).output().unwrap();
+    assert!(replay.status.success());
+    let mut expected = seed_payload.clone();
+    expected["cached"] = json!(true);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&replay.stdout).unwrap(),
+        expected
+    );
+    let human_replay = command(false, true).output().unwrap();
+    assert!(human_replay.status.success());
+    assert!(human_replay.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&human_replay.stderr).contains("Using cached result"));
+    let mismatch = command(true, false).output().unwrap();
+    assert_eq!(mismatch.status.code(), Some(5));
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("different parameters"));
+    assert_eq!(read_cache(), (params_hash.clone(), seed_json));
+
+    // Four representative shapes in both output modes; the pure unit test
+    // covers the complete shape table. Invalid cache entries must not ingest
+    // appended source messages or replace the operator's cached bytes.
+    for (case, invalid) in ["{", "7", "[]", "null"].into_iter().enumerate() {
+        append_message(case + 1);
+
+        for robot in [false, true] {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            let updated = storage
+                .raw()
+                .execute_compat(
+                    "UPDATE idempotency_keys SET result_json = ?1 WHERE key = ?2",
+                    coding_agent_search::franken_sync::params![invalid, "cache-shape"],
+                )
+                .unwrap();
+            assert_eq!(updated, 1);
+            storage.close_without_checkpoint().unwrap();
+            let output = command(robot, true).output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(5),
+                "invalid={invalid} robot={robot}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("Using cached result"));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("invalid idempotency cache"));
+            let storage = FrankenStorage::open_readonly(&db_path).unwrap();
+            assert_eq!(storage.total_conversation_count().unwrap(), 1);
+            assert_eq!(storage.total_message_count().unwrap(), 1);
+            storage.close_without_checkpoint().unwrap();
+
+            assert_eq!(read_cache(), (params_hash.clone(), invalid.to_string()));
+        }
+    }
+}
+
+/// Requires `.workspace-trusted` authority semantics in the CASS adapter.
 #[test]
 fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
     use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
@@ -118,6 +370,35 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
 
     let tmp = TempDir::new().unwrap();
     let home = tmp.path();
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(home.join(".env"))
+        .expect("stop dotenv discovery at this isolated fixture home");
+    let isolated_cmd = || {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        cmd.env_clear();
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        cmd.current_dir(home)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("CODEX_HOME", home.join(".codex"))
+            // On Windows the default ~/.cursor/projects is the profile known
+            // folder, which ignores HOME and USERPROFILE.
+            .env("CASS_CURSOR_PROJECTS_ROOT", home.join(".cursor/projects"))
+            .env("CASS_CLOUDMCP_DATA_ROOT", home.join("cloudmcp"))
+            .env("CASS_OPENWEBUI_DATA_ROOT", home.join("openwebui"))
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728");
+        cmd
+    };
     let data_dir = home.join("cass-data");
     fs::create_dir_all(&data_dir).unwrap();
     let correct = home.join("parent-project/my-app");
@@ -141,7 +422,9 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
     fs::create_dir_all(&transcript_dir).unwrap();
     let transcript = transcript_dir.join("gh459-session.jsonl");
     fs::write(&transcript, "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"gh459needle retained chat\"}]}}\n").unwrap();
-    fs::File::open(&transcript)
+    fs::File::options()
+        .write(true)
+        .open(&transcript)
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(100)))
         .unwrap();
@@ -253,7 +536,7 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
     let original_analytics = analytics_snapshot(Some(workspace_id));
 
     let run_index = |canonical_only: bool, semantic: bool| {
-        let mut cmd = base_cmd(home);
+        let mut cmd = isolated_cmd();
         cmd.env("CASS_AUTO_REFRESH", "0")
             .env("CASS_IGNORE_SOURCES_CONFIG", "1")
             .args(["index", "--full", "--json", "--data-dir"])
@@ -274,7 +557,7 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
         );
     };
     let search_payload = |mode: &str, workspace: Option<&std::path::Path>| {
-        let mut cmd = base_cmd(home);
+        let mut cmd = isolated_cmd();
         cmd.env("CASS_AUTO_REFRESH", "0")
             .env("CASS_SEMANTIC_EMBEDDER", "hash")
             .args([
@@ -351,7 +634,9 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
     assert_eq!(search_count(Some(&correct)), 0);
     let sidecar = project.join(".workspace-trusted");
     fs::write(&sidecar, json!({"workspacePath":correct}).to_string()).unwrap();
-    fs::File::open(&sidecar)
+    fs::File::options()
+        .write(true)
+        .open(&sidecar)
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(100)))
         .unwrap();
@@ -439,7 +724,9 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
         0
     );
     fs::write(&sidecar, "{malformed").unwrap();
-    fs::File::open(&sidecar)
+    fs::File::options()
+        .write(true)
+        .open(&sidecar)
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(100)))
         .unwrap();
@@ -888,6 +1175,8 @@ fn index_robot_trace_ingest_flag_parses_for_perf_bisection() -> Result<(), Strin
 #[serial]
 fn index_robot_trace_ingest_emits_batch_ndjson_with_lookup_counters()
 -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+
     let tmp = TempDir::new()?;
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -896,7 +1185,7 @@ fn index_robot_trace_ingest_emits_batch_ndjson_with_lookup_counters()
     // qu81y: no process-global env mutation — base_cmd(home) passes
     // HOME/XDG/CODEX_HOME (= home/.codex) explicitly to every cass child.
 
-    make_codex_session(
+    let session = make_codex_session(
         &codex_home,
         "2026/05/13",
         "rollout-trace-ingest.jsonl",
@@ -931,6 +1220,38 @@ fn index_robot_trace_ingest_emits_batch_ndjson_with_lookup_counters()
             "--data-dir",
         ])
         .arg(&data_dir);
+    // The source ledger reuses an unchanged completed file even during a full
+    // lexical rebuild. That run must not invent an ingestion trace.
+    let unchanged_output = traced.output()?;
+    assert!(
+        unchanged_output.status.success(),
+        "unchanged index should succeed: {}",
+        String::from_utf8_lossy(&unchanged_output.stderr)
+    );
+    let unchanged_payload: serde_json::Value = serde_json::from_slice(&unchanged_output.stdout)?;
+    assert_eq!(unchanged_payload["messages"], 2);
+    assert!(
+        !String::from_utf8_lossy(&unchanged_output.stderr)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|line| line["event"] == "ingest_batch"),
+        "unchanged source must not fabricate an ingest batch"
+    );
+    let mut session_file = OpenOptions::new().append(true).open(&session)?;
+    writeln!(
+        session_file,
+        "{}",
+        serde_json::json!({
+            "timestamp": (chrono::Utc::now() + chrono::Duration::seconds(3)).to_rfc3339(),
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "trace_ingest_appended_message" }]
+            }
+        })
+    )?;
+    drop(session_file);
     let traced_output = traced.output()?;
     let stdout = String::from_utf8_lossy(&traced_output.stdout);
     let stderr = String::from_utf8_lossy(&traced_output.stderr);
@@ -944,6 +1265,7 @@ fn index_robot_trace_ingest_emits_batch_ndjson_with_lookup_counters()
         payload.get("success").and_then(|value| value.as_bool()),
         Some(true)
     );
+    assert_eq!(payload["messages"], 3);
 
     let trace = stderr
         .lines()
@@ -951,6 +1273,7 @@ fn index_robot_trace_ingest_emits_batch_ndjson_with_lookup_counters()
         .find(|line| line.get("event").and_then(|value| value.as_str()) == Some("ingest_batch"))
         .ok_or_else(|| format!("stderr should contain ingest_batch trace JSON; got: {stderr}"))?;
     assert_eq!(trace["status"], "ok");
+    assert_eq!(trace["inserted_messages"], 1);
     assert_eq!(
         trace["lexical_strategy"],
         "deferred_authoritative_db_rebuild"
@@ -1244,6 +1567,147 @@ fn watch_once_indexes_real_aider_session_with_deferred_tantivy_open() {
                 .is_some_and(|content| content.contains("lazywatchprobe"))
         }),
         "search results should include the watch-once session content; payload: {payload}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn gh478_watch_once_retains_codex_hint_when_symlink_target_has_no_provider_marker() {
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+    use frankensqlite::compat::RowExt;
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    fs::write(home.join(".env"), "").unwrap();
+    let filename = "rollout-2026-01-01T00-00-00-22222222-2222-4222-8222-222222222222.jsonl";
+    let regular = make_codex_session(
+        &home.join("regular/.codex"),
+        "2026/01",
+        filename,
+        "heliotropesymlinkneedle",
+    );
+    let external = home.join("external-store");
+    let real = make_codex_session(&external, "2026/01", filename, "heliotropesymlinkneedle");
+    let neighbor = make_codex_session(
+        &external,
+        "2026/01",
+        "rollout-neighbor.jsonl",
+        "unrequestedneighborneedle",
+    );
+    for source in [&regular, &real, &neighbor] {
+        fs::File::options()
+            .write(true)
+            .open(source)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(100)),
+            )
+            .unwrap();
+    }
+    let source_bytes = fs::read(&real).unwrap();
+    let source_mtime = fs::metadata(&real).unwrap().modified().unwrap();
+    let linked_dir = home.join("linked/.codex/sessions/2026/01");
+    fs::create_dir_all(linked_dir.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(real.parent().unwrap(), &linked_dir).unwrap();
+    let linked = linked_dir.join(filename);
+    let canonical_real = fs::canonicalize(&real).unwrap();
+    let isolated_cmd = || {
+        let mut cmd = base_cmd(home);
+        cmd.env_clear();
+        if let Some(value) = std::env::var_os("PATH") {
+            cmd.env("PATH", value);
+        }
+        cmd.current_dir(home)
+            .env("HOME", home)
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("CASS_CLOUDMCP_DATA_ROOT", home.join("cloudmcp"))
+            .env("CASS_OPENWEBUI_DATA_ROOT", home.join("openwebui"))
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728");
+        cmd
+    };
+
+    for (label, paths, expected_source) in [
+        (
+            "regular",
+            vec![regular.clone()],
+            fs::canonicalize(&regular).unwrap(),
+        ),
+        ("linked", vec![linked.clone()], canonical_real.clone()),
+        (
+            "aliases",
+            vec![linked, canonical_real.clone()],
+            canonical_real,
+        ),
+    ] {
+        let data_dir = home.join(format!("data-{label}"));
+        let output = isolated_cmd()
+            .args(["index", "--watch-once"])
+            .args(&paths)
+            .args(["--json", "--no-progress-events", "--data-dir"])
+            .arg(&data_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(payload["success"], true, "{label}: {payload}");
+
+        let storage = FrankenStorage::open_readonly(&data_dir.join("agent_search.db")).unwrap();
+        assert_eq!(storage.total_conversation_count().unwrap(), 1, "{label}");
+        assert_eq!(storage.total_message_count().unwrap(), 2, "{label}");
+        let rows = storage
+            .raw()
+            .query("SELECT source_path FROM conversations")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get_typed::<String>(0).unwrap(),
+            expected_source.to_string_lossy()
+        );
+        storage.close_without_checkpoint().unwrap();
+
+        let output = isolated_cmd()
+            .args([
+                "search",
+                "heliotropesymlinkneedle",
+                "--json",
+                "--mode",
+                "lexical",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let hits = payload["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "{label}: {payload}");
+        assert!(
+            hits.iter()
+                .all(|hit| hit["content"].as_str().is_some_and(|content| {
+                    content.contains("heliotropesymlinkneedle")
+                        && !content.contains("unrequestedneighborneedle")
+                })),
+            "{label}: {payload}"
+        );
+    }
+    assert_eq!(fs::read(&real).unwrap(), source_bytes);
+    assert_eq!(
+        fs::metadata(&real).unwrap().modified().unwrap(),
+        source_mtime
     );
 }
 
@@ -2360,6 +2824,233 @@ fn gh413_full_rebuild_drains_when_one_conversation_exceeds_the_inflight_budget()
     }
 }
 
+/// GH #483: `cass index --full --rebuild-profile bounded` runs the documented
+/// single-core, low-memory rebuild on a skewed corpus (one long conversation
+/// ahead of many small ones), indexes every message, reports the settings it
+/// used and where each came from, and leaves both kinds of conversation
+/// searchable. An explicit `CASS_TANTIVY_REBUILD_*` value still beats the
+/// preset; the default run reports no preset values; an unknown preset is a
+/// usage error.
+///
+/// No-claim: this proves the preset reaches the live rebuild on a tiny
+/// corpus. It does not measure peak RSS or wall time on the reporter's 504K
+/// message archive, and resume after SIGTERM is the source-ledger's contract.
+#[test]
+#[serial]
+fn gh483_bounded_rebuild_profile_indexes_a_skewed_corpus_and_reports_its_settings() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    let codex_root = data_dir.join(".codex").join("sessions");
+    fs::create_dir_all(&codex_root).unwrap();
+
+    let write_session = |name: &str, session_id: &str, turns: &[(String, String)]| {
+        let mut sample = serde_json::to_string(&serde_json::json!({
+            "timestamp": "2025-09-30T15:42:34.559Z",
+            "type": "session_meta",
+            "payload": {"id": session_id, "cwd": "/test/workspace", "cli_version": "0.42.0"}
+        }))
+        .unwrap();
+        sample.push('\n');
+        for (user, assistant) in turns {
+            for (role, kind, text) in [
+                ("user", "input_text", user),
+                ("assistant", "text", assistant),
+            ] {
+                sample.push_str(
+                    &serde_json::to_string(&serde_json::json!({
+                        "timestamp": "2025-09-30T15:42:36.190Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": role,
+                            "content": [{"type": kind, "text": text}]
+                        }
+                    }))
+                    .unwrap(),
+                );
+                sample.push('\n');
+            }
+        }
+        fs::write(codex_root.join(name), sample).unwrap();
+    };
+    let giant_turns: Vec<(String, String)> = (0..600)
+        .map(|turn| {
+            (
+                format!("gh483 giant question {turn} about the wedged archive"),
+                format!("gh483 giant answer {turn}"),
+            )
+        })
+        .chain(std::iter::once((
+            "gh483 giant late needle".to_string(),
+            "gh483 giant closing answer".to_string(),
+        )))
+        .collect();
+    write_session("rollout-giant.jsonl", "gh483-giant", &giant_turns);
+    for small in 0..40 {
+        write_session(
+            &format!("rollout-small-{small:02}.jsonl"),
+            &format!("gh483-small-{small:02}"),
+            &[(
+                format!("gh483 small marker {small:02}"),
+                format!("gh483 small reply {small:02}"),
+            )],
+        );
+    }
+    let expected_messages = 2 * giant_turns.len() + 2 * 40;
+
+    let index = |extra_env: &[(&str, &str)], profile: Option<&str>| {
+        let mut cmd = base_cmd(tmp.path());
+        cmd.env("CODEX_HOME", data_dir.join(".codex"));
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
+        cmd.args([
+            "index",
+            "--full",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--json",
+            "--no-progress-events",
+        ]);
+        if let Some(profile) = profile {
+            cmd.args(["--rebuild-profile", profile]);
+        }
+        let output = cmd
+            .timeout(std::time::Duration::from_secs(600))
+            .output()
+            .expect("run cass index");
+        assert!(
+            output.status.success(),
+            "index --full {profile:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("index json")
+    };
+    let settings_by_env = |report: &serde_json::Value| {
+        report["rebuild_profile"]["settings"]
+            .as_array()
+            .expect("settings array")
+            .iter()
+            .map(|setting| {
+                (
+                    setting["env"].as_str().unwrap().to_string(),
+                    (
+                        setting["value"].as_u64().unwrap(),
+                        setting["source"].clone(),
+                    ),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+
+    let bounded = index(&[], Some("bounded"));
+    assert_eq!(bounded["conversations"], 41, "{bounded}");
+    assert_eq!(bounded["messages"], expected_messages, "{bounded}");
+    let profile = &bounded["rebuild_profile"];
+    assert_eq!(profile["name"], "bounded");
+    let settings = settings_by_env(&bounded);
+    assert_eq!(settings.len(), 5, "{profile}");
+    for (env, expected) in [
+        ("CASS_TANTIVY_REBUILD_WORKERS", 1),
+        ("CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS", 1),
+        ("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE", 1),
+        ("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", 64),
+        ("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES", 64 << 20),
+    ] {
+        assert_eq!(
+            settings.get(env),
+            Some(&(expected, serde_json::json!("profile"))),
+            "{env}: {profile}"
+        );
+    }
+    let effective = &profile["effective"];
+    assert_eq!(effective["workers"], 1, "{profile}");
+    assert_eq!(effective["page_prep_workers"], 1, "{profile}");
+    assert_eq!(effective["staged_merge_workers"], 1, "{profile}");
+    assert_eq!(effective["pipeline_channel_size"], 1, "{profile}");
+    assert_eq!(
+        effective["steady_batch_fetch_conversations"], 64,
+        "{profile}"
+    );
+    assert_eq!(
+        effective["steady_commit_every_message_bytes"],
+        64 << 20,
+        "{profile}"
+    );
+
+    for needle in ["gh483 giant late needle", "gh483 small marker 37"] {
+        let output = base_cmd(tmp.path())
+            .env("CODEX_HOME", data_dir.join(".codex"))
+            .args([
+                "search",
+                needle,
+                "--json",
+                "--mode",
+                "lexical",
+                "--data-dir",
+                data_dir.to_str().unwrap(),
+            ])
+            .output()
+            .expect("run cass search");
+        assert!(
+            output.status.success(),
+            "search {needle:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let hits = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .expect("search json")["hits"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            hits.iter().any(|hit| hit["content"]
+                .as_str()
+                .is_some_and(|content| content.contains(needle))),
+            "no hit for {needle:?} after the bounded rebuild: {hits:?}"
+        );
+    }
+
+    // An explicit operator value beats the preset, and says so.
+    let overridden = index(&[("CASS_TANTIVY_REBUILD_WORKERS", "2")], Some("bounded"));
+    assert_eq!(overridden["messages"], expected_messages);
+    let settings = settings_by_env(&overridden);
+    assert_eq!(
+        settings.get("CASS_TANTIVY_REBUILD_WORKERS"),
+        Some(&(2, serde_json::json!("env")))
+    );
+    assert_eq!(
+        settings.get("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE"),
+        Some(&(1, serde_json::json!("profile")))
+    );
+    assert_eq!(overridden["rebuild_profile"]["effective"]["workers"], 2);
+
+    // Without the flag nothing is preset.
+    let default = index(&[], None);
+    assert_eq!(default["messages"], expected_messages);
+    assert_eq!(default["rebuild_profile"]["name"], "default");
+    assert_eq!(
+        default["rebuild_profile"]["settings"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        default["rebuild_profile"]["effective"]["pipeline_channel_size"],
+        4
+    );
+
+    base_cmd(tmp.path())
+        .args([
+            "index",
+            "--full",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--json",
+            "--rebuild-profile",
+            "tiny",
+        ])
+        .assert()
+        .code(2);
+}
+
 /// GH #439 / WS-B.2c: the post-publish fallback-FTS repair runs after the
 /// lexical generation is published, in phase 0, and used to emit no liveness
 /// signal — so the stall watchdog killed healthy `cass index --full` runs on
@@ -2401,6 +3092,469 @@ fn fts_repair_liveness_index_cmd(home: &std::path::Path, data_dir: &std::path::P
     .env("CASS_INDEX_STALL_ABORT_SECS", "20")
     .env("CASS_INDEX_FINALIZE_ABORT_SECS", "20");
     cmd
+}
+
+/// GH #495 (bead 2l1b0.45): archives whose SQL-fallback FTS shadow is residue
+/// must converge through both reported journeys, `cass doctor
+/// --rebuild-canonical-fts --yes` (exit 13 on the reporter's archives) and
+/// `cass index --full`, without changing canonical history. The shapes are the
+/// reported ones: orphan shadow tables with no virtual table (a surviving
+/// `_data` collided with the repair's CREATE), the legacy 7-column
+/// internal-content DDL, and that DDL with a row missing from `_docsize`
+/// (PRIMARY KEY failure). An already canonical contentless shadow is the control.
+#[test]
+fn gh495_residue_fts_shadows_converge_through_doctor_and_full_index() {
+    use coding_agent_search::franken_sync::compat::ConnectionExt;
+    use frankensqlite::compat::RowExt;
+
+    const LEGACY_DDL: &str = "CREATE VIRTUAL TABLE fts_messages USING fts5(
+        content, title, agent, workspace, source_path,
+        created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
+    let reshape = |db_path: &std::path::Path, shape: &str| {
+        let storage = SqliteStorage::open(db_path).unwrap();
+        let raw = storage.raw();
+        let mut statements: Vec<&str> = Vec::new();
+        match shape {
+            "orphan-shadow-tables" => statements.extend([
+                "DROP TABLE fts_messages",
+                "CREATE TABLE fts_messages_config(k PRIMARY KEY, v) WITHOUT ROWID",
+                "CREATE TABLE fts_messages_content(id INTEGER PRIMARY KEY, c0, c1, c2, c3, c4, c5, c6)",
+                "CREATE TABLE fts_messages_data(id INTEGER PRIMARY KEY, block BLOB)",
+                "CREATE TABLE fts_messages_docsize(id INTEGER PRIMARY KEY, sz BLOB)",
+                "CREATE TABLE fts_messages_idx(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID",
+                "INSERT INTO fts_messages_data(id, block) VALUES (10, X'00')",
+            ]),
+            "legacy-ddl" | "legacy-ddl-missing-docsize" => {
+                statements.extend(["DROP TABLE fts_messages", LEGACY_DDL]);
+            }
+            "canonical-control" => {}
+            other => panic!("unknown shape {other}"),
+        }
+        for statement in statements {
+            raw.execute(statement)
+                .unwrap_or_else(|err| panic!("{shape}: {statement}: {err}"));
+        }
+        if shape.starts_with("legacy-ddl") {
+            // Populate the legacy internal-content shadow one row per message,
+            // as the pre-V14 writer did.
+            let messages: Vec<(i64, String)> = raw
+                .query("SELECT id, content FROM messages ORDER BY id")
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.get_typed(0).unwrap(), row.get_typed(1).unwrap()))
+                .collect();
+            for (id, content) in &messages {
+                raw.execute_compat(
+                    "INSERT INTO fts_messages(
+                        rowid, content, title, agent, workspace, source_path, created_at, message_id
+                     ) VALUES (?1, ?2, '', '', '', '', 0, ?1)",
+                    coding_agent_search::franken_sync::params![*id, content.as_str()],
+                )
+                .unwrap_or_else(|err| panic!("{shape}: legacy shadow row {id}: {err}"));
+            }
+            if shape == "legacy-ddl-missing-docsize" {
+                raw.execute_compat(
+                    "DELETE FROM fts_messages_docsize WHERE id = ?1",
+                    coding_agent_search::franken_sync::params![messages[0].0],
+                )
+                .unwrap();
+            }
+        }
+        storage.close().unwrap();
+    };
+    let inspect = |db_path: &std::path::Path| {
+        let storage = SqliteStorage::open_readonly(db_path).unwrap();
+        let raw = storage.raw();
+        let count = |sql: &str| raw.query(sql).unwrap()[0].get_typed::<i64>(0).unwrap();
+        let ddl = raw
+            .query("SELECT sql FROM sqlite_master WHERE name = 'fts_messages'")
+            .unwrap()
+            .first()
+            .map(|row| row.get_typed::<String>(0).unwrap())
+            .unwrap_or_default();
+        let canonical = ["conversations", "messages"].map(|table| {
+            raw.query(&format!("SELECT * FROM {table} ORDER BY id"))
+                .unwrap()
+                .into_iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>()
+        });
+        let messages = count("SELECT COUNT(*) FROM messages");
+        let docsize = if ddl.is_empty() {
+            -1
+        } else {
+            count("SELECT COUNT(*) FROM fts_messages_docsize")
+        };
+        storage.close_without_checkpoint().unwrap();
+        (
+            // Whitespace-free, so `content = ''` and `content=''` compare alike.
+            ddl.split_whitespace().collect::<String>(),
+            docsize,
+            messages,
+            canonical,
+        )
+    };
+
+    for shape in [
+        "orphan-shadow-tables",
+        "legacy-ddl",
+        "legacy-ddl-missing-docsize",
+        "canonical-control",
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let data_dir = home.join("cass_data");
+        fs::create_dir_all(&data_dir).unwrap();
+        seed_fts_liveness_sessions(home);
+        let cass = |args: &[&str]| {
+            base_cmd(home)
+                .current_dir(home)
+                .args(args)
+                .arg("--data-dir")
+                .arg(&data_dir)
+                .env("CASS_AUTO_REFRESH", "0")
+                .env("CASS_FTS_SHADOW_MAX_MESSAGES", "0")
+                .output()
+                .unwrap()
+        };
+        let seeded = cass(&["index", "--full", "--json", "--no-progress-events"]);
+        assert!(
+            seeded.status.success(),
+            "{shape}: seed failed: {}",
+            String::from_utf8_lossy(&seeded.stderr)
+        );
+        let db_path = data_dir.join("agent_search.db");
+        let (_, _, messages, canonical_before) = inspect(&db_path);
+        assert!(messages > 1, "{shape}: the fixture must have messages");
+
+        for journey in [
+            &["doctor", "--rebuild-canonical-fts", "--yes", "--json"][..],
+            &["index", "--full", "--json", "--no-progress-events"][..],
+        ] {
+            reshape(&db_path, shape);
+            let output = cass(journey);
+            assert!(
+                output.status.success(),
+                "{shape} {journey:?}: exit {:?}\nstdout: {}\nstderr: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let (ddl, docsize, messages_after, canonical_after) = inspect(&db_path);
+            assert!(
+                ddl.contains("content=''") && ddl.contains("contentless_delete=1"),
+                "{shape} {journey:?}: the shadow must be the canonical contentless one: {ddl}"
+            );
+            assert_eq!(
+                docsize, messages_after,
+                "{shape} {journey:?}: every message must be in the shadow exactly once"
+            );
+            assert_eq!(
+                canonical_after, canonical_before,
+                "{shape} {journey:?}: canonical rows must not change"
+            );
+        }
+    }
+}
+
+/// GH #497 follow-up (reporter validation on 2026-09-23): an archive whose
+/// corpus is over `CASS_FTS_SHADOW_MAX_MESSAGES` and that still carries the
+/// `content=''`-only `fts_messages` registration must settle through
+/// `cass doctor --rebuild-canonical-fts`:
+///
+/// - the apply that retires the residue exits 0 and says so
+///   (`repair_kind = retired_not_viable`), instead of the exit 13 storage
+///   error that is indistinguishable from a failed repair;
+/// - once retired, the dry-run plans nothing and does not claim a mutation,
+///   and a repeat apply changes nothing;
+/// - the durable marker describes a settled state, not a pending action;
+/// - raising the bound recreates the canonical shadow from canonical rows.
+#[test]
+fn gh497_oversized_residue_retires_successfully_and_settles() {
+    use coding_agent_search::franken_sync::compat::ConnectionExt;
+    use frankensqlite::compat::RowExt;
+
+    // The registration the reporter's archive carried (cass before 2026-08-04).
+    const CONTENT_ONLY_DDL: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(\
+        content, title, agent, workspace, source_path, created_at UNINDEXED, \
+        content = '', tokenize = 'porter')";
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    seed_fts_liveness_sessions(home);
+    let cass = |args: &[&str], bound: &str| {
+        base_cmd(home)
+            .current_dir(home)
+            .args(args)
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CASS_FTS_SHADOW_MAX_MESSAGES", bound)
+            .output()
+            .unwrap()
+    };
+    let describe = |output: &std::process::Output| {
+        format!(
+            "exit {:?}\nstdout: {}\nstderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+    let json = |output: &std::process::Output| -> serde_json::Value {
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
+            panic!(
+                "stdout is not one JSON document ({err}): {}",
+                describe(output)
+            )
+        })
+    };
+
+    let seeded = cass(&["index", "--full", "--json", "--no-progress-events"], "0");
+    assert!(seeded.status.success(), "seed: {}", describe(&seeded));
+    let db_path = data_dir.join("agent_search.db");
+
+    // Replace the canonical shadow with the legacy content=''-only one and
+    // populate it through the virtual table, one row per message.
+    {
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let raw = storage.raw();
+        raw.execute("DROP TABLE fts_messages").unwrap();
+        raw.execute(CONTENT_ONLY_DDL).unwrap();
+        let messages: Vec<(i64, String)> = raw
+            .query("SELECT id, content FROM messages ORDER BY id")
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get_typed(0).unwrap(), row.get_typed(1).unwrap()))
+            .collect();
+        for (id, content) in &messages {
+            raw.execute_compat(
+                "INSERT INTO fts_messages(
+                    rowid, content, title, agent, workspace, source_path, created_at
+                 ) VALUES (?1, ?2, '', '', '', '', 0)",
+                coding_agent_search::franken_sync::params![*id, content.as_str()],
+            )
+            .unwrap_or_else(|err| panic!("legacy shadow row {id}: {err}"));
+        }
+        storage.close().unwrap();
+    }
+
+    // Everything a retirement or a repeat apply could touch.
+    let snapshot = || {
+        let storage = SqliteStorage::open_readonly(&db_path).unwrap();
+        let raw = storage.raw();
+        let fts_objects: Vec<String> = raw
+            .query("SELECT name FROM sqlite_master WHERE name LIKE 'fts_messages%' ORDER BY name")
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get_typed(0).unwrap())
+            .collect();
+        let markers: Vec<(String, String)> = raw
+            .query(
+                "SELECT key, value FROM meta
+                 WHERE key IN ('fts_shadow_not_viable', 'fts_fallback_repair_pending')
+                 ORDER BY key",
+            )
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get_typed(0).unwrap(), row.get_typed(1).unwrap()))
+            .collect();
+        let canonical = ["conversations", "messages"].map(|table| {
+            raw.query(&format!("SELECT * FROM {table} ORDER BY id"))
+                .unwrap()
+                .into_iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>()
+        });
+        storage.close_without_checkpoint().unwrap();
+        (fts_objects, markers, canonical)
+    };
+    let (objects_before, _, canonical_before) = snapshot();
+    assert!(
+        objects_before.iter().any(|name| name == "fts_messages"),
+        "fixture must carry the legacy registration: {objects_before:?}"
+    );
+    let message_count = canonical_before[1].len();
+    assert!(message_count > 1, "the fixture must have messages");
+    // The corpus is over this bound, so the shadow is not viable.
+    let bound = "1";
+
+    let dry_run = cass(
+        &["doctor", "--rebuild-canonical-fts", "--dry-run", "--json"],
+        bound,
+    );
+    assert!(
+        dry_run.status.success(),
+        "first dry-run: {}",
+        describe(&dry_run)
+    );
+    let dry_run = json(&dry_run);
+    assert_eq!(dry_run["parity"]["status"], "residue", "{dry_run}");
+    assert_eq!(
+        dry_run["planned_action"], "drop_residue_and_mark_not_viable",
+        "{dry_run}"
+    );
+    assert_eq!(dry_run["would_mutate"], true, "{dry_run}");
+
+    let applied = cass(
+        &["doctor", "--rebuild-canonical-fts", "--yes", "--json"],
+        bound,
+    );
+    assert!(
+        applied.status.success(),
+        "retiring an oversized residue shadow is a completed repair: {}",
+        describe(&applied)
+    );
+    let applied = json(&applied);
+    assert_eq!(applied["repair_kind"], "retired_not_viable", "{applied}");
+    assert_eq!(applied["shadow_retired"], true, "{applied}");
+    assert_eq!(applied["shadow_mutated"], true, "{applied}");
+    assert_eq!(applied["canonical_rows_modified"], false, "{applied}");
+    assert_eq!(applied["parity_before"]["status"], "residue", "{applied}");
+    assert_eq!(applied["parity_after"]["status"], "absent", "{applied}");
+    let detail = applied["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("fallback FTS shadow not viable on this engine")
+            && detail.contains("settled state")
+            && !detail.contains("once the corpus fits the bound"),
+        "the retirement detail must read as terminal: {detail}"
+    );
+
+    let (objects_retired, markers_retired, canonical_retired) = snapshot();
+    assert!(
+        objects_retired.is_empty(),
+        "every derived FTS object must be gone: {objects_retired:?}"
+    );
+    assert_eq!(
+        markers_retired.len(),
+        2,
+        "both durable markers must be recorded: {markers_retired:?}"
+    );
+    assert_eq!(
+        canonical_retired, canonical_before,
+        "canonical rows must not change"
+    );
+
+    let settled_dry_run = cass(
+        &["doctor", "--rebuild-canonical-fts", "--dry-run", "--json"],
+        bound,
+    );
+    assert!(
+        settled_dry_run.status.success(),
+        "settled dry-run: {}",
+        describe(&settled_dry_run)
+    );
+    let settled_dry_run = json(&settled_dry_run);
+    assert_eq!(
+        settled_dry_run["parity"]["status"], "absent",
+        "{settled_dry_run}"
+    );
+    assert_eq!(
+        settled_dry_run["planned_action"], "none_shadow_retired_not_viable",
+        "{settled_dry_run}"
+    );
+    assert_eq!(settled_dry_run["would_mutate"], false, "{settled_dry_run}");
+    assert_eq!(
+        settled_dry_run["apply_command"],
+        serde_json::Value::Null,
+        "{settled_dry_run}"
+    );
+
+    let repeated = cass(
+        &["doctor", "--rebuild-canonical-fts", "--yes", "--json"],
+        bound,
+    );
+    assert!(
+        repeated.status.success(),
+        "repeat apply: {}",
+        describe(&repeated)
+    );
+    let repeated = json(&repeated);
+    assert_eq!(repeated["repair_kind"], "retired_not_viable", "{repeated}");
+    assert_eq!(repeated["shadow_mutated"], false, "{repeated}");
+    let (objects_repeated, markers_repeated, canonical_repeated) = snapshot();
+    assert!(objects_repeated.is_empty(), "{objects_repeated:?}");
+    assert_eq!(
+        markers_repeated, markers_retired,
+        "a repeat apply on a settled retirement must not rewrite its markers"
+    );
+    assert_eq!(canonical_repeated, canonical_before);
+
+    // Retirement is not a dead end: once the bound admits the corpus, the
+    // same command recreates the canonical contentless shadow.
+    let unbounded = cass(
+        &["doctor", "--rebuild-canonical-fts", "--yes", "--json"],
+        "0",
+    );
+    assert!(
+        unbounded.status.success(),
+        "unbounded apply: {}",
+        describe(&unbounded)
+    );
+    let unbounded = json(&unbounded);
+    assert_eq!(
+        unbounded["repair_kind"], "failure_atomic_recreate",
+        "{unbounded}"
+    );
+    assert_eq!(
+        unbounded["parity_after"]["status"], "healthy",
+        "{unbounded}"
+    );
+    assert_eq!(
+        unbounded["repair_pending_marker_cleared"], true,
+        "{unbounded}"
+    );
+    let storage = SqliteStorage::open_readonly(&db_path).unwrap();
+    let raw = storage.raw();
+    let ddl: String = raw
+        .query("SELECT sql FROM sqlite_master WHERE name = 'fts_messages'")
+        .unwrap()[0]
+        .get_typed(0)
+        .unwrap();
+    let ddl: String = ddl.split_whitespace().collect();
+    assert!(
+        ddl.contains("content=''") && ddl.contains("contentless_delete=1"),
+        "the recreated shadow must be the canonical one: {ddl}"
+    );
+    let docsize: i64 = raw
+        .query("SELECT COUNT(*) FROM fts_messages_docsize")
+        .unwrap()[0]
+        .get_typed(0)
+        .unwrap();
+    assert_eq!(usize::try_from(docsize).unwrap(), message_count);
+    let not_viable_markers: i64 = raw
+        .query("SELECT COUNT(*) FROM meta WHERE key = 'fts_shadow_not_viable'")
+        .unwrap()[0]
+        .get_typed(0)
+        .unwrap();
+    assert_eq!(
+        not_viable_markers, 0,
+        "a viable rebuild clears the retirement marker"
+    );
+    // The retirement also recorded the repair-pending marker that `cass
+    // status` reports as `index.fallback_fts_repair.pending`; a verified
+    // healthy rebuild must clear it too, or status keeps reporting a pending
+    // repair for a shadow doctor just rebuilt.
+    let pending_markers: i64 = raw
+        .query("SELECT COUNT(*) FROM meta WHERE key = 'fts_fallback_repair_pending'")
+        .unwrap()[0]
+        .get_typed(0)
+        .unwrap();
+    assert_eq!(
+        pending_markers, 0,
+        "a verified healthy rebuild clears the repair-pending marker"
+    );
+    storage.close_without_checkpoint().unwrap();
+
+    let status = cass(&["status", "--json"], "0");
+    assert!(status.status.success(), "status: {}", describe(&status));
+    let status = json(&status);
+    assert!(
+        status["index"].get("fallback_fts_repair").is_none(),
+        "status must not report a pending FTS repair after doctor rebuilt the shadow: {status}"
+    );
 }
 
 fn seed_fts_liveness_sessions(home: &std::path::Path) {
@@ -2747,11 +3901,12 @@ fn assert_gh413_fts_shadow_bound(legacy_checkpoint: bool) {
         serde_json::from_slice(&fs::read(&checkpoint_path).unwrap()).unwrap();
     assert_eq!(initial_checkpoint["completed"], true);
     if legacy_checkpoint {
-        // The original GH #413 archive had a matching-path v2 checkpoint
-        // without execution_mode. A copied checkpoint with the old path takes
-        // the ordinary writable route and cannot exercise this regression.
+        // The original GH #413 archive had a matching-path checkpoint of the
+        // current version without execution_mode. A copied checkpoint with
+        // the old path takes the ordinary writable route and cannot exercise
+        // this regression.
         let mut legacy = initial_checkpoint.clone();
-        assert_eq!(legacy["version"], 2);
+        assert_eq!(legacy["version"], 3);
         assert_eq!(
             legacy["db"]["db_path"].as_str().unwrap(),
             fs::canonicalize(&db_path).unwrap().to_str().unwrap()
@@ -2833,9 +3988,16 @@ fn assert_gh413_fts_shadow_bound(legacy_checkpoint: bool) {
         .expect("status after the drop");
     let status_json: serde_json::Value =
         serde_json::from_slice(&status.stdout).expect("status --json output is JSON");
+    // GH #495: the drop over the bound is a settled retirement. Status keeps
+    // the reason but does not report it as a pending repair.
     let pending = &status_json["index"]["fallback_fts_repair"];
     assert_eq!(
         pending["pending"],
+        serde_json::json!(false),
+        "a retired shadow is not a pending repair: {status_json}"
+    );
+    assert_eq!(
+        pending["retired_not_viable"],
         serde_json::json!(true),
         "status must carry the dropped-shadow marker: {status_json}"
     );
@@ -3004,6 +4166,7 @@ fn gh382_final_wal_checkpoint_is_bounded_and_reported_without_success() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
     seed_fts_liveness_sessions(home);
+    let db_path = data_dir.join("agent_search.db");
     let wal_path = data_dir.join("agent_search.db-wal");
 
     let started = std::time::Instant::now();
@@ -3018,6 +4181,7 @@ fn gh382_final_wal_checkpoint_is_bounded_and_reported_without_success() {
         ])
         .arg(&data_dir)
         .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         // Discrimination by wall clock: a full run of this fixture takes up
         // to ~30 s on a loaded debug-build fleet worker, so the park is 60 s
         // against a 1 s budget — a run that waited for the parked checkpoint
@@ -3052,6 +4216,59 @@ fn gh382_final_wal_checkpoint_is_bounded_and_reported_without_success() {
         Some(1),
         "timed-out index JSON must expose its configured budget: {parked_payload}"
     );
+    let status = base_cmd(home)
+        .current_dir(home)
+        .args(["status", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass status after the reaped checkpoint");
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap_or_else(|err| {
+        panic!(
+            "status --json must print JSON ({err}); stdout={} stderr={}",
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        )
+    });
+    assert_eq!(
+        status["rebuild"]["active"], false,
+        "a reaped checkpoint owner must not retain active indexing admission: {status}"
+    );
+    let archive_contents = || {
+        use coding_agent_search::franken_sync::compat::{
+            ConnectionExt, OpenFlags, RowExt, open_with_flags,
+        };
+
+        let connection =
+            open_with_flags(&db_path.to_string_lossy(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("strictly read the durable archive after checkpoint process exit");
+        let messages = connection
+            .query_map_collect(
+                "SELECT content FROM messages ORDER BY content",
+                &[],
+                |row| row.get_typed::<String>(0),
+            )
+            .expect("canonical messages");
+        for row in connection.query("PRAGMA integrity_check").unwrap() {
+            assert_eq!(row.get_typed::<String>(0).unwrap(), "ok");
+        }
+        assert!(
+            connection
+                .query("PRAGMA foreign_key_check")
+                .unwrap()
+                .is_empty()
+        );
+        connection.close_without_checkpoint().unwrap();
+        messages
+    };
+    let expected_messages = [
+        "fts liveness alpha",
+        "fts liveness alpha_response",
+        "fts liveness beta",
+        "fts liveness beta_response",
+    ];
+    assert_eq!(archive_contents(), expected_messages);
     let parked_elapsed = elapsed;
     // A WAL that still carries frames is larger than its 32-byte header; a
     // truncated one (frankensqlite keeps the header on TRUNCATE) is exactly 32.
@@ -3059,7 +4276,7 @@ fn gh382_final_wal_checkpoint_is_bounded_and_reported_without_success() {
     let wal_bytes_after_parked_run = fs::metadata(&wal_path).map(|meta| meta.len()).unwrap_or(0);
     assert!(
         wal_bytes_after_parked_run > WAL_HEADER_BYTES,
-        "the skipped checkpoint must leave the WAL frames for the next opener; \
+        "the interrupted checkpoint must leave the WAL frames for the next opener; \
          wal_bytes={wal_bytes_after_parked_run}\nstderr={stderr}"
     );
 
@@ -3069,6 +4286,7 @@ fn gh382_final_wal_checkpoint_is_bounded_and_reported_without_success() {
         .args(["index", "--json", "--no-progress-events", "--data-dir"])
         .arg(&data_dir)
         .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         .output()
         .expect("run a plain cass index without the park");
     let plain_elapsed = started.elapsed();
@@ -3088,6 +4306,12 @@ fn gh382_final_wal_checkpoint_is_bounded_and_reported_without_success() {
         plain_payload["final_wal_checkpoint"]["status"].as_str(),
         Some("completed"),
         "the retrying index must report completed final WAL checkpoint: {plain_payload}"
+    );
+    assert_eq!(archive_contents(), expected_messages);
+    assert!(
+        fs::read(data_dir.join("index-run.lock"))
+            .unwrap()
+            .is_empty()
     );
     // The bound, measured against the same worker's load: a run that waited
     // for the 60 s park would take at least the plain run plus 60 s; a
@@ -3301,6 +4525,19 @@ fn gh440_plain_index_resumes_a_force_rebuild_killed_between_commit_and_checkpoin
     assert!(
         committed_docs > checkpoint_docs,
         "the kill window must have the authority ahead of the checkpoint: {payload}"
+    );
+    // 7qirz: mid-rebuild, the lock names the rebuild, not the last preflight
+    // step (which is what #483/#497 operators saw for a whole 42-minute pass).
+    // Windows refuses reads of a byte range another process holds locked
+    // (os error 33), so cass mirrors the lock's metadata into
+    // index-run.lock.meta and reads that on a lock conflict
+    // (asset_state::index_run_lock_metadata_sidecar_path). Do the same.
+    let lock = fs::read_to_string(data_dir.join("index-run.lock"))
+        .or_else(|_| fs::read_to_string(data_dir.join("index-run.lock.meta")))
+        .expect("index-run.lock (or its metadata sidecar) while the rebuild is parked");
+    assert!(
+        lock.lines().any(|line| line == "phase=lexical:rebuild"),
+        "the lock must name the active rebuild: {lock}"
     );
     child.kill().expect("kill parked force-rebuild");
     let _ = child.wait();
@@ -3617,11 +4854,23 @@ fn gh441_plain_index_consolidates_a_fragmented_generation_and_doctor_reports_it(
 /// maintenance path removes the pressure without a destructive rebuild.
 ///
 /// The negative query is intentionally the seven-word stopword-heavy query
-/// from the issue.  It must fail truthfully while maintenance is disabled,
-/// including the operator hint and the configured fuel variable.  After one
-/// ordinary `cass index` run, the same query must succeed under the default
-/// fuel budget; a high process-level override is also checked before that
-/// maintenance run to prove the new binary reads `CASS_QUILL_QUERY_FUEL_BUDGET`.
+/// from the issue.  Against an explicit low per-query work ceiling it must
+/// fail truthfully while maintenance is disabled, including the operator hint
+/// and the configured fuel variable.  A high process-level override is also
+/// checked before that maintenance run to prove the new binary reads
+/// `CASS_QUILL_QUERY_FUEL_BUDGET`.  After one ordinary `cass index` run, the
+/// same query must succeed under the shipped default fuel budget.
+///
+/// No-claim: the shipped default ceiling is not exhausted by this fixture.
+/// The 801-segment generation answers the reporter's query under the shipped
+/// default, so the boundary is proven against an explicit ceiling instead of
+/// by pretending the default refuses here.  Upstream's own GH #441 test says
+/// the same thing about its smaller fixture: the reporter's default-budget
+/// exhaustion needs an archive far larger than a test can hold, and the
+/// owner-scale archive cannot run the path here (bead
+/// `coding_agent_session_search-g3zyo`).  The durable repair, not a bigger
+/// budget, is what this test proves: ordinary maintenance folds the
+/// fragmented generation and the same query then answers.
 #[test]
 fn gh441_801_segment_query_fuel_boundary_and_incremental_repair() {
     let tmp = TempDir::new().unwrap();
@@ -3751,6 +5000,12 @@ fn gh441_801_segment_query_fuel_boundary_and_incremental_repair() {
     assert_eq!(pressure_check["status"], "warn");
     assert_eq!(pressure_check["fix_available"], true);
 
+    // A one-unit ceiling is the smallest the engine accepts and it refuses
+    // before the first segment is charged, so the refusal is deterministic
+    // and independent of how the engine meters this query. The shipped
+    // default answers this fixture (see the no-claim above), so the ceiling
+    // under test is the engine's work ceiling, not the shipped default.
+    const LOW_FUEL_CEILING: &str = "1";
     let exhausted = base_cmd(home)
         .current_dir(home)
         .args([
@@ -3765,6 +5020,7 @@ fn gh441_801_segment_query_fuel_boundary_and_incremental_repair() {
         ])
         .arg(&data_dir)
         .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_QUILL_QUERY_FUEL_BUDGET", LOW_FUEL_CEILING)
         .output()
         .expect("fuel-bound lexical query");
     assert!(
@@ -4302,4 +5558,167 @@ fn gh453_snapshot(home: &std::path::Path, data_dir: &std::path::Path) -> Gh453Sn
             })
             .unwrap_or_default(),
     }
+}
+
+/// Rows of `sql` as stock SQLite's CLI reads them, strictly read-only.
+fn stock_sqlite_json(db: &std::path::Path, sql: &str) -> Vec<serde_json::Value> {
+    let output = std::process::Command::new("sqlite3")
+        .args(["-readonly", "-json"])
+        .arg(db)
+        .arg(sql)
+        .output()
+        .expect("run the stock sqlite3 CLI");
+    assert!(
+        output.status.success(),
+        "sqlite3 {sql:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("sqlite3 output is UTF-8");
+    if stdout.trim().is_empty() {
+        return Vec::new();
+    }
+    serde_json::from_str(&stdout).expect("sqlite3 -json output parses")
+}
+
+/// Texts in `expected` with no stored copy, and stored texts nobody wrote.
+fn payload_mismatches(expected: &[String], stored: &[String]) -> (usize, usize) {
+    let mut remaining = std::collections::HashMap::<&str, usize>::new();
+    for text in expected {
+        *remaining.entry(text.as_str()).or_default() += 1;
+    }
+    let mut unexpected = 0;
+    for text in stored {
+        match remaining.get_mut(text.as_str()) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => unexpected += 1,
+        }
+    }
+    (remaining.values().sum(), unexpected)
+}
+
+/// gi7k7 (#516): FrankenSQLite's 0.4.10 data-integrity advisory (bd-obwsy)
+/// covers inserts inside an explicit transaction that could corrupt a table
+/// b-tree, which stock SQLite reports as "Rowid N out of order". Every
+/// `cass index` batch writes variable-width rows inside explicit
+/// transactions. This drives the real `cass index --full` over 2,000 messages
+/// 50 to 3,200 characters wide, then has stock SQLite verify the archive:
+/// integrity_check, exact counts, and every message payload.
+#[test]
+fn index_full_variable_width_corpus_passes_stock_sqlite_verification() {
+    let sqlite3_available = std::process::Command::new("sqlite3")
+        .arg("-version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !sqlite3_available {
+        eprintln!(
+            "skipping index_full_variable_width_corpus_passes_stock_sqlite_verification: \
+             the stock verification requires the sqlite3 CLI"
+        );
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let sessions = home.join(".codex/sessions/2026/10/17");
+    fs::create_dir_all(&sessions).unwrap();
+    let data_dir = home.join("cass_data");
+
+    // Deterministic widths and text without a rand dependency (PCG constants).
+    let mut state: u64 = 0x0b5e_0b5e;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        state >> 33
+    };
+    let mut expected = Vec::new();
+    for session in 0..20_u64 {
+        let id = format!("00000000-0000-4000-8000-{session:012}");
+        let mut lines = vec![
+            serde_json::json!({
+                "timestamp": "2026-10-17T10:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-10-17T10:00:00.000Z",
+                    "cwd": format!("/tmp/obwsy/{session}"),
+                    "originator": "codex_cli_rs",
+                    "cli_version": "0.1.0"
+                }
+            })
+            .to_string(),
+        ];
+        for message in 0..100_u64 {
+            let width = 50 + usize::try_from(next() % 3_151).unwrap();
+            let mut text = format!("obwsy s{session} m{message} ");
+            while text.len() < width {
+                text.push(char::from(b'a' + u8::try_from(next() % 26).unwrap()));
+            }
+            let (role, kind) = if message % 2 == 0 {
+                ("user", "input_text")
+            } else {
+                ("assistant", "output_text")
+            };
+            lines.push(
+                serde_json::json!({
+                    "timestamp": format!(
+                        "2026-10-17T10:{:02}:{:02}.000Z",
+                        (message + 1) / 60,
+                        (message + 1) % 60
+                    ),
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": role,
+                        "content": [{"type": kind, "text": text}]
+                    }
+                })
+                .to_string(),
+            );
+            expected.push(text);
+        }
+        fs::write(
+            sessions.join(format!("rollout-2026-10-17T10-00-00-{id}.jsonl")),
+            lines.join("\n") + "\n",
+        )
+        .unwrap();
+    }
+
+    base_cmd(home)
+        .current_dir(home)
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let db = data_dir.join("agent_search.db");
+    assert_eq!(
+        stock_sqlite_json(&db, "PRAGMA integrity_check"),
+        vec![serde_json::json!({"integrity_check": "ok"})],
+        "stock SQLite must find the archive intact"
+    );
+    assert_eq!(
+        stock_sqlite_json(
+            &db,
+            "SELECT (SELECT count(*) FROM conversations) AS conversations, \
+             (SELECT count(*) FROM messages) AS messages",
+        ),
+        vec![serde_json::json!({"conversations": 20, "messages": 2000})]
+    );
+    let stored: Vec<String> = stock_sqlite_json(&db, "SELECT content FROM messages")
+        .into_iter()
+        .map(|row| row["content"].as_str().expect("content is text").to_owned())
+        .collect();
+    assert_eq!(
+        payload_mismatches(&expected, &stored),
+        (0, 0),
+        "every written message must be stored exactly once, byte for byte"
+    );
+
+    // The comparison is not vacuous: one altered text is one missing and one
+    // unexpected payload.
+    let mut altered = expected.clone();
+    altered[1_000].push('!');
+    assert_eq!(payload_mismatches(&altered, &stored), (1, 1));
 }

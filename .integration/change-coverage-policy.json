@@ -1,0 +1,70 @@
+{
+  "applicability": {
+    "status": "required",
+    "waiver": {
+      "approval": "",
+      "approved": false,
+      "evidence": [],
+      "reason": ""
+    }
+  },
+  "command": {
+    "argv": [
+      "REPLACE_WITH_REPOSITORY_COVERAGE_COMMAND"
+    ],
+    "cwd": ".",
+    "env": {
+      "PYTHONDONTWRITEBYTECODE": "1"
+    },
+    "expected_exit_code": 0,
+    "id": "changed-line-coverage",
+    "timeout_sec": 900
+  },
+  "component_ids": [
+    "INT-001"
+  ],
+  "deletion_evidence_command_ids": [
+    "final-focused",
+    "final-full"
+  ],
+  "error_line_patterns": [],
+  "exclude_globs": [
+    "tests/**",
+    "test/**",
+    "docs/**",
+    "**/*.md"
+  ],
+  "format": "coveragepy-json",
+  "id": "CHCOV-001",
+  "limits": {
+    "max_changed_lines": 20000,
+    "max_output_bytes": 96000,
+    "max_report_bytes": 200000000
+  },
+  "path_mappings": [],
+  "report_path": ".integration/changed-line-coverage.json",
+  "schema_version": "1.0",
+  "source_globs": [
+    "**/*.py",
+    "**/*.go",
+    "**/*.java",
+    "**/*.kt",
+    "**/*.js",
+    "**/*.jsx",
+    "**/*.ts",
+    "**/*.tsx",
+    "**/*.rs",
+    "**/*.cs",
+    "**/*.c",
+    "**/*.cc",
+    "**/*.cpp",
+    "**/*.h",
+    "**/*.hpp"
+  ],
+  "thresholds": {
+    "max_uninstrumented_lines": 0,
+    "min_changed_line_coverage": 1.0,
+    "min_error_line_coverage": 1.0
+  },
+  "waivers": []
+}

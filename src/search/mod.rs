@@ -22,6 +22,7 @@
 //! - **[`pack_planner`]**: Deterministic answer-pack evidence selection core.
 
 pub mod ann_index;
+pub mod archive_rebuild;
 pub mod asset_state;
 pub(crate) mod bounded_discovery;
 pub mod canonicalize;
@@ -32,6 +33,7 @@ pub(crate) mod drill_down;
 pub mod e2e_scenarios;
 pub mod embedder;
 pub mod embedder_registry;
+pub mod external_embedder;
 pub mod fastembed_embedder;
 pub mod fastembed_reranker;
 pub(crate) mod fleet_cheap_probes;
@@ -39,6 +41,8 @@ pub mod hash_embedder;
 pub(crate) mod human_readiness_summary;
 pub(crate) mod incident_categories;
 pub(crate) mod incident_redaction;
+pub(crate) mod inline_repair;
+pub mod lexical_quarantine;
 pub(crate) mod liveness_fixtures;
 pub(crate) mod model_acquisition;
 pub mod model_download;
@@ -62,6 +66,7 @@ pub(crate) mod salvage_ledger;
 pub(crate) mod search_mode_metadata;
 pub mod semantic_manifest;
 pub(crate) mod semantic_publish_safety;
+pub mod semantic_reader;
 pub(crate) mod semantic_readiness;
 pub(crate) mod source_provenance;
 pub(crate) mod storage_integrity;

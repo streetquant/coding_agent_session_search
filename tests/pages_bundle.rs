@@ -29,9 +29,12 @@ mod tests {
     }
 
     fn run_node_module_assertions(script: &str) -> Result<()> {
+        // `--experimental-detect-module` loads the ES-module assets as modules
+        // on Node 20.10+ and is a no-op where detection is the default
+        // (22.7+). Node 24 removed `--experimental-default-type`.
         let output = Command::new("node")
             .args([
-                "--experimental-default-type=module",
+                "--experimental-detect-module",
                 "--input-type=module",
                 "--eval",
                 script,
@@ -46,6 +49,33 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
 
+        Ok(())
+    }
+
+    fn run_node_contract_tests(path: &str, pattern: &str) -> Result<()> {
+        let output = Command::new("node")
+            .args([
+                "--experimental-vm-modules",
+                "--test",
+                "--test-reporter=tap",
+                "--test-timeout=30000",
+                "--test-name-pattern",
+                pattern,
+                path,
+            ])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success()
+                && stdout.lines().any(|line| {
+                    line.strip_prefix("# pass ")
+                        .and_then(|count| count.parse::<usize>().ok())
+                        .is_some_and(|count| count > 0)
+                }),
+            "Node contract tests failed or matched no cases: {path}/{pattern}\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         Ok(())
     }
 
@@ -696,7 +726,7 @@ mod tests {
         let conversation_js = include_str!("../src/pages_assets/conversation.js");
         assert!(
             conversation_js
-                .contains("el.setAttribute('href', sanitizeDestinationUrl(attr.value));"),
+                .contains("el.setAttribute(\"href\", sanitizeDestinationUrl(attr.value));"),
             "fallback HTML sanitizer should sanitize href attributes, not just markdown link generation"
         );
 
@@ -837,86 +867,34 @@ mod tests {
     }
 
     #[test]
-    fn test_archive_search_timestamp_filters_reject_fractional_values() {
-        let database_js = include_str!("../src/pages_assets/database.js");
-        let search_js = include_str!("../src/pages_assets/search.js");
-
-        assert!(
-            search_js.contains("!Number.isSafeInteger(numeric)")
-                && !search_js.contains("Number.isSafeInteger(Math.trunc(numeric))"),
-            "routed timestamp filters should reject malformed fractional values instead of truncating them"
-        );
-        assert!(
-            database_js.contains("!Number.isSafeInteger(numeric)")
-                && !database_js.contains("Math.trunc(numeric)"),
-            "SQL timestamp filter normalization should reject fractional values before binding"
-        );
+    fn test_archive_search_timestamp_filters_reject_fractional_values() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                import assert from 'node:assert/strict';
+                import { normalizeSearchTimeRange } from './src/pages_assets/database.js';
+                for (const value of [0.5, -0.5, '1.5', Number.MAX_SAFE_INTEGER + 1]) {
+                    assert.throws(() => normalizeSearchTimeRange(value, null), RangeError);
+                    assert.throws(() => normalizeSearchTimeRange(null, value), RangeError);
+                }
+                assert.deepEqual(normalizeSearchTimeRange(0, 1), { since: 0, until: 1 });
+            "#,
+        )
     }
 
     #[test]
-    fn test_archive_search_time_filters_are_applied_before_pagination() {
-        let database_js = include_str!("../src/pages_assets/database.js");
-        let search_js = include_str!("../src/pages_assets/search.js");
-
-        assert!(
-            database_js.contains("searchMode = 'auto', since = null, until = null"),
-            "searchConversations should accept time filters at the database boundary"
-        );
-        assert!(
-            database_js.contains("sql += ' AND c.started_at >= ?';")
-                && database_js.contains("sql += ' AND c.started_at <= ?';"),
-            "FTS search should add time predicates to SQL instead of filtering after LIMIT/OFFSET"
-        );
-
-        let since_predicate = database_js
-            .find("sql += ' AND c.started_at >= ?';")
-            .expect("expected lower-bound search predicate");
-        let until_predicate = database_js
-            .find("sql += ' AND c.started_at <= ?';")
-            .expect("expected upper-bound search predicate");
-        let result_ordering = database_js
-            .find("ORDER BY score")
-            .expect("expected FTS score ordering");
-        assert!(
-            since_predicate < result_ordering && until_predicate < result_ordering,
-            "time predicates must be added before ORDER BY/LIMIT so pagination cannot hide valid matches"
-        );
-
-        assert!(
-            search_js.contains("since: currentFilters.since,")
-                && search_js.contains("until: currentFilters.until,"),
-            "search UI should pass active route/control time filters into searchConversations"
-        );
-        assert!(
-            !search_js.contains("Apply time filter post-query"),
-            "search UI should not reintroduce post-query time filtering after pagination"
-        );
+    fn test_archive_search_time_filters_are_applied_before_pagination() -> Result<()> {
+        run_node_contract_tests(
+            "tests/pages/workspace-query.test.mjs",
+            "text search intersects|scoped pages do not filter",
+        )
     }
 
     #[test]
-    fn test_archive_recent_filters_combine_agent_and_time_before_limit() {
-        let database_js = include_str!("../src/pages_assets/database.js");
-        let search_js = include_str!("../src/pages_assets/search.js");
-
-        assert!(
-            database_js.contains(
-                "export function getConversationsByAgent(agent, limit = 50, since = null, until = null)"
-            ),
-            "agent-filtered recent queries should accept optional time bounds"
-        );
-        assert!(
-            database_js.contains("sql += ' AND started_at >= ?';")
-                && database_js.contains("sql += ' AND started_at <= ?';"),
-            "agent-filtered recent queries should apply time bounds in SQL before LIMIT"
-        );
-        assert!(
-            search_js.contains("const hasTimeFilter = currentFilters.since !== null || currentFilters.until !== null;"),
-            "recent search should treat an explicit since=0 route filter as present"
-        );
-        assert!(
-            search_js.contains("currentFilters.since,\n                currentFilters.until,"),
-            "recent search should pass time bounds when an agent filter is also active"
-        );
+    fn test_archive_recent_filters_combine_agent_and_time_before_limit() -> Result<()> {
+        run_node_contract_tests(
+            "tests/pages/workspace-query.test.mjs",
+            "browsing uses|both inclusive bounds",
+        )
     }
 
     #[test]
@@ -946,15 +924,15 @@ mod tests {
             "search should centralize virtual-results teardown so error/reset paths do not leave stale virtual list state behind"
         );
         assert!(
-            search_js.contains("destroyVirtualResultsView();\n        showNoResults();")
-                && search_js.contains("destroyVirtualResultsView();\n    hideNoResults();")
-                && search_js.contains("destroyVirtualResultsView();\n    hideLoading();"),
+            search_js.contains("destroyVirtualResultsView();\n    showNoResults();")
+                && search_js.contains("destroyVirtualResultsView();\n  hideNoResults();")
+                && search_js.contains("destroyVirtualResultsView();\n  hideLoading();"),
             "search no-results, error, and clear/reset paths should all tear down virtual-results presentation"
         );
     }
 
     #[test]
-    fn test_search_route_state_restores_filters_and_back_navigation() {
+    fn test_search_route_state_restores_filters_and_back_navigation() -> Result<()> {
         let viewer_js = include_str!("../src/pages_assets/viewer.js");
         assert!(
             viewer_js.contains("const searchParams = parseSearchParams(route);")
@@ -965,13 +943,7 @@ mod tests {
             "viewer should restore routed search filters into the live search UI and preserve the current query/filter state when navigating back from a conversation"
         );
 
-        let search_js = include_str!("../src/pages_assets/search.js");
-        assert!(
-            search_js.contains("export async function setSearchRoute(routeSearch = {}, options = {}) {")
-                && search_js.contains("currentFilters = normalizeRouteFilters(routeSearch);")
-                && search_js.contains("timePreset: since !== null || until !== null ? SEARCH_CONFIG.TIME_FILTER_CUSTOM_VALUE : null,"),
-            "search should expose a route-state application path that restores routed filters instead of keeping stale in-memory filters alive"
-        );
+        run_node_contract_tests("tests/pages/search-route-state.test.mjs", ".*")
     }
 
     #[test]
@@ -1485,12 +1457,13 @@ mod tests {
             "auth QR open flow should snapshot the current scanner session before async work"
         );
         assert!(
-            auth_js.contains("if (qrScanner && !elements.qrScanner?.classList.contains('hidden'))"),
+            auth_js
+                .contains("if (qrScanner && !elements.qrScanner?.classList.contains(\"hidden\"))"),
             "auth QR open flow should refuse to spawn a second scanner while one is already active"
         );
         assert!(
             auth_js.contains("!isCurrentQrScannerSession(sessionToken)")
-                && auth_js.contains("elements.qrScanner?.classList.contains('hidden')"),
+                && auth_js.contains("elements.qrScanner?.classList.contains(\"hidden\")"),
             "auth QR open flow should abort stale scanner starts after cancel or lock"
         );
         assert!(
@@ -1510,7 +1483,7 @@ mod tests {
             auth_js.contains("let activeSessionExpiryTs = 0;")
                 && auth_js.contains("let activeSessionExpiryTimerId = null;")
                 && auth_js.contains(
-                    "document.addEventListener('visibilitychange', handleSessionVisibilityChange);"
+                    "document.addEventListener(\"visibilitychange\", handleSessionVisibilityChange);"
                 ),
             "auth should track active session expiry in memory and recheck it when the page becomes visible again"
         );
@@ -1524,7 +1497,7 @@ mod tests {
         assert!(
             auth_js.contains("scheduleActiveSessionExpiry(expiry);")
                 && auth_js.contains(
-                    "showError('Your session expired. Please unlock the archive again.');"
+                    "showError(\"Your session expired. Please unlock the archive again.\");"
                 ),
             "auth should actively enforce live session expiry instead of only checking expiry on page reload"
         );
@@ -1543,7 +1516,7 @@ mod tests {
             "conversation load failures should be logged with conversation context"
         );
         assert!(
-            conversation_js.contains("showError('Failed to load conversation');"),
+            conversation_js.contains("showError(\"Failed to load conversation\");"),
             "conversation load failures should render a user-visible error panel instead of becoming unhandled promise rejections"
         );
         assert!(
@@ -1572,18 +1545,18 @@ mod tests {
             "settings initialization and async handlers should await the async render path"
         );
         assert!(
-            settings_js.contains("showNotification(`Storage mode changed to ${newMode}`, 'success');\n        await render();"),
+            settings_js.contains("showNotification(`Storage mode changed to ${newMode}`, \"success\");\n    await render();"),
             "storage mode changes should await the async settings rerender so rerender failures stay inside the handler error path"
         );
         assert!(
             settings_js.contains(
-                "showNotification('Current storage cleared', 'success');\n        await render();"
+                "showNotification(\"Current storage cleared\", \"success\");\n    await render();"
             ),
             "clear-current-storage should await the async settings rerender"
         );
         assert!(
             settings_js.contains(
-                "showNotification('OPFS data cleared', 'success');\n        await render();"
+                "showNotification(\"OPFS data cleared\", \"success\");\n    await render();"
             ),
             "legacy OPFS cleanup should await the async settings rerender"
         );
@@ -1593,14 +1566,15 @@ mod tests {
                 && settings_js.contains("Legacy decrypted database files were detected in OPFS.")
                 && !settings_js.contains("opfs-toggle")
                 && !settings_js.contains("handleOPFSToggle")
-                && settings_js.contains("await rerenderSettingsUI('storage mode cancellation');")
-                && settings_js.contains("await rerenderSettingsUI('storage mode change failure');"),
+                && settings_js.contains("await rerenderSettingsUI(\"storage mode cancellation\");")
+                && settings_js
+                    .contains("await rerenderSettingsUI(\"storage mode change failure\");"),
             "settings must describe OPFS as legacy plaintext residue, not expose it as an active cache mode"
         );
 
         let storage_js = include_str!("../src/pages_assets/storage.js");
         assert!(
-            storage_js.contains("const LEGACY_OPFS_MODE = 'opfs';")
+            storage_js.contains("const LEGACY_OPFS_MODE = \"opfs\";")
                 && storage_js.contains("clearLegacyOpfsPreferences();")
                 && !storage_js.contains("StorageMode.OPFS")
                 && !storage_js.contains("case StorageMode.OPFS"),
@@ -1636,26 +1610,29 @@ mod tests {
 
         let auth_js = include_str!("../src/pages_assets/auth.js");
         assert!(
-            auth_js.contains("import { COI_STATE, getCOIState, initCOIDetection, onServiceWorkerActivated } from './coi-detector.js';"),
+            auth_js.contains(
+                "import {\n  COI_STATE,\n  getCOIState,\n  initCOIDetection,\n  onServiceWorkerActivated,\n} from \"./coi-detector.js\";"
+            ),
             "COI bootstrap should now live in auth.js"
         );
         assert!(
             auth_js.contains("registerServiceWorker().catch((error) => {")
                 && auth_js.contains("initCOIDetection({")
                 && auth_js.contains("onServiceWorkerActivated(async () => {")
-                && auth_js.contains("authScreen?.classList.add('hidden');"),
+                && auth_js.contains("authScreen?.classList.add(\"hidden\");"),
             "auth.js should own service-worker registration, initial auth hiding, COI initialization, and activation rechecks"
         );
         assert!(
-            auth_js.contains("const appScreen = document.getElementById('app-screen');")
-                && auth_js.contains("if (appScreen && !appScreen.classList.contains('hidden')) {")
+            auth_js.contains("const appScreen = document.getElementById(\"app-screen\");")
+                && auth_js
+                    .contains("if (appScreen && !appScreen.classList.contains(\"hidden\")) {")
                 && auth_js.contains("const revealAuthScreenIfLocked = () => {")
                 && auth_js.contains("revealAuthScreenIfLocked();"),
             "COI bootstrap should only re-show the auth screen while the app is still locked, including late failure paths"
         );
         assert!(
-            auth_js.contains("}).catch((error) => {")
-                && auth_js.contains("console.error('[App] COI initialization failed:', error);")
+            auth_js.contains("})\n    .catch((error) => {")
+                && auth_js.contains("console.error(\"[App] COI initialization failed:\", error);")
                 && auth_js.contains("revealAuthScreenIfLocked();"),
             "COI bootstrap failures should fall back to revealing the auth screen instead of leaving the page blank"
         );
@@ -1667,12 +1644,12 @@ mod tests {
         assert!(
             coi_detector_js.contains("Promise.resolve(registeredCallback()).catch((error) => {")
                 && coi_detector_js
-                    .contains("console.error('[COI] Activation callback failed:', error);"),
+                    .contains("console.error(\"[COI] Activation callback failed:\", error);"),
             "service worker activation fanout should catch rejected async callbacks instead of leaking unhandled promise rejections"
         );
         assert!(
             coi_detector_js
-                .contains("const ARCHIVE_SCOPE_URL = new URL('./', import.meta.url).href;")
+                .contains("const ARCHIVE_SCOPE_URL = new URL(\"./\", import.meta.url).href;")
                 && coi_detector_js
                     .contains("const registrations = await navigator.serviceWorker.getRegistrations();")
                 && coi_detector_js.contains(
@@ -1681,12 +1658,12 @@ mod tests {
                 && coi_detector_js.contains(
                     "Boolean(registration?.active || registration?.installing || registration?.waiting)"
                 )
-                && coi_detector_js.contains("registration?.active?.state === 'activated'")
+                && coi_detector_js.contains("registration?.active?.state === \"activated\"")
                 && coi_detector_js.contains("waitForExactServiceWorkerActivation(maxWaitMs)")
-                && coi_detector_js.contains("candidateWorker?.state === 'redundant'")
+                && coi_detector_js.contains("candidateWorker?.state === \"redundant\"")
                 && coi_detector_js.contains("Math.min(100, remainingMs)")
                 && coi_detector_js.contains(
-                    "console.warn('[COI] Archive service worker is not active - degrading');"
+                    "console.warn(\"[COI] Archive service worker is not active - degrading\");"
                 )
                 && !coi_detector_js.contains("navigator.serviceWorker.getRegistration()")
                 && !coi_detector_js.contains("navigator.serviceWorker.ready"),
@@ -1712,67 +1689,38 @@ mod tests {
         let sw_js = include_str!("../src/pages_assets/sw.js");
         assert!(
             sw_js.contains(
-                "const payload = event.data && typeof event.data === 'object' ? event.data : null;"
+                "const payload = event.data && typeof event.data === \"object\" ? event.data : null;"
             ) && sw_js.contains("if (!payload) {")
                 && sw_js.contains("Ignoring malformed message payload")
-                && sw_js.contains("rejectRequest('Malformed message payload');"),
+                && sw_js.contains("rejectRequest(\"Malformed message payload\");"),
             "service worker message handling should guard against null or non-object payloads before destructuring and fail fast to the caller"
         );
         assert!(
-            sw_js.contains("if (typeof type !== 'string' || type.length === 0) {")
+            sw_js.contains("if (typeof type !== \"string\" || type.length === 0) {")
                 && sw_js.contains("Ignoring message without a valid type")
-                && sw_js.contains("rejectRequest('Message type must be a non-empty string');")
-                && sw_js.contains("type: 'REQUEST_INVALID',")
+                && sw_js.contains("rejectRequest(\"Message type must be a non-empty string\");")
+                && sw_js.contains("type: \"REQUEST_INVALID\",")
                 && sw_js.contains("rejectRequest(`Unknown message type: ${type}`);"),
             "service worker message handling should reject invalid or unknown message types without forcing controller RPC callers to time out"
         );
     }
 
     #[test]
-    fn test_service_worker_fetch_keeps_network_success_when_cache_write_fails() {
+    fn test_service_worker_fetch_keeps_network_success_when_cache_write_fails() -> Result<()> {
         let sw_js = include_str!("../src/pages_assets/sw.js");
-        assert!(
-            sw_js.contains("const cacheWrite = getCurrentCache()")
-                && sw_js.contains("log(LOG.WARN, 'Cache put error:', error);")
-                && sw_js.contains("trackBackgroundTask(cacheWrite);")
-                && sw_js.contains("Promise.all(backgroundTasks)")
-                && sw_js.contains("return addSecurityHeaders(response);"),
-            "service worker cache writes must stay best-effort for the response while remaining bound to the FetchEvent lifetime"
-        );
-        assert!(
-            sw_js
-                .contains("if (cacheEligible && request.mode === 'navigate') {\n            try {")
-                && sw_js.contains("const cachedIndex = await cache.match(indexUrl);")
-                && sw_js.contains("log(LOG.WARN, 'Navigation cache fallback error:', cacheError);"),
-            "navigation fallback should not crash if the Cache API itself fails during offline fallback"
-        );
-        assert!(
-            sw_js.contains("const cacheEligible = isCacheEligibleRequest(request, url);")
-                && sw_js.contains("url.search === ''")
-                && sw_js.contains("!request.headers.has('authorization')")
-                && sw_js.contains("!request.headers.has('range')")
-                && sw_js.contains("request.cache !== 'no-store'")
-                && sw_js.contains("responseAllowsCaching(response)")
-                && sw_js.contains("response.status === 200")
-                && sw_js.contains("directiveName === 'no-store'")
-                && sw_js.contains("directiveName === 'no-cache'")
-                && sw_js.contains("directiveName === 'private'")
-                && !sw_js.contains("caches.match("),
-            "runtime caching must stay inside the archive scope and must not fall through to stale or unrelated origin caches"
-        );
+        run_node_contract_tests("tests/pages/service-worker-cache.test.mjs", ".*")?;
 
         let install_body = sw_js
-            .split_once("self.addEventListener('install'")
+            .split_once("self.addEventListener(\"install\"")
             .expect("install handler")
             .1
-            .split_once("self.addEventListener('activate'")
+            .split_once("self.addEventListener(\"activate\"")
             .expect("bounded install handler")
             .0;
         assert!(
             !install_body.contains("self.skipWaiting()")
                 && sw_js.contains("event.waitUntil(skipWaitingTask);")
-                && sw_js.contains("event.waitUntil(clearCacheTask);")
-                && sw_js.contains("const CACHE_VERSION = 'v7';"),
+                && sw_js.contains("event.waitUntil(clearCacheTask);"),
             "updates must wait for explicit user activation and every async message operation must extend its event lifetime"
         );
         assert!(
@@ -1781,9 +1729,10 @@ mod tests {
                 && sw_js.contains("if (remaining.length > 0) {")
                 && sw_js.contains("!Number.isInteger(data.level)")
                 && sw_js.contains("!Object.values(LOG).includes(data.level)")
-                && sw_js.contains("rejectRequest('Invalid log level');"),
+                && sw_js.contains("rejectRequest(\"Invalid log level\");"),
             "cache cleanup must verify its postcondition and message-controlled log levels must be validated"
         );
+        Ok(())
     }
 
     #[test]
@@ -1791,40 +1740,41 @@ mod tests {
         let sw_register_js = include_str!("../src/pages_assets/sw-register.js");
         assert!(
             sw_register_js.contains("void applyUpdate().catch((error) => {")
-                && sw_register_js.contains("console.error('[SW] Failed to apply update:', error);"),
+                && sw_register_js
+                    .contains("console.error(\"[SW] Failed to apply update:\", error);"),
             "service worker update UI should catch async applyUpdate failures instead of leaking unhandled rejections"
         );
         assert!(
-            sw_register_js.contains("if (!('serviceWorker' in navigator)) {")
+            sw_register_js.contains("if (!(\"serviceWorker\" in navigator)) {")
                 && sw_register_js.contains("if (!currentRegistration) {")
                 && sw_register_js.contains("return true;"),
             "service worker unregister should treat unsupported or already-unregistered states as successful no-ops"
         );
         assert!(
             sw_register_js
-                .contains("const ARCHIVE_SCOPE_URL = new URL('./', import.meta.url).href;")
+                .contains("const ARCHIVE_SCOPE_URL = new URL(\"./\", import.meta.url).href;")
                 && sw_register_js
-                    .contains("const SERVICE_WORKER_URL = new URL('./sw.js', import.meta.url).href;")
+                    .contains("const SERVICE_WORKER_URL = new URL(\"./sw.js\", import.meta.url).href;")
                 && sw_register_js.contains(
-                    "navigator.serviceWorker.register(SERVICE_WORKER_URL, {\n            scope: ARCHIVE_SCOPE_URL,"
+                    "navigator.serviceWorker.register(SERVICE_WORKER_URL, {\n      scope: ARCHIVE_SCOPE_URL,"
                 )
                 && sw_register_js.contains("await waitForExactRegistrationActivation(registration);")
                 && sw_register_js.contains("DEFAULT_SW_ACTIVATION_TIMEOUT_MS = 30_000")
                 && sw_register_js.contains("Timed out waiting for archive service worker activation")
-                && sw_register_js.contains("candidateWorker.state === 'activated'")
-                && sw_register_js.contains("candidateWorker.state === 'redundant'")
+                && sw_register_js.contains("candidateWorker.state === \"activated\"")
+                && sw_register_js.contains("candidateWorker.state === \"redundant\"")
                 && !sw_register_js.contains("navigator.serviceWorker.ready")
                 && sw_register_js
                     .contains("const registrations = await navigator.serviceWorker.getRegistrations();")
                 && sw_register_js.contains("registrations.find(hasExactScope) || null")
                 && sw_register_js.contains(
-                    "const activeWorker = currentRegistration?.active?.state === 'activated'"
+                    "const activeWorker =\n    currentRegistration?.active?.state === \"activated\""
                 )
                 && sw_register_js.contains("activeWorker.postMessage(message, [channel.port2]);")
                 && sw_register_js.contains("channel.port1.close();")
                 && sw_register_js.contains("channel.port2.close();")
                 && sw_register_js.contains(
-                    "throw new Error('Failed to enumerate service worker registrations', { cause: error });"
+                    "throw new Error(\"Failed to enumerate service worker registrations\", { cause: error });"
                 )
                 && !sw_register_js.contains("getRegistration(getCurrentScopeUrl())"),
             "registration RPC and unregister must resolve the exact archive scope instead of a broader longest-prefix registration"
@@ -1834,22 +1784,24 @@ mod tests {
                 && sw_register_js.contains("if (!reg?.waiting || !reg.active)")
                 && sw_register_js.contains("watchInstallingWorker(reg, reg.installing);")
                 && sw_register_js.contains("const watchedInstallingWorkers = new WeakSet();")
-                && sw_register_js.contains("newWorker.state === 'installed'")
+                && sw_register_js.contains("newWorker.state === \"installed\"")
                 && sw_register_js.contains(
-                    "return 'serviceWorker' in navigator && hasExactScope(registration);"
+                    "return \"serviceWorker\" in navigator && hasExactScope(registration);"
                 )
-                && sw_register_js.contains("&& registration.active?.state === 'activated';"),
+                && sw_register_js.contains(
+                    "hasExactScope(registration) &&\n      registration.active?.state === \"activated\"\n    );"
+                ),
             "pre-existing waiting updates and status getters should be scoped to the exact archive registration"
         );
         assert!(
             sw_register_js.contains("if (!currentRegistration?.waiting) {")
                 && sw_register_js.contains("const controllerChanged = await waitForActivation;")
-                && sw_register_js.contains("waitingWorker.state !== 'activated'")
+                && sw_register_js.contains("waitingWorker.state !== \"activated\"")
                 && sw_register_js.contains("currentRegistration.active !== waitingWorker")
                 && sw_register_js.contains(
-                    "throw new Error('Archive update did not become the active controller; the page was not reloaded');"
+                    "throw new Error(\n      \"Archive update did not become the active controller; the page was not reloaded\",\n    );"
                 )
-                && sw_register_js.find("waitingWorker.state !== 'activated'")
+                && sw_register_js.find("waitingWorker.state !== \"activated\"")
                     < sw_register_js.find("window.location.reload();"),
             "update application must not reload the old worker after an activation timeout"
         );
@@ -1883,7 +1835,7 @@ mod tests {
         let stats_js = include_str!("../src/pages_assets/stats.js");
         assert!(
             stats_js.contains(
-                ".sort((a, b) => (b[1] - a[1]) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))"
+                ".sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))"
             ),
             "database fallback top-term ranking should use alphabetical tie-breaking so equal-frequency terms do not depend on object insertion order"
         );
@@ -2155,30 +2107,28 @@ mod tests {
     }
 
     #[test]
-    fn test_attachment_manifest_failures_only_cache_true_absence() {
+    fn test_attachment_manifest_failures_only_cache_true_absence() -> Result<()> {
         let attachments_js = include_str!("../src/pages_assets/attachments.js");
         assert!(
             attachments_js.contains("function shouldCacheManifestAbsence(error) {")
-                && attachments_js.contains("return error?.code === 'ATTACHMENT_MANIFEST_ABSENT';")
+                && attachments_js
+                    .contains("return error?.code === \"ATTACHMENT_MANIFEST_ABSENT\";")
                 && attachments_js.contains("isManifestLoaded = shouldCacheManifestAbsence(error);"),
             "attachment init should only memoize true manifest absence instead of treating every manifest failure as a permanent no-attachments state"
         );
         assert!(
             attachments_js.contains("if (response.status === 404) {")
                 && attachments_js.contains(
-                    "throw createAttachmentError('Manifest not found', 'ATTACHMENT_MANIFEST_ABSENT');"
+                    "throw createAttachmentError(\"Manifest not found\", \"ATTACHMENT_MANIFEST_ABSENT\");"
                 )
-                && attachments_js.contains("'ATTACHMENT_MANIFEST_FETCH_FAILED'")
-                && attachments_js.contains("'ATTACHMENT_MANIFEST_INVALID'"),
+                && attachments_js.contains("\"ATTACHMENT_MANIFEST_FETCH_FAILED\"")
+                && attachments_js.contains("\"ATTACHMENT_MANIFEST_INVALID\""),
             "attachment manifest loading should distinguish missing manifests from retryable fetch or parse failures"
         );
-        assert!(
-            attachments_js.contains("if (shouldCacheManifestAbsence(error)) {")
-                && attachments_js.contains("throw error;")
-                && attachments_js
-                    .contains("if (error?.code === 'ATTACHMENT_REQUEST_INVALIDATED') {"),
-            "attachment invalidation handling should use stable error codes instead of brittle string matching"
-        );
+        run_node_contract_tests(
+            "tests/pages/attachment-admission.test.mjs",
+            "manifest|reset cancels a body",
+        )
     }
 
     #[test]
@@ -2188,7 +2138,7 @@ mod tests {
             conversation_js.contains("state.ready = true;")
                 && conversation_js.contains("return state.available;")
                 && conversation_js
-                    .contains("if (error?.code === 'ATTACHMENT_REQUEST_INVALIDATED') {")
+                    .contains("if (error?.code === \"ATTACHMENT_REQUEST_INVALIDATED\") {")
                 && conversation_js.contains("state.ready = false;")
                 && conversation_js.contains("state.available = false;"),
             "conversation attachment readiness should only become terminal after a successful or absent manifest load, not after a transient manifest failure"
@@ -2199,7 +2149,7 @@ mod tests {
     fn test_search_keyboard_navigation_tracks_logical_result_indices() {
         let search_js = include_str!("../src/pages_assets/search.js");
         assert!(
-            search_js.contains("function focusResultCardAtIndex(index, align = 'start') {")
+            search_js.contains("function focusResultCardAtIndex(index, align = \"start\") {")
                 && search_js.contains("virtualList.scrollToIndex(index, align);")
                 && search_js.contains("return elements.resultsList.querySelector(`.result-card[data-result-index=\"${index}\"]`);"),
             "search keyboard navigation should resolve result focus by logical index so virtualized results beyond the current DOM window stay reachable"
@@ -2210,9 +2160,10 @@ mod tests {
             "both direct and virtual result cards should expose a stable logical index for keyboard navigation"
         );
         assert!(
-            search_js.contains("focusResultCardAtIndex(currentIndex + 1, 'end');")
-                && search_js.contains("focusResultCardAtIndex(currentIndex - 1, 'start');")
-                && search_js.contains("focusResultCardAtIndex(currentResults.length - 1, 'end');"),
+            search_js.contains("focusResultCardAtIndex(currentIndex + 1, \"end\");")
+                && search_js.contains("focusResultCardAtIndex(currentIndex - 1, \"start\");")
+                && search_js
+                    .contains("focusResultCardAtIndex(currentResults.length - 1, \"end\");"),
             "Arrow/Home/End navigation should move by logical result index instead of only among currently rendered siblings"
         );
     }
@@ -2467,11 +2418,11 @@ mod tests {
         let auth_js = include_str!("../src/pages_assets/auth.js");
         assert!(
             auth_js.contains(
-                "const payload = event?.data && typeof event.data === 'object' ? event.data : null;"
+                "const payload = event?.data && typeof event.data === \"object\" ? event.data : null;"
             ) && auth_js.contains("Ignoring malformed worker message payload")
                 && auth_js
-                    .contains("void handleWorkerError(new Error('Malformed worker response'));")
-                && auth_js.contains("case 'WORKER_ERROR':")
+                    .contains("void handleWorkerError(new Error(\"Malformed worker response\"));")
+                && auth_js.contains("case \"WORKER_ERROR\":")
                 && auth_js.contains(
                     "void handleWorkerError(new Error(`Unknown worker message type: ${type}`));"
                 ),
@@ -2481,12 +2432,12 @@ mod tests {
         let crypto_worker_js = include_str!("../src/pages_assets/crypto_worker.js");
         assert!(
             crypto_worker_js.contains("Ignoring malformed worker request payload")
-                && crypto_worker_js.contains("type: 'WORKER_ERROR',")
-                && crypto_worker_js.contains("error: 'Malformed worker request payload',")
+                && crypto_worker_js.contains("type: \"WORKER_ERROR\",")
+                && crypto_worker_js.contains("error: \"Malformed worker request payload\",")
                 && crypto_worker_js
                     .contains("throw new Error(`Unknown worker message type: ${type}`);")
                 && crypto_worker_js.contains("type: getWorkerFailureMessageType(type),")
-                && crypto_worker_js.contains("return 'WORKER_ERROR';"),
+                && crypto_worker_js.contains("return \"WORKER_ERROR\";"),
             "crypto worker should report malformed or unknown payloads and fall back to a generic worker failure type"
         );
     }
@@ -2495,7 +2446,7 @@ mod tests {
     fn test_crypto_worker_rejects_unsupported_archive_compression() {
         let crypto_worker_js = include_str!("../src/pages_assets/crypto_worker.js");
         assert!(
-            crypto_worker_js.contains("cfg.compression !== 'deflate'")
+            crypto_worker_js.contains("cfg.compression !== \"deflate\"")
                 && crypto_worker_js.contains("Unsupported archive compression")
                 && !crypto_worker_js.contains("// No compression"),
             "crypto worker should fail closed when encrypted config.json declares unsupported compression"
@@ -2780,6 +2731,17 @@ mod tests {
                 import vm from 'node:vm';
 
                 const source = fs.readFileSync('./src/pages_assets/auth.js', 'utf8');
+                const trackedBuffers = [];
+                function TrackingUint8Array(...args) {
+                    const bytes = Reflect.construct(Uint8Array, args, Uint8Array);
+                    trackedBuffers.push(bytes);
+                    return bytes;
+                }
+                TrackingUint8Array.prototype = Uint8Array.prototype;
+                Object.setPrototypeOf(TrackingUint8Array, Uint8Array);
+                Object.defineProperty(TrackingUint8Array, Symbol.hasInstance, {
+                    value(value) { return value instanceof Uint8Array; },
+                });
                 const start = source.indexOf('async function readResponseBytesExact(');
                 const end = source.indexOf('\nfunction getUnencryptedPayloadPath()', start);
                 if (start < 0 || end < 0) {
@@ -2789,7 +2751,7 @@ mod tests {
                     const MAX_BROWSER_DATABASE_SIZE = 512 * 1024 * 1024;
                     ${source.slice(start, end)}
                 `;
-                const context = { Uint8Array };
+                const context = { Uint8Array: TrackingUint8Array, AbortController };
                 vm.createContext(context);
                 vm.runInContext(code, context);
 
@@ -2832,6 +2794,44 @@ mod tests {
                     throw new Error('source response chunks were not zeroized after copying');
                 }
 
+                for (const abortOnDone of [false, true]) {
+                    const controller = new AbortController();
+                    const terminalValue = new Uint8Array([9, 7]);
+                    let reads = 0;
+                    const terminalResponse = {
+                        headers: { get() { return null; } },
+                        body: {
+                            getReader() {
+                                return {
+                                    async read() {
+                                        if (reads++ === 0) {
+                                            return { done: false, value: new Uint8Array([1, 2]) };
+                                        }
+                                        if (abortOnDone) controller.abort();
+                                        return { done: true, value: terminalValue };
+                                    },
+                                    async cancel() {},
+                                };
+                            },
+                        },
+                    };
+                    const allocationStart = trackedBuffers.length;
+                    let rejected = false;
+                    try {
+                        await context.readResponseBytesExact(
+                            terminalResponse, 2, 'fixture database', controller.signal
+                        );
+                    } catch {
+                        rejected = true;
+                    }
+                    if (rejected !== abortOnDone || terminalValue.some(Boolean)) {
+                        throw new Error('terminal body read escaped cancellation or plaintext wiping');
+                    }
+                    if (abortOnDone && trackedBuffers[allocationStart].some(Boolean)) {
+                        throw new Error('abort at terminal read retained accumulated plaintext');
+                    }
+                }
+
                 const oversizedChunk = new Uint8Array([9, 8, 7]);
                 const oversized = responseFrom([oversizedChunk]);
                 let oversizedRejected = false;
@@ -2865,6 +2865,160 @@ mod tests {
                 if (!truncatedRejected) {
                     throw new Error('truncated response did not fail its exact-size check');
                 }
+
+                let releaseStalledRead;
+                let stalledCancelCalls = 0;
+                let stalledReadCalls = 0;
+                const receivedBeforeAbort = new Uint8Array([7, 8]);
+                const stalledResponse = {
+                    headers: { get() { return null; } },
+                    body: {
+                        getReader() {
+                            return {
+                                read() {
+                                    stalledReadCalls += 1;
+                                    if (stalledReadCalls === 1) {
+                                        return Promise.resolve({ done: false, value: receivedBeforeAbort });
+                                    }
+                                    return new Promise(resolve => { releaseStalledRead = resolve; });
+                                },
+                                cancel() {
+                                    stalledCancelCalls += 1;
+                                    return new Promise(() => {});
+                                },
+                            };
+                        },
+                    },
+                };
+                const abortController = new AbortController();
+                const allocationStart = trackedBuffers.length;
+                const stalledRead = context.readResponseBytesExact(
+                    stalledResponse,
+                    4,
+                    'fixture database',
+                    abortController.signal
+                );
+                const stalledOutcome = stalledRead.then(() => 'resolved', () => 'rejected');
+                for (let turn = 0; turn < 20 && !releaseStalledRead; turn += 1) {
+                    await Promise.resolve();
+                }
+                const receiveBuffer = trackedBuffers[allocationStart];
+                if (!releaseStalledRead || receiveBuffer[0] !== 7 || receiveBuffer[1] !== 8) {
+                    throw new Error('abort fixture never populated the receive buffer before stalling');
+                }
+                if (receivedBeforeAbort.some(Boolean)) {
+                    throw new Error('initial plaintext chunk was not cleared before the next read');
+                }
+                abortController.abort();
+                const outcome = await Promise.race([
+                    stalledOutcome,
+                    new Promise(resolve => setTimeout(() => resolve('hung'), 1000)),
+                ]);
+                if (outcome !== 'rejected') {
+                    throw new Error('aborting a stalled body read waited for read/cancel to settle');
+                }
+                if (stalledCancelCalls !== 1) {
+                    throw new Error(`stalled response cancellation ran ${stalledCancelCalls} times`);
+                }
+                const stalledBuffers = trackedBuffers.slice(allocationStart);
+                if (stalledBuffers.length !== 1 || stalledBuffers[0].some(Boolean)) {
+                    throw new Error('aborting the body read did not zero its exact-size buffer');
+                }
+
+                const lateChunk = new Uint8Array([5, 6]);
+                releaseStalledRead({ done: false, value: lateChunk });
+                await Promise.resolve();
+                await Promise.resolve();
+                if (lateChunk.some(Boolean)) {
+                    throw new Error('a plaintext chunk arriving after abort was not zeroized');
+                }
+            "#,
+        )
+    }
+
+    #[test]
+    fn auth_config_and_integrity_fetches_abort_with_stale_init_attempt() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                import fs from 'node:fs';
+                import vm from 'node:vm';
+
+                const source = fs.readFileSync('./src/pages_assets/auth.js', 'utf8');
+                const attemptStart = source.indexOf('function beginAppInitAttempt()');
+                const attemptEnd = source.indexOf('\nfunction beginQrScannerSession()', attemptStart);
+                const configStart = source.indexOf('async function loadConfig(');
+                const configEnd = source.indexOf('\nfunction getSessionKeys()', configStart);
+                const fingerprintStart = source.indexOf('async function displayFingerprint(');
+                const fingerprintEnd = source.indexOf('\nfunction setupUnencryptedMode()', fingerprintStart);
+                if ([attemptStart, attemptEnd, configStart, configEnd, fingerprintStart, fingerprintEnd].some(index => index < 0)) {
+                    throw new Error('could not isolate auth initialization cancellation functions');
+                }
+                const code = `
+                    let activeAppInitToken = 0;
+                    let activeAppInitController = null;
+                    const ARCHIVE_SCOPE_URL = new URL('https://example.test/archive/');
+                    let config = { export_id: 'AQ==' };
+                    const elements = { fingerprintValue: { textContent: 'untouched' } };
+                    function getTofuKey() { return 'fixture-tofu-key'; }
+                    ${source.slice(attemptStart, attemptEnd)}
+                    ${source.slice(configStart, configEnd)}
+                    ${source.slice(fingerprintStart, fingerprintEnd)}
+                `;
+                const fetches = [];
+                const context = {
+                    AbortController,
+                    URL,
+                    fetch(url, options = {}) {
+                        const signal = options.signal;
+                        fetches.push({ url: String(url), signal });
+                        return new Promise((resolve, reject) => {
+                            const fail = () => reject(
+                                signal?.reason ?? Object.assign(new Error('aborted'), { name: 'AbortError' })
+                            );
+                            if (!signal) {
+                                reject(new Error('auth fetch omitted its cancellation signal'));
+                            } else if (signal.aborted) {
+                                fail();
+                            } else {
+                                signal.addEventListener('abort', fail, { once: true });
+                            }
+                        });
+                    },
+                    computeFingerprint: async () => 'fixture-fingerprint',
+                    verifyTofu: async () => ({ valid: true, isFirstVisit: true }),
+                    displayTofuStatus() {},
+                    base64ToBytes: () => new Uint8Array(8),
+                    formatFingerprint: () => 'fallback-fingerprint',
+                };
+                vm.createContext(context);
+                vm.runInContext(code, context);
+
+                const token = context.beginAppInitAttempt();
+                const pending = [
+                    context.loadConfig(token).then(() => null, error => error),
+                    context.displayFingerprint(token).then(() => null, error => error),
+                ];
+                if (fetches.length !== 2 ||
+                    !fetches.some(({ url }) => url.endsWith('/config.json')) ||
+                    !fetches.some(({ url }) => url.endsWith('/integrity.json')) ||
+                    fetches[0].signal !== fetches[1].signal) {
+                    throw new Error('config and integrity fetches did not share the init attempt signal');
+                }
+
+                context.invalidateAppInitAttempt();
+                const settled = await Promise.race([
+                    Promise.all(pending).then(errors => ({ errors })),
+                    new Promise(resolve => setTimeout(() => resolve({ timeout: true }), 100)),
+                ]);
+                if (settled.timeout || settled.errors.some(error => error?.name !== 'AbortError')) {
+                    throw new Error('stale config/integrity fetches did not reject promptly on invalidation');
+                }
+                if (fetches.some(({ signal }) => !signal.aborted)) {
+                    throw new Error('invalidating auth initialization left a fetch signal live');
+                }
+                if (vm.runInContext('elements.fingerprintValue.textContent', context) !== 'untouched') {
+                    throw new Error('stale integrity cancellation wrote fallback fingerprint UI');
+                }
             "#,
         )
     }
@@ -2885,13 +3039,21 @@ mod tests {
                 const code = `
                     const activeAppInitToken = 1;
                     const ARCHIVE_SCOPE_URL = new URL('https://example.test/archive/');
+                    const activeSignal = new AbortController().signal;
+                    function isCurrentAppInitToken(token) { return token === activeAppInitToken; }
+                    function getAppInitSignal(_token) { return activeSignal; }
                     function getUnencryptedPayloadPath() { return './payload/data.db'; }
                     function getUnencryptedPayloadSize() { return 4; }
                     ${source.slice(start, end)}
                 `;
+                let fetchSignal = null;
                 const context = {
                     URL,
-                    fetch: async () => ({ ok: true, status: 206 }),
+                    AbortController,
+                    fetch: async (_url, options) => {
+                        fetchSignal = options?.signal;
+                        return { ok: true, status: 206 };
+                    },
                 };
                 vm.createContext(context);
                 vm.runInContext(code, context);
@@ -2904,6 +3066,9 @@ mod tests {
                 }
                 if (!rejected) {
                     throw new Error('partial 206 database response was accepted as a complete archive');
+                }
+                if (!fetchSignal || fetchSignal.aborted) {
+                    throw new Error('unencrypted payload fetch did not receive its init cancellation signal');
                 }
             "#,
         )
@@ -3013,7 +3178,7 @@ mod tests {
     }
 
     #[test]
-    fn pages_runtime_uses_pinned_official_vendor_apis() {
+    fn pages_runtime_uses_pinned_official_vendor_apis() -> Result<()> {
         let database_js = include_str!("../src/pages_assets/database.js");
         let deserialize_call = database_js
             .find("sqliteApi.capi.sqlite3_deserialize(")
@@ -3030,7 +3195,7 @@ mod tests {
                 && database_js.contains("SQLITE_DESERIALIZE_READONLY")
                 && database_js.contains("const SQLITE_DESERIALIZE_PADDING = 20;")
                 && database_js.contains("const MAX_BROWSER_DATABASE_SIZE = 512 * 1024 * 1024;")
-                && database_js.contains("const MAX_WASM32_ALLOCATION_SIZE = 0xFFFFFFFF;")
+                && database_js.contains("const MAX_WASM32_ALLOCATION_SIZE = 0xffffffff;")
                 && database_js.contains("checkedDatabaseAllocationSize(dbBytes.byteLength)")
                 && database_js
                     .contains("Ownership of a valid Uint8Array transfers to this function")
@@ -3067,36 +3232,15 @@ mod tests {
                 && worker_js.contains("cannot be read safely without streaming response support")
                 && worker_js.contains("return concatenateAndZeroChunks(chunks);")
                 && worker_js.contains("const generation = beginDecryptAttempt();")
-                && worker_js.contains("ensureCurrentDecryptAttempt(generation);")
                 && worker_js.contains("invalidateDecryptAttempts();")
-                && worker_js.contains("encryptedChunk?.fill(0);")
                 && worker_js.contains("passwordBytes.fill(0);")
                 && worker_js.contains("result.hash.fill(0);")
                 && !worker_js.contains("await response.arrayBuffer()")
                 && worker_js.matches("await writer.abort(error);").count() == 1
         );
 
-        for unlock_function in ["handleUnlockPassword", "handleUnlockRecovery"] {
-            let signature = format!("async function {unlock_function}");
-            let function_body = worker_js
-                .split_once(signature.as_str())
-                .unwrap_or_else(|| panic!("missing {unlock_function}"))
-                .1
-                .split_once("\n}\n")
-                .unwrap_or_else(|| panic!("unbounded {unlock_function}"))
-                .0;
-            let derive_offset = function_body
-                .find("const kek = await deriveKekFrom")
-                .unwrap_or_else(|| panic!("missing KEK derivation in {unlock_function}"));
-            let unwrap_try_offset = function_body
-                .find("let unwrappedDek = null;\n            try {")
-                .unwrap_or_else(|| panic!("missing unwrap-only catch in {unlock_function}"));
-            assert!(
-                derive_offset < unwrap_try_offset
-                    && function_body.contains("if (error?.name !== 'OperationError')"),
-                "{unlock_function} must not relabel KDF/runtime failures as bad credentials"
-            );
-        }
+        run_node_contract_tests("tests/pages/crypto-worker-admission.test.mjs", ".*")?;
+        run_node_contract_tests("tests/pages/crypto-worker-unlock.test.mjs", ".*")?;
 
         let auth_js = include_str!("../src/pages_assets/auth.js");
         assert!(
@@ -3123,10 +3267,10 @@ mod tests {
         let sw_js = include_str!("../src/pages_assets/sw.js");
         for vendor_asset in EXPECTED_VENDOR_ASSETS {
             assert!(
-                sw_js.contains(&format!("'./{vendor_asset}'")),
+                sw_js.contains(&format!("\"./{vendor_asset}\"")),
                 "service worker must cache {vendor_asset}"
             );
         }
-        assert!(sw_js.contains("Promise.all(STATIC_ASSETS.map(asset => cache.add(asset)))"));
+        Ok(())
     }
 }

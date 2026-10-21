@@ -1,14 +1,305 @@
 # CASS 0.8.0 changelog research
 
+September 16 continuation (unreleased): commits `70a33b7b`, `5403f925`,
+`4e32e8a9` and fixture correction `4cbee654` contain GH473/474/476/477/478
+changes. Their final-graph runtime and performance acceptance remains pending;
+the changelog describes source behavior, not completed issue acceptance.
+FAD 0.3.0 is now published and verified against its registry checksum after
+1,181 passing tests, all-target Clippy and its standard scanner gate. CASS
+still awaits Frankensearch 0.6.1 and the corrected SQLite recovery candidate.
+The first upstream recovery run passed 12 tests and exposed a live-writer
+fixture that inadvertently released its POSIX lock; the corrected fixture
+retains the descriptor and independently checks the lock. No owner archive
+was modified or certified repaired. The strict CASS scanner and complete
+platform release gates remain open.
+
+Next-release preparation (September 12 UTC, unreleased, bead yrjna): local
+Shelley/Grok Bot integration is represented by commits `5d187f87`, `59b5d10c`
+and the native-ID changes after v0.8.0. The published FAD dependency is now
+0.2.4; historical 0.2.3 references below identify the discovery evidence used
+at that time. The source-backup repair in `ee64d3b1` replaces an overwriting
+copy with exclusive destination creation and bounded retries. It adds real
+file and symlink conservation tests; those tests have not yet executed.
+Crossbeam-channel 0.5.17 is committed as `f5328832`. Its first remote gate
+was interrupted before a compiler or test verdict; the unchanged-source
+continuation passed formatting, all-target Clippy and 35 focused tests. Its
+strict UBS Rust module timed out after 300 seconds; source-after verification
+passed. Neither that update nor the planned 0.9.0 release has full release
+clearance. Asupersync 0.4.11 and its four companion packages are the next
+isolated dependency candidate; validation is pending.
+
+Fleet follow-up (September 11, unreleased, bead av59c): published FAD 0.2.3
+lists `~/.config/muse/auth.json` and `~/.config/muse` as local discovery probes.
+CASS previously admitted both into automatic remote source configuration.
+The shared discovery/configuration predicate now excludes that configuration
+tree, including old reports classified as unknown, while retaining Muse's
+data roots. Existing manually configured sources are not rewritten. Focused
+remote validation passed as recorded below; this finding does not establish that any
+operator credentials were actually transferred.
+
+The same fleet review found `run_setup` cleared its saved state before the
+CLI attempted final sync, contradicting the failed-sync resume hint. State
+is now retained while sync is pending. The new CLI regression starts from
+fixture-backed completed setup, exercises a real OpenSSH transport failure,
+and checks repeated JSON resume still reports pending sync with the selected
+host and source configuration preserved. This is not successful live SSH
+recovery or all-ten-machine acceptance.
+
+Remote validation completed on September 11 at 20:26 UTC. Formatting and
+all-target Clippy passed, along with 34 library tests and the CLI regression.
+A test-only follow-up explicitly bound `CASS_DATA_DIR` and improved failure
+diagnostics; its formatting, scoped Clippy and CLI rerun passed. The first
+run's environment was checked and had no inherited data-directory override.
+Strict UBS 5.3.13 remains red: the four-file scan reported 5 critical findings
+and 1,781 warnings; the final test-file scan reported zero critical findings
+and 1,108 warnings. No findings were suppressed. The three production files
+and final test match their tested hashes. This is local unreleased work,
+not full-suite, successful fleet-recovery or release acceptance.
+
+Subsequent validation (2026-09-11 UTC, unreleased): v7 passed formatting,
+all-target Clippy, 178 library tests, 68 integration tests and 68 goldens.
+Two integration failures remain recorded: a Devin WAL append returned four
+instead of five messages, and the rebuilding-generation CLI test took its
+lock before its copied legacy fixture had a usable Quill generation. The
+source-resume SIGINT, SIGTERM and bounded-stop journeys all passed. Strict
+UBS remained red: the Rust module exceeded 300 seconds and Python reported
+one warning. Frozen development CLI SHA256:
+`802aa06f83454f1aeba732aff74f32309ab390711cbc579fe1d8ec0f6820ffc3`.
+The next frozen candidate includes the Devin whole-second cutoff correction,
+real fixture admission before the rebuild lock, one-pass conversation
+statistics, and explicit pending-analytics completion with maintenance
+exclusion. Its selected runtime checks are recorded below. A later comment-only
+Python change documents a narrow UBS 5.3.13 false positive: `json.loads` already has an
+enclosing `JSONDecodeError` handler. It is outside that frozen candidate and
+passed a separate strict pinned scan: one file, zero critical findings, zero
+warnings, and 49 informational findings. Sixteen JSON/error-path controls also
+passed. The same-line pragma applies to every finding on that line, not one
+rule. It does not resolve the Rust scanner timeout.
+
+The v8c gate finished on September 11 at 08:09 UTC: formatting and all-target
+Clippy passed, with 225 library, 86 integration and 68 golden passes. One OMP
+integration failed and one semantic test remained ignored. The new Devin
+same-second WAL append/replay test passed, as did all four deferred-watch
+journeys, five Shelley tests and three interrupted-resume journeys. The OMP
+failure occurred in a new test helper that parsed empty stdout after an
+expected failure; production fatal robot JSON is emitted on stderr. That
+helper also lost the child's stderr, so the original exact envelope cannot
+be recovered. A test-only correction preserves all existing assertions and
+adds exact error-code/stream checks. Its separate focused remote rerun passed:
+one test, zero failures, 11.00 seconds, with formatting and scoped Clippy also
+passing. The actual journey covers deferred search, full analytics completion,
+replay conservation, missing-marker refusal and all five held-lock conflicts.
+All other 3,751 frozen inputs, the original private Git HEAD, the broad-run
+receipts and the application binary stayed unchanged. The formatter-only
+patch was reviewed and applied to the canonical test; its SHA256 is
+`d42edfbd1bb44f6f67509c06acb135f0e80e07501ae3cfe63c7b6bf0f07a5051`.
+Focused receipt SHA256:
+`f51bc7bb92563b1f574779024377f939be13f0e4ee9c4592ffe33a0c758f2135`.
+The original frozen source stayed unchanged through the broad run. Receipt
+SHA256: `d9552cf8bd1bf7b31766b141594513c19212c7fd575cc8ebc1a9c149117014ef`.
+The full gate remains red: strict UBS timed out its Rust module at 300 seconds
+and reported the Python warning predating the separate comment-only fix.
+
+The v8c development executable
+`1182c93d1ba643a1988cb628796d6e33a29c2fed6fd81ca16d5f9af4f75d4241`
+was run once on the retained current archive copy. Statistics preserved all
+13,990 conversations, 2,410,329 messages, dates, agent counts and ordered
+workspace results. Elapsed time was 10.25 seconds and maximum RSS was
+1,498,792 KiB: no clear improvement over the retained earlier development
+run. Intervening analytics work changed the archive's physical state between
+runs, so this is not an identical-state performance comparison. The archive
+observations and executable stayed unchanged within this run, and the whole
+process group stopped without a guard intervention. No additional statistics
+run is warranted until a relevant implementation change is available.
+
+Original issue validation update (2026-09-11 UTC, unreleased): reviewed the
+source changes recorded in `ed7d166a` and the complete v6 remote gate receipt.
+The fixed snapshot passed formatting, all-target Clippy with warnings denied,
+175 selected library tests, 53 selected integration tests and 68 goldens.
+Two integration tests failed: Shelley batch metadata retained an old analytics
+workspace, and the 80-source signal fixture's prefix query matched neighboring
+source IDs. Both repairs and subsequent fallback-cancellation, progress and
+stale-cursor corrections await v7 validation. Strict UBS remains red because
+the pinned Rust scan times out and the Python scan reports findings; this is
+not release clearance. Frozen CLI SHA256:
+`9424674a31c3e0d28af3c4ad573d38ab2e2f32bc10762b4f122456706d9fc1bb`.
+The registry-backed source-resume test passed in both indexing modes. Bounded
+analytics-reset interruption/reopen and absent-FTS Codebuff storage controls
+also passed; the latter does not establish published Codebuff connector
+adoption. Current archive validation remains separate from original reporter
+archives: a retained 2,410,329-message copy resumed analytics through 595,664
+messages, then stopped with typed interruption/143 without forced termination.
+Its measured peak was 3,835,012 KiB. These corpus probes used development
+binaries from the test gate, not optimized release builds, and do not certify
+released performance. Old/new stats outputs agreed, but the approximately
+10-second runtime and 1.55 GB memory use did not improve in those runs.
+Private archives and machine identities are kept outside the repository.
+Separately, the official v0.8.0 Linux x86_64 asset was checked against its
+published archive checksum and executed once per search mode on the retained
+current copy. Both lexical and default-hybrid searches timed out during setup
+at the requested 3,000 ms and returned zero hits despite exit 0. Neither run
+demonstrates working search on that archive. The executable and archive
+observations were unchanged and both process groups stopped. This official
+release baseline uses different source and optimization settings from the
+development probes above; the timings are not an old/new performance comparison.
+A separate single invocation using the official release's unmodified default
+120,000 ms budget succeeded: five distinct hits, no timeout, 6.94 seconds and
+2,558,324 KiB maximum RSS. Hybrid intent fell back to lexical because model
+download consent was absent; no model was downloaded. Source archive and
+executable observations were unchanged, and all child processes stopped.
+This establishes default-command retrieval on this current copy. It does not
+satisfy the earlier three-second probes, memory targets, semantic retrieval,
+or original-reporter acceptance. The earlier short-budget failures must not
+be read as proof that default search cannot finish.
+GitHub metadata still identifies v0.8.0 as the published 2026-09-10 release;
+these subsequent source changes are unreleased. Original issue acceptance
+remains open.
+
+Original issue implementation follow-up (2026-09-11 UTC, unreleased): Prime
+explicit-file routing, migration-aware schema-only storage admission, known
+legacy hash-space rebuilding, and completed-backfill no-op caching are under
+combined remote validation. The cache is a maintenance skip hint, never search
+serving authority; Unix descriptor identity and DB/WAL/vector change stamps
+bind it to the completed artifact. Changed archives still require canonical
+reconciliation, and concurrent indexing is still excluded. New tests include
+same-tail edits, symlink WAL routing, old read transactions, replaced archive
+paths, legacy wrong-vector replacement, and real Prime watcher notifications.
+No native large-archive performance or remaining issue closure is claimed.
+The fleet-only follow-up gate below timed out after1800s during Clippy and
+executed no Rust tests; the combined candidate uses the supported10800s RCH
+transport limit without changing behavioral assertions or scanner policy.
+
+Reingest follow-up (2026-09-11 UTC, original `av59c`, unreleased): reviewed the
+source after `b65e6803` and the retained two-mirror reproducer below. The source
+filter previously narrowed only the report. The new scan entry point selects
+remote roots, suppresses local discovery and historical salvage, forces mirror
+recovery past unchanged-file fingerprints, and preserves global/per-connector
+local watermarks in both streaming and batch ingestion. Mixed valid/unknown
+filters fail before archive creation; preview discovery no longer opens the
+database before the index lock. Both configured and database-fallback mirror
+discovery now hash the exact configured path, matching sync for a bare `~`.
+Real CLI regressions cover selective/full/replay/all-mirror ingestion, missing
+mirrors, watermark preservation and subsequent local indexing; execution is
+pending. A separate synthetic harness reproduction proved the TMPDIR symlink
+privacy bypass: one inventory was written inside an isolated fake checkout
+before the fix; after resolving the artifact root, the same case exits 2 with
+no inventory inside, while normal external initialization still succeeds.
+The first remote validation snapshot omitted `.gitattributes`, so all-target
+Clippy failed at its existing `include_str!`; that attempt is retained and
+cannot certify the gate. Final validation and the unchanged all-ten-host
+authentication/strict-UBS acceptance remain pending. GitHub metadata was checked:
+v0.8.0 is published at 2026-09-10 16:11:54 UTC; these fixes are unreleased.
+
+Bounded setup probe follow-up (2026-09-10, original `av59c`): commit `7459cdeb`
+limits optional health/stats/du/find measurements to a shared two-second budget.
+Directory presence remains useful when measurements are unavailable; estimates
+remain null rather than becoming false zeros. `InstalledUnknown` retains the
+installed version, remains selectable for sync, and does not request indexing
+solely because the optional check failed. A real ten-machine baseline at the
+same 10-second deadline found eight reachable; both Mac probes timed out.
+The remote gate passed formatting, all-target Clippy and 146 tests (76 library,
+two setup CLI, 68 unchanged goldens; zero failed or ignored). UBS completed with
+three critical and 320 warning findings, so `STAGE=ubs EXIT=1` remains red.
+The three critical findings are pre-existing: two panics in the test-fixture
+loader and an integer session-count comparison misidentified as a secret
+comparison. The warning inventory is not waived or claimed fully resolved.
+All 1040 CASS and 77 FAD inputs were unchanged after the gate, and the three
+canonical files match its manifest. Gate log SHA256:
+`665898d6e40e200dd8fb5cc09b2ec9d69c95150961466e35b75b453698661b08`.
+The matched live comparison improved reachability from eight to nine of the
+same ten machines at the same 10-second deadline. The previously failing newer
+Mac completed in 2548 ms and exposed 27 session roots. Every previously reachable
+host remained reachable and retained all previously detected paths. The older
+Mac still timed out; the CLI's exit 0 for partial setup is not an all-ten pass.
+Executable SHA256: `8a7b8db232cddd048733cba950ba4f72fe1d04f387b7a3eeb943d4267cae3197`.
+Private ordinal summary SHA256: `7ac5fa4b436ec022ea51203f9b1c214e6572925321c4c98b3f893623dd2ce861`.
+This is setup-probe validation; the full sync/search lifecycle was tested in the
+preceding fleet run below, not repeated for this executable.
+Separately, an isolated two-mirror CLI reproducer confirms that
+`sources reingest --source alpha` also ingests beta while reporting only alpha;
+the original bead retains that unresolved scope defect.
+The gate's first
+payload failed before compilation because a concurrent commit made the exported
+HEAD diff empty; the replacement patch uses verified baseline hashes. No result
+is credited to that failed attempt. GitHub metadata reports v0.8.0 published at
+16:11:54 UTC targeting `96510ff5`, which contains the runtime change; this later
+verification is not evidence that its published binaries passed this gate.
+
+Fresh-eye fleet review (2026-09-10, `av59c`): the previous executable reproduced
+three discovery defects with isolated generic configuration: `Match` overwrote
+the preceding host's address, a reused source label falsely marked a different
+target configured, and an existing target under a different label was not skipped.
+The patch fixes these, quoted/commented aliases, first-value precedence, the
+invalid printed add command, and zero-transfer `will_reindex` metadata. It also
+bounds child output during collection and keeps timeout/error cleanup, rather
+than checking size only after allocating the entire Tailscale response.
+
+The final schema pass additionally found that JSON `null` for an empty Tailscale
+address slice rejected the entire provider response. The amended parser treats
+null/missing addresses as empty and skips that peer; the existing mixed-peer test
+now covers this case. The final amendment passed formatting, all-target Clippy,
+and all 91 selected tests, with no failures or ignored tests. The rebuilt binary
+repeated the complete live workflow successfully on nine authenticated machines;
+the tenth still requires authentication, so the overall harness exits 1.
+The final gate ended at 02:45 UTC with `STAGE=ubs EXIT=1` after a 300-second
+`MODULE_TIMEOUT`. All 1040 CASS and 77 FAD source inputs were unchanged after
+execution; the four reviewed Rust files match the build manifest and the live
+binary matches the executable receipt. This does not clear the release gate.
+Final executable SHA256: `7241298dc93353fe3aef6456c092bef5ac87c36831e43a84b9c6f990551268d4`.
+Final private ordinal summary SHA256: `0d3f4478760e1a4d8825196c952772e48ba483391bc9a441df1eed02234b5cdd`.
+Final gate log SHA256: `fb3b916cc07a1e12ad36b73102b509a7b7a409782e7232f3e74ba974a4193b43`.
+The following comparison receipts describe the preceding review build, retained
+separately from this final amendment.
+
+The harness now rejects Python `-O` (observed exit 2), avoids private-path
+tracebacks for invalid input (observed exit 2), and compares content and host
+provenance across global, source-scoped and default-hybrid results. Formatting,
+all-target Clippy and 91 tests passed (nine library, six sources CLI, two setup,
+six index JSON, 68 unchanged goldens). Three same-invocation before/after CLI
+comparisons confirm the discovery defects fail on the previous binary and pass
+on this one. Three additional malformed/private-input cases exit 2 without
+tracebacks or path leakage.
+
+The strengthened live harness passed all workflow checks on nine authenticated
+machines: initial/replay/busy counts 18, mirror recovery 27, appended/offline
+counts 36. Content and host provenance agree across all query scopes. A zero-file
+replay now reports `will_reindex=false` (previous binary reported true). The tenth
+host still requires authentication, so the overall live result is failed. That
+gate ended with a 300-second UBS timeout and unchanged source inputs; this is
+not release clearance.
+Reviewed executable SHA256: `2a861819bb08f8caf51496a67a31b5fdb9a688736028c16e4e192496b806cd0a`.
+Reviewed harness SHA256: `9aec231f6d19fd24f07df46471c7f5b65b6a57c5ebd32e8eeca406c9e4526dc4`.
+Private ordinal summary SHA256: `7f27406adf5966f6b7ca0fa3c0786445ce82c4222ca488d5fa5a322ee7264c97`.
+
 Optional Tailscale discovery (2026-09-09, original bead `av59c`): owner-requested
 `--tailscale` is wired through both discovery and setup. Local status is bounded
 to five seconds; online peer IPv4 addresses merge with configured SSH aliases,
 without changing authentication or host-key policy. Offline peers, the local
-node and IPv6-only peers are omitted. Parser and real missing-executable CLI
-tests are authored. The new frozen remote gate and private live tailnet test
-are pending; the earlier 86-test/nine-host evidence below does not validate this
-new capability. Source snapshot also retains a concurrent answer-pack command
-change to always include its database argument; it is not a Tailscale fix.
+node and IPv6-only peers are omitted. The new frozen remote gate passed formatting,
+all-target Clippy and 88 tests: six library, six sources CLI, two setup-option,
+six index JSON, and 68 unchanged goldens. The missing-executable CLI test verifies
+that optional discovery failure retains SSH aliases and reports a warning.
+
+The new executable then ran the actual Tailscale lane of the private fleet harness.
+Discovery added 15 online peer candidates to the two explicit test configuration
+entries; all requested peer addresses were found without being declared as SSH
+aliases. Nine authenticated machines passed initial sync/search (18 messages),
+unchanged replay, index-lock refusal (exit 7), mirror recovery (27 messages), a
+second append (36 messages), and refused-source partial failure (exit 8, existing
+36 messages preserved). Exact source/host provenance, negative source filters and
+default-hybrid lexical fallback passed each phase. One requested machine still
+requires human authentication, so the ten-machine harness correctly exits 1.
+
+Executable SHA256: `a28c5028842655c86c8d79f23dc0edb8c7a9d9a3f014fb26c6afe6c6feb74a14`.
+Harness SHA256: `736800dd4b73d8fd679ffb97b4de02b7dc5c58059bdd25ab4e31ff7d1322b655`.
+Private ordinal summary SHA256: `fd65284b3367cfad0f965e7f228fadb9aa0013073d3f65103a94fbb46f52091f`.
+The gate finished at 23:06 UTC: UBS timed out after 300 seconds (`MODULE_TIMEOUT`),
+so `STAGE=ubs EXIT=1` keeps the release gate red. All other stages passed. The
+post-run check verified all 1040 CASS and 77 FAD inputs unchanged, and the final
+binary matches the live-run SHA above. Gate log SHA256:
+`2ec0efa5276467e29b8d3c09b6a17919ba27a7de63cfcea469fc4ce3905d07b1`.
+This is neither an all-ten pass nor a release clearance. Source snapshot also retains a concurrent answer-pack
+command change to always include its database argument; it is not a Tailscale fix.
 
 Fleet investigation (2026-09-09, bead `av59c`): live SSH testing exposed two
 source defects. Discovery ignored the SSH configuration override used by

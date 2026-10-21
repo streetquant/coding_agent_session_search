@@ -119,6 +119,8 @@ fn cass_cmd(home: &Path, xdg_data: &Path, args: &[String]) -> Command {
         .env("CASS_SEMANTIC_EMBEDDER", "hash")
         .env("NO_COLOR", "1")
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("CASS_CLOUDMCP_DATA_ROOT", home.join("cloudmcp-empty"))
+        .env("CASS_OPENWEBUI_DATA_ROOT", home.join("openwebui-empty"))
         .env("CODEX_HOME", home.join(".codex-empty"))
         .env("CLAUDE_HOME", home.join(".claude-empty"))
         .env("GEMINI_HOME", home.join(".gemini-empty"))
@@ -406,6 +408,72 @@ fn every_incident_kind_redacts_and_uses_share_safe_rerun() -> TestResult {
         assert_kind_capsule(&payload, &home, kind)?;
         log_scenario(&argv, &payload, "redacted + share-safe rerun");
     }
+    Ok(())
+}
+
+#[test]
+fn structured_credentials_and_key_collisions_survive_only_as_redacted_evidence() -> TestResult {
+    let (_tmp, home, xdg_data) = isolated_home()?;
+    let fx = tempfile::TempDir::new()?;
+    let fixture = write_inputs(fx.path(), "ci-failure", "redacted")?;
+    let mut source: Value = serde_json::from_slice(&std::fs::read(&fixture)?)?;
+    let first_key = ["api_key=", "abcdefgh12345678"].concat();
+    let second_key = ["password=", "abcdefgh12345678"].concat();
+    source["sources"]["repro_capsule"]["env"] = json!({
+        "password": (["a", "bc"].concat()),
+        "pin": 1234,
+        "api_key": { "nested": (["tiny", "-secret"].concat()) },
+        "authorization": false,
+        "token_count": 42,
+        (first_key.clone()): "first",
+        (second_key.clone()): "second",
+    });
+    std::fs::write(&fixture, serde_json::to_vec_pretty(&source)?)?;
+    let (payload, argv) = run_capsule(&home, &xdg_data, &capsule_argv(&fixture))?;
+    assert_kind_capsule(&payload, &home, "ci-failure")?;
+    let env = payload
+        .pointer("/capsule/env_summary")
+        .and_then(Value::as_object)
+        .ok_or("capsule omitted structured environment evidence")?;
+    for field in ["password", "pin", "api_key", "authorization"] {
+        ensure(
+            env.get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.cmp("[REDACTED]").is_eq()),
+            || format!("structured credential field was not redacted: {field}"),
+        )?;
+    }
+    ensure(
+        env.get("token_count")
+            .is_some_and(|value| value.eq(&json!(42))),
+        || "non-secret token count must remain useful".to_string(),
+    )?;
+    let mut collision_values = env
+        .iter()
+        .filter(|(key, _)| key.starts_with("[SECRET_ENV_REDACTED]"))
+        .filter_map(|(_, value)| value.as_str())
+        .collect::<Vec<_>>();
+    collision_values.sort_unstable();
+    ensure(collision_values.eq(&["first", "second"]), || {
+        "redacted object-key collisions lost source evidence".to_string()
+    })?;
+    let encoded = serde_json::to_string(&payload)?;
+    ensure(
+        !encoded.contains(&first_key) && !encoded.contains(&second_key),
+        || "capsule retained a secret-bearing object key".to_string(),
+    )?;
+    ensure(
+        payload
+            .pointer("/redaction_report/fields_scrubbed")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count >= 6),
+        || "redaction tally omitted structured credential changes".to_string(),
+    )?;
+    log_scenario(
+        &argv,
+        &payload,
+        "short/scalar/container credentials + lossless key collisions",
+    );
     Ok(())
 }
 

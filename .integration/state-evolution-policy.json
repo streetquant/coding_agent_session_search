@@ -1,0 +1,178 @@
+{
+  "applicability": {
+    "status": "required",
+    "waiver": {
+      "approval": "",
+      "approved": false,
+      "evidence": [],
+      "reason": ""
+    }
+  },
+  "candidate_root": ".",
+  "limits": {
+    "max_output_bytes": 96000,
+    "max_scenarios": 32,
+    "max_state_bytes": 1000000000,
+    "max_state_files": 50000,
+    "max_steps": 128,
+    "max_subject_bytes": 2000000000,
+    "max_subject_files": 100000,
+    "per_command_timeout_sec": 300,
+    "whole_run_timeout_sec": 3600
+  },
+  "scenarios": [
+    {
+      "component_ids": [
+        "INT-001"
+      ],
+      "id": "STATE-001",
+      "ignore_patterns": [],
+      "repetitions": 2,
+      "required_obligations": [
+        "old-reader-after-expand",
+        "new-reader-after-old-write",
+        "old-reader-after-new-write",
+        "rollback-restores-state"
+      ],
+      "state_paths": [
+        "REPLACE_WITH_PERSISTED_STATE_PATH"
+      ],
+      "steps": [
+        {
+          "assertions": [],
+          "capture_checkpoint": "pre-migration",
+          "command": {
+            "argv": [
+              "REPLACE_WITH_STATE_COMMAND",
+              "seed",
+              "{sandbox_root}"
+            ],
+            "cwd": ".",
+            "env": {},
+            "expected_exit_code": 0,
+            "id": "state-seed",
+            "timeout_sec": 120
+          },
+          "id": "seed-old-state",
+          "irreversible": false,
+          "irreversible_approval": {
+            "approval": "",
+            "approved": false,
+            "evidence": [],
+            "reason": ""
+          },
+          "mode": "mutating",
+          "output_format": "json",
+          "phase": "seed",
+          "proves": [],
+          "state_change": "must_change"
+        },
+        {
+          "assertions": [
+            {
+              "expected": true,
+              "operator": "eq",
+              "path": "$.REPLACE_WITH_COMPATIBILITY_ASSERTION_FIELD"
+            }
+          ],
+          "command": {
+            "argv": [
+              "REPLACE_WITH_STATE_COMMAND",
+              "expand",
+              "{sandbox_root}"
+            ],
+            "cwd": ".",
+            "env": {},
+            "expected_exit_code": 0,
+            "id": "state-expand",
+            "timeout_sec": 120
+          },
+          "id": "expand",
+          "irreversible": false,
+          "irreversible_approval": {
+            "approval": "",
+            "approved": false,
+            "evidence": [],
+            "reason": ""
+          },
+          "mode": "mutating",
+          "output_format": "json",
+          "phase": "expand",
+          "proves": [
+            "old-reader-after-expand"
+          ],
+          "state_change": "may_change"
+        },
+        {
+          "assertions": [
+            {
+              "expected": true,
+              "operator": "eq",
+              "path": "$.REPLACE_WITH_COMPATIBILITY_ASSERTION_FIELD"
+            }
+          ],
+          "command": {
+            "argv": [
+              "REPLACE_WITH_STATE_COMMAND",
+              "new-read",
+              "{sandbox_root}"
+            ],
+            "cwd": ".",
+            "env": {},
+            "expected_exit_code": 0,
+            "id": "state-new-read",
+            "timeout_sec": 120
+          },
+          "id": "mixed-version-read",
+          "irreversible": false,
+          "irreversible_approval": {
+            "approval": "",
+            "approved": false,
+            "evidence": [],
+            "reason": ""
+          },
+          "mode": "read_only",
+          "output_format": "json",
+          "phase": "new-reader",
+          "proves": [
+            "new-reader-after-old-write",
+            "old-reader-after-new-write"
+          ],
+          "state_change": "unchanged"
+        },
+        {
+          "assertions": [],
+          "command": {
+            "argv": [
+              "REPLACE_WITH_STATE_COMMAND",
+              "rollback",
+              "{sandbox_root}"
+            ],
+            "cwd": ".",
+            "env": {},
+            "expected_exit_code": 0,
+            "id": "state-rollback",
+            "timeout_sec": 120
+          },
+          "expect_checkpoint": "pre-migration",
+          "id": "rollback",
+          "irreversible": false,
+          "irreversible_approval": {
+            "approval": "",
+            "approved": false,
+            "evidence": [],
+            "reason": ""
+          },
+          "mode": "mutating",
+          "output_format": "json",
+          "phase": "rollback",
+          "proves": [
+            "rollback-restores-state"
+          ],
+          "state_change": "may_change"
+        }
+      ]
+    }
+  ],
+  "schema_version": "1.0"
+}

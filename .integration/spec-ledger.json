@@ -1,0 +1,77 @@
+{
+  "commitments": [
+    {
+      "acceptance_criteria": [
+        {
+          "given": "the target repository is at the recorded baseline and required configuration is present",
+          "id": "AC-001",
+          "then": "the target adopts the pinned upstream implementation and dependency contract with every intentional difference enumerated",
+          "when": "the upstream tree is integrated on main"
+        }
+      ],
+      "change_control": {
+        "approval": "",
+        "reason": ""
+      },
+      "component_ids": [
+        "INT-001"
+      ],
+      "id": "SPEC-001",
+      "source": {
+        "kind": "user_request",
+        "reference": "https://github.com/Dicklesworthstone/coding_agent_session_search/tree/main"
+      },
+      "stability": "frozen",
+      "statement": "Integrate upstream cc7bdf13dceca8995628aecbb552a1067f7b43de on main, including its 0.10.0 implementation and pinned dependency family.",
+      "status": "active",
+      "supersedes": [],
+      "verifier_command_ids": [
+        "final-focused"
+      ]
+    },
+    {
+      "id": "SPEC-002",
+      "statement": "Preserve pre-existing committed and uncommitted native-history behavior and all existing files; keep the launch-root BR ledger authoritative and live archives unchanged.",
+      "source": {"kind": "repository_policy", "reference": "AGENTS.md:13-29 and user-supplied launch-root BR rules"},
+      "status": "active",
+      "stability": "frozen",
+      "component_ids": ["INT-001"],
+      "supersedes": [],
+      "change_control": {"reason": "", "approval": ""},
+      "acceptance_criteria": [{"id": "AC-002", "given": "the baseline patch, path hashes, and local-only history", "when": "upstream is integrated", "then": "local identities, ingestion paths and safety fixes remain represented, no existing path is deleted, and peer edits remain unstaged"}],
+      "verifier_command_ids": ["final-focused", "final-full"]
+    },
+    {
+      "id": "SPEC-003",
+      "statement": "Finish the remaining implementation outcomes in existing BR tasks after checking each against the integrated source and runtime; accept existing implementations only with current acceptance evidence.",
+      "source": {"kind": "user_request", "reference": "update the cass from upstream and finish whatever is left to implement"},
+      "status": "active",
+      "stability": "frozen",
+      "component_ids": ["INT-001"],
+      "supersedes": [],
+      "change_control": {"reason": "", "approval": ""},
+      "acceptance_criteria": [{"id": "AC-003", "given": "the all-status live BR ledger and integrated upstream implementation", "when": "each unfinished outcome is reconciled", "then": "every required outcome has current source and runtime acceptance, with no missing or blocked requirement represented as complete"}],
+      "verifier_command_ids": ["final-full"]
+    },
+    {
+      "id": "SPEC-004",
+      "statement": "Verify the integrated candidate through repository-required formatting, compiler, clippy, meaningful regression tests, UBS and relevant end-to-end acceptance before declaring completion.",
+      "source": {"kind": "repository_policy", "reference": "AGENTS.md:251-288,377-426"},
+      "status": "active",
+      "stability": "frozen",
+      "component_ids": ["INT-001"],
+      "supersedes": [],
+      "change_control": {"reason": "", "approval": ""},
+      "acceptance_criteria": [{"id": "AC-004", "given": "the exact final candidate and dependencies", "when": "the prescribed gates execute", "then": "passing receipts identify the tested candidate and prove required behavior, and unavailable runners or unexecuted cases remain explicit blockers"}],
+      "verifier_command_ids": ["final-full"]
+    }
+  ],
+  "decisions": [],
+  "integration": {
+    "baseline_head": "3254b9701105ccd3808bfa2c424cedc10e597a0e",
+    "created_at": "2026-10-20T19:13:08+00:00",
+    "feature": "Update CASS from pinned upstream main, preserve native-history changes, and finish remaining existing BR implementation tasks",
+    "reference": "https://github.com/Dicklesworthstone/coding_agent_session_search/tree/main"
+  },
+  "schema_version": "1.0"
+}

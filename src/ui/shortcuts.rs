@@ -14,6 +14,7 @@ pub const QUIT: &str = "Esc/F10";
 pub const CLEAR_FILTERS: &str = "Ctrl+Del";
 pub const RESET_STATE: &str = "Ctrl+Shift+Del";
 pub const RANKING: &str = "F12";
+pub const GROUPING: &str = "Alt+F";
 pub const REFRESH: &str = "Ctrl+Shift+R";
 pub const DETAIL_OPEN: &str = "Enter";
 pub const DETAIL_CLOSE: &str = "Esc";
@@ -37,6 +38,7 @@ pub const STATS_BAR: &str = "Ctrl+S";
 pub const COPY: &str = "Alt+Y";
 pub const COPY_PATH: &str = "Ctrl+Y";
 pub const COPY_CONTENT: &str = "Ctrl+Shift+C";
+pub const BOOKMARK: &str = "Alt+E";
 pub const BULK_MENU: &str = "Alt+B";
 pub const JSON_VIEW: &str = "Alt+Shift+J";
 pub const TOGGLE_SELECT: &str = "Ctrl+X";
@@ -63,7 +65,6 @@ pub const MACRO_TOGGLE: &str = "Alt+M";
 
 // Surface navigation
 pub const SURFACE_ANALYTICS: &str = "Alt+A";
-pub const SURFACE_SWARM: &str = "Alt+W";
 
 // Navigation
 pub const TAB_FOCUS: &str = "Tab";
@@ -178,6 +179,7 @@ mod tests {
     #[test]
     fn action_shortcuts_have_expected_values() {
         assert_eq!(COPY, "Alt+Y");
+        assert_eq!(BOOKMARK, "Alt+E");
         assert_eq!(BULK_MENU, "Alt+B");
         assert_eq!(PANE_FILTER, "Alt+/");
         assert_eq!(EXPORT_HTML, "Ctrl+E");

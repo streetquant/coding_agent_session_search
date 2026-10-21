@@ -1,0 +1,187 @@
+//! Include Codex's flat archived_sessions collection without widening narrow
+//! session/file roots or changing the existing active-session cutoff.
+
+use std::collections::HashSet;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use franken_agent_detection::connectors::codex::rollout_session_path;
+
+use super::discovery::Inventory;
+use super::path_policy::ScanExclusions;
+use super::{Connector, DiscoveredSourceFile, Result, ScanContext, ScanRoot};
+
+const ARCHIVE: &str = "archived_sessions";
+
+fn configured_home() -> PathBuf {
+    // Match FAD's env_path_nonempty(), including surrounding whitespace.
+    dotenvy::var("CODEX_HOME")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".codex"))
+}
+
+pub(super) fn default_home(ctx: &ScanContext) -> PathBuf {
+    // Retain FAD's legacy data_dir-as-Codex-root override.
+    let is_codex = ctx.data_dir.to_str().is_some_and(|path| {
+        path.contains(".codex") || path.ends_with("/codex") || path.ends_with("\\codex")
+    });
+    if is_codex && ctx.data_dir.join("sessions").exists() {
+        return ctx.data_dir.clone();
+    }
+    configured_home()
+}
+
+pub(super) fn detect(inner: &dyn Connector) -> super::DetectionResult {
+    let mut detection = inner.detect();
+    let home = configured_home();
+    let archive = home.join(ARCHIVE);
+    if archive.is_dir() {
+        detection.detected = true;
+        detection
+            .evidence
+            .push("Codex archived_sessions directory exists".to_owned());
+        // A host may turn detection roots into explicit ScanRoots. Returning
+        // only sessions/ would then hide the sibling archive again, while
+        // returning only archived_sessions/ loses full-home ID/cutoff policy.
+        // Use the common home for this profile and retain other native roots.
+        let sessions = home.join("sessions");
+        detection
+            .root_paths
+            .retain(|path| path != &sessions && path != &archive);
+        if !detection.root_paths.contains(&home) {
+            detection.root_paths.push(home);
+        }
+    }
+    detection
+}
+
+fn archive_candidates(ctx: &ScanContext) -> Vec<ScanRoot> {
+    let bases = if ctx.use_default_detection() {
+        vec![ScanRoot::local(default_home(ctx))]
+    } else {
+        ctx.scan_roots.clone()
+    };
+    let mut roots = Vec::new();
+    for base in bases {
+        if base.path.is_file() {
+            continue;
+        }
+        roots.push(base.with_path(base.path.join(ARCHIVE)));
+        let under_codex = base
+            .path
+            .ancestors()
+            .any(|path| path.file_name().is_some_and(|name| name == ".codex"));
+        if !under_codex {
+            roots.push(base.with_path(base.path.join(".codex").join(ARCHIVE)));
+        }
+    }
+    roots
+}
+
+fn path_key(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+pub(super) fn discover(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+    discover_for_scan(ctx)?.finish()
+}
+
+pub(super) fn discover_for_scan(ctx: &ScanContext) -> Result<Inventory> {
+    let exclusions = ScanExclusions::from_env();
+    exclusions.validate_codex()?;
+    let mut inventory = Inventory::default();
+    inventory.collect(ctx, &exclusions);
+    let mut seen_roots = HashSet::new();
+    for root in archive_candidates(ctx) {
+        if inventory.should_skip(&root.path, &exclusions)
+            || !seen_roots.insert(path_key(&root.path))
+        {
+            continue;
+        }
+        match fs::metadata(&root.path) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                inventory.record_failure(&root.path, error.into());
+                continue;
+            }
+        }
+        // Moving a rollout to the archive does not give its contents a new
+        // mtime. A global cutoff cannot establish whether it was ever indexed.
+        // Let the source-boundary ledger reuse unchanged archived files instead.
+        let mut scope = ScanContext::with_roots(ctx.data_dir.clone(), vec![root], None);
+        scope.progress_tick.clone_from(&ctx.progress_tick);
+        inventory.collect(&scope, &exclusions);
+    }
+    Ok(inventory)
+}
+
+/// Preserve the full-home active-session identity when Codex archives a native
+/// rollout. Explicit archive/file roots retain their existing scoped identities.
+/// Non-native archive names use an archive namespace, not an invented date.
+pub(super) fn session_id(ctx: &ScanContext, source: &DiscoveredSourceFile) -> Option<String> {
+    if !source
+        .source_path
+        .ancestors()
+        .any(|path| path.file_name().is_some_and(|name| name == ARCHIVE))
+    {
+        return None;
+    }
+    let root = archive_candidates(ctx)
+        .into_iter()
+        .find(|root| root.origin == source.origin && source.source_path.starts_with(&root.path))?;
+    let relative = source.source_path.strip_prefix(&root.path).ok()?;
+    if relative.components().count() == 1
+        && let Some(id) = native_session_id(&source.source_path)
+    {
+        return Some(id);
+    }
+    Path::new(ARCHIVE)
+        .join(rollout_session_path(relative))
+        .to_str()
+        .map(str::to_owned)
+}
+
+fn native_session_id(path: &Path) -> Option<String> {
+    // A compressed rollout (GH #513) names the same session as its plain form.
+    let session = rollout_session_path(path);
+    let stem = session.file_name()?.to_str()?;
+    let suffix = stem.strip_prefix("rollout-")?;
+    let timestamp = suffix.get(..19)?;
+    chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H-%M-%S").ok()?;
+    let uuid = suffix.get(19..)?.strip_prefix('-')?;
+    if uuid.len() != 36
+        || !uuid.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+    {
+        return None;
+    }
+    Path::new(timestamp.get(..4)?)
+        .join(timestamp.get(5..7)?)
+        .join(timestamp.get(8..10)?)
+        .join(stem)
+        .to_str()
+        .map(str::to_owned)
+}
+
+#[cfg(test)]
+mod detection_tests;
+#[cfg(test)]
+mod tests;

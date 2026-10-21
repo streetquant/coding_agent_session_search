@@ -1,0 +1,59 @@
+{
+  "cases": [
+    {
+      "applicability": "required",
+      "assertions": [
+        {
+          "id": "ASSERT-001",
+          "left": "reference.exit_code",
+          "op": "equal",
+          "right": "target.exit_code"
+        },
+        {
+          "id": "ASSERT-002",
+          "left": "reference.stdout_json",
+          "op": "json_equal",
+          "right": "target.stdout_json"
+        }
+      ],
+      "component_ids": [
+        "INT-001"
+      ],
+      "id": "BEH-001",
+      "normalization": {
+        "json_ignore_paths": [],
+        "replace": [],
+        "strip_ansi": true
+      },
+      "probes": {
+        "reference": {
+          "approval": "REPLACE_WITH_RECORDED_OBSERVATION_APPROVAL",
+          "expected_exit_code": 0,
+          "observation": {
+            "exit_code": 0,
+            "stderr": "",
+            "stdout": "REPLACE_WITH_PINNED_REFERENCE_OBSERVATION"
+          },
+          "provenance": "REPLACE_WITH_CAPTURE_OR_TRUSTED_FIXTURE_PROVENANCE",
+          "workspace": "recorded"
+        },
+        "target": {
+          "argv": [
+            "REPLACE_WITH_TARGET_PROBE_COMMAND"
+          ],
+          "cwd": ".",
+          "env": {},
+          "expected_exit_code": 0,
+          "repetitions": 2,
+          "timeout_sec": 60,
+          "workspace": "target"
+        }
+      },
+      "waiver": {
+        "approval": "",
+        "reason": ""
+      }
+    }
+  ],
+  "schema_version": "1.0"
+}

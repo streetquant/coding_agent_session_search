@@ -22,6 +22,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
+use clap::Parser;
+use coding_agent_search::{Cli, Commands, search::query::SearchMode};
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
@@ -175,6 +177,45 @@ fn jsonl_every_line_is_independent_valid_json_without_robot_meta() -> TestResult
     Ok(())
 }
 
+/// 2l1b0.58: README promises `--robot-format jsonl` is hits only unless
+/// `--robot-meta` is given. Every search has a budget and the header was
+/// gated on `budget_ms > 0`, so a `{budget, _meta}` line always led the
+/// output and a line-per-hit consumer counted it as a hit.
+#[test]
+fn jsonl_without_robot_meta_is_hits_only() -> TestResult {
+    let tmp = TempDir::new()?;
+    let data_dir = copy_search_demo_fixture(tmp.path())?;
+    let stdout = run_search(&data_dir, &["hello", "--robot-format", "jsonl"])?;
+    let lines = output_lines(&stdout);
+    ensure(!lines.is_empty(), "the demo fixture must match `hello`")?;
+    for line in &lines {
+        let value: serde_json::Value = serde_json::from_str(line)?;
+        ensure(
+            value.get("_meta").is_none() && value.get("budget").is_none(),
+            format!("jsonl without --robot-meta printed a header line: {line}"),
+        )?;
+        ensure(
+            value.get("source_path").is_some(),
+            format!("every jsonl line must be a hit: {line}"),
+        )?;
+    }
+
+    // Positive control: asking for metadata still leads with the header.
+    let with_meta = run_search(
+        &data_dir,
+        &["hello", "--robot-format", "jsonl", "--robot-meta"],
+    )?;
+    let first_line = output_lines(&with_meta)
+        .first()
+        .copied()
+        .ok_or_else(|| test_error("jsonl --robot-meta printed nothing"))?;
+    let first: serde_json::Value = serde_json::from_str(first_line)?;
+    ensure(
+        first.get("_meta").is_some(),
+        format!("--robot-meta must lead with the _meta header: {first_line}"),
+    )
+}
+
 #[test]
 fn compact_format_is_exactly_one_line_of_valid_json() -> TestResult {
     let tmp = TempDir::new()?;
@@ -214,6 +255,42 @@ fn json_format_parses_as_a_single_json_document() -> TestResult {
             .as_array()
             .is_some_and(Vec::is_empty),
         "ordinary robot search unexpectedly shed work",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn completed_no_match_search_does_not_claim_a_timeout_on_stderr() -> TestResult {
+    let tmp = TempDir::new()?;
+    let data_dir = copy_search_demo_fixture(tmp.path())?;
+    let output = Command::cargo_bin("cass")?
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .args([
+            "--color=never",
+            "search",
+            NO_MATCH_QUERY,
+            "--robot",
+            "--mode",
+            "lexical",
+            "--timeout",
+            "60000",
+            "--data-dir",
+            data_dir.to_str().ok_or("non-utf8 path")?,
+        ])
+        .output()?;
+    ensure(output.status.success(), "no-match search failed")?;
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    ensure(
+        payload["budget"]["timed_out"] == false,
+        format!(
+            "a completed search must report budget.timed_out=false: budget={}",
+            payload["budget"]
+        ),
+    )?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    ensure(
+        !stderr.contains("budget.timed_out=true"),
+        format!("a genuine no-match must not carry the timeout note: {stderr}"),
     )?;
     Ok(())
 }
@@ -267,6 +344,13 @@ fn timed_out_search_returns_before_slow_operation_and_names_shed_sections() -> T
         payload["hits"].as_array().is_some(),
         "search timeout did not return a valid partial hits array",
     )?;
+    // GH #422 follow-on: an exit-0 empty result must not look like a clean
+    // no-match on the diagnostics stream.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    ensure(
+        stderr.contains("budget.timed_out=true") && stderr.contains("not a no-match result"),
+        format!("timed-out search must say so on stderr: {stderr}"),
+    )?;
     for section in [
         "search",
         "reranking",
@@ -279,11 +363,46 @@ fn timed_out_search_returns_before_slow_operation_and_names_shed_sections() -> T
             format!("search timeout omitted skipped section {section}: {budget}"),
         )?;
     }
+    let recommendation = budget["recommended_next_probe"]
+        .as_str()
+        .ok_or_else(|| test_error("search timeout omitted its bounded retry"))?;
+    let retry_args = shell_words::split(recommendation)?;
     ensure(
-        budget["recommended_next_probe"]
-            .as_str()
-            .is_some_and(|probe| probe.contains("cass search") && probe.contains("--timeout")),
-        "search timeout did not recommend a bounded search retry",
+        retry_args.first().is_some_and(|arg| arg == "cass"),
+        "search retry named a different executable",
+    )?;
+    // A dataset-scoped retry puts the global --db before the subcommand.
+    // Parse its real CLI contract instead of requiring the literal prefix
+    // "cass search", which rejects correctly preserved database selection.
+    let retry = Cli::try_parse_from(retry_args)?;
+    ensure(
+        retry.db == Some(data_dir.join("agent_search.db")),
+        "search retry changed the database",
+    )?;
+    let Some(Commands::Search {
+        query,
+        data_dir: retry_data,
+        timeout: Some(retry_timeout),
+        mode: Some(SearchMode::Lexical),
+        json: true,
+        robot_meta: true,
+        rerank: true,
+        explain: true,
+        aggregate: Some(aggregate),
+        ..
+    }) = retry.command
+    else {
+        return Err(test_error(
+            "search retry lost requested mode or output flags",
+        ));
+    };
+    ensure(
+        query == "hello" && retry_data.as_ref() == Some(&data_dir) && aggregate == ["agent"],
+        "search retry changed the query, dataset, or aggregation",
+    )?;
+    ensure(
+        retry_timeout > 120 && retry_timeout <= 300_000,
+        "search retry did not preserve a larger bounded timeout",
     )?;
     ensure(
         payload.get("aggregations").is_none() && payload.get("explanation").is_none(),
@@ -631,6 +750,74 @@ fn blocking_sessions_file_search_returns_bounded_partial_without_broadening_scop
     Ok(())
 }
 
+/// 2l1b0.68: a budgeted (robot) search configures semantics once, on its
+/// bounded worker. The direct setup path used to run again afterwards: the
+/// cost was paid twice, outside the budget, and that path could spawn the
+/// daemon the worker declined to spawn. The test hook delays only the direct
+/// path. A robot hybrid search must not pay the delay, and a human-mode
+/// search (no budget) still runs the direct path, which proves the hook is
+/// live. The 60 s budget (`--timeout` is milliseconds) is healthy after the
+/// worker, so before the fix the budget check admitted the direct path and the
+/// robot search took the full 30 s delay (negative control); a small budget
+/// would have shed that path for an unrelated reason.
+#[test]
+fn robot_search_configures_semantics_once_on_its_bounded_worker() -> TestResult {
+    let tmp = TempDir::new()?;
+    let data_dir = copy_search_demo_fixture(tmp.path())?;
+    let data = data_dir.to_str().ok_or("non-utf8 path")?;
+    let run = |robot: bool, delay_ms: &str| -> Result<(bool, Duration, String), Box<dyn Error>> {
+        let mut cmd = Command::cargo_bin("cass")?;
+        cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_TEST_SEARCH_DIRECT_SEMANTIC_SETUP_SLOW_MS", delay_ms)
+            .args([
+                "--color=never",
+                "search",
+                "hello",
+                "--mode",
+                "hybrid",
+                "--timeout",
+                "60000",
+                "--data-dir",
+                data,
+            ]);
+        if robot {
+            cmd.args(["--robot", "--robot-meta"]);
+        }
+        let started = Instant::now();
+        let output = cmd.output()?;
+        let elapsed = started.elapsed();
+        eprintln!(
+            "{{\"step\":\"search\",\"robot\":{robot},\"direct_delay_ms\":{delay_ms},\"exit\":{:?},\"elapsed_ms\":{}}}",
+            output.status.code(),
+            elapsed.as_millis()
+        );
+        Ok((
+            output.status.success(),
+            elapsed,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ))
+    };
+
+    let (ok, elapsed, stderr) = run(true, "30000")?;
+    ensure(ok, format!("robot hybrid search failed: {stderr}"))?;
+    ensure(
+        elapsed < Duration::from_secs(20),
+        format!("a robot search repeated the semantic setup outside its budget: {elapsed:?}"),
+    )?;
+
+    let (ok, elapsed, stderr) = run(false, "3000")?;
+    ensure(ok, format!("human hybrid search failed: {stderr}"))?;
+    ensure(
+        elapsed >= Duration::from_millis(3000),
+        format!("a human search must still configure semantics on the direct path: {elapsed:?}"),
+    )?;
+    Ok(())
+}
+
+/// Explicit `--mode semantic` under an exhausted robot budget fails closed with
+/// the typed retryable timeout (exit 10, ds7uy.4.1) instead of returning a
+/// lexical result or an empty success (bead vy4ic chose this contract over the
+/// generic exit-0 timeout envelope, which still applies to other searches).
 #[test]
 fn explicit_semantic_timeout_never_substitutes_lexical_hits() -> TestResult {
     let tmp = TempDir::new()?;
@@ -652,34 +839,38 @@ fn explicit_semantic_timeout_never_substitutes_lexical_hits() -> TestResult {
             data_dir.to_str().ok_or("non-utf8 path")?,
         ])
         .output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
     ensure(
-        output.status.success(),
+        output.status.code() == Some(10),
         format!(
-            "semantic timeout failed: status={:?}; stderr={}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
+            "explicit semantic timeout must exit 10: status={:?}; stderr={stderr}",
+            output.status
         ),
     )?;
-    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    // No result document at all, so no lexical hits can reach a consumer.
     ensure(
-        payload["_meta"]["requested_search_mode"] == "semantic",
-        "semantic timeout lost requested mode",
+        output.stdout.is_empty(),
+        format!(
+            "explicit semantic timeout must not print a result: {}",
+            String::from_utf8_lossy(&output.stdout)
+        ),
+    )?;
+    let last_line = stderr
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .ok_or("explicit semantic timeout must emit a JSON error")?;
+    let payload: serde_json::Value = serde_json::from_str(last_line.trim())?;
+    let error = &payload["error"];
+    ensure(
+        error["kind"] == "timeout" && error["code"] == 10 && error["retryable"] == true,
+        format!("expected a retryable timeout error: {payload}"),
     )?;
     ensure(
-        payload["_meta"]["search_mode"] == "semantic",
-        "semantic timeout silently substituted lexical mode",
-    )?;
-    ensure(
-        payload["_meta"]["fallback_tier"].is_null(),
-        "semantic timeout reported a lexical fallback tier",
-    )?;
-    ensure(
-        payload["_meta"]["semantic_refinement"] == false,
-        "semantic timeout claimed incomplete semantic work was completed",
-    )?;
-    ensure(
-        payload["hits"].as_array().is_some_and(Vec::is_empty),
-        "semantic timeout must not return lexical hits",
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("semantic_budget checkpoint=")),
+        format!("the error must name the budget checkpoint that refused semantic: {payload}"),
     )?;
     Ok(())
 }

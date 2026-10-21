@@ -1,0 +1,78 @@
+{
+  "applicability": "assess",
+  "baseline": {
+    "expected_head": "",
+    "root": "REPLACE_WITH_CLEAN_PREFEATURE_BASELINE_ROOT"
+  },
+  "candidate": {
+    "expected_head": "",
+    "root": "."
+  },
+  "defaults": {
+    "max_coefficient_of_variation": 0.1,
+    "max_median_absolute_deviation_ratio": 0.1,
+    "max_output_bytes": 96000,
+    "max_total_measurement_seconds": 900,
+    "repetitions": 5,
+    "timeout_sec": 180,
+    "warmups": 1
+  },
+  "harness_root": ".",
+  "metrics": [
+    {
+      "category": "latency",
+      "command": {
+        "argv_template": [
+          "REPLACE_WITH_CHECKED_IN_BENCHMARK_COMMAND",
+          "{subject_root}"
+        ],
+        "cwd": ".",
+        "env": {},
+        "id": "measure-NF-001",
+        "timeout_sec": 180
+      },
+      "component_ids": [
+        "INT-001"
+      ],
+      "correctness_command_ids": [
+        "final-focused",
+        "final-full"
+      ],
+      "direction": "lower",
+      "extractor": {
+        "kind": "json_path",
+        "path": "$.value"
+      },
+      "id": "NF-001",
+      "max_absolute_regression": 0.0,
+      "max_relative_regression_pct": 5.0,
+      "minimum_improvement_pct": null,
+      "name": "Representative runtime metric",
+      "shortcut_guards": [
+        {
+          "expected": 1,
+          "id": "SG-001",
+          "kind": "json_assertion",
+          "operator": "gte",
+          "path": "$.work_units"
+        },
+        {
+          "command_id": "final-full",
+          "id": "SG-002",
+          "kind": "final_command"
+        }
+      ],
+      "statistic": "median",
+      "unit": "milliseconds",
+      "waiver": {
+        "approval": "",
+        "reason": ""
+      }
+    }
+  ],
+  "not_applicable": {
+    "approval": "",
+    "reason": ""
+  },
+  "schema_version": "1.0"
+}

@@ -1,0 +1,30 @@
+{
+  "checkpoint": {
+    "bound_artifacts": [
+      ".integration/feature-map.json",
+      ".integration/spec-ledger.json",
+      ".integration/spec-baseline.json",
+      ".integration/reference-lock.json",
+      ".integration/verification-manifest.json",
+      "integration-plan.md"
+    ]
+  },
+  "govern": {
+    "nudge_categories": [
+      "tests",
+      "regression"
+    ],
+    "recent_command_window": 8,
+    "reuse_categories": [
+      "inspection",
+      "search"
+    ]
+  },
+  "ledger_path": ".integration/execution-ledger.jsonl",
+  "observation": {
+    "exclude_sensitive_paths": true,
+    "max_file_bytes": 2000000
+  },
+  "schema_version": "1.0",
+  "state_path": ".integration/execution-state.json"
+}

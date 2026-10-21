@@ -1,0 +1,82 @@
+{
+  "abstention": {
+    "allow_needs_more_evidence": true,
+    "minimum_direct_anchors": 1,
+    "minimum_independent_channels": 2
+  },
+  "budget": {
+    "context_lines": 6,
+    "max_files": 28,
+    "max_lines_per_file": 100,
+    "max_total_lines": 900,
+    "per_view_max_files": 48
+  },
+  "coverage": {
+    "minimum_changed_path_fraction": 1.0,
+    "minimum_impacted_test_fraction": 1.0,
+    "require_edit_ripple_signal_when_diff_exists": true
+  },
+  "history": {
+    "command_timeout_sec": 4,
+    "commit_limit": 8,
+    "enabled": true,
+    "token_limit": 4,
+    "total_timeout_sec": 10
+  },
+  "limits": {
+    "max_paths_per_signal": 128,
+    "max_queries_per_signal": 32,
+    "max_signals": 64,
+    "max_trace_bytes": 2000000,
+    "max_trace_items": 5000
+  },
+  "schema_version": "1.0",
+  "signals": [
+    {
+      "component_ids": [
+        "INT-001"
+      ],
+      "given_paths": [],
+      "id": "CTX-001",
+      "kind": "feature2integration",
+      "queries": [
+        "Update CASS from pinned upstream main, preserve native-history changes, and finish remaining existing BR implementation tasks"
+      ],
+      "required": true,
+      "required_channels": [
+        "lexical",
+        "architecture",
+        "tests",
+        "instructions"
+      ],
+      "seeds": [],
+      "trace_path": "",
+      "waiver": {
+        "approval": "",
+        "reason": ""
+      }
+    },
+    {
+      "component_ids": [
+        "INT-001"
+      ],
+      "given_paths": [],
+      "id": "CTX-002",
+      "kind": "edit2ripple",
+      "queries": [
+        "Update CASS from pinned upstream main, preserve native-history changes, and finish remaining existing BR implementation tasks"
+      ],
+      "required": true,
+      "required_channels": [
+        "impact",
+        "tests"
+      ],
+      "seeds": [],
+      "trace_path": "",
+      "waiver": {
+        "approval": "",
+        "reason": ""
+      }
+    }
+  ]
+}

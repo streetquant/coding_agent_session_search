@@ -57,6 +57,9 @@ schemas: (auto-generated from contract)
       - max_fields: integer
       - max_limit: integer
     - mistake_recoveries: array
+    - source_ingest_reuse: object
+      - disabled_by: ?
+      - enabled: boolean
     - version: string
     - workflows: array
   diag:
@@ -222,6 +225,7 @@ schemas: (auto-generated from contract)
       - db_without_raw_mirror_count: integer
       - mirror_without_db_link_count: integer
       - missing_current_source_count: integer
+      - raw_mirror_capture_disabled: boolean
       - raw_mirror_db_link_count: integer
       - recommended_action: string
       - schema_version: integer
@@ -704,7 +708,9 @@ schemas: (auto-generated from contract)
       - feature_compiled_in: boolean
       - hint: ?
       - hnsw_path: ?
+      - hnsw_present: boolean
       - hnsw_ready: boolean
+      - hnsw_state: string
       - model_dir: ?
       - preferred_backend: string
       - progressive_ready: boolean
@@ -2583,7 +2589,9 @@ schemas: (auto-generated from contract)
       - feature_compiled_in: boolean
       - hint: ?
       - hnsw_path: ?
+      - hnsw_present: boolean
       - hnsw_ready: boolean
+      - hnsw_state: string
       - model_dir: ?
       - preferred_backend: string
       - progressive_ready: boolean
@@ -2766,6 +2774,7 @@ schemas: (auto-generated from contract)
       - db_without_raw_mirror_count: integer
       - mirror_without_db_link_count: integer
       - missing_current_source_count: integer
+      - raw_mirror_capture_disabled: boolean
       - raw_mirror_db_link_count: integer
       - recommended_action: string
       - schema_version: integer
@@ -2873,6 +2882,7 @@ schemas: (auto-generated from contract)
     - ingest_quarantine: object
       - circuit_breaker_active: boolean
       - circuit_breaker_limit: integer
+      - deferred_conversations: integer
       - newest_last_attempt_at_ms: ?
       - quarantine_files: array
       - quarantined_conversations: integer
@@ -3028,6 +3038,7 @@ schemas: (auto-generated from contract)
       - ingest_quarantine: object
         - circuit_breaker_active: boolean
         - circuit_breaker_limit: integer
+        - deferred_conversations: integer
         - newest_last_attempt_at_ms: ?
         - quarantine_files: array
         - quarantined_conversations: integer
@@ -3047,6 +3058,7 @@ schemas: (auto-generated from contract)
       - rebuild: object
         - active: boolean
         - engine_incompatible: boolean
+        - expected_docs_scan: ?
         - indexed_docs: ?
         - job_id: ?
         - job_kind: ?
@@ -3074,7 +3086,9 @@ schemas: (auto-generated from contract)
         - feature_compiled_in: boolean
         - hint: ?
         - hnsw_path: ?
+        - hnsw_present: boolean
         - hnsw_ready: boolean
+        - hnsw_state: string
         - model_dir: ?
         - preferred_backend: string
         - progressive_ready: boolean
@@ -3100,6 +3114,19 @@ schemas: (auto-generated from contract)
     - lexical_update_deferred: boolean
     - messages: ?
     - quarantined_conversations: integer
+    - rebuild_profile: object
+      - effective: object
+        - page_prep_workers: integer
+        - pipeline_channel_size: integer
+        - pipeline_max_message_bytes_in_flight: integer
+        - staged_merge_workers: integer
+        - staged_shard_builders: integer
+        - steady_batch_fetch_conversations: integer
+        - steady_commit_every_message_bytes: integer
+        - tantivy_writer_threads: integer
+        - workers: integer
+      - name: string
+      - settings: array
     - success: boolean
   introspect:
     - api_version: integer
@@ -3162,6 +3189,17 @@ schemas: (auto-generated from contract)
     - status: string
   pack:
     - _meta: object
+      - effective: object
+        - auto_corrections: array
+        - command: string
+        - daemon: object
+        - db_path: string
+        - db_path_source: string
+        - filters: object
+        - query: string
+        - query_recoveries: array
+        - query_structure: ?
+        - time_window: object
       - elapsed_ms: integer
       - format: string
       - generated_at_ms: integer
@@ -3222,6 +3260,7 @@ schemas: (auto-generated from contract)
     - realized: object
       - candidate_count: integer
       - fallback_mode: ?
+      - fallback_reason: ?
       - search_mode: string
       - selected_evidence_count: integer
       - selected_session_count: integer
@@ -3259,6 +3298,17 @@ schemas: (auto-generated from contract)
         - semantic_fallback: object
         - token_budget: object
         - total_matches: integer
+      - effective: object
+        - auto_corrections: array
+        - command: string
+        - daemon: object
+        - db_path: string
+        - db_path_source: string
+        - filters: object
+        - query: string
+        - query_recoveries: array
+        - query_structure: ?
+        - time_window: object
       - elapsed_ms: integer
       - explanation_cards: array
       - fallback_reason: ?
@@ -3333,6 +3383,7 @@ schemas: (auto-generated from contract)
         - search_ms: integer
       - tokens_estimated: ?
       - wildcard_fallback: boolean
+      - wildcard_fallback_skipped: ?
     - _timeout: ?
     - _warning: ?
     - aggregations: ?
@@ -3354,6 +3405,7 @@ schemas: (auto-generated from contract)
     - request_id: ?
     - suggestions: array
     - total_matches: integer
+    - zero_result_diagnosis: ?
   selftest:
     - archive_accessed: boolean
     - checks: array
@@ -3384,6 +3436,7 @@ schemas: (auto-generated from contract)
       - db_without_raw_mirror_count: integer
       - mirror_without_db_link_count: integer
       - missing_current_source_count: integer
+      - raw_mirror_capture_disabled: boolean
       - raw_mirror_db_link_count: integer
       - recommended_action: string
       - schema_version: integer
@@ -3536,6 +3589,7 @@ schemas: (auto-generated from contract)
     - ingest_quarantine: object
       - circuit_breaker_active: boolean
       - circuit_breaker_limit: integer
+      - deferred_conversations: integer
       - newest_last_attempt_at_ms: ?
       - quarantine_files: array
       - quarantined_conversations: integer
@@ -3557,6 +3611,11 @@ schemas: (auto-generated from contract)
     - rebuild: object
       - active: boolean
       - engine_incompatible: boolean
+      - expected_docs_scan: ?
+        - expected_docs_so_far: integer
+        - last_conversation_id: integer
+        - max_conversation_id: integer
+        - saved_at: ?
       - indexed_docs: ?
       - job_id: ?
       - job_kind: ?
@@ -3671,7 +3730,9 @@ schemas: (auto-generated from contract)
       - feature_compiled_in: boolean
       - hint: ?
       - hnsw_path: ?
+      - hnsw_present: boolean
       - hnsw_ready: boolean
+      - hnsw_state: string
       - model_dir: ?
       - preferred_backend: string
       - progressive_ready: boolean
@@ -3728,9 +3789,11 @@ schemas: (auto-generated from contract)
         - reserved_cores: integer
       - schema_version: string
       - topology: object
+        - host_memory_total_bytes: ?
         - llc_groups: integer
         - logical_cpus: integer
         - memory_available_bytes: ?
+        - memory_limit_source: ?
         - memory_total_bytes: ?
         - numa_nodes: integer
         - physical_cores: integer
@@ -3784,6 +3847,7 @@ schemas: (auto-generated from contract)
       - db_without_raw_mirror_count: integer
       - mirror_without_db_link_count: integer
       - missing_current_source_count: integer
+      - raw_mirror_capture_disabled: boolean
       - raw_mirror_db_link_count: integer
       - recommended_action: string
       - schema_version: integer
@@ -3936,6 +4000,7 @@ schemas: (auto-generated from contract)
     - ingest_quarantine: object
       - circuit_breaker_active: boolean
       - circuit_breaker_limit: integer
+      - deferred_conversations: integer
       - newest_last_attempt_at_ms: ?
       - quarantine_files: array
       - quarantined_conversations: integer
@@ -3957,6 +4022,11 @@ schemas: (auto-generated from contract)
     - rebuild: object
       - active: boolean
       - engine_incompatible: boolean
+      - expected_docs_scan: ?
+        - expected_docs_so_far: integer
+        - last_conversation_id: integer
+        - max_conversation_id: integer
+        - saved_at: ?
       - indexed_docs: ?
       - job_id: ?
       - job_kind: ?
@@ -4071,7 +4141,9 @@ schemas: (auto-generated from contract)
       - feature_compiled_in: boolean
       - hint: ?
       - hnsw_path: ?
+      - hnsw_present: boolean
       - hnsw_ready: boolean
+      - hnsw_state: string
       - model_dir: ?
       - preferred_backend: string
       - progressive_ready: boolean
@@ -4128,9 +4200,11 @@ schemas: (auto-generated from contract)
         - reserved_cores: integer
       - schema_version: string
       - topology: object
+        - host_memory_total_bytes: ?
         - llc_groups: integer
         - logical_cpus: integer
         - memory_available_bytes: ?
+        - memory_limit_source: ?
         - memory_total_bytes: ?
         - numa_nodes: integer
         - physical_cores: integer
@@ -4208,6 +4282,7 @@ schemas: (auto-generated from contract)
       - ingest_quarantine: object
         - circuit_breaker_active: boolean
         - circuit_breaker_limit: integer
+        - deferred_conversations: integer
         - inspected: boolean
         - newest_last_attempt_at_ms: ?
         - quarantine_files: array
@@ -4226,6 +4301,7 @@ schemas: (auto-generated from contract)
       - rebuild: object
         - active: boolean
         - engine_incompatible: boolean
+        - expected_docs_scan: ?
         - indexed_docs: ?
         - inspected: boolean
         - job_id: ?
@@ -4279,7 +4355,9 @@ schemas: (auto-generated from contract)
         - feature_compiled_in: boolean
         - hint: ?
         - hnsw_path: ?
+        - hnsw_present: boolean
         - hnsw_ready: boolean
+        - hnsw_state: string
         - inspected: boolean
         - model_dir: ?
         - preferred_backend: string
@@ -4323,12 +4401,18 @@ schemas: (auto-generated from contract)
       - recommended_next_probe: ?
       - skipped_sections: array
       - timed_out: boolean
+    - content_source: string
     - context: integer
+    - conversation_id: integer
+    - coordinate_space: string
     - end_line: integer
     - highlight_line: ?
     - lines: array
     - path: string
     - source_exists: boolean
+    - source_id: string
     - start_line: integer
     - target_line: ?
+    - target_message_index: integer
     - total_lines: integer
+    - total_messages: integer

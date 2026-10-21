@@ -1,0 +1,64 @@
+{
+  "components": [
+    {
+      "component_id": "INT-001",
+      "reviews": [
+        {
+          "category": "functional",
+          "findings": [
+            {
+              "allow_evidence_path_change": false,
+              "approval": "",
+              "confidence": "high",
+              "disposition": "adopted",
+              "duplicate_of": "",
+              "end_line": 17,
+              "evidence_change_approval": "",
+              "evidence_path": "AGENTS.md",
+              "id": "IMPL-REQ-001",
+              "impact": "high",
+              "reason": "The repository evidence constrains the integrated behavior.",
+              "spec_ids": [
+                "SPEC-002"
+              ],
+              "start_line": 13,
+              "statement": "No existing file may be deleted without express written permission, including paths upstream removed."
+            }
+          ],
+          "no_findings_reason": ""
+        },
+        {
+          "category": "business",
+          "findings": [],
+          "no_findings_reason": "The requested upstream update introduces no billing, tenancy or commercial policy change. Existing user-owned history remains protected by SPEC-002."
+        },
+        {
+          "category": "technical",
+          "findings": [],
+          "no_findings_reason": "Existing FrankenSQLite-only new code, asupersync runtime and pinned dependency requirements are explicit in AGENTS.md and incorporated by SPEC-001 and SPEC-004."
+        },
+        {
+          "category": "interface_protocol",
+          "findings": [],
+          "no_findings_reason": "Robot JSON goldens and native connector provenance already supply explicit compatibility checks under SPEC-002 and SPEC-004; no new protocol is proposed."
+        },
+        {
+          "category": "structural_convention",
+          "findings": [],
+          "no_findings_reason": "The update preserves the existing registry and storage/indexer/search boundaries; shared-file reservations and exact-path staging are explicit repository requirements under SPEC-002."
+        },
+        {
+          "category": "data_structure",
+          "findings": [],
+          "no_findings_reason": "SQLite remains authoritative and search assets remain derived. No live archive migration is part of source integration; isolated migration acceptance remains required before completion."
+        }
+      ]
+    }
+  ],
+  "limits": {
+    "max_evidence_bytes": 1000000,
+    "max_excerpt_lines": 80,
+    "max_findings": 128
+  },
+  "schema_version": "1.0"
+}

@@ -96,7 +96,17 @@
       "found": false
     },
     {
+      "name": "continue",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
       "name": "antigravity",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "pi_durable",
       "path": "(not detected)",
       "found": false
     },
@@ -151,6 +161,16 @@
       "found": false
     },
     {
+      "name": "grok_bot",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "codebuff",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
       "name": "goose",
       "path": "(not detected)",
       "found": false
@@ -166,12 +186,22 @@
       "found": false
     },
     {
+      "name": "shelley",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
       "name": "kilo",
       "path": "(not detected)",
       "found": false
     },
     {
       "name": "cloudmcp",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "openwebui",
       "path": "(not detected)",
       "found": false
     }

@@ -773,6 +773,8 @@
     "vector_index_path": null,
     "model_dir": null,
     "hnsw_path": null,
+    "hnsw_present": false,
+    "hnsw_state": "not_inspected",
     "hnsw_ready": false,
     "progressive_ready": false,
     "progressive_reason_code": null,
@@ -896,7 +898,7 @@
       "redacted_path": null,
       "current_db_matches": null,
       "ready": false,
-      "present": null,
+      "present": false,
       "note": "HNSW/mmap accelerators are optional derived assets and must not block lexical search"
     },
     "memoization_cache": {
@@ -932,7 +934,7 @@
     "full_rebuild_readiness": {
       "status": "ready",
       "enforced": true,
-      "formula": "max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2)",
+      "formula": "max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2 - rebuild_staging_bytes)",
       "required_bytes": 536870912,
       "floor_bytes": 536870912,
       "db_bundle_bytes": 0,
@@ -940,6 +942,7 @@
       "retired_segment_bytes": 0,
       "retired_segment_files": 0,
       "retained_publish_backup_bytes": 0,
+      "rebuild_staging_bytes": 0,
       "available_bytes": "[LIVE_BYTES]",
       "shortfall_bytes": 0,
       "probe_path": "[TEST_HOME]",
@@ -948,7 +951,7 @@
       ],
       "notes": [
         "A full rebuild (cass index --full / --force-rebuild) needs 536870912 bytes free at [TEST_HOME], and the free space there covers it, so the indexer's headroom preflight would pass.",
-        "Requirement is max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2): db bundle 0 bytes, lexical index 0 bytes, floor 536870912 bytes."
+        "Requirement is max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2 - rebuild_staging_bytes): db bundle 0 bytes, lexical index 0 bytes, floor 536870912 bytes."
       ]
     },
     "total_accounted_bytes": 0,
@@ -2860,6 +2863,7 @@
     "current_source_newer_than_archive_count": 0,
     "raw_mirror_db_link_count": 0,
     "sole_copy_warning_count": 0,
+    "raw_mirror_capture_disabled": false,
     "recommended_action": "Coverage ledger has no immediate action for archive preservation."
   },
   "source_authority": {

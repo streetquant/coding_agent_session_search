@@ -225,6 +225,8 @@ pub struct PackCandidate {
     pub line_start: Option<usize>,
     pub line_end: Option<usize>,
     pub conversation_id: Option<i64>,
+    /// One-based canonical `messages.idx + 1`, as accepted by --message-index.
+    /// Physical source-file coordinates belong only in line_start/line_end.
     pub message_index: Option<usize>,
     pub citation_verified: bool,
     pub content_hash: String,
@@ -253,7 +255,7 @@ impl PackCandidate {
     ) -> Self {
         // Search navigation uses normalized message ordinals. Physical source
         // lines are assigned only after reading and matching the source record.
-        let message_index = hit.line_number.and_then(|line| line.checked_sub(1));
+        let message_index = hit.line_number.filter(|&line| line != 0);
         let source_id = if hit.source_id.trim().is_empty() {
             "local".to_string()
         } else {
@@ -265,14 +267,8 @@ impl PackCandidate {
             hit.origin_kind.trim().to_string()
         };
         let content_hash = format!("{:016x}", hit.content_hash);
-        let candidate_id = format!(
-            "{}:{}:{}",
-            source_id,
-            hit.source_path,
-            hit.line_number.unwrap_or_default()
-        );
-        Self {
-            candidate_id,
+        let mut candidate = Self {
+            candidate_id: String::new(),
             source_path: hit.source_path.clone(),
             source_id,
             origin_kind,
@@ -305,11 +301,70 @@ impl PackCandidate {
             query_phrase_count,
             source_readiness: PackSourceReadiness::Healthy,
             source_explicitly_requested: false,
+        };
+        candidate.candidate_id = evidence_id(&candidate);
+        candidate
+    }
+
+    fn session_key(&self) -> PackSessionKey {
+        PackSessionKey {
+            source_id: self.source_id.clone(),
+            source_path: self.source_path.clone(),
+            agent: self.agent.clone(),
+            conversation_id: self.conversation_id,
         }
     }
 
-    fn session_key(&self) -> (&str, &str) {
-        (&self.source_id, &self.source_path)
+    fn verified_line_range(&self) -> Option<(usize, usize)> {
+        if !self.citation_verified {
+            return None;
+        }
+        let start = self.line_start?;
+        let end = self.line_end.unwrap_or(start);
+        (start > 0 && end >= start).then_some((start, end))
+    }
+}
+
+/// Keep archive identity separate from display redaction. A provider database
+/// can hold multiple conversations at one path; unknown conversation IDs must
+/// not erase the provider identity we do have.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct PackSessionKey {
+    source_id: String,
+    source_path: String,
+    agent: String,
+    conversation_id: Option<i64>,
+}
+
+/// Physical-file coordinates are not scoped by archive conversation/provider.
+/// Two canonical sessions can cite the same verified bytes in one local file;
+/// equal paths on different sources, however, are different files.
+#[derive(Debug)]
+struct VerifiedPackFileSpan {
+    source_id: String,
+    source_path: String,
+    start: usize,
+    end: usize,
+}
+
+impl VerifiedPackFileSpan {
+    fn from_candidate(candidate: &PackCandidate) -> Option<Self> {
+        let (start, end) = candidate.verified_line_range()?;
+        Some(Self {
+            source_id: candidate.source_id.clone(),
+            source_path: candidate.source_path.clone(),
+            start,
+            end,
+        })
+    }
+
+    fn overlaps(&self, candidate: &PackCandidate) -> bool {
+        candidate.verified_line_range().is_some_and(|(start, end)| {
+            self.source_id == candidate.source_id
+                && self.source_path == candidate.source_path
+                && self.start <= end
+                && start <= self.end
+        })
     }
 }
 
@@ -521,6 +576,9 @@ impl PackRenderFormat {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackRenderRequest {
+    /// What the pack's search actually ran, echoed as `_meta.effective`
+    /// (2l1b0.68); `None` omits it.
+    pub effective: Option<serde_json::Value>,
     pub query_text: String,
     pub normalized_query: String,
     pub generated_at_ms: i64,
@@ -531,6 +589,11 @@ pub struct PackRenderRequest {
     pub limits: PackPlannerLimits,
     pub search_mode: String,
     pub fallback_mode: Option<String>,
+    /// Why the executor fell back to `fallback_mode`, as a typed reason code
+    /// (`SemanticFallbackReason::code`) it observed (GH #507). `None` means no
+    /// cause was supplied, not that assets are missing; the renderer flags such
+    /// a fallback instead of inventing a cause.
+    pub fallback_reason: Option<String>,
     pub semantic_joined: bool,
     pub freshness_policy: PackFreshnessPolicy,
     pub freshness_window_seconds: i64,
@@ -543,6 +606,7 @@ pub struct PackRenderRequest {
 impl Default for PackRenderRequest {
     fn default() -> Self {
         Self {
+            effective: None,
             query_text: String::new(),
             normalized_query: String::new(),
             generated_at_ms: 0,
@@ -559,6 +623,7 @@ impl Default for PackRenderRequest {
             limits: PackPlannerLimits::default(),
             search_mode: "hybrid".to_string(),
             fallback_mode: None,
+            fallback_reason: None,
             semantic_joined: false,
             freshness_policy: PackFreshnessPolicy::PreferRecent,
             freshness_window_seconds: DEFAULT_FRESHNESS_WINDOW_SECONDS,
@@ -609,6 +674,8 @@ struct RenderedMeta {
     partial: bool,
     format: &'static str,
     warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effective: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -626,6 +693,7 @@ struct RenderedLimits {
 struct RenderedRealized {
     search_mode: String,
     fallback_mode: Option<String>,
+    fallback_reason: Option<String>,
     semantic_joined: bool,
     candidate_count: usize,
     selected_evidence_count: usize,
@@ -725,6 +793,8 @@ struct RenderedEvidence {
     redactions: Vec<RenderedRedaction>,
     #[serde(skip)]
     source_readiness: PackSourceReadiness,
+    #[serde(skip)]
+    session_key: PackSessionKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -739,6 +809,7 @@ struct RenderedCitation {
     line_start: Option<usize>,
     line_end: Option<usize>,
     message_index: Option<usize>,
+    message_index_base: u8,
     conversation_id: Option<i64>,
     content_hash: String,
     span_hash: String,
@@ -799,7 +870,7 @@ struct RenderedPrivacy {
 #[derive(Debug, Default)]
 struct SourceAccumulator {
     origin_kind: String,
-    sessions: BTreeSet<String>,
+    sessions: BTreeSet<PackSessionKey>,
     evidence_count: usize,
     newest_evidence_at_ms: Option<i64>,
     healthy: bool,
@@ -880,16 +951,27 @@ struct ScoredCandidate {
 #[derive(Debug, Default)]
 struct SelectedState {
     source_ids: HashSet<String>,
-    sessions: HashSet<(String, String)>,
+    sessions: HashSet<PackSessionKey>,
     span_hashes: HashSet<String>,
     content_hashes: HashSet<String>,
-    ranges: Vec<(String, Option<usize>, Option<usize>)>,
+    verified_ranges: Vec<VerifiedPackFileSpan>,
 }
 
 pub fn plan_answer_pack(
-    request: PackPlanRequest,
+    mut request: PackPlanRequest,
 ) -> Result<PlannedAnswerPack, PackPlannerLimitError> {
     request.limits.validate()?;
+
+    // Caller-supplied ordinals or malformed spans are not verified file lines.
+    // Clear them before scoring, deduplication, IDs and rendering can mistake
+    // them for physical evidence. Preserve canonical message identity/content.
+    for candidate in &mut request.candidates {
+        if candidate.verified_line_range().is_none() {
+            candidate.citation_verified = false;
+            candidate.line_start = None;
+            candidate.line_end = None;
+        }
+    }
 
     let candidate_count = request.candidates.len();
     let diagnostics = PackPlannerDiagnostics {
@@ -1045,9 +1127,7 @@ pub fn plan_answer_pack(
         }
 
         let session_key = candidate.session_key();
-        if !selected_state
-            .sessions
-            .contains(&(session_key.0.to_string(), session_key.1.to_string()))
+        if !selected_state.sessions.contains(&session_key)
             && selected_state.sessions.len() >= request.limits.max_sessions
         {
             omitted.push(omitted_candidate(
@@ -1062,20 +1142,16 @@ pub fn plan_answer_pack(
         selected_state
             .source_ids
             .insert(candidate.source_id.clone());
-        selected_state
-            .sessions
-            .insert((candidate.source_id.clone(), candidate.source_path.clone()));
+        selected_state.sessions.insert(session_key);
         selected_state
             .span_hashes
             .insert(candidate.span_hash.clone());
         selected_state
             .content_hashes
             .insert(candidate.content_hash.clone());
-        selected_state.ranges.push((
-            candidate.source_path.clone(),
-            candidate.line_start,
-            candidate.line_end,
-        ));
+        if let Some(span) = VerifiedPackFileSpan::from_candidate(candidate) {
+            selected_state.verified_ranges.push(span);
+        }
 
         selected.push(PlannedPackEvidence {
             id: evidence_id(candidate),
@@ -1269,13 +1345,9 @@ fn hard_omission_reason(
             .content_hashes
             .contains(&candidate.content_hash)
         || selected_state
-            .ranges
+            .verified_ranges
             .iter()
-            .any(|(source_path, start, end)| {
-                // ubs:ignore — compares public citation paths, never secret material.
-                source_path == &candidate.source_path
-                    && line_ranges_overlap(*start, *end, candidate.line_start, candidate.line_end)
-            })
+            .any(|span| span.overlaps(candidate))
     {
         return Some(PackOmittedReason::DuplicateContent);
     }
@@ -1291,20 +1363,6 @@ fn is_stale_under_strict_policy(candidate: &PackCandidate, request: &PackPlanReq
     };
     let max_age_ms = request.freshness_window_seconds.saturating_mul(1_000);
     request.now_ms.saturating_sub(created_at_ms) > max_age_ms
-}
-
-fn line_ranges_overlap(
-    left_start: Option<usize>,
-    left_end: Option<usize>,
-    right_start: Option<usize>,
-    right_end: Option<usize>,
-) -> bool {
-    let (Some(left_start), Some(right_start)) = (left_start, right_start) else {
-        return false;
-    };
-    let left_end = left_end.unwrap_or(left_start);
-    let right_end = right_end.unwrap_or(right_start);
-    left_start <= right_end && right_start <= left_end
 }
 
 fn score_candidate(
@@ -1445,7 +1503,7 @@ fn freshness_score(candidate: &PackCandidate, request: &PackPlanRequest) -> f64 
 }
 
 fn source_diversity_score(candidate: &PackCandidate, selected_state: &SelectedState) -> f64 {
-    let session_key = (candidate.source_id.clone(), candidate.source_path.clone());
+    let session_key = candidate.session_key();
     if selected_state.sessions.contains(&session_key) {
         0.0
     } else if selected_state.source_ids.contains(&candidate.source_id) {
@@ -1483,7 +1541,7 @@ fn citation_quality_score(candidate: &PackCandidate) -> f64 {
     let has_path = !candidate.source_path.trim().is_empty();
     let has_source = !candidate.source_id.trim().is_empty();
     let has_agent = !candidate.agent.trim().is_empty();
-    let has_line_span = candidate.line_start.is_some() && candidate.line_end.is_some();
+    let has_line_span = candidate.verified_line_range().is_some();
     if has_path && has_source && has_agent && has_line_span {
         1.0
     } else if has_path && has_source && has_agent {
@@ -1506,13 +1564,9 @@ fn duplicate_penalty(candidate: &PackCandidate, selected_state: &SelectedState) 
         return 0.5;
     }
     if selected_state
-        .ranges
+        .verified_ranges
         .iter()
-        .any(|(source_path, start, end)| {
-            // ubs:ignore — compares public citation paths, never secret material.
-            source_path == &candidate.source_path
-                && line_ranges_overlap(*start, *end, candidate.line_start, candidate.line_end)
-        })
+        .any(|span| span.overlaps(candidate))
     {
         return 0.25;
     }
@@ -1560,6 +1614,24 @@ fn candidate_ordering(
         })
         .then_with(|| left_candidate.source_id.cmp(&right_candidate.source_id))
         .then_with(|| left_candidate.source_path.cmp(&right_candidate.source_path))
+        .then_with(|| {
+            match (
+                left_candidate.conversation_id,
+                right_candidate.conversation_id,
+            ) {
+                (Some(left), Some(right)) => left.cmp(&right),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            }
+        })
+        .then_with(|| left_candidate.agent.cmp(&right_candidate.agent))
+        .then_with(|| {
+            compare_optional_usize_low_first(
+                left_candidate.message_index,
+                right_candidate.message_index,
+            )
+        })
         .then_with(|| {
             compare_optional_usize_low_first(left_candidate.line_start, right_candidate.line_start)
         })
@@ -1621,17 +1693,47 @@ fn estimated_tokens(text: &str) -> usize {
 }
 
 fn evidence_id(candidate: &PackCandidate) -> String {
-    let mut hasher_input = String::new();
-    hasher_input.push_str(&candidate.source_id);
-    hasher_input.push('\n');
-    hasher_input.push_str(&candidate.source_path);
-    hasher_input.push('\n');
-    hasher_input.push_str(&candidate.line_start.unwrap_or_default().to_string());
-    hasher_input.push('\n');
-    hasher_input.push_str(&candidate.line_end.unwrap_or_default().to_string());
-    hasher_input.push('\n');
-    hasher_input.push_str(&candidate.span_hash);
-    let hash = blake3::hash(hasher_input.as_bytes());
+    // Pathnames alone are not session identities: provider databases contain
+    // many conversations at one path. Length-prefix strings so embedded
+    // newlines/colons cannot move data into a neighboring identity component.
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cass.pack.evidence.v2\0");
+    for text in [
+        &candidate.source_id,
+        &candidate.source_path,
+        &candidate.agent,
+        &candidate.content_hash,
+    ] {
+        hasher.update(&(text.len() as u64).to_le_bytes());
+        hasher.update(text.as_bytes());
+    }
+    match candidate.conversation_id {
+        Some(id) => {
+            hasher.update(&[1]);
+            hasher.update(&id.to_le_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    for coordinate in [
+        candidate.message_index,
+        candidate.line_start,
+        candidate.line_end,
+    ] {
+        match coordinate {
+            Some(number) => {
+                hasher.update(&[1]);
+                hasher.update(&(number as u64).to_le_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+    }
+    hasher.update(&(candidate.span_hash.len() as u64).to_le_bytes());
+    hasher.update(candidate.span_hash.as_bytes());
+    let hash = hasher.finalize();
     encoded_evidence_id(hash.as_bytes())
 }
 
@@ -1787,16 +1889,27 @@ fn rendered_answer_pack_with_correlation(
     let (omitted_items, omitted_redactions) = rendered_omitted_items(&plan.omitted);
     let semantic_readiness = effective_semantic_readiness(request);
     let health_is_healthy = health_is_healthy(request, &source_readiness);
+    // GH #507: the executor's own cause for its fallback, redacted like the
+    // rest of the envelope. It is never inferred from which assets exist.
+    let fallback_reason = request.fallback_mode.as_ref().and_then(|_| {
+        trimmed_optional_string(request.fallback_reason.as_deref())
+            .map(|reason| redact_pack_output_text(&reason, &mut envelope_redactions))
+    });
     let mut warnings = readiness_warnings(
         request,
         semantic_readiness,
+        fallback_reason.as_deref(),
         &source_readiness,
         evidence.is_empty(),
         &mut envelope_redactions,
     );
-    let recommended_action =
-        readiness_recommended_action(request, semantic_readiness, health_is_healthy)
-            .map(|action| redact_pack_output_text(&action, &mut envelope_redactions));
+    let recommended_action = readiness_recommended_action(
+        request,
+        semantic_readiness,
+        fallback_reason.as_deref(),
+        health_is_healthy,
+    )
+    .map(|action| redact_pack_output_text(&action, &mut envelope_redactions));
     let index_generation = request
         .readiness
         .index_generation
@@ -1807,6 +1920,12 @@ fn rendered_answer_pack_with_correlation(
         .lock_state
         .as_deref()
         .map(|state| redact_pack_output_text(state, &mut envelope_redactions));
+    // `_meta.effective` echoes the raw query, its grouping, the database path
+    // and the filters, so it is redacted like the rest of the envelope.
+    let effective = request
+        .effective
+        .as_ref()
+        .map(|value| redact_pack_output_json(value, &mut envelope_redactions));
     let redaction_counts = redaction_counts(
         redacted_count,
         &evidence,
@@ -1819,7 +1938,7 @@ fn rendered_answer_pack_with_correlation(
     }
 
     RenderedAnswerPack {
-        schema_version: "cass.pack.v1",
+        schema_version: "cass.pack.v2",
         query: RenderedQuery {
             text: query_text,
             normalized: normalized_query,
@@ -1832,6 +1951,7 @@ fn rendered_answer_pack_with_correlation(
             partial: request.budget.timed_out || !request.budget.skipped_sections.is_empty(),
             format: request.format.label(),
             warnings: warnings.clone(),
+            effective,
         },
         budget: request.budget.clone(),
         limits: RenderedLimits {
@@ -1846,6 +1966,7 @@ fn rendered_answer_pack_with_correlation(
         realized: RenderedRealized {
             search_mode: request.search_mode.clone(),
             fallback_mode: request.fallback_mode.clone(),
+            fallback_reason,
             semantic_joined: request.semantic_joined,
             candidate_count: plan.candidate_count,
             selected_evidence_count: plan.selected_evidence_count,
@@ -1919,6 +2040,7 @@ fn health_is_healthy(
 fn readiness_warnings(
     request: &PackRenderRequest,
     semantic_readiness: PackSemanticReadiness,
+    fallback_reason: Option<&str>,
     source_readiness: &[RenderedSourceReadiness],
     no_evidence: bool,
     redactions: &mut Vec<RenderedRedaction>,
@@ -1937,6 +2059,10 @@ fn readiness_warnings(
     match semantic_readiness {
         PackSemanticReadiness::FallbackLexical => {
             warnings.push("semantic_fallback_lexical".to_string());
+            // A fallback the executor did not explain stays visible as such.
+            if fallback_reason.is_none() {
+                warnings.push("semantic_fallback_reason_unreported".to_string());
+            }
         }
         PackSemanticReadiness::Unavailable => {
             warnings.push("semantic_unavailable_lexical_fallback".to_string());
@@ -1973,6 +2099,7 @@ fn readiness_warnings(
 fn readiness_recommended_action(
     request: &PackRenderRequest,
     semantic_readiness: PackSemanticReadiness,
+    fallback_reason: Option<&str>,
     health_is_healthy: bool,
 ) -> Option<String> {
     if let Some(action) = trimmed_optional_string(request.readiness.recommended_action.as_deref()) {
@@ -2012,6 +2139,13 @@ fn readiness_recommended_action(
         semantic_readiness,
         PackSemanticReadiness::FallbackLexical | PackSemanticReadiness::Unavailable
     ) {
+        // Pack's own lexical evidence selection is not an asset problem, so a
+        // model install would not change it (GH #507).
+        if fallback_reason == Some("pack_enrichment_unavailable") {
+            return Some(
+                "continue with lexical evidence; pack selects evidence lexically, and cass search --mode hybrid ranks with semantics".to_string(),
+            );
+        }
         return Some(
             "continue with lexical evidence or install semantic model explicitly".to_string(),
         );
@@ -2088,6 +2222,30 @@ fn redact_pack_output_text(input: &str, redactions: &mut Vec<RenderedRedaction>)
     }
 
     output
+}
+
+/// Redacts every string in a JSON value; keys are schema names and are kept.
+fn redact_pack_output_json(
+    value: &serde_json::Value,
+    redactions: &mut Vec<RenderedRedaction>,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => {
+            serde_json::Value::String(redact_pack_output_text(text, redactions))
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| redact_pack_output_json(item, redactions))
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, item)| (key.clone(), redact_pack_output_json(item, redactions)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 fn redacted_source_label(
@@ -2284,6 +2442,7 @@ fn rendered_evidence(
         line_start: candidate.line_start,
         line_end: candidate.line_end,
         message_index: candidate.message_index,
+        message_index_base: 1,
         conversation_id: candidate.conversation_id,
         content_hash: candidate.content_hash.clone(),
         span_hash: candidate.span_hash.clone(),
@@ -2314,6 +2473,7 @@ fn rendered_evidence(
             .collect(),
         redactions,
         source_readiness: candidate.source_readiness,
+        session_key: candidate.session_key(),
     }
 }
 
@@ -2398,7 +2558,7 @@ fn rendered_source_summary(evidence: &[RenderedEvidence]) -> Vec<RenderedSourceS
             healthy: true,
             ..SourceAccumulator::default()
         });
-        entry.sessions.insert(item.citation.source_path.clone());
+        entry.sessions.insert(item.session_key.clone());
         entry.evidence_count += 1;
         entry.newest_evidence_at_ms =
             newer_timestamp(entry.newest_evidence_at_ms, item.citation.created_at_ms);
@@ -2577,6 +2737,7 @@ fn render_answer_pack_jsonl(
     lines.push(json_line(
         serde_json::json!({
             "_meta": &envelope.meta,
+            "schema_version": envelope.schema_version,
             "budget": &envelope.budget,
         }),
         request,
@@ -2657,6 +2818,12 @@ fn render_answer_pack_markdown(envelope: &RenderedAnswerPack) -> String {
                     out.push('-');
                     out.push_str(&line_end.to_string());
                 }
+            }
+            if let Some(conversation_id) = item.citation.conversation_id {
+                out.push_str(&format!(" conversation_id={conversation_id}"));
+            }
+            if let Some(message_index) = item.citation.message_index {
+                out.push_str(&format!(" message_index={message_index} (1-based)"));
             }
             out.push_str("\n\n");
             // Preserve the complete prepared excerpt, including blank lines.
@@ -2906,6 +3073,7 @@ mod tests {
 
     fn render_request(format: PackRenderFormat) -> PackRenderRequest {
         PackRenderRequest {
+            effective: None,
             query_text: "pack handoff".to_string(),
             normalized_query: "pack handoff".to_string(),
             generated_at_ms: 1_060_000,
@@ -2928,6 +3096,7 @@ mod tests {
             },
             search_mode: "hybrid".to_string(),
             fallback_mode: Some("lexical".to_string()),
+            fallback_reason: Some("semantic_absent".to_string()),
             semantic_joined: false,
             freshness_policy: PackFreshnessPolicy::PreferRecent,
             freshness_window_seconds: 60,
@@ -3081,7 +3250,7 @@ mod tests {
         let candidate = PackCandidate::from_search_hit(&hit, 1, 0);
 
         assert_eq!(candidate.match_type, "implicit_wildcard");
-        assert_eq!(candidate.message_index, Some(11));
+        assert_eq!(candidate.message_index, Some(12));
         assert_eq!(candidate.line_start, None);
         assert_eq!(candidate.line_end, None);
         assert!(!candidate.citation_verified);
@@ -3104,7 +3273,7 @@ mod tests {
         let mut item = candidate("verify", "local", path.to_str().unwrap(), 10.0);
         item.created_at_ms = None;
         item.excerpt = "verifiedneedle".to_string();
-        item.message_index = Some(0);
+        item.message_index = Some(1);
         let base = plan_answer_pack(request(vec![item])).unwrap();
 
         for (contents, expected_line) in [
@@ -3126,7 +3295,7 @@ mod tests {
             assert_eq!(citation.line_start, expected_line);
             assert_eq!(citation.line_end, expected_line);
             assert_eq!(citation.citation_verified, expected_line.is_some());
-            assert_eq!(citation.message_index, Some(0));
+            assert_eq!(citation.message_index, Some(1));
             if expected_line.is_some() {
                 assert_eq!(
                     citation.span_hash,
@@ -3425,7 +3594,7 @@ mod tests {
 
         assert!(!rendered.contains('\n'));
         assert_eq!(value, render_answer_pack_value(&plan, &req).unwrap());
-        assert_eq!(value["schema_version"], "cass.pack.v1");
+        assert_eq!(value["schema_version"], "cass.pack.v2");
         assert_eq!(value["_meta"]["format"], "compact");
         assert_eq!(value["_meta"]["partial"], false);
         assert_eq!(
@@ -3468,6 +3637,7 @@ mod tests {
         assert!(lines[2].starts_with("{\"omitted\":"));
         assert!(lines[3].starts_with("{\"privacy\":"));
         let meta: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(meta["schema_version"], "cass.pack.v2");
         let omitted: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(
             meta["_meta"]["warnings"],
@@ -3812,6 +3982,117 @@ mod tests {
         );
     }
 
+    fn fallback_plan() -> PlannedAnswerPack {
+        plan_answer_pack(request(vec![candidate(
+            "fallback",
+            "local",
+            "/s/fallback.jsonl",
+            10.0,
+        )]))
+        .unwrap()
+    }
+
+    fn warning_list(value: &serde_json::Value) -> Vec<String> {
+        value["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|warning| warning.as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// GH #507: a fallback the executor explains carries that cause.
+    #[test]
+    fn render_fallback_reports_the_executor_cause() {
+        let mut req = render_request(PackRenderFormat::Json);
+        req.fallback_reason = Some("semantic_budget_limited".to_string());
+        let value = render_answer_pack_value(&fallback_plan(), &req).unwrap();
+
+        assert_eq!(value["realized"]["fallback_mode"], "lexical");
+        assert_eq!(
+            value["realized"]["fallback_reason"],
+            "semantic_budget_limited"
+        );
+        assert_eq!(value["health"]["semantic_state"], "fallback_lexical");
+        let warnings = warning_list(&value);
+        assert!(warnings.contains(&"semantic_fallback_lexical".to_string()));
+        assert!(!warnings.contains(&"semantic_fallback_reason_unreported".to_string()));
+    }
+
+    /// A fallback without a supplied cause is flagged, never given one.
+    #[test]
+    fn render_unexplained_fallback_is_flagged_not_filled_in() {
+        for reason in [None, Some("   ".to_string())] {
+            let mut req = render_request(PackRenderFormat::Json);
+            req.fallback_reason = reason;
+            let value = render_answer_pack_value(&fallback_plan(), &req).unwrap();
+
+            assert!(value["realized"]["fallback_reason"].is_null());
+            let warnings = warning_list(&value);
+            assert!(warnings.contains(&"semantic_fallback_lexical".to_string()));
+            assert!(warnings.contains(&"semantic_fallback_reason_unreported".to_string()));
+        }
+    }
+
+    /// An explicit lexical request is not a fallback, and a stray cause
+    /// without a fallback is not reported.
+    #[test]
+    fn render_lexical_request_reports_no_fallback_or_cause() {
+        let mut req = render_request(PackRenderFormat::Json);
+        req.search_mode = "lexical".to_string();
+        req.fallback_mode = None;
+        req.fallback_reason = Some("semantic_absent".to_string());
+        req.readiness.semantic_readiness = PackSemanticReadiness::Disabled;
+        let value = render_answer_pack_value(&fallback_plan(), &req).unwrap();
+
+        assert!(value["realized"]["fallback_mode"].is_null());
+        assert!(value["realized"]["fallback_reason"].is_null());
+        let warnings = warning_list(&value);
+        assert!(warnings.contains(&"semantic_disabled".to_string()));
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.starts_with("semantic_fallback"))
+        );
+    }
+
+    /// Pack's own lexical selection is not an asset problem, so it must not
+    /// send the operator to install a model; an absent model still does.
+    #[test]
+    fn render_pack_policy_fallback_does_not_recommend_a_model_install() {
+        let mut req = render_request(PackRenderFormat::Json);
+        req.fallback_reason = Some("pack_enrichment_unavailable".to_string());
+        let value = render_answer_pack_value(&fallback_plan(), &req).unwrap();
+        assert_eq!(value["health"]["healthy"], true);
+        let action = value["health"]["recommended_action"].as_str().unwrap();
+        assert!(action.contains("cass search --mode hybrid"), "{action}");
+        assert!(!action.contains("install semantic model"), "{action}");
+
+        req.fallback_reason = Some("semantic_absent".to_string());
+        let value = render_answer_pack_value(&fallback_plan(), &req).unwrap();
+        assert_eq!(
+            value["health"]["recommended_action"],
+            "continue with lexical evidence or install semantic model explicitly"
+        );
+    }
+
+    /// The cause passes through the envelope redaction and is counted.
+    #[test]
+    fn render_fallback_reason_is_redacted_and_counted() {
+        let mut req = render_request(PackRenderFormat::Json);
+        req.fallback_reason = Some("semantic_absent".to_string());
+        let value = render_answer_pack_value(&fallback_plan(), &req).unwrap();
+        assert_eq!(value["privacy"]["redaction_applied"], false);
+
+        req.fallback_reason =
+            Some("model at /home/alice/.cache/cass/model.bin unreadable".to_string());
+        let value = render_answer_pack_value(&fallback_plan(), &req).unwrap();
+
+        let reason = value["realized"]["fallback_reason"].as_str().unwrap();
+        assert!(!reason.contains("/home/alice"), "{reason}");
+        assert_eq!(value["privacy"]["redaction_applied"], true);
+    }
+
     #[test]
     fn render_active_rebuild_marks_pack_not_fresh() {
         let plan = plan_answer_pack(request(vec![candidate(
@@ -3953,6 +4234,13 @@ mod tests {
             last_synced_at_ms: Some(1_000_000),
             recommended_action: Some(format!("sync {home_path} from {host}")),
         }];
+        req.effective = Some(serde_json::json!({
+            "command": "pack",
+            "query": req.query_text,
+            "query_structure": format!("investigate AND {token}"),
+            "db_path": format!("{home_path}/agent_search.db"),
+            "filters": {"workspaces": [home_path]},
+        }));
 
         let rendered = render_answer_pack(&plan, &req).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
@@ -3960,6 +4248,14 @@ mod tests {
         for raw in [&token, home_path, host] {
             assert!(!rendered.contains(raw));
         }
+        let effective = &value["_meta"]["effective"];
+        assert_eq!(effective["command"], "pack");
+        assert_eq!(effective["query"], value["query"]["text"]);
+        assert_eq!(effective["db_path"], "[REDACTED_PATH]/agent_search.db");
+        assert_eq!(
+            effective["filters"]["workspaces"],
+            serde_json::json!(["[REDACTED_PATH]/private"])
+        );
         assert_eq!(
             value["query"]["text"],
             "investigate [REDACTED] at [REDACTED_PATH]/private"
@@ -3986,7 +4282,7 @@ mod tests {
             value["privacy"]["redaction_counts"]["private_path"]
                 .as_u64()
                 .unwrap()
-                >= 3
+                >= 6
         );
     }
 
@@ -4368,7 +4664,7 @@ mod tests {
         span_duplicate.span_hash = span_source.span_hash.clone();
 
         let range_source = candidate("range-source", "local", "/s/range.jsonl", 8.0);
-        let mut range_duplicate = candidate("range-dup", "remote", "/s/range.jsonl", 7.0);
+        let mut range_duplicate = candidate("range-dup", "local", "/s/range.jsonl", 7.0);
         range_duplicate.line_start = Some(11);
         range_duplicate.line_end = Some(14);
 

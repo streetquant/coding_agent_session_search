@@ -65,7 +65,8 @@ fn artifact(corpus: &SemanticCorpusSnapshotIdentity, bytes: &[u8]) -> SemanticGe
         content_sha256: corpus.content_sha256.clone(),
     };
     SemanticGenerationArtifact {
-        role: SemanticArtifactRole::FastVector,
+        shard: None,
+            role: SemanticArtifactRole::FastVector,
         relative_path: "fast/primary.fsvi".to_owned(),
         artifact_sha256,
         size_bytes,
@@ -265,20 +266,27 @@ fn fresh_process_generation_child() {
 
 use coding_agent_search::search::semantic_manifest::{
     SEMANTIC_CURRENT_POINTER_SCHEMA_VERSION, SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION,
-    SemanticArtifactRole, SemanticArtifactValidationEvidence, SemanticCorpusSnapshotIdentity,
-    SemanticCurrentPointerV1, SemanticExpectedCurrentV1, SemanticGenerationArtifact,
-    SemanticGenerationDiskStateV1, SemanticGenerationManifestV1, SemanticGenerationRecoveryAction,
-    SemanticGenerationStatus, SemanticGenerationTopology, SemanticProducerAttestation,
-    load_current_semantic_generation, resolve_semantic_generation_disk_state,
+    SemanticArtifactRole, SemanticArtifactSealStateV1, SemanticArtifactValidationEvidence,
+    SemanticCorpusSnapshotIdentity, SemanticCurrentPointerV1, SemanticExpectedCurrentV1,
+    SemanticGenerationArtifact, SemanticGenerationDiskStateV1, SemanticGenerationError,
+    SemanticGenerationManifestV1, SemanticGenerationRecoveryAction, SemanticGenerationStatus,
+    SemanticGenerationTopology, SemanticProducerAttestation, load_current_semantic_generation,
+    resolve_semantic_generation_disk_state,
 };
+use coding_agent_search::search::semantic_reader::publication::{
+    SelectedSemanticGeneration, SemanticSelectionBudget,
+};
+use coding_agent_search::search::vector_index::{ROLE_USER, SemanticDocId};
+use frankensearch::core::generation::ArtifactGenerationIdentityV1;
 use frankensearch::core::{
-    EMBEDDING_INPUT_CONTRACT_SCHEMA_V1, EMBEDDING_PRODUCER_ATTESTATION_SCHEMA_V1,
-    EMBEDDING_SPACE_IDENTITY_SCHEMA_V1, EmbeddingArtifactIdentityV1, EmbeddingIdentityBundleV1,
-    EmbeddingInputContractV1, EmbeddingProducerAttestationV1, EmbeddingSpaceIdentityV1,
-    EmbeddingSpaceKindV1, GoldenVectorCertificateV1, QuantizationFormat,
+    BoundQueryEmbedding, EMBEDDING_INPUT_CONTRACT_SCHEMA_V1,
+    EMBEDDING_PRODUCER_ATTESTATION_SCHEMA_V1, EMBEDDING_SPACE_IDENTITY_SCHEMA_V1,
+    EmbeddingArtifactIdentityV1, EmbeddingIdentityBundleV1, EmbeddingInputContractV1,
+    EmbeddingProducerAttestationV1, EmbeddingSpaceIdentityV1, EmbeddingSpaceKindV1,
+    GoldenVectorCertificateV1, QuantizationFormat, TieredQueryEmbeddings,
     VECTOR_STORAGE_IDENTITY_SCHEMA_V1, VectorStorageIdentityV1,
 };
-use frankensearch::{VectorIndex, index};
+use frankensearch::index::{FsviV2IdentityBinding, ValidatedFsviBytes, VectorIndex};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
@@ -293,6 +301,7 @@ use wait_timeout::ChildExt;
 const ACCEPTED_CHILD_DATA_DIR_ENV: &str = "CASS_TEST_ACCEPTED_SEMANTIC_GENERATION_DIR";
 const ACCEPTED_CHILD_GENERATION_ENV: &str = "CASS_TEST_ACCEPTED_SEMANTIC_GENERATION_ID";
 const ACCEPTED_CHILD_CORPUS_ENV: &str = "CASS_TEST_ACCEPTED_SEMANTIC_CORPUS_SHA256";
+const ACCEPTED_CHILD_SNAPSHOT_ENV: &str = "CASS_TEST_ACCEPTED_SEMANTIC_CORPUS_SNAPSHOT";
 const ACCEPTED_CHILD_MARKER: &str = "accepted_semantic_generation_fresh_process_verified";
 const POINTER_PUBLISH_CRASH_DATA_DIR_ENV: &str = "CASS_TEST_POINTER_PUBLISH_CRASH_DATA_DIR";
 const POINTER_PUBLISH_CRASH_EXIT_CODE: i32 = 86;
@@ -385,7 +394,7 @@ fn accepted_embedding_identity() -> frankensearch::core::FrozenEmbeddingIdentity
         input,
         storage: VectorStorageIdentityV1 {
             schema_version: VECTOR_STORAGE_IDENTITY_SCHEMA_V1,
-            format: "fsvi-v1".to_owned(),
+            format: "fsvi-v2".to_owned(),
             quantization: QuantizationFormat::F16,
             // frankensearch validates the canonical spelling since 14d1480a.
             endianness: "little-endian".to_owned(),
@@ -397,41 +406,56 @@ fn accepted_embedding_identity() -> frankensearch::core::FrozenEmbeddingIdentity
     .expect("accepted semantic fixture identity")
 }
 
-fn write_real_fsvi(path: &Path) {
-    fs::create_dir_all(path.parent().expect("FSVI parent")).expect("create FSVI parent");
-    let mut writer = VectorIndex::create_with_revision(
-        path,
-        "cass-fresh-process-semantic-fixture",
-        "fixture-v1",
-        256,
-        index::Quantization::F16,
+fn accepted_fsvi_binding() -> FsviV2IdentityBinding {
+    FsviV2IdentityBinding::new(
+        ArtifactGenerationIdentityV1::new(1, [73; 16]).expect("fixture generation identity"),
+        accepted_embedding_identity(),
     )
-    .expect("create real FSVI writer");
+    .expect("fixture FSVI v2 binding")
+}
+
+fn write_real_fsvi(path: &Path) -> ValidatedFsviBytes {
+    fs::create_dir_all(path.parent().expect("FSVI parent")).expect("create FSVI parent");
+    let binding = accepted_fsvi_binding();
+    let mut writer =
+        VectorIndex::create_v2(path, binding.clone()).expect("create real FSVI v2 writer");
     for document in 0..4 {
         let mut vector = vec![0.0_f32; 256];
         vector[document] = 1.0;
+        let id = SemanticDocId {
+            message_id: document as u64 + 1,
+            chunk_idx: 0,
+            agent_id: 1,
+            workspace_id: 1,
+            source_id: 0,
+            role: ROLE_USER,
+            created_at_ms: 1_721_990_000_000,
+            content_hash: Some([document as u8 + 1; 32]),
+        };
         writer
-            .write_record(&format!("doc-{document}"), &vector)
+            .write_record(&id.to_doc_id_string(), &vector)
             .expect("write real FSVI record");
     }
     writer.finish().expect("finish real FSVI");
+    ValidatedFsviBytes::open_published(path, &binding).expect("admit fixture FSVI v2 owner")
 }
 
 fn accepted_manifest(data_dir: &Path) -> SemanticGenerationManifestV1 {
-    let corpus = accepted_corpus_identity();
+    let mut corpus = accepted_corpus_identity();
     let generation_id = "gen-fresh-process-accepted-0001";
-    let relative_path = "fast/writer-produced.fsvi";
+    let relative_path = "quality/writer-produced.fsvi";
     let generation_dir = data_dir
         .join("vector_index")
         .join("generations")
         .join(generation_id);
     let artifact_path = generation_dir.join(relative_path);
-    write_real_fsvi(&artifact_path);
+    let owner = write_real_fsvi(&artifact_path);
+    corpus.ordered_live_docset_sha256 = hex::encode(owner.witness().ordered_live_docset_digest);
     let artifact_bytes = fs::read(&artifact_path).expect("read writer-produced FSVI");
     let artifact_sha256 = accepted_sha256(&artifact_bytes);
     let size_bytes = u64::try_from(artifact_bytes.len()).expect("FSVI size fits u64");
     let validation = SemanticArtifactValidationEvidence {
-        validator_id: "frankensearch-vector-index-open-v1".to_owned(),
+        validator_id: "frankensearch-fsvi-v2-owner".to_owned(),
         validated_at_ms: 1_721_990_000_250,
         artifact_sha256: artifact_sha256.clone(),
         size_bytes,
@@ -440,18 +464,20 @@ fn accepted_manifest(data_dir: &Path) -> SemanticGenerationManifestV1 {
         vector_slot_count: corpus.document_count,
         live_vector_count: corpus.document_count,
         tombstone_vector_count: 0,
-        wal_entry_count: 0,
+        seal: SemanticArtifactSealStateV1::Vector { wal_entry_count: 0 },
         generation_corpus_sha256: corpus.corpus_sha256.clone(),
         covered_live_docset_sha256: corpus.ordered_live_docset_sha256.clone(),
         covered_content_sha256: corpus.content_sha256.clone(),
     };
     let artifact = SemanticGenerationArtifact {
-        role: SemanticArtifactRole::FastVector,
+        shard: None,
+        role: SemanticArtifactRole::QualityVector,
         relative_path: relative_path.to_owned(),
         artifact_sha256,
         size_bytes,
-        artifact_format: "fsvi-v1".to_owned(),
-        artifact_parameters_sha256: accepted_sha256(b"fsvi-v1-f16-little-l2"),
+        artifact_format: "fsvi-v2".to_owned(),
+        fsvi_generation: Some(accepted_fsvi_binding().generation()),
+        artifact_parameters_sha256: accepted_sha256(b"fsvi-v2-f16-little-l2"),
         embedding_identity: accepted_embedding_identity(),
         ann_base: None,
         selected_document_count: corpus.document_count,
@@ -459,7 +485,7 @@ fn accepted_manifest(data_dir: &Path) -> SemanticGenerationManifestV1 {
         vector_slot_count: corpus.document_count,
         live_vector_count: corpus.document_count,
         tombstone_vector_count: 0,
-        wal_entry_count: 0,
+        seal: SemanticArtifactSealStateV1::Vector { wal_entry_count: 0 },
         generation_corpus_sha256: corpus.corpus_sha256.clone(),
         covered_live_docset_sha256: corpus.ordered_live_docset_sha256.clone(),
         covered_content_sha256: corpus.content_sha256.clone(),
@@ -474,8 +500,8 @@ fn accepted_manifest(data_dir: &Path) -> SemanticGenerationManifestV1 {
         created_at_ms: 1_721_990_000_000,
         completed_at_ms: 1_721_990_000_200,
         sealed_at_ms: 1_721_990_000_300,
-        requested_topology: SemanticGenerationTopology::FastOnly,
-        realized_topology: SemanticGenerationTopology::FastOnly,
+        requested_topology: SemanticGenerationTopology::QualityOnly,
+        realized_topology: SemanticGenerationTopology::QualityOnly,
         status: SemanticGenerationStatus::Sealed,
         corpus,
         producer: SemanticProducerAttestation {
@@ -526,6 +552,416 @@ fn sanitized_child_failure(combined: &str, sensitive_values: &[&str]) -> String 
 }
 
 #[test]
+fn accepted_full_audit_rejects_self_consistent_descriptors_for_different_fsvi_bytes()
+-> anyhow::Result<()> {
+    for mismatch in [
+        "identity",
+        "generation",
+        "counts",
+        "docset",
+        "invalid-image",
+    ] {
+        let temp = tempfile::tempdir()?;
+        let mut manifest = accepted_manifest(temp.path());
+        let path = manifest
+            .generation_dir(temp.path())?
+            .join(&manifest.artifacts[0].relative_path);
+        match mismatch {
+            "identity" => {
+                let mut identity = manifest.artifacts[0].embedding_identity.identity.clone();
+                identity.space.pooling = "different-pooling-same-model-and-dimension".to_owned();
+                identity.producer.space_fingerprint = identity.space.fingerprint();
+                manifest.artifacts[0].embedding_identity = identity.freeze()?;
+            }
+            "generation" => {
+                manifest.artifacts[0].fsvi_generation =
+                    Some(ArtifactGenerationIdentityV1::new(2, [73; 16])?);
+            }
+            "counts" => {
+                let artifact = &mut manifest.artifacts[0];
+                artifact.vector_slot_count += 1;
+                artifact.tombstone_vector_count += 1;
+                artifact.validation.vector_slot_count = artifact.vector_slot_count;
+                artifact.validation.tombstone_vector_count = artifact.tombstone_vector_count;
+                manifest.total_vector_slot_count_across_tiers += 1;
+                manifest.total_tombstone_vector_count_across_tiers += 1;
+            }
+            "docset" => {
+                let forged = accepted_sha256(b"different-document-membership");
+                manifest.corpus.ordered_live_docset_sha256 = forged.clone();
+                manifest.artifacts[0].covered_live_docset_sha256 = forged.clone();
+                manifest.artifacts[0].validation.covered_live_docset_sha256 = forged;
+            }
+            "invalid-image" => {
+                let mut bytes = fs::read(&path)?;
+                bytes[0] ^= 1;
+                fs::write(&path, &bytes)?;
+                let digest = accepted_sha256(&bytes);
+                manifest.artifacts[0].artifact_sha256 = digest.clone();
+                manifest.artifacts[0].validation.artifact_sha256 = digest;
+            }
+            _ => unreachable!("enumerated fixture mismatch"),
+        }
+        // Every claim and its producer receipt agree; SHA and size still
+        // authenticate the actual file. Only parsing that file can reject it.
+        manifest.validate()?;
+        let before = fs::read(&path)?;
+        let expected_reason = match mismatch {
+            "identity" | "generation" => "semantic_artifact_reindex_required",
+            "counts" | "docset" => "semantic_artifact_witness_mismatch",
+            _ => "semantic_artifact_corrupt",
+        };
+        let check = |error: &SemanticGenerationError| {
+            assert_eq!(error.reason_code(), expected_reason, "{mismatch}");
+            if matches!(mismatch, "identity" | "generation" | "invalid-image") {
+                assert!(std::error::Error::source(error).is_some());
+            }
+            assert!(
+                !error
+                    .to_string()
+                    .contains(&temp.path().display().to_string())
+            );
+            assert!(
+                !error
+                    .to_string()
+                    .contains(&manifest.artifacts[0].artifact_sha256)
+            );
+        };
+        check(&manifest.write_immutable(temp.path()).expect_err(mismatch));
+        assert!(!manifest.manifest_path(temp.path())?.exists());
+
+        // Reproduce an externally written, internally consistent manifest;
+        // bypassing the sealer must not bypass publication or fresh load.
+        fs::write(
+            manifest.manifest_path(temp.path())?,
+            manifest.canonical_bytes()?,
+        )?;
+        let pointer = SemanticCurrentPointerV1::for_manifest(&manifest, manifest.sealed_at_ms, 1)?;
+        check(
+            &pointer
+                .publish_atomic(temp.path(), &SemanticExpectedCurrentV1::Absent)
+                .expect_err(mismatch),
+        );
+        assert!(!SemanticCurrentPointerV1::path(temp.path()).exists());
+        fs::write(
+            SemanticCurrentPointerV1::path(temp.path()),
+            pointer.canonical_bytes()?,
+        )?;
+        check(
+            &load_current_semantic_generation(temp.path(), Some(&manifest.corpus))
+                .expect_err(mismatch),
+        );
+        check(&resolve_semantic_generation_disk_state(temp.path(), None).expect_err(mismatch));
+        assert_eq!(fs::read(&path)?, before, "{mismatch} changed vector bytes");
+    }
+    Ok(())
+}
+
+#[test]
+fn accepted_full_audit_bounds_declared_image_before_opening_it() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut manifest = accepted_manifest(temp.path());
+    let artifact = &mut manifest.artifacts[0];
+    artifact.relative_path = "quality/not-created-oversized.fsvi".to_owned();
+    artifact.size_bytes = 1024 * 1024 * 1024;
+    artifact.validation.size_bytes = artifact.size_bytes;
+    manifest.validate()?;
+    let error = manifest
+        .write_immutable(temp.path())
+        .expect_err("bounded audit");
+    assert_eq!(
+        error.reason_code(),
+        "semantic_artifact_admission_budget_exceeded"
+    );
+    assert_eq!(
+        error.recovery_action(),
+        SemanticGenerationRecoveryAction::ReindexRequired
+    );
+    assert!(matches!(
+        error,
+        SemanticGenerationError::ArtifactAdmissionBudgetExceeded {
+            declared_bytes: 1_073_741_824,
+            max_bytes: 536_870_912,
+            ..
+        }
+    ));
+    assert!(!manifest.manifest_path(temp.path())?.exists());
+    Ok(())
+}
+
+#[test]
+fn accepted_disk_readiness_requires_caller_source_and_preserves_corruption_errors() {
+    let temp = tempfile::tempdir().expect("temporary semantic data directory");
+    let manifest = accepted_manifest(temp.path());
+    let expected_source = manifest.corpus.clone();
+    manifest.write_immutable(temp.path()).expect("seal fixture");
+    let pointer = SemanticCurrentPointerV1::for_manifest(&manifest, manifest.sealed_at_ms, 1)
+        .expect("fixture pointer");
+    pointer
+        .publish_atomic(temp.path(), &SemanticExpectedCurrentV1::Absent)
+        .expect("select fixture");
+
+    let unknown = resolve_semantic_generation_disk_state(temp.path(), None)
+        .expect("disk audit without source witness");
+    assert!(matches!(
+        &unknown,
+        SemanticGenerationDiskStateV1::SourceUnknown { generation_id, .. }
+            if generation_id == &manifest.generation_id
+    ));
+    assert_eq!(
+        unknown.reason_code(),
+        Some("semantic_generation_source_unknown")
+    );
+    assert_eq!(
+        unknown.recovery_action(),
+        Some(SemanticGenerationRecoveryAction::VerifySource)
+    );
+    let robot = serde_json::to_value(unknown.robot_projection()).expect("robot state");
+    assert_eq!(robot["state"]["state"], "source_unknown");
+    assert_eq!(robot["recovery_action"], "verify_source");
+    assert!(
+        unknown
+            .to_string()
+            .contains("caller-pinned canonical source")
+    );
+
+    let ready = resolve_semantic_generation_disk_state(temp.path(), Some(&expected_source))
+        .expect("matching caller-pinned source");
+    assert!(matches!(ready, SemanticGenerationDiskStateV1::Ready { .. }));
+    assert_eq!(ready.reason_code(), None);
+    assert_eq!(ready.recovery_action(), None);
+
+    let mut stale_sequence = expected_source.clone();
+    stale_sequence.source_change_sequence += 1;
+    let mut foreign_database = expected_source;
+    foreign_database.database_uuid.push_str("-foreign");
+    for expected in [stale_sequence, foreign_database] {
+        let error = resolve_semantic_generation_disk_state(temp.path(), Some(&expected))
+            .expect_err("same corpus digest does not excuse a different source identity");
+        assert_eq!(error.reason_code(), "semantic_generation_stale_source");
+    }
+
+    let artifact = temp
+        .path()
+        .join("vector_index/generations")
+        .join(&manifest.generation_id)
+        .join(&manifest.artifacts[0].relative_path);
+    let mut bytes = fs::read(&artifact).expect("read owned fixture");
+    let last = bytes.last_mut().expect("nonempty FSVI");
+    *last ^= 1;
+    fs::write(&artifact, bytes).expect("corrupt only this test's owned fixture");
+    let error = resolve_semantic_generation_disk_state(temp.path(), None)
+        .expect_err("unknown source must still reject corrupt artifact bytes");
+    assert_eq!(error.reason_code(), "semantic_artifact_digest_mismatch");
+}
+
+#[test]
+fn accepted_readiness_never_certifies_legacy_or_unknown_vector_descriptors() -> anyhow::Result<()> {
+    for format in ["fsvi-v1", "fsvi-v3", "unrecognized-container"] {
+        for mixed_tier in [false, true] {
+            let temp = tempfile::tempdir()?;
+            let mut manifest = accepted_manifest(temp.path());
+            let generation_dir = manifest.generation_dir(temp.path())?;
+            let artifact_path = generation_dir.join(&manifest.artifacts[0].relative_path);
+            if mixed_tier {
+                let mut fast = manifest.artifacts[0].clone();
+                fast.role = SemanticArtifactRole::FastVector;
+                fast.relative_path = "fast/writer-produced.fsvi".to_owned();
+                let fast_path = generation_dir.join(&fast.relative_path);
+                fs::create_dir_all(fast_path.parent().expect("fast artifact parent"))?;
+                fs::copy(&artifact_path, fast_path)?;
+                manifest.artifacts.insert(0, fast);
+                manifest.requested_topology = SemanticGenerationTopology::FullProgressive;
+                manifest.realized_topology = SemanticGenerationTopology::FullProgressive;
+                manifest.total_vector_slot_count_across_tiers *= 2;
+                manifest.total_live_vector_count_across_tiers *= 2;
+            }
+            let quality = manifest.artifacts.last_mut().expect("quality artifact");
+            quality.artifact_format = format.to_owned();
+            quality.fsvi_generation = None;
+            let mut identity = quality.embedding_identity.identity.clone();
+            identity.storage.format = format.to_owned();
+            quality.embedding_identity = identity.freeze()?;
+            // The unchanged writer image and its exact SHA make this a
+            // descriptor-downgrade challenge: hash-only diagnostics remain
+            // possible, but they cannot authorize sealing or publication.
+            manifest.validate()?;
+            let check_publication_rejection = |error: &SemanticGenerationError| {
+                if format == "fsvi-v1" {
+                    assert!(matches!(
+                        error,
+                        SemanticGenerationError::LegacyUnidentified { artifact_count: 1 }
+                    ));
+                    assert_eq!(
+                        error.recovery_action(),
+                        SemanticGenerationRecoveryAction::ReindexRequired
+                    );
+                } else {
+                    assert!(matches!(
+                        error,
+                        SemanticGenerationError::UnsupportedVectorFormat {
+                            role: SemanticArtifactRole::QualityVector
+                        }
+                    ));
+                    assert_eq!(
+                        error.recovery_action(),
+                        SemanticGenerationRecoveryAction::UpgradeRequired
+                    );
+                }
+                assert!(!error.to_string().contains(format));
+                assert!(
+                    !error
+                        .to_string()
+                        .contains(&temp.path().display().to_string())
+                );
+            };
+            check_publication_rejection(
+                &manifest
+                    .write_immutable(temp.path())
+                    .expect_err("unsupported image cannot seal"),
+            );
+            assert!(!manifest.manifest_path(temp.path())?.exists());
+            // Model an external historical producer bypassing the sealer;
+            // the independent pointer publisher must still reject it.
+            fs::write(
+                manifest.manifest_path(temp.path())?,
+                manifest.canonical_bytes()?,
+            )?;
+            let pointer =
+                SemanticCurrentPointerV1::for_manifest(&manifest, manifest.sealed_at_ms, 1)?;
+            check_publication_rejection(
+                &pointer
+                    .publish_atomic(temp.path(), &SemanticExpectedCurrentV1::Absent)
+                    .expect_err("unsupported image cannot become current"),
+            );
+            assert!(!SemanticCurrentPointerV1::path(temp.path()).exists());
+            // An externally written pointer remains inspectable for recovery
+            // without ever certifying it as a supported serving generation.
+            fs::write(
+                SemanticCurrentPointerV1::path(temp.path()),
+                pointer.canonical_bytes()?,
+            )?;
+            load_current_semantic_generation(temp.path(), Some(&manifest.corpus))?;
+
+            for source in [None, Some(&manifest.corpus)] {
+                let result = resolve_semantic_generation_disk_state(temp.path(), source);
+                if format == "fsvi-v1" {
+                    let state = result?;
+                    assert_eq!(
+                        state,
+                        SemanticGenerationDiskStateV1::LegacyUnidentified { artifact_count: 1 }
+                    );
+                    assert_eq!(
+                        state.recovery_action(),
+                        Some(SemanticGenerationRecoveryAction::ReindexRequired)
+                    );
+                    let robot = serde_json::to_value(state.robot_projection())?;
+                    assert_eq!(robot["state"]["state"], "legacy_unidentified");
+                    assert_eq!(robot["recovery_action"], "reindex_required");
+                } else {
+                    let error = result.expect_err("unknown container cannot certify readiness");
+                    assert!(matches!(
+                        error,
+                        SemanticGenerationError::UnsupportedVectorFormat {
+                            role: SemanticArtifactRole::QualityVector
+                        }
+                    ));
+                    assert_eq!(
+                        error.reason_code(),
+                        "semantic_artifact_format_upgrade_required"
+                    );
+                    assert_eq!(
+                        error.recovery_action(),
+                        SemanticGenerationRecoveryAction::UpgradeRequired
+                    );
+                    let message = error.to_string();
+                    assert!(message.contains("upgrade CASS"));
+                    assert!(!message.contains(format));
+                    assert!(!message.contains(&manifest.artifacts[0].artifact_sha256));
+                    assert!(!message.contains(&temp.path().display().to_string()));
+                }
+            }
+
+            let mut stale = manifest.corpus.clone();
+            stale.source_change_sequence += 1;
+            assert_eq!(
+                resolve_semantic_generation_disk_state(temp.path(), Some(&stale))
+                    .expect_err("stale source still takes precedence")
+                    .reason_code(),
+                "semantic_generation_stale_source"
+            );
+            let mut bytes = fs::read(&artifact_path)?;
+            *bytes.last_mut().expect("nonempty writer image") ^= 1;
+            fs::write(&artifact_path, bytes)?;
+            for source in [None, Some(&manifest.corpus)] {
+                assert_eq!(
+                    resolve_semantic_generation_disk_state(temp.path(), source)
+                        .expect_err("format classification must preserve corrupt-image errors")
+                        .reason_code(),
+                    "semantic_artifact_digest_mismatch"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn accepted_full_disk_audit_preserves_vector_access_time() -> anyhow::Result<()> {
+    use std::fs::{File, FileTimes};
+    use std::io::Read;
+    use std::time::UNIX_EPOCH;
+
+    let temp = tempfile::tempdir()?;
+    let manifest = accepted_manifest(temp.path());
+    let vector = manifest
+        .generation_dir(temp.path())?
+        .join(&manifest.artifacts[0].relative_path);
+
+    // An ordinary read must expose this regression on the current filesystem.
+    // Use the real vector fixture as the control, then restore only its atime.
+    let mut control = File::open(&vector)?;
+    control.set_times(FileTimes::new().set_accessed(UNIX_EPOCH))?;
+    control.read_exact(&mut [0_u8; 1])?;
+    if control.metadata()?.accessed()? == UNIX_EPOCH {
+        eprintln!("full disk-audit atime control not exercised: filesystem ignores read atime");
+        return Ok(());
+    }
+    control.set_times(FileTimes::new().set_accessed(UNIX_EPOCH))?;
+    let before = control.metadata()?;
+    let assert_preserved = |step| -> anyhow::Result<()> {
+        let after = fs::metadata(&vector)?;
+        assert_eq!(
+            after.accessed()?,
+            before.accessed()?,
+            "{step} changed atime"
+        );
+        assert_eq!(
+            after.modified()?,
+            before.modified()?,
+            "{step} changed mtime"
+        );
+        assert_eq!(after.len(), before.len(), "{step} changed vector length");
+        Ok(())
+    };
+
+    manifest.write_immutable(temp.path())?;
+    assert_preserved("manifest sealing")?;
+    SemanticCurrentPointerV1::for_manifest(&manifest, manifest.sealed_at_ms, 1)?
+        .publish_atomic(temp.path(), &SemanticExpectedCurrentV1::Absent)?;
+    assert_preserved("pointer publication")?;
+    let loaded = load_current_semantic_generation(temp.path(), Some(&manifest.corpus))?;
+    assert_eq!(loaded.manifest, manifest);
+    assert_preserved("full selected-generation load")?;
+    let state = resolve_semantic_generation_disk_state(temp.path(), Some(&manifest.corpus))?;
+    assert!(matches!(state, SemanticGenerationDiskStateV1::Ready { .. }));
+    assert_preserved("disk readiness audit")?;
+    eprintln!("full disk-audit atime control exercised: four audit paths preserved metadata");
+    Ok(())
+}
+
+#[test]
 fn accepted_pointer_publication_crash_is_reported_as_retryable_interruption() {
     let temp = tempfile::tempdir().expect("temporary semantic data directory");
     let mut child = Command::new(std::env::current_exe().expect("integration test binary"))
@@ -555,7 +991,7 @@ fn accepted_pointer_publication_crash_is_reported_as_retryable_interruption() {
         "child must terminate at the injected pre-rename crash point"
     );
 
-    let state = resolve_semantic_generation_disk_state(temp.path())
+    let state = resolve_semantic_generation_disk_state(temp.path(), None)
         .expect("resolve disk state after interrupted pointer publication");
     assert_eq!(
         state,
@@ -634,6 +1070,10 @@ fn accepted_fresh_process_restart_loads_writer_produced_fsvi_by_manifest_path() 
         .env(ACCEPTED_CHILD_DATA_DIR_ENV, temp.path())
         .env(ACCEPTED_CHILD_GENERATION_ENV, &manifest.generation_id)
         .env(ACCEPTED_CHILD_CORPUS_ENV, &manifest.corpus.corpus_sha256)
+        .env(
+            ACCEPTED_CHILD_SNAPSHOT_ENV,
+            serde_json::to_string(&manifest.corpus).expect("caller snapshot"),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -712,30 +1152,61 @@ fn accepted_fresh_process_generation_child() {
     let expected_generation =
         std::env::var(ACCEPTED_CHILD_GENERATION_ENV).expect("expected generation");
     let expected_corpus = std::env::var(ACCEPTED_CHILD_CORPUS_ENV).expect("expected corpus digest");
+    let expected_snapshot: SemanticCorpusSnapshotIdentity = serde_json::from_str(
+        &std::env::var(ACCEPTED_CHILD_SNAPSHOT_ENV).expect("caller-pinned snapshot"),
+    )
+    .expect("caller snapshot identity");
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
         .without_time()
         .with_writer(std::io::stderr)
         .finish();
     tracing::subscriber::with_default(subscriber, || {
-        let loaded = load_current_semantic_generation(Path::new(&data_dir), None)
-            .expect("fresh-process manifest load");
+        let loaded =
+            load_current_semantic_generation(Path::new(&data_dir), Some(&expected_snapshot))
+                .expect("fresh-process manifest load");
         assert_eq!(loaded.manifest.generation_id, expected_generation);
         assert_eq!(loaded.manifest.corpus.corpus_sha256, expected_corpus);
         assert_eq!(loaded.artifact_paths.len(), 1);
         let artifact_path = loaded
             .artifact_paths
-            .get(&SemanticArtifactRole::FastVector)
-            .expect("resolved fast artifact");
-        // This contract intentionally stops at immutable selected bytes. The
-        // accepted read-only FSVI semantic witness/search owner is the formal
-        // blocker coding_agent_session_search-cass-fsvi-semantic-witness-xbq0b;
-        // never substitute the mutating VectorIndex::open path here.
+            .get(&SemanticArtifactRole::QualityVector)
+            .expect("resolved quality artifact");
         let selected_bytes =
             fs::read(artifact_path).expect("read exact manifest-selected writer-produced FSVI");
         assert_eq!(
             accepted_sha256(&selected_bytes),
             loaded.manifest.artifacts[0].artifact_sha256
+        );
+        let reader = SelectedSemanticGeneration::open_current(
+            Path::new(&data_dir),
+            &expected_snapshot,
+            SemanticSelectionBudget::default(),
+        )
+        .expect("fresh-process retained quality owner");
+        assert_eq!(
+            reader.selection().manifest().realized_topology,
+            SemanticGenerationTopology::QualityOnly
+        );
+        let mut query_identity = accepted_embedding_identity().identity;
+        query_identity.storage.format = "in-memory-f32".to_owned();
+        query_identity.storage.quantization = QuantizationFormat::F32;
+        query_identity.storage.endianness = "native-f32-values".to_owned();
+        let mut vector = vec![0.0; 256];
+        vector[0] = 1.0;
+        let query = TieredQueryEmbeddings::quality_only(
+            BoundQueryEmbedding::new(vector, query_identity).expect("bound quality query"),
+        );
+        let results = reader
+            .activate(&query)
+            .expect("activate quality owner")
+            .search(1, None)
+            .expect("search retained quality owner");
+        assert_eq!(results.batch().hits().len(), 1);
+        assert_eq!(results.batch().hits()[0].document.message_id, 1);
+        assert_eq!(
+            fs::read(artifact_path).expect("unchanged fixture image"),
+            selected_bytes
         );
         let details = BTreeMap::from([
             ("artifact_count", loaded.artifact_paths.len().to_string()),

@@ -362,21 +362,250 @@ fn normalize_wildcard_term_parts(raw: &str) -> Vec<String> {
     parts
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum SqliteMessageScanOperand {
     Terms(Vec<SqliteMessageScanTermPart>),
     Phrase(Vec<String>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct SqliteMessageScanAlternative {
-    operand: SqliteMessageScanOperand,
-    negated: bool,
+struct SqliteMessageScanQuery {
+    expr: CassBoolExpr<SqliteMessageScanOperand>,
 }
 
-type SqliteMessageScanGroup = Vec<SqliteMessageScanAlternative>;
-struct SqliteMessageScanQuery {
-    groups: Vec<SqliteMessageScanGroup>,
+/// A CASS query as the fallback lanes (SQLite FTS5 and the source scan)
+/// evaluate it, parsed with the lexical engine's grammar (2l1b0.52): NOT
+/// binds tightest, then AND (explicit or implied), then OR; parentheses
+/// group; negation is parity-based; an operator with no operand is dropped.
+#[derive(Clone, Debug, PartialEq)]
+enum CassBoolExpr<T> {
+    Operand(T),
+    Not(Box<CassBoolExpr<T>>),
+    And(Vec<CassBoolExpr<T>>),
+    Or(Vec<CassBoolExpr<T>>),
+}
+
+/// The shipping lexer's operand and operator tokens, plus the grouping
+/// parentheses that [`cass_bool_tokens`] splits off before lexing. `Token`
+/// never holds `LParen` or `RParen`.
+#[derive(Clone, Debug, PartialEq)]
+enum CassBoolToken {
+    Token(FsCassQueryToken),
+    Open,
+    Close,
+}
+
+/// Lex `raw` for the fallback lanes. Grouping parentheses follow the lexical
+/// engine's rules: a `(` opens a group only at the start of a word (after
+/// whitespace, `&&`, `||`, a phrase, another parenthesis or a leading `-`),
+/// a `)` closes one only while a group is open, and phrases are opaque. The
+/// text between them goes through the shipping lexer unchanged.
+fn cass_bool_tokens(raw: &str) -> Vec<CassBoolToken> {
+    fn flush(segment: &mut String, tokens: &mut Vec<CassBoolToken>) {
+        if !segment.is_empty() {
+            // The loop below splits every grouping parenthesis off, so the
+            // engine lexer (same grouping rules since frankensearch 0.7)
+            // reports none here. Map any it does report onto the group
+            // tokens anyway: a raw paren token would stall the parser.
+            tokens.extend(fs_cass_parse_boolean_query(segment).into_iter().map(
+                |token| match token {
+                    FsCassQueryToken::LParen => CassBoolToken::Open,
+                    FsCassQueryToken::RParen => CassBoolToken::Close,
+                    token => CassBoolToken::Token(token),
+                },
+            ));
+            segment.clear();
+        }
+    }
+    let mut tokens = Vec::new();
+    let mut segment = String::new();
+    let mut chars = raw.chars().peekable();
+    let mut in_phrase = false;
+    let mut at_word_start = true;
+    let mut open_groups = 0_usize;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                in_phrase = !in_phrase;
+                at_word_start = true;
+                segment.push(ch);
+            }
+            _ if in_phrase => segment.push(ch),
+            '(' if at_word_start => {
+                flush(&mut segment, &mut tokens);
+                tokens.push(CassBoolToken::Open);
+                open_groups += 1;
+            }
+            ')' if open_groups > 0 => {
+                flush(&mut segment, &mut tokens);
+                tokens.push(CassBoolToken::Close);
+                open_groups -= 1;
+                at_word_start = true;
+            }
+            ' ' | '\t' | '\n' => {
+                at_word_start = true;
+                segment.push(ch);
+            }
+            '&' | '|' if chars.peek() == Some(&ch) => {
+                chars.next();
+                segment.push(ch);
+                segment.push(ch);
+                at_word_start = true;
+            }
+            '-' if at_word_start => segment.push(ch),
+            _ => {
+                at_word_start = false;
+                segment.push(ch);
+            }
+        }
+    }
+    flush(&mut segment, &mut tokens);
+    tokens
+}
+
+/// An operand the lane cannot express: the whole query is declined.
+struct CassBoolUnsupported;
+
+/// Recursive-descent parser for [`CassBoolExpr`]:
+///
+/// ```text
+/// or      := and (OR and)*
+/// and     := unary ([AND] unary)*
+/// unary   := NOT* primary
+/// primary := TERM | PHRASE | '(' or ')'
+/// ```
+struct CassBoolParser<'a, T, F> {
+    tokens: &'a [CassBoolToken],
+    position: usize,
+    lower: F,
+    _operand: std::marker::PhantomData<T>,
+}
+
+impl<'a, T, F> CassBoolParser<'a, T, F>
+where
+    F: FnMut(&FsCassQueryToken) -> Result<Option<T>, CassBoolUnsupported>,
+{
+    /// Parse `tokens`, lowering each term or phrase with `lower`: `Ok(None)`
+    /// skips an operand that normalizes to nothing, `Err` declines the query.
+    fn parse(
+        tokens: &'a [CassBoolToken],
+        lower: F,
+    ) -> Result<Option<CassBoolExpr<T>>, CassBoolUnsupported> {
+        let mut parser = Self {
+            tokens,
+            position: 0,
+            lower,
+            _operand: std::marker::PhantomData,
+        };
+        let mut expr = parser.parse_or()?;
+        // A `)` outside any group cannot come from cass_bool_tokens, but a
+        // truncated parse must not drop the rest of the query.
+        while parser.position < parser.tokens.len() {
+            parser.position += 1;
+            if let Some(rest) = parser.parse_or()? {
+                expr = Some(match expr {
+                    Some(CassBoolExpr::Or(mut operands)) => {
+                        operands.push(rest);
+                        CassBoolExpr::Or(operands)
+                    }
+                    Some(first) => CassBoolExpr::Or(vec![first, rest]),
+                    None => rest,
+                });
+            }
+        }
+        Ok(expr)
+    }
+
+    fn peek(&self) -> Option<&'a CassBoolToken> {
+        self.tokens.get(self.position)
+    }
+
+    fn parse_or(&mut self) -> Result<Option<CassBoolExpr<T>>, CassBoolUnsupported> {
+        let mut operands = Vec::new();
+        loop {
+            match self.peek() {
+                None | Some(CassBoolToken::Close) => break,
+                Some(CassBoolToken::Token(FsCassQueryToken::Or)) => {
+                    self.position += 1;
+                    continue;
+                }
+                Some(_) => {}
+            }
+            if let Some(operand) = self.parse_and()? {
+                operands.push(operand);
+            }
+        }
+        Ok(match operands.len() {
+            0 => None,
+            1 => operands.pop(),
+            _ => Some(CassBoolExpr::Or(operands)),
+        })
+    }
+
+    fn parse_and(&mut self) -> Result<Option<CassBoolExpr<T>>, CassBoolUnsupported> {
+        let mut operands = Vec::new();
+        loop {
+            match self.peek() {
+                None
+                | Some(CassBoolToken::Close)
+                | Some(CassBoolToken::Token(FsCassQueryToken::Or)) => break,
+                Some(CassBoolToken::Token(FsCassQueryToken::And)) => {
+                    self.position += 1;
+                    continue;
+                }
+                Some(_) => {}
+            }
+            if let Some(operand) = self.parse_unary()? {
+                operands.push(operand);
+            }
+        }
+        Ok(match operands.len() {
+            0 => None,
+            1 => operands.pop(),
+            _ => Some(CassBoolExpr::And(operands)),
+        })
+    }
+
+    fn parse_unary(&mut self) -> Result<Option<CassBoolExpr<T>>, CassBoolUnsupported> {
+        let mut negated = false;
+        while let Some(CassBoolToken::Token(FsCassQueryToken::Not)) = self.peek() {
+            negated = !negated;
+            self.position += 1;
+        }
+        // A NOT with no operand (before AND, OR, `)` or the end) is dropped.
+        if !matches!(
+            self.peek(),
+            Some(
+                CassBoolToken::Open
+                    | CassBoolToken::Token(FsCassQueryToken::Term(_) | FsCassQueryToken::Phrase(_))
+            )
+        ) {
+            return Ok(None);
+        }
+        let operand = self.parse_primary()?;
+        Ok(match operand {
+            Some(operand) if negated => Some(CassBoolExpr::Not(Box::new(operand))),
+            other => other,
+        })
+    }
+
+    fn parse_primary(&mut self) -> Result<Option<CassBoolExpr<T>>, CassBoolUnsupported> {
+        let Some(token) = self.peek() else {
+            return Ok(None);
+        };
+        self.position += 1;
+        match token {
+            CassBoolToken::Open => {
+                let inner = self.parse_or()?;
+                // An unclosed group closes at the end of the query.
+                if matches!(self.peek(), Some(CassBoolToken::Close)) {
+                    self.position += 1;
+                }
+                Ok(inner)
+            }
+            CassBoolToken::Token(token) => Ok((self.lower)(token)?.map(CassBoolExpr::Operand)),
+            CassBoolToken::Close => Ok(None),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -731,6 +960,61 @@ impl SemanticTierMode {
     }
 }
 
+mod ann_shards;
+#[cfg(test)]
+mod ann_shards_integration;
+mod message_topk;
+#[cfg(test)]
+mod message_topk_integration;
+mod session_scope;
+use session_scope::{
+    SEMANTIC_SESSION_SCOPE_MAX_MESSAGES, SessionScopedSemanticFilter,
+    load_semantic_session_message_ids,
+};
+
+/// Intersect the original scope with message-level refill constraints before
+/// vector top-k. Hash-only admission cannot prove either message constraint.
+struct ExactMessageRefillFilter<'a> {
+    base: Option<&'a dyn FsSearchFilter>,
+    excluded: &'a HashSet<u64>,
+    ceiling: Option<u64>,
+}
+
+impl FsSearchFilter for ExactMessageRefillFilter<'_> {
+    fn matches(&self, doc_id: &str, metadata: Option<&serde_json::Value>) -> bool {
+        let Some(rest) = doc_id.strip_prefix("m|") else {
+            return false;
+        };
+        let mut parts = rest.splitn(3, '|');
+        let Some(message_id) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
+            return false;
+        };
+        if parts
+            .next()
+            .and_then(|value| value.parse::<u8>().ok())
+            .is_none()
+            || self.excluded.contains(&message_id)
+            || self.ceiling.is_some_and(|ceiling| message_id >= ceiling)
+        {
+            return false;
+        }
+        crate::search::vector_index::parse_semantic_doc_id_filter_view(doc_id).is_some()
+            && self.base.is_none_or(|base| base.matches(doc_id, metadata))
+    }
+
+    fn matches_doc_id_hash(
+        &self,
+        _hash: u64,
+        _metadata: Option<&serde_json::Value>,
+    ) -> Option<bool> {
+        None
+    }
+
+    fn name(&self) -> &str {
+        "cass_exact_message_refill_filter"
+    }
+}
+
 const PROGRESSIVE_EMBEDDING_CACHE_CAPACITY: usize = 64;
 const ANN_CANDIDATE_MULTIPLIER: usize = 4;
 const HYBRID_NO_LIMIT_PLANNING_WINDOW: usize = 64;
@@ -783,12 +1067,18 @@ const NO_LIMIT_BYTES_FLOOR: u64 = 256 * 1024 * 1024;
 /// else on the box.
 const NO_LIMIT_RAM_DIVISOR: u64 = 16;
 
-/// Above this corpus size, exact Tantivy `Count` collection is not part of the
-/// default top-N path. Common-term counts on multi-million-document indexes can
-/// dominate the query and turn a five-hit search into a full corpus scan; robot
-/// output already reports lower-bound count precision when the exact total is
-/// not available.
-const DEFAULT_EXACT_TOTAL_COUNT_MAX_DOCS: usize = 50_000;
+/// Above this corpus size, exact total counting is not part of the default
+/// top-N path, and a saturated page reports `limit + 1` as a lower bound.
+///
+/// The cap was 50,000 when the lexical engine was Tantivy, whose `Count` over a
+/// common term on a multi-million-document index could dominate the query. On
+/// Quill the count is cheap: on a 1,034,219-document archive (paired runs,
+/// `--limit 10`), exact totals added 0.00-0.11 s CPU to a ~0.8 s search even for
+/// "AGENTS.md" (867,087 matches) and "the" (439,461). Meanwhile the capped
+/// answer was wrong by up to five orders of magnitude ("stale lock": 11 against
+/// 11,915), and agents read `total_matches` as a count. The cap now sits at five
+/// times that archive; `CASS_SEARCH_EXACT_TOTAL_COUNT_MAX_DOCS` still overrides it.
+const DEFAULT_EXACT_TOTAL_COUNT_MAX_DOCS: usize = 5_000_000;
 const DEFAULT_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS: usize = 10_000;
 
 fn exact_total_count_max_docs() -> usize {
@@ -1051,6 +1341,102 @@ pub struct ParsedQuery {
     pub operators: Vec<String>,
     /// Whether implicit AND is used between terms
     pub implicit_and: bool,
+    /// How the operands group, as the lexical engine reads the query: every
+    /// compound group parenthesized, e.g. `(a AND b) OR c` (2l1b0.52).
+    pub structure: Option<String>,
+}
+
+/// Grouping of a parsed CASS query for `--explain`: compound operands are
+/// parenthesized, so precedence never has to be inferred from the text.
+fn render_query_structure(expr: &CassBoolExpr<String>) -> String {
+    fn grouped(expr: &CassBoolExpr<String>) -> String {
+        match expr {
+            CassBoolExpr::And(_) | CassBoolExpr::Or(_) => {
+                format!("({})", render_query_structure(expr))
+            }
+            other => render_query_structure(other),
+        }
+    }
+    match expr {
+        CassBoolExpr::Operand(text) => text.clone(),
+        CassBoolExpr::Not(inner) => format!("NOT {}", grouped(inner)),
+        CassBoolExpr::And(operands) => operands
+            .iter()
+            .map(grouped)
+            .collect::<Vec<_>>()
+            .join(" AND "),
+        CassBoolExpr::Or(operands) => operands
+            .iter()
+            .map(grouped)
+            .collect::<Vec<_>>()
+            .join(" OR "),
+    }
+}
+
+/// How the lexical engine reads a query. `--explain` shows it as
+/// `parsed.structure` and warnings; robot search echoes it in
+/// `_meta.effective` (2l1b0.52, 2l1b0.68).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueryReading {
+    /// Operand grouping with every compound group parenthesized, e.g.
+    /// `a OR (b AND c)`; `None` for a query without operands.
+    pub structure: Option<String>,
+    /// Parentheses recovered instead of rejected, e.g. `1 unclosed '('
+    /// closed at the end of the query`.
+    pub recoveries: Vec<String>,
+}
+
+/// Read `query` with the grammar the lexical engine applies.
+pub fn read_query(query: &str) -> QueryReading {
+    let tokens = cass_bool_tokens(query);
+    let structure = CassBoolParser::parse(&tokens, |token: &FsCassQueryToken| {
+        Ok(match token {
+            FsCassQueryToken::Term(text) => Some(text.clone()),
+            FsCassQueryToken::Phrase(text) => Some(format!("\"{text}\"")),
+            FsCassQueryToken::And
+            | FsCassQueryToken::Or
+            | FsCassQueryToken::Not
+            | FsCassQueryToken::LParen
+            | FsCassQueryToken::RParen => None,
+        })
+    })
+    .ok()
+    .flatten()
+    .map(|expr| render_query_structure(&expr));
+    QueryReading {
+        structure,
+        recoveries: group_recovery_warnings(&tokens),
+    }
+}
+
+/// `--explain` warnings for parentheses the grammar recovers instead of
+/// rejecting, read the way the lexical engine reads them: an unclosed `(`
+/// closes at the end of the query and an empty `()` is skipped.
+fn group_recovery_warnings(tokens: &[CassBoolToken]) -> Vec<String> {
+    let mut open_groups = 0_usize;
+    let mut empty_groups = 0_usize;
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            CassBoolToken::Open => {
+                open_groups += 1;
+                if matches!(tokens.get(index + 1), Some(CassBoolToken::Close)) {
+                    empty_groups += 1;
+                }
+            }
+            CassBoolToken::Close => open_groups = open_groups.saturating_sub(1),
+            CassBoolToken::Token(_) => {}
+        }
+    }
+    let mut warnings = Vec::new();
+    if open_groups > 0 {
+        warnings.push(format!(
+            "{open_groups} unclosed '(' closed at the end of the query"
+        ));
+    }
+    if empty_groups > 0 {
+        warnings.push(format!("{empty_groups} empty '()' skipped"));
+    }
+    warnings
 }
 
 /// Comprehensive query explanation for debugging and understanding search behavior
@@ -1169,6 +1555,10 @@ impl QueryExplanation {
                     parsed.operators.push("NOT".to_string());
                     next_negated = true;
                 }
+                // Grouping is reported through `structure` (read_query below).
+                // A parenthesis is not an operand and does not separate two
+                // operands, so implicit-AND adjacency carries across it.
+                FsCassQueryToken::LParen | FsCassQueryToken::RParen => {}
             }
         }
 
@@ -1177,6 +1567,8 @@ impl QueryExplanation {
         // a query can contain both an explicit connector and a later implicit
         // one (`foo AND bar baz`).
         parsed.implicit_and = uses_implicit_and;
+        let reading = read_query(query);
+        parsed.structure = reading.structure;
 
         // Determine query type
         let query_type = Self::classify_query(&parsed, filters, &sanitized);
@@ -1191,7 +1583,8 @@ impl QueryExplanation {
         let filters_summary = Self::summarize_filters(filters);
 
         // Generate warnings
-        let warnings = Self::generate_warnings(&parsed, &sanitized, filters);
+        let mut warnings = Self::generate_warnings(&parsed, &sanitized, filters);
+        warnings.extend(reading.recoveries);
 
         Self {
             original_query: query.to_string(),
@@ -1388,7 +1781,9 @@ impl QueryExplanation {
 
         // Warn about complex boolean queries
         if parsed.operators.len() > 3 {
-            warnings.push("Complex boolean query may have unexpected precedence".to_string());
+            warnings.push(
+                "Complex boolean query: parsed.structure shows how its operands group".to_string(),
+            );
         }
 
         // Warn about narrow filters that might miss results
@@ -1620,7 +2015,9 @@ pub struct SearchHit {
     pub content: String,
     #[serde(skip_serializing)]
     pub content_hash: u64,
-    #[serde(skip_serializing)]
+    /// Canonical conversation identity in the archive used by search.
+    /// Keep this with source_id, source_path and line_number for exact follow-ups.
+    /// Null means no canonical conversation identity is available; never invent one.
     pub conversation_id: Option<i64>,
     pub score: f32,
     pub source_path: String,
@@ -1630,7 +2027,8 @@ pub struct SearchHit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_original: Option<String>,
     pub created_at: Option<i64>,
-    /// Line number in the source file where the matched message starts (1-indexed)
+    /// Canonical message ordinal (`messages.idx + 1`), NOT a physical file line.
+    /// Pass unchanged to view/expand --message-index, with source_id and conversation_id.
     pub line_number: Option<usize>,
     /// How this result matched the query (exact, prefix wildcard, etc.)
     #[serde(default)]
@@ -1810,20 +2208,53 @@ fn execute_query_with_bounded_exact_count(
     limit: usize,
     offset: usize,
 ) -> Result<CassLexicalSearchResult> {
-    let page = crate::search::quill_bridge::search_paginated(reader, query, limit, offset, false)?;
+    bounded_exact_count_page(limit, offset, exact_total_count_max_docs(), |exact_count| {
+        crate::search::quill_bridge::search_paginated(reader, query, limit, offset, exact_count)
+    })
+}
+
+/// The policy of [`execute_query_with_bounded_exact_count`], with the engine
+/// call passed in as `run(exact_count)`.
+///
+/// The ranked page is the result; the exact total is an optional extra. The
+/// counting pass visits every match (the engine's block-max pruning is off for
+/// it), so on a fragmented or match-heavy index it can exhaust the query fuel
+/// the ranked page fit in. That refusal costs only the total, which is then
+/// reported as unknown exactly as on a large index (GH #518). Every other
+/// failure of the counting pass, cancellation included, still fails the query.
+fn bounded_exact_count_page(
+    limit: usize,
+    offset: usize,
+    exact_count_max_docs: usize,
+    mut run: impl FnMut(bool) -> Result<crate::search::quill_bridge::QuillLexicalPage>,
+) -> Result<CassLexicalSearchResult> {
+    let page = run(false)?;
     // `limit == 0` must not read as saturated: an empty page would equal an
     // empty limit and trigger the expensive exact-count pass for a caller that
     // asked for no rows at all.
     let page_saturated = limit > 0 && page.hits.len() == limit;
     let index_doc_count = page.doc_count;
     let total_count = if page_saturated {
-        if should_collect_exact_total_count(index_doc_count, exact_total_count_max_docs()) {
-            crate::search::quill_bridge::search_paginated(reader, query, limit, offset, true)?
-                .total_count
+        if should_collect_exact_total_count(index_doc_count, exact_count_max_docs) {
+            match run(true) {
+                Ok(counted) => counted.total_count,
+                Err(error) if crate::search::quill_bridge::is_query_fuel_exhausted(&error) => {
+                    tracing::warn!(
+                        index_doc_count,
+                        limit,
+                        offset,
+                        error = %format_args!("{error:#}"),
+                        "exact lexical count ran out of query fuel; keeping the ranked page \
+                         and reporting its total as unknown"
+                    );
+                    None
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             tracing::debug!(
                 index_doc_count,
-                exact_count_max_docs = exact_total_count_max_docs(),
+                exact_count_max_docs,
                 limit,
                 offset,
                 "skipping exact lexical count on large saturated result page"
@@ -2584,7 +3015,7 @@ struct SemanticSearchState {
     embedder: Arc<dyn Embedder>,
     artifacts: Arc<Vec<SemanticIndexArtifact>>,
     quality_artifact: Option<SemanticIndexArtifact>,
-    fs_ann_index: Option<Arc<FsHnswIndex>>,
+    fs_ann_index: Option<Arc<ann_shards::SemanticAnnShardSet>>,
     fs_ann_unavailable: Option<SemanticAnnUnavailableReason>,
     fs_ann_fallback_reported: bool,
     fs_in_memory_two_tier_index: Option<Arc<FsInMemoryTwoTierIndex>>,
@@ -2655,7 +3086,7 @@ struct SemanticCandidateSearchRequest<'a> {
     approximate: bool,
     tier_mode: SemanticTierMode,
     in_memory_two_tier_index: Option<&'a Arc<FsInMemoryTwoTierIndex>>,
-    ann_index: Option<&'a Arc<FsHnswIndex>>,
+    ann_index: Option<&'a Arc<ann_shards::SemanticAnnShardSet>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -3026,10 +3457,7 @@ impl FsLexicalRead for CassProgressiveLexicalAdapter {
 }
 
 pub struct SearchClient {
-    reader: Option<(
-        frankensearch::quill::QuillSearchIndex,
-        crate::search::quill_bridge::QuillCassFields,
-    )>,
+    reader: LexicalReaderSlot,
     sqlite: Mutex<Option<SearchSqliteConnection>>,
     sqlite_path: Option<PathBuf>,
     strict_read_only: bool,
@@ -3053,11 +3481,34 @@ pub struct SearchClient {
     /// `_meta.lexical_degrade_reason` so an agent can tell "no lexical hits"
     /// from "lexical was skipped because the engine ran out of query fuel".
     last_lexical_degrade_reason: Mutex<Option<&'static str>>,
+    /// Why the most recent `search_with_fallback` did not run the automatic
+    /// `*term*` retry its sparse result would otherwise get (`None` when the
+    /// retry ran or did not apply). Robot metadata surfaces it as
+    /// `_meta.wildcard_fallback_skipped` (2l1b0.68): above 10,000 documents
+    /// the retry used to turn off without a trace.
+    last_wildcard_fallback_skip: Mutex<Option<&'static str>>,
 }
 
 /// `_meta.lexical_degrade_reason` value when Quill's query-fuel ceiling was
 /// hit on the lexical leg of a hybrid search (GH #441).
 pub const LEXICAL_DEGRADE_QUERY_FUEL_EXHAUSTED: &str = "query_fuel_exhausted";
+
+/// `_meta.wildcard_fallback_skipped` value when the index holds more documents
+/// than `CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS` (default 10,000).
+pub const WILDCARD_FALLBACK_SKIPPED_LARGE_INDEX: &str = "index_over_automatic_limit";
+
+/// `_meta.wildcard_fallback_skipped` value when
+/// `CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS=0` turned the retry off.
+pub const WILDCARD_FALLBACK_SKIPPED_DISABLED: &str = "automatic_retry_disabled";
+
+/// `_meta.wildcard_fallback_skipped` value when a zero-hit query has a term
+/// longer than the automatic retry accepts.
+pub const WILDCARD_FALLBACK_SKIPPED_LONG_TERM: &str = "long_query_term";
+
+/// `_meta.wildcard_fallback_skipped` value when the automatic retry ran out of
+/// Quill query fuel; the plain query's hits are returned
+/// (coding_agent_session_search-7hvlg).
+pub const WILDCARD_FALLBACK_SKIPPED_QUERY_FUEL_EXHAUSTED: &str = "query_fuel_exhausted";
 
 #[derive(Debug, Clone, Copy)]
 pub struct SearchClientOptions {
@@ -3260,14 +3711,11 @@ fn cache_eviction_policy_from_env_value(value: Option<&str>) -> CacheEvictionPol
 #[derive(Clone)]
 struct CachedHit {
     hit: SearchHit,
-    lc_content: String,
-    lc_title: Option<String>,
-    bloom64: u64,
 }
 
 impl CachedHit {
     /// Approximate byte size of this cached hit (rough estimate for memory guardrails).
-    /// Includes `SearchHit` strings + lowercase copies + bloom filter.
+    /// Includes the `SearchHit` and its owned strings.
     fn approx_bytes(&self) -> usize {
         // Base struct overhead
         let base = std::mem::size_of::<Self>();
@@ -3290,10 +3738,7 @@ impl CachedHit {
                 .origin_host
                 .as_ref()
                 .map_or(0, std::string::String::len);
-        // Lowercase cache copies
-        let lc_strings =
-            self.lc_content.len() + self.lc_title.as_ref().map_or(0, std::string::String::len);
-        base + hit_strings + lc_strings
+        base + hit_strings
     }
 }
 
@@ -3554,6 +3999,51 @@ struct FederatedIndexReader {
 
 static FEDERATED_SEARCH_READERS: Lazy<RwLock<HashMap<String, Arc<Vec<FederatedIndexReader>>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// The single-directory lexical reader and the path it was opened from.
+///
+/// A lexical rebuild publishes a new index lineage by exchanging the whole
+/// directory, which in-place catch-up cannot follow. The slot lets a
+/// reloading client (the TUI) open the path again and swap the reader in
+/// instead of failing every later search.
+#[derive(Default)]
+struct LexicalReaderSlot {
+    index_path: Option<PathBuf>,
+    current: RwLock<
+        Option<(
+            frankensearch::quill::QuillSearchIndex,
+            crate::search::quill_bridge::QuillCassFields,
+        )>,
+    >,
+}
+
+impl LexicalReaderSlot {
+    fn new(
+        index_path: PathBuf,
+        reader: Option<(
+            frankensearch::quill::QuillSearchIndex,
+            crate::search::quill_bridge::QuillCassFields,
+        )>,
+    ) -> Self {
+        Self {
+            index_path: Some(index_path),
+            current: RwLock::new(reader),
+        }
+    }
+
+    fn get(
+        &self,
+    ) -> Option<(
+        frankensearch::quill::QuillSearchIndex,
+        crate::search::quill_bridge::QuillCassFields,
+    )> {
+        self.current.read().clone()
+    }
+
+    fn is_some(&self) -> bool {
+        self.current.read().is_some()
+    }
+}
 static SEARCH_CLIENT_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 static SEARCHER_RELOAD_TIMEOUT: Lazy<Duration> = Lazy::new(|| {
@@ -3573,22 +4063,37 @@ impl Drop for ReloadInFlightGuard {
     }
 }
 
+/// Refresh `readers` in place on a bounded worker. `Ok(true)` when a
+/// directory was republished as a new index lineage and must be opened again
+/// (see [`crate::search::quill_bridge::refresh_reader_or_detect_republish`]).
 fn reload_index_readers_bounded(
     readers: Vec<frankensearch::quill::QuillSearchIndex>,
     reload_in_flight: Arc<AtomicBool>,
-) -> Result<()> {
+) -> Result<bool> {
+    let republished = Arc::new(AtomicBool::new(false));
+    let worker_republished = Arc::clone(&republished);
     run_reload_bounded(
         move || {
-            readers
-                .iter()
-                .try_for_each(|reader| {
-                    crate::search::quill_bridge::refresh_reader(reader).map(|_| ())
-                })
-                .map_err(|error| error.to_string())
+            for reader in &readers {
+                match crate::search::quill_bridge::refresh_reader_or_detect_republish(reader) {
+                    Ok(None) => {}
+                    Ok(Some(reason)) => {
+                        tracing::info!(
+                            index = %reader.path().display(),
+                            reason,
+                            "lexical index was republished; reopening it"
+                        );
+                        worker_republished.store(true, Ordering::SeqCst);
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            Ok(())
         },
         reload_in_flight,
         *SEARCHER_RELOAD_TIMEOUT,
-    )
+    )?;
+    Ok(republished.load(Ordering::SeqCst))
 }
 
 fn run_reload_bounded<F>(
@@ -4014,6 +4519,23 @@ fn stored_preview_is_complete_content(stored_preview: &str) -> bool {
 }
 
 impl SearchClient {
+    /// Create a database-backed semantic client without opening a lexical index.
+    ///
+    /// The archive connection and semantic assets remain lazy. Callers must
+    /// attach a validated semantic context before querying; this constructor
+    /// performs no index repair, model loading, or background work.
+    pub fn open_semantic(db_path: &Path, options: SearchClientOptions) -> Result<Option<Self>> {
+        Self::from_opened_lexical_index(
+            crate::search::tantivy::OpenedLexicalIndex {
+                path: db_path.to_path_buf(),
+                reader: None,
+                federated_readers: None,
+            },
+            Some(db_path),
+            options,
+        )
+    }
+
     pub fn open(index_path: &Path, db_path: Option<&Path>) -> Result<Option<Self>> {
         Self::open_with_options(index_path, db_path, SearchClientOptions::default())
     }
@@ -4124,7 +4646,7 @@ impl SearchClient {
         }
 
         Ok(Some(Self {
-            reader: tantivy,
+            reader: LexicalReaderSlot::new(index_path, tantivy),
             sqlite: Mutex::new(None),
             sqlite_path,
             strict_read_only: options.strict_read_only,
@@ -4140,6 +4662,7 @@ impl SearchClient {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         }))
     }
 
@@ -4152,22 +4675,23 @@ impl SearchClient {
         if guard.is_none()
             && let Some(path) = &self.sqlite_path
         {
-            match open_search_hydration_sqlite(
+            let conn = open_search_hydration_sqlite(
                 path,
                 std::time::Duration::from_secs(1),
                 self.strict_read_only,
-            ) {
-                Ok(conn) => {
-                    *guard = Some(conn);
-                }
-                Err(err) => {
-                    tracing::debug!(
-                        error = %err,
-                        path = %path.display(),
-                        "readonly sqlite open failed for search client"
-                    );
-                }
-            }
+            )
+            .map_err(|error| {
+                // A configured archive that failed to open is not an absent
+                // optional backend. Keep the storage cause in the displayed
+                // message as well as the error chain: CLI callers generally
+                // render only the outermost error.
+                let context = format!(
+                    "opening configured search archive {} failed: {error}",
+                    path.display()
+                );
+                error.context(context)
+            })?;
+            *guard = Some(conn);
         }
 
         Ok(guard)
@@ -4189,57 +4713,61 @@ impl SearchClient {
         let query: &str = &query;
         let sanitized = nfc_sanitize_query(query);
         let field_mask = effective_field_mask(field_mask);
+        // Only lexical readers provide a publication generation with which to
+        // invalidate results. A SQLite-only client can observe new canonical
+        // rows between calls and must query its archive again.
+        let can_use_cache = self.has_tantivy()
+            && field_mask.allows_cache()
+            && (field_mask.needs_content() || field_mask.wants_snippet());
+
+        // Admit the current generation before using either its cached results
+        // or its document count to size this request.
+        self.refresh_lexical_generation()?;
+
+        // Resolve an unlimited request against the generation just admitted,
+        // not the older reader's count from before the reload. SQLite-only
+        // clients have no lexical document count, so retain the shared result
+        // cap instead of mistaking an unavailable count for a one-hit archive.
         let limit = if limit == 0 {
-            self.total_docs().min(no_limit_result_cap()).max(1)
+            let cap = no_limit_result_cap();
+            if self.has_tantivy() {
+                self.total_docs().min(cap).max(1)
+            } else {
+                cap
+            }
         } else {
             limit
         };
-        let can_use_cache =
-            field_mask.allows_cache() && (field_mask.needs_content() || field_mask.wants_snippet());
 
-        // Invalidate prefix cache if the index has been updated since last search.
-        // This must happen BEFORE the cache check below to avoid serving stale results.
-        if let Some((reader, _)) = &self.reader {
-            self.maybe_reload_reader(reader)?;
-            self.track_generation(reader.keeper_generation());
-        } else if let Some(readers) = self.federated_readers()
-            && let Some(signature) = self.maybe_reload_federated_readers(readers.as_ref())?
-        {
-            self.track_generation(signature);
-        }
-
-        // Fast path: reuse cached prefix when user is typing forward (offset 0 only).
-        // Only use cache for simple queries (no wildcards, no boolean operators) because
-        // the cache matching logic enforces strict prefix AND semantics which is incorrect
-        // for suffixes, substrings, OR, NOT, or phrases.
+        // A prior query's top-k is not the top-k of an extended query, even
+        // when every cached hit still matches: scores and omitted competitors
+        // can change. Reuse only the exact NFC query and field projection.
+        // Prefixes remain useful solely as hints for posting-list prewarming.
+        let cache_epoch = self.reload_epoch.load(Ordering::SeqCst);
         if can_use_cache
             && offset == 0
             && !query.contains('*')
             && !fs_cass_has_boolean_operators(query)
         {
-            self.maybe_schedule_adaptive_query_prewarm(&sanitized, &filters);
-            if let Some(cached) = self.cached_prefix_hits(&sanitized, &filters) {
-                // Opt 2.4: Pre-compute lowercase query terms once, reuse for all hits
-                let query_terms = QueryTermsLower::from_query(&sanitized);
-                let mut filtered: Vec<SearchHit> = cached
-                    .into_iter()
-                    .filter(|h| hit_matches_query_cached_precomputed(h, &query_terms))
-                    .map(|c| c.hit.clone())
-                    .collect();
-                if filtered.len() >= limit {
-                    filtered.truncate(limit);
+            self.maybe_schedule_adaptive_query_prewarm(query, &filters, field_mask);
+            if let Some(cached) = self.cached_query_hits(query, &filters, field_mask) {
+                if cached.len() >= limit {
                     self.metrics.inc_cache_hits();
                     self.maybe_log_cache_metrics("hit");
                     if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
                         *tc = None;
                     }
-                    return Ok(filtered);
+                    return Ok(cached
+                        .into_iter()
+                        .take(limit)
+                        .map(|cached| cached.hit)
+                        .collect());
                 }
                 // Cache had entries but not enough to satisfy limit - shortfall, not miss
                 self.metrics.inc_cache_shortfall();
                 self.maybe_log_cache_metrics("shortfall");
             } else {
-                // No cached prefix at all - this is the actual miss
+                // No result for this exact query and projection.
                 self.metrics.inc_cache_miss();
                 self.maybe_log_cache_metrics("miss");
             }
@@ -4270,7 +4798,7 @@ impl SearchClient {
         };
 
         // Tantivy is the primary high-performance engine.
-        if let Some((reader, fields)) = &self.reader {
+        if let Some((reader, fields)) = self.reader.get() {
             tracing::info!(
                 backend = "tantivy",
                 query = sanitized,
@@ -4279,8 +4807,8 @@ impl SearchClient {
                 "search_start"
             );
             let (hits, tantivy_total_count) = self.search_tantivy(
-                reader,
-                fields,
+                &reader,
+                &fields,
                 query,
                 &sanitized,
                 filters.clone(),
@@ -4314,8 +4842,8 @@ impl SearchClient {
                         "retrying lexical fetch due to dedup or session-path shortfall"
                     );
                     let (retry_hits, retry_total_count) = self.search_tantivy(
-                        reader,
-                        fields,
+                        &reader,
+                        &fields,
                         query,
                         &sanitized,
                         filters.clone(),
@@ -4340,7 +4868,7 @@ impl SearchClient {
                 );
 
                 if can_use_cache && offset == 0 {
-                    self.put_cache(&sanitized, &filters, &paged_hits);
+                    self.put_cache(query, &filters, field_mask, cache_epoch, &paged_hits);
                 }
                 return Ok(paged_hits);
             }
@@ -4423,7 +4951,7 @@ impl SearchClient {
                 );
 
                 if can_use_cache && offset == 0 {
-                    self.put_cache(&sanitized, &filters, &paged_hits);
+                    self.put_cache(query, &filters, field_mask, cache_epoch, &paged_hits);
                 }
                 return Ok(paged_hits);
             }
@@ -4472,7 +5000,7 @@ impl SearchClient {
                 self.postprocess_hits_page(hits, &sanitized, &filters, limit, offset);
 
             if can_use_cache && offset == 0 {
-                self.put_cache(&sanitized, &filters, &paged_hits);
+                self.put_cache(query, &filters, field_mask, cache_epoch, &paged_hits);
             }
             return Ok(paged_hits);
         }
@@ -4532,15 +5060,7 @@ impl SearchClient {
         let embedder_id = artifacts[0].index().embedder_id().to_string();
         let dimension = artifacts[0].index().dimension();
         let shard_count = artifacts.len();
-        let fs_ann_unavailable = if shard_count != 1 {
-            Some(SemanticAnnUnavailableReason::MultipleExactShards)
-        } else if let Some(reason) = artifacts[0].ann_unavailable_reason() {
-            Some(reason)
-        } else if artifacts[0].ann_path().is_none() {
-            Some(SemanticAnnUnavailableReason::SidecarMissing)
-        } else {
-            None
-        };
+        let fs_ann_unavailable = ann_shards::SemanticAnnShardSet::unavailable_reason(&artifacts);
         let artifacts = Arc::new(artifacts);
 
         let capacity = NonZeroUsize::new(100).ok_or_else(|| anyhow!("invalid cache size"))?;
@@ -4795,9 +5315,9 @@ impl SearchClient {
         }
     }
 
-    fn ann_index(&self) -> Result<Option<Arc<FsHnswIndex>>> {
+    fn ann_index(&self) -> Result<Option<Arc<ann_shards::SemanticAnnShardSet>>> {
         loop {
-            let (ann_path, fs_semantic_index, context_token) = {
+            let (artifacts, context_token) = {
                 let mut guard = self
                     .semantic
                     .lock()
@@ -4818,24 +5338,13 @@ impl SearchClient {
                     }
                     return Ok(None);
                 }
-                if state.artifacts.len() != 1 {
-                    state.fs_ann_unavailable =
-                        Some(SemanticAnnUnavailableReason::MultipleExactShards);
-                    continue;
-                }
-                let artifact = &state.artifacts[0];
-                let Some(ann_path) = artifact.ann_path().map(Path::to_path_buf) else {
-                    state.fs_ann_unavailable = Some(SemanticAnnUnavailableReason::SidecarMissing);
-                    continue;
-                };
                 (
-                    ann_path,
-                    artifact.index_owner(),
+                    Arc::clone(&state.artifacts),
                     Arc::clone(&state.context_token),
                 )
             };
 
-            let opened = open_fs_semantic_ann_index(fs_semantic_index.as_ref(), &ann_path);
+            let opened = ann_shards::SemanticAnnShardSet::open(artifacts);
 
             let mut guard = self
                 .semantic
@@ -4958,7 +5467,117 @@ impl SearchClient {
             });
     }
 
+    /// Preserve the inexpensive first window when its score bound proves the
+    /// requested message ranking. Chunk-dominated windows need a bounded exact
+    /// refill, not one larger window that can still contain the same message.
     fn search_exact_semantic_indexes(
+        context: &SemanticCandidateContext,
+        embedding: &[f32],
+        fetch_limit: usize,
+        fs_filter: Option<&dyn FsSearchFilter>,
+    ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
+        let (initial, retry) = Self::search_exact_semantic_indexes_initial_window(
+            context,
+            embedding,
+            fetch_limit,
+            fs_filter,
+        )?;
+        if !retry.exact_window_may_omit_competitor {
+            return Ok((initial, retry));
+        }
+        let record_count = context.artifacts.iter().fold(0usize, |total, artifact| {
+            total
+                .saturating_add(artifact.index().record_count())
+                .saturating_add(artifact.index().wal_record_count())
+        });
+        let return_limit = Self::semantic_exact_candidate_limit(fetch_limit, record_count);
+        let mut refills_left = message_topk::MAX_EXACT_MESSAGE_REFILLS;
+        let mut rounds = 0usize;
+        let mut best_by_message = HashMap::<u64, VectorSearchResult>::new();
+        for artifact in context.artifacts.iter() {
+            let index = artifact.index();
+            let physical_count = index
+                .record_count()
+                .saturating_add(index.wal_record_count());
+            let target = return_limit.min(physical_count);
+            // Retain the existing message-overfetch allowance for hydration.
+            // Bound each raw window independently of the total archive size;
+            // the extra lookahead proves strict score cutoffs without a refill.
+            let window = target
+                .saturating_mul(4)
+                .saturating_add(1)
+                .min(physical_count);
+            let selection = message_topk::collect_exact_messages(
+                target,
+                window,
+                refills_left + 1,
+                |excluded, ceiling, window| {
+                    let filter = ExactMessageRefillFilter {
+                        base: fs_filter,
+                        excluded,
+                        ceiling,
+                    };
+                    let hits = index
+                        .search_top_k(embedding, window.min(physical_count), Some(&filter))
+                        .map_err(|error| anyhow!("exact semantic refill failed: {error}"))?;
+                    hits.into_iter()
+                        .map(|hit| {
+                            let parsed = parse_semantic_doc_id(&hit.doc_id).ok_or_else(|| {
+                                anyhow!(
+                                    "exact semantic refill returned an invalid message identity"
+                                )
+                            })?;
+                            Ok(VectorSearchResult {
+                                message_id: parsed.message_id,
+                                chunk_idx: parsed.chunk_idx,
+                                score: hit.score,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()
+                },
+            )
+            .map_err(|error| match error {
+                message_topk::RefillError::Backend(error) => error,
+                other => anyhow!("{other}"),
+            })?;
+            rounds = rounds.saturating_add(selection.rounds);
+            refills_left -= selection.rounds.saturating_sub(1);
+            for hit in selection.hits {
+                best_by_message
+                    .entry(hit.message_id)
+                    .and_modify(|best| {
+                        if hit.score.total_cmp(&best.score).is_gt() {
+                            best.score = hit.score;
+                            best.chunk_idx = hit.chunk_idx;
+                        }
+                    })
+                    .or_insert(hit);
+            }
+            // Per-shard top-k messages suffice for global top-k. Prune after
+            // each merge instead of retaining k messages times all shard count.
+            best_by_message = Self::collapse_semantic_results(best_by_message, return_limit)
+                .into_iter()
+                .map(|hit| (hit.message_id, hit))
+                .collect();
+        }
+        let hits = Self::collapse_semantic_results(best_by_message, return_limit);
+        let has_more_candidates = hits.len() >= return_limit && return_limit < record_count;
+        tracing::debug!(
+            shard_count = context.artifacts.len(),
+            rounds,
+            returned = hits.len(),
+            "exact semantic message refinement complete"
+        );
+        Ok((
+            hits,
+            SemanticCandidateRetryState {
+                has_more_candidates,
+                exact_window_may_omit_competitor: false,
+            },
+        ))
+    }
+
+    fn search_exact_semantic_indexes_initial_window(
         context: &SemanticCandidateContext,
         embedding: &[f32],
         fetch_limit: usize,
@@ -4966,7 +5585,12 @@ impl SearchClient {
     ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
         if context.artifacts.len() == 1 {
             let index = context.artifacts[0].index();
-            let record_count = index.record_count();
+            // The retained query view includes WAL additions and replacements.
+            // Main rows plus retained WAL rows bound physical candidates, not
+            // distinct live messages; only the backend resolves replacements.
+            let record_count = index
+                .record_count()
+                .saturating_add(index.wal_record_count());
             let candidate_limit = Self::semantic_exact_candidate_limit(fetch_limit, record_count);
             let fs_hits = index
                 .search_top_k(embedding, candidate_limit, fs_filter)
@@ -4976,8 +5600,11 @@ impl SearchClient {
                 Self::record_fs_semantic_hit(&mut best_by_message, hit);
             }
             let collapsed = Self::collapse_semantic_results(best_by_message, candidate_limit);
-            let has_more_candidates =
-                fs_hits.len() >= candidate_limit && candidate_limit < record_count;
+            // FSVI deduplicates document IDs after raw top-k. A short nonempty
+            // batch can therefore hide later messages even before our first
+            // refill. Only an empty batch or a full-record window proves that
+            // no candidates remain; retain the score bound in every other case.
+            let has_more_candidates = !fs_hits.is_empty() && candidate_limit < record_count;
             let max_omitted_score = if has_more_candidates {
                 fs_hits.last().map(|hit| hit.score)
             } else {
@@ -5003,7 +5630,10 @@ impl SearchClient {
         let mut has_more_candidates = false;
         for artifact in context.artifacts.iter() {
             let index = artifact.index();
-            let shard_record_count = index.record_count();
+            // A main-empty shard can still have searchable durable WAL rows.
+            let shard_record_count = index
+                .record_count()
+                .saturating_add(index.wal_record_count());
             // Search chunks, then collapse by message. A message can have many
             // high-scoring chunks, so per-shard top-k chunks alone is not a
             // proof of per-message top-k. Use a bounded overfetch window and
@@ -5016,8 +5646,7 @@ impl SearchClient {
             let fs_hits = index
                 .search_top_k(embedding, shard_limit, fs_filter)
                 .map_err(|err| anyhow!("frankensearch sharded semantic search failed: {err}"))?;
-            if fs_hits.len() >= shard_limit
-                && shard_limit < shard_record_count
+            if shard_limit < shard_record_count
                 && let Some(last_hit) = fs_hits.last()
             {
                 has_more_candidates = true;
@@ -5032,6 +5661,17 @@ impl SearchClient {
             for hit in &fs_hits {
                 Self::record_fs_semantic_hit(&mut best_by_message, hit);
             }
+            // Max-score collapse distributes over bounded top-k merge. Keep
+            // only the eventual return window after each shard, rather than
+            // retaining a full candidate page for every opened shard.
+            let keep = Self::semantic_exact_candidate_limit(fetch_limit, raw_hits);
+            // Exhausting each physical shard does not exhaust the merged
+            // candidate page when bounded global retention discards messages.
+            has_more_candidates |= best_by_message.len() > keep;
+            best_by_message = Self::collapse_semantic_results(best_by_message, keep)
+                .into_iter()
+                .map(|hit| (hit.message_id, hit))
+                .collect();
         }
         let candidate_return_limit = Self::semantic_exact_candidate_limit(fetch_limit, raw_hits);
         let collapsed = Self::collapse_semantic_results(best_by_message, candidate_return_limit);
@@ -5069,6 +5709,47 @@ impl SearchClient {
             semantic_filter = semantic_filter.with_roles(Some(roles));
         }
 
+        if !filters.session_paths.is_empty() {
+            let message_ids = {
+                let sqlite_guard = self.sqlite_guard()?;
+                let conn = sqlite_guard.as_ref().ok_or_else(|| {
+                    anyhow!("session-scoped semantic search requires database connection")
+                })?;
+                load_semantic_session_message_ids(
+                    conn,
+                    &filters.session_paths,
+                    SEMANTIC_SESSION_SCOPE_MAX_MESSAGES,
+                )?
+            };
+            // No selected archive messages means no matching vector records.
+            // In particular, never interpret an empty allowlist as unrestricted.
+            if message_ids.is_empty() {
+                return Ok((
+                    Vec::new(),
+                    SemanticCandidateRetryState {
+                        has_more_candidates: false,
+                        exact_window_may_omit_competitor: false,
+                    },
+                    None,
+                ));
+            }
+            let scoped_filter = SessionScopedSemanticFilter {
+                metadata: &semantic_filter,
+                message_ids: &message_ids,
+            };
+            // The native ANN lane selects a global window before filtering.
+            // It cannot guarantee recall for a narrow session selection; use
+            // the retained exact owners with the filter inside top-k instead.
+            // None here means no ANN statistics: this was an exact search.
+            let (results, retry_state) = Self::search_exact_semantic_indexes(
+                context,
+                embedding,
+                request.fetch_limit,
+                Some(&scoped_filter),
+            )?;
+            return Ok((results, retry_state, None));
+        }
+
         if request.tier_mode.wants_two_tier() && !request.approximate {
             tracing::debug!(
                 tier_mode = ?request.tier_mode,
@@ -5093,65 +5774,15 @@ impl SearchClient {
                     "approximate search requested; bypassing two-tier mode"
                 );
             }
-
             let ann = request
                 .ann_index
-                .ok_or_else(|| anyhow!("HNSW index failed to initialize"))?;
-            let candidate = request
-                .fetch_limit
-                .saturating_mul(ANN_CANDIDATE_MULTIPLIER)
-                .max(request.fetch_limit);
-            let ef = FS_HNSW_DEFAULT_EF_SEARCH.max(candidate);
-            let (ann_results, search_stats) =
-                ann.knn_search_with_stats(embedding, candidate, ef)
-                    .map_err(|err| anyhow!("frankensearch approximate search failed: {err}"))?;
-            let ann_stats = Some(crate::search::ann_index::AnnSearchStats {
-                index_size: search_stats.index_size,
-                dimension: search_stats.dimension,
-                ef_search: search_stats.ef_search,
-                k_requested: search_stats.k_requested,
-                k_returned: search_stats.k_returned,
-                search_time_us: search_stats.search_time_us,
-                estimated_recall: search_stats.estimated_recall as f32,
-                is_approximate: search_stats.is_approximate,
-            });
-
-            let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
-
-            let mut best_by_message: HashMap<u64, VectorSearchResult> =
-                HashMap::with_capacity(ann_results.len());
-            for hit in ann_results.iter() {
-                if let Some(filter) = fs_filter
-                    && !filter.matches(&hit.doc_id, None)
-                {
-                    continue;
-                }
-                let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
-                    continue;
-                };
-                best_by_message
-                    .entry(parsed.message_id)
-                    .and_modify(|entry| {
-                        if hit.score > entry.score {
-                            entry.score = hit.score;
-                            entry.chunk_idx = parsed.chunk_idx;
-                        }
-                    })
-                    .or_insert(VectorSearchResult {
-                        message_id: parsed.message_id,
-                        chunk_idx: parsed.chunk_idx,
-                        score: hit.score,
-                    });
-            }
-
-            return Ok((
-                Self::collapse_semantic_results(best_by_message, request.fetch_limit),
-                SemanticCandidateRetryState {
-                    has_more_candidates: ann_results.len() >= candidate,
-                    exact_window_may_omit_competitor: false,
-                },
-                ann_stats,
-            ));
+                .ok_or_else(|| anyhow!("HNSW cohort failed to initialize"))?;
+            return ann.search_with_exact_fallback(
+                context,
+                embedding,
+                request.fetch_limit,
+                semantic_filter_as_search_filter(&semantic_filter),
+            );
         }
 
         let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
@@ -6316,12 +6947,21 @@ impl SearchClient {
                 if !Arc::ptr_eq(&embedding.context_token, &context_token) {
                     continue;
                 }
-                let in_memory_two_tier_index = if tier_mode.wants_two_tier() && !approximate {
+                let in_memory_two_tier_index = if tier_mode.wants_two_tier()
+                    && !approximate
+                    && filters.session_paths.is_empty()
+                {
                     self.in_memory_two_tier_index(tier_mode)?
                 } else {
                     None
                 };
-                let ann_index = if approximate { self.ann_index()? } else { None };
+                // Session-scoped selection uses exact filtered vectors. Do not
+                // load the global ANN graph for a query that cannot use it.
+                let ann_index = if approximate && filters.session_paths.is_empty() {
+                    self.ann_index()?
+                } else {
+                    None
+                };
                 let effective_approximate = approximate && ann_index.is_some();
                 let effective_tier_mode = if approximate {
                     SemanticTierMode::Single
@@ -6351,14 +6991,18 @@ impl SearchClient {
             };
 
             // A semantic-only client deliberately has no lexical reader. Use
-            // this admitted vector generation for an unlimited request's cap,
-            // rather than silently truncating it to one lexical document.
+            // the complete retained vector view for an unlimited request's
+            // cap: durable WAL additions are searchable before consolidation,
+            // including when a shard has no main records. Main rows plus WAL
+            // rows safely bound live messages even when updates replace rows.
             let limit = if limit == 0 {
                 candidate_context
                     .artifacts
                     .iter()
                     .fold(0usize, |count, artifact| {
-                        count.saturating_add(artifact.index().record_count())
+                        count
+                            .saturating_add(artifact.index().record_count())
+                            .saturating_add(artifact.index().wal_record_count())
                     })
                     .min(no_limit_result_cap())
                     .max(1)
@@ -6743,6 +7387,7 @@ impl SearchClient {
         sparse_threshold: usize,
         field_mask: FieldMask,
     ) -> Result<SearchResult> {
+        self.record_wildcard_fallback_skip(None);
         // First, try the normal search
         let hits = self.search(query, filters.clone(), limit, offset, field_mask)?;
         let baseline_stats = self.cache_stats();
@@ -6771,7 +7416,12 @@ impl SearchClient {
         {
             // Either we have enough results, query already has wildcards,
             // query uses boolean/phrases, or query is empty.
-            if is_sparse && !automatic_wildcard_allowed {
+            if is_sparse
+                && !automatic_wildcard_allowed
+                && !query_has_wildcards
+                && !has_boolean_or_phrase
+                && !query.trim().is_empty()
+            {
                 tracing::debug!(
                     query,
                     returned_hits = hits.len(),
@@ -6779,6 +7429,13 @@ impl SearchClient {
                     automatic_wildcard_max_docs = automatic_wildcard_fallback_max_docs(),
                     "skipping automatic wildcard fallback on large index"
                 );
+                self.record_wildcard_fallback_skip(Some(
+                    if automatic_wildcard_fallback_max_docs() == 0 {
+                        WILDCARD_FALLBACK_SKIPPED_DISABLED
+                    } else {
+                        WILDCARD_FALLBACK_SKIPPED_LARGE_INDEX
+                    },
+                ));
             }
             // Generate suggestions only if truly zero hits
             let suggestions = if hits.is_empty() && !query.trim().is_empty() {
@@ -6798,6 +7455,7 @@ impl SearchClient {
         }
 
         if should_skip_automatic_wildcard_fallback_for_long_zero_hit_query(query, hits.len()) {
+            self.record_wildcard_fallback_skip(Some(WILDCARD_FALLBACK_SKIPPED_LONG_TERM));
             let suggestions = if hits.is_empty() {
                 self.generate_suggestions(query, &filters)
             } else {
@@ -6829,7 +7487,41 @@ impl SearchClient {
         );
 
         let mut fallback_hits =
-            self.search(&wildcard_query, filters.clone(), limit, offset, field_mask)?;
+            match self.search(&wildcard_query, filters.clone(), limit, offset, field_mask) {
+                Ok(fallback_hits) => fallback_hits,
+                // The retry only refines a search that already succeeded. A
+                // `*term*` dictionary walk can exhaust the query fuel the plain
+                // query fit in (GH #518); that refusal must not discard the
+                // plain query's hits (coding_agent_session_search-7hvlg).
+                // Other failures still fail the search.
+                Err(error) if crate::search::quill_bridge::is_query_fuel_exhausted(&error) => {
+                    tracing::warn!(
+                        original_query = query,
+                        wildcard_query,
+                        original_count = hits.len(),
+                        error = %format_args!("{error:#}"),
+                        "wildcard_fallback ran out of query fuel; returning the original results"
+                    );
+                    self.record_wildcard_fallback_skip(Some(
+                        WILDCARD_FALLBACK_SKIPPED_QUERY_FUEL_EXHAUSTED,
+                    ));
+                    let suggestions = if hits.is_empty() {
+                        self.generate_suggestions(query, &filters)
+                    } else {
+                        Vec::new()
+                    };
+                    return Ok(SearchResult {
+                        hits,
+                        wildcard_fallback: false,
+                        cache_stats: baseline_stats,
+                        suggestions,
+                        ann_stats: None,
+                        ann_unavailable_reason: None,
+                        total_count: tantivy_total,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
         let fallback_stats = self.cache_stats();
         // Re-capture total_count after wildcard search (may have changed)
         let fallback_tantivy_total = self
@@ -6920,8 +7612,27 @@ impl SearchClient {
         approximate: bool,
         semantic_tier_mode: SemanticTierMode,
     ) -> Result<SearchResult> {
+        if semantic_query.trim().is_empty() {
+            return self.search_with_fallback(
+                lexical_query,
+                filters,
+                limit,
+                offset,
+                sparse_threshold,
+                field_mask,
+            );
+        }
+
+        self.refresh_lexical_generation()?;
         let requested_limit = limit;
-        let total_docs = self.total_docs().max(1);
+        // A missing lexical reader says nothing about the size of the
+        // canonical or semantic archive. Keep both candidate legs bounded by
+        // the shared cap instead of silently restricting each to one hit.
+        let total_docs = if self.has_tantivy() {
+            self.total_docs().max(1)
+        } else {
+            no_limit_result_cap()
+        };
         let limit = if requested_limit == 0 {
             total_docs.min(no_limit_result_cap()).max(1)
         } else {
@@ -6938,17 +7649,6 @@ impl SearchClient {
                 ann_unavailable_reason: None,
                 total_count: None,
             });
-        }
-
-        if semantic_query.trim().is_empty() {
-            return self.search_with_fallback(
-                lexical_query,
-                filters,
-                limit,
-                offset,
-                sparse_threshold,
-                field_mask,
-            );
         }
 
         let budget =
@@ -6987,6 +7687,7 @@ impl SearchClient {
             }
             Err(err) => return Err(err),
         };
+        let session_scoped = !filters.session_paths.is_empty();
         let (semantic_hits, semantic_ann_stats) = self.search_semantic_with_tier(
             semantic_query,
             filters,
@@ -6996,7 +7697,9 @@ impl SearchClient {
             approximate,
             semantic_tier_mode,
         )?;
-        let semantic_ann_unavailable_reason = if approximate {
+        let semantic_ann_unavailable_reason = if approximate && session_scoped {
+            Some(SemanticAnnUnavailableReason::SessionScopeRequiresExact)
+        } else if approximate {
             self.ann_unavailability_reason()?
         } else {
             None
@@ -7123,20 +7826,30 @@ impl SearchClient {
 
         let reload_started = Instant::now();
         let cached_generation = self.federated_generation_signature(readers);
-        if let Err(error) = reload_index_readers_bounded(
+        let republished = match reload_index_readers_bounded(
             readers.iter().map(|shard| shard.reader.clone()).collect(),
             Arc::clone(&self.metrics.reload_in_flight),
         ) {
-            self.metrics
-                .record_cache_lookup(crate::daemon_runtime_state::CacheLookup {
-                    cache_hit: true,
-                    cached_generation: Some(self.federated_generation_signature(readers)),
-                    current_generation: self.federated_generation_signature(readers),
-                    reload_attempted: true,
-                    reload_succeeded: false,
-                    served_fallback: false,
-                });
-            return Err(error);
+            Ok(republished) => republished,
+            Err(error) => {
+                self.metrics
+                    .record_cache_lookup(crate::daemon_runtime_state::CacheLookup {
+                        cache_hit: true,
+                        cached_generation: Some(self.federated_generation_signature(readers)),
+                        current_generation: self.federated_generation_signature(readers),
+                        reload_attempted: true,
+                        reload_succeeded: false,
+                        served_fallback: false,
+                    });
+                return Err(error);
+            }
+        };
+        if republished {
+            self.reopen_republished_lexical_index()?;
+            *guard = Some(Instant::now());
+            return Ok(self
+                .federated_readers()
+                .map(|reopened| self.federated_generation_signature(&reopened)));
         }
         let elapsed = reload_started.elapsed();
         // Rate-limit from completion, not start. A slow successful reload must
@@ -7195,6 +7908,9 @@ impl SearchClient {
                     served_fallback: false,
                 });
             if let Ok(mut cache) = self.prefix_cache.lock() {
+                // A search already using the prior generation must not refill
+                // this cache after its invalidation.
+                self.reload_epoch.fetch_add(1, Ordering::SeqCst);
                 cache.clear();
             }
         }
@@ -7997,131 +8713,28 @@ impl SearchClient {
                 .collect()
         }
 
-        fn flush_pending_or_group(
-            pending_or_group: &mut SqliteMessageScanGroup,
-            groups: &mut Vec<SqliteMessageScanGroup>,
-        ) {
-            if !pending_or_group.is_empty() {
-                groups.push(std::mem::take(pending_or_group));
-            }
-        }
-
-        fn apply_operand(
-            operand: SqliteMessageScanOperand,
-            next_negated: &mut bool,
-            in_or_sequence: &mut bool,
-            just_saw_or: &mut bool,
-            pending_or_group: &mut SqliteMessageScanGroup,
-            groups: &mut Vec<SqliteMessageScanGroup>,
-        ) {
-            let alternative = SqliteMessageScanAlternative {
-                operand,
-                negated: *next_negated,
-            };
-
-            if *in_or_sequence && *just_saw_or {
-                if pending_or_group.is_empty()
-                    && let Some(previous_group) = groups.pop()
-                {
-                    // The primary frankensearch builder lifts its preceding
-                    // Must/MustNot clause into the tighter-binding OR group.
-                    // Flattening an already-grouped clause is equivalent and
-                    // also handles permissive malformed forms such as
-                    // `A AND OR B` without changing their established meaning.
-                    pending_or_group.extend(previous_group);
-                }
-                pending_or_group.push(alternative);
-            } else {
-                flush_pending_or_group(pending_or_group, groups);
-                *in_or_sequence = false;
-                groups.push(vec![alternative]);
-            }
-
-            *just_saw_or = false;
-            *next_negated = false;
-        }
-
-        let tokens = fs_cass_parse_boolean_query(raw_query);
-        if tokens.is_empty() {
-            return None;
-        }
-
-        let mut groups = Vec::new();
-        let mut pending_or_group: SqliteMessageScanGroup = Vec::new();
-        let mut next_negated = false;
-        let mut in_or_sequence = false;
-        let mut just_saw_or = false;
-        for token in tokens {
-            match token {
-                FsCassQueryToken::And => {
-                    flush_pending_or_group(&mut pending_or_group, &mut groups);
-                    in_or_sequence = false;
-                    just_saw_or = false;
-                    next_negated = false;
-                }
-                FsCassQueryToken::Or => {
-                    in_or_sequence = true;
-                    just_saw_or = true;
-                }
-                FsCassQueryToken::Not => {
-                    if !just_saw_or {
-                        flush_pending_or_group(&mut pending_or_group, &mut groups);
-                        in_or_sequence = false;
-                        just_saw_or = false;
-                    }
-                    // Repeated NOT tokens remain one negation in the pinned
-                    // compatibility grammar; they do not toggle polarity.
-                    next_negated = true;
-                }
+        let tokens = cass_bool_tokens(raw_query);
+        let expr = CassBoolParser::parse(&tokens, |token: &FsCassQueryToken| {
+            Ok(match token {
                 FsCassQueryToken::Term(term) => {
-                    let parts = scan_parts(normalize_wildcard_term_parts(&term));
-                    if parts.is_empty() {
-                        continue;
-                    }
-                    apply_operand(
-                        SqliteMessageScanOperand::Terms(parts),
-                        &mut next_negated,
-                        &mut in_or_sequence,
-                        &mut just_saw_or,
-                        &mut pending_or_group,
-                        &mut groups,
-                    );
-                }
-                FsCassQueryToken::Phrase(phrase) => {
-                    let parts = normalize_phrase_terms(&phrase);
-                    if parts.is_empty() {
-                        continue;
-                    }
-                    apply_operand(
-                        SqliteMessageScanOperand::Phrase(parts),
-                        &mut next_negated,
-                        &mut in_or_sequence,
-                        &mut just_saw_or,
-                        &mut pending_or_group,
-                        &mut groups,
-                    );
-                }
-            }
-        }
-
-        flush_pending_or_group(&mut pending_or_group, &mut groups);
-
-        for group in &mut groups {
-            for alternative in group.iter_mut() {
-                if let SqliteMessageScanOperand::Terms(parts) = &mut alternative.operand {
+                    let mut parts = scan_parts(normalize_wildcard_term_parts(term));
                     parts.sort();
                     parts.dedup();
+                    (!parts.is_empty()).then_some(SqliteMessageScanOperand::Terms(parts))
                 }
-            }
-            group.sort();
-            group.dedup();
-        }
-        groups.retain(|group| !group.is_empty());
-        if groups.is_empty() {
-            return None;
-        }
-
-        Some(SqliteMessageScanQuery { groups })
+                FsCassQueryToken::Phrase(phrase) => {
+                    let parts = normalize_phrase_terms(phrase);
+                    (!parts.is_empty()).then_some(SqliteMessageScanOperand::Phrase(parts))
+                }
+                FsCassQueryToken::And
+                | FsCassQueryToken::Or
+                | FsCassQueryToken::Not
+                | FsCassQueryToken::LParen
+                | FsCassQueryToken::RParen => None,
+            })
+        })
+        .ok()??;
+        Some(SqliteMessageScanQuery { expr })
     }
 
     fn sqlite_message_scan_score(haystacks: &[String], scan_query: &SqliteMessageScanQuery) -> f32 {
@@ -8160,29 +8773,31 @@ impl SearchClient {
             }
         };
 
-        let mut score = 0.0f32;
-        for group in &scan_query.groups {
-            let mut group_matched = false;
-            let mut group_score = 0.0f32;
-            for alternative in group {
-                let alternative_score = operand_score(&alternative.operand);
-                let alternative_matched = if alternative.negated {
-                    alternative_score <= 0.0
-                } else {
-                    alternative_score > 0.0
-                };
-                if alternative_matched {
-                    group_matched = true;
-                    if !alternative.negated {
-                        group_score = group_score.max(alternative_score);
-                    }
+        /// `None` when the row does not match; otherwise the positive score
+        /// it earned (an excluded operand matches with zero).
+        fn evaluate(
+            expr: &CassBoolExpr<SqliteMessageScanOperand>,
+            operand_score: &dyn Fn(&SqliteMessageScanOperand) -> f32,
+        ) -> Option<f32> {
+            match expr {
+                CassBoolExpr::Operand(operand) => {
+                    let score = operand_score(operand);
+                    (score > 0.0).then_some(score)
                 }
+                CassBoolExpr::Not(inner) => evaluate(inner, operand_score).is_none().then_some(0.0),
+                CassBoolExpr::And(operands) => operands
+                    .iter()
+                    .map(|operand| evaluate(operand, operand_score))
+                    .sum(),
+                CassBoolExpr::Or(operands) => operands
+                    .iter()
+                    .filter_map(|operand| evaluate(operand, operand_score))
+                    .reduce(f32::max),
             }
-            if !group_matched {
-                return 0.0;
-            }
-            score += group_score;
         }
+        let Some(score) = evaluate(&scan_query.expr, &operand_score) else {
+            return 0.0;
+        };
 
         // A negative-only query has no positive relevance contribution, but
         // its complement matches still need a non-zero sentinel so the caller
@@ -9214,210 +9829,97 @@ pub fn fuzz_transpile_to_fts5(raw_query: &str) -> Option<String> {
     transpile_to_fts5(raw_query)
 }
 
-/// Transpile a raw query string into an FTS5-compatible query string.
-/// Preserves custom precedence (OR > AND) by adding parentheses.
-/// Returns None if the query contains features unsupported by FTS5 (e.g. leading wildcards).
+/// Transpile a raw query into an FTS5 query with the lexical parser's meaning
+/// (see [`CassBoolExpr`]). Every compound operand is parenthesized, so the
+/// result does not lean on the FTS5 engine's own precedence. Returns None
+/// when FTS5 cannot express the query (a leading or inner wildcard, or a
+/// complement: an OR operand or a conjunction made only of NOTs, since FTS5
+/// NOT is binary), so the caller falls back to a source scan instead of
+/// answering a different question.
 fn transpile_to_fts5(raw_query: &str) -> Option<String> {
-    let tokens = fs_cass_parse_boolean_query(raw_query);
-    if tokens.is_empty() {
-        return Some("".to_string());
+    let tokens = cass_bool_tokens(raw_query);
+    let expr = CassBoolParser::parse(&tokens, |token: &FsCassQueryToken| match token {
+        FsCassQueryToken::Term(t) => {
+            if matches!(
+                FsCassWildcardPattern::parse(t),
+                FsCassWildcardPattern::Suffix(_)
+                    | FsCassWildcardPattern::Substring(_)
+                    | FsCassWildcardPattern::Complex(_)
+            ) {
+                return Err(CassBoolUnsupported);
+            }
+            // Split punctuation into porter-aligned fragments first so
+            // fallback queries match SQLite tokenization: a punctuated term
+            // like `foo-bar` becomes `(foo AND bar)`.
+            let term_parts = normalize_term_parts(t);
+            if term_parts.is_empty() {
+                return Ok(None);
+            }
+            let rendered_parts = term_parts
+                .iter()
+                .map(|part| render_fts5_term_part(part).ok_or(CassBoolUnsupported))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some(if rendered_parts.len() > 1 {
+                format!("({})", rendered_parts.join(" AND "))
+            } else {
+                rendered_parts[0].clone()
+            }))
+        }
+        FsCassQueryToken::Phrase(p) => {
+            let phrase_parts = normalize_phrase_terms(p);
+            Ok((!phrase_parts.is_empty()).then(|| format!("\"{}\"", phrase_parts.join(" "))))
+        }
+        FsCassQueryToken::And
+        | FsCassQueryToken::Or
+        | FsCassQueryToken::Not
+        | FsCassQueryToken::LParen
+        | FsCassQueryToken::RParen => Ok(None),
+    })
+    .ok()?;
+    match expr {
+        None => Some(String::new()),
+        Some(expr) => render_fts5_expr(&expr),
     }
+}
 
-    let mut fts_clauses: Vec<(&str, String)> = Vec::new();
-    let mut pending_or_group: Vec<String> = Vec::new();
-    let mut next_op = "AND";
-    let mut in_or_sequence = false;
-    let mut just_saw_or = false;
-    for token in tokens {
-        match token {
-            FsCassQueryToken::And => {
-                if !pending_or_group.is_empty() {
-                    let group = if pending_or_group.len() > 1 {
-                        format!("({})", pending_or_group.join(" OR "))
-                    } else {
-                        pending_or_group.pop().unwrap_or_default()
-                    };
-                    fts_clauses.push(("AND", group));
-                    pending_or_group.clear();
-                }
-                in_or_sequence = false;
-                just_saw_or = false;
-                next_op = "AND";
-            }
-            FsCassQueryToken::Or => {
-                if fts_clauses.is_empty() && pending_or_group.is_empty() {
-                    // Be permissive with a leading OR the same way we already
-                    // salvage a leading AND: ignore it instead of turning the
-                    // whole fallback query into an empty result set.
-                    continue;
-                }
-                if next_op == "NOT" {
-                    // The pinned parser accepts permissive token sequences such
-                    // as `A NOT OR B` and interprets them as `A OR NOT B`.
-                    // FTS5 has no match-all operand with which to express that
-                    // complement branch, so fail over to the source scan rather
-                    // than silently broadening it to `A OR B`.
-                    return None;
-                }
-                // Start or continue an OR group. Unsupported `OR NOT` forms
-                // are rejected when the subsequent NOT token arrives.
-                in_or_sequence = true;
-                just_saw_or = true;
-            }
-            FsCassQueryToken::Not => {
-                // FTS5 supports binary (`foo NOT bar`) NOT, but not a leading
-                // unary-NOT query (`NOT foo`). We also reject `OR NOT` groupings
-                // in the fallback transpiler.
-                if just_saw_or {
-                    return None;
-                }
-
-                if fts_clauses.is_empty() && pending_or_group.is_empty() {
-                    return None;
-                }
-
-                if !pending_or_group.is_empty() {
-                    let group = if pending_or_group.len() > 1 {
-                        format!("({})", pending_or_group.join(" OR "))
-                    } else {
-                        pending_or_group.pop().unwrap_or_default()
-                    };
-                    fts_clauses.push(("AND", group));
-                    pending_or_group.clear();
-                }
-                in_or_sequence = false;
-                just_saw_or = false;
-                next_op = "NOT";
-            }
-            FsCassQueryToken::Term(t) => {
-                let raw_pattern = FsCassWildcardPattern::parse(&t);
-                if matches!(
-                    raw_pattern,
-                    FsCassWildcardPattern::Suffix(_)
-                        | FsCassWildcardPattern::Substring(_)
-                        | FsCassWildcardPattern::Complex(_)
-                ) {
-                    return None;
-                }
-
-                // Sanitize and normalize. FTS5 implicitly ANDs words in a string,
-                // but we split punctuation into porter-aligned fragments first so
-                // fallback queries match SQLite tokenization.
-                let term_parts = normalize_term_parts(&t);
-                if term_parts.is_empty() {
-                    continue;
-                }
-
-                let mut rendered_parts = Vec::with_capacity(term_parts.len());
-                for part in &term_parts {
-                    rendered_parts.push(render_fts5_term_part(part)?);
-                }
-
-                // If multiple parts, wrap in parens and join with AND so a
-                // punctuated term like `foo-bar` becomes `(foo AND bar)`.
-                let fts_term = if rendered_parts.len() > 1 {
-                    format!("({})", rendered_parts.join(" AND "))
-                } else {
-                    rendered_parts[0].clone()
-                };
-
-                if in_or_sequence && just_saw_or {
-                    if pending_or_group.is_empty() {
-                        let (op, _) = fts_clauses.last()?;
-                        if *op != "AND" {
-                            // `(... NOT ...) OR ...` cannot be represented
-                            // with our FTS5 fallback transpilation.
-                            return None;
-                        }
-                        let (_, val) = fts_clauses.pop()?;
-                        pending_or_group.push(val);
-                    }
-                    pending_or_group.push(fts_term);
-                    in_or_sequence = true;
-                } else {
-                    if !pending_or_group.is_empty() {
-                        let group = if pending_or_group.len() > 1 {
-                            format!("({})", pending_or_group.join(" OR "))
-                        } else {
-                            pending_or_group.pop().unwrap_or_default()
-                        };
-                        fts_clauses.push(("AND", group));
-                        pending_or_group.clear();
-                    }
-                    in_or_sequence = false;
-                    fts_clauses.push((next_op, fts_term));
-                }
-                just_saw_or = false;
-                next_op = "AND";
-            }
-            FsCassQueryToken::Phrase(p) => {
-                let phrase_parts = normalize_phrase_terms(&p);
-                if phrase_parts.is_empty() {
-                    continue;
-                }
-                let fts_phrase = format!("\"{}\"", phrase_parts.join(" "));
-
-                if in_or_sequence && just_saw_or {
-                    if pending_or_group.is_empty() {
-                        let (op, _) = fts_clauses.last()?;
-                        if *op != "AND" {
-                            // `(... NOT ...) OR ...` cannot be represented
-                            // with our FTS5 fallback transpilation.
-                            return None;
-                        }
-                        let (_, val) = fts_clauses.pop()?;
-                        pending_or_group.push(val);
-                    }
-                    pending_or_group.push(fts_phrase);
-                    in_or_sequence = true;
-                } else {
-                    if !pending_or_group.is_empty() {
-                        let group = if pending_or_group.len() > 1 {
-                            format!("({})", pending_or_group.join(" OR "))
-                        } else {
-                            pending_or_group.pop().unwrap_or_default()
-                        };
-                        fts_clauses.push(("AND", group));
-                        pending_or_group.clear();
-                    }
-                    in_or_sequence = false;
-                    fts_clauses.push((next_op, fts_phrase));
-                }
-                just_saw_or = false;
-                next_op = "AND";
-            }
+/// FTS5 text for `expr`, or None for a complement FTS5 cannot express.
+fn render_fts5_expr(expr: &CassBoolExpr<String>) -> Option<String> {
+    fn grouped(expr: &CassBoolExpr<String>) -> Option<String> {
+        match expr {
+            CassBoolExpr::Operand(text) => Some(text.clone()),
+            compound => render_fts5_expr(compound).map(|text| format!("({text})")),
         }
     }
-
-    if !pending_or_group.is_empty() {
-        let group = if pending_or_group.len() > 1 {
-            format!("({})", pending_or_group.join(" OR "))
-        } else {
-            pending_or_group.pop().unwrap_or_default()
-        };
-        fts_clauses.push((next_op, group));
-    }
-
-    if fts_clauses.is_empty() {
-        return Some("".to_string());
-    }
-
-    // Safety guard: the fallback transpiler must never emit NOT as the first
-    // operator because SQLite FTS5 requires a left operand.
-    if fts_clauses.first().is_some_and(|(op, _)| *op == "NOT") {
-        return None;
-    }
-
-    // Join clauses. The first operator is ignored (start of query).
-    let mut query = String::new();
-    for (i, (op, text)) in fts_clauses.into_iter().enumerate() {
-        if i > 0 {
-            query.push_str(&format!(" {} ", op));
+    match expr {
+        CassBoolExpr::Operand(text) => Some(text.clone()),
+        CassBoolExpr::Not(_) => None,
+        CassBoolExpr::Or(operands) => Some(
+            operands
+                .iter()
+                .map(grouped)
+                .collect::<Option<Vec<_>>>()?
+                .join(" OR "),
+        ),
+        CassBoolExpr::And(operands) => {
+            let mut included = Vec::new();
+            let mut excluded = Vec::new();
+            for operand in operands {
+                match operand {
+                    CassBoolExpr::Not(inner) => excluded.push(grouped(inner)?),
+                    other => included.push(grouped(other)?),
+                }
+            }
+            if included.is_empty() {
+                return None;
+            }
+            let mut text = included.join(" AND ");
+            for exclusion in excluded {
+                text.push_str(" NOT ");
+                text.push_str(&exclusion);
+            }
+            Some(text)
         }
-        query.push_str(&text);
     }
-
-    Some(query)
 }
 
 #[derive(Default, Clone)]
@@ -9563,9 +10065,21 @@ fn maybe_spawn_warm_worker(
                 }
                 last_run = now;
                 let reload_started = Instant::now();
-                if let Err(err) = crate::search::quill_bridge::refresh_reader(&reader) {
-                    tracing::warn!(error = ?err, "warm_worker_reload_failed");
-                    continue;
+                match crate::search::quill_bridge::refresh_reader_or_detect_republish(&reader) {
+                    Ok(None) => {}
+                    Ok(Some(reason)) => {
+                        // Its clone of the reader belongs to the old lineage;
+                        // warming it would only warm files that are gone.
+                        tracing::debug!(
+                            reason,
+                            "warm worker stops: its lexical index was republished"
+                        );
+                        return;
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = ?err, "warm_worker_reload_failed");
+                        continue;
+                    }
                 }
                 let elapsed = reload_started.elapsed();
                 let epoch = reload_epoch.fetch_add(1, Ordering::SeqCst) + 1;
@@ -9613,165 +10127,7 @@ fn maybe_spawn_warm_worker(
 }
 
 fn cached_hit_from(hit: &SearchHit) -> CachedHit {
-    let cache_text = if hit.content.is_empty() {
-        hit.snippet.as_str()
-    } else {
-        hit.content.as_str()
-    };
-    let lc_content = cache_text.to_lowercase();
-    let lc_title = (!hit.title.is_empty()).then(|| hit.title.to_lowercase());
-    // Snippet is derived from content, so we don't index/bloom it separately
-    let bloom64 = bloom_from_text(&lc_content, &lc_title);
-    CachedHit {
-        hit: hit.clone(),
-        lc_content,
-        lc_title,
-        bloom64,
-    }
-}
-
-fn bloom_from_text(content: &str, title: &Option<String>) -> u64 {
-    let mut bits = 0u64;
-    for token in token_stream(content) {
-        bits |= hash_token(token);
-    }
-    if let Some(t) = title {
-        for token in token_stream(t) {
-            bits |= hash_token(token);
-        }
-    }
-    bits
-}
-
-fn token_stream(text: &str) -> impl Iterator<Item = &str> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-}
-
-fn hash_token(tok: &str) -> u64 {
-    // Simple 64-bit djb2-style hash mapped to bit position 0..63
-    let mut h: u64 = 5381;
-    for b in tok.as_bytes() {
-        h = ((h << 5).wrapping_add(h)).wrapping_add(u64::from(*b));
-    }
-    1u64 << (h % 64)
-}
-
-// ============================================================================
-// QueryTermsLower: Pre-computed lowercase query tokens (Opt 2.4)
-// ============================================================================
-//
-// Avoids repeated to_lowercase() calls when filtering many cached hits.
-// The query is lowercased once and tokens extracted once, then reused.
-
-/// Pre-computed lowercase query terms for efficient hit matching.
-/// Call `from_query` once, then reuse for all hits in a search.
-struct QueryTermsLower {
-    /// The lowercased query string (owned to keep tokens valid)
-    query_lower: String,
-    /// Pre-computed token positions (start, end) into query_lower
-    token_ranges: Vec<(usize, usize)>,
-    /// Pre-computed bloom bits for fast rejection
-    bloom_mask: u64,
-}
-
-impl QueryTermsLower {
-    /// Create from a query string, pre-computing lowercase and tokens.
-    fn from_query(query: &str) -> Self {
-        if query.is_empty() {
-            return Self {
-                query_lower: String::new(),
-                token_ranges: Vec::new(),
-                bloom_mask: 0,
-            };
-        }
-
-        let query_lower = query.to_lowercase();
-        let mut token_ranges = Vec::new();
-        let mut bloom_mask = 0u64;
-
-        // Extract token positions
-        let mut start = None;
-        for (i, c) in query_lower.char_indices() {
-            if c.is_alphanumeric() {
-                if start.is_none() {
-                    start = Some(i);
-                }
-            } else if let Some(s) = start.take() {
-                let token = &query_lower[s..i];
-                bloom_mask |= hash_token(token);
-                token_ranges.push((s, i));
-            }
-        }
-        // Handle trailing token
-        if let Some(s) = start {
-            let token = &query_lower[s..];
-            bloom_mask |= hash_token(token);
-            token_ranges.push((s, query_lower.len()));
-        }
-
-        Self {
-            query_lower,
-            token_ranges,
-            bloom_mask,
-        }
-    }
-
-    /// Check if this query is empty (no tokens).
-    #[inline]
-    fn is_empty(&self) -> bool {
-        self.token_ranges.is_empty()
-    }
-
-    /// Iterate over the pre-computed lowercase tokens.
-    #[inline]
-    fn tokens(&self) -> impl Iterator<Item = &str> {
-        self.token_ranges
-            .iter()
-            .map(|(s, e)| &self.query_lower[*s..*e])
-    }
-
-    /// Get the bloom mask for fast rejection.
-    #[inline]
-    fn bloom_mask(&self) -> u64 {
-        self.bloom_mask
-    }
-}
-
-/// Check if a cached hit matches the pre-computed query terms.
-/// This is the optimized version that avoids repeated to_lowercase() calls.
-fn hit_matches_query_cached_precomputed(hit: &CachedHit, terms: &QueryTermsLower) -> bool {
-    if terms.is_empty() {
-        return true;
-    }
-
-    // Bloom gate: all query tokens must have bits set
-    if hit.bloom64 & terms.bloom_mask() != terms.bloom_mask() {
-        return false;
-    }
-
-    // Verify each token matches as a prefix of a word in at least one field (implicit AND)
-    terms.tokens().all(|t| {
-        // Check content tokens
-        if token_stream(&hit.lc_content).any(|word| word.starts_with(t)) {
-            return true;
-        }
-        // Check title tokens
-        if let Some(title) = &hit.lc_title
-            && token_stream(title).any(|word| word.starts_with(t))
-        {
-            return true;
-        }
-        false
-    })
-}
-
-/// Legacy function for backward compatibility with tests.
-/// Prefer `hit_matches_query_cached_precomputed` with `QueryTermsLower` for batch operations.
-#[cfg(test)]
-fn hit_matches_query_cached(hit: &CachedHit, query: &str) -> bool {
-    let terms = QueryTermsLower::from_query(query);
-    hit_matches_query_cached_precomputed(hit, &terms)
+    CachedHit { hit: hit.clone() }
 }
 
 fn is_prefix_only(query: &str) -> bool {
@@ -9940,7 +10296,7 @@ fn filters_fingerprint(filters: &SearchFilters) -> String {
 impl SearchClient {
     /// Return the total number of indexed Tantivy documents.
     pub fn total_docs(&self) -> usize {
-        if let Some((reader, _)) = &self.reader {
+        if let Some((reader, _)) = self.reader.get() {
             return usize::try_from(reader.doc_count().unwrap_or(0)).unwrap_or(usize::MAX);
         }
         self.federated_readers()
@@ -9960,6 +10316,22 @@ impl SearchClient {
         self.reader.is_some() || self.federated_readers().is_some()
     }
 
+    fn refresh_lexical_generation(&self) -> Result<()> {
+        if let Some((reader, _)) = self.reader.get() {
+            // A reload can replace the reader after a generation directory
+            // exchange, so track the reader that is current afterwards.
+            self.maybe_reload_reader(&reader)?;
+            if let Some((reader, _)) = self.reader.get() {
+                self.track_generation(reader.keeper_generation());
+            }
+        } else if let Some(readers) = self.federated_readers()
+            && let Some(signature) = self.maybe_reload_federated_readers(readers.as_ref())?
+        {
+            self.track_generation(signature);
+        }
+        Ok(())
+    }
+
     fn maybe_reload_reader(&self, reader: &frankensearch::quill::QuillSearchIndex) -> Result<()> {
         if !self.reload_on_search {
             return Ok(());
@@ -9973,20 +10345,26 @@ impl SearchClient {
         {
             let reload_started = Instant::now();
             let cached_generation = reader.keeper_generation();
-            if let Err(error) = reload_index_readers_bounded(
+            let republished = match reload_index_readers_bounded(
                 vec![reader.clone()],
                 Arc::clone(&self.metrics.reload_in_flight),
             ) {
-                self.metrics
-                    .record_cache_lookup(crate::daemon_runtime_state::CacheLookup {
-                        cache_hit: true,
-                        cached_generation: Some(cached_generation),
-                        current_generation: cached_generation,
-                        reload_attempted: true,
-                        reload_succeeded: false,
-                        served_fallback: false,
-                    });
-                return Err(error);
+                Ok(republished) => republished,
+                Err(error) => {
+                    self.metrics
+                        .record_cache_lookup(crate::daemon_runtime_state::CacheLookup {
+                            cache_hit: true,
+                            cached_generation: Some(cached_generation),
+                            current_generation: cached_generation,
+                            reload_attempted: true,
+                            reload_succeeded: false,
+                            served_fallback: false,
+                        });
+                    return Err(error);
+                }
+            };
+            if republished {
+                self.reopen_republished_lexical_index()?;
             }
             let elapsed = reload_started.elapsed();
             // Rate-limit from completion, not start. This keeps a slow reload
@@ -10012,6 +10390,87 @@ impl SearchClient {
                 "tantivy_reader_reload"
             );
         }
+        Ok(())
+    }
+
+    /// Open the index path again after it was republished as a new lineage
+    /// (a rebuild's directory exchange), the way `open_with_options` opens
+    /// it, and swap the readers in. The rebuild can reuse the old generation
+    /// number, so the prefix cache is cleared here rather than left to
+    /// `track_generation`.
+    fn reopen_republished_lexical_index(&self) -> Result<()> {
+        let Some(index_path) = self.reader.index_path.clone() else {
+            return Err(anyhow!(
+                "the lexical index was republished and this search client has no path to reopen it from"
+            ));
+        };
+        type Opened = (
+            Option<frankensearch::quill::QuillSearchIndex>,
+            Option<Vec<FederatedIndexReader>>,
+        );
+        let opened: Arc<Mutex<Option<Opened>>> = Arc::new(Mutex::new(None));
+        let worker_opened = Arc::clone(&opened);
+        run_reload_bounded(
+            move || {
+                let single = crate::search::quill_bridge::open_cass_reader(&index_path).ok();
+                let federated = if single.is_none() {
+                    crate::search::tantivy::open_federated_search_readers(&index_path)
+                        .ok()
+                        .flatten()
+                        .filter(|readers| !readers.is_empty())
+                        .map(|readers| {
+                            readers
+                                .into_iter()
+                                .map(|(reader, fields)| FederatedIndexReader { reader, fields })
+                                .collect::<Vec<_>>()
+                        })
+                } else {
+                    None
+                };
+                if single.is_none() && federated.is_none() {
+                    return Err(format!(
+                        "reopening the republished lexical index at {}: no readable index",
+                        index_path.display()
+                    ));
+                }
+                *worker_opened.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((single, federated));
+                Ok(())
+            },
+            Arc::clone(&self.metrics.reload_in_flight),
+            *SEARCHER_RELOAD_TIMEOUT,
+        )?;
+        let (single, federated) = opened
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .ok_or_else(|| anyhow!("the lexical reopen worker returned no readers"))?;
+        *self.reader.current.write() = single.map(|reader| {
+            (
+                reader,
+                crate::search::quill_bridge::QuillCassFields::compiled(),
+            )
+        });
+        match federated {
+            Some(readers) => {
+                FEDERATED_SEARCH_READERS
+                    .write()
+                    .insert(self.cache_namespace.clone(), Arc::new(readers));
+            }
+            None => {
+                FEDERATED_SEARCH_READERS
+                    .write()
+                    .remove(&self.cache_namespace);
+            }
+        }
+        if let Ok(mut cache) = self.prefix_cache.lock() {
+            self.reload_epoch.fetch_add(1, Ordering::SeqCst);
+            cache.clear();
+        }
+        *self
+            .last_generation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         Ok(())
     }
 
@@ -10043,14 +10502,15 @@ impl SearchClient {
         );
     }
 
-    /// Generate an interned cache key for the given query and filters.
+    /// Generate an interned result key for the exact query, filters and fields.
     /// Returns Arc<str> to enable memory sharing for repeated queries.
-    fn cache_key(&self, query: &str, filters: &SearchFilters) -> Arc<str> {
+    fn cache_key(&self, query: &str, filters: &SearchFilters, field_mask: FieldMask) -> Arc<str> {
         let key_str = format!(
-            "{}|{}::{}",
+            "{}|{query:?}::{}|fields:{}:{:?}",
             self.cache_namespace,
-            query,
-            filters_fingerprint(filters)
+            filters_fingerprint(filters),
+            field_mask.flags,
+            field_mask.preview_content_chars,
         );
         intern_cache_key(&key_str)
     }
@@ -10085,6 +10545,7 @@ impl SearchClient {
         shard: &LruCache<Arc<str>, Vec<CachedHit>>,
         query: &str,
         filters: &SearchFilters,
+        field_mask: FieldMask,
     ) -> bool {
         let mut byte_indices: Vec<usize> = query.char_indices().map(|(i, _)| i).collect();
         byte_indices.push(query.len());
@@ -10093,7 +10554,7 @@ impl SearchClient {
             if end == 0 || end == query_len {
                 continue;
             }
-            let key = self.cache_key(&query[..end], filters);
+            let key = self.cache_key(&query[..end], filters, field_mask);
             if shard.contains(&key) {
                 return true;
             }
@@ -10101,7 +10562,12 @@ impl SearchClient {
         false
     }
 
-    fn maybe_schedule_adaptive_query_prewarm(&self, query: &str, filters: &SearchFilters) {
+    fn maybe_schedule_adaptive_query_prewarm(
+        &self,
+        query: &str,
+        filters: &SearchFilters,
+        field_mask: FieldMask,
+    ) {
         if query.is_empty() {
             return;
         }
@@ -10113,7 +10579,7 @@ impl SearchClient {
         let decision = match self.prefix_cache.lock() {
             Ok(cache) => {
                 let hot_prefix = cache.shard_opt(&shard_name).is_some_and(|shard| {
-                    self.cached_prefix_key_exists_in_shard(shard, query, filters)
+                    self.cached_prefix_key_exists_in_shard(shard, query, filters, field_mask)
                 });
                 if !hot_prefix {
                     AdaptivePrewarmDecision::SkipCold
@@ -10146,36 +10612,39 @@ impl SearchClient {
         }
     }
 
-    fn cached_prefix_hits(&self, query: &str, filters: &SearchFilters) -> Option<Vec<CachedHit>> {
+    fn cached_query_hits(
+        &self,
+        query: &str,
+        filters: &SearchFilters,
+        field_mask: FieldMask,
+    ) -> Option<Vec<CachedHit>> {
         if query.is_empty() {
             return None;
         }
         let cache = self.prefix_cache.lock().ok()?;
         let shard_name = self.shard_name(filters);
         let shard = cache.shard_opt(&shard_name)?;
-        // Iterate over character boundaries to avoid slicing mid-codepoint.
-        let mut byte_indices: Vec<usize> = query.char_indices().map(|(i, _)| i).collect();
-        byte_indices.push(query.len());
-        for &end in byte_indices.iter().rev() {
-            if end == 0 {
-                continue;
-            }
-            let key = self.cache_key(&query[..end], filters);
-            // LruCache.peek() accepts &Q where Arc<str>: Borrow<Q>, so &Arc<str> works
-            if let Some(hits) = shard.peek(&key) {
-                return Some(hits.clone());
-            }
-        }
-        None
+        let key = self.cache_key(query, filters, field_mask);
+        shard.peek(&key).cloned()
     }
 
-    fn put_cache(&self, query: &str, filters: &SearchFilters, hits: &[SearchHit]) {
+    fn put_cache(
+        &self,
+        query: &str,
+        filters: &SearchFilters,
+        field_mask: FieldMask,
+        expected_epoch: u64,
+        hits: &[SearchHit],
+    ) {
         if query.is_empty() || hits.is_empty() {
             return;
         }
         if let Ok(mut cache) = self.prefix_cache.lock() {
+            if self.reload_epoch.load(Ordering::SeqCst) != expected_epoch {
+                return;
+            }
             let shard_name = self.shard_name(filters);
-            let key = self.cache_key(query, filters);
+            let key = self.cache_key(query, filters, field_mask);
             let cached_hits: Vec<CachedHit> = hits.iter().map(cached_hit_from).collect();
             cache.put(&shard_name, key, cached_hits);
         }
@@ -10192,6 +10661,25 @@ impl SearchClient {
     #[must_use]
     pub fn lexical_degrade_reason(&self) -> Option<&'static str> {
         self.last_lexical_degrade_reason
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+    }
+
+    fn record_wildcard_fallback_skip(&self, reason: Option<&'static str>) {
+        if let Ok(mut slot) = self.last_wildcard_fallback_skip.lock() {
+            *slot = reason;
+        }
+    }
+
+    /// Why the most recent `search_with_fallback` skipped the automatic
+    /// wildcard retry a sparse result would otherwise get, if it did. See
+    /// [`WILDCARD_FALLBACK_SKIPPED_LARGE_INDEX`],
+    /// [`WILDCARD_FALLBACK_SKIPPED_DISABLED`] and
+    /// [`WILDCARD_FALLBACK_SKIPPED_LONG_TERM`] (2l1b0.68).
+    #[must_use]
+    pub fn wildcard_fallback_skipped_reason(&self) -> Option<&'static str> {
+        self.last_wildcard_fallback_skip
             .lock()
             .ok()
             .and_then(|slot| *slot)
@@ -10316,7 +10804,7 @@ mod tests {
 
     fn cass_layer_b_test_client(connection: Option<SearchSqliteConnection>) -> SearchClient {
         SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(connection),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -10332,6 +10820,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         }
     }
 
@@ -11712,7 +12201,7 @@ mod tests {
                 )
             });
         let client = SearchClient {
-            reader,
+            reader: LexicalReaderSlot::new(dir.path().to_path_buf(), reader),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -11728,6 +12217,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
         let semantic_embedder: Arc<dyn Embedder> = fast_embedder;
         client.set_semantic_context(
@@ -11950,94 +12440,6 @@ mod tests {
             let s2 = interner.intern(query);
             assert!(Arc::ptr_eq(&s1, &s2));
         }
-    }
-
-    // ==========================================================================
-    // QueryTermsLower Tests (Opt 2.4)
-    // ==========================================================================
-
-    #[test]
-    fn query_terms_lower_basic() {
-        let terms = QueryTermsLower::from_query("Hello World");
-
-        assert_eq!(terms.query_lower, "hello world");
-        let tokens: Vec<&str> = terms.tokens().collect();
-        assert_eq!(tokens, vec!["hello", "world"]);
-    }
-
-    #[test]
-    fn query_terms_lower_empty() {
-        let terms = QueryTermsLower::from_query("");
-
-        assert!(terms.is_empty());
-        assert_eq!(terms.tokens().count(), 0);
-    }
-
-    #[test]
-    fn query_terms_lower_single_term() {
-        let terms = QueryTermsLower::from_query("TEST");
-
-        let tokens: Vec<&str> = terms.tokens().collect();
-        assert_eq!(tokens, vec!["test"]);
-    }
-
-    #[test]
-    fn query_terms_lower_with_punctuation() {
-        let terms = QueryTermsLower::from_query("hello, world! how's it?");
-
-        let tokens: Vec<&str> = terms.tokens().collect();
-        assert_eq!(tokens, vec!["hello", "world", "how", "s", "it"]);
-    }
-
-    #[test]
-    fn query_terms_lower_unicode() {
-        let terms = QueryTermsLower::from_query("Héllo Wörld");
-
-        assert_eq!(terms.query_lower, "héllo wörld");
-        let tokens: Vec<&str> = terms.tokens().collect();
-        assert_eq!(tokens, vec!["héllo", "wörld"]);
-    }
-
-    #[test]
-    fn query_terms_lower_bloom_mask() {
-        let terms = QueryTermsLower::from_query("test");
-
-        // Bloom mask should be non-zero for non-empty query
-        assert_ne!(terms.bloom_mask(), 0);
-
-        // Same query should produce same bloom mask
-        let terms2 = QueryTermsLower::from_query("test");
-        assert_eq!(terms.bloom_mask(), terms2.bloom_mask());
-    }
-
-    #[test]
-    fn hit_matches_with_precomputed_terms() {
-        let hit = SearchHit {
-            title: "Test Title".into(),
-            snippet: "".into(),
-            content: "hello world content".into(),
-            content_hash: stable_content_hash("hello world content"),
-            score: 1.0,
-            source_path: "p".into(),
-            agent: "a".into(),
-            workspace: "w".into(),
-            workspace_original: None,
-            created_at: None,
-            line_number: None,
-            match_type: MatchType::Exact,
-            source_id: "local".into(),
-            origin_kind: "local".into(),
-            origin_host: None,
-            conversation_id: None,
-        };
-        let cached = cached_hit_from(&hit);
-
-        // Test with precomputed terms
-        let terms = QueryTermsLower::from_query("hello");
-        assert!(hit_matches_query_cached_precomputed(&cached, &terms));
-
-        let terms_miss = QueryTermsLower::from_query("missing");
-        assert!(!hit_matches_query_cached_precomputed(&cached, &terms_miss));
     }
 
     // ==========================================================================
@@ -12366,45 +12768,6 @@ mod tests {
     // ==========================================================================
 
     #[test]
-    fn cache_enforces_prefix_matching() {
-        // Hit contains "arrow"
-        let hit = SearchHit {
-            title: "test".into(),
-            snippet: "".into(),
-            content: "arrow".into(),
-            content_hash: stable_content_hash("arrow"),
-            score: 1.0,
-            source_path: "p".into(),
-            agent: "a".into(),
-            workspace: "w".into(),
-            workspace_original: None,
-            created_at: None,
-            line_number: None,
-            match_type: MatchType::Exact,
-            source_id: "local".into(),
-            origin_kind: "local".into(),
-            origin_host: None,
-            conversation_id: None,
-        };
-
-        let cached = CachedHit {
-            hit: hit.clone(),
-            lc_content: "arrow".into(),
-            lc_title: Some("test".into()),
-            bloom64: u64::MAX, // Bypass bloom filter
-        };
-
-        // Query "row" is contained in "arrow" but is NOT a prefix.
-        // It should NOT match if we are enforcing prefix semantics.
-        let matched = hit_matches_query_cached(&cached, "row");
-
-        assert!(
-            !matched,
-            "Query 'row' should NOT match content 'arrow' (prefix match required)"
-        );
-    }
-
-    #[test]
     fn search_deduplication_across_pages_repro() {
         // Distinct sessions with identical content should remain visible across
         // pages. Global pagination still has to happen after deduplication, but
@@ -12482,26 +12845,250 @@ mod tests {
         assert_ne!(page1[0].source_path, page2[0].source_path);
     }
 
+    fn lexical_cache_fixture() -> Result<TempDir> {
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+        for (id, content) in [
+            "cacheword cacheword cacheword cacheword cacheword cacheword rareword",
+            "cacheword rareword rareword rareword rareword rareword rareword",
+            "cacheword fillerword one two three four five six seven eight nine ten",
+            "cacheword fillerword eleven twelve thirteen fourteen fifteen sixteen seventeen",
+            "cacheword fillerword eighteen nineteen twenty twentyone twentytwo twentythree",
+            "cacheword fillerword twentyfour twentyfive twentysix twentyseven twentyeight",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            index.add_conversation(&NormalizedConversation {
+                agent_slug: "codex".into(),
+                external_id: Some(format!("cache-session-{id}")),
+                title: Some(format!("Cache fixture {id}")),
+                workspace: Some("/cache-fixture".into()),
+                source_path: dir.path().join(format!("session-{id}.jsonl")),
+                started_at: Some(1_700_000_000_000 + id as i64),
+                ended_at: None,
+                metadata: json!({}),
+                messages: vec![NormalizedMessage {
+                    idx: 0,
+                    role: "user".into(),
+                    author: None,
+                    created_at: Some(1_700_000_000_000 + id as i64),
+                    content: content.into(),
+                    extra: json!({}),
+                    snippets: vec![],
+                    invocations: vec![],
+                }],
+            })?;
+        }
+        index.commit()?;
+        Ok(dir)
+    }
+
+    fn open_cache_test_client(path: &Path) -> Result<SearchClient> {
+        // Background prewarming has its own tests. Keep publication and
+        // epoch changes synchronous in these cache-equivalence regressions.
+        SearchClient::open_with_options(
+            path,
+            None,
+            SearchClientOptions {
+                enable_reload: true,
+                enable_warm: false,
+                strict_read_only: true,
+            },
+        )?
+        .ok_or_else(|| anyhow!("cache fixture must have a lexical reader"))
+    }
+
     #[test]
-    fn cache_skips_complex_queries() {
-        let client = SearchClient {
-            reader: None,
-            sqlite: Mutex::new(None),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            strict_read_only: false,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
-            last_lexical_degrade_reason: Mutex::new(None),
+    fn result_cache_unlimited_search_uses_reloaded_document_count() -> Result<()> {
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+        let conversation = |id: i64| NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: Some(format!("reload-session-{id}")),
+            title: Some(format!("Reload fixture {id}")),
+            workspace: Some("/cache-fixture".into()),
+            source_path: dir.path().join(format!("reload-session-{id}.jsonl")),
+            started_at: Some(1_700_000_000_000 + id),
+            ended_at: None,
+            metadata: json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(1_700_000_000_000 + id),
+                content: format!("cacheword newly visible message {id}"),
+                extra: json!({}),
+                snippets: vec![],
+                invocations: vec![],
+            }],
         };
+        index.add_conversation(&conversation(0))?;
+        index.commit()?;
+        let warm = open_cache_test_client(dir.path())?;
+        let initial = warm.search("cacheword", SearchFilters::default(), 0, 0, FieldMask::FULL)?;
+        assert_eq!(initial.len(), 1);
+
+        for id in 1..3 {
+            index.add_conversation(&conversation(id))?;
+        }
+        index.commit()?;
+        assert_eq!(
+            warm.total_docs(),
+            1,
+            "the retained reader has not reloaded yet"
+        );
+
+        // Admit the next reload deterministically. The old ordering computed
+        // an unlimited request's cap from the one-document reader before this
+        // reload and silently truncated the newly admitted generation to one.
+        *warm.last_reload.lock().unwrap() = None;
+        let actual = warm.search("cacheword", SearchFilters::default(), 0, 0, FieldMask::FULL)?;
+        assert_eq!(
+            actual.len(),
+            3,
+            "all newly published messages must be returned"
+        );
+        let cold = open_cache_test_client(dir.path())?;
+        let expected = cold.search("cacheword", SearchFilters::default(), 0, 0, FieldMask::FULL)?;
+        assert_eq!(
+            serde_json::to_value(&actual)?,
+            serde_json::to_value(&expected)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn result_cache_query_extension_matches_cold_ranking_and_repeats_exactly() -> Result<()> {
+        let dir = lexical_cache_fixture()?;
+        let warm = open_cache_test_client(dir.path())?;
+        let cold = open_cache_test_client(dir.path())?;
+        let prefix = warm.search("cacheword", SearchFilters::default(), 1, 0, FieldMask::FULL)?;
+        assert_eq!(prefix.len(), 1);
+        assert!(
+            prefix[0].content.contains("rareword"),
+            "cached hit survives the extended query"
+        );
+        let expected = cold.search(
+            "cacheword rareword",
+            SearchFilters::default(),
+            1,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(expected.len(), 1);
+        assert_ne!(
+            prefix[0].source_path, expected[0].source_path,
+            "the new term changes the winner"
+        );
+        let actual = warm.search(
+            "cacheword rareword",
+            SearchFilters::default(),
+            1,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(
+            serde_json::to_value(&actual)?,
+            serde_json::to_value(&expected)?
+        );
+        let hits_before = warm.cache_stats().cache_hits;
+        let repeated = warm.search(
+            "cacheword rareword",
+            SearchFilters::default(),
+            1,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(
+            serde_json::to_value(&repeated)?,
+            serde_json::to_value(&expected)?
+        );
+        assert_eq!(warm.cache_stats().cache_hits, hits_before + 1);
+
+        // A short cached page cannot certify a larger request or its offset.
+        for (limit, offset) in [(2, 0), (1, 1)] {
+            let expected = cold.search(
+                "cacheword rareword",
+                SearchFilters::default(),
+                limit,
+                offset,
+                FieldMask::new(true, true, true, false),
+            )?;
+            let actual = warm.search(
+                "cacheword rareword",
+                SearchFilters::default(),
+                limit,
+                offset,
+                FieldMask::FULL,
+            )?;
+            assert_eq!(
+                serde_json::to_value(&actual)?,
+                serde_json::to_value(&expected)?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn result_cache_keeps_field_projections_independent_in_both_orders() -> Result<()> {
+        let dir = lexical_cache_fixture()?;
+        let projected = FieldMask::new(false, true, false, true);
+        for masks in [[projected, FieldMask::FULL], [FieldMask::FULL, projected]] {
+            let warm = open_cache_test_client(dir.path())?;
+            for mask in masks {
+                let cold = open_cache_test_client(dir.path())?;
+                let expected = cold.search("cacheword", SearchFilters::default(), 1, 0, mask)?;
+                let actual = warm.search("cacheword", SearchFilters::default(), 1, 0, mask)?;
+                assert_eq!(actual.len(), 1);
+                assert_eq!(actual[0].content.is_empty(), !mask.needs_content());
+                assert_eq!(actual[0].title.is_empty(), !mask.wants_title());
+                assert_eq!(
+                    serde_json::to_value(&actual)?,
+                    serde_json::to_value(&expected)?
+                );
+                let hits_before = warm.cache_stats().cache_hits;
+                let repeated = warm.search("cacheword", SearchFilters::default(), 1, 0, mask)?;
+                assert_eq!(
+                    serde_json::to_value(&repeated)?,
+                    serde_json::to_value(&expected)?
+                );
+                assert_eq!(warm.cache_stats().cache_hits, hits_before + 1);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn result_cache_rejects_late_publication_from_an_invalidated_generation() -> Result<()> {
+        let dir = lexical_cache_fixture()?;
+        let client = open_cache_test_client(dir.path())?;
+        let hits = client.search("cacheword", SearchFilters::default(), 1, 0, FieldMask::FULL)?;
+        let epoch = client.reload_epoch.load(Ordering::SeqCst);
+        let generation = client
+            .cache_stats()
+            .reader_generation
+            .expect("tracked generation");
+        client.track_generation(generation + 1);
+        client.put_cache(
+            "cacheword",
+            &SearchFilters::default(),
+            FieldMask::FULL,
+            epoch,
+            &hits,
+        );
+        assert!(
+            client
+                .cached_query_hits("cacheword", &SearchFilters::default(), FieldMask::FULL)
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cache_skips_complex_queries() -> Result<()> {
+        let dir = lexical_cache_fixture()?;
+        let client = open_cache_test_client(dir.path())?;
 
         // Wildcard query should skip cache logic entirely (no miss recorded)
         let _ = client.search("foo*", SearchFilters::default(), 10, 0, FieldMask::FULL);
@@ -12532,12 +13119,13 @@ mod tests {
             stats.cache_miss, 1,
             "Simple query should trigger cache miss"
         );
+        Ok(())
     }
 
     #[test]
-    fn cache_prefix_lookup_handles_utf8_boundaries() {
+    fn cache_query_lookup_preserves_utf8_and_requires_exact_text() {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -12553,6 +13141,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = vec![SearchHit {
@@ -12574,39 +13163,22 @@ mod tests {
             conversation_id: None,
         }];
 
-        client.put_cache("こん", &SearchFilters::default(), &hits);
+        client.put_cache("こん", &SearchFilters::default(), FieldMask::FULL, 0, &hits);
 
         let cached = client
-            .cached_prefix_hits("こんにちは", &SearchFilters::default())
+            .cached_query_hits("こん", &SearchFilters::default(), FieldMask::FULL)
             .unwrap();
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].hit.title, "こんにちは");
+        assert!(
+            client
+                .cached_query_hits("こんにちは", &SearchFilters::default(), FieldMask::FULL)
+                .is_none()
+        );
     }
 
     #[test]
-    fn bloom_gate_rejects_missing_terms() {
-        let hit = SearchHit {
-            title: "hello world".into(),
-            snippet: "hello world".into(),
-            content: "hello world".into(),
-            content_hash: stable_content_hash("hello world"),
-            score: 1.0,
-            source_path: "p".into(),
-            agent: "a".into(),
-            workspace: "w".into(),
-            workspace_original: None,
-            created_at: None,
-            line_number: None,
-            match_type: MatchType::Exact,
-            source_id: "local".into(),
-            origin_kind: "local".into(),
-            origin_host: None,
-            conversation_id: None,
-        };
-        let cached = cached_hit_from(&hit);
-        assert!(hit_matches_query_cached(&cached, "hello"));
-        assert!(!hit_matches_query_cached(&cached, "missing"));
-
+    fn cache_metrics_count_each_outcome() {
         let metrics = Metrics::default();
         metrics.inc_cache_hits();
         metrics.inc_cache_miss();
@@ -12749,7 +13321,7 @@ mod tests {
     #[test]
     fn progressive_phase_reuses_lexical_cache_without_db_hydration() -> Result<()> {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -12765,6 +13337,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
         let field_mask = FieldMask::new(false, true, true, true);
         let lexical_hit = SearchHit {
@@ -13291,7 +13864,7 @@ mod tests {
                 (1, 1, 0, 'the error_handler fired', 1);",
         )?;
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -13307,6 +13880,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.search("*handler", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -13374,7 +13948,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -13390,6 +13964,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -13462,7 +14037,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -13478,6 +14053,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -13566,7 +14142,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader,
+            reader: LexicalReaderSlot::new(dir.path().to_path_buf(), reader),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -13582,6 +14158,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let sqlite_hits = client.search_sqlite_fts5(
@@ -13672,7 +14249,7 @@ mod tests {
         // Opening via sqlite_guard() must remain read-only. A search path
         // should not trigger heavyweight derived-index repair.
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path.clone()),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -13688,6 +14265,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let guard = client
@@ -13792,7 +14370,7 @@ mod tests {
         }
 
         let client = Arc::new(SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -13808,6 +14386,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         });
         let worker_count = 4;
         let start = Arc::new(std::sync::Barrier::new(worker_count + 1));
@@ -14080,7 +14659,7 @@ mod tests {
         }
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -14096,6 +14675,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let guard = client.sqlite_guard()?;
@@ -14248,7 +14828,7 @@ mod tests {
             ],
         )?;
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -14264,6 +14844,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
         let direct_hits = client.search_sqlite_fts5(
             Path::new(":memory:"),
@@ -14386,7 +14967,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -14402,6 +14983,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let fallback_key = (
@@ -14434,7 +15016,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -14450,6 +15032,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let error = client
@@ -14631,7 +15214,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -14647,6 +15230,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.search("delta", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -14749,7 +15333,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -14765,6 +15349,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let local_hits = client.browse_by_date(
@@ -14878,7 +15463,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -14894,6 +15479,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let remote_hits = client.search(
@@ -15040,7 +15626,7 @@ mod tests {
         );
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -15056,6 +15642,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.search(
@@ -15097,8 +15684,12 @@ mod tests {
         Ok(())
     }
 
+    /// 2l1b0.52: the scan lane evaluates the lexical engine's standard
+    /// grammar (NOT, then AND, then OR; parentheses group). Negative controls:
+    /// the legacy OR-binds-tighter reading rejected "beta gamma" for the first
+    /// mixed query and "alpha" for the second.
     #[test]
-    fn sqlite_message_scan_preserves_boolean_or_precedence() {
+    fn sqlite_message_scan_follows_standard_boolean_precedence() {
         fn score(haystack: &str, query: &SqliteMessageScanQuery) -> f32 {
             SearchClient::sqlite_message_scan_score(&[haystack.to_lowercase()], query)
         }
@@ -15109,31 +15700,35 @@ mod tests {
         assert!(score("beta", &simple_or) > 0.0);
         assert_eq!(score("gamma", &simple_or), 0.0);
 
+        // (alpha AND beta) OR gamma
         let and_then_or = SearchClient::sqlite_message_scan_query("alpha AND beta OR gamma")
             .expect("AND followed by OR scan query");
-        assert!(
-            score("alpha gamma", &and_then_or) > 0.0,
-            "alpha AND (beta OR gamma) should accept the gamma branch"
-        );
+        assert!(score("alpha beta", &and_then_or) > 0.0);
+        assert!(score("beta gamma", &and_then_or) > 0.0);
         assert_eq!(score("alpha", &and_then_or), 0.0);
-        assert_eq!(score("beta gamma", &and_then_or), 0.0);
 
+        // alpha OR (beta AND gamma)
         let or_then_and = SearchClient::sqlite_message_scan_query("alpha OR beta AND gamma")
             .expect("OR followed by AND scan query");
-        assert!(
-            score("alpha gamma", &or_then_and) > 0.0,
-            "(alpha OR beta) AND gamma should accept the alpha branch"
-        );
-        assert!(
-            score("beta gamma", &or_then_and) > 0.0,
-            "(alpha OR beta) AND gamma should accept the beta branch"
-        );
-        assert_eq!(score("alpha", &or_then_and), 0.0);
+        assert!(score("alpha", &or_then_and) > 0.0);
+        assert!(score("beta gamma", &or_then_and) > 0.0);
+        assert_eq!(score("beta", &or_then_and), 0.0);
+
+        let grouped = SearchClient::sqlite_message_scan_query("(alpha OR beta) AND gamma")
+            .expect("grouped scan query");
+        assert_eq!(score("alpha", &grouped), 0.0);
+        assert!(score("alpha gamma", &grouped) > 0.0);
+        assert!(score("beta gamma", &grouped) > 0.0);
 
         let binary_not =
             SearchClient::sqlite_message_scan_query("alpha NOT beta").expect("NOT scan query");
         assert!(score("alpha", &binary_not) > 0.0);
         assert_eq!(score("alpha beta", &binary_not), 0.0);
+
+        let excluded_group =
+            SearchClient::sqlite_message_scan_query("alpha -(beta OR gamma)").expect("NOT group");
+        assert!(score("alpha", &excluded_group) > 0.0);
+        assert_eq!(score("alpha gamma", &excluded_group), 0.0);
     }
 
     #[test]
@@ -15142,14 +15737,13 @@ mod tests {
             SearchClient::sqlite_message_scan_score(&[haystack.to_lowercase()], query)
         }
 
-        // OR binds tighter than the implicit conjunction around NOT, so this
-        // is `alpha AND (NOT beta OR gamma)` in the pinned primary builder.
+        // (alpha AND NOT beta) OR gamma
         let nested = SearchClient::sqlite_message_scan_query("alpha NOT beta OR gamma")
             .expect("nested negated OR scan query");
         assert!(score("alpha", &nested) > 0.0);
         assert_eq!(score("alpha beta", &nested), 0.0);
         assert!(score("alpha beta gamma", &nested) > 0.0);
-        assert_eq!(score("gamma", &nested), 0.0);
+        assert!(score("gamma", &nested) > 0.0);
 
         let or_not = SearchClient::sqlite_message_scan_query("alpha OR NOT beta")
             .expect("OR-NOT scan query");
@@ -15162,16 +15756,277 @@ mod tests {
         assert!(score("alpha", &standalone_not) > 0.0);
         assert_eq!(score("alpha beta", &standalone_not), 0.0);
 
+        // Negation is parity-based: NOT NOT beta is beta.
         let repeated_not = SearchClient::sqlite_message_scan_query("NOT NOT beta")
             .expect("repeated standalone NOT query");
-        assert!(score("alpha", &repeated_not) > 0.0);
-        assert_eq!(score("alpha beta", &repeated_not), 0.0);
+        assert_eq!(score("alpha", &repeated_not), 0.0);
+        assert!(score("alpha beta", &repeated_not) > 0.0);
 
+        // A NOT with no operand is dropped: alpha OR beta.
         let permissive = SearchClient::sqlite_message_scan_query("alpha NOT OR beta")
             .expect("permissive NOT-before-OR query");
         assert!(score("alpha beta", &permissive) > 0.0);
-        assert_eq!(score("gamma beta", &permissive), 0.0);
-        assert!(score("gamma delta", &permissive) > 0.0);
+        assert!(score("gamma beta", &permissive) > 0.0);
+        assert_eq!(score("gamma delta", &permissive), 0.0);
+    }
+
+    /// Set-algebra reference for the fallback-lane differential (2l1b0.52).
+    #[derive(Debug)]
+    enum BoolReference {
+        Term(usize),
+        Not(Box<BoolReference>),
+        And(Vec<BoolReference>),
+        Or(Vec<BoolReference>),
+    }
+
+    impl BoolReference {
+        const TERMS: [&'static str; 4] = ["kiwiword", "limeword", "mangoword", "plumword"];
+
+        /// Deterministic xorshift, so every run generates the same queries.
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+
+        fn generate(state: &mut u64, depth: usize) -> Self {
+            let roll = Self::next(state) % 10;
+            if depth == 0 || roll < 3 {
+                return Self::Term((Self::next(state) % Self::TERMS.len() as u64) as usize);
+            }
+            let children = |state: &mut u64| -> Vec<Self> {
+                let count = 2 + (Self::next(state) % 2) as usize;
+                (0..count)
+                    .map(|_| Self::generate(state, depth - 1))
+                    .collect()
+            };
+            match roll {
+                3 | 4 => Self::Not(Box::new(Self::generate(state, depth - 1))),
+                5..=7 => Self::And(children(state)),
+                _ => Self::Or(children(state)),
+            }
+        }
+
+        fn matches(&self, row: &[bool]) -> bool {
+            match self {
+                Self::Term(term) => row[*term],
+                Self::Not(inner) => !inner.matches(row),
+                Self::And(children) => children.iter().all(|child| child.matches(row)),
+                Self::Or(children) => children.iter().any(|child| child.matches(row)),
+            }
+        }
+
+        /// Query text that the standard grammar parses back into `self`, with
+        /// the operator spelling (AND, `&&` or implied; OR or `||`; NOT or
+        /// `-`) and any optional grouping chosen by `state`.
+        fn render(&self, state: &mut u64) -> String {
+            match self {
+                Self::Term(term) => Self::TERMS[*term].to_string(),
+                Self::Not(inner) => {
+                    let operand = inner.render_operand(state, true);
+                    if matches!(**inner, Self::Not(_)) || Self::next(state).is_multiple_of(2) {
+                        format!("NOT {operand}")
+                    } else {
+                        format!("-{operand}")
+                    }
+                }
+                Self::And(children) => {
+                    let separator = [" AND ", " && ", " "][(Self::next(state) % 3) as usize];
+                    children
+                        .iter()
+                        .map(|child| child.render_operand(state, matches!(child, Self::Or(_))))
+                        .collect::<Vec<_>>()
+                        .join(separator)
+                }
+                Self::Or(children) => {
+                    let separator = [" OR ", " || "][(Self::next(state) % 2) as usize];
+                    children
+                        .iter()
+                        .map(|child| child.render_operand(state, false))
+                        .collect::<Vec<_>>()
+                        .join(separator)
+                }
+            }
+        }
+
+        /// `self` as an operand: a compound expression is parenthesized when
+        /// precedence requires it, and at random otherwise.
+        fn render_operand(&self, state: &mut u64, required: bool) -> String {
+            let compound = matches!(self, Self::And(_) | Self::Or(_));
+            let text = self.render(state);
+            if compound && (required || Self::next(state).is_multiple_of(2)) {
+                format!("({text})")
+            } else {
+                text
+            }
+        }
+    }
+
+    /// 2l1b0.52: both fallback lanes, the SQLite FTS5 entry point and the
+    /// source-table scan, return exactly the set a set-algebra reference
+    /// computes for generated Boolean queries in every operator spelling,
+    /// with and without redundant grouping, including complements. The FTS5
+    /// entry point hands queries FTS5 cannot express to the scan, so the run
+    /// must exercise both routes. The legacy grammar (OR tighter than AND,
+    /// parentheses ignored) fails most mixed cases.
+    #[test]
+    fn fallback_lanes_match_set_algebra_for_generated_boolean_queries() -> Result<()> {
+        let conn = SearchSqliteFixture::in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER,
+                idx INTEGER,
+                content TEXT,
+                created_at INTEGER
+             );
+             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+             CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at UNINDEXED,
+                content='',
+                tokenize='porter'
+             );
+             INSERT INTO sources(id, kind) VALUES('local', 'local');
+             INSERT INTO agents(id, slug) VALUES(1, 'codex');
+             INSERT INTO workspaces(id, path) VALUES(1, '/ws');
+             INSERT INTO conversations(
+                id, agent_id, workspace_id, source_id, origin_host, title, source_path
+             ) VALUES(1, 1, 1, 'local', NULL, 'fixture', '/tmp/fixture.jsonl');",
+        )?;
+        let mut state = 0x21B0_0052_u64;
+        let mut rows: Vec<Vec<bool>> = Vec::new();
+        for id in 1..=48_i64 {
+            let row: Vec<bool> = BoolReference::TERMS
+                .iter()
+                .map(|_| BoolReference::next(&mut state) % 100 < 45)
+                .collect();
+            let mut words = vec![format!("msgid{id}")];
+            words.extend(
+                BoolReference::TERMS
+                    .iter()
+                    .zip(&row)
+                    .filter(|(_, present)| **present)
+                    .map(|(term, _)| (*term).to_string()),
+            );
+            let content = words.join(" ");
+            conn.execute_compat(
+                "INSERT INTO messages(id, conversation_id, idx, content, created_at)
+                 VALUES(?1, 1, ?2, ?3, ?1)",
+                params![id, id - 1, content.as_str()],
+            )?;
+            conn.execute_compat(
+                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+                 VALUES(?1, ?2, 'fixture', 'codex', '/ws', '/tmp/fixture.jsonl', ?1)",
+                params![id, content.as_str()],
+            )?;
+            rows.push(row);
+        }
+        let client = cass_layer_b_test_client(Some(conn.into_connection()));
+        let hit_ids = |hits: Vec<SearchHit>| -> Result<std::collections::BTreeSet<i64>> {
+            hits.iter()
+                .map(|hit| {
+                    hit.content
+                        .split_whitespace()
+                        .find_map(|word| word.strip_prefix("msgid"))
+                        .and_then(|digits| digits.parse().ok())
+                        .ok_or_else(|| anyhow!("hit without a msgid token: {:?}", hit.content))
+                })
+                .collect()
+        };
+
+        let (mut fts5_routed, mut scan_routed, mut proper_subsets) = (0, 0, 0);
+        for case in 0..64 {
+            let expr = BoolReference::generate(&mut state, 3);
+            let query = expr.render_operand(&mut state, false);
+            let expected: std::collections::BTreeSet<i64> = rows
+                .iter()
+                .zip(1_i64..)
+                .filter(|(row, _)| expr.matches(row))
+                .map(|(_, id)| id)
+                .collect();
+            if !expected.is_empty() && expected.len() < rows.len() {
+                proper_subsets += 1;
+            }
+            let route = if transpile_to_fts5(&query).is_some() {
+                fts5_routed += 1;
+                "fts5"
+            } else {
+                scan_routed += 1;
+                "scan"
+            };
+            let via_entry = hit_ids(client.search_sqlite_fts5(
+                Path::new(":memory:"),
+                &query,
+                SearchFilters::default(),
+                1000,
+                0,
+                FieldMask::FULL,
+            )?)?;
+            let via_scan = {
+                let sqlite_guard = client.sqlite_guard()?;
+                let conn = sqlite_guard
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("fixture connection missing"))?;
+                hit_ids(client.search_sqlite_message_scan(
+                    conn,
+                    SqliteMessageScanRequest {
+                        raw_query: &query,
+                        filters: &SearchFilters::default(),
+                        limit: 1000,
+                        offset: 0,
+                        scan_page_rows: 16,
+                        field_mask: FieldMask::FULL,
+                        query_match_type: dominant_match_type(&query),
+                    },
+                )?)?
+            };
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "fallback_differential",
+                    "case": case,
+                    "query": query,
+                    "route": route,
+                    "expected": expected.len(),
+                    "entry_hits": via_entry.len(),
+                    "scan_hits": via_scan.len(),
+                })
+            );
+            assert_eq!(
+                via_entry, expected,
+                "case {case}: FTS5 entry point ({route}) for {query:?} = {expr:?}"
+            );
+            assert_eq!(
+                via_scan, expected,
+                "case {case}: source scan for {query:?} = {expr:?}"
+            );
+        }
+        assert!(
+            fts5_routed >= 16 && scan_routed >= 8,
+            "both routes must be exercised: fts5={fts5_routed} scan={scan_routed}"
+        );
+        assert!(
+            proper_subsets >= 32,
+            "too few informative cases: {proper_subsets} of 64"
+        );
+        Ok(())
     }
 
     /// 1t79z: the scan lane honours suffix / substring / complex wildcards
@@ -15524,7 +16379,7 @@ mod tests {
                 (3, 1, 2, 'gamma delta', 3);",
         )?;
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -15540,6 +16395,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.search_sqlite_fts5(
@@ -15597,7 +16453,7 @@ mod tests {
                 (3, 1, 2, 'plain hauler text', 3);",
         )?;
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -15613,6 +16469,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
         let contents = |query: &str| -> Result<HashSet<String>> {
             Ok(client
@@ -15704,7 +16561,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -15720,6 +16577,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.browse_by_date(
@@ -15800,7 +16658,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -15816,6 +16674,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -16244,7 +17103,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16260,6 +17119,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -16318,7 +17178,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16334,6 +17194,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -16408,7 +17269,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16424,6 +17285,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let first_hit = SearchHit {
@@ -16526,7 +17388,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16542,6 +17404,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -16613,7 +17476,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16629,6 +17492,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let first_hit = SearchHit {
@@ -16707,7 +17571,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16723,6 +17587,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -16791,7 +17656,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16807,6 +17672,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -16875,7 +17741,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16891,6 +17757,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -16960,7 +17827,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16976,6 +17843,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -17083,7 +17951,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -17099,6 +17967,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.browse_by_date(
@@ -17159,7 +18028,11 @@ mod tests {
             let cache = client.prefix_cache.lock().unwrap();
             let shard = cache.shard_opt("global").unwrap();
             // "app" should be in cache
-            assert!(shard.contains(&client.cache_key("app", &SearchFilters::default())));
+            assert!(shard.contains(&client.cache_key(
+                "app",
+                &SearchFilters::default(),
+                FieldMask::FULL
+            )));
         }
 
         // 4. Add new doc with "apricot"
@@ -17212,7 +18085,7 @@ mod tests {
     #[test]
     fn track_generation_clears_cache_on_change() {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -17228,6 +18101,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -17250,7 +18124,13 @@ mod tests {
         };
         let hits = vec![hit];
 
-        client.put_cache("hello", &SearchFilters::default(), &hits);
+        client.put_cache(
+            "hello",
+            &SearchFilters::default(),
+            FieldMask::FULL,
+            0,
+            &hits,
+        );
         {
             let cache = client.prefix_cache.lock().unwrap();
             assert!(!cache.shards.is_empty());
@@ -17275,7 +18155,7 @@ mod tests {
     #[test]
     fn cache_total_cap_evicts_across_shards() {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(2, 0)), // tiny entry cap, no byte cap
@@ -17291,6 +18171,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -17315,13 +18196,13 @@ mod tests {
 
         let mut filters = SearchFilters::default();
         filters.agents.insert("agent1".into());
-        client.put_cache("a", &filters, &hits);
+        client.put_cache("a", &filters, FieldMask::FULL, 0, &hits);
         filters.agents.clear();
         filters.agents.insert("agent2".into());
-        client.put_cache("b", &filters, &hits);
+        client.put_cache("b", &filters, FieldMask::FULL, 0, &hits);
         filters.agents.clear();
         filters.agents.insert("agent3".into());
-        client.put_cache("c", &filters, &hits);
+        client.put_cache("c", &filters, FieldMask::FULL, 0, &hits);
 
         let stats = client.cache_stats();
         assert!(stats.total_cost <= stats.total_cap);
@@ -17331,7 +18212,7 @@ mod tests {
     #[test]
     fn cache_stats_reflect_metrics() {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -17347,6 +18228,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         client.metrics.inc_cache_hits();
@@ -17373,7 +18255,7 @@ mod tests {
     fn adaptive_query_prewarm_schedules_only_after_hot_prefix_cache_entry() {
         let (tx, rx) = mpsc::unbounded();
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(10, 0)),
@@ -17389,11 +18271,12 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
         let mut filters = SearchFilters::default();
         filters.workspaces.insert("/tmp/cass-workspace".into());
 
-        client.maybe_schedule_adaptive_query_prewarm("hel", &filters);
+        client.maybe_schedule_adaptive_query_prewarm("hel", &filters, FieldMask::FULL);
         assert!(
             rx.try_recv().is_err(),
             "cold prefixes should not schedule adaptive prewarm"
@@ -17403,15 +18286,21 @@ mod tests {
         hit.snippet = "hello".into();
         hit.content = "hello world".into();
         hit.content_hash = stable_content_hash(&hit.content);
-        client.put_cache("hel", &filters, std::slice::from_ref(&hit));
+        client.put_cache(
+            "hel",
+            &filters,
+            FieldMask::FULL,
+            0,
+            std::slice::from_ref(&hit),
+        );
 
         let total_cost_before = client.cache_stats().total_cost;
-        client.maybe_schedule_adaptive_query_prewarm("hel", &filters);
+        client.maybe_schedule_adaptive_query_prewarm("hel", &filters, FieldMask::FULL);
         assert!(
             rx.try_recv().is_err(),
             "an exact cached query should not schedule redundant prewarm"
         );
-        client.maybe_schedule_adaptive_query_prewarm("hello", &filters);
+        client.maybe_schedule_adaptive_query_prewarm("hello", &filters, FieldMask::FULL);
 
         let job = rx
             .try_recv()
@@ -17438,7 +18327,7 @@ mod tests {
 
         let (tx, rx) = mpsc::unbounded();
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(10, byte_cap)),
@@ -17454,18 +18343,25 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
         let filters = SearchFilters::default();
 
-        client.put_cache("hel", &filters, std::slice::from_ref(&hit));
-        client.maybe_schedule_adaptive_query_prewarm("zebra", &filters);
+        client.put_cache(
+            "hel",
+            &filters,
+            FieldMask::FULL,
+            0,
+            std::slice::from_ref(&hit),
+        );
+        client.maybe_schedule_adaptive_query_prewarm("zebra", &filters, FieldMask::FULL);
         assert_eq!(
             client.cache_stats().prewarm_skipped_pressure,
             0,
             "cold queries should not be counted as pressure-skipped prewarm jobs"
         );
 
-        client.maybe_schedule_adaptive_query_prewarm("hello", &filters);
+        client.maybe_schedule_adaptive_query_prewarm("hello", &filters, FieldMask::FULL);
 
         assert!(
             rx.try_recv().is_err(),
@@ -17481,7 +18377,7 @@ mod tests {
     fn cache_eviction_count_tracks_evictions() {
         // tiny entry cap (2 entries), no byte cap - forces evictions
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(2, 0)),
@@ -17497,6 +18393,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -17522,16 +18419,22 @@ mod tests {
         client.put_cache(
             "query1",
             &SearchFilters::default(),
+            FieldMask::FULL,
+            0,
             std::slice::from_ref(&hit),
         );
         client.put_cache(
             "query2",
             &SearchFilters::default(),
+            FieldMask::FULL,
+            0,
             std::slice::from_ref(&hit),
         );
         client.put_cache(
             "query3",
             &SearchFilters::default(),
+            FieldMask::FULL,
+            0,
             std::slice::from_ref(&hit),
         );
 
@@ -17694,7 +18597,7 @@ mod tests {
     fn cache_byte_cap_triggers_eviction() {
         // Large entry cap (1000), tiny byte cap (100 bytes) - forces byte-based evictions
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(1000, 100)), // byte cap of 100
@@ -17710,6 +18613,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         // Large content to exceed byte cap quickly
@@ -17734,9 +18638,27 @@ mod tests {
         };
 
         // Put 3 large entries - should trigger byte-based evictions
-        client.put_cache("q1", &SearchFilters::default(), std::slice::from_ref(&hit));
-        client.put_cache("q2", &SearchFilters::default(), std::slice::from_ref(&hit));
-        client.put_cache("q3", &SearchFilters::default(), std::slice::from_ref(&hit));
+        client.put_cache(
+            "q1",
+            &SearchFilters::default(),
+            FieldMask::FULL,
+            0,
+            std::slice::from_ref(&hit),
+        );
+        client.put_cache(
+            "q2",
+            &SearchFilters::default(),
+            FieldMask::FULL,
+            0,
+            std::slice::from_ref(&hit),
+        );
+        client.put_cache(
+            "q3",
+            &SearchFilters::default(),
+            FieldMask::FULL,
+            0,
+            std::slice::from_ref(&hit),
+        );
 
         let stats = client.cache_stats();
         assert!(
@@ -18804,6 +19726,129 @@ mod tests {
         );
     }
 
+    /// coding_agent_session_search-7hvlg (GH #518 follow-up): the automatic
+    /// `*term*` retry only refines a search that already succeeded. Its
+    /// dictionary walk can run out of the query fuel the plain lookup fit in;
+    /// the plain query's hits must come back, with `wildcard_fallback_skipped`
+    /// naming the cause, instead of the whole search failing.
+    #[test]
+    fn search_with_fallback_keeps_exact_hits_when_the_wildcard_retry_runs_out_of_fuel() -> Result<()>
+    {
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+        let conversation = |id: usize, content: String| NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some(format!("doc-{id}")),
+            workspace: Some(std::path::PathBuf::from("/ws")),
+            source_path: dir.path().join(format!("{id}.jsonl")),
+            started_at: Some(100),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(100),
+                content,
+                extra: serde_json::json!({}),
+                snippets: vec![],
+                invocations: Vec::new(),
+            }],
+        };
+        // Many distinct terms over a few segments give the retry's
+        // dictionary walk real work; one document holds the needle.
+        for id in 0..400 {
+            let words = (0..16)
+                .map(|word| format!("filler{id}x{word}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            index.add_conversation(&conversation(id, words))?;
+            if id % 100 == 99 {
+                index.commit()?;
+            }
+        }
+        index.add_conversation(&conversation(400, "needleword appears once".into()))?;
+        index.commit()?;
+
+        let client_with_budget = |budget: u64| -> Result<SearchClient> {
+            let reader = crate::search::quill_bridge::open_cass_reader_with_query_fuel_budget(
+                dir.path(),
+                budget,
+            )?;
+            SearchClient::from_opened_lexical_index(
+                crate::search::tantivy::OpenedLexicalIndex {
+                    path: dir.path().to_path_buf(),
+                    reader: Some((
+                        reader,
+                        crate::search::quill_bridge::QuillCassFields::compiled(),
+                    )),
+                    federated_readers: None,
+                },
+                None,
+                SearchClientOptions::default(),
+            )?
+            .context("a reader is present")
+        };
+        let plain = |budget: u64| {
+            client_with_budget(budget)?.search(
+                "needleword",
+                SearchFilters::default(),
+                10,
+                0,
+                FieldMask::FULL,
+            )
+        };
+        let budget = (0..40)
+            .map(|shift| 1_u64 << shift)
+            .find(|budget| plain(*budget).is_ok())
+            .expect("the plain lookup fits some budget");
+        // Precondition: at that budget the retry's walk does not fit.
+        let refused = client_with_budget(budget)?
+            .search(
+                "*needleword*",
+                SearchFilters::default(),
+                10,
+                0,
+                FieldMask::FULL,
+            )
+            .expect_err("`*needleword*` must cost more fuel than the plain lookup");
+        assert!(
+            crate::search::quill_bridge::is_query_fuel_exhausted(&refused),
+            "{refused:#}"
+        );
+
+        let client = client_with_budget(budget)?;
+        let result = client.search_with_fallback(
+            "needleword",
+            SearchFilters::default(),
+            10,
+            0,
+            5,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(result.hits.len(), 1, "budget {budget}: the plain hit");
+        assert!(!result.wildcard_fallback);
+        assert_eq!(
+            client.wildcard_fallback_skipped_reason(),
+            Some(WILDCARD_FALLBACK_SKIPPED_QUERY_FUEL_EXHAUSTED)
+        );
+
+        // Control: with fuel to spare the retry runs and nothing is skipped.
+        let client = client_with_budget(budget.saturating_mul(1 << 20))?;
+        let result = client.search_with_fallback(
+            "needleword",
+            SearchFilters::default(),
+            10,
+            0,
+            5,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(client.wildcard_fallback_skipped_reason(), None);
+        Ok(())
+    }
+
     #[test]
     fn search_with_fallback_skips_when_query_has_wildcards() -> Result<()> {
         let dir = TempDir::new()?;
@@ -19062,7 +20107,7 @@ mod tests {
     #[test]
     fn search_with_fallback_emits_wildcard_suggestion_on_zero_hits() -> Result<()> {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -19078,6 +20123,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let result = client.search_with_fallback(
@@ -19156,7 +20202,7 @@ mod tests {
     fn search_with_fallback_skips_for_nonzero_offset() -> Result<()> {
         // Even with zero hits, fallback should not run when paginating (offset > 0)
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -19172,6 +20218,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let result = client.search_with_fallback(
@@ -19202,7 +20249,7 @@ mod tests {
     fn generate_suggestions_limits_and_sets_shortcuts() -> Result<()> {
         // Build a client without backends; suggestions are purely local heuristics
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -19218,6 +20265,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let mut filters = SearchFilters::default();
@@ -20335,7 +21383,7 @@ mod tests {
     fn filter_fidelity_cache_key_isolation() {
         // Different filters should have different cache keys
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -20351,6 +21399,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let filters_empty = SearchFilters::default();
@@ -20360,9 +21409,9 @@ mod tests {
         let mut filters_ws = SearchFilters::default();
         filters_ws.workspaces.insert("/ws".into());
 
-        let key_empty = client.cache_key("test", &filters_empty);
-        let key_agent = client.cache_key("test", &filters_agent);
-        let key_ws = client.cache_key("test", &filters_ws);
+        let key_empty = client.cache_key("test", &filters_empty, FieldMask::FULL);
+        let key_agent = client.cache_key("test", &filters_agent, FieldMask::FULL);
+        let key_ws = client.cache_key("test", &filters_ws, FieldMask::FULL);
 
         // All keys should be different
         assert_ne!(
@@ -20381,7 +21430,7 @@ mod tests {
         // Same filter should produce same key
         let mut filters_agent2 = SearchFilters::default();
         filters_agent2.agents.insert("codex".into());
-        let key_agent2 = client.cache_key("test", &filters_agent2);
+        let key_agent2 = client.cache_key("test", &filters_agent2, FieldMask::FULL);
         assert_eq!(key_agent, key_agent2, "Same filter should produce same key");
     }
 
@@ -20491,14 +21540,40 @@ mod tests {
         assert_eq!(transpile_to_fts5("-foo"), None);
     }
 
+    /// 2l1b0.52: the fallback follows the lexical parser's standard grammar,
+    /// parentheses included, and refuses only what FTS5 cannot express: a
+    /// complement (an OR operand, or a conjunction of NOTs alone).
     #[test]
-    fn transpile_to_fts5_rejects_or_not_forms_it_cannot_represent() {
+    fn transpile_to_fts5_rejects_only_forms_fts5_cannot_express() {
         assert_eq!(transpile_to_fts5("foo OR NOT bar"), None);
-        assert_eq!(transpile_to_fts5("foo NOT bar OR baz"), None);
+        assert_eq!(transpile_to_fts5("NOT foo NOT bar"), None);
         assert_eq!(
-            transpile_to_fts5("foo NOT OR bar"),
-            None,
-            "permissive NOT-before-OR syntax must not broaden to foo OR bar"
+            transpile_to_fts5("(foo OR bar) baz").as_deref(),
+            Some("(foo OR bar) AND baz")
+        );
+        assert_eq!(
+            transpile_to_fts5("foo -(bar OR baz)").as_deref(),
+            Some("foo NOT (bar OR baz)")
+        );
+        assert_eq!(transpile_to_fts5("x&&(y)").as_deref(), Some("x AND y"));
+        // Negative: without grouping this reads foo OR (bar AND baz).
+        assert_eq!(
+            transpile_to_fts5("foo OR bar baz").as_deref(),
+            Some("foo OR (bar AND baz)")
+        );
+        assert_eq!(
+            transpile_to_fts5("foo NOT bar OR baz").as_deref(),
+            Some("(foo NOT bar) OR baz")
+        );
+        // A NOT with no operand is dropped, as the lexical parser drops it.
+        assert_eq!(
+            transpile_to_fts5("foo NOT OR bar").as_deref(),
+            Some("foo OR bar")
+        );
+        // A `(` inside a word is a term character, not a group.
+        assert_eq!(
+            transpile_to_fts5("foo(bar)").as_deref(),
+            Some("(foo AND bar)")
         );
     }
 
@@ -20535,14 +21610,365 @@ mod tests {
         );
         assert_eq!(
             transpile_to_fts5("foo OR bar NOT baz"),
-            Some("(foo OR bar) NOT baz".to_string())
+            Some("foo OR (bar NOT baz)".to_string())
         );
+    }
+
+    #[test]
+    fn sqlite_only_unlimited_search_returns_all_matches_and_offset_suffixes() -> Result<()> {
+        let fixture = build_semantic_test_fixture()?;
+        assert!(!fixture.client.has_tantivy());
+        assert_eq!(fixture.client.total_docs(), 0);
+        assert!(transpile_to_fts5("*mantic").is_none());
+
+        // Exercise both the ordinary SQLite query and the source-table scan
+        // needed for a leading wildcard that FTS5 cannot represent.
+        for query in ["semantic", "*mantic"] {
+            let expected = fixture.client.search(
+                query,
+                SearchFilters::default(),
+                fixture.doc_ids.len(),
+                0,
+                FieldMask::FULL,
+            )?;
+            assert_eq!(expected.len(), fixture.doc_ids.len(), "{query}");
+            let mut expected_paths = expected
+                .iter()
+                .map(|hit| hit.source_path.clone())
+                .collect::<Vec<_>>();
+            expected_paths.sort();
+            assert_eq!(expected_paths, fixture.source_paths, "{query}");
+
+            for offset in [0, 1, expected.len()] {
+                let actual = fixture.client.search(
+                    query,
+                    SearchFilters::default(),
+                    0,
+                    offset,
+                    FieldMask::FULL,
+                )?;
+                assert_eq!(
+                    serde_json::to_value(&actual)?,
+                    serde_json::to_value(&expected[offset..])?,
+                    "{query} with offset {offset} must retain the unlimited result suffix"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_only_hybrid_preserves_complete_windows_and_empty_semantic_delegation() -> Result<()> {
+        let fixture = build_semantic_test_fixture()?;
+        assert!(!fixture.client.has_tantivy());
+        let row_count = fixture.doc_ids.len();
+
+        for semantic_query in ["semantic fixture query", ""] {
+            let expected = fixture
+                .client
+                .search_hybrid(
+                    "semantic",
+                    semantic_query,
+                    SearchFilters::default(),
+                    row_count,
+                    0,
+                    0,
+                    FieldMask::FULL,
+                    false,
+                )?
+                .hits;
+            assert_eq!(
+                expected.len(),
+                row_count,
+                "semantic query {semantic_query:?}"
+            );
+            let mut expected_paths = expected
+                .iter()
+                .map(|hit| hit.source_path.clone())
+                .collect::<Vec<_>>();
+            expected_paths.sort();
+            assert_eq!(expected_paths, fixture.source_paths);
+
+            if semantic_query.is_empty() {
+                let lexical = fixture.client.search(
+                    "semantic",
+                    SearchFilters::default(),
+                    row_count,
+                    0,
+                    FieldMask::FULL,
+                )?;
+                assert_eq!(
+                    serde_json::to_value(&expected)?,
+                    serde_json::to_value(&lexical)?,
+                    "an empty semantic query must preserve the lexical result"
+                );
+            }
+
+            for limit in [row_count, 0] {
+                for offset in [0, 1, row_count] {
+                    let actual = fixture
+                        .client
+                        .search_hybrid(
+                            "semantic",
+                            semantic_query,
+                            SearchFilters::default(),
+                            limit,
+                            offset,
+                            0,
+                            FieldMask::FULL,
+                            false,
+                        )?
+                        .hits;
+                    assert_eq!(
+                        serde_json::to_value(&actual)?,
+                        serde_json::to_value(&expected[offset..])?,
+                        "semantic query {semantic_query:?}, limit {limit}, offset {offset}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_only_result_cache_never_replays_forgotten_canonical_rows() -> Result<()> {
+        let fixture = build_semantic_test_fixture()?;
+        assert!(!fixture.client.has_tantivy());
+        let db_path = fixture
+            .client
+            .sqlite_path
+            .as_ref()
+            .expect("fixture configured archive");
+        let storage = FrankenStorage::open(db_path)?;
+        let first =
+            fixture
+                .client
+                .search("semantic", SearchFilters::default(), 1, 0, FieldMask::FULL)?;
+        assert_eq!(first.len(), 1);
+        let forgotten_path = first[0].source_path.clone();
+        let forgotten = storage.forget_conversations_by_source_glob(&forgotten_path, false)?;
+        assert_eq!(forgotten.conversations_deleted, 1);
+        assert_eq!(forgotten.messages_matched, 1);
+        storage.rebuild_fts()?;
+
+        let cold = SearchClient::open_with_options(
+            fixture._dir.path(),
+            Some(db_path),
+            SearchClientOptions {
+                enable_reload: false,
+                enable_warm: false,
+                strict_read_only: true,
+            },
+        )?
+        .expect("canonical fixture remains available");
+        assert!(!cold.has_tantivy());
+        let expected = cold.search("semantic", SearchFilters::default(), 1, 0, FieldMask::FULL)?;
+        assert_eq!(expected.len(), 1);
+        assert_ne!(expected[0].source_path, forgotten_path);
+        for _ in 0..2 {
+            let actual = fixture.client.search(
+                "semantic",
+                SearchFilters::default(),
+                1,
+                0,
+                FieldMask::FULL,
+            )?;
+            assert_eq!(
+                serde_json::to_value(&actual)?,
+                serde_json::to_value(&expected)?
+            );
+            assert_eq!(fixture.client.cache_stats().cache_hits, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn configured_archive_corruption_reaches_sqlite_search_and_date_browse() -> Result<()> {
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join("corrupt-archive.db");
+        let corrupt_bytes = vec![0xa5; 8192];
+        std::fs::write(&db_path, &corrupt_bytes)?;
+
+        for strict_read_only in [false, true] {
+            let original_error =
+                open_search_hydration_sqlite(&db_path, Duration::from_secs(1), strict_read_only)
+                    .expect_err("a non-SQLite file must fail the actual archive opener");
+            let original_message = original_error.to_string();
+            let original_cause = original_error.root_cause().to_string();
+            let client = SearchClient::open_with_options(
+                &dir.path().join("missing-lexical-index"),
+                Some(&db_path),
+                SearchClientOptions {
+                    enable_reload: false,
+                    enable_warm: false,
+                    strict_read_only,
+                },
+            )?
+            .expect("the configured archive is opened lazily");
+            assert!(!client.has_tantivy());
+
+            let outcomes = [
+                client.search("needle", SearchFilters::default(), 5, 0, FieldMask::FULL),
+                client.search("*needle", SearchFilters::default(), 5, 0, FieldMask::FULL),
+                client.browse_by_date(SearchFilters::default(), 5, 0, true, FieldMask::FULL),
+            ];
+            for outcome in outcomes {
+                let error = outcome.expect_err(
+                    "a configured corrupt archive must not become a successful empty result",
+                );
+                let message = error.to_string();
+                assert!(
+                    message.contains("opening configured search archive"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains(&db_path.display().to_string()),
+                    "{message}"
+                );
+                assert!(message.contains(&original_message), "{message}");
+                assert_eq!(error.root_cause().to_string(), original_cause);
+            }
+            assert_eq!(std::fs::read(&db_path)?, corrupt_bytes);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn configured_archive_disappearance_errors_and_a_restored_archive_can_retry() -> Result<()> {
+        let mut fixture = build_semantic_test_fixture()?;
+        fixture.client.strict_read_only = true;
+        assert!(fixture.client.sqlite.lock().unwrap().is_none());
+        let db_path = fixture
+            .client
+            .sqlite_path
+            .as_ref()
+            .expect("fixture configured archive");
+        let original_bytes = std::fs::read(db_path)?;
+        let parked_path = db_path.with_extension("parked");
+        std::fs::rename(db_path, &parked_path)?;
+
+        let outcomes = [
+            fixture.client.search(
+                "semantic fixture query",
+                SearchFilters::default(),
+                5,
+                0,
+                FieldMask::FULL,
+            ),
+            fixture
+                .client
+                .browse_by_date(SearchFilters::default(), 5, 0, true, FieldMask::FULL),
+            fixture
+                .client
+                .search_semantic(
+                    "semantic fixture query",
+                    SearchFilters::default(),
+                    5,
+                    0,
+                    FieldMask::FULL,
+                    false,
+                )
+                .map(|(hits, _)| hits),
+        ];
+        for outcome in outcomes {
+            let error = outcome.expect_err("a disappeared configured archive must remain an error");
+            assert!(
+                error
+                    .to_string()
+                    .contains("opening configured search archive"),
+                "{error}"
+            );
+            assert!(error.chain().count() > 1, "the storage cause must survive");
+        }
+        assert!(
+            !db_path.exists(),
+            "search must not recreate the missing archive"
+        );
+        assert_eq!(std::fs::read(&parked_path)?, original_bytes);
+        std::fs::rename(&parked_path, db_path)?;
+
+        let (hits, _) = fixture.client.search_semantic(
+            "semantic fixture query",
+            SearchFilters::default(),
+            5,
+            0,
+            FieldMask::FULL,
+            false,
+        )?;
+        assert_eq!(hits.len(), fixture.doc_ids.len());
+        assert_eq!(std::fs::read(db_path)?, original_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn configured_archive_failure_keeps_complete_stored_lexical_hits_available() -> Result<()> {
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+        let content = "retained lexical evidence from the published generation";
+        let conversation = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some("retained evidence".into()),
+            workspace: None,
+            source_path: dir.path().join("retained.jsonl"),
+            started_at: Some(1),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(1),
+                content: content.into(),
+                extra: serde_json::json!({}),
+                snippets: vec![],
+                invocations: Vec::new(),
+            }],
+        };
+        index.add_conversation(&conversation)?;
+        index.commit()?;
+        let db_path = dir.path().join("corrupt-archive.db");
+        let corrupt_bytes = vec![0xa5; 8192];
+        std::fs::write(&db_path, &corrupt_bytes)?;
+
+        for configured_db in [None, Some(db_path.as_path())] {
+            let client = SearchClient::open_with_options(
+                dir.path(),
+                configured_db,
+                SearchClientOptions {
+                    enable_reload: false,
+                    enable_warm: false,
+                    strict_read_only: true,
+                },
+            )?
+            .expect("the published lexical index must remain usable");
+            assert!(client.has_tantivy());
+            if configured_db.is_some() {
+                assert!(client.sqlite_guard().is_err());
+                assert!(
+                    client.hydrate_tantivy_hit_contents(&[(1, 0)], &[]).is_err(),
+                    "required canonical hydration must report archive failure"
+                );
+            } else {
+                assert!(client.sqlite_guard()?.is_none());
+            }
+            let hits =
+                client.search("retained", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].content, content);
+            assert_eq!(
+                hits[0].source_path,
+                conversation.source_path.to_string_lossy()
+            );
+        }
+        assert_eq!(std::fs::read(&db_path)?, corrupt_bytes);
+        Ok(())
     }
 
     #[test]
     fn search_sqlite_fts5_returns_empty_when_sqlite_is_unavailable() {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -20558,6 +21984,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.search_sqlite_fts5(
@@ -20574,6 +22001,10 @@ mod tests {
             hits.unwrap().is_empty(),
             "unavailable SQLite fallback should keep returning an empty result set"
         );
+        let browse = client
+            .browse_by_date(SearchFilters::default(), 10, 0, true, FieldMask::FULL)
+            .expect("an absent optional SQLite backend stays non-fatal");
+        assert!(browse.is_empty());
     }
 
     /// `coding_agent_session_search-k0e5p` (ibuuh.24.2 sub-bead):
@@ -20684,7 +22115,7 @@ mod tests {
         }
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -20700,6 +22131,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         // Hit-key tuple: (source_path, line_number) is the stable
@@ -21218,6 +22650,62 @@ mod tests {
         assert!(exp.parsed.operators.contains(&"AND".to_string()));
     }
 
+    /// 2l1b0.52: `--explain` shows how the engine groups the query, so an
+    /// agent never infers precedence from the text. Negative control: the
+    /// legacy grammar grouped `a OR b c` as `(a OR b) AND c`.
+    #[test]
+    fn explanation_shows_the_grouping_the_engine_applies() {
+        let structure = |raw: &str| {
+            QueryExplanation::analyze(raw, &SearchFilters::default())
+                .parsed
+                .structure
+        };
+        assert_eq!(structure("a OR b c").as_deref(), Some("a OR (b AND c)"));
+        assert_eq!(structure("(a OR b) c").as_deref(), Some("(a OR b) AND c"));
+        assert_eq!(
+            structure("a -(b OR \"c d\")").as_deref(),
+            Some("a AND NOT (b OR \"c d\")")
+        );
+        assert_eq!(structure("NOT NOT a").as_deref(), Some("a"));
+        assert_eq!(structure("").as_deref(), None);
+    }
+
+    /// Unbalanced parentheses are recovered, not rejected, and `--explain`
+    /// says how: the grouping shown is the one searched.
+    #[test]
+    fn explanation_reports_recovered_parentheses() {
+        let explain = |raw: &str| QueryExplanation::analyze(raw, &SearchFilters::default());
+        let recovery = |warnings: &[String]| {
+            warnings
+                .iter()
+                .filter(|warning| warning.contains("'('") || warning.contains("'()'"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        let unclosed = explain("kiwi AND (lime OR mango");
+        assert_eq!(
+            unclosed.parsed.structure.as_deref(),
+            Some("kiwi AND (lime OR mango)")
+        );
+        assert_eq!(
+            recovery(&unclosed.warnings),
+            ["1 unclosed '(' closed at the end of the query"]
+        );
+
+        let empty = explain("kiwi () lime");
+        assert_eq!(empty.parsed.structure.as_deref(), Some("kiwi AND lime"));
+        assert_eq!(recovery(&empty.warnings), ["1 empty '()' skipped"]);
+
+        // Balanced groups, and parentheses inside a word, recover nothing.
+        for balanced in ["(kiwi OR lime) mango", "call foo(bar) now", "kiwi lime)"] {
+            assert!(
+                recovery(&explain(balanced).warnings).is_empty(),
+                "{balanced:?} needs no recovery"
+            );
+        }
+    }
+
     #[test]
     fn explanation_classifies_phrase_query() {
         let exp = QueryExplanation::analyze("\"exact phrase\"", &SearchFilters::default());
@@ -21473,7 +22961,7 @@ mod tests {
     #[test]
     fn cache_metrics_incremented_on_operations() {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -21489,6 +22977,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         // Initial metrics should be zero
@@ -21513,7 +23002,7 @@ mod tests {
     fn cache_shard_name_deterministic() {
         // Verify that shard name generation is deterministic for same filters
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -21529,6 +23018,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let filters1 = SearchFilters::default();
@@ -22184,6 +23674,131 @@ mod tests {
     }
 
     #[test]
+    fn semantic_no_limit_includes_retained_wal_messages_and_offset_suffixes() -> Result<()> {
+        let identities = |hits: &[SearchHit]| {
+            hits.iter()
+                .map(|hit| {
+                    (
+                        hit.source_path.clone(),
+                        hit.conversation_id,
+                        hit.line_number,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for sharded in [false, true] {
+            let fixture =
+                build_semantic_test_fixture_with_options(sharded, SemanticAnnFixtureMode::Missing)?;
+            assert!(!fixture.client.has_tantivy());
+            let (expected, _) = fixture.client.search_semantic(
+                "semantic fixture query",
+                SearchFilters::default(),
+                fixture.doc_ids.len(),
+                0,
+                FieldMask::FULL,
+                false,
+            )?;
+            assert_eq!(expected.len(), 3);
+            let (embedder, filter_maps, records) = {
+                let guard = fixture.client.semantic.lock().unwrap();
+                let state = guard.as_ref().expect("fixture semantic context");
+                let mut records = Vec::new();
+                for artifact in state.artifacts.iter() {
+                    let index = artifact.index();
+                    for row in 0..index.record_count() {
+                        records.push((index.doc_id_at(row)?.to_owned(), index.vector_at_f32(row)?));
+                    }
+                }
+                (
+                    Arc::clone(&state.embedder),
+                    state.filter_maps.clone(),
+                    records,
+                )
+            };
+
+            // Exercise both a wholly WAL-backed generation and a mixed
+            // main/WAL generation, with the delta in a separate shard too.
+            for main_rows_per_shard in [0_usize, 1] {
+                let mut artifacts = Vec::new();
+                let shard_size = if sharded { 2 } else { records.len() };
+                for (shard, rows) in records.chunks(shard_size).enumerate() {
+                    let path = fixture.vector_dir.join(format!(
+                        "unlimited-wal-{main_rows_per_shard}-shard-{shard}.fsvi"
+                    ));
+                    let main_rows = main_rows_per_shard.min(rows.len());
+                    let mut writer = VectorIndex::create_with_revision(
+                        &path,
+                        embedder.id(),
+                        "rev-1",
+                        embedder.dimension(),
+                        frankensearch::index::Quantization::F16,
+                    )?;
+                    for (doc_id, vector) in &rows[..main_rows] {
+                        writer.write_record(doc_id, vector)?;
+                    }
+                    writer.finish()?;
+                    if main_rows < rows.len() {
+                        let mut writer = VectorIndex::open_writer(&path)?;
+                        writer.append_batch(&rows[main_rows..])?;
+                        assert!(writer.wal_record_count() > 0);
+                    }
+                    artifacts.push(SemanticIndexArtifact::open(&path, None)?);
+                }
+                let main_count: usize = artifacts
+                    .iter()
+                    .map(|artifact| artifact.index().record_count())
+                    .sum();
+                let wal_count: usize = artifacts
+                    .iter()
+                    .map(|artifact| artifact.index().wal_record_count())
+                    .sum();
+                assert!(wal_count > 0, "the reopened delta must remain in WAL");
+                assert_eq!(main_count + wal_count, expected.len());
+                assert!(main_count < expected.len());
+                fixture.client.set_semantic_artifacts_context(
+                    Arc::clone(&embedder),
+                    artifacts,
+                    None,
+                    filter_maps.clone(),
+                    None,
+                )?;
+                let before = semantic_artifact_tree_snapshot(&fixture.vector_dir)?;
+                for approximate in [false, true] {
+                    let (hits, stats) = fixture.client.search_semantic(
+                        "semantic fixture query",
+                        SearchFilters::default(),
+                        0,
+                        0,
+                        FieldMask::FULL,
+                        approximate,
+                    )?;
+                    assert_eq!(
+                        identities(&hits),
+                        identities(&expected),
+                        "unlimited search lost WAL messages: sharded={sharded}, \
+                         main_rows_per_shard={main_rows_per_shard}, approximate={approximate}"
+                    );
+                    assert!(stats.is_none(), "the fixture has no admitted ANN graph");
+                    let (page, _) = fixture.client.search_semantic(
+                        "semantic fixture query",
+                        SearchFilters::default(),
+                        0,
+                        1,
+                        FieldMask::FULL,
+                        approximate,
+                    )?;
+                    assert_eq!(identities(&page), identities(&expected[1..]));
+                }
+                assert_eq!(
+                    semantic_artifact_tree_snapshot(&fixture.vector_dir)?,
+                    before
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn semantic_search_session_paths_filter_retries_past_initial_candidates() -> Result<()> {
         let fixture = build_semantic_test_fixture()?;
         let mut filters = SearchFilters::default();
@@ -22427,12 +24042,12 @@ mod tests {
 
     #[test]
     fn exact_artifact_contract_invalid_optional_ann_falls_back_exact_read_only() -> Result<()> {
-        let mut modes = vec![
+        let modes = [
             SemanticAnnFixtureMode::CorruptMetadata,
             SemanticAnnFixtureMode::CrossRoleAlias,
+            #[cfg(unix)]
+            SemanticAnnFixtureMode::FinalComponentSymlink,
         ];
-        #[cfg(unix)]
-        modes.push(SemanticAnnFixtureMode::FinalComponentSymlink);
 
         for mode in modes {
             let fixture = build_semantic_test_fixture_with_ann(mode)?;
@@ -22526,7 +24141,7 @@ mod tests {
         assert_eq!(hits[2].source_path, fixture.source_paths[2]);
         assert_eq!(
             fixture.client.ann_unavailability_reason()?,
-            Some(SemanticAnnUnavailableReason::MultipleExactShards)
+            Some(SemanticAnnUnavailableReason::SidecarMissing)
         );
         assert_eq!(
             semantic_artifact_tree_snapshot(&fixture.vector_dir)?,
@@ -22811,6 +24426,247 @@ mod tests {
         assert!(!should_collect_exact_total_count(0, 0));
         assert!(!should_collect_exact_total_count(1, 0));
         assert!(!should_collect_exact_total_count(usize::MAX, 0));
+    }
+
+    fn gh518_page(
+        hits: usize,
+        total_count: Option<usize>,
+        doc_count: usize,
+    ) -> crate::search::quill_bridge::QuillLexicalPage {
+        crate::search::quill_bridge::QuillLexicalPage {
+            hits: (0..hits)
+                .map(|rank| crate::search::quill_bridge::QuillLexicalDocHit {
+                    bm25_score: 1.0,
+                    rank,
+                    global_docid: u32::try_from(rank).expect("fixture rank fits u32"),
+                    document_id: format!("gh518-{rank}"),
+                })
+                .collect(),
+            total_count,
+            doc_count,
+        }
+    }
+
+    /// An error carrying the engine's own Display text, wrapped the way
+    /// `quill_bridge::search_paginated` wraps it.
+    fn gh518_engine_error(error: frankensearch::quill::argus::ArgusError) -> anyhow::Error {
+        anyhow!(
+            "executing a Quill lexical query: {}",
+            frankensearch::quill::QuillIndexError::from(error)
+        )
+    }
+
+    fn gh518_fuel_exhausted() -> anyhow::Error {
+        gh518_engine_error(
+            frankensearch::quill::argus::ArgusError::QueryFuelExhausted {
+                budget: 100,
+                consumed: 100,
+                segments_touched: 1,
+                dictionary_blocks: 2,
+                posting_blocks: 97,
+                position_docs: 0,
+            },
+        )
+    }
+
+    /// GH #518: the exact total is optional. When only the counting pass runs
+    /// out of query fuel, the ranked page is returned and its total is unknown.
+    #[test]
+    fn bounded_exact_count_keeps_the_page_when_only_the_count_runs_out_of_fuel() -> Result<()> {
+        let mut passes = Vec::new();
+        let result = bounded_exact_count_page(4, 0, 1_000, |exact_count| {
+            passes.push(exact_count);
+            if exact_count {
+                Err(gh518_fuel_exhausted())
+            } else {
+                Ok(gh518_page(4, None, 500))
+            }
+        })?;
+        assert_eq!(
+            passes,
+            [false, true],
+            "a saturated page on a small index asks for the exact count"
+        );
+        assert_eq!(result.hits, gh518_page(4, None, 500).hits);
+        assert_eq!(result.total_count, None);
+        Ok(())
+    }
+
+    /// The degrade is keyed to fuel exhaustion of the counting pass alone: a
+    /// cancelled count still fails the query, and the ranked pass is never
+    /// optional (its fuel refusal fails the query before any count is tried).
+    #[test]
+    fn bounded_exact_count_still_fails_on_other_count_errors_and_on_page_fuel() {
+        let cancelled = bounded_exact_count_page(4, 0, 1_000, |exact_count| {
+            if exact_count {
+                Err(gh518_engine_error(
+                    frankensearch::quill::argus::ArgusError::QueryCancelled { phase: "collect" },
+                ))
+            } else {
+                Ok(gh518_page(4, None, 500))
+            }
+        });
+        let error = cancelled
+            .err()
+            .expect("a cancelled counting pass fails the query");
+        assert!(
+            !crate::search::quill_bridge::is_query_fuel_exhausted(&error),
+            "{error:#}"
+        );
+
+        let mut passes = Vec::new();
+        let refused = bounded_exact_count_page(4, 0, 1_000, |exact_count| {
+            passes.push(exact_count);
+            Err(gh518_fuel_exhausted())
+        });
+        let error = refused
+            .err()
+            .expect("a fuel-exhausted ranked pass fails the query");
+        assert!(
+            crate::search::quill_bridge::is_query_fuel_exhausted(&error),
+            "{error:#}"
+        );
+        assert_eq!(passes, [false], "no count is attempted without a page");
+    }
+
+    /// Controls for the unchanged policy: an affordable count is reported, an
+    /// unsaturated page is its own total, and an index over the exact-count
+    /// ceiling is never recounted.
+    #[test]
+    fn bounded_exact_count_reports_affordable_totals_and_skips_unneeded_counts() -> Result<()> {
+        let counted = bounded_exact_count_page(4, 0, 1_000, |exact_count| {
+            Ok(gh518_page(4, exact_count.then_some(37), 500))
+        })?;
+        assert_eq!(counted.total_count, Some(37));
+
+        let mut passes = Vec::new();
+        let unsaturated = bounded_exact_count_page(4, 10, 1_000, |exact_count| {
+            passes.push(exact_count);
+            Ok(gh518_page(3, None, 500))
+        })?;
+        assert_eq!(passes, [false]);
+        assert_eq!(unsaturated.total_count, Some(13));
+
+        let mut passes = Vec::new();
+        let over_ceiling = bounded_exact_count_page(4, 0, 499, |exact_count| {
+            passes.push(exact_count);
+            Ok(gh518_page(4, None, 500))
+        })?;
+        assert_eq!(passes, [false]);
+        assert_eq!(over_ceiling.total_count, None);
+        Ok(())
+    }
+
+    /// GH #518 on the real engine: the ranked page comes from Quill, the
+    /// counting call gets Quill's own typed fuel refusal, and the policy keeps
+    /// the page with an unknown total. With fuel for both, the same call
+    /// reports the exact total and ranks the same page.
+    ///
+    /// The two calls use separate readers, ample fuel for the page and one
+    /// unit for the count, because a count-only refusal under one shared
+    /// budget could not be produced on frankensearch-quill 0.4.1. For CASS's
+    /// parsed queries the counting pass always fit the smallest budget the
+    /// ranked page fit, whether the matches sat in one segment past the first
+    /// 4,096-document scoring window or spread over one segment per ingest
+    /// shard, so no budget fit the page but not the count. The policy stays
+    /// because the total is optional either way; this test pins its wiring to
+    /// real engine errors, and the injected-error tests above pin its
+    /// decisions.
+    #[test]
+    fn bounded_exact_count_survives_a_real_count_fuel_refusal() -> Result<()> {
+        const STRONG: usize = 4;
+        const WEAK: usize = 60;
+        let dir = TempDir::new()?;
+        // Same length, so only the term frequency ranks the strong ones first.
+        let strong = ["needle"; 24].join(" ");
+        let weak = std::iter::once("needle")
+            .chain(std::iter::repeat_n("filler", 23))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut documents = Vec::with_capacity(STRONG + WEAK);
+        for ordinal in 0..STRONG + WEAK {
+            documents.push(frankensearch::quill::cass::CassDocument {
+                agent: "codex".into(),
+                workspace: Some("/ws".into()),
+                workspace_original: None,
+                source_path: format!("/gh518/{ordinal:03}.jsonl"),
+                msg_idx: 0,
+                created_at: Some(100),
+                title: Some("fixture".into()),
+                content: if ordinal < STRONG {
+                    strong.clone()
+                } else {
+                    weak.clone()
+                },
+                source_id: "local".into(),
+                origin_kind: "local".into(),
+                origin_host: None,
+                conversation_id: Some(i64::try_from(ordinal)? + 1),
+            });
+        }
+        let mut writer = crate::search::quill_bridge::QuillCassIndex::open_or_create(dir.path())?;
+        writer.add_cass_documents(&documents)?;
+        writer.commit()?;
+        drop(writer);
+
+        let query = frankensearch::quill::query::CassQueryParser::new(
+            frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
+        )
+        .map_err(|error| anyhow!("building the CASS query parser: {error}"))?
+        .parse("needle", &FsCassQueryFilters::default())
+        .query;
+        let open = |budget: u64| {
+            crate::search::quill_bridge::open_cass_reader_with_query_fuel_budget(dir.path(), budget)
+        };
+        let ample = open(crate::search::quill_bridge::cass_quill_config().query_fuel_budget)?;
+        let starved = open(1)?;
+        // Precondition: the starved reader really refuses the counting call
+        // with the engine's typed fuel error, not some other failure.
+        let refusal = match crate::search::quill_bridge::search_paginated(
+            &starved, &query, STRONG, 0, true,
+        ) {
+            Ok(page) => bail!(
+                "a one-unit reader must refuse the count, but it returned {} hits and total {:?}",
+                page.hits.len(),
+                page.total_count
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                refusal.downcast_ref::<frankensearch::quill::QuillIndexError>(),
+                Some(frankensearch::quill::QuillIndexError::QueryFuelExhausted { .. })
+            ),
+            "{refusal:#}"
+        );
+
+        let mut passes = Vec::new();
+        let degraded = bounded_exact_count_page(STRONG, 0, 1_000_000, |exact_count| {
+            passes.push(exact_count);
+            let reader = if exact_count { &starved } else { &ample };
+            crate::search::quill_bridge::search_paginated(reader, &query, STRONG, 0, exact_count)
+        })?;
+        assert_eq!(
+            passes,
+            [false, true],
+            "a saturated small page asks for its count"
+        );
+        assert_eq!(degraded.hits.len(), STRONG, "the ranked page survives");
+        assert_eq!(degraded.total_count, None, "its total is unknown");
+
+        // Control: with fuel for both passes the production entry point
+        // reports the exact total and ranks the same page.
+        let counted = execute_query_with_bounded_exact_count(&ample, &query, STRONG, 0)?;
+        let direct =
+            crate::search::quill_bridge::search_paginated(&ample, &query, STRONG, 0, true)?;
+        assert_eq!(counted.total_count, direct.total_count);
+        assert_eq!(
+            counted.total_count,
+            Some(STRONG + WEAK),
+            "every document matches"
+        );
+        assert_eq!(counted.hits, degraded.hits);
+        Ok(())
     }
 
     #[test]
@@ -23345,17 +25201,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unicode_emoji_query_terms_lower() {
-        let terms = QueryTermsLower::from_query("🚀 LAUNCH");
-        // Emoji becomes space, LAUNCH lowercased
-        let tokens: Vec<&str> = terms.tokens().collect();
-        assert!(
-            tokens.contains(&"launch"),
-            "Should extract 'launch' from emoji query"
-        );
-    }
-
     // --- CJK character queries ---
 
     #[test]
@@ -23390,13 +25235,6 @@ mod tests {
         assert_eq!(terms, vec!["测试", "代码", "search"]);
     }
 
-    #[test]
-    fn unicode_cjk_query_terms_lower() {
-        let terms = QueryTermsLower::from_query("测试 代码");
-        let tokens: Vec<&str> = terms.tokens().collect();
-        assert_eq!(tokens, vec!["测试", "代码"]);
-    }
-
     // --- RTL text queries ---
 
     #[test]
@@ -23420,14 +25258,6 @@ mod tests {
             })
             .collect();
         assert_eq!(terms, vec!["שלום", "עולם"]);
-    }
-
-    #[test]
-    fn unicode_arabic_query_terms_lower() {
-        // Arabic doesn't have case, so lowercasing is a no-op
-        let terms = QueryTermsLower::from_query("مرحبا بالعالم");
-        let tokens: Vec<&str> = terms.tokens().collect();
-        assert_eq!(tokens, vec!["مرحبا", "بالعالم"]);
     }
 
     // --- Mixed script queries ---
@@ -23456,13 +25286,6 @@ mod tests {
         // Emoji stripped, scripts preserved
         let sanitized = sanitize_query("Hello 🌍 世界");
         assert_eq!(sanitized, "Hello   世界");
-    }
-
-    #[test]
-    fn unicode_latin_cyrillic_arabic_query() {
-        let terms = QueryTermsLower::from_query("Hello Мир مرحبا");
-        let tokens: Vec<&str> = terms.tokens().collect();
-        assert_eq!(tokens, vec!["hello", "мир", "مرحبا"]);
     }
 
     // --- Zero-width characters ---
@@ -23673,18 +25496,6 @@ mod tests {
                 "CJK wildcard should produce wildcard or exact pattern"
             );
         }
-    }
-
-    #[test]
-    fn unicode_query_terms_lower_case_folding() {
-        // German sharp s (ß) lowercases to ß (not ss in Rust)
-        let terms = QueryTermsLower::from_query("STRAßE");
-        assert_eq!(terms.query_lower, "straße");
-
-        // Turkish dotless I (İ → i with dot below in some locales, but
-        // Rust uses simple Unicode case mapping)
-        let terms2 = QueryTermsLower::from_query("HELLO");
-        assert_eq!(terms2.query_lower, "hello");
     }
 
     #[test]
@@ -24072,24 +25883,83 @@ mod tests {
         );
     }
 
+    /// frankensearch 0.7's lexer reports grouping parentheses as tokens. The
+    /// fallback lanes split them off first, so a raw paren token (which would
+    /// stall `CassBoolParser`) never reaches the parser, and every lane still
+    /// terminates on unbalanced or code-shaped input.
     #[test]
-    fn special_char_terms_lower_injection() {
-        let qt = QueryTermsLower::from_query("'; DROP TABLE--");
-        let tokens: Vec<&str> = qt.tokens().collect();
-        for token in &tokens {
+    fn cass_bool_tokens_never_pass_a_raw_paren_token() {
+        for query in [
+            "foo(bar)",
+            "a) (b",
+            "x -(y)",
+            "\"p\"(q)",
+            "(a (b) c",
+            "((a))",
+            "a&&(b||c)",
+            "NOT(a)",
+            ")(",
+            "f(x) OR (g(y) h)",
+            "$(rm -rf /)",
+        ] {
+            let tokens = cass_bool_tokens(query);
             assert!(
-                token.chars().all(|c| c.is_alphanumeric()),
-                "Token should only contain alphanumeric characters: {token}"
+                !tokens.iter().any(|token| matches!(
+                    token,
+                    CassBoolToken::Token(FsCassQueryToken::LParen | FsCassQueryToken::RParen)
+                )),
+                "{query:?}: {tokens:?}"
             );
+            let _ = read_query(query);
+            let _ = transpile_to_fts5(query);
         }
+        // Mid-word parentheses stay part of the term.
+        assert_eq!(
+            cass_bool_tokens("foo(bar)"),
+            vec![CassBoolToken::Token(FsCassQueryToken::Term(
+                "foo(bar)".to_string()
+            ))]
+        );
     }
 
+    /// `--explain` lexes the raw query, where grouping parentheses now arrive
+    /// as tokens: they add no term, keep implicit-AND adjacency, and the
+    /// grouping shows in `structure`.
     #[test]
-    fn special_char_terms_lower_null_bytes() {
-        let qt = QueryTermsLower::from_query("test\x00hidden");
-        let tokens: Vec<&str> = qt.tokens().collect();
-        assert!(tokens.contains(&"test"));
-        assert!(tokens.contains(&"hidden"));
+    fn explain_reports_grouped_operands_as_bare_terms() {
+        let filters = SearchFilters::default();
+        let explanation = QueryExplanation::analyze("(alpha OR beta) gamma", &filters);
+        let terms: Vec<&str> = explanation
+            .parsed
+            .terms
+            .iter()
+            .map(|term| term.text.as_str())
+            .collect();
+        assert_eq!(terms, vec!["alpha", "beta", "gamma"]);
+        assert!(explanation.parsed.implicit_and);
+        assert!(
+            explanation
+                .parsed
+                .structure
+                .as_deref()
+                .is_some_and(|structure| structure.contains("(alpha OR beta)")),
+            "{:?}",
+            explanation.parsed.structure
+        );
+
+        // An explicit OR before the group is not an implicit AND.
+        let explanation = QueryExplanation::analyze("alpha OR (beta)", &filters);
+        assert!(!explanation.parsed.implicit_and);
+
+        // A parenthesis inside a word is not a group.
+        let explanation = QueryExplanation::analyze("foo(bar)", &filters);
+        let terms: Vec<&str> = explanation
+            .parsed
+            .terms
+            .iter()
+            .map(|term| term.text.as_str())
+            .collect();
+        assert_eq!(terms, vec!["foo(bar)"]);
     }
 
     #[test]
@@ -24187,19 +26057,6 @@ mod tests {
             .filter(|t| matches!(t, QueryToken::Term(_)))
             .count();
         assert_eq!(parsed_term_count, 1000, "Parser should produce 1000 terms");
-
-        // QueryTermsLower should handle this efficiently
-        let qt = QueryTermsLower::from_query(&query);
-        let tokens_lower: Vec<&str> = qt.tokens().collect();
-        assert_eq!(
-            tokens_lower.len(),
-            1000,
-            "All 1000 identical terms should be preserved"
-        );
-        assert!(
-            tokens_lower.iter().all(|t| *t == "test"),
-            "All tokens should be 'test'"
-        );
     }
 
     #[test]
@@ -24340,11 +26197,6 @@ mod tests {
 
         // Should produce exactly 1 token
         assert_eq!(tokens.len(), 1);
-
-        // QueryTermsLower internal storage should be bounded
-        let qt = QueryTermsLower::from_query(&large_query);
-        let token_count = qt.tokens().count();
-        assert_eq!(token_count, 1, "Should be 1 token of 100k chars");
     }
 
     #[test]
@@ -24361,16 +26213,14 @@ mod tests {
                 thread::spawn(move || {
                     let sanitized = sanitize_query(&query);
                     let tokens = parse_boolean_query(&sanitized);
-                    let qt = QueryTermsLower::from_query(&query);
-                    (tokens.len(), qt.tokens().count())
+                    tokens.len()
                 })
             })
             .collect();
 
         for (i, handle) in handles.into_iter().enumerate() {
-            let (token_len, qt_len) = handle.join().expect("Thread panicked");
+            let token_len = handle.join().expect("Thread panicked");
             assert!(token_len > 0, "Query {} should produce tokens", i);
-            assert!(qt_len > 0, "Query {} QueryTermsLower should have tokens", i);
         }
     }
 
@@ -24536,7 +26386,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         let sanitized = sanitize_query(&cjk_chars);
-        let qt = QueryTermsLower::from_query(&sanitized);
+        let tokens = parse_boolean_query(&sanitized);
         let elapsed = start.elapsed();
 
         assert!(
@@ -24544,7 +26394,7 @@ mod tests {
             "Large CJK query took {:?} (>1s)",
             elapsed
         );
-        assert!(!qt.is_empty(), "CJK query should produce tokens");
+        assert!(!tokens.is_empty(), "CJK query should produce tokens");
     }
 
     #[test]
@@ -24584,7 +26434,6 @@ mod tests {
         let start = std::time::Instant::now();
         let sanitized = sanitize_query(&mixed);
         let tokens = parse_boolean_query(&sanitized);
-        let qt = QueryTermsLower::from_query(&mixed);
         let elapsed = start.elapsed();
 
         assert!(
@@ -24593,7 +26442,6 @@ mod tests {
             elapsed
         );
         assert!(!tokens.is_empty());
-        assert!(!qt.is_empty());
     }
 
     // ==========================================================================
@@ -24932,30 +26780,6 @@ mod tests {
         assert!(!explanation.parsed.terms.is_empty());
     }
 
-    // --- QueryTermsLower edge cases ---
-
-    #[test]
-    fn query_terms_lower_unicode_normalization() {
-        // Accented characters should be lowercased properly
-        let terms = QueryTermsLower::from_query("CAFÉ RÉSUMÉ");
-        assert_eq!(terms.query_lower, "café résumé");
-    }
-
-    #[test]
-    fn query_terms_lower_mixed_case_unicode() {
-        // Mixed case CJK and Latin
-        let terms = QueryTermsLower::from_query("Hello日本語World");
-        // CJK chars have no case, Latin chars should be lowercased
-        assert!(terms.query_lower.contains("hello"));
-        assert!(terms.query_lower.contains("world"));
-    }
-
-    #[test]
-    fn query_terms_lower_preserves_numbers() {
-        let terms = QueryTermsLower::from_query("ABC123XYZ");
-        assert_eq!(terms.query_lower, "abc123xyz");
-    }
-
     // --- WildcardPattern edge cases ---
 
     #[test]
@@ -25019,39 +26843,40 @@ mod tests {
         );
         assert_eq!(
             transpile_to_fts5("foo OR bar"),
-            Some("(foo OR bar)".to_string())
+            Some("foo OR bar".to_string())
         );
         assert_eq!(transpile_to_fts5("OR foo"), Some("foo".to_string()));
         assert_eq!(transpile_to_fts5("NOT foo"), None);
 
-        // Precedence: OR binds tighter than AND in our parser logic
-        // "A AND B OR C" -> "A AND (B OR C)"
+        // Standard precedence (2l1b0.52): AND binds tighter than OR, and the
+        // result is an OR of explicitly parenthesized AND-groups. The legacy
+        // grammar read "A AND B OR C" as "A AND (B OR C)".
         assert_eq!(
             transpile_to_fts5("A AND B OR C"),
-            Some("A AND (B OR C)".to_string())
+            Some("(A AND B) OR C".to_string())
         );
-
-        // "A OR B AND C" -> "(A OR B) AND C"
         assert_eq!(
             transpile_to_fts5("A OR B AND C"),
-            Some("(A OR B) AND C".to_string())
+            Some("A OR (B AND C)".to_string())
         );
-
-        // "A OR B OR C" -> "(A OR B OR C)"
         assert_eq!(
             transpile_to_fts5("A OR B OR C"),
-            Some("(A OR B OR C)".to_string())
+            Some("A OR B OR C".to_string())
         );
 
-        // An implicit conjunction ends the OR sequence just like an explicit
-        // AND. Remaining in OR mode here would silently broaden the query.
+        // An implicit conjunction binds like an explicit AND.
         assert_eq!(
             transpile_to_fts5("A OR B C"),
-            Some("(A OR B) AND C".to_string())
+            Some("A OR (B AND C)".to_string())
         );
         assert_eq!(
             transpile_to_fts5("A OR B C OR D"),
-            Some("(A OR B) AND (C OR D)".to_string())
+            Some("A OR (B AND C) OR D".to_string())
+        );
+        // Negation is parity-based.
+        assert_eq!(
+            transpile_to_fts5("A NOT NOT B"),
+            Some("A AND B".to_string())
         );
 
         // Phrases

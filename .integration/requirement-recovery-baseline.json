@@ -1,0 +1,62 @@
+{
+  "captured_at": "2026-10-20T19:27:53+00:00",
+  "diff_fingerprint": "ff0853fcad575ab06252a182229d13f54dde2bbaa57dea36033e76dd69f01130",
+  "errors": [],
+  "feature_map_projection_hash": "5a6d9a51610cd90d22fff27e8218d5a608d517a51b6a258014c4302e4fdcf11f",
+  "git_head": "3254b9701105ccd3808bfa2c424cedc10e597a0e",
+  "kind": "requirement_recovery_baseline",
+  "policy_semantic_hash": "910c3e1519c145cea679bc10c9e0b1acec38dcf690b42ed0b7f8e0d380324472",
+  "policy_sha256": "a1b43451b35d742d30a52fabef3a617f3e1ec7845d55118230b6474fa0c5ce32",
+  "requirements": [
+    {
+      "allow_evidence_path_change": false,
+      "approval": "",
+      "category": "functional",
+      "component_id": "INT-001",
+      "confidence": "high",
+      "disposition": "adopted",
+      "duplicate_of": "",
+      "evidence": {
+        "end_line": 17,
+        "excerpt": "## RULE NUMBER 1: NO FILE DELETION\n\n**YOU ARE NEVER ALLOWED TO DELETE A FILE WITHOUT EXPRESS PERMISSION.** Even a new file that you yourself created, such as a test code file. You have a horrible track record of deleting critically important files or otherwise throwing away tons of expensive work. As a result, you have permanently lost any and all rights to determine that a file or folder should be deleted.\n\n**YOU MUST ALWAYS ASK AND RECEIVE CLEAR, WRITTEN PERMISSION BEFORE EVER DELETING A FILE OR FOLDER OF ANY KIND.**",
+        "excerpt_sha256": "48be6ccca373f245976f4cfffdb1fe95ac4c9834a394f7bf667b47cf11d539b9",
+        "file_sha256": "0bfe417391821597aae28beeb9c6fd14b1fcf7320da85536f6c51567a1dcb9d5",
+        "path": "AGENTS.md",
+        "start_line": 13
+      },
+      "evidence_change_approval": "",
+      "id": "IMPL-REQ-001",
+      "impact": "high",
+      "reason": "The repository evidence constrains the integrated behavior.",
+      "spec_ids": [
+        "SPEC-002"
+      ],
+      "statement": "No existing file may be deleted without express written permission, including paths upstream removed."
+    }
+  ],
+  "schema_version": "1.0",
+  "snapshot_hash": "ebca4b0545ea7a3ac134053a07a94c68d5a79722430b71b0ab07613ace2db424",
+  "spec_ledger_sha256": "9b155581bcacd6df0047d8d6910049c1374691034e87205454a0556f348785c8",
+  "summary": {
+    "active_component_ids": [
+      "INT-001"
+    ],
+    "active_spec_ids": [
+      "SPEC-001",
+      "SPEC-002",
+      "SPEC-003",
+      "SPEC-004"
+    ],
+    "finding_count": 1,
+    "limits": {
+      "max_evidence_bytes": 1000000,
+      "max_excerpt_lines": 80,
+      "max_findings": 128
+    },
+    "reviewed_component_ids": [
+      "INT-001"
+    ]
+  },
+  "valid": true,
+  "warnings": []
+}

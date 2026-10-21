@@ -14,6 +14,7 @@
 //! `--json`/`--robot` paths produce a parseable JSON envelope.
 
 use assert_cmd::Command;
+use coding_agent_search::raw_mirror::{RawMirrorCaptureInput, capture_source_file};
 use predicates::str::contains;
 use std::path::Path;
 use tempfile::TempDir;
@@ -103,6 +104,212 @@ fn mirror_prune_json_emits_envelope_with_prune_payload() {
         prune.get("manifest_count").is_some(),
         "payload missing manifest_count: {prune}"
     );
+}
+
+/// GH488: populated previews return candidates without adding persistent audit
+/// records. Exercise both an absent ledger and retained historical evidence.
+#[test]
+fn mirror_prune_repeated_previews_do_not_grow_the_archive() {
+    let temp = TempDir::new().expect("tempdir");
+    let data_dir = temp.path().join("data");
+    for index in 0..32 {
+        let source_path = temp.path().join(format!("session-{index}.jsonl"));
+        std::fs::write(&source_path, format!("{{\"text\":\"session {index}\"}}\n"))
+            .expect("write source");
+        capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture real source");
+    }
+    let root = data_dir.join("raw-mirror/v1");
+    let audit_path = root.join("pruned.jsonl");
+    let snapshot = || {
+        walkdir::WalkDir::new(&root)
+            .into_iter()
+            .map(|entry| entry.expect("mirror entry"))
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| {
+                let bytes = std::fs::read(entry.path()).expect("mirror bytes");
+                (entry.into_path(), bytes)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    for preview in 0..4 {
+        if preview == 1 {
+            std::fs::write(&audit_path, b"{\"mode\":\"apply\",\"applied\":true}\n")
+                .expect("seed historical audit");
+        }
+        let before = snapshot();
+        let mut cmd = cmd_in(temp.path());
+        cmd.args([
+            "mirror",
+            "prune",
+            "--max-size",
+            "0",
+            "--safety-hold-down",
+            "0s",
+            "--dry-run",
+            "--json",
+        ]);
+        let output = cmd.assert().success();
+        let value: serde_json::Value =
+            serde_json::from_slice(&output.get_output().stdout).expect("prune JSON");
+        let prune = &value["prune"];
+        assert_eq!(value["success"], true);
+        assert_eq!(prune["mode"], "dry-run");
+        assert_eq!(prune["planned_manifest_count"], 32);
+        assert_eq!(prune["planned_blob_count"], 32);
+        assert_eq!(prune["entries"].as_array().expect("candidates").len(), 64);
+        assert_eq!(prune["applied_reclaim_bytes"], 0);
+        assert!(prune["audit_log_path"].is_null());
+        assert_eq!(snapshot(), before, "preview {preview} changed mirror files");
+        if preview == 0 {
+            assert!(!audit_path.exists());
+        }
+    }
+}
+
+/// GH #522: `--keep-latest N` is a retention predicate on its own. It retires
+/// the superseded capture of an appended transcript and keeps the newest one,
+/// and the only capture of another session, through both preview and apply.
+#[test]
+fn mirror_prune_keep_latest_keeps_the_newest_capture_of_each_source() {
+    let temp = TempDir::new().expect("tempdir");
+    let data_dir = temp.path().join("data");
+    let capture = |source_path: &Path| {
+        capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path,
+            db_links: &[],
+        })
+        .expect("capture real source")
+    };
+    let lone = temp.path().join("lone.jsonl");
+    std::fs::write(&lone, "{\"text\":\"only copy\"}\n").expect("write lone session");
+    let only_copy = capture(&lone);
+    let active = temp.path().join("active.jsonl");
+    std::fs::write(&active, "{\"text\":\"first run\"}\n").expect("write transcript");
+    let superseded = capture(&active);
+    // Capture times are milliseconds; keep the two captures apart.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(
+        &active,
+        "{\"text\":\"first run\"}\n{\"text\":\"second run\"}\n",
+    )
+    .expect("append to transcript");
+    let newest = capture(&active);
+    let root = data_dir.join("raw-mirror/v1");
+
+    for mode in ["--dry-run", "--apply"] {
+        let mut cmd = cmd_in(temp.path());
+        cmd.args([
+            "mirror",
+            "prune",
+            "--keep-latest",
+            "1",
+            "--safety-hold-down",
+            "0s",
+            mode,
+            "--json",
+        ]);
+        let output = cmd.assert().success();
+        let value: serde_json::Value =
+            serde_json::from_slice(&output.get_output().stdout).expect("prune JSON");
+        let report = &value["prune"];
+        assert_eq!(report["keep_latest"], 1, "{report}");
+        assert_eq!(report["planned_manifest_count"], 1, "{report}");
+        let manifests = report["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .filter(|entry| entry["kind"] == "manifest")
+            .collect::<Vec<_>>();
+        assert_eq!(manifests.len(), 1, "{report}");
+        assert_eq!(
+            manifests[0]["path"].as_str(),
+            Some(superseded.manifest_relative_path.as_str())
+        );
+        assert_eq!(
+            manifests[0]["reason"],
+            "superseded by the newest 1 captures of its source file"
+        );
+        assert_eq!(
+            root.join(&superseded.manifest_relative_path).exists(),
+            mode == "--dry-run"
+        );
+        assert!(root.join(&newest.manifest_relative_path).exists());
+        assert!(root.join(&only_copy.manifest_relative_path).exists());
+    }
+
+    let mut cmd = cmd_in(temp.path());
+    cmd.args(["mirror", "prune", "--keep-latest", "0", "--json"]);
+    cmd.assert().failure().code(2);
+    assert!(root.join(&newest.manifest_relative_path).exists());
+}
+
+/// Preview details are bounded, but apply must retain every audit entry.
+#[test]
+fn mirror_prune_caps_preview_details_without_truncating_apply() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("data/raw-mirror/v1");
+    let mut expected_bytes = 0_u64;
+    for index in 0..1_001 {
+        let bytes = format!("orphan capture {index}");
+        let digest = blake3::hash(bytes.as_bytes()).to_hex().to_string();
+        let directory = root.join("blobs/blake3").join(&digest[..2]);
+        std::fs::create_dir_all(&directory).expect("blob directory");
+        std::fs::write(directory.join(format!("{digest}.raw")), &bytes).expect("orphan blob");
+        expected_bytes += bytes.len() as u64;
+    }
+    let audit_path = root.join("pruned.jsonl");
+    for mode in ["--dry-run", "--dry-run", "--apply"] {
+        let mut cmd = cmd_in(temp.path());
+        cmd.args([
+            "mirror",
+            "prune",
+            "--max-size",
+            "0",
+            "--safety-hold-down",
+            "0s",
+            mode,
+            "--json",
+        ]);
+        let output = cmd.assert().success();
+        let value: serde_json::Value =
+            serde_json::from_slice(&output.get_output().stdout).expect("prune JSON");
+        let report = &value["prune"];
+        assert_eq!(report["planned_blob_count"], 1_001);
+        assert_eq!(report["planned_reclaim_bytes"], expected_bytes);
+        let entries = report["entries"].as_array().expect("entries");
+        if mode == "--dry-run" {
+            assert_eq!(entries.len(), 1_000);
+            assert_eq!(report["omitted_entry_count"], 1);
+            assert_eq!(report["applied_blob_count"], 0);
+            assert!(!audit_path.exists());
+        } else {
+            assert_eq!(entries.len(), 1_001);
+            assert_eq!(report["omitted_entry_count"], 0);
+            assert_eq!(report["applied_blob_count"], 1_001);
+            assert_eq!(report["applied_reclaim_bytes"], expected_bytes);
+            assert!(entries.iter().all(|entry| entry["applied"] == true));
+            let audit = std::fs::read_to_string(&audit_path).expect("applied audit");
+            assert_eq!(
+                audit.lines().count(),
+                2_002,
+                "one intent and result per blob"
+            );
+        }
+    }
 }
 
 /// `--apply` on an empty data dir must still produce an "apply" summary

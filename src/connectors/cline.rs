@@ -4,9 +4,13 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 
 use super::{
@@ -16,6 +20,7 @@ use super::{
 };
 
 const MAX_HISTORY_BYTES: u64 = 100 * 1024 * 1024;
+const CLI_MESSAGES_SUFFIX: &str = ".messages.json";
 const LOG_NAMES: [&str; 2] = ["api_conversation_history.json", "ui_messages.json"];
 const EXTENSIONS: [&str; 2] = ["saoudrizwan.claude-dev", "rooveterinaryinc.roo-cline"];
 const STORAGE_SUFFIXES: [&str; 20] = [
@@ -54,6 +59,555 @@ struct Task {
     root: ScanRoot,
 }
 
+struct CliSession {
+    messages_path: PathBuf,
+    metadata_path: PathBuf,
+    root: ScanRoot,
+}
+
+impl CliSession {
+    fn changed(&self, since: Option<i64>) -> bool {
+        file_modified_since(&self.messages_path, since)
+            || file_modified_since(&self.metadata_path, since)
+    }
+
+    fn conversation(&self) -> Result<NormalizedConversation> {
+        let envelope = read_cli_json(&self.messages_path)?;
+        let object = envelope
+            .as_object()
+            .context("Cline CLI message source must be a JSON object")?;
+        let native_messages = object
+            .get("messages")
+            .and_then(Value::as_array)
+            .context("Cline CLI message source is missing its messages array")?;
+
+        let path_session_id = self
+            .messages_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(CLI_MESSAGES_SUFFIX))
+            .context("Cline CLI message filename has no native session identifier")?;
+        let directory_session_id = self
+            .messages_path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .context("Cline CLI message source is not inside a session directory")?;
+        let session_id = object
+            .get("sessionId")
+            .or_else(|| object.get("session_id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .context("Cline CLI message source is missing its native session identifier")?;
+        ensure!(
+            session_id == path_session_id && session_id == directory_session_id, // ubs:ignore -- Public native session identifiers bind the transcript to its filename, not credential authentication.
+            "Cline CLI session identity does not match its source path"
+        );
+
+        let session_metadata = if self.metadata_path.is_file() {
+            Some(read_cli_json(&self.metadata_path)?)
+        } else {
+            None
+        };
+        if let Some(metadata_id) = session_metadata
+            .as_ref()
+            .and_then(|value| value.get("session_id"))
+        {
+            let metadata_id = metadata_id
+                .as_str()
+                .context("Cline CLI sidecar session_id must be a string")?;
+            ensure!(
+                metadata_id == session_id, // ubs:ignore -- Public sidecar/transcript provenance identifiers, not bearer secrets.
+                "Cline CLI sidecar identity does not match its message source"
+            );
+        }
+        let session_id = session_id.to_owned();
+
+        let mut messages = Vec::with_capacity(native_messages.len());
+        for (index, item) in native_messages.iter().enumerate() {
+            ensure!(
+                item.is_object(),
+                "Cline CLI message at position {index} is not a JSON object"
+            );
+            let content_value = item
+                .get("content")
+                .or_else(|| item.get("text"))
+                .or_else(|| item.get("message"));
+            let content = match content_value
+                .map(flatten_cli_content)
+                .filter(|content| !content.trim().is_empty())
+            {
+                Some(content) => content,
+                None => serde_json::to_string(item)
+                    .context("failed to preserve a Cline CLI message without searchable text")?,
+            };
+            let idx = i64::try_from(index)
+                .context("Cline CLI message order exceeds the supported index range")?;
+            messages.push(NormalizedMessage {
+                idx,
+                role: item
+                    .get("role")
+                    .or_else(|| item.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("agent")
+                    .to_owned(), // ubs:ignore -- One owned normalized role per retained native message, bounded by the source byte limit.
+                author: None,
+                created_at: item
+                    .get("timestamp")
+                    .or_else(|| item.get("created_at"))
+                    .or_else(|| item.get("ts"))
+                    .and_then(parse_timestamp),
+                content,
+                extra: item.clone(), // ubs:ignore -- Preserve the complete native JSON separately from searchable rendering; the source is byte bounded.
+                invocations: content_value.map_or_else(Vec::new, |value| {
+                    franken_agent_detection::extract_invocations_from_content_blocks(value)
+                }),
+                snippets: Vec::new(),
+            });
+        }
+        reindex_messages(&mut messages);
+
+        let title = session_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("title"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                messages
+                    .first()
+                    .and_then(|message| message.content.lines().next())
+                    .map(|line| line.chars().take(100).collect())
+            });
+        let workspace = session_metadata
+            .as_ref()
+            .and_then(|metadata| {
+                [
+                    "workspace_root",
+                    "workspaceHome",
+                    "rootPath",
+                    "cwd",
+                    "workspace",
+                    "cwdOnTaskInitialization",
+                ]
+                .iter()
+                .find_map(|key| metadata.get(*key).and_then(Value::as_str))
+            })
+            .or_else(|| {
+                [
+                    "workspace_root",
+                    "workspaceHome",
+                    "rootPath",
+                    "cwd",
+                    "workspace",
+                ]
+                .iter()
+                .find_map(|key| object.get(*key).and_then(Value::as_str))
+            })
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from);
+        let started_at = messages
+            .iter()
+            .filter_map(|message| message.created_at)
+            .min()
+            .or_else(|| {
+                session_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("started_at"))
+                    .and_then(parse_timestamp)
+            });
+        let ended_at = messages
+            .iter()
+            .filter_map(|message| message.created_at)
+            .max()
+            .or_else(|| object.get("updated_at").and_then(parse_timestamp));
+
+        let mut native_header = envelope;
+        if let Some(header) = native_header.as_object_mut() {
+            header.remove("messages");
+        }
+        Ok(NormalizedConversation {
+            agent_slug: "cline".to_owned(),
+            external_id: Some(session_id),
+            title,
+            workspace,
+            started_at,
+            ended_at,
+            metadata: json!({
+                "source": "cline",
+                "layout": "standalone_cli",
+                "coverage": "native_cli_message_snapshot",
+                "source_read_complete": true,
+                "transcript_finality": "unknown",
+                "message_count": messages.len(),
+                "native_header": native_header,
+                "native_session_metadata": session_metadata,
+            }),
+            source_path: self.messages_path.clone(),
+            messages,
+        })
+    }
+}
+
+fn is_cli_messages_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(CLI_MESSAGES_SUFFIX))
+}
+
+fn configured_cli_root() -> Option<PathBuf> {
+    dotenvy::var("CASS_CLINE_DATA_ROOT")
+        .ok()
+        .filter(|root| !root.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+fn host_cli_root() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".cline/data/sessions"))
+}
+
+fn same_file_object(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        left.dev() == right.dev() && left.ino() == right.ino()
+    }
+    #[cfg(windows)]
+    {
+        left.volume_serial_number().is_some()
+            && left.volume_serial_number() == right.volume_serial_number()
+            && left.file_index().is_some()
+            && left.file_index() == right.file_index()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (left, right);
+        false
+    }
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    left == right
+        || left
+            .canonicalize()
+            .ok()
+            .zip(right.canonicalize().ok())
+            .is_some_and(|(left, right)| left == right)
+}
+
+fn legacy_source_layout(path: &Path) -> bool {
+    let base = if path
+        .file_name()
+        .is_some_and(|name| name == "settings" || name == "settings.json")
+    {
+        path.parent().unwrap_or(path)
+    } else {
+        path
+    };
+    let is_extension_root = base
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.contains("claude-dev") || name.contains("roo-cline"));
+    let has_legacy_task = base.is_dir()
+        && fs::read_dir(base).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                entry.file_type().is_ok_and(|kind| kind.is_dir())
+                    && LOG_NAMES.iter().any(|log| entry.path().join(log).is_file())
+            })
+        });
+    if is_extension_root || has_legacy_task {
+        return true;
+    }
+
+    let base_name = base.file_name().and_then(|name| name.to_str());
+    let suffixes: &[&str] = match base_name {
+        Some(".config") => &[
+            "Code/User/globalStorage",
+            "Code - Insiders/User/globalStorage",
+            "VSCodium/User/globalStorage",
+        ],
+        Some("Application Support") => &[
+            "Code/User/globalStorage",
+            "Code - Insiders/User/globalStorage",
+            "VSCodium/User/globalStorage",
+        ],
+        Some("Roaming")
+            if base
+                .parent()
+                .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "AppData")) =>
+        {
+            &[
+                "Code/User/globalStorage",
+                "Code - Insiders/User/globalStorage",
+                "VSCodium/User/globalStorage",
+            ]
+        }
+        Some("Code" | "Code - Insiders" | "VSCodium") => &["User/globalStorage"],
+        Some("User") => &["globalStorage"],
+        Some("globalStorage") => &[""],
+        _ => &STORAGE_SUFFIXES,
+    };
+    suffixes.iter().any(|suffix| {
+        EXTENSIONS
+            .iter()
+            .any(|extension| base.join(suffix).join(extension).is_dir())
+    })
+}
+
+fn native_cli_root_for(path: &Path, default_cli_root: Option<&Path>) -> Option<PathBuf> {
+    let name = path.file_name()?;
+    let parent_name = path.parent()?.file_name();
+    let grandparent_name = path.parent()?.parent()?.file_name();
+    if name == "sessions"
+        && parent_name.is_some_and(|parent| parent == "data")
+        && grandparent_name.is_some_and(|parent| parent == ".cline")
+    {
+        return Some(path.to_path_buf());
+    }
+    if name == "data" && parent_name.is_some_and(|parent| parent == ".cline") {
+        return Some(path.join("sessions"));
+    }
+    if name == ".cline" {
+        return Some(path.join("data/sessions"));
+    }
+
+    default_cli_root.and_then(|root| {
+        let home = root.parent()?.parent()?.parent()?;
+        same_path(path, home).then(|| root.to_path_buf())
+    })
+}
+
+fn cli_scan_roots_with(
+    ctx: &ScanContext,
+    configured_root: Option<PathBuf>,
+    default_cli_root: Option<PathBuf>,
+) -> Result<Vec<ScanRoot>> {
+    if !ctx.use_default_detection() {
+        return Ok(ctx.scan_roots.clone());
+    }
+
+    // A source-root override remains isolated; `data_dir` is normally CASS's
+    // archive and must not suppress default agent-source discovery.
+    if let Some(root) = configured_root {
+        return Ok(vec![ScanRoot::local(root)]);
+    }
+
+    if let Some(root) = native_cli_root_for(&ctx.data_dir, default_cli_root.as_deref()) {
+        return Ok(vec![ScanRoot::local(root)]);
+    }
+
+    let mut modern_tasks = Vec::new();
+    let mut seen_tasks = HashSet::new();
+    ClineConnector::collect_tasks(
+        &ScanRoot::local(ctx.data_dir.clone()),
+        &mut modern_tasks,
+        &mut seen_tasks,
+    );
+    let task_container = ctx.data_dir.file_name().is_some_and(|name| name == "tasks");
+    if !modern_tasks.is_empty() || task_container || legacy_source_layout(&ctx.data_dir) {
+        return Ok(vec![ScanRoot::local(ctx.data_dir.clone())]);
+    }
+
+    Ok(default_cli_root.into_iter().map(ScanRoot::local).collect())
+}
+
+fn cli_scan_roots(ctx: &ScanContext) -> Result<Vec<ScanRoot>> {
+    cli_scan_roots_with(ctx, configured_cli_root(), host_cli_root())
+}
+
+fn push_cli_session(
+    path: PathBuf,
+    root: &ScanRoot,
+    sessions: &mut Vec<CliSession>,
+    seen: &mut HashSet<PathBuf>,
+) {
+    if !is_cli_messages_path(&path) || !path.is_file() {
+        return;
+    }
+    let key = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    if !seen.insert(key) {
+        return;
+    }
+    let metadata_path = path.with_file_name(
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(CLI_MESSAGES_SUFFIX))
+            .map_or_else(|| "session.json".to_owned(), |id| format!("{id}.json")),
+    );
+    sessions.push(CliSession {
+        messages_path: path,
+        metadata_path,
+        root: root.clone(),
+    });
+}
+
+fn collect_cli_sessions(
+    root: &ScanRoot,
+    sessions: &mut Vec<CliSession>,
+    seen: &mut HashSet<PathBuf>,
+) -> Result<()> {
+    let path = &root.path;
+    if !path.exists() {
+        return Ok(());
+    }
+    if path.is_file() {
+        push_cli_session(path.clone(), root, sessions, seen);
+        return Ok(());
+    }
+
+    let directory_name = path.file_name().and_then(|name| name.to_str());
+    let scoped_path = match directory_name {
+        Some(".cline") => Some(path.join("data/sessions")),
+        Some("data") => Some(path.join("sessions")),
+        _ => None,
+    };
+    if let Some(scoped_path) = scoped_path {
+        if scoped_path.exists() {
+            collect_cli_sessions(&root.with_path(scoped_path), sessions, seen)?;
+        }
+        return Ok(());
+    }
+
+    let expected_file = directory_name.map(|id| path.join(format!("{id}{CLI_MESSAGES_SUFFIX}")));
+    if let Some(expected_file) = expected_file.filter(|candidate| candidate.is_file()) {
+        push_cli_session(expected_file, root, sessions, seen);
+        return Ok(());
+    }
+
+    let entries = fs::read_dir(path)
+        .with_context(|| format!("could not enumerate Cline CLI root {}", path.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!( /* ubs:ignore -- This diagnostic allocates only if reading a directory entry fails. */
+                "could not enumerate an entry in Cline CLI root {}",
+                path.display()
+            )
+        })?;
+        let entry_path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_file() && is_cli_messages_path(&entry_path) {
+            push_cli_session(entry_path, root, sessions, seen);
+        } else if file_type.is_dir() {
+            let Some(id) = entry_path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let mut candidate_name = std::ffi::OsString::from(id);
+            candidate_name.push(CLI_MESSAGES_SUFFIX);
+            let candidate = entry_path.join(candidate_name); // ubs:ignore -- Name comes from a single read_dir basename plus a constant suffix; this is read discovery, not an extraction/write path.
+            if candidate.is_file() {
+                push_cli_session(candidate, root, sessions, seen);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cli_sessions(ctx: &ScanContext) -> Result<Vec<CliSession>> {
+    let mut sessions = Vec::new();
+    let mut seen = HashSet::new();
+    for root in cli_scan_roots(ctx)? {
+        collect_cli_sessions(&root, &mut sessions, &mut seen)?;
+    }
+    sessions.sort_by(|a, b| a.messages_path.cmp(&b.messages_path));
+    Ok(sessions)
+}
+
+fn read_cli_json(path: &Path) -> Result<Value> {
+    for _attempt in 0..2 {
+        let mut file = fs::File::open(path)
+            .with_context(|| format!("could not open Cline CLI source {}", path.display()))?; // ubs:ignore -- Error-only diagnostic in a two-attempt stable-read loop.
+        let before = file.metadata()?;
+        ensure!(
+            before.len() <= MAX_HISTORY_BYTES,
+            "Cline CLI source {} exceeds the 100 MiB safety limit",
+            path.display()
+        );
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(MAX_HISTORY_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("could not read Cline CLI source {}", path.display()))?; // ubs:ignore -- Error-only diagnostic in a two-attempt stable-read loop.
+        ensure!(
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= MAX_HISTORY_BYTES,
+            "Cline CLI source {} exceeded the 100 MiB safety limit while being read",
+            path.display()
+        );
+        let after = file.metadata()?;
+        let current = fs::metadata(path)?;
+        if !same_file_object(&before, &after)
+            || !same_file_object(&after, &current)
+            || before.len() != after.len()
+            || before.modified().ok() != after.modified().ok()
+            || after.len() != current.len()
+            || after.modified().ok() != current.modified().ok()
+            || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != after.len()
+        {
+            continue;
+        }
+        let text = std::str::from_utf8(&bytes)
+            .with_context(|| format!("Cline CLI source {} is not valid UTF-8", path.display()))? // ubs:ignore -- Error-only diagnostic, never allocated on a successful decode.
+            .trim_start_matches('\u{feff}');
+        return serde_json::from_str(text).with_context(|| {
+            format!( /* ubs:ignore -- Error-only diagnostic, never allocated on successful JSON parsing. */
+                "Cline CLI source {} contains malformed or truncated JSON",
+                path.display()
+            )
+        });
+    }
+    anyhow::bail!(
+        "Cline CLI source {} changed while being read; retry after the writer settles",
+        path.display()
+    )
+}
+
+fn flatten_cli_content(value: &Value) -> String {
+    let Some(blocks) = value.as_array() else {
+        return flatten_content(value);
+    };
+    let mut parts = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        let rendered = if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+            let mut result_text = Vec::new();
+            if let Some(content) = block.get("content") {
+                collect_result_text(content, &mut result_text);
+            }
+            if result_text.is_empty() {
+                block.to_string() // ubs:ignore -- Retains an otherwise unrenderable native tool-result block within the source byte limit.
+            } else {
+                result_text.join("\n")
+            }
+        } else {
+            let rendered = flatten_content(&Value::Array(vec![block.clone()])); // ubs:ignore -- The shared renderer accepts an array; one bounded block is copied while the raw native payload stays intact.
+            if rendered.trim().is_empty() {
+                block.to_string() // ubs:ignore -- Retains an otherwise unrenderable native block within the source byte limit.
+            } else {
+                rendered
+            }
+        };
+        if !rendered.trim().is_empty() {
+            parts.push(rendered);
+        }
+    }
+    parts.join("\n")
+}
+
+fn collect_result_text(value: &Value, output: &mut Vec<String>) {
+    match value {
+        Value::String(text) if !text.trim().is_empty() => output.push(text.clone()),
+        Value::Array(items) => {
+            for item in items {
+                collect_result_text(item, output);
+            }
+        }
+        Value::Object(fields) => {
+            for key in ["text", "content", "output", "result"] {
+                if let Some(value) = fields.get(key) {
+                    collect_result_text(value, output);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn modern_task(path: &Path) -> bool {
     path.parent()
         .is_some_and(|parent| parent.file_name().is_some_and(|n| n == "tasks"))
@@ -85,7 +639,7 @@ fn read_json(path: &Path) -> Option<Value> {
     serde_json::from_str(text).ok()
 }
 
-fn messages(value: Value) -> Vec<NormalizedMessage> {
+fn messages(value: Value, preserve_native_content: bool) -> Vec<NormalizedMessage> {
     let Value::Array(items) = value else {
         return Vec::new();
     };
@@ -95,7 +649,24 @@ fn messages(value: Value) -> Vec<NormalizedMessage> {
             .get("content")
             .or_else(|| item.get("text"))
             .or_else(|| item.get("message"));
-        let content = content_value.map(flatten_content).unwrap_or_default();
+        let content = content_value
+            .map(|value| {
+                if preserve_native_content {
+                    flatten_cli_content(value)
+                } else {
+                    flatten_content(value)
+                }
+            })
+            .unwrap_or_default();
+        let content = if content.trim().is_empty()
+            && preserve_native_content
+            && content_value.is_some_and(|value| {
+                !value.is_null() && !value.as_array().is_some_and(Vec::is_empty)
+            }) {
+            item.to_string() // ubs:ignore -- Retains the whole native record when ordinary text rendering is empty; source size is bounded.
+        } else {
+            content
+        };
         if content.trim().is_empty() {
             continue;
         }
@@ -167,7 +738,10 @@ impl Task {
             {
                 continue;
             }
-            let parsed = messages(value);
+            let preserve_native_content = path
+                .file_name()
+                .is_some_and(|name| name == "api_conversation_history.json");
+            let parsed = messages(value, preserve_native_content);
             if !parsed.is_empty() {
                 return Some((path, parsed));
             }
@@ -320,7 +894,12 @@ impl ClineConnector {
                     .unwrap_or_default()
                     .iter()
                     .any(|source| source.source_path.starts_with(&ctx.data_dir));
-                if !scoped_legacy && let Some(home) = dirs::home_dir() {
+                let scoped_cli =
+                    configured_cli_root().is_some_and(|root| root.starts_with(&ctx.data_dir));
+                if !scoped_legacy
+                    && !scoped_cli
+                    && let Some(home) = dirs::home_dir()
+                {
                     Self::collect_tasks(&ScanRoot::local(home), &mut tasks, &mut seen);
                 }
             }
@@ -336,13 +915,33 @@ impl ClineConnector {
 
 impl Connector for ClineConnector {
     fn detect(&self) -> DetectionResult {
-        franken_agent_detection::ClineConnector::new().detect()
+        let mut result = franken_agent_detection::ClineConnector::new().detect();
+        if let Some(root) = configured_cli_root().or_else(host_cli_root) {
+            let context =
+                ScanContext::with_roots(PathBuf::new(), vec![ScanRoot::local(root.clone())], None);
+            if let Ok(sessions) = cli_sessions(&context)
+                && !sessions.is_empty()
+            {
+                if !result.root_paths.contains(&root) {
+                    result.root_paths.push(root.clone());
+                }
+                result.evidence.push(format!(
+                    "{} standalone Cline CLI session source(s) under {}",
+                    sessions.len(),
+                    root.display()
+                ));
+                result.detected = true;
+            }
+        }
+        result
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let mut conversations = franken_agent_detection::ClineConnector::new().scan(ctx)?;
-        conversations
-            .retain(|conversation| !conversation.source_path.parent().is_some_and(modern_task));
+        conversations.retain(|conversation| {
+            !conversation.source_path.parent().is_some_and(modern_task)
+                && !is_cli_messages_path(&conversation.source_path)
+        });
         for task in Self::tasks(ctx) {
             if let Some(tick) = &ctx.progress_tick {
                 tick();
@@ -353,13 +952,24 @@ impl Connector for ClineConnector {
                 conversations.push(conversation);
             }
         }
+        for session in cli_sessions(ctx)? {
+            if let Some(tick) = &ctx.progress_tick {
+                tick();
+            }
+            if session.changed(ctx.since_ts) {
+                conversations.push(session.conversation()?);
+            }
+        }
         Ok(conversations)
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
         let mut sources =
             franken_agent_detection::ClineConnector::new().discover_source_files(ctx)?;
-        sources.retain(|source| !source.source_path.parent().is_some_and(modern_task));
+        sources.retain(|source| {
+            !source.source_path.parent().is_some_and(modern_task)
+                && !is_cli_messages_path(&source.source_path)
+        });
         for task in Self::tasks(ctx) {
             if !task.changed(ctx.since_ts) {
                 continue;
@@ -399,8 +1009,140 @@ impl Connector for ClineConnector {
                 }
             }
         }
+        for session in cli_sessions(ctx)? {
+            if !session.changed(ctx.since_ts) {
+                continue;
+            }
+            let CliSession {
+                messages_path,
+                metadata_path,
+                root,
+            } = session;
+            sources.push(
+                DiscoveredSourceFile::new(
+                    "cline",
+                    &root,
+                    messages_path,
+                    DiscoveredSourceRole::PrimarySessionLog,
+                    true,
+                )
+                .with_fs_metadata(),
+            );
+            if metadata_path.is_file() {
+                sources.push(
+                    DiscoveredSourceFile::new(
+                        "cline",
+                        &root,
+                        metadata_path,
+                        DiscoveredSourceRole::MetadataSidecar,
+                        false,
+                    )
+                    .with_fs_metadata(),
+                );
+            }
+        }
         let mut seen = HashSet::new();
-        sources.retain(|source| seen.insert(source.source_path.clone()));
+        sources.retain(|source| {
+            let key = fs::canonicalize(&source.source_path)
+                .unwrap_or_else(|_| source.source_path.clone());
+            seen.insert(key)
+        });
         Ok(sources)
+    }
+}
+
+#[cfg(test)]
+mod cli_root_tests {
+    use super::{
+        ClineConnector, Connector, ScanContext, ScanRoot, cli_scan_roots_with, collect_cli_sessions,
+    };
+    use anyhow::{Context, ensure};
+    use serde_json::json;
+    use std::collections::HashSet;
+    use std::fs;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    fn write_native_session(root: &Path, session_id: &str) -> anyhow::Result<()> {
+        let session = root.join(session_id);
+        fs::create_dir_all(&session)?;
+        fs::write(
+            session.join(format!("{session_id}.messages.json")),
+            serde_json::to_vec(&json!({
+                "sessionId": session_id,
+                "messages": [{"role": "user", "content": "fixture"}]
+            }))?,
+        )?;
+        fs::write(
+            session.join(format!("{session_id}.json")),
+            serde_json::to_vec(&json!({"session_id": session_id}))?,
+        )?;
+        Ok(())
+    }
+
+    fn sessions_under(root: &ScanRoot) -> anyhow::Result<Vec<String>> {
+        let mut sessions = Vec::new();
+        let mut seen = HashSet::new();
+        collect_cli_sessions(root, &mut sessions, &mut seen)?;
+        sessions
+            .into_iter()
+            .map(|session| {
+                session
+                    .conversation()
+                    .map(|conversation| conversation.external_id.unwrap_or_default())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ordinary_custom_archive_uses_default_host_cli_root() -> anyhow::Result<()> {
+        let home = TempDir::new()?;
+        let archive = TempDir::new()?;
+        let host_cli_root = home.path().join(".cline/data/sessions");
+        write_native_session(&host_cli_root, "host-session")?;
+        write_native_session(&archive.path().join("old-export"), "archive-session")?;
+
+        let context = ScanContext::local_default(archive.path().to_path_buf(), None);
+        let roots = cli_scan_roots_with(&context, None, Some(host_cli_root.clone()))?;
+        ensure!(roots.len() == 1);
+        let root = roots.first().context("missing selected Cline root")?;
+        ensure!(root.path == host_cli_root);
+        ensure!(sessions_under(root)? == ["host-session"]); // ubs:ignore -- Public fixture session ID checks discovery scope, not credentials.
+        Ok(())
+    }
+
+    #[test]
+    fn recognized_legacy_source_stays_scoped_with_default_host_cli_present() -> anyhow::Result<()> {
+        let home = TempDir::new()?;
+        let legacy = TempDir::new()?;
+        let host_cli_root = home.path().join(".cline/data/sessions");
+        write_native_session(&host_cli_root, "host-session")?;
+
+        let legacy_root = legacy.path().join("saoudrizwan.claude-dev");
+        let task = legacy_root.join("task-legacy");
+        fs::create_dir_all(&task)?;
+        fs::write(
+            task.join("api_conversation_history.json"),
+            serde_json::to_vec(&json!([
+                {"role": "user", "content": "legacy fixture"}
+            ]))?,
+        )?;
+
+        let context = ScanContext::local_default(legacy_root.clone(), None);
+        let roots = cli_scan_roots_with(&context, None, Some(host_cli_root))?;
+        ensure!(roots.len() == 1);
+        let root = roots.first().context("missing selected Cline root")?;
+        ensure!(root.path == legacy_root);
+        ensure!(sessions_under(root)?.is_empty());
+
+        let conversations = ClineConnector::new().scan(&context)?;
+        ensure!(conversations.len() == 1);
+        ensure!(
+            conversations
+                .first()
+                .and_then(|conversation| conversation.messages.first())
+                .is_some_and(|message| message.content.contains("legacy fixture"))
+        );
+        Ok(())
     }
 }

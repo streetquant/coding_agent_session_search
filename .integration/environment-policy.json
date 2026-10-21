@@ -1,0 +1,46 @@
+{
+  "approved_drift": [],
+  "manifest_mode": "auto",
+  "safe_environment_keys": [
+    "CI",
+    "LANG",
+    "LC_ALL",
+    "NO_COLOR",
+    "TZ"
+  ],
+  "schema_version": "1.0",
+  "tools": [
+    {
+      "name": "git",
+      "required": true,
+      "version_argv": [
+        "git",
+        "--version"
+      ]
+    },
+    {
+      "name": "python",
+      "required": false,
+      "version_argv": [
+        "python",
+        "--version"
+      ]
+    },
+    {
+      "name": "br",
+      "required": false,
+      "version_argv": [
+        "br",
+        "--version"
+      ]
+    },
+    {
+      "name": "bv",
+      "required": false,
+      "version_argv": [
+        "bv",
+        "--version"
+      ]
+    }
+  ]
+}

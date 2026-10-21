@@ -41,11 +41,20 @@ fn cass_cmd(temp_home: &std::path::Path) -> Command {
     cmd.env("HOME", temp_home);
     cmd.env("XDG_DATA_HOME", temp_home.join(".local/share"));
     cmd.env("XDG_CONFIG_HOME", temp_home.join(".config"));
+    cmd.env("XDG_CACHE_HOME", temp_home.join(".cache"));
     cmd.env("CODEX_HOME", temp_home.join(".codex"));
+    cmd.env("CASS_CLOUDMCP_DATA_ROOT", temp_home.join("cloudmcp-empty"));
+    cmd.env(
+        "CASS_OPENWEBUI_DATA_ROOT",
+        temp_home.join("openwebui-empty"),
+    );
     // Provider overrides and CWD discovery precede HOME for some connectors.
     // Keep concurrent fleet tests and the worker's own sessions out of fixtures.
     cmd.current_dir(temp_home);
     cmd.env("CLAUDE_HOME", temp_home.join(".claude"));
+    // The Claude Code connector reads CLAUDE_CONFIG_DIR, not CLAUDE_HOME, and
+    // on Windows its default root is the profile known folder, not HOME.
+    cmd.env("CLAUDE_CONFIG_DIR", temp_home.join(".claude"));
     cmd.env("GEMINI_HOME", temp_home.join(".gemini"));
     cmd.env("OPENCODE_STORAGE_ROOT", temp_home.join(".opencode"));
     cmd.env("CASS_AIDER_DATA_ROOT", temp_home.join(".aider-missing"));
@@ -60,6 +69,36 @@ fn cass_cmd(temp_home: &std::path::Path) -> Command {
     cmd.env("CASS_AUTO_REFRESH", "0");
     cmd.env("CASS_DAEMON_SOCKET", temp_home.join("cass-daemon.sock"));
     cmd
+}
+
+/// The file a pack citation names. Pack redacts paths under a home directory,
+/// keeping only the file name, and a Windows temp dir is under one. Map such
+/// a citation back to the one fixture file under `home` with that name.
+fn cited_source(home: &Path, cited: &str) -> PathBuf {
+    let Some(redacted) = cited.strip_prefix("[REDACTED_PATH]") else {
+        return PathBuf::from(cited);
+    };
+    let name = Path::new(redacted.trim_start_matches(['/', '\\']))
+        .file_name()
+        .expect("a redacted citation keeps its file name")
+        .to_owned();
+    let matches: Vec<PathBuf> = walkdir::WalkDir::new(home)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file() && entry.file_name() == name)
+        .map(walkdir::DirEntry::into_path)
+        .collect();
+    assert_eq!(matches.len(), 1, "one fixture file is named {name:?}");
+    matches.into_iter().next().expect("one match")
+}
+
+/// Where `seed_codex_session` puts `filename`, joined component by component
+/// as the Codex connector walks it, so the separators match the archive's
+/// stored path on Windows too.
+fn native_codex_session_path(codex_home: &Path, filename: &str) -> PathBuf {
+    ["sessions", "2026", "04", "23", filename]
+        .iter()
+        .fold(codex_home.to_path_buf(), |path, part| path.join(part))
 }
 
 fn seed_codex_session(codex_home: &std::path::Path, filename: &str, keyword: &str) {
@@ -170,6 +209,8 @@ fn gh422_search_refresh_stall_releases_lock_and_recovers_cold_query() {
         .env("CASS_DATA_DIR", &data_dir)
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("CASS_CLOUDMCP_DATA_ROOT", home.join("cloudmcp-empty"))
+        .env("CASS_OPENWEBUI_DATA_ROOT", home.join("openwebui-empty"))
         .env("CASS_AUTO_REFRESH", "0")
         .env("CASS_INDEX_STALL_DETECT_SECS", "5")
         .env("CASS_INDEX_STALL_ABORT_SECS", "20")
@@ -674,6 +715,162 @@ fn run_hybrid_hash_search(home: &Path, data_dir: &Path, query: &str) -> Value {
 }
 
 #[test]
+fn semantic_budget_admission_and_dispatch_preserve_requested_mode() {
+    let tmp = TempDir::new().expect("isolated budget-transition home");
+    let home = tmp.path();
+    fs::write(home.join(".env"), "").expect("isolate dotenv discovery");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).expect("budget-transition archive directory");
+    for idx in 0..3 {
+        seed_codex_session(
+            &home.join(".codex"),
+            &format!("rollout-budget-transition-{idx}.jsonl"),
+            "budgettransitionprobe searchable concept",
+        );
+    }
+    run_fresh_index(home, &data_dir);
+    build_hash_semantic_assets(&data_dir, false);
+
+    let run = |mode: Option<&str>, budget: &str, phase: &str, model: &str| {
+        let mut cmd = cass_cmd(home);
+        cmd.args([
+            "search",
+            "budgettransitionprobe",
+            "--json",
+            "--robot-meta",
+            "--model",
+            model,
+            "--limit",
+            "5",
+            "--no-maintenance",
+            "--no-daemon",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .env("CASS_SEARCH_BUDGET_MS", budget)
+        .env("CASS_SEARCH_TIMEOUT_MS", "")
+        .env("CASS_SEARCH_TIMEOUT", "")
+        .env("CASS_SEARCH_MODE", "")
+        .env("CASS_TEST_SEMANTIC_DISPATCH_BUDGET_PHASE", phase)
+        .timeout(Duration::from_secs(60));
+        if let Some(mode) = mode {
+            cmd.args(["--mode", mode]);
+        }
+        let output = cmd
+            .output()
+            .expect("fresh-process budget-transition search");
+        assert!(output.stdout.len().saturating_add(output.stderr.len()) < 8 * 1024 * 1024);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout
+                .lines()
+                .count()
+                .saturating_add(stderr.lines().count())
+                < 10_000
+        );
+        let encoded = if output.status.success() {
+            stdout.trim()
+        } else {
+            stderr
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .expect("JSON error")
+        };
+        let payload: Value = serde_json::from_str(encoded).expect("budget-transition JSON");
+        (output.status.code(), payload, stdout.is_empty())
+    };
+
+    for mode in [Some("semantic"), Some("hybrid"), None, Some("lexical")] {
+        let (code, healthy, _) = run(mode, "5000", "", "hash");
+        assert_eq!(code, Some(0), "healthy {mode:?}: {healthy}");
+        assert!(!healthy["hits"].as_array().expect("healthy hits").is_empty());
+        assert_eq!(healthy["_meta"]["search_mode"], mode.unwrap_or("hybrid"));
+
+        if mode != Some("lexical") {
+            let (code, invalid, empty_stdout) = run(mode, "1", "", "invalid-fixture-producer");
+            assert_eq!(code, Some(15), "invalid producer must win: {invalid}");
+            assert_eq!(invalid["error"]["code"], 15);
+            assert!(empty_stdout);
+
+            let (code, pressure, empty_stdout) = run(mode, "1", "", "hash");
+            if mode == Some("semantic") {
+                assert_eq!(code, Some(10), "strict initial admission: {pressure}");
+                assert!(empty_stdout);
+                assert_eq!(pressure["error"]["kind"], "timeout");
+                assert_eq!(pressure["error"]["retryable"], true);
+                assert!(
+                    pressure["error"]["hint"]
+                        .as_str()
+                        .expect("retry hint")
+                        .contains("Increase --timeout")
+                );
+            } else {
+                assert_eq!(code, Some(0), "hybrid initial admission: {pressure}");
+                assert_eq!(pressure["_meta"]["search_mode"], "lexical");
+                assert_eq!(pressure["_meta"]["semantic_refinement"], false);
+                assert_eq!(
+                    pressure["_meta"]["semantic_fallback_reason"],
+                    "semantic_budget_limited"
+                );
+            }
+        }
+
+        for phase in ["near-limit", "exhausted"] {
+            let (code, payload, empty_stdout) = run(mode, "5000", phase, "hash");
+            if mode == Some("semantic") {
+                assert_eq!(code, Some(10), "strict dispatch {phase}: {payload}");
+                assert!(empty_stdout);
+                assert_eq!(payload["error"]["kind"], "timeout");
+                assert_eq!(payload["error"]["retryable"], true);
+                let message = payload["error"]["message"]
+                    .as_str()
+                    .expect("timeout reason");
+                assert!(message.contains("checkpoint=before-search"));
+                assert!(message.contains(&format!("phase={phase}")));
+                continue;
+            }
+            assert_eq!(code, Some(0), "dispatch {mode:?}/{phase}: {payload}");
+            let meta = &payload["_meta"];
+            assert_eq!(meta["search_mode"], "lexical");
+            assert_eq!(meta["semantic_refinement"], false);
+            let skipped = payload["budget"]["skipped_sections"]
+                .as_array()
+                .expect("skipped sections");
+            let hits = payload["hits"].as_array().expect("dispatch hits");
+            if mode == Some("lexical") {
+                assert!(!hits.is_empty());
+                assert!(
+                    !skipped
+                        .iter()
+                        .any(|section| section == "semantic_refinement")
+                );
+            } else {
+                assert_eq!(meta["fallback_tier"], "lexical");
+                assert_eq!(meta["refinement_level"], "lexical_only");
+                assert_eq!(meta["semantic_fallback_reason"], "semantic_budget_limited");
+                assert!(
+                    skipped
+                        .iter()
+                        .any(|section| section == "semantic_refinement")
+                );
+                if phase == "near-limit" {
+                    assert!(
+                        !hits.is_empty(),
+                        "NearLimit must still execute lexical retrieval"
+                    );
+                } else {
+                    assert!(hits.is_empty());
+                    assert_eq!(payload["budget"]["timed_out"], true);
+                    assert!(skipped.iter().any(|section| section == "search"));
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn explicit_semantic_budget_pressure_never_realizes_lexical() {
     let tmp = TempDir::new().expect("create isolated semantic-budget home");
     let home = tmp.path();
@@ -922,6 +1119,155 @@ fn no_maintenance_lexical_search_is_byte_stable_across_the_real_cli_path() {
 }
 
 #[test]
+fn bounded_history_recipe_keeps_workspace_dates_citations_and_archive_bytes() -> anyhow::Result<()>
+{
+    use chrono::{Duration as CalendarDuration, Utc};
+    use serde_json::json;
+
+    let tmp = TempDir::new()?;
+    let home = tmp.path();
+    // Stop dotenv discovery before it can reach an operator's configuration.
+    fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(home.join(".env"))?;
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("recipe-archive");
+    let workspace = home.join("selected-project");
+    let other_workspace = home.join("unrelated-project");
+    let now = Utc::now();
+    let recent = now.to_rfc3339();
+    let old = (now - CalendarDuration::days(30)).to_rfc3339();
+    let selected_source = native_codex_session_path(&codex_home, "rollout-recipe-recent.jsonl");
+    for (name, cwd, timestamp) in [
+        ("rollout-recipe-recent.jsonl", &workspace, &recent),
+        ("rollout-recipe-old.jsonl", &workspace, &old),
+        ("rollout-recipe-other.jsonl", &other_workspace, &recent),
+    ] {
+        let path = native_codex_session_path(&codex_home, name);
+        fs::create_dir_all(path.parent().unwrap())?;
+        let metadata = json!({
+            "timestamp": timestamp, "type": "session_meta",
+            "payload": {"id": name, "cwd": cwd, "cli_version": "0.42.0"},
+        });
+        let message = json!({
+            "timestamp": timestamp, "type": "response_item",
+            "payload": {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": format!("performance regression recipe evidence {name}")},
+            ]},
+        });
+        fs::write(path, format!("{metadata}\n{message}\n"))?;
+    }
+    run_fresh_index(home, &data_dir);
+    run_forced_full_index(home, &data_dir);
+    let storage = FrankenStorage::open_readonly(&data_dir.join("agent_search.db"))?;
+    assert_eq!(
+        storage.list_conversations(10, 0)?.len(),
+        3,
+        "fixture isolation"
+    );
+    drop(storage);
+    let before = data_tree_snapshot(home);
+
+    let output = cass_cmd(home)
+        .args(["search", "performance regression", "--workspace"])
+        .arg(&workspace)
+        .args([
+            "--days",
+            "7",
+            "--mode",
+            "lexical",
+            "--no-maintenance",
+            "--robot",
+            "--robot-meta",
+            "--fields",
+            "minimal",
+            "--limit",
+            "5",
+            "--max-tokens",
+            "2000",
+            "--timeout",
+            "2000",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .timeout(Duration::from_secs(10))
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(payload["budget"]["timed_out"], false);
+    assert_eq!(payload["_meta"]["search_mode"], "lexical");
+    let hits = payload["hits"].as_array().unwrap();
+    assert_eq!(
+        hits.len(),
+        1,
+        "workspace/date scope must exclude both distractors: {payload}"
+    );
+    let hit = &hits[0];
+    assert!(hit.get("content").is_none() && hit.get("snippet").is_none());
+    let source = hit["source_path"].as_str().unwrap();
+    assert_eq!(Path::new(source), selected_source);
+    // Search's `line_number` is the canonical message ordinal
+    // (`messages.idx + 1`), not a physical file line. `cass view` keeps the
+    // two coordinate spaces apart: `-n` is a raw file line, and a search hit
+    // is followed with `--message-index` (see `cass view --help` and the
+    // search-hit field bridge in README). Following the hit in the wrong
+    // space lands on the rollout's `session_meta` line instead of the cited
+    // message.
+    let message_index = hit["line_number"].as_u64().unwrap();
+    assert!(message_index > 0);
+    assert_eq!(hit["agent"], "codex");
+    assert!(payload["_meta"]["tokens_estimated"].as_u64().unwrap() <= 2000);
+
+    let view = cass_cmd(home)
+        .env("CASS_DATA_DIR", &data_dir)
+        .args([
+            "view",
+            source,
+            "--message-index",
+            &message_index.to_string(),
+            "-C",
+            "3",
+            "--json",
+            "--timeout",
+            "2000",
+        ])
+        .timeout(Duration::from_secs(10))
+        .output()?;
+    assert!(
+        view.status.success(),
+        "{}",
+        String::from_utf8_lossy(&view.stderr)
+    );
+    let viewed: Value = serde_json::from_slice(&view.stdout)?;
+    // The canonical message lookup reports a deadline failure as a command
+    // error ("Canonical message lookup exceeded its <N>ms budget"), not as
+    // a `budget` block: only the raw-file view carries that envelope. A
+    // successful exit is therefore the timeout signal on this path.
+    assert_eq!(viewed["coordinate_space"], "message_index");
+    assert!(viewed["lines"].as_array().unwrap().iter().any(|row| {
+        row["is_target"] == true
+            && row["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("performance regression"))
+    }));
+    assert_eq!(
+        data_tree_snapshot(home),
+        before,
+        "retrieval must not change the isolated home or archive"
+    );
+    assert!(
+        !data_dir.join("models").exists(),
+        "recipe must not acquire a model"
+    );
+    Ok(())
+}
+
+#[test]
 fn gh422_timeout_retry_preserves_scoped_read_only_search() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("retry's isolated home");
@@ -934,7 +1280,9 @@ fn gh422_timeout_retry_preserves_scoped_read_only_search() {
     for name in ["rollout-selected.jsonl", "rollout-excluded.jsonl"] {
         seed_codex_session(&codex_home, name, "scopedretryneedle");
     }
-    let selected = codex_home.join("sessions/2026/04/23/rollout-selected.jsonl");
+    // A scope matches stored paths exactly, and the archive stores the
+    // connector's walked path: native separators throughout on Windows.
+    let selected = native_codex_session_path(&codex_home, "rollout-selected.jsonl");
     let scope = home.join("selected sessions.txt");
     fs::write(&scope, format!("{}\n", selected.display())).unwrap();
     let indexed = cass_cmd(&home)
@@ -981,7 +1329,7 @@ fn gh422_timeout_retry_preserves_scoped_read_only_search() {
     for (delay, agent, expected_hits) in [
         ("CASS_TEST_SEARCH_SETUP_SLOW_MS", "codex", 1),
         ("CASS_TEST_SEARCH_META_SLOW_MS", "codex", 1),
-        ("CASS_TEST_SEARCH_SETUP_SLOW_MS", "not-a-real-agent", 0),
+        ("CASS_TEST_SEARCH_SETUP_SLOW_MS", "claude_code", 0),
     ] {
         let output = cass_cmd(&home)
             .env(delay, "6000")
@@ -1106,6 +1454,31 @@ fn gh422_timeout_retry_preserves_scoped_read_only_search() {
         );
         assert!(!data_dir.join("agent_search.db").exists());
     }
+    let invalid = cass_cmd(&home)
+        .env("CASS_TEST_SEARCH_SETUP_SLOW_MS", "6000")
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "search",
+            "scopedretryneedle",
+            "--robot",
+            "--mode",
+            "lexical",
+            "--no-maintenance",
+            "--timeout",
+            "3000",
+            "--agent",
+            "not-a-real-agent",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .timeout(Duration::from_secs(15))
+        .output()
+        .unwrap();
+    assert_eq!(invalid.status.code(), Some(2));
+    let error: Value = serde_json::from_slice(&invalid.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "unknown-agent", "{error}");
+    assert_eq!(before, data_tree_snapshot(&data_dir));
 }
 
 #[test]
@@ -1240,7 +1613,7 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
     for item in evidence {
         let citation = &item["citation"];
         assert_eq!(
-            Path::new(citation["source_path"].as_str().expect("source path")),
+            cited_source(home, citation["source_path"].as_str().expect("source path")),
             source_path
         );
         let line = citation["line_start"].as_u64().expect("citation line") as usize;
@@ -1253,11 +1626,51 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
             citation["span_hash"],
             blake3::hash(cited.as_bytes()).to_hex().to_string()
         );
-        let citation_core = format!(
-            "local\n{}\n{line}\n{line}\n{}",
-            source_path.display(),
-            blake3::hash(cited.as_bytes()).to_hex()
-        );
+        // Recompute the v2 identity (#493) independently of the production
+        // hasher: a domain tag, then length-prefixed text fields, then tagged
+        // optional coordinates. The line and span hash it binds are the ones
+        // checked against the source file just above.
+        let mut identity = blake3::Hasher::new();
+        identity.update(b"cass.pack.evidence.v2\0");
+        // Pack binds the stored source path, and prints it redacted under a
+        // home directory (a Windows temp dir is under one).
+        let stored_path = native_codex_session_path(&codex_home, filename)
+            .to_string_lossy()
+            .into_owned();
+        for field in ["source_id", "source_path", "agent", "content_hash"] {
+            let text = if field == "source_path" {
+                stored_path.as_str()
+            } else {
+                citation[field].as_str().expect(field)
+            };
+            identity.update(&(text.len() as u64).to_le_bytes());
+            identity.update(text.as_bytes());
+        }
+        match citation["conversation_id"].as_i64() {
+            Some(id) => {
+                identity.update(&[1]);
+                identity.update(&id.to_le_bytes());
+            }
+            None => {
+                identity.update(&[0]);
+            }
+        }
+        for field in ["message_index", "line_start", "line_end"] {
+            match citation[field].as_u64() {
+                Some(number) => {
+                    identity.update(&[1]);
+                    identity.update(&number.to_le_bytes());
+                }
+                None => {
+                    identity.update(&[0]);
+                }
+            }
+        }
+        let span_hash = blake3::hash(cited.as_bytes()).to_hex().to_string();
+        identity.update(&(span_hash.len() as u64).to_le_bytes());
+        identity.update(span_hash.as_bytes());
+        assert_eq!(citation["line_start"], line);
+        assert_eq!(citation["source_id"], "local");
         let encoded = item["id"]
             .as_str()
             .expect("evidence ID")
@@ -1284,7 +1697,7 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
         }
         assert_eq!(
             &decoded,
-            blake3::hash(citation_core.as_bytes()).as_bytes(),
+            identity.finalize().as_bytes(),
             "evidence identity must bind the actual verified source span"
         );
         assert!(citation["message_index"].is_u64());
@@ -1676,8 +2089,11 @@ fn pack_final_output_budget_bounds_all_formats_and_refuses_oversized_metadata() 
             }
             for item in evidence {
                 assert_eq!(item["citation"]["verified"], true);
-                let source =
-                    fs::read_to_string(item["citation"]["source_path"].as_str().unwrap()).unwrap();
+                let source = fs::read_to_string(cited_source(
+                    home,
+                    item["citation"]["source_path"].as_str().unwrap(),
+                ))
+                .unwrap();
                 let line_index = source
                     .lines()
                     .position(|line| {
@@ -1828,8 +2244,8 @@ fn structured_pack_retains_source_verification_after_slow_planning() {
     );
     let source_path = codex_home.join("sessions/2026/04/23/rollout-planning.jsonl");
     assert_eq!(
-        citation["source_path"],
-        source_path.to_string_lossy().as_ref()
+        cited_source(home, citation["source_path"].as_str().expect("source path")),
+        source_path
     );
     assert_eq!(citation["line_start"], 2);
     let source = fs::read_to_string(source_path).unwrap();
@@ -1945,7 +2361,11 @@ fn pack_excludes_skill_payloads_without_losing_ordinary_evidence() {
             assert_eq!(evidence[0]["excerpt"], ordinary);
             let citation = &evidence[0]["citation"];
             assert_eq!(citation["verified"], true);
-            let source = fs::read_to_string(citation["source_path"].as_str().unwrap()).unwrap();
+            let source = fs::read_to_string(cited_source(
+                home,
+                citation["source_path"].as_str().unwrap(),
+            ))
+            .unwrap();
             let line = source.lines().nth(1).unwrap();
             assert_eq!(
                 citation["span_hash"],
@@ -2025,7 +2445,11 @@ fn pack_excludes_skill_payloads_without_losing_ordinary_evidence() {
             for item in evidence {
                 let citation = &item["citation"];
                 assert_eq!(citation["verified"], true, "opt-in {format}");
-                let source = fs::read_to_string(citation["source_path"].as_str().unwrap()).unwrap();
+                let source = fs::read_to_string(cited_source(
+                    home,
+                    citation["source_path"].as_str().unwrap(),
+                ))
+                .unwrap();
                 assert_eq!(
                     citation["span_hash"],
                     blake3::hash(source.lines().nth(1).unwrap().as_bytes())
@@ -2179,11 +2603,13 @@ fn markdown_pack_preserves_json_excerpts_without_interpreting_source_markup() {
             } else {
                 format!("{excerpt}\n")
             });
-            let source = Path::new(
+            let source = cited_source(
+                home,
                 item["citation"]["source_path"]
                     .as_str()
                     .expect("source path"),
             );
+            let source = source.as_path();
             assert!(source.is_file());
             if source.file_name().and_then(|name| name.to_str())
                 == Some("rollout-markdown-safe.jsonl")
@@ -2317,9 +2743,7 @@ fn explicit_empty_session_scope_never_expands_to_the_archive() {
     }
     run_fresh_index(home, &data_dir);
     build_hash_semantic_assets(&data_dir, true);
-    let selected = codex_home
-        .join("sessions/2026/04/23")
-        .join("rollout-scope-selected.jsonl");
+    let selected = native_codex_session_path(&codex_home, "rollout-scope-selected.jsonl");
     let scope_path = home.join("session-scope.txt");
     let before = data_tree_snapshot(&data_dir);
 

@@ -23,7 +23,7 @@
 //! |-------------|------------------------------------------------------------|
 //! | Chrome      | ToggleTheme, ToggleDensity, ToggleHelpStrip, OpenUpdate    |
 //! | Filter      | FilterAgent, FilterWorkspace, FilterToday/Week/CustomDate  |
-//! | View        | OpenSavedViews, SaveViewSlot, LoadViewSlot, BulkActions, ReloadIndex |
+//! | View        | OpenSavedViews, CycleGrouping, SaveViewSlot, LoadViewSlot, BulkActions, ReloadIndex |
 //! | Analytics   | AnalyticsDashboard..AnalyticsCoverage                      |
 //! | Export      | ScreenshotHtml, ScreenshotSvg, ScreenshotText             |
 //! | Recording   | MacroRecordingToggle                                       |
@@ -160,10 +160,16 @@ pub enum PaletteAction {
     FilterWeek,
     FilterCustomDate,
     OpenSavedViews,
+    CycleGrouping,
     SaveViewSlot(u8),
     LoadViewSlot(u8),
     OpenBulkActions,
     ReloadIndex,
+    /// Save the selected search hit through `crate::bookmarks`.
+    BookmarkSelectedHit,
+    /// Open the swarm operations cockpit (the Swarm tab), which has no
+    /// direct key.
+    OpenSwarm,
     // -- Analytics surface ------------------------------------------------
     AnalyticsDashboard,
     AnalyticsExplorer,
@@ -196,10 +202,13 @@ impl PaletteAction {
             | Self::FilterWeek
             | Self::FilterCustomDate => PaletteGroup::Filter,
             Self::OpenSavedViews
+            | Self::CycleGrouping
             | Self::SaveViewSlot(_)
             | Self::LoadViewSlot(_)
             | Self::OpenBulkActions
-            | Self::ReloadIndex => PaletteGroup::View,
+            | Self::ReloadIndex
+            | Self::BookmarkSelectedHit
+            | Self::OpenSwarm => PaletteGroup::View,
             Self::AnalyticsDashboard
             | Self::AnalyticsExplorer
             | Self::AnalyticsHeatmap
@@ -235,10 +244,13 @@ impl PaletteAction {
             Self::FilterCustomDate => "InputModeEntered(CreatedFrom)",
             // View
             Self::OpenSavedViews => "SavedViewsOpened",
+            Self::CycleGrouping => "GroupingCycled",
             Self::SaveViewSlot(_) => "ViewSaved(slot)",
             Self::LoadViewSlot(_) => "ViewLoaded(slot)",
             Self::OpenBulkActions => "BulkActionsOpened",
             Self::ReloadIndex => "IndexRefreshRequested",
+            Self::BookmarkSelectedHit => "BookmarkSelectedHit",
+            Self::OpenSwarm => "SwarmEntered",
             // Analytics (all batch: AnalyticsEntered + AnalyticsViewChanged)
             Self::AnalyticsDashboard => "batch[AnalyticsEntered, AnalyticsViewChanged(Dashboard)]",
             Self::AnalyticsExplorer => "batch[AnalyticsEntered, AnalyticsViewChanged(Explorer)]",
@@ -282,6 +294,8 @@ pub enum PaletteResult {
     SetTimeFilter { from: TimeFilterPreset },
     /// Open the saved-views picker.
     OpenSavedViews,
+    /// Cycle result panes through agent, conversation, workspace, and flat.
+    CycleGrouping,
     /// Save the current view to a numbered slot.
     SaveViewSlot(u8),
     /// Load a view from a numbered slot.
@@ -290,6 +304,10 @@ pub enum PaletteResult {
     OpenBulkActions,
     /// Reload/refresh the index.
     ReloadIndex,
+    /// Bookmark the selected search hit.
+    BookmarkSelectedHit,
+    /// Switch to the swarm operations cockpit.
+    OpenSwarm,
     /// Navigate to an analytics sub-view (by name).
     OpenAnalyticsView(AnalyticsTarget),
     /// Request a screenshot export in the given format.
@@ -362,10 +380,13 @@ impl PaletteAction {
             Self::FilterCustomDate => PaletteResult::EnterInputMode(InputModeTarget::CreatedFrom),
             // Views
             Self::OpenSavedViews => PaletteResult::OpenSavedViews,
+            Self::CycleGrouping => PaletteResult::CycleGrouping,
             Self::SaveViewSlot(slot) => PaletteResult::SaveViewSlot(*slot),
             Self::LoadViewSlot(slot) => PaletteResult::LoadViewSlot(*slot),
             Self::OpenBulkActions => PaletteResult::OpenBulkActions,
             Self::ReloadIndex => PaletteResult::ReloadIndex,
+            Self::BookmarkSelectedHit => PaletteResult::BookmarkSelectedHit,
+            Self::OpenSwarm => PaletteResult::OpenSwarm,
             // Analytics
             Self::AnalyticsDashboard => {
                 PaletteResult::OpenAnalyticsView(AnalyticsTarget::Dashboard)
@@ -498,6 +519,11 @@ pub fn default_actions() -> Vec<PaletteItem> {
             "List saved slots",
         ),
         item(
+            PaletteAction::CycleGrouping,
+            "Cycle result grouping (agent / conversation / workspace / flat)",
+            shortcuts::GROUPING,
+        ),
+        item(
             PaletteAction::ToggleDensity,
             "Toggle density",
             shortcuts::DENSITY,
@@ -542,6 +568,16 @@ pub fn default_actions() -> Vec<PaletteItem> {
             PaletteAction::OpenBulkActions,
             "Bulk actions",
             shortcuts::BULK_MENU,
+        ),
+        item(
+            PaletteAction::BookmarkSelectedHit,
+            "Bookmark selected result",
+            shortcuts::BOOKMARK,
+        ),
+        item(
+            PaletteAction::OpenSwarm,
+            "Swarm operations cockpit",
+            "Swarm tab: live read-only swarm status",
         ),
         item(
             PaletteAction::ReloadIndex,
@@ -1051,10 +1087,13 @@ mod tests {
             PaletteAction::FilterWeek,
             PaletteAction::FilterCustomDate,
             PaletteAction::OpenSavedViews,
+            PaletteAction::CycleGrouping,
             PaletteAction::SaveViewSlot(1),
             PaletteAction::LoadViewSlot(1),
             PaletteAction::OpenBulkActions,
             PaletteAction::ReloadIndex,
+            PaletteAction::BookmarkSelectedHit,
+            PaletteAction::OpenSwarm,
             PaletteAction::AnalyticsDashboard,
             PaletteAction::AnalyticsExplorer,
             PaletteAction::AnalyticsHeatmap,
@@ -1090,6 +1129,8 @@ mod tests {
             PaletteAction::LoadViewSlot(1),
             PaletteAction::OpenBulkActions,
             PaletteAction::ReloadIndex,
+            PaletteAction::BookmarkSelectedHit,
+            PaletteAction::OpenSwarm,
             PaletteAction::AnalyticsDashboard,
             PaletteAction::AnalyticsExplorer,
             PaletteAction::AnalyticsHeatmap,
@@ -1156,6 +1197,11 @@ mod tests {
         assert_eq!(PaletteAction::LoadViewSlot(5).group(), PaletteGroup::View);
         assert_eq!(PaletteAction::OpenBulkActions.group(), PaletteGroup::View);
         assert_eq!(PaletteAction::ReloadIndex.group(), PaletteGroup::View);
+        assert_eq!(
+            PaletteAction::BookmarkSelectedHit.group(),
+            PaletteGroup::View
+        );
+        assert_eq!(PaletteAction::OpenSwarm.group(), PaletteGroup::View);
     }
 
     #[test]
@@ -1197,6 +1243,8 @@ mod tests {
             PaletteAction::OpenSavedViews,
             PaletteAction::OpenBulkActions,
             PaletteAction::ReloadIndex,
+            PaletteAction::BookmarkSelectedHit,
+            PaletteAction::OpenSwarm,
             PaletteAction::AnalyticsDashboard,
             PaletteAction::AnalyticsExplorer,
             PaletteAction::AnalyticsHeatmap,
@@ -1308,6 +1356,14 @@ mod tests {
             PaletteAction::ReloadIndex.dispatch(),
             PaletteResult::ReloadIndex
         );
+        assert_eq!(
+            PaletteAction::BookmarkSelectedHit.dispatch(),
+            PaletteResult::BookmarkSelectedHit
+        );
+        assert_eq!(
+            PaletteAction::OpenSwarm.dispatch(),
+            PaletteResult::OpenSwarm
+        );
     }
 
     #[test]
@@ -1380,7 +1436,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_exhaustive_all_26_actions() {
+    fn dispatch_exhaustive_all_actions() {
         // Every action variant must dispatch without panic and return non-Noop.
         let all: Vec<PaletteAction> = vec![
             PaletteAction::ToggleTheme,
@@ -1397,6 +1453,8 @@ mod tests {
             PaletteAction::LoadViewSlot(1),
             PaletteAction::OpenBulkActions,
             PaletteAction::ReloadIndex,
+            PaletteAction::BookmarkSelectedHit,
+            PaletteAction::OpenSwarm,
             PaletteAction::AnalyticsDashboard,
             PaletteAction::AnalyticsExplorer,
             PaletteAction::AnalyticsHeatmap,

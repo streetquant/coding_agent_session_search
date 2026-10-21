@@ -1,0 +1,293 @@
+{
+  "captured_at": "2026-10-20T19:30:29+00:00",
+  "contract_sha256": "d10c965413f9138aa8eb23a1e77ac91bb61413e63088e3e621bbcecd594fa0c8",
+  "coverage": {
+    "active_component_ids": [
+      "INT-001"
+    ],
+    "active_spec_ids": [
+      "SPEC-001",
+      "SPEC-002",
+      "SPEC-003",
+      "SPEC-004"
+    ],
+    "covered_component_ids": [
+      "INT-001"
+    ],
+    "covered_spec_ids": [
+      "SPEC-001",
+      "SPEC-002",
+      "SPEC-003",
+      "SPEC-004"
+    ],
+    "facet_ids": [
+      "FACET-001",
+      "FACET-002",
+      "FACET-003",
+      "FACET-004"
+    ],
+    "missing_component_ids": [],
+    "missing_spec_ids": []
+  },
+  "diff_fingerprint": "ff0853fcad575ab06252a182229d13f54dde2bbaa57dea36033e76dd69f01130",
+  "errors": [],
+  "facets": [
+    {
+      "baseline_final_expectation_matched": false,
+      "command": {
+        "allow_worktree_change": false,
+        "argv": [
+          "cargo",
+          "pkgid",
+          "--offline"
+        ],
+        "cwd": ".",
+        "env": {},
+        "expected_exit_code": 0,
+        "id": "diagnose-FACET-001",
+        "required": true,
+        "timeout_sec": 120
+      },
+      "comparable": true,
+      "component_ids": [
+        "INT-001"
+      ],
+      "errors": [],
+      "expectation_matched": true,
+      "id": "FACET-001",
+      "mode": "direct_target",
+      "observations": [
+        {
+          "combined": "path+file:///warp/projects/softwares/cass#coding-agent-search@0.8.0",
+          "exit_code": 0,
+          "stderr": "",
+          "stdout": "path+file:///warp/projects/softwares/cass#coding-agent-search@0.8.0",
+          "timed_out": false
+        },
+        {
+          "combined": "path+file:///warp/projects/softwares/cass#coding-agent-search@0.8.0",
+          "exit_code": 0,
+          "stderr": "",
+          "stdout": "path+file:///warp/projects/softwares/cass#coding-agent-search@0.8.0",
+          "timed_out": false
+        }
+      ],
+      "phase": "baseline",
+      "runtime_evidence": {
+        "declared": [
+          {
+            "kind": "contains",
+            "value": "coding-agent-search@0.8.0"
+          }
+        ],
+        "errors": [],
+        "matched": [
+          {
+            "kind": "contains",
+            "value": "coding-agent-search@0.8.0"
+          }
+        ],
+        "valid": true
+      },
+      "spec_ids": [
+        "SPEC-001"
+      ],
+      "stable": true,
+      "state_after": "a2eb6ba41e9d8b6820a137402455960678468849a73678a39b103d4f36fbe3df",
+      "state_before": "a2eb6ba41e9d8b6820a137402455960678468849a73678a39b103d4f36fbe3df",
+      "state_changed": false,
+      "statement": "Cargo resolves the target package metadata as upstream 0.10.0. This facet proves package adoption only; compiled behavior, preservation and remaining BR acceptance require separate evidence.",
+      "valid": true
+    },
+    {
+      "command": {
+        "allow_worktree_change": false,
+        "argv": [
+          "git",
+          "diff",
+          "--check"
+        ],
+        "cwd": ".",
+        "env": {},
+        "expected_exit_code": 0,
+        "id": "diagnose-FACET-002",
+        "required": true,
+        "timeout_sec": 120
+      },
+      "comparable": true,
+      "component_ids": [
+        "INT-001"
+      ],
+      "errors": [],
+      "expectation_matched": true,
+      "id": "FACET-002",
+      "mode": "diagnosis_only",
+      "observations": [
+        {
+          "combined": "",
+          "exit_code": 0,
+          "stderr": "",
+          "stdout": "",
+          "timed_out": false
+        },
+        {
+          "combined": "",
+          "exit_code": 0,
+          "stderr": "",
+          "stdout": "",
+          "timed_out": false
+        }
+      ],
+      "phase": "baseline",
+      "runtime_evidence": {
+        "declared": [],
+        "errors": [],
+        "matched": [],
+        "valid": true
+      },
+      "spec_ids": [
+        "SPEC-002"
+      ],
+      "stable": true,
+      "state_after": "a2eb6ba41e9d8b6820a137402455960678468849a73678a39b103d4f36fbe3df",
+      "state_before": "a2eb6ba41e9d8b6820a137402455960678468849a73678a39b103d4f36fbe3df",
+      "state_changed": false,
+      "statement": "Observe whitespace health of the existing local diff; this is diagnostic evidence and does not certify preservation of native ingestion behavior.",
+      "valid": true
+    },
+    {
+      "command": {
+        "allow_worktree_change": false,
+        "argv": [
+          "br",
+          "list",
+          "--status",
+          "open",
+          "--status",
+          "in_progress",
+          "--status",
+          "blocked",
+          "--format",
+          "csv",
+          "--fields",
+          "id,status",
+          "--no-auto-flush",
+          "--no-auto-import"
+        ],
+        "cwd": ".",
+        "env": {},
+        "expected_exit_code": 0,
+        "id": "diagnose-FACET-003",
+        "required": true,
+        "timeout_sec": 120
+      },
+      "comparable": true,
+      "component_ids": [
+        "INT-001"
+      ],
+      "errors": [],
+      "expectation_matched": true,
+      "id": "FACET-003",
+      "mode": "diagnosis_only",
+      "observations": [
+        {
+          "combined": "id,status\ncoding_agent_session_search-2l1b0.2,open\ncoding_agent_session_search-scohn,open\ncoding_agent_session_search-iify0,blocked\ncoding_agent_session_search-g3zyo,blocked\ncoding_agent_session_search-aegfi,open\ncoding_agent_session_search-ggjoc,in_progress\ncoding_agent_session_search-cjugu,blocked\ncoding_agent_session_search-kupq4,in_progress\ncoding_agent_session_search-jyfuq.2,open\ncoding_agent_session_search-ds7uy.5.1,open\ncoding_agent_session_search-ds7uy.4.2,open\ncoding_agent_session_search-ds7uy.3.3,open\ncoding_agent_session_search-ds7uy.3.2,open\ncoding_agent_session_search-ds7uy.4.1,in_progress\ncoding_agent_session_search-rustsec-zero-vulnerability-baseline-gothf,open\ncoding_agent_session_search-wfm4e,open\ncoding_agent_session_search-cass-fsvi-semantic-witness-xbq0b,blocked\ncoding_agent_session_search-ds7uy.5,open\ncoding_agent_session_search-ds7uy.4,open\ncoding_agent_session_search-ds7uy.3,open\ncoding_agent_session_search-ds7uy.2,open\ncoding_agent_session_search-ds7uy.1,open\ncoding_agent_session_search-jyfuq,open\ncoding_agent_session_search-ds7uy,open\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.2.6,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.14,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.12,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.2,open\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.1,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg,open\ncoding_agent_session_search-2l1b0.33,in_progress\ncoding_agent_session_search-devin-watch-fixture-bounded-readines-upzn0,in_progress\ncoding_agent_session_search-k18a0,in_progress\ncoding_agent_session_search-lqz28,in_progress\ncoding_agent_session_search-of9i7,open\ncoding_agent_session_search-av59c,in_progress\ncoding_agent_session_search-sxhgy,in_progress\ncoding_agent_session_search-962e8,in_progress\ncoding_agent_session_search-kz23l,in_progress\ncoding_agent_session_search-r5c6h,in_progress\ncoding_agent_session_search-q4fve,in_progress\ncoding_agent_session_search-jmk3l,in_progress\ncoding_agent_session_search-cooow,in_progress\ncoding_agent_session_search-jfkqh,in_progress\ncoding_agent_session_search-zp700,in_progress\ncoding_agent_session_search-kigjq,in_progress\ncoding_agent_session_search-91njy,blocked\ncoding_agent_session_search-90y8u,in_progress\ncoding_agent_session_search-2l1b0.32,blocked\ncoding_agent_session_search-2l1b0.31,open\ncoding_agent_session_search-2l1b0.25,open\ncoding_agent_session_search-2l1b0.24,open\ncoding_agent_session_search-2l1b0.23,open\ncoding_agent_session_search-2l1b0.22,open\ncoding_agent_session_search-2l1b0.20,in_progress\ncoding_agent_session_search-2l1b0.11,open\ncoding_agent_session_search-2l1b0.10,open\ncoding_agent_session_search-2l1b0.9,open\ncoding_agent_session_search-2l1b0.8,blocked\ncoding_agent_session_search-2l1b0.7,open\ncoding_agent_session_search-2l1b0.6,open\ncoding_agent_session_search-2l1b0.5,open\ncoding_agent_session_search-2l1b0.4,open\ncoding_agent_session_search-2l1b0.3,in_progress\ncoding_agent_session_search-2l1b0.1,blocked\ncoding_agent_session_search-2l1b0,in_progress\ncoding_agent_session_search-9lz4y,in_progress\ncoding_agent_session_search-yxcga,blocked\ncoding_agent_session_search-test-env-api-isolation-qu81y.2,in_progress\ncoding_agent_session_search-test-env-api-isolation-qu81y.1,in_progress\ncoding_agent_session_search-u3vho,in_progress\ncoding_agent_session_search-fyepq,in_progress\ncoding_agent_session_search-98anf,in_progress\ncoding_agent_session_search-fjp82,in_progress\ncoding_agent_session_search-orz9w,in_progress\ncoding_agent_session_search-apzyi,in_progress\ncoding_agent_session_search-l2t7m,in_progress\ncoding_agent_session_search-zrtrr,in_progress\ncoding_agent_session_search-y7vcg,in_progress\ncoding_agent_session_search-uvii3,in_progress\ncoding_agent_session_search-3a4ut,in_progress\ncoding_agent_session_search-gyiuc,in_progress\ncoding_agent_session_search-aocm4,in_progress\ncoding_agent_session_search-4290i,in_progress\ncoding_agent_session_search-wxuu2,in_progress\ncoding_agent_session_search-mt24v,in_progress\ncoding_agent_session_search-h7dla,in_progress\ncoding_agent_session_search-k2k20,open\ncoding_agent_session_search-gh374-mirror-recovery-authority-zp0fp,open\ncoding_agent_session_search-gh373-stall-watchdog-false-fire-fr7wp,in_progress\ncoding_agent_session_search-gh372-opencode-scan-perf-tdvbf,open\ncoding_agent_session_search-gh349-migration-oom-without-rowid-sh-qpdtd,open\ncoding_agent_session_search-gh369-fts5-multileaf-segment-writer-cb0gl,open\ncoding_agent_session_search-gh353-status-search-fingerprint-spli-wjpv5,in_progress\ncoding_agent_session_search-gh345-329-fts-rebuild-allocation-bou-jd3zj,open\ncoding_agent_session_search-gh364-watch-once-false-oom-quarantin-trxfe,open\ncoding_agent_session_search-test-env-api-isolation-qu81y,open\ncoding_agent_session_search-rustsec-zero-vulnerability-baseline-gothf.11,open\ncoding_agent_session_search-rustsec-zero-vulnerability-baseline-gothf.9,open\ncoding_agent_session_search-rustsec-zero-vulnerability-baseline-gothf.8,open\ncoding_agent_session_search-jyfuq.1,in_progress\ncoding_agent_session_search-leli0,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.15,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.13,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.11,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.10,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.9,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.8,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.7,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.6,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.5,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.4,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.3,in_progress\ncoding_agent_session_search-guided-ops-repro-trust-5u82n,open\ncoding_agent_session_search-swarm-coordination-intelligence-gnrxb,open\ncoding_agent_session_search-oh96l,open\ncoding_agent_session_search-7ew.3,in_progress\ncoding_agent_session_search-rvbsf,blocked\ncoding_agent_session_search-2l1b0.30,open\ncoding_agent_session_search-2l1b0.28,open\ncoding_agent_session_search-2l1b0.26,open\ncoding_agent_session_search-2l1b0.21,open\ncoding_agent_session_search-2l1b0.19,open\ncoding_agent_session_search-2l1b0.18,open\ncoding_agent_session_search-2l1b0.17,open\ncoding_agent_session_search-2l1b0.16,open\ncoding_agent_session_search-2l1b0.14,in_progress\ncoding_agent_session_search-2l1b0.13,in_progress\ncoding_agent_session_search-2l1b0.12,blocked\ncoding_agent_session_search-igh4d,in_progress\ncoding_agent_session_search-xhw6y,in_progress\ncoding_agent_session_search-jrl45,in_progress\ncoding_agent_session_search-70o8f,open\ncoding_agent_session_search-g3s8y,in_progress\ncoding_agent_session_search-3kde4,open\ncoding_agent_session_search-uc7nz,in_progress\ncoding_agent_session_search-yviq2,open\ncoding_agent_session_search-9md4k,in_progress\ncoding_agent_session_search-4w0ma,open\ncoding_agent_session_search-povuc,in_progress\ncoding_agent_session_search-njx4p,open\ncoding_agent_session_search-ul46p,in_progress\ncoding_agent_session_search-ztlan,in_progress\ncoding_agent_session_search-fsqlite-async-forward-port-2amyb,open\ncoding_agent_session_search-cljkz,in_progress\ncoding_agent_session_search-7ew.6,in_progress\ncoding_agent_session_search-2l1b0.29,open\ncoding_agent_session_search-2l1b0.27,open\ncoding_agent_session_search-prxuj,in_progress\ncoding_agent_session_search-0nq2s,in_progress\ncoding_agent_session_search-rril3,in_progress\ncoding_agent_session_search-sd5o9,in_progress\ncoding_agent_session_search-eq69o,in_progress\ncoding_agent_session_search-robsafei,in_progress",
+          "exit_code": 0,
+          "stderr": "",
+          "stdout": "id,status\ncoding_agent_session_search-2l1b0.2,open\ncoding_agent_session_search-scohn,open\ncoding_agent_session_search-iify0,blocked\ncoding_agent_session_search-g3zyo,blocked\ncoding_agent_session_search-aegfi,open\ncoding_agent_session_search-ggjoc,in_progress\ncoding_agent_session_search-cjugu,blocked\ncoding_agent_session_search-kupq4,in_progress\ncoding_agent_session_search-jyfuq.2,open\ncoding_agent_session_search-ds7uy.5.1,open\ncoding_agent_session_search-ds7uy.4.2,open\ncoding_agent_session_search-ds7uy.3.3,open\ncoding_agent_session_search-ds7uy.3.2,open\ncoding_agent_session_search-ds7uy.4.1,in_progress\ncoding_agent_session_search-rustsec-zero-vulnerability-baseline-gothf,open\ncoding_agent_session_search-wfm4e,open\ncoding_agent_session_search-cass-fsvi-semantic-witness-xbq0b,blocked\ncoding_agent_session_search-ds7uy.5,open\ncoding_agent_session_search-ds7uy.4,open\ncoding_agent_session_search-ds7uy.3,open\ncoding_agent_session_search-ds7uy.2,open\ncoding_agent_session_search-ds7uy.1,open\ncoding_agent_session_search-jyfuq,open\ncoding_agent_session_search-ds7uy,open\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.2.6,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.14,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.12,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.2,open\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.1,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg,open\ncoding_agent_session_search-2l1b0.33,in_progress\ncoding_agent_session_search-devin-watch-fixture-bounded-readines-upzn0,in_progress\ncoding_agent_session_search-k18a0,in_progress\ncoding_agent_session_search-lqz28,in_progress\ncoding_agent_session_search-of9i7,open\ncoding_agent_session_search-av59c,in_progress\ncoding_agent_session_search-sxhgy,in_progress\ncoding_agent_session_search-962e8,in_progress\ncoding_agent_session_search-kz23l,in_progress\ncoding_agent_session_search-r5c6h,in_progress\ncoding_agent_session_search-q4fve,in_progress\ncoding_agent_session_search-jmk3l,in_progress\ncoding_agent_session_search-cooow,in_progress\ncoding_agent_session_search-jfkqh,in_progress\ncoding_agent_session_search-zp700,in_progress\ncoding_agent_session_search-kigjq,in_progress\ncoding_agent_session_search-91njy,blocked\ncoding_agent_session_search-90y8u,in_progress\ncoding_agent_session_search-2l1b0.32,blocked\ncoding_agent_session_search-2l1b0.31,open\ncoding_agent_session_search-2l1b0.25,open\ncoding_agent_session_search-2l1b0.24,open\ncoding_agent_session_search-2l1b0.23,open\ncoding_agent_session_search-2l1b0.22,open\ncoding_agent_session_search-2l1b0.20,in_progress\ncoding_agent_session_search-2l1b0.11,open\ncoding_agent_session_search-2l1b0.10,open\ncoding_agent_session_search-2l1b0.9,open\ncoding_agent_session_search-2l1b0.8,blocked\ncoding_agent_session_search-2l1b0.7,open\ncoding_agent_session_search-2l1b0.6,open\ncoding_agent_session_search-2l1b0.5,open\ncoding_agent_session_search-2l1b0.4,open\ncoding_agent_session_search-2l1b0.3,in_progress\ncoding_agent_session_search-2l1b0.1,blocked\ncoding_agent_session_search-2l1b0,in_progress\ncoding_agent_session_search-9lz4y,in_progress\ncoding_agent_session_search-yxcga,blocked\ncoding_agent_session_search-test-env-api-isolation-qu81y.2,in_progress\ncoding_agent_session_search-test-env-api-isolation-qu81y.1,in_progress\ncoding_agent_session_search-u3vho,in_progress\ncoding_agent_session_search-fyepq,in_progress\ncoding_agent_session_search-98anf,in_progress\ncoding_agent_session_search-fjp82,in_progress\ncoding_agent_session_search-orz9w,in_progress\ncoding_agent_session_search-apzyi,in_progress\ncoding_agent_session_search-l2t7m,in_progress\ncoding_agent_session_search-zrtrr,in_progress\ncoding_agent_session_search-y7vcg,in_progress\ncoding_agent_session_search-uvii3,in_progress\ncoding_agent_session_search-3a4ut,in_progress\ncoding_agent_session_search-gyiuc,in_progress\ncoding_agent_session_search-aocm4,in_progress\ncoding_agent_session_search-4290i,in_progress\ncoding_agent_session_search-wxuu2,in_progress\ncoding_agent_session_search-mt24v,in_progress\ncoding_agent_session_search-h7dla,in_progress\ncoding_agent_session_search-k2k20,open\ncoding_agent_session_search-gh374-mirror-recovery-authority-zp0fp,open\ncoding_agent_session_search-gh373-stall-watchdog-false-fire-fr7wp,in_progress\ncoding_agent_session_search-gh372-opencode-scan-perf-tdvbf,open\ncoding_agent_session_search-gh349-migration-oom-without-rowid-sh-qpdtd,open\ncoding_agent_session_search-gh369-fts5-multileaf-segment-writer-cb0gl,open\ncoding_agent_session_search-gh353-status-search-fingerprint-spli-wjpv5,in_progress\ncoding_agent_session_search-gh345-329-fts-rebuild-allocation-bou-jd3zj,open\ncoding_agent_session_search-gh364-watch-once-false-oom-quarantin-trxfe,open\ncoding_agent_session_search-test-env-api-isolation-qu81y,open\ncoding_agent_session_search-rustsec-zero-vulnerability-baseline-gothf.11,open\ncoding_agent_session_search-rustsec-zero-vulnerability-baseline-gothf.9,open\ncoding_agent_session_search-rustsec-zero-vulnerability-baseline-gothf.8,open\ncoding_agent_session_search-jyfuq.1,in_progress\ncoding_agent_session_search-leli0,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.15,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.13,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.11,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.10,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.9,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.8,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.7,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.6,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.5,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.4,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.3,in_progress\ncoding_agent_session_search-guided-ops-repro-trust-5u82n,open\ncoding_agent_session_search-swarm-coordination-intelligence-gnrxb,open\ncoding_agent_session_search-oh96l,open\ncoding_agent_session_search-7ew.3,in_progress\ncoding_agent_session_search-rvbsf,blocked\ncoding_agent_session_search-2l1b0.30,open\ncoding_agent_session_search-2l1b0.28,open\ncoding_agent_session_search-2l1b0.26,open\ncoding_agent_session_search-2l1b0.21,open\ncoding_agent_session_search-2l1b0.19,open\ncoding_agent_session_search-2l1b0.18,open\ncoding_agent_session_search-2l1b0.17,open\ncoding_agent_session_search-2l1b0.16,open\ncoding_agent_session_search-2l1b0.14,in_progress\ncoding_agent_session_search-2l1b0.13,in_progress\ncoding_agent_session_search-2l1b0.12,blocked\ncoding_agent_session_search-igh4d,in_progress\ncoding_agent_session_search-xhw6y,in_progress\ncoding_agent_session_search-jrl45,in_progress\ncoding_agent_session_search-70o8f,open\ncoding_agent_session_search-g3s8y,in_progress\ncoding_agent_session_search-3kde4,open\ncoding_agent_session_search-uc7nz,in_progress\ncoding_agent_session_search-yviq2,open\ncoding_agent_session_search-9md4k,in_progress\ncoding_agent_session_search-4w0ma,open\ncoding_agent_session_search-povuc,in_progress\ncoding_agent_session_search-njx4p,open\ncoding_agent_session_search-ul46p,in_progress\ncoding_agent_session_search-ztlan,in_progress\ncoding_agent_session_search-fsqlite-async-forward-port-2amyb,open\ncoding_agent_session_search-cljkz,in_progress\ncoding_agent_session_search-7ew.6,in_progress\ncoding_agent_session_search-2l1b0.29,open\ncoding_agent_session_search-2l1b0.27,open\ncoding_agent_session_search-prxuj,in_progress\ncoding_agent_session_search-0nq2s,in_progress\ncoding_agent_session_search-rril3,in_progress\ncoding_agent_session_search-sd5o9,in_progress\ncoding_agent_session_search-eq69o,in_progress\ncoding_agent_session_search-robsafei,in_progress",
+          "timed_out": false
+        },
+        {
+          "combined": "id,status\ncoding_agent_session_search-2l1b0.2,open\ncoding_agent_session_search-scohn,open\ncoding_agent_session_search-iify0,blocked\ncoding_agent_session_search-g3zyo,blocked\ncoding_agent_session_search-aegfi,open\ncoding_agent_session_search-ggjoc,in_progress\ncoding_agent_session_search-cjugu,blocked\ncoding_agent_session_search-kupq4,in_progress\ncoding_agent_session_search-jyfuq.2,open\ncoding_agent_session_search-ds7uy.5.1,open\ncoding_agent_session_search-ds7uy.4.2,open\ncoding_agent_session_search-ds7uy.3.3,open\ncoding_agent_session_search-ds7uy.3.2,open\ncoding_agent_session_search-ds7uy.4.1,in_progress\ncoding_agent_session_search-rustsec-zero-vulnerability-baseline-gothf,open\ncoding_agent_session_search-wfm4e,open\ncoding_agent_session_search-cass-fsvi-semantic-witness-xbq0b,blocked\ncoding_agent_session_search-ds7uy.5,open\ncoding_agent_session_search-ds7uy.4,open\ncoding_agent_session_search-ds7uy.3,open\ncoding_agent_session_search-ds7uy.2,open\ncoding_agent_session_search-ds7uy.1,open\ncoding_agent_session_search-jyfuq,open\ncoding_agent_session_search-ds7uy,open\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.2.6,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.14,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.12,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.2,open\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.1,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg,open\ncoding_agent_session_search-2l1b0.33,in_progress\ncoding_agent_session_search-devin-watch-fixture-bounded-readines-upzn0,in_progress\ncoding_agent_session_search-k18a0,in_progress\ncoding_agent_session_search-lqz28,in_progress\ncoding_agent_session_search-of9i7,open\ncoding_agent_session_search-av59c,in_progress\ncoding_agent_session_search-sxhgy,in_progress\ncoding_agent_session_search-962e8,in_progress\ncoding_agent_session_search-kz23l,in_progress\ncoding_agent_session_search-r5c6h,in_progress\ncoding_agent_session_search-q4fve,in_progress\ncoding_agent_session_search-jmk3l,in_progress\ncoding_agent_session_search-cooow,in_progress\ncoding_agent_session_search-jfkqh,in_progress\ncoding_agent_session_search-zp700,in_progress\ncoding_agent_session_search-kigjq,in_progress\ncoding_agent_session_search-91njy,blocked\ncoding_agent_session_search-90y8u,in_progress\ncoding_agent_session_search-2l1b0.32,blocked\ncoding_agent_session_search-2l1b0.31,open\ncoding_agent_session_search-2l1b0.25,open\ncoding_agent_session_search-2l1b0.24,open\ncoding_agent_session_search-2l1b0.23,open\ncoding_agent_session_search-2l1b0.22,open\ncoding_agent_session_search-2l1b0.20,in_progress\ncoding_agent_session_search-2l1b0.11,open\ncoding_agent_session_search-2l1b0.10,open\ncoding_agent_session_search-2l1b0.9,open\ncoding_agent_session_search-2l1b0.8,blocked\ncoding_agent_session_search-2l1b0.7,open\ncoding_agent_session_search-2l1b0.6,open\ncoding_agent_session_search-2l1b0.5,open\ncoding_agent_session_search-2l1b0.4,open\ncoding_agent_session_search-2l1b0.3,in_progress\ncoding_agent_session_search-2l1b0.1,blocked\ncoding_agent_session_search-2l1b0,in_progress\ncoding_agent_session_search-9lz4y,in_progress\ncoding_agent_session_search-yxcga,blocked\ncoding_agent_session_search-test-env-api-isolation-qu81y.2,in_progress\ncoding_agent_session_search-test-env-api-isolation-qu81y.1,in_progress\ncoding_agent_session_search-u3vho,in_progress\ncoding_agent_session_search-fyepq,in_progress\ncoding_agent_session_search-98anf,in_progress\ncoding_agent_session_search-fjp82,in_progress\ncoding_agent_session_search-orz9w,in_progress\ncoding_agent_session_search-apzyi,in_progress\ncoding_agent_session_search-l2t7m,in_progress\ncoding_agent_session_search-zrtrr,in_progress\ncoding_agent_session_search-y7vcg,in_progress\ncoding_agent_session_search-uvii3,in_progress\ncoding_agent_session_search-3a4ut,in_progress\ncoding_agent_session_search-gyiuc,in_progress\ncoding_agent_session_search-aocm4,in_progress\ncoding_agent_session_search-4290i,in_progress\ncoding_agent_session_search-wxuu2,in_progress\ncoding_agent_session_search-mt24v,in_progress\ncoding_agent_session_search-h7dla,in_progress\ncoding_agent_session_search-k2k20,open\ncoding_agent_session_search-gh374-mirror-recovery-authority-zp0fp,open\ncoding_agent_session_search-gh373-stall-watchdog-false-fire-fr7wp,in_progress\ncoding_agent_session_search-gh372-opencode-scan-perf-tdvbf,open\ncoding_agent_session_search-gh349-migration-oom-without-rowid-sh-qpdtd,open\ncoding_agent_session_search-gh369-fts5-multileaf-segment-writer-cb0gl,open\ncoding_agent_session_search-gh353-status-search-fingerprint-spli-wjpv5,in_progress\ncoding_agent_session_search-gh345-329-fts-rebuild-allocation-bou-jd3zj,open\ncoding_agent_session_search-gh364-watch-once-false-oom-quarantin-trxfe,open\ncoding_agent_session_search-test-env-api-isolation-qu81y,open\ncoding_agent_session_search-rustsec-zero-vulnerability-baseline-gothf.11,open\ncoding_agent_session_search-rustsec-zero-vulnerability-baseline-gothf.9,open\ncoding_agent_session_search-rustsec-zero-vulnerability-baseline-gothf.8,open\ncoding_agent_session_search-jyfuq.1,in_progress\ncoding_agent_session_search-leli0,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.15,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.13,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.11,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.10,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.9,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.8,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.7,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.6,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.5,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.4,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.3,in_progress\ncoding_agent_session_search-guided-ops-repro-trust-5u82n,open\ncoding_agent_session_search-swarm-coordination-intelligence-gnrxb,open\ncoding_agent_session_search-oh96l,open\ncoding_agent_session_search-7ew.3,in_progress\ncoding_agent_session_search-rvbsf,blocked\ncoding_agent_session_search-2l1b0.30,open\ncoding_agent_session_search-2l1b0.28,open\ncoding_agent_session_search-2l1b0.26,open\ncoding_agent_session_search-2l1b0.21,open\ncoding_agent_session_search-2l1b0.19,open\ncoding_agent_session_search-2l1b0.18,open\ncoding_agent_session_search-2l1b0.17,open\ncoding_agent_session_search-2l1b0.16,open\ncoding_agent_session_search-2l1b0.14,in_progress\ncoding_agent_session_search-2l1b0.13,in_progress\ncoding_agent_session_search-2l1b0.12,blocked\ncoding_agent_session_search-igh4d,in_progress\ncoding_agent_session_search-xhw6y,in_progress\ncoding_agent_session_search-jrl45,in_progress\ncoding_agent_session_search-70o8f,open\ncoding_agent_session_search-g3s8y,in_progress\ncoding_agent_session_search-3kde4,open\ncoding_agent_session_search-uc7nz,in_progress\ncoding_agent_session_search-yviq2,open\ncoding_agent_session_search-9md4k,in_progress\ncoding_agent_session_search-4w0ma,open\ncoding_agent_session_search-povuc,in_progress\ncoding_agent_session_search-njx4p,open\ncoding_agent_session_search-ul46p,in_progress\ncoding_agent_session_search-ztlan,in_progress\ncoding_agent_session_search-fsqlite-async-forward-port-2amyb,open\ncoding_agent_session_search-cljkz,in_progress\ncoding_agent_session_search-7ew.6,in_progress\ncoding_agent_session_search-2l1b0.29,open\ncoding_agent_session_search-2l1b0.27,open\ncoding_agent_session_search-prxuj,in_progress\ncoding_agent_session_search-0nq2s,in_progress\ncoding_agent_session_search-rril3,in_progress\ncoding_agent_session_search-sd5o9,in_progress\ncoding_agent_session_search-eq69o,in_progress\ncoding_agent_session_search-robsafei,in_progress",
+          "exit_code": 0,
+          "stderr": "",
+          "stdout": "id,status\ncoding_agent_session_search-2l1b0.2,open\ncoding_agent_session_search-scohn,open\ncoding_agent_session_search-iify0,blocked\ncoding_agent_session_search-g3zyo,blocked\ncoding_agent_session_search-aegfi,open\ncoding_agent_session_search-ggjoc,in_progress\ncoding_agent_session_search-cjugu,blocked\ncoding_agent_session_search-kupq4,in_progress\ncoding_agent_session_search-jyfuq.2,open\ncoding_agent_session_search-ds7uy.5.1,open\ncoding_agent_session_search-ds7uy.4.2,open\ncoding_agent_session_search-ds7uy.3.3,open\ncoding_agent_session_search-ds7uy.3.2,open\ncoding_agent_session_search-ds7uy.4.1,in_progress\ncoding_agent_session_search-rustsec-zero-vulnerability-baseline-gothf,open\ncoding_agent_session_search-wfm4e,open\ncoding_agent_session_search-cass-fsvi-semantic-witness-xbq0b,blocked\ncoding_agent_session_search-ds7uy.5,open\ncoding_agent_session_search-ds7uy.4,open\ncoding_agent_session_search-ds7uy.3,open\ncoding_agent_session_search-ds7uy.2,open\ncoding_agent_session_search-ds7uy.1,open\ncoding_agent_session_search-jyfuq,open\ncoding_agent_session_search-ds7uy,open\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.2.6,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.14,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.12,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.2,open\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.1,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg,open\ncoding_agent_session_search-2l1b0.33,in_progress\ncoding_agent_session_search-devin-watch-fixture-bounded-readines-upzn0,in_progress\ncoding_agent_session_search-k18a0,in_progress\ncoding_agent_session_search-lqz28,in_progress\ncoding_agent_session_search-of9i7,open\ncoding_agent_session_search-av59c,in_progress\ncoding_agent_session_search-sxhgy,in_progress\ncoding_agent_session_search-962e8,in_progress\ncoding_agent_session_search-kz23l,in_progress\ncoding_agent_session_search-r5c6h,in_progress\ncoding_agent_session_search-q4fve,in_progress\ncoding_agent_session_search-jmk3l,in_progress\ncoding_agent_session_search-cooow,in_progress\ncoding_agent_session_search-jfkqh,in_progress\ncoding_agent_session_search-zp700,in_progress\ncoding_agent_session_search-kigjq,in_progress\ncoding_agent_session_search-91njy,blocked\ncoding_agent_session_search-90y8u,in_progress\ncoding_agent_session_search-2l1b0.32,blocked\ncoding_agent_session_search-2l1b0.31,open\ncoding_agent_session_search-2l1b0.25,open\ncoding_agent_session_search-2l1b0.24,open\ncoding_agent_session_search-2l1b0.23,open\ncoding_agent_session_search-2l1b0.22,open\ncoding_agent_session_search-2l1b0.20,in_progress\ncoding_agent_session_search-2l1b0.11,open\ncoding_agent_session_search-2l1b0.10,open\ncoding_agent_session_search-2l1b0.9,open\ncoding_agent_session_search-2l1b0.8,blocked\ncoding_agent_session_search-2l1b0.7,open\ncoding_agent_session_search-2l1b0.6,open\ncoding_agent_session_search-2l1b0.5,open\ncoding_agent_session_search-2l1b0.4,open\ncoding_agent_session_search-2l1b0.3,in_progress\ncoding_agent_session_search-2l1b0.1,blocked\ncoding_agent_session_search-2l1b0,in_progress\ncoding_agent_session_search-9lz4y,in_progress\ncoding_agent_session_search-yxcga,blocked\ncoding_agent_session_search-test-env-api-isolation-qu81y.2,in_progress\ncoding_agent_session_search-test-env-api-isolation-qu81y.1,in_progress\ncoding_agent_session_search-u3vho,in_progress\ncoding_agent_session_search-fyepq,in_progress\ncoding_agent_session_search-98anf,in_progress\ncoding_agent_session_search-fjp82,in_progress\ncoding_agent_session_search-orz9w,in_progress\ncoding_agent_session_search-apzyi,in_progress\ncoding_agent_session_search-l2t7m,in_progress\ncoding_agent_session_search-zrtrr,in_progress\ncoding_agent_session_search-y7vcg,in_progress\ncoding_agent_session_search-uvii3,in_progress\ncoding_agent_session_search-3a4ut,in_progress\ncoding_agent_session_search-gyiuc,in_progress\ncoding_agent_session_search-aocm4,in_progress\ncoding_agent_session_search-4290i,in_progress\ncoding_agent_session_search-wxuu2,in_progress\ncoding_agent_session_search-mt24v,in_progress\ncoding_agent_session_search-h7dla,in_progress\ncoding_agent_session_search-k2k20,open\ncoding_agent_session_search-gh374-mirror-recovery-authority-zp0fp,open\ncoding_agent_session_search-gh373-stall-watchdog-false-fire-fr7wp,in_progress\ncoding_agent_session_search-gh372-opencode-scan-perf-tdvbf,open\ncoding_agent_session_search-gh349-migration-oom-without-rowid-sh-qpdtd,open\ncoding_agent_session_search-gh369-fts5-multileaf-segment-writer-cb0gl,open\ncoding_agent_session_search-gh353-status-search-fingerprint-spli-wjpv5,in_progress\ncoding_agent_session_search-gh345-329-fts-rebuild-allocation-bou-jd3zj,open\ncoding_agent_session_search-gh364-watch-once-false-oom-quarantin-trxfe,open\ncoding_agent_session_search-test-env-api-isolation-qu81y,open\ncoding_agent_session_search-rustsec-zero-vulnerability-baseline-gothf.11,open\ncoding_agent_session_search-rustsec-zero-vulnerability-baseline-gothf.9,open\ncoding_agent_session_search-rustsec-zero-vulnerability-baseline-gothf.8,open\ncoding_agent_session_search-jyfuq.1,in_progress\ncoding_agent_session_search-leli0,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.15,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.13,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.11,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.10,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.9,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.8,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.7,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.6,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.5,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.4,in_progress\ncoding_agent_session_search-cass-fleet-resilience-20260608-uojcg.3,in_progress\ncoding_agent_session_search-guided-ops-repro-trust-5u82n,open\ncoding_agent_session_search-swarm-coordination-intelligence-gnrxb,open\ncoding_agent_session_search-oh96l,open\ncoding_agent_session_search-7ew.3,in_progress\ncoding_agent_session_search-rvbsf,blocked\ncoding_agent_session_search-2l1b0.30,open\ncoding_agent_session_search-2l1b0.28,open\ncoding_agent_session_search-2l1b0.26,open\ncoding_agent_session_search-2l1b0.21,open\ncoding_agent_session_search-2l1b0.19,open\ncoding_agent_session_search-2l1b0.18,open\ncoding_agent_session_search-2l1b0.17,open\ncoding_agent_session_search-2l1b0.16,open\ncoding_agent_session_search-2l1b0.14,in_progress\ncoding_agent_session_search-2l1b0.13,in_progress\ncoding_agent_session_search-2l1b0.12,blocked\ncoding_agent_session_search-igh4d,in_progress\ncoding_agent_session_search-xhw6y,in_progress\ncoding_agent_session_search-jrl45,in_progress\ncoding_agent_session_search-70o8f,open\ncoding_agent_session_search-g3s8y,in_progress\ncoding_agent_session_search-3kde4,open\ncoding_agent_session_search-uc7nz,in_progress\ncoding_agent_session_search-yviq2,open\ncoding_agent_session_search-9md4k,in_progress\ncoding_agent_session_search-4w0ma,open\ncoding_agent_session_search-povuc,in_progress\ncoding_agent_session_search-njx4p,open\ncoding_agent_session_search-ul46p,in_progress\ncoding_agent_session_search-ztlan,in_progress\ncoding_agent_session_search-fsqlite-async-forward-port-2amyb,open\ncoding_agent_session_search-cljkz,in_progress\ncoding_agent_session_search-7ew.6,in_progress\ncoding_agent_session_search-2l1b0.29,open\ncoding_agent_session_search-2l1b0.27,open\ncoding_agent_session_search-prxuj,in_progress\ncoding_agent_session_search-0nq2s,in_progress\ncoding_agent_session_search-rril3,in_progress\ncoding_agent_session_search-sd5o9,in_progress\ncoding_agent_session_search-eq69o,in_progress\ncoding_agent_session_search-robsafei,in_progress",
+          "timed_out": false
+        }
+      ],
+      "phase": "baseline",
+      "runtime_evidence": {
+        "declared": [],
+        "errors": [],
+        "matched": [],
+        "valid": true
+      },
+      "spec_ids": [
+        "SPEC-003"
+      ],
+      "stable": true,
+      "state_after": "a2eb6ba41e9d8b6820a137402455960678468849a73678a39b103d4f36fbe3df",
+      "state_before": "a2eb6ba41e9d8b6820a137402455960678468849a73678a39b103d4f36fbe3df",
+      "state_changed": false,
+      "statement": "Observe the unfinished live BR work surface without changing claims; final closure still requires task-specific acceptance.",
+      "valid": true
+    },
+    {
+      "command": {
+        "allow_worktree_change": false,
+        "argv": [
+          "bash",
+          "scripts/gate.sh"
+        ],
+        "cwd": ".",
+        "env": {
+          "GATE_RETRIES": "1",
+          "GATE_RETRY_SLEEP": "0"
+        },
+        "expected_exit_code": 0,
+        "id": "diagnose-FACET-004",
+        "required": true,
+        "timeout_sec": 120
+      },
+      "comparable": true,
+      "component_ids": [
+        "INT-001"
+      ],
+      "errors": [],
+      "expectation_matched": true,
+      "id": "FACET-004",
+      "mode": "diagnosis_only",
+      "observations": [
+        {
+          "combined": "scripts/gate.sh: line 395: rch: command not found\n---- gate receipt 2026-10-20TTIMEZ HEAD=3254b9701105ccd3808bfa2c424cedc10e597a0e DIFF_SHA256=5f09f3727d03ed3b832a80c2559193f955802dda776c5d487bb720581884f037 rch_exit=127 receipt=/tmp/cass-gate.RECEIPT lines=2 ----\nSTAGE=rch EXIT=127 (remote job did not complete normally)\nSTAGE=source-identity EXIT=missing (no terminal receipt)\nSTAGE=source-freshness EXIT=missing (no terminal receipt)\nSTAGE=fmt EXIT=missing (no terminal receipt)\nSTAGE=clippy EXIT=missing (no terminal receipt)\nSTAGE=lib-tests EXIT=missing (no terminal receipt)\nSTAGE=test-cli_robot EXIT=missing (no terminal receipt)\nSTAGE=test-bookmarks_cli EXIT=missing (no terminal receipt)\nSTAGE=goldens EXIT=missing (no terminal receipt)\nSTAGE=ubs EXIT=missing (no terminal receipt)\nSTAGE=job-complete EXIT=missing (no terminal receipt)\ngate attempt 1/1 TIME\ngate: lib-tests has no positive terminal test count\ngate: test-cli_robot has no positive terminal test count\ngate: test-bookmarks_cli has no positive terminal test count\ngate: goldens has no positive terminal test count\ngate: missing final job-complete receipt\ngate: RED (receipt kept at /tmp/cass-gate.RECEIPT)",
+          "exit_code": 1,
+          "stderr": "gate attempt 1/1 TIME\ngate: lib-tests has no positive terminal test count\ngate: test-cli_robot has no positive terminal test count\ngate: test-bookmarks_cli has no positive terminal test count\ngate: goldens has no positive terminal test count\ngate: missing final job-complete receipt\ngate: RED (receipt kept at /tmp/cass-gate.RECEIPT)",
+          "stdout": "scripts/gate.sh: line 395: rch: command not found\n---- gate receipt 2026-10-20TTIMEZ HEAD=3254b9701105ccd3808bfa2c424cedc10e597a0e DIFF_SHA256=5f09f3727d03ed3b832a80c2559193f955802dda776c5d487bb720581884f037 rch_exit=127 receipt=/tmp/cass-gate.RECEIPT lines=2 ----\nSTAGE=rch EXIT=127 (remote job did not complete normally)\nSTAGE=source-identity EXIT=missing (no terminal receipt)\nSTAGE=source-freshness EXIT=missing (no terminal receipt)\nSTAGE=fmt EXIT=missing (no terminal receipt)\nSTAGE=clippy EXIT=missing (no terminal receipt)\nSTAGE=lib-tests EXIT=missing (no terminal receipt)\nSTAGE=test-cli_robot EXIT=missing (no terminal receipt)\nSTAGE=test-bookmarks_cli EXIT=missing (no terminal receipt)\nSTAGE=goldens EXIT=missing (no terminal receipt)\nSTAGE=ubs EXIT=missing (no terminal receipt)\nSTAGE=job-complete EXIT=missing (no terminal receipt)",
+          "timed_out": false
+        },
+        {
+          "combined": "scripts/gate.sh: line 395: rch: command not found\n---- gate receipt 2026-10-20TTIMEZ HEAD=3254b9701105ccd3808bfa2c424cedc10e597a0e DIFF_SHA256=5f09f3727d03ed3b832a80c2559193f955802dda776c5d487bb720581884f037 rch_exit=127 receipt=/tmp/cass-gate.RECEIPT lines=2 ----\nSTAGE=rch EXIT=127 (remote job did not complete normally)\nSTAGE=source-identity EXIT=missing (no terminal receipt)\nSTAGE=source-freshness EXIT=missing (no terminal receipt)\nSTAGE=fmt EXIT=missing (no terminal receipt)\nSTAGE=clippy EXIT=missing (no terminal receipt)\nSTAGE=lib-tests EXIT=missing (no terminal receipt)\nSTAGE=test-cli_robot EXIT=missing (no terminal receipt)\nSTAGE=test-bookmarks_cli EXIT=missing (no terminal receipt)\nSTAGE=goldens EXIT=missing (no terminal receipt)\nSTAGE=ubs EXIT=missing (no terminal receipt)\nSTAGE=job-complete EXIT=missing (no terminal receipt)\ngate attempt 1/1 TIME\ngate: lib-tests has no positive terminal test count\ngate: test-cli_robot has no positive terminal test count\ngate: test-bookmarks_cli has no positive terminal test count\ngate: goldens has no positive terminal test count\ngate: missing final job-complete receipt\ngate: RED (receipt kept at /tmp/cass-gate.RECEIPT)",
+          "exit_code": 1,
+          "stderr": "gate attempt 1/1 TIME\ngate: lib-tests has no positive terminal test count\ngate: test-cli_robot has no positive terminal test count\ngate: test-bookmarks_cli has no positive terminal test count\ngate: goldens has no positive terminal test count\ngate: missing final job-complete receipt\ngate: RED (receipt kept at /tmp/cass-gate.RECEIPT)",
+          "stdout": "scripts/gate.sh: line 395: rch: command not found\n---- gate receipt 2026-10-20TTIMEZ HEAD=3254b9701105ccd3808bfa2c424cedc10e597a0e DIFF_SHA256=5f09f3727d03ed3b832a80c2559193f955802dda776c5d487bb720581884f037 rch_exit=127 receipt=/tmp/cass-gate.RECEIPT lines=2 ----\nSTAGE=rch EXIT=127 (remote job did not complete normally)\nSTAGE=source-identity EXIT=missing (no terminal receipt)\nSTAGE=source-freshness EXIT=missing (no terminal receipt)\nSTAGE=fmt EXIT=missing (no terminal receipt)\nSTAGE=clippy EXIT=missing (no terminal receipt)\nSTAGE=lib-tests EXIT=missing (no terminal receipt)\nSTAGE=test-cli_robot EXIT=missing (no terminal receipt)\nSTAGE=test-bookmarks_cli EXIT=missing (no terminal receipt)\nSTAGE=goldens EXIT=missing (no terminal receipt)\nSTAGE=ubs EXIT=missing (no terminal receipt)\nSTAGE=job-complete EXIT=missing (no terminal receipt)",
+          "timed_out": false
+        }
+      ],
+      "phase": "baseline",
+      "runtime_evidence": {
+        "declared": [],
+        "errors": [],
+        "matched": [],
+        "valid": true
+      },
+      "spec_ids": [
+        "SPEC-004"
+      ],
+      "stable": true,
+      "state_after": "a2eb6ba41e9d8b6820a137402455960678468849a73678a39b103d4f36fbe3df",
+      "state_before": "a2eb6ba41e9d8b6820a137402455960678468849a73678a39b103d4f36fbe3df",
+      "state_changed": false,
+      "statement": "Attempt the repository-required gate through RCH and record missing runner admission; diagnosis-only until a real compiler/test run becomes available.",
+      "valid": true
+    }
+  ],
+  "feature_map_projection_hash": "c2738a88516cd6da5807c419a8be1b34c1466a5bafda0d4518b340f8d054b9d8",
+  "feature_map_sha256": "670a0bd3089a0ed5594ec905f4aadfceefd15a9d98d3a6db731d917507477ad9",
+  "git_head": "3254b9701105ccd3808bfa2c424cedc10e597a0e",
+  "kind": "diagnosis_baseline",
+  "schema_version": "1.0",
+  "snapshot_hash": "59dc0bc6218ae2e33e0893db68519fd707d1f5c6a8eba7c3ea5ed2cb7941c8f0",
+  "spec_ledger_sha256": "9b155581bcacd6df0047d8d6910049c1374691034e87205454a0556f348785c8",
+  "valid": true,
+  "warnings": []
+}

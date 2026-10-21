@@ -104,8 +104,11 @@
       "pipeline_channel_size": 4,
       "controller_loadavg_high_watermark_1m": 121.0,
       "controller_loadavg_low_watermark_1m": 120.0,
+      "startup_page_fetch_message_bytes": "[LIVE_BYTES]",
+      "steady_page_fetch_message_bytes": "[LIVE_BYTES]",
       "runtime": null
-    }
+    },
+    "expected_docs_scan": null
   },
   "rebuild_progress": {
     "active": false,
@@ -144,6 +147,8 @@
     "vector_index_path": null,
     "model_dir": null,
     "hnsw_path": null,
+    "hnsw_present": false,
+    "hnsw_state": "not_inspected",
     "hnsw_ready": false,
     "progressive_ready": false,
     "progressive_reason_code": null,
@@ -202,6 +207,7 @@
     "schema_version": 1,
     "status": "ok",
     "quarantined_conversations": 0,
+    "deferred_conversations": 0,
     "recent_quarantined_conversations": 0,
     "recent_window_seconds": 3600,
     "circuit_breaker_limit": 25,
@@ -237,14 +243,14 @@
       {
         "controller_id": "semantic_search",
         "policy_id": "semantic.hybrid_preferred.v1",
-        "policy_version": "semantic_schema_1+chunking_1",
+        "policy_version": "semantic_schema_1+chunking_2",
         "status": "fallback",
         "fallback_state": "conservative",
         "conservative_fallback": true,
         "decision_reason": "semantic unavailable; lexical fallback remains active",
         "inputs": {
           "chunk_timeout_seconds": "120",
-          "chunking_strategy_version": "1",
+          "chunking_strategy_version": "2",
           "download_policy": "opt_in",
           "fast_dimension": "256",
           "fast_tier_embedder": "hash",
@@ -279,7 +285,9 @@
       "llc_groups": 8,
       "smt_threads_per_core": 2,
       "memory_total_bytes": null,
-      "memory_available_bytes": null
+      "memory_available_bytes": null,
+      "host_memory_total_bytes": null,
+      "memory_limit_source": null
     },
     "reserved_core_policy": {
       "reserved_cores": "[LIVE_COUNTER]",
@@ -493,6 +501,7 @@
     "current_source_newer_than_archive_count": 0,
     "raw_mirror_db_link_count": 0,
     "sole_copy_warning_count": 0,
+    "raw_mirror_capture_disabled": false,
     "recommended_action": "Run 'cass index --full' once before coverage can be assessed."
   },
   "quarantine": {

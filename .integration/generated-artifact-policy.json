@@ -1,0 +1,78 @@
+{
+  "applicability": {
+    "status": "required",
+    "waiver": {
+      "approval": "",
+      "approved": false,
+      "evidence": [],
+      "reason": ""
+    }
+  },
+  "artifact_sets": [
+    {
+      "component_ids": [
+        "INT-001"
+      ],
+      "config_paths": [],
+      "determinism_required": true,
+      "determinism_waiver": {
+        "approval": "",
+        "approved": false,
+        "evidence": [],
+        "reason": ""
+      },
+      "generator_command": {
+        "argv": [
+          "REPLACE_WITH_PINNED_GENERATOR_COMMAND"
+        ],
+        "cwd": ".",
+        "env": {},
+        "expected_exit_code": 0,
+        "id": "generate-GEN-001",
+        "timeout_sec": 300
+      },
+      "id": "GEN-001",
+      "ignore_patterns": [],
+      "output_paths": [
+        "REPLACE_WITH_CHECKED_IN_GENERATED_OUTPUT_PATH"
+      ],
+      "repetitions": 2,
+      "source_paths": [
+        "REPLACE_WITH_GENERATOR_SOURCE_OR_SCHEMA_PATH"
+      ],
+      "tool_provenance": {
+        "expected_binary_sha256": "",
+        "expected_version_regex": "^REPLACE_WITH_EXACT_VERSION_OUTPUT$",
+        "name": "REPLACE_WITH_GENERATOR_NAME",
+        "provenance_paths": [
+          "REPLACE_WITH_LOCKFILE_OR_GENERATOR_SOURCE_PATH"
+        ],
+        "version_command": {
+          "argv": [
+            "REPLACE_WITH_GENERATOR_EXECUTABLE",
+            "--version"
+          ],
+          "cwd": ".",
+          "env": {},
+          "expected_exit_code": 0,
+          "id": "generator-version-GEN-001",
+          "timeout_sec": 30
+        }
+      }
+    }
+  ],
+  "candidate_root": ".",
+  "limits": {
+    "max_artifact_sets": 32,
+    "max_command_output_bytes": 96000,
+    "max_input_bytes_total": 1000000000,
+    "max_input_files": 50000,
+    "max_output_bytes_total": 1000000000,
+    "max_output_files": 50000,
+    "max_subject_bytes": 2000000000,
+    "max_subject_files": 100000,
+    "per_command_timeout_sec": 300,
+    "whole_run_timeout_sec": 3600
+  },
+  "schema_version": "1.0"
+}

@@ -3,6 +3,10 @@
   "crate_version": "[VERSION]",
   "build_commit": "[BUILD_COMMIT]",
   "build_commit_date": "[BUILD_COMMIT_DATE]",
+  "source_ingest_reuse": {
+    "enabled": true,
+    "disabled_by": null
+  },
   "api_version": 1,
   "contract_version": "1",
   "features": [
@@ -53,7 +57,9 @@
     "omp",
     "factory",
     "openclaw",
+    "continue",
     "antigravity",
+    "pi_durable",
     "prime_agent",
     "kimi",
     "kiro",
@@ -64,11 +70,15 @@
     "qwen",
     "grok",
     "devin",
+    "grok_bot",
+    "codebuff",
     "goose",
     "crush",
     "hermes",
+    "shelley",
     "kilo",
-    "cloudmcp"
+    "cloudmcp",
+    "openwebui"
   ],
   "global_flags": [
     {
@@ -337,11 +347,10 @@
         },
         {
           "name": "embedder",
-          "description": "Embedder to use for semantic indexing (hash, minilm, multilingual-minilm)",
+          "description": "Embedder for semantic indexing (hash, minilm, multilingual-minilm, external); defaults to semantic policy",
           "arg_type": "option",
           "value_type": "string",
-          "required": false,
-          "default": "fastembed"
+          "required": false
         },
         {
           "name": "data-dir",
@@ -406,6 +415,18 @@
           "enum_values": [
             "true",
             "false"
+          ]
+        },
+        {
+          "name": "rebuild-profile",
+          "description": "Lexical-rebuild settings preset (GH #483). `bounded` is the single-core, low-memory recipe for a wedged or memory-starved archive: one rebuild worker and one page-prep thread, a one-page pipeline, 64 conversations per fetch and a durable commit every 64 MiB of text. An explicit CASS_TANTIVY_REBUILD_* value still wins over the preset. Applies to any lexical rebuild this run performs (`--full`, or resuming an interrupted rebuild); it never changes what gets indexed. `--json` reports the values used under `rebuild_profile`",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "default": "default",
+          "enum_values": [
+            "default",
+            "bounded"
           ]
         },
         {
@@ -567,7 +588,7 @@
         },
         {
           "name": "fields",
-          "description": "Select specific fields in JSON output (comma-separated). Use 'minimal' for `source_path,line_number,agent` or 'summary' for `source_path,line_number,agent,title,score`. Example: --fields `source_path,line_number`",
+          "description": "Select specific fields in JSON output (comma-separated). Use 'minimal' for `source_path,line_number,agent,source_id,conversation_id` or 'summary' for `source_path,line_number,agent,title,score,source_id,conversation_id`. Example: --fields `source_path,line_number`",
           "arg_type": "option",
           "value_type": "string",
           "required": false,
@@ -701,14 +722,14 @@
         },
         {
           "name": "timeout",
-          "description": "Timeout in milliseconds. Returns partial results and error if exceeded",
+          "description": "Timeout in milliseconds; 0 explicitly disables the search deadline. Returns partial results and error if a positive timeout is exceeded",
           "arg_type": "option",
           "value_type": "integer",
           "required": false
         },
         {
           "name": "highlight",
-          "description": "Highlight matching terms in snippets with **bold** markers (text and JSON output)",
+          "description": "Also mark query-term occurrences the engine left unmarked; snippets always mark matched terms with **bold** (text and JSON output)",
           "arg_type": "flag",
           "required": false,
           "enum_values": [
@@ -744,7 +765,7 @@
         },
         {
           "name": "approximate",
-          "description": "Use approximate nearest neighbor (ANN) search with HNSW for faster semantic/hybrid queries. Trades slight accuracy loss for O(log n) search complexity instead of O(n). Only affects semantic and hybrid modes; ignored for lexical search. Requires an HNSW index built with `cass index --semantic --approximate`",
+          "description": "Use approximate nearest neighbor (ANN) search with HNSW for faster semantic/hybrid queries. Trades slight accuracy loss for O(log n) search complexity instead of O(n). Only affects semantic and hybrid modes; ignored for lexical search. Requires an HNSW index built with `cass index --semantic --build-hnsw`",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -755,7 +776,7 @@
         },
         {
           "name": "model",
-          "description": "Embedding model to use for semantic search. Available models depend on what's been downloaded. Use `cass models --list` to see available options",
+          "description": "Embedding model to use for semantic search. Available models depend on what's been downloaded. `cass models status --json` lists them",
           "arg_type": "option",
           "value_type": "string",
           "required": false
@@ -773,7 +794,7 @@
         },
         {
           "name": "reranker",
-          "description": "Reranker model to use (requires --rerank). Use `cass models --list` to see available options",
+          "description": "Reranker model to use (requires --rerank). Defaults to `ms-marco`, the only registered reranker",
           "arg_type": "option",
           "value_type": "string",
           "required": false
@@ -1689,7 +1710,7 @@
     },
     {
       "name": "view",
-      "description": "View a source file at a specific line (follow up on search results)",
+      "description": "Inspect file lines, or follow a search hit with --message-index",
       "arguments": [
         {
           "name": "path",
@@ -1715,7 +1736,14 @@
         {
           "name": "line",
           "short": "n",
-          "description": "Line number to show (1-indexed)",
+          "description": "Physical file line (1-based), NOT search's line_number; use --message-index for hits",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "message-index",
+          "description": "Canonical message ordinal: pass search's line_number unchanged (1-based). Reads the archive only; never substitutes a physical file line",
           "arg_type": "option",
           "value_type": "integer",
           "required": false
@@ -2137,6 +2165,17 @@
           ]
         },
         {
+          "name": "repair-leaked-pages",
+          "description": "Free leaked pages (integrity_check's \"page N is never used\": pages no table, index or freelist owns) in place. Refuses any other integrity damage. Supports `--dry-run`; mutation requires `--yes` and backs up the live bundle first (`cass doctor backups restore`)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "cleanup-interrupted-artifacts",
           "description": "Quarantine interrupted `raw_mirror_capture` staging artifacts that block doctor mutation, instead of forcing a manual `rm` inside the data dir. Requires `--yes`; artifacts are renamed into a quarantine dir, never deleted",
           "arg_type": "flag",
@@ -2245,6 +2284,35 @@
             "true",
             "false"
           ]
+        },
+        {
+          "name": "exact-source-id",
+          "description": "Select native identities from this literal stored source ID; requires agent and external ID",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "exact-agent",
+          "description": "Original stored agent slug for exact native identity selection",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "exact-external-id",
+          "description": "Native external session ID to select (repeatable, at most 256; ambiguous identities fail)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "exact-workspace",
+          "description": "Require the exact literal stored workspace; no path normalization or ancestor matching",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
         },
         {
           "name": "limit",
@@ -2555,8 +2623,9 @@
         },
         {
           "name": "include-tools",
-          "description": "Include tool calls in export (default: true)",
-          "arg_type": "flag",
+          "description": "Include tool calls in the export; `--include-tools=false` omits them (default: true)",
+          "arg_type": "option",
+          "value_type": "enum",
           "required": false,
           "default": "true",
           "enum_values": [
@@ -2566,8 +2635,9 @@
         },
         {
           "name": "show-timestamps",
-          "description": "Show message timestamps",
-          "arg_type": "flag",
+          "description": "Show message timestamps; `--show-timestamps=false` hides them (default: true)",
+          "arg_type": "option",
+          "value_type": "enum",
           "required": false,
           "default": "true",
           "enum_values": [
@@ -2666,7 +2736,7 @@
     },
     {
       "name": "expand",
-      "description": "Show messages around a specific line in a session file",
+      "description": "Expand a search hit with --message-index, or inspect raw JSONL with --line",
       "arguments": [
         {
           "name": "path",
@@ -2685,10 +2755,24 @@
         {
           "name": "line",
           "short": "n",
-          "description": "Line number to show context around",
+          "description": "Physical file line, NOT search's line_number; use --message-index for hits",
           "arg_type": "option",
           "value_type": "integer",
-          "required": true
+          "required": false
+        },
+        {
+          "name": "message-index",
+          "description": "Canonical message ordinal: pass search's line_number unchanged (1-based). Reads the archive only; never substitutes a physical file line",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "conversation-id",
+          "description": "Exact conversation_id from search (disambiguates shared source paths)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
         },
         {
           "name": "context",
@@ -2876,6 +2960,18 @@
             "basename",
             "full",
             "hash"
+          ]
+        },
+        {
+          "name": "share-profile",
+          "description": "Share profile applied to every exported text: public (home paths, usernames, project names, hostnames, emails and other personal data), team (home paths and personal data), personal (nothing). Credentials are never rewritten; the secret scan rejects them. Default: public for a plaintext export, team when encrypted",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "public",
+            "team",
+            "personal"
           ]
         },
         {
@@ -3097,7 +3193,7 @@
     },
     {
       "name": "forget",
-      "description": "Prune an already-indexed subset of conversations by source-path glob (dry-run by default; `--apply` to commit). Removes matching rows from the canonical DB and rebuilds derived search/analytics assets",
+      "description": "Prune an already-indexed subset of conversations by source-path glob (dry-run by default; `--apply` to commit). Removes matching rows from the canonical DB and rebuilds derived search/analytics assets. Source files are kept: a source that changes afterwards is indexed again",
       "arguments": [
         {
           "name": "source-glob",
@@ -3457,6 +3553,386 @@
         }
       ],
       "has_json_output": true
+    },
+    {
+      "name": "serve",
+      "description": "Reuse read-only search readers, or run one supervised request and exit. Semantic retrieval and refinement require explicit opt-in. See docs/SEARCH_SERVICE.md",
+      "arguments": [
+        {
+          "name": "index",
+          "description": "Published lexical index directory, instead of --data-dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "data-dir",
+          "description": "Select the compiled lexical index beneath this explicit data directory. Resolves the path only; never opens or repairs the canonical database",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "stdio",
+          "description": "Use newline-delimited JSON requests and responses on standard I/O",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "query",
+          "description": "Run one query and exit; emit a bounded JSON reply without reading stdin. Uses the service's read-only readers, fallback consent and resource supervision",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "transcript",
+          "description": "Read one bounded canonical transcript page and exit without reading stdin. JSON selects source_path, source_id, conversation_id, optional cursor and limit. Requires --db; never opens source files, lexical readers or models",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "mode",
+          "description": "Retrieval mode for --query (default lexical). Semantic and hybrid require --semantic-embedder, --data-dir and --db. No models are downloaded",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "lexical",
+            "semantic",
+            "hybrid"
+          ]
+        },
+        {
+          "name": "approximate",
+          "description": "Request approximate retrieval with an explicit semantic/hybrid --mode. The service currently uses exact search and reports ANN as unavailable",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "limit",
+          "description": "Maximum hits for --query (default 10, maximum 100)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "offset",
+          "description": "Result offset for --query (default 0; offset + limit + 1 must be at most 1024)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "agent",
+          "description": "Agent name or supported alias for --query; repeat for multiple agents. Unknown names fail before opening the index or archive",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "workspace",
+          "description": "Exact workspace for --query; repeat for multiple workspaces",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "source-id",
+          "description": "Exact source ID for --query, not the synthetic remote group",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "created-from",
+          "description": "Inclusive lower creation timestamp in epoch milliseconds for --query",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "created-to",
+          "description": "Inclusive upper creation timestamp in epoch milliseconds for --query",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "refine",
+          "description": "Refine one bounded lexical shortlist and exit without reading stdin. JSON selects query, lexical_query, filters, candidate_limit and limit. Requires an installed --reranker-model; never downloads model files",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "mcp",
+          "description": "Speak MCP instead of the CASS JSON-lines protocol on the same stdio transport",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "db",
+          "description": "Opt in to canonical view requests against this fixed read-only archive. Search stays index-only unless --lexical-fallback is also supplied",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "lexical-fallback",
+          "description": "Recover Quill fuel refusals using this explicit archive's SQLite lane. Admits at most 64 MiB of database plus WAL; shares the request deadline. Results identify the changed backend and are not Quill-score equivalent",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "reranker-model",
+          "description": "Opt in to candidate-only refinement with this installed local reranker. Never downloads files; ordinary search, startup and status stay model-free",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "semantic-embedder",
+          "description": "Opt in to retained semantic/hybrid retrieval using installed assets. Requires explicit --data-dir and --db; ordinary search stays lexical",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "minilm",
+            "multilingual-minilm",
+            "hash",
+            "external"
+          ]
+        },
+        {
+          "name": "request-timeout-ms",
+          "description": "Whole-request deadline, including setup, search, teardown and one-shot output. For --stdio, starts at the first frame byte; idle sessions are not timed out. Expiry exits the worker with code 124",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "default": "30000"
+        },
+        {
+          "name": "admission-dir",
+          "description": "Shared local control directory for nonblocking cross-process reader admission. Writes only pool metadata; never place this directory inside a search index",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "admission-slots",
+          "description": "Maximum reader-owning processes sharing the same admission directory",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "max-resident-mib",
+          "description": "Terminate this worker with exit 126 when sampled resident memory exceeds this many MiB. Sampling includes idle readers; it is not a kernel-enforced allocation limit",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "default": "4096"
+        }
+      ],
+      "has_json_output": false
+    },
+    {
+      "name": "archive",
+      "description": "Export, verify or restore a bounded, versioned logical canonical archive",
+      "arguments": [
+        {
+          "name": "db",
+          "description": "Existing canonical archive. Export never creates or repairs this file",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "data-dir",
+          "description": "Explicit canonical archive directory (also accepts CASS_DATA_DIR)",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Receipts are JSON regardless of this compatibility flag",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "codex-layout-migrate",
+      "description": "Prove a same-source flat/dated Codex transition before indexing its second layout. Dry-run by default. --apply registers a receipt without rewriting archive rows",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Explicit CASS directory containing the existing agent_search.db; no custom DB",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "source",
+          "description": "Exact named local source configured in sources.toml and the archive",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": true
+        },
+        {
+          "name": "from",
+          "description": "Existing flat or native dated rollout. Both inputs must remain accessible",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "to",
+          "description": "Matching rollout in the other layout, belonging to the same local source",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "apply",
+          "description": "Register the proven identity before indexing the second layout; default is dry-run",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "json",
+          "description": "Emit the migration report as JSON. Fatal errors use stderr, not stdout",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "lexical-quarantine",
+      "description": "Inspect retained failed lexical rebuilds without opening the database. Read-only by default; --apply requires the exact fingerprint from --plan",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Explicit archive directory; never defaults to another user's archive",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "json",
+          "description": "Emit one complete inventory; complete=false exits with code 8",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "plan",
+          "description": "Preview the complete cleanup policy and its approval fingerprint; no writes",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "apply",
+          "description": "Apply only a matching preview under the indexer lock. Preserves newest/recent evidence",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "semantic-reclaim",
+      "description": "Preview or reclaim unreferenced semantic backfill scratch",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Existing CASS data directory; no default archive is guessed",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "dry-run",
+          "description": "Explicitly preview without deleting artifacts (also the default)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "apply",
+          "description": "Delete only the candidates in a still-current approved preview",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "plan-fingerprint",
+          "description": "Exact plan_fingerprint from a prior preview of this archive",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Emit one JSON result on stdout and structured failures on stderr",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        }
+      ],
+      "has_json_output": true
     }
   ],
   "exit_codes": [
@@ -3486,9 +3962,9 @@
     },
     {
       "code": "4",
-      "meaning": "network error",
-      "retryable": "yes",
-      "agent_action": "Check connectivity or remote source configuration, then retry."
+      "meaning": "I/O failure or unsafe operation refused",
+      "retryable": "maybe",
+      "agent_action": "Branch on err.kind: fix the path, permissions, or free space for io/output-not-writable; follow err.hint for refused-unsafe. Not a network code: remote sources fail with 12, model downloads with 20-23."
     },
     {
       "code": "5",
@@ -3498,9 +3974,9 @@
     },
     {
       "code": "6",
-      "meaning": "incompatible version",
+      "meaning": "required input missing",
       "retryable": "no",
-      "agent_action": "Upgrade cass or the calling client before retrying."
+      "agent_action": "Supply the missing input named by err.kind (a password via --password-stdin, or a resume command), then rerun."
     },
     {
       "code": "7",
@@ -3510,9 +3986,9 @@
     },
     {
       "code": "8",
-      "meaning": "partial result",
+      "meaning": "partial result (sources sync only)",
       "retryable": "yes",
-      "agent_action": "Increase timeout or page through remaining results."
+      "agent_action": "Some sources had path failures: inspect the per-source errors and re-sync the failed sources. Search/pack timeouts exit 0 with budget.timed_out instead."
     },
     {
       "code": "9",
@@ -3579,6 +4055,18 @@
       "meaning": "I/O during model verify/install",
       "retryable": "maybe",
       "agent_action": "Fix filesystem permissions or disk space, then retry."
+    },
+    {
+      "code": "70",
+      "meaning": "index stalled and aborted",
+      "retryable": "yes",
+      "agent_action": "Read the kind index-stalled envelope on stderr and cass status --json, then rerun cass index; the lock is reaped on the next start."
+    },
+    {
+      "code": "130",
+      "meaning": "interrupted (SIGINT)",
+      "retryable": "yes",
+      "agent_action": "Rerun the command; cass sources setup --resume continues an interrupted setup."
     }
   ],
   "env_vars": [
@@ -3639,7 +4127,7 @@
     {
       "name": "CASS_SEARCH_BUDGET_MS",
       "default": "120000",
-      "description": "Fallback structured search worker budget in milliseconds when --timeout, CASS_SEARCH_TIMEOUT_MS, and [search].timeout_ms do not supply a positive effective timeout."
+      "description": "Fallback structured search worker budget in milliseconds only when the search timeout is unspecified; 0 explicitly disables the deadline. Explicit --timeout, CASS_SEARCH_TIMEOUT_MS, and [search].timeout_ms values override this fallback, including 0."
     },
     {
       "name": "CASS_TRIAGE_BUDGET_MS",
@@ -3727,6 +4215,11 @@
       "description": "Set to 1 to defer derived analytics writes during indexing. A legacy OMP identity migration keeps its analytics phase and durable cursor pending until a later index run with this unset."
     },
     {
+      "name": "CASS_RAW_MIRROR",
+      "default": "1",
+      "description": "Raw-mirror capture of session source files. Set 0, false, no or off to stop copying sources whose provider keeps its own history; existing captures stay until `cass mirror prune`, indexing is unaffected, and doctor reports raw_mirror_capture_disabled because a file its provider deletes then survives only in the archive DB."
+    },
+    {
       "name": "CASS_AUTO_REFRESH",
       "default": "1",
       "description": "Stale-on-read catch-up: search/pack/TUI may spawn a detached low-priority `cass index --background` when the index is stale, partial, or behind. Set 0 to disable globally; `search --no-maintenance` always disables it for that request."
@@ -3760,6 +4253,11 @@
       "name": "CASS_SCHEDULE_MAX_BACKFILL_BATCHES",
       "default": "200",
       "description": "Upper bound on `cass models backfill --scheduled` batches one nightly `cass schedule run` will execute."
+    },
+    {
+      "name": "CASS_SCHEDULE_MAX_LOAD_DEFERRAL_SECS",
+      "default": "10800",
+      "description": "Longest severe machine load may keep skipping scheduled incremental runs, measured from the last incremental run that completed; past it the run goes ahead at scheduler priority. 0 = skip for load without limit."
     },
     {
       "name": "CASS_INDEX_STALL_DETECT_SECS",
@@ -3924,10 +4422,10 @@
     {
       "name": "bounded-search",
       "intent": "Search sessions without flooding the caller's token budget.",
-      "first_command": "cass search \"<query>\" --robot --limit 10 --fields summary --max-content-length 800 --robot-meta",
+      "first_command": "cass search \"<query>\" --robot --limit 10 --fields summary,provenance,conversation_id --max-content-length 800 --robot-meta",
       "follow_up_commands": [
-        "cass view <source_path> -n <line_number> --json",
-        "cass expand <source_path> --line <line_number> -C 3 --json",
+        "cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --json",
+        "cass expand <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> -C 3 --json",
         "cass pack \"<query>\" --robot --max-tokens 4000 --limit 10"
       ],
       "parse_contract": "Parse hits[], _meta.realized_mode, _meta.fallback_mode, cursor, and *_truncated flags.",
@@ -3938,8 +4436,8 @@
       "intent": "Build a deterministic cited handoff bundle for another agent.",
       "first_command": "cass pack \"<question>\" --robot --max-tokens 4000 --max-evidence 8 --max-sessions 3 --require-evidence",
       "follow_up_commands": [
-        "cass search \"<question>\" --robot --limit 10 --fields provenance --robot-meta",
-        "cass view <source_path> -n <line_number> --json"
+        "cass search \"<question>\" --robot --limit 10 --fields summary,provenance,conversation_id --robot-meta",
+        "cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --json"
       ],
       "parse_contract": "Parse evidence[], warnings[], privacy, freshness, health, and omitted[].",
       "note": "Use pack when the downstream consumer needs citations rather than raw search hits."
@@ -3947,14 +4445,14 @@
     {
       "name": "session-drilldown",
       "intent": "Move from a hit to surrounding conversation context.",
-      "first_command": "cass view <source_path> -n <line_number> --json",
+      "first_command": "cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --json",
       "follow_up_commands": [
-        "cass expand <source_path> --line <line_number> -C 5 --json",
+        "cass expand <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> -C 5 --json",
         "cass context <source_path> --json",
         "cass resume <source_path> --shell"
       ],
-      "parse_contract": "Parse path, line_number, message, surrounding messages, and resume command output.",
-      "note": "Use source_path and line_number from search hits; do not infer file formats by hand."
+      "parse_contract": "Parse coordinate_space, message_index, conversation_id, source_id, content, and is_target in the returned messages.",
+      "note": "Pass source_path, source_id, conversation_id, and line_number from the same hit; line_number belongs to --message-index, not raw --line."
     },
     {
       "name": "semantic-models",
@@ -4167,13 +4665,13 @@
       "wrong": "cass view session.jsonl --line-number 42 --json",
       "canonical": "cass view session.jsonl --line 42 --json",
       "accepted": true,
-      "behavior": "Search-result field names such as line_number/line-number are accepted as drill-down line aliases."
+      "behavior": "Legacy --line-number/--line_number flags still inspect raw lines; use --message-index for search hits."
     },
     {
       "wrong": "cass view source_path=session.jsonl source_id=local line_number=42 --json",
-      "canonical": "cass view session.jsonl --source local --line 42 --json",
+      "canonical": "cass view session.jsonl --source local --message-index 42 --json",
       "accepted": true,
-      "behavior": "Search-result field bundles can be pasted directly into follow-up drill-down commands."
+      "behavior": "Pasted line_number fields select canonical messages, not raw lines; include conversation_id when a source path contains multiple conversations."
     },
     {
       "wrong": "cass search auth --format json",

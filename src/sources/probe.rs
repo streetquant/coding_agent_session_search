@@ -48,6 +48,10 @@ use super::{
 /// Default connection timeout in seconds.
 pub const DEFAULT_PROBE_TIMEOUT: u64 = 10;
 
+/// Network fan-out per probe batch, independent of CPU count or Rayon settings.
+/// This bounds simultaneous SSH probes, not the number of eligible hosts.
+const MAX_PARALLEL_PROBES: usize = 4;
+
 /// Result of probing an SSH host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostProbeResult {
@@ -115,6 +119,8 @@ pub enum CassStatus {
     },
     /// cass is installed but no index exists or is empty.
     InstalledNotIndexed { version: String },
+    /// cass is installed, but the bounded index inspection did not complete.
+    InstalledUnknown { version: String },
     /// cass is not found on PATH.
     NotFound,
     /// Couldn't determine cass status.
@@ -126,16 +132,18 @@ impl CassStatus {
     pub fn is_installed(&self) -> bool {
         matches!(
             self,
-            CassStatus::Indexed { .. } | CassStatus::InstalledNotIndexed { .. }
+            CassStatus::Indexed { .. }
+                | CassStatus::InstalledNotIndexed { .. }
+                | CassStatus::InstalledUnknown { .. }
         )
     }
 
     /// Get the installed version if available.
     pub fn version(&self) -> Option<&str> {
         match self {
-            CassStatus::Indexed { version, .. } | CassStatus::InstalledNotIndexed { version } => {
-                Some(version)
-            }
+            CassStatus::Indexed { version, .. }
+            | CassStatus::InstalledNotIndexed { version }
+            | CassStatus::InstalledUnknown { version } => Some(version),
             _ => None,
         }
     }
@@ -173,7 +181,7 @@ pub struct SystemInfo {
     pub has_wget: bool,
     /// Remote home directory.
     pub remote_home: String,
-    /// Unique machine identifier (for deduplication of SSH aliases).
+    /// Unique machine identifier (combined with remote_home for alias deduplication).
     /// On Linux: /etc/machine-id, on macOS: IOPlatformUUID.
     #[serde(default)]
     pub machine_id: Option<String>,
@@ -204,11 +212,31 @@ fn shell_single_quote_arg(value: &str) -> String {
     format!("'{}'", value.replace('\'', r#"'\''"#))
 }
 
+/// Local discovery does not imply that a mixed application container is safe
+/// to copy to another machine. Also recognize old probe reports whose generic
+/// path classifier called the Grok Bot directory an unknown provider.
+pub(crate) fn remote_probe_source_allowed(agent: &str, path: &str) -> bool {
+    if matches!(agent, "grok_bot" | "grok-bot") {
+        return false;
+    }
+    let path = path.replace('\\', "/");
+    // FAD also probes Muse's authentication file to detect a local install.
+    // Neither that file nor its containing configuration tree is session data.
+    // Apply the path boundary even to old reports classified as "unknown".
+    if path.contains("/.config/muse/") || path.ends_with("/.config/muse") {
+        return false;
+    }
+    !path.contains("/Library/Application Support/Grok Bot/")
+        && !path.ends_with("/Library/Application Support/Grok Bot")
+}
+
 fn collect_probe_dirs(probe_paths: Vec<(&'static str, Vec<String>)>) -> Vec<String> {
     let mut dir_list = Vec::new();
-    for (_slug, paths) in probe_paths {
+    for (slug, paths) in probe_paths {
         for path in paths {
-            dir_list.push(path);
+            if remote_probe_source_allowed(slug, &path) {
+                dir_list.push(path);
+            }
         }
     }
     dir_list.sort();
@@ -283,6 +311,21 @@ fn build_probe_script_for_dir_modes(dir_list: &[String], recursive_dirs: &[Strin
         r#"#!/bin/bash
 echo "===PROBE_START==="
 
+# Optional archive measurements share a two-second budget. Without a timeout
+# utility (common on macOS), omit them instead of starting unbounded work.
+PROBE_TIMEOUT_BIN=""
+if command -v timeout &>/dev/null; then
+    PROBE_TIMEOUT_BIN=timeout
+elif command -v gtimeout &>/dev/null; then
+    PROBE_TIMEOUT_BIN=gtimeout
+fi
+PROBE_OPTIONAL_DEADLINE=$((SECONDS + 2))
+probe_optional() {{
+    local remaining=$((PROBE_OPTIONAL_DEADLINE - SECONDS))
+    [ -n "$PROBE_TIMEOUT_BIN" ] && [ "$remaining" -gt 0 ] || return 124
+    "$PROBE_TIMEOUT_BIN" --kill-after=1s "${{remaining}}s" "$@"
+}}
+
 # System info
 echo "OS=$(uname -s | tr '[:upper:]' '[:lower:]')"
 echo "ARCH=$(uname -m)"
@@ -326,19 +369,25 @@ if [ -n "$CASS_BIN" ]; then
         echo "CASS_VERSION=$CASS_VER"
 
         # Get health status (JSON output) - only if version was detected
-        if "$CASS_BIN" health --json &>/dev/null; then
-            echo "CASS_HEALTH=OK"
+        if probe_optional "$CASS_BIN" health --json &>/dev/null; then
             # Try to get session count from stats
-            STATS=$("$CASS_BIN" stats --json 2>/dev/null)
+            STATS=$(probe_optional "$CASS_BIN" stats --json 2>/dev/null)
             if [ $? -eq 0 ] && [ -n "$STATS" ]; then
                 # Extract total conversations from JSON (allow whitespace/newlines)
                 SESSIONS=$(echo "$STATS" | tr -d '\n' | sed -n 's/.*"conversations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
-                echo "CASS_SESSIONS=${{SESSIONS:-0}}"
+                if [ -n "$SESSIONS" ]; then
+                    echo "CASS_HEALTH=OK"
+                    echo "CASS_SESSIONS=$SESSIONS"
+                else
+                    echo "CASS_HEALTH=UNKNOWN"
+                fi
             else
-                echo "CASS_SESSIONS=0"
+                echo "CASS_HEALTH=UNKNOWN"
             fi
         else
-            echo "CASS_HEALTH=NOT_INDEXED"
+            # A failed health check can mean stale/corrupt assets or a timeout;
+            # it does not establish that the archive is empty.
+            echo "CASS_HEALTH=UNKNOWN"
         fi
     fi
 else
@@ -512,7 +561,7 @@ for dir in "${{PROBE_DIRS[@]}}"; do
             SIZE=0
             COUNT=0
         fi
-        echo "AGENT_DATA=$dir|${{SIZE:-0}}|${{COUNT:-0}}"
+        echo "AGENT_DATA=$dir|$SIZE|$COUNT"
     fi
 done
 
@@ -617,7 +666,7 @@ pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
 /// Parse the probe script output into a HostProbeResult.
 fn parse_probe_output(host_name: &str, output: &str, connection_time_ms: u64) -> HostProbeResult {
     let mut values: HashMap<String, String> = HashMap::new();
-    let mut agent_data: Vec<(String, u64, u64)> = Vec::new(); // (path, size_mb, count)
+    let mut agent_data: Vec<(String, Option<u64>, Option<u64>)> = Vec::new();
 
     // Parse only key=value pairs emitted by the probe script itself. SSH login
     // banners, forced-command wrappers, or shell noise can appear before or
@@ -653,8 +702,8 @@ fn parse_probe_output(host_name: &str, output: &str, connection_time_ms: u64) ->
                 // Yields: count, size, path
                 let parts: Vec<&str> = data.rsplitn(3, '|').collect();
                 if parts.len() == 3 {
-                    let count = parts[0].parse().unwrap_or(0);
-                    let size = parts[1].parse().unwrap_or(0);
+                    let count = parts[0].parse().ok();
+                    let size = parts[1].parse().ok();
                     let path = parts[2].to_string();
                     agent_data.push((path, size, count));
                 }
@@ -684,8 +733,12 @@ fn parse_probe_output(host_name: &str, output: &str, connection_time_ms: u64) ->
                     session_count: sessions,
                     last_indexed: None,
                 }
-            } else {
+            } else if health == Some("NOT_INDEXED") {
                 CassStatus::InstalledNotIndexed {
+                    version: version.clone(),
+                }
+            } else {
+                CassStatus::InstalledUnknown {
                     version: version.clone(),
                 }
             }
@@ -750,8 +803,8 @@ fn parse_probe_output(host_name: &str, output: &str, connection_time_ms: u64) ->
             DetectedAgent {
                 agent_type,
                 path,
-                estimated_sessions: Some(count),
-                estimated_size_mb: Some(size_mb),
+                estimated_sessions: count,
+                estimated_size_mb: size_mb,
             }
         })
         .collect();
@@ -831,8 +884,11 @@ fn infer_agent_type(path: &str) -> String {
 
 /// Probe multiple hosts in parallel.
 ///
-/// Uses rayon's parallel iterator to probe hosts concurrently, calling the
-/// progress callback as each probe completes.
+/// Uses a dedicated Rayon pool with at most four workers per batch, calling
+/// the progress callback as each probe completes. CPU count, a caller's Rayon
+/// pool and RAYON_NUM_THREADS cannot increase SSH fan-out. Every supplied host
+/// still receives one result, in input order; the limit never truncates a fleet.
+/// If worker creation fails, the same probes run sequentially on the caller.
 ///
 /// # Arguments
 /// * `hosts` - Slice of discovered hosts to probe
@@ -853,22 +909,33 @@ where
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    if hosts.is_empty() {
+        return Vec::new();
+    }
     let total = hosts.len();
     let completed = Arc::new(AtomicUsize::new(0));
     let on_progress = Arc::new(on_progress);
+    let probe = |host: &DiscoveredHost| {
+        let result = probe_host(host, timeout_secs);
+        let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
+        on_progress(done, total, &host.name);
+        result
+    };
 
-    // Use rayon for true parallel execution
-    hosts
-        .par_iter()
-        .map(|host| {
-            let result = probe_host(host, timeout_secs);
-
-            let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
-            on_progress(done, total, &host.name);
-
-            result
-        })
-        .collect()
+    // GH505: a CPU-sized pool is not a network admission policy. Do not use
+    // the global/caller's Rayon pool, including as a thread-creation fallback.
+    // The empty case above also prevents num_threads(0) selecting CPU count.
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(total.min(MAX_PARALLEL_PROBES))
+        .thread_name(|index| format!("cass-ssh-probe-{index}"))
+        .build()
+    {
+        Ok(pool) => pool.install(|| hosts.par_iter().map(probe).collect()),
+        Err(error) => {
+            tracing::warn!(%error, "SSH probe worker pool unavailable; probing sequentially");
+            hosts.iter().map(probe).collect()
+        }
+    }
 }
 
 /// Cache for probe results to avoid repeated probing.
@@ -922,11 +989,12 @@ impl ProbeCache {
     }
 }
 
-/// Deduplicate probe results that point to the same physical machine.
+/// Deduplicate successful probe results for the same home on the same machine.
 ///
-/// Multiple SSH aliases may point to the same machine. This function identifies
-/// duplicates using the machine_id from the probe and keeps only one entry per
-/// physical machine.
+/// A machine ID alone does not identify a session source: SSH logins with
+/// different home directories can expose different histories and installations.
+/// Merge only when both machine_id and remote_home are known and exactly equal.
+/// Missing/blank identity metadata and failed probes remain separate candidates.
 ///
 /// # Selection criteria (when duplicates found)
 /// 1. Prefer hosts with cass already installed
@@ -939,34 +1007,37 @@ impl ProbeCache {
 pub fn deduplicate_probe_results(
     results: Vec<HostProbeResult>,
 ) -> (Vec<HostProbeResult>, HashMap<String, Vec<String>>) {
-    // Group by machine_id (skip hosts without machine_id - can't dedupe them)
-    let mut by_machine_id: HashMap<String, Vec<HostProbeResult>> = HashMap::new();
-    let mut no_machine_id: Vec<HostProbeResult> = Vec::new();
+    let mut by_remote_home: HashMap<(String, String), Vec<HostProbeResult>> = HashMap::new();
+    let mut ungrouped: Vec<HostProbeResult> = Vec::new();
 
     for result in results {
-        if let Some(ref machine_id) = result
-            .system_info
-            .as_ref()
-            .and_then(|s| s.machine_id.clone())
+        if result.reachable
+            && let Some(info) = &result.system_info
+            && let Some(machine_id) = &info.machine_id
+            && !machine_id.trim().is_empty()
+            && !info.remote_home.trim().is_empty()
         {
-            by_machine_id
-                .entry(machine_id.clone())
+            // Do not infer identity from an alias label or normalize remote
+            // paths using this machine's filesystem semantics. Preserve the
+            // exact reported home, including case and symlink spellings.
+            by_remote_home
+                .entry((machine_id.clone(), info.remote_home.clone()))
                 .or_default()
                 .push(result);
         } else {
-            no_machine_id.push(result);
+            ungrouped.push(result);
         }
     }
 
     let mut deduplicated: Vec<HostProbeResult> = Vec::new();
     let mut merged_aliases: HashMap<String, Vec<String>> = HashMap::new();
 
-    // Process groups with machine_id
-    for (_machine_id, mut group) in by_machine_id {
+    // Rank only aliases with the same established remote-home identity.
+    for (_identity, mut group) in by_remote_home {
         if group.len() == 1 {
             deduplicated.push(group.remove(0));
         } else {
-            // Multiple aliases for same machine - pick the best one
+            // Multiple aliases for the same remote home - pick the best one
             group.sort_by(|a, b| {
                 // 1. Prefer installed cass
                 let a_installed = a.cass_status.is_installed();
@@ -1003,8 +1074,8 @@ pub fn deduplicate_probe_results(
         }
     }
 
-    // Add back hosts without machine_id
-    deduplicated.extend(no_machine_id);
+    // Unestablished identities must not suppress any other candidate.
+    deduplicated.extend(ungrouped);
 
     // Sort final list by name for consistent ordering
     deduplicated.sort_by(|a, b| a.host_name.cmp(&b.host_name));
@@ -1229,6 +1300,35 @@ MEM_AVAIL_KB=4194304
     }
 
     #[test]
+    fn probe_optional_unknown_preserves_installation_and_detected_paths() {
+        let output = "===PROBE_START===\nCASS_VERSION=0.7.1\nCASS_HEALTH=UNKNOWN\nAGENT_DATA=~/.claude/projects||\nAGENT_DATA=~/.codex/sessions|0|0\n===PROBE_END===\n";
+        let result = parse_probe_output("workstation", output, 2000);
+        assert!(result.reachable);
+        assert!(result.has_cass());
+        assert_eq!(result.cass_status.version(), Some("0.7.1"));
+        assert!(matches!(
+            result.cass_status,
+            CassStatus::InstalledUnknown { .. }
+        ));
+        assert!(result.has_agent_data());
+        assert_eq!(result.detected_agents[0].estimated_sessions, None);
+        assert_eq!(result.detected_agents[0].estimated_size_mb, None);
+        assert_eq!(result.detected_agents[1].estimated_sessions, Some(0));
+        assert_eq!(result.detected_agents[1].estimated_size_mb, Some(0));
+        assert!(!super::super::index::RemoteIndexer::needs_indexing(&result));
+        let display =
+            super::super::interactive::probe_to_display_info(&result, &Default::default());
+        assert!(matches!(
+            display.state,
+            super::super::interactive::HostState::ReadyToSync
+        ));
+        assert!(matches!(
+            display.cass_status,
+            super::super::interactive::CassStatusDisplay::InstalledUnknown { .. }
+        ));
+    }
+
+    #[test]
     fn test_parse_probe_output_malformed() {
         let output = "random garbage";
         let result = parse_probe_output("bad-host", output, 0);
@@ -1306,6 +1406,7 @@ CASS_VERSION=0.4.2
     // =========================================================================
 
     /// Execute a probe script on the local system via bash, returning stdout.
+    #[cfg(not(windows))]
     fn run_probe_script_with_home(script: &str, home: Option<&std::path::Path>) -> String {
         use std::io::Write;
         let mut cmd = Command::new("bash");
@@ -1391,6 +1492,7 @@ CASS_VERSION=0.4.2
     }
 
     /// Execute PROBE_SCRIPT on the local system via bash, returning stdout.
+    #[cfg(not(windows))]
     fn run_probe_script_locally() -> String {
         run_probe_script_with_home(&build_probe_script(), None)
     }
@@ -1706,6 +1808,35 @@ exit "$status"
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_optional_commands_share_deadline_and_skip_without_timeout() {
+        let script = build_probe_script_for_dirs(&[]);
+        let helper = script
+            .split("# System info")
+            .next()
+            .expect("probe preamble");
+        let exercise = format!(
+            "{helper}\n\
+             [ -n \"$PROBE_TIMEOUT_BIN\" ] || exit 1\n\
+             probe_optional printf 'FAST_OK\\n'\n\
+             probe_optional sleep 10\n\
+             echo SLOW_EXIT=$?\n\
+             probe_optional printf 'MUST_NOT_RUN\\n'\n\
+             echo EXHAUSTED_EXIT=$?\n\
+             PROBE_OPTIONAL_DEADLINE=$((SECONDS + 2))\n\
+             PROBE_TIMEOUT_BIN=\n\
+             probe_optional printf 'MUST_NOT_RUN\\n'\n\
+             echo UNAVAILABLE_EXIT=$?\n"
+        );
+        let output = run_probe_script_with_home(&exercise, None);
+        assert!(output.contains("FAST_OK"));
+        assert!(output.contains("SLOW_EXIT=124"));
+        assert!(output.contains("EXHAUSTED_EXIT=124"));
+        assert!(output.contains("UNAVAILABLE_EXIT=124"));
+        assert!(!output.contains("MUST_NOT_RUN"));
+    }
+
+    #[test]
     #[cfg(not(windows))]
     fn probe_script_treats_special_probe_paths_as_literals() {
         let home = tempfile::tempdir().expect("temp home");
@@ -1895,6 +2026,8 @@ exit "$status"
         assert!(script.contains("copilot-chat"), "missing copilot path");
         assert!(script.contains("~/.windsurf"), "missing windsurf path");
         assert!(script.contains("~/.factory"), "missing factory path");
+        assert!(script.contains("~/.local/share/muse/sessions"));
+        assert!(!script.contains("~/.config/muse"));
         assert!(script.contains("~/.clawdbot"), "missing clawdbot path");
         assert!(script.contains("~/.vibe"), "missing vibe path");
         assert!(script.contains("sourcegraph.amp"), "missing amp path");
@@ -1911,6 +2044,36 @@ exit "$status"
         assert!(script.contains("===PROBE_START==="));
         assert!(script.contains("===PROBE_END==="));
         assert!(script.contains("for dir in \"${PROBE_DIRS[@]}\""));
+    }
+
+    #[test]
+    fn gh447_remote_probe_excludes_grok_bot_mixed_container_and_keeps_grok_cli() {
+        let path = "~/Library/Application Support/Grok Bot/sand-client-persistence";
+        let paths = collect_probe_dirs(vec![
+            ("grok_bot", vec![path.into(), "/custom/replica-root".into()]),
+            ("unknown", vec![path.into()]),
+            ("grok", vec!["~/.grok/sessions".into()]),
+            ("codex", vec!["~/.codex/sessions".into()]),
+        ]);
+        assert_eq!(paths, vec!["~/.codex/sessions", "~/.grok/sessions"]);
+        let script = build_probe_script();
+        assert!(!script.contains("Grok Bot"));
+        assert!(script.contains("~/.grok/sessions"));
+        assert!(script.contains("~/.codex/sessions"));
+        // An older/custom probe can still report this directory under the
+        // generic unknown provider. Parse that real wire shape before passing
+        // it to automatic source configuration.
+        let parsed = parse_probe_output(
+            "laptop",
+            "===PROBE_START===\nAGENT_DATA=/Users/test/Library/Application Support/Grok Bot/sand-client-persistence|1|200\nAGENT_DATA=/Users/test/.codex/sessions|2|3\n===PROBE_END===",
+            1,
+        );
+        assert_eq!(parsed.detected_agents.len(), 2);
+        let generator = super::super::config::SourceConfigGenerator::new();
+        assert_eq!(
+            generator.generate_source("laptop", &parsed).paths,
+            vec!["/Users/test/.codex/sessions"]
+        );
     }
 
     #[test]
@@ -2129,5 +2292,401 @@ exit "$status"
                 mid
             );
         }
+    }
+
+    #[test]
+    fn test_deduplicate_distinct_homes_survive_source_configuration() {
+        let records = [
+            ("alice", "/home/alice", "~/.claude/projects", 10),
+            ("alice-alias", "/home/alice", "~/.claude/projects", 5),
+            ("bob", "/home/bob", "~/.codex/sessions", 1000),
+        ];
+        let results: Vec<_> = records
+            .iter()
+            .map(|(name, home, path, sessions)| {
+                parse_probe_output(
+                    name,
+                    &format!(
+                        "===PROBE_START===\nOS=linux\nARCH=x86_64\n\
+                         HOME={home}\nMACHINE_ID=shared-machine\nCASS_VERSION=0.10.0\n\
+                         CASS_HEALTH=OK\nCASS_SESSIONS={sessions}\n\
+                         AGENT_DATA={path}|5|{sessions}\n===PROBE_END===\n"
+                    ),
+                    1,
+                )
+            })
+            .collect();
+        let mut reversed = results.clone();
+        reversed.reverse();
+        for input in [results, reversed] {
+            // Exercise both discovery orders; Bob's larger archive must never
+            // cause Alice's different home to disappear during setup selection.
+            let (deduped, merged) = deduplicate_probe_results(input);
+            assert_eq!(
+                deduped
+                    .iter()
+                    .map(|host| host.host_name.as_str())
+                    .collect::<Vec<_>>(),
+                ["alice", "bob"]
+            );
+            assert_eq!(
+                merged,
+                HashMap::from([("alice".to_string(), vec!["alice-alias".to_string()])])
+            );
+            let generator = super::super::config::SourceConfigGenerator::new();
+            let probes: Vec<_> = deduped
+                .iter()
+                .map(|host| (host.host_name.as_str(), host))
+                .collect();
+            let preview = generator.generate_preview(&probes, &Default::default());
+            assert!(preview.sources_skipped.is_empty());
+            assert_eq!(preview.sources_to_add.len(), 2);
+            for (name, home, path, _) in [records[0], records[2]] {
+                let source = preview
+                    .sources_to_add
+                    .iter()
+                    .find(|source| source.name == name)
+                    .unwrap();
+                assert_eq!(source.host.as_deref(), Some(name));
+                assert_eq!(source.paths, vec![path]);
+                assert!(
+                    source
+                        .path_mappings
+                        .iter()
+                        .any(|mapping| mapping.from == home)
+                );
+                assert!(source.validate().is_ok());
+            }
+            let (again, merged_again) = deduplicate_probe_results(deduped.clone());
+            assert_eq!(
+                serde_json::to_value(again).unwrap(),
+                serde_json::to_value(deduped).unwrap()
+            );
+            assert!(merged_again.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_deduplicate_requires_nonblank_machine_and_home() {
+        for (machine_id, home) in [
+            (None, "/home/user"),
+            (Some(""), "/home/user"),
+            (Some(" \t"), "/home/user"),
+            (Some("same-machine"), ""),
+            (Some("same-machine"), " \t"),
+        ] {
+            let mut results = vec![
+                make_probe_result("first", machine_id, Some(10)),
+                make_probe_result("second", machine_id, Some(1000)),
+            ];
+            for result in &mut results {
+                result.system_info.as_mut().unwrap().remote_home = home.into();
+            }
+            let expected = serde_json::to_value(&results).unwrap();
+            let (deduped, merged) = deduplicate_probe_results(results);
+            assert_eq!(serde_json::to_value(deduped).unwrap(), expected);
+            assert!(merged.is_empty());
+        }
+        let mut results = vec![
+            make_probe_result("first", Some("same-machine"), Some(10)),
+            make_probe_result("second", Some("same-machine"), Some(1000)),
+        ];
+        for result in &mut results {
+            result.system_info = None;
+        }
+        let (deduped, merged) = deduplicate_probe_results(results);
+        assert_eq!(deduped.len(), 2);
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn test_deduplicate_preserves_exact_remote_home_spelling() {
+        for (first_home, second_home) in [
+            ("/home/Alice", "/home/alice"),
+            ("/home/alice", "/home/alice-backup"),
+            ("/home/alice", "/home/alice/"),
+            ("/home/link/../alice", "/home/alice"),
+        ] {
+            let mut first = make_probe_result("first", Some("same-machine"), Some(10));
+            let mut second = make_probe_result("second", Some("same-machine"), Some(1000));
+            first.system_info.as_mut().unwrap().remote_home = first_home.into();
+            second.system_info.as_mut().unwrap().remote_home = second_home.into();
+            let expected = serde_json::to_value([&first, &second]).unwrap();
+            let (deduped, merged) = deduplicate_probe_results(vec![second, first]);
+            assert_eq!(serde_json::to_value(deduped).unwrap(), expected);
+            assert!(merged.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_deduplicate_failed_probe_cannot_hide_reachable_home() {
+        let good = make_probe_result("good", Some("same-machine"), Some(10));
+        let mut failed = make_probe_result("failed", Some("same-machine"), Some(1000));
+        // Even if a caller retains metadata alongside a failed observation,
+        // stale installation/session counts cannot suppress a reachable alias.
+        failed.reachable = false;
+        failed.error = Some("connection failed after an earlier observation".into());
+        let (deduped, merged) = deduplicate_probe_results(vec![good.clone(), failed.clone()]);
+        assert_eq!(
+            serde_json::to_value(deduped).unwrap(),
+            serde_json::to_value([failed, good]).unwrap()
+        );
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn test_parallel_probe_empty_never_reports_progress() {
+        let results = probe_hosts_parallel(&[], 1, |_, _, _| {
+            panic!("an empty batch must not report a completed probe");
+        });
+        assert!(results.is_empty());
+    }
+
+    /// Run only the named test in an isolated environment. Real OpenSSH uses
+    /// a refusing ProxyCommand; only external Tailscale status is a fixture.
+    /// No process-wide environment changes leak into parallel library tests.
+    #[cfg(target_os = "linux")]
+    fn bounded_probe_fixture_child(test_name: &str) -> bool {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        if dotenvy::var("CASS_TEST_BOUNDED_PROBE_CHILD").is_ok_and(|name| name == test_name) {
+            return true;
+        }
+        assert!(
+            Command::new("/usr/bin/ssh")
+                .arg("-V")
+                .output()
+                .expect("real OpenSSH is required")
+                .status
+                .success()
+        );
+        let root = tempfile::tempdir().unwrap();
+        for directory in ["bin", "home", "config", "cache", "data"] {
+            fs::create_dir_all(root.path().join(directory)).unwrap();
+        }
+        let recorder = root.path().join("record-transport.sh");
+        fs::write(
+            &recorder,
+            r#"#!/bin/sh
+set -eu
+printf 'start %s\n' "$1" >> "$CASS_TEST_PROBE_ROOT/transports"
+/bin/sleep 0.1
+printf 'end %s\n' "$1" >> "$CASS_TEST_PROBE_ROOT/transports"
+exit 1
+"#,
+        )
+        .unwrap();
+        fs::write(root.path().join("transports"), "").unwrap();
+        fs::write(
+            root.path().join("ssh_config"),
+            format!(
+                "Host *\n ProxyCommand /bin/sh \"{}\" %h\n BatchMode yes\n ConnectionAttempts 1\n\
+                 Host workstation\n HostName 100.64.0.1\n User developer\n Port 2222\n",
+                recorder.display()
+            ),
+        )
+        .unwrap();
+        let tailscale = root.path().join("bin/tailscale");
+        fs::write(
+            &tailscale,
+            r#"#!/bin/sh
+set -eu
+[ "$#" -eq 2 ] && [ "$1" = status ] && [ "$2" = --json ] || exit 64
+printf 'status\n' >> "$CASS_TEST_PROBE_ROOT/status-calls"
+exec /bin/cat "$CASS_TEST_PROBE_ROOT/status.json"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&tailscale, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut peers = serde_json::Map::new();
+        for index in 1..=17 {
+            peers.insert(
+                format!("machine-{index}"),
+                serde_json::json!({"Online": true, "TailscaleIPs": [format!("100.64.0.{index}")]}),
+            );
+        }
+        peers.insert(
+            "tagged-provider".into(),
+            serde_json::json!({"Online": true, "Tags": ["tag:mullvad-exit-node"], "TailscaleIPs": ["100.90.0.1"]}),
+        );
+        peers.insert(
+            "dns-provider".into(),
+            serde_json::json!({"Online": true, "DNSName": "SE-STO-WG-001.MULLVAD.TS.NET.", "Tags": null, "TailscaleIPs": ["100.90.0.2"]}),
+        );
+        fs::write(
+            root.path().join("status.json"),
+            serde_json::to_vec(&serde_json::json!({"BackendState": "Running", "Peer": peers}))
+                .unwrap(),
+        )
+        .unwrap();
+        let output = assert_cmd::Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .current_dir(root.path())
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", root.path().join("bin").display()),
+            )
+            .env("HOME", root.path().join("home"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("CASS_DATA_DIR", root.path().join("cass-data"))
+            .env("CASS_SSH_CONFIG", root.path().join("ssh_config"))
+            .env("CASS_TEST_PROBE_ROOT", root.path())
+            .env("CASS_TEST_BOUNDED_PROBE_CHILD", test_name)
+            .env("RAYON_NUM_THREADS", "32")
+            .env("RUST_MIN_STACK", "134217728")
+            .args([
+                "--exact",
+                test_name,
+                "--nocapture",
+                "--test-threads=1",
+                "--color=never",
+            ])
+            .timeout(Duration::from_secs(60))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            "the isolated regression must actually run: {output:?}"
+        );
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_bounded_probe_transports(expected: &[String]) {
+        use std::collections::BTreeSet;
+
+        let root = std::path::PathBuf::from(dotenvy::var("CASS_TEST_PROBE_ROOT").unwrap());
+        let trace = std::fs::read_to_string(root.join("transports")).unwrap();
+        let mut active = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        for line in trace.lines() {
+            let (event, host) = line.split_once(' ').expect("transport event");
+            match event {
+                "start" => {
+                    assert!(active.insert(host.to_string()), "duplicate start: {trace}");
+                    assert!(seen.insert(host.to_string()), "repeated probe: {trace}");
+                    assert!(active.len() <= 4, "excessive SSH fan-out: {trace}");
+                }
+                "end" => assert!(active.remove(host), "unmatched completion: {trace}"),
+                _ => panic!("unexpected transport event: {line}"),
+            }
+        }
+        assert!(active.is_empty(), "unfinished transports: {trace}");
+        assert_eq!(seen, expected.iter().cloned().collect::<BTreeSet<_>>());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_parallel_probe_fleet_is_bounded_and_complete() {
+        if !bounded_probe_fixture_child(
+            "sources::probe::tests::test_parallel_probe_fleet_is_bounded_and_complete",
+        ) {
+            return;
+        }
+        let root = std::path::PathBuf::from(dotenvy::var("CASS_TEST_PROBE_ROOT").unwrap());
+        for parent_workers in [1, 32] {
+            let parent = rayon::ThreadPoolBuilder::new()
+                .num_threads(parent_workers)
+                .build()
+                .unwrap();
+            for count in [1, 3, 4, 5, 17] {
+                std::fs::write(root.join("transports"), "").unwrap();
+                let hosts: Vec<_> = (1..=count)
+                    .rev()
+                    .map(|index| DiscoveredHost {
+                        name: format!("100.64.0.{index}"),
+                        hostname: None,
+                        user: None,
+                        port: None,
+                        identity_file: None,
+                    })
+                    .collect();
+                let progress = std::sync::Mutex::new(Vec::new());
+                let results = parent.install(|| {
+                    probe_hosts_parallel(&hosts, 10, |done, total, name| {
+                        progress.lock().unwrap().push((
+                            done,
+                            total,
+                            name.to_string(),
+                            rayon::current_num_threads(),
+                        ));
+                    })
+                });
+                let expected: Vec<_> = hosts.iter().map(|host| host.name.clone()).collect();
+                assert_eq!(
+                    results
+                        .iter()
+                        .map(|host| host.host_name.clone())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                assert!(
+                    results
+                        .iter()
+                        .all(|host| !host.reachable && host.error.is_some())
+                );
+                let mut progress = progress.into_inner().unwrap();
+                progress.sort_by_key(|entry| entry.0);
+                assert_eq!(progress.len(), count);
+                for (index, (done, total, _, workers)) in progress.iter().enumerate() {
+                    assert_eq!(*done, index + 1);
+                    assert_eq!(*total, count);
+                    // This also catches inherited 32-worker execution without
+                    // relying on sleep timings to expose excessive overlap.
+                    assert!(*workers <= 4, "inherited a {workers}-worker pool");
+                }
+                let reported: std::collections::BTreeSet<_> =
+                    progress.into_iter().map(|entry| entry.2).collect();
+                assert_eq!(
+                    reported,
+                    expected
+                        .iter()
+                        .cloned()
+                        .collect::<std::collections::BTreeSet<_>>()
+                );
+                assert_bounded_probe_transports(&expected);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_parallel_probe_setup_excludes_provider_transports() {
+        if !bounded_probe_fixture_child(
+            "sources::probe::tests::test_parallel_probe_setup_excludes_provider_transports",
+        ) {
+            return;
+        }
+        let parent = rayon::ThreadPoolBuilder::new()
+            .num_threads(32)
+            .build()
+            .unwrap();
+        parent.install(|| {
+            let error = super::super::setup::run_setup(&super::super::setup::SetupOptions {
+                non_interactive: true,
+                json: true,
+                tailscale: true,
+                skip_install: true,
+                skip_index: true,
+                skip_sync: true,
+                ..Default::default()
+            })
+            .unwrap_err();
+            // All eligible hosts reach real OpenSSH; the refusing transport
+            // makes each unreachable. Provider endpoints must never get here.
+            assert!(matches!(error, super::super::setup::SetupError::NoHosts));
+        });
+        let expected: Vec<_> = (1..=17).map(|index| format!("100.64.0.{index}")).collect();
+        assert_bounded_probe_transports(&expected);
+        let root = std::path::PathBuf::from(dotenvy::var("CASS_TEST_PROBE_ROOT").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(root.join("status-calls")).unwrap(),
+            "status\n"
+        );
+        assert!(!root.join("config/cass/sources.toml").exists());
     }
 }

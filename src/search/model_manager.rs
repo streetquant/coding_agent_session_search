@@ -9,6 +9,8 @@
 //! It does **not** download models. Missing files are surfaced as availability
 //! states so the UI can guide the user. Downloads are handled by [`model_download`].
 
+mod external;
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -686,6 +688,12 @@ pub(crate) fn probe_semantic_availability_for_embedder(
     data_dir: &Path,
     embedder_name: &str,
 ) -> SemanticAvailability {
+    if embedder_name
+        .trim()
+        .eq_ignore_ascii_case(crate::search::external_embedder::EXTERNAL_EMBEDDER)
+    {
+        return external::probe(data_dir);
+    }
     if let Some(availability) = selected_generation_owner_requirement(data_dir) {
         return availability;
     }
@@ -909,6 +917,14 @@ fn load_semantic_context_inner(
     defer_embedder_load: bool,
     strict_read_only: bool,
 ) -> SemanticSetup {
+    if embedder_name
+        .trim()
+        .eq_ignore_ascii_case(crate::search::external_embedder::EXTERNAL_EMBEDDER)
+    {
+        // The local deferred/daemon fallback is not an external provider. This
+        // path admits the external artifact first, then runs its own preflight.
+        return external::load(data_dir, db_path, strict_read_only);
+    }
     if let Some(availability) = selected_generation_owner_requirement(data_dir) {
         return SemanticSetup {
             availability,
@@ -1287,8 +1303,14 @@ fn semantic_availability_from_cache_state(
 /// vector index header with the current native MiniLM contract. Shape equality
 /// alone cannot prove compatibility across inference-engine generations.
 ///
-/// Returns `true` if rebuild is needed, `false` otherwise.
+/// A selected generation requires the owner-backed admission path; this legacy
+/// probe cannot certify it by inspecting a conventional filename. Such a
+/// selection (including an unreadable pointer) returns `true` without opening
+/// legacy assets. This function never repairs or replays a writable index.
 pub fn needs_index_rebuild(data_dir: &Path) -> bool {
+    if selected_generation_owner_requirement(data_dir).is_some() {
+        return true;
+    }
     let index_path = vector_index_path(data_dir, FastEmbedder::embedder_id_static());
 
     if !index_path.is_file() {
@@ -1296,8 +1318,8 @@ pub fn needs_index_rebuild(data_dir: &Path) -> bool {
         return false;
     }
 
-    // Try to load the index and check its embedder ID
-    match VectorIndex::open(&index_path) {
+    // Diagnostics must not replay/repair a journal or create writable sidecars.
+    match VectorIndex::open_read_only(&index_path) {
         Ok(index) => {
             validate_vector_index_contract(&index, FastEmbedder::embedder_id_static(), 384).is_err()
         }
@@ -1528,6 +1550,97 @@ mod tests {
     fn test_needs_index_rebuild_no_index() {
         let tmp = tempdir().unwrap();
         assert!(!needs_index_rebuild(tmp.path()));
+    }
+
+    #[test]
+    fn rebuild_probe_preserves_legacy_bytes_and_directory_entries() -> anyhow::Result<()> {
+        let tmp = tempdir()?;
+        let path = vector_index_path(tmp.path(), FastEmbedder::embedder_id_static());
+        std::fs::create_dir_all(path.parent().expect("vector parent"))?;
+        let revision = expected_vector_space_revision(FastEmbedder::embedder_id_static())
+            .ok_or_else(|| anyhow::anyhow!("MiniLM vector-space revision is missing"))?;
+        VectorIndex::create_with_revision(
+            &path,
+            FastEmbedder::embedder_id_static(),
+            revision,
+            384,
+            frankensearch::index::Quantization::F16,
+        )?
+        .finish()?;
+        let before = std::fs::read(&path)?;
+        let modified = std::fs::metadata(&path)?.modified()?;
+        let entries = |parent: &Path| -> std::io::Result<Vec<std::ffi::OsString>> {
+            let mut names = std::fs::read_dir(parent)?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            names.sort();
+            Ok(names)
+        };
+        let parent = path.parent().expect("vector parent");
+        let before_entries = entries(parent)?;
+        for _ in 0..2 {
+            assert!(!needs_index_rebuild(tmp.path()));
+        }
+        assert_eq!(std::fs::read(&path)?, before);
+        assert_eq!(std::fs::metadata(&path)?.modified()?, modified);
+        assert_eq!(entries(parent)?, before_entries);
+
+        // An invalid journal must not be truncated, replayed or replaced by a
+        // compatibility probe, even when it makes the probe fail closed.
+        let wal = frankensearch::index::wal_path_for(&path);
+        std::fs::write(&wal, b"owned malformed WAL control")?;
+        let wal_before = std::fs::read(&wal)?;
+        let entries_with_wal = entries(parent)?;
+        let _ = needs_index_rebuild(tmp.path());
+        assert_eq!(std::fs::read(&wal)?, wal_before);
+        assert_eq!(std::fs::read(&path)?, before);
+        assert_eq!(std::fs::metadata(&path)?.modified()?, modified);
+        assert_eq!(entries(parent)?, entries_with_wal);
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_probe_does_not_bypass_selected_generation() -> anyhow::Result<()> {
+        let tmp = tempdir()?;
+        let pointer = SemanticCurrentPointerV1::path(tmp.path());
+        std::fs::create_dir_all(pointer.parent().expect("pointer parent"))?;
+        std::fs::write(&pointer, b"owned malformed current pointer")?;
+        assert!(
+            needs_index_rebuild(tmp.path()),
+            "selection must not look like an absent legacy index"
+        );
+
+        let legacy = vector_index_path(tmp.path(), FastEmbedder::embedder_id_static());
+        std::fs::create_dir_all(legacy.parent().expect("legacy parent"))?;
+        let revision = expected_vector_space_revision(FastEmbedder::embedder_id_static())
+            .ok_or_else(|| anyhow::anyhow!("MiniLM vector-space revision is missing"))?;
+        VectorIndex::create_with_revision(
+            &legacy,
+            FastEmbedder::embedder_id_static(),
+            revision,
+            384,
+            frankensearch::index::Quantization::F16,
+        )?
+        .finish()?;
+        let before = std::fs::read(&legacy)?;
+        assert!(
+            needs_index_rebuild(tmp.path()),
+            "compatible legacy bytes must not override current selection"
+        );
+        assert_eq!(std::fs::read(&legacy)?, before);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let dangling = tempdir()?;
+            let pointer = SemanticCurrentPointerV1::path(dangling.path());
+            std::fs::create_dir_all(pointer.parent().expect("dangling pointer parent"))?;
+            symlink(dangling.path().join("absent-target"), &pointer)?;
+            assert!(
+                needs_index_rebuild(dangling.path()),
+                "dangling selection is not absence"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -1943,15 +2056,20 @@ mod tests {
         };
         std::fs::create_dir_all(parent)?;
 
-        let writer = VectorIndex::create_with_revision(
-            &index_path,
-            FastEmbedder::embedder_id_static(),
+        for legacy in [
             "1.0",
-            384,
-            frankensearch::index::Quantization::F16,
-        )?;
-        writer.finish()?;
-        assert!(needs_index_rebuild(tmp.path()));
+            "native-minilm-v1:c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+        ] {
+            let writer = VectorIndex::create_with_revision(
+                &index_path,
+                FastEmbedder::embedder_id_static(),
+                legacy,
+                384,
+                frankensearch::index::Quantization::F16,
+            )?;
+            writer.finish()?;
+            assert!(needs_index_rebuild(tmp.path()));
+        }
 
         let expected_revision = expected_vector_space_revision(FastEmbedder::embedder_id_static())
             .ok_or_else(|| anyhow::anyhow!("MiniLM vector-space revision is not registered"))?;

@@ -28,6 +28,447 @@ const GOLDEN_UPDATE_COMMAND_SHAPE: &str = "UPDATE_GOLDENS=1 rch exec -- env CARG
 const GOLDEN_REVIEW_COMMAND_SHAPE: &str = "git diff -- tests/fixtures/swarm_status tests/golden/swarm_status tests/swarm_status_contract.rs";
 const STRESS_SAMPLE_COUNT: usize = 5;
 
+#[test]
+fn live_swarm_reads_proof_metadata_without_following_artifact_paths() {
+    let root = TempDir::new().unwrap();
+    let proofs = root.path().join(".cass/proofs");
+    fs::create_dir_all(&proofs).unwrap();
+    let manifest = proofs.join("proof-manifest.jsonl");
+    let content = format!(
+        "{}\n{{bad\n",
+        json!({
+            "label":"selected test", "status":"pass", "command":"PRIVATE_COMMAND",
+            "path":"/private/never-read.json"
+        })
+    );
+    fs::write(&manifest, &content).unwrap();
+    let before = fs::metadata(&manifest).unwrap().modified().unwrap();
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .current_dir(root.path())
+        .env("HOME", root.path().join("home"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_DATA_HOME", root.path().join("data"))
+        .env("CASS_DATA_DIR", root.path().join("archive"))
+        .env_remove("CASS_TRACE_FILE")
+        .env_remove("CASS_SWARM_AGENT_MAIL_URL")
+        .env_remove("CASS_SWARM_AGENT_MAIL_TOKEN")
+        .args(["swarm", "status", "--json"])
+        .timeout(Duration::from_secs(40))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["evidence"]["recent_proofs"][0]["reported_status"],
+        "pass"
+    );
+    assert_eq!(
+        value["evidence"]["recent_proofs"][0]["status"],
+        "unverified"
+    );
+    assert!(value["summary"]["proof_gap_count"].is_null());
+    assert_eq!(
+        value["_meta"]["source_observations"]["evidence"]["rejected_records"],
+        1
+    );
+    let rendered = String::from_utf8(output.stdout).unwrap();
+    assert!(!rendered.contains("PRIVATE_COMMAND"));
+    assert!(!rendered.contains("/private/"));
+    assert_eq!(fs::read_to_string(&manifest).unwrap(), content);
+    assert_eq!(fs::metadata(&manifest).unwrap().modified().unwrap(), before);
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn live_swarm_status_reports_unknown_sources_without_zero_work_claims() {
+    let root = TempDir::new().expect("empty working directory");
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .current_dir(root.path())
+        .env("HOME", root.path().join("home"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_DATA_HOME", root.path().join("data"))
+        .env("CASS_DATA_DIR", root.path().join("cass-data"))
+        .env("CASS_AUTO_REFRESH", "0")
+        .env_remove("CASS_SWARM_AGENT_MAIL_URL")
+        .env_remove("CASS_SWARM_AGENT_MAIL_TOKEN")
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .args(["swarm", "status", "--json"])
+        .timeout(Duration::from_secs(40))
+        .output()
+        .expect("live status command");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("status JSON");
+    assert_eq!(value["status"], "partial");
+    for field in ["healthy", "initialized", "search_ready", "active_rebuild"] {
+        assert_eq!(
+            value["cass"][field], false,
+            "absent archive {field}: {value}"
+        );
+    }
+    assert_eq!(value["cass"]["health_status"], "uninitialized");
+    assert_eq!(
+        value["_meta"]["source_observations"]["cass_health"]["source_kind"],
+        "passive-filesystem"
+    );
+    for field in [
+        "ready_count",
+        "in_progress_count",
+        "blocked_count",
+        "dirty_worktree",
+    ] {
+        assert!(
+            value["summary"][field].is_null(),
+            "unknown {field}: {value}"
+        );
+    }
+    assert_eq!(value["build_pressure"]["status"], "unknown");
+    assert!(value["summary"]["build_pressure"].is_null());
+    for field in ["active_cargo_jobs", "cpu_count", "load_average_1m"] {
+        assert!(value["build_pressure"][field].is_null());
+    }
+    assert_eq!(
+        value["build_pressure"]["recommended_action"],
+        "inspect-rch-state"
+    );
+    assert!(value["beads"]["graph"].is_null());
+    assert!(
+        value["_meta"]["generated_at_ms"]
+            .as_u64()
+            .is_some_and(|time| time > 0)
+    );
+    assert!(!root.path().join(".beads").exists());
+    assert!(!root.path().join(".git").exists());
+    assert!(!root.path().join("cass-data").exists());
+}
+
+#[test]
+fn passive_cass_observer_preserves_archive_stale_lock_and_trace_files() {
+    let root = TempDir::new().expect("observer environment");
+    let db = root.path().join("archive.db");
+    let lock = root.path().join("index-run.lock");
+    let sidecar = root.path().join("index-run.lock.meta");
+    let trace = root.path().join("trace.jsonl");
+    let env_trace = root.path().join("env-trace.jsonl");
+    // Deliberately not a valid database: observing it must never open, repair,
+    // or infer query readiness from the mere presence of a file.
+    fs::write(&db, b"unprobed archive sentinel").unwrap();
+    fs::write(&lock, b"pid=4294967295\nmode=index\n").unwrap();
+    fs::write(&sidecar, b"pid=4294967295\nmode=index\n").unwrap();
+    fs::write(&trace, b"existing trace\n").unwrap();
+    let before: Vec<_> = [&db, &lock, &sidecar, &trace]
+        .into_iter()
+        .map(|path| {
+            (
+                path,
+                fs::read(path).unwrap(),
+                fs::metadata(path).unwrap().modified().unwrap(),
+            )
+        })
+        .collect();
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .current_dir(root.path())
+        .env("CASS_TRACE_FILE", &env_trace)
+        .arg("--trace-file")
+        .arg(&trace)
+        .args(["swarm", "observe-cass", "--data-dir"])
+        .arg(root.path())
+        .arg("--db-path")
+        .arg(&db)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .expect("passive child");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    for field in ["healthy", "initialized", "search_ready", "active_rebuild"] {
+        assert!(value[field].is_null(), "unprobed {field}: {value}");
+    }
+    assert_eq!(value["source_kind"], "passive-filesystem");
+    assert_eq!(value["archive_id"].as_str().unwrap().len(), 64);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("archive sentinel"));
+    assert!(!env_trace.exists());
+    for (path, bytes, modified) in before {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), modified);
+    }
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 4);
+}
+
+#[test]
+#[cfg(unix)]
+fn passive_cass_observer_reads_held_lock_without_releasing_the_owner() {
+    let root = TempDir::new().expect("locked archive");
+    let lock = root.path().join("index-run.lock");
+    fs::write(&lock, format!("pid={}\nmode=index\n", std::process::id())).unwrap();
+    let owner = fs::File::options()
+        .read(true)
+        .write(true)
+        .open(&lock)
+        .unwrap();
+    owner.lock().unwrap();
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .current_dir(root.path())
+        .args(["swarm", "observe-cass", "--data-dir"])
+        .arg(root.path())
+        .arg("--db-path")
+        .arg(root.path().join("missing.db"))
+        .timeout(Duration::from_secs(5))
+        .output()
+        .expect("passive child");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["active_rebuild"], true);
+    assert_eq!(value["initialized"], false);
+    let contender = fs::File::open(&lock).unwrap();
+    assert!(matches!(
+        contender.try_lock_shared(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    owner.unlock().unwrap();
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn live_swarm_observes_explicit_database_without_opening_it() {
+    let root = TempDir::new().expect("explicit archive");
+    let db = root.path().join("explicit.db");
+    fs::write(&db, b"unprobed archive sentinel").unwrap();
+    let modified = fs::metadata(&db).unwrap().modified().unwrap();
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .current_dir(root.path())
+        .env("HOME", root.path().join("home"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_DATA_HOME", root.path().join("data"))
+        .env("CASS_DATA_DIR", root.path().join("absent-default"))
+        .env("CASS_AUTO_REFRESH", "0")
+        // The observer must override this inherited preference, rather than
+        // relying on the operator to disable RCH's status-time cache writes.
+        .env("RCH_DISABLE_CONFIG_CACHE", "0")
+        .env_remove("CASS_TRACE_FILE")
+        .env_remove("CASS_SWARM_AGENT_MAIL_URL")
+        .env_remove("CASS_SWARM_AGENT_MAIL_TOKEN")
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .arg("--db")
+        .arg(&db)
+        .args(["swarm", "status", "--json"])
+        .timeout(Duration::from_secs(40))
+        .output()
+        .expect("live status child");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["cass"]["health_status"], "unprobed");
+    for field in ["healthy", "initialized", "search_ready"] {
+        assert!(value["cass"][field].is_null(), "unprobed {field}: {value}");
+    }
+    assert_eq!(value["cass"]["active_rebuild"], false);
+    assert_eq!(fs::read(&db).unwrap(), b"unprobed archive sentinel");
+    assert_eq!(fs::metadata(&db).unwrap().modified().unwrap(), modified);
+    let entries: Vec<_> = fs::read_dir(root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, [std::ffi::OsString::from("explicit.db")]);
+}
+
+#[test]
+#[ignore = "requires installed br 0.6.x or 0.7.x; run explicitly through RCH"]
+fn live_swarm_cli_reads_real_git_and_beads_without_authorizing_claims() {
+    let sandbox = TempDir::new().expect("isolated CLI environment");
+    let repo = sandbox.path().join("repo");
+    fs::create_dir(&repo).expect("repository directory");
+    let tool = |program: &str, args: &[&str]| {
+        assert!(matches!(program, "git" | "br"), "unknown test tool");
+        let mut command = if program == "git" {
+            std::process::Command::new("git")
+        } else {
+            std::process::Command::new("br")
+        };
+        let output = command
+            .args(args)
+            .current_dir(&repo)
+            .env("HOME", sandbox.path().join("home"))
+            .env("XDG_CONFIG_HOME", sandbox.path().join("config"))
+            .env("BEADS_DIR", repo.join(".beads"))
+            .env_remove("BEADS_DB")
+            .env_remove("BD_DB")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .expect("installed Git and br tools");
+        assert!(
+            output.status.success(),
+            "{program} {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    tool("git", &["init", "-b", "main"]);
+    fs::write(repo.join("tracked.txt"), "original").expect("tracked file");
+    tool("git", &["add", "tracked.txt"]);
+    tool(
+        "git",
+        &[
+            "-c",
+            "user.name=CASS Test",
+            "-c",
+            "user.email=cass@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "seed",
+        ],
+    );
+    let head = String::from_utf8(tool("git", &["rev-parse", "HEAD"]))
+        .expect("Git commit identity")
+        .trim()
+        .to_owned();
+    fs::write(repo.join("tracked.txt"), "modified").expect("dirty worktree");
+    tool("br", &["init", "--prefix", "live"]);
+    let create = |title: &str| {
+        let value: Value = serde_json::from_slice(&tool("br", &["create", title, "--json"]))
+            .expect("created bead");
+        value["id"].as_str().expect("bead ID").to_owned()
+    };
+    let ready = create("Ready task");
+    let active = create("Active task");
+    let blocked = create("Blocked task");
+    tool("br", &["update", &active, "--status", "in_progress"]);
+    tool("br", &["dep", "add", &blocked, &active]);
+    tool("br", &["sync", "--flush-only"]);
+
+    let unchanged: Vec<_> = [
+        ".git/index",
+        ".beads/issues.jsonl",
+        ".beads/beads.db",
+        "tracked.txt",
+    ]
+    .into_iter()
+    .map(|relative| {
+        let path = repo.join(relative);
+        let bytes = fs::read(&path).expect("source bytes");
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        (path, bytes, modified)
+    })
+    .collect();
+    let cass = |args: &[&str]| {
+        let output = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+            .current_dir(&repo)
+            .env("HOME", sandbox.path().join("home"))
+            .env("XDG_CONFIG_HOME", sandbox.path().join("config"))
+            .env("XDG_DATA_HOME", sandbox.path().join("data"))
+            .env("CASS_DATA_DIR", sandbox.path().join("cass-data"))
+            .env("CASS_AUTO_REFRESH", "0")
+            .env_remove("CASS_SWARM_AGENT_MAIL_URL")
+            .env_remove("CASS_SWARM_AGENT_MAIL_TOKEN")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .args(args)
+            .timeout(Duration::from_secs(40))
+            .output()
+            .expect("live CLI output");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).expect("live CLI JSON")
+    };
+    let status = cass(&["swarm", "status", "--json"]);
+    assert_eq!(status["status"], "partial");
+    assert_eq!(status["summary"]["dirty_worktree"], true);
+    let dirty_paths = status["git"]["dirty_paths"].as_array().unwrap();
+    assert!(dirty_paths.iter().all(|row| row["path"].is_string()));
+    assert!(dirty_paths.iter().any(|row| row["path"] == "tracked.txt"));
+    for (category, id, count) in [
+        ("ready", &ready, "ready_count"),
+        ("in_progress", &active, "in_progress_count"),
+        ("blocked", &blocked, "blocked_count"),
+    ] {
+        assert_eq!(status["summary"][count], 1);
+        let row = &status["beads"][category][0];
+        assert_eq!(row["id"], id.as_str());
+        assert_eq!(row["safe_to_claim"], false);
+        assert!(
+            row["claim_blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "live-coordination-unverified")
+        );
+        assert!(row.get("stale_state").is_none());
+    }
+    assert!(status["summary"]["stale_candidate_count"].is_null());
+    assert_eq!(
+        status["build_pressure"]["recommended_action"],
+        "inspect-rch-state"
+    );
+    let observations = &status["_meta"]["source_observations"];
+    assert_eq!(observations["git"]["head"], head);
+    assert_eq!(
+        observations["git"]["repository_id"].as_str().unwrap().len(),
+        64
+    );
+    assert_eq!(observations["beads"]["source_kind"], "exported-jsonl");
+    assert!(observations["beads"]["observed_at_ms"].as_u64().unwrap() > 0);
+    let packet = cass(&["swarm", "work-packet", "--json", "--bead", &ready]);
+    assert_eq!(
+        packet["summary"]["bead_id"], ready,
+        "live work packet did not retain the requested fixture bead: {packet:#}"
+    );
+    assert_eq!(packet["summary"]["safe_to_start"], false);
+    assert_eq!(packet["_meta"]["source_observations"]["git"]["head"], head);
+    assert_eq!(
+        packet["work_packet"]["collision_simulation"]["inputs"]["dirty_path_count"],
+        dirty_paths.len()
+    );
+    assert!(
+        packet["work_packet"]["collision_simulation"]["advisories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|advisory| advisory["kind"] == "peer-dirty-unrelated")
+    );
+    for (path, bytes, modified) in &unchanged {
+        assert_eq!(&fs::read(path).expect("source unchanged"), bytes);
+        assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), *modified);
+    }
+    // Break only this disposable export. Git should remain usable, and the
+    // tracker failure must not turn into a zero-ready-work result.
+    fs::write(repo.join(".beads/issues.jsonl"), "{malformed\n").expect("damaged test export");
+    let failed = cass(&["swarm", "status", "--json"]);
+    assert_eq!(failed["status"], "partial");
+    assert_eq!(failed["summary"]["dirty_worktree"], true);
+    assert!(failed["summary"]["ready_count"].is_null());
+    assert_eq!(
+        fs::read(repo.join(".beads/issues.jsonl")).unwrap(),
+        b"{malformed\n"
+    );
+    assert_eq!(
+        fs::read(repo.join(".beads/beads.db")).unwrap(),
+        unchanged[2].1
+    );
+}
+
 const REQUIRED_SCENARIOS: &[&str] = &[
     "healthy",
     "busy",

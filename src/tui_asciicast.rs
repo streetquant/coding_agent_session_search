@@ -388,19 +388,17 @@ where
 }
 
 fn is_pty_eof_error(err: &io::Error) -> bool {
-    if matches!(
+    let eof_kind = matches!(
         err.kind(),
         io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe
-    ) {
-        return true;
-    }
+    );
     #[cfg(unix)]
     {
-        err.raw_os_error() == Some(posix::EIO)
+        eof_kind || err.raw_os_error() == Some(posix::EIO)
     }
     #[cfg(not(unix))]
     {
-        false
+        eof_kind
     }
 }
 
@@ -478,10 +476,9 @@ impl Drop for StdinNonBlockingGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ensure_asciicast_output_available, is_pty_eof_error, open_asciicast_recorder_no_overwrite,
-        strip_asciicast_args,
-    };
+    #[cfg(unix)]
+    use super::ensure_asciicast_output_available;
+    use super::{is_pty_eof_error, open_asciicast_recorder_no_overwrite, strip_asciicast_args};
     use std::io;
     use std::io::Write as _;
 

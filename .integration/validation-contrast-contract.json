@@ -1,0 +1,39 @@
+{
+  "baseline": {
+    "expected_head": "REPLACE_WITH_BASELINE_COMMIT",
+    "root": "REPLACE_WITH_CLEAN_BASELINE_WORKTREE"
+  },
+  "candidate": {
+    "expected_head": "",
+    "root": "."
+  },
+  "cases": [
+    {
+      "command": {
+        "argv_template": [
+          "python",
+          "REPLACE_WITH_CONTRAST_HARNESS.py",
+          "--subject-root",
+          "{subject_root}"
+        ],
+        "cwd": ".",
+        "env": {},
+        "expected_exit_code": 0,
+        "id": "contrast-VC-001",
+        "timeout_sec": 120
+      },
+      "component_ids": [
+        "INT-001"
+      ],
+      "id": "VC-001",
+      "repetitions": 2,
+      "required_role": "feature_discriminating",
+      "waiver": {
+        "approval": "",
+        "reason": ""
+      }
+    }
+  ],
+  "harness_root": ".",
+  "schema_version": "1.0"
+}

@@ -1,0 +1,26 @@
+{
+  "exclusions": [
+    "secrets and credentials",
+    "vendor and generated output",
+    "unrelated modules"
+  ],
+  "feature": "Update CASS from pinned upstream main, preserve native-history changes, and finish remaining existing BR implementation tasks",
+  "graph_context": {
+    "architecture_map": ".integration/architecture-map.json",
+    "br_bv_probe": ".integration/br-bv-probe.json",
+    "impact_plan": ".integration/impact-plan.json",
+    "max_graph_neighbors_per_seed": 8
+  },
+  "limits": {
+    "context_lines": 6,
+    "max_files": 24,
+    "max_lines_per_file": 100,
+    "max_total_lines": 800
+  },
+  "queries": [
+    "Update CASS from pinned upstream main, preserve native-history changes, and finish remaining existing BR implementation tasks"
+  ],
+  "reference": "https://github.com/Dicklesworthstone/coding_agent_session_search/tree/main",
+  "schema_version": "1.1",
+  "seeds": []
+}

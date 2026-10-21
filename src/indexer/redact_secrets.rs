@@ -13,12 +13,37 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use once_cell::sync::Lazy;
 use regex::{Regex, RegexSet};
 
+use crate::indexer::memoization::MemoRetentionBudget;
+
 /// Placeholder inserted where a secret was found.
 const REDACTED: &str = "[REDACTED]";
+
+/// One allowance shared by every production redactor, including Rayon workers
+/// inside a giant conversation. Entry-count overrides cannot multiply this
+/// retained-value ceiling. This measures String buffer capacity, not process
+/// RSS, map metadata, allocator retention, or caller-owned output strings.
+const REDACTION_RETAINED_VALUE_BYTES: usize = 64 * 1024 * 1024;
+static REDACTION_RETENTION: Lazy<Arc<MemoRetentionBudget>> =
+    Lazy::new(|| MemoRetentionBudget::new(REDACTION_RETAINED_VALUE_BYTES));
+
+/// The resident-memory sampler is the only production policy writer. It uses
+/// its already-hysteretic byte allowance, not CPU load, to shrink retained
+/// values. No per-message OS probes or new sampler thread are introduced.
+pub(super) fn update_redaction_retention_limit(inflight_byte_allowance: usize) {
+    apply_redaction_retention_limit(&REDACTION_RETENTION, inflight_byte_allowance);
+}
+
+fn apply_redaction_retention_limit(
+    retention: &MemoRetentionBudget,
+    inflight_byte_allowance: usize,
+) {
+    retention.set_limit(inflight_byte_allowance.min(REDACTION_RETAINED_VALUE_BYTES));
+}
 
 /// Return whether a JSON object key names a credential-bearing field.
 ///
@@ -102,18 +127,27 @@ struct SecretPattern {
     regex: Regex,
 }
 
-pub(crate) const AWS_ACCESS_KEY_PATTERN: &str = r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b";
+// Word boundaries are ASCII (`(?-u:\b)`), never Unicode `\b`. A Unicode word
+// boundary stops the regex crate's lazy DFA on any haystack with a non-ASCII
+// byte, and the whole RegexSet then runs on the PikeVM: on 593 MiB of real
+// session text the Unicode set scanned 10 MiB/s and the ASCII set 261-284 MiB/s,
+// with identical pattern matches on all 3.1M strings. Every boundary here sits
+// next to an ASCII word character, and ASCII word characters are a subset of
+// Unicode ones, so the ASCII form matches wherever the Unicode form did (plus a
+// token directly touching a non-ASCII letter): redaction can only get stricter.
+pub(crate) const AWS_ACCESS_KEY_PATTERN: &str = r"(?-u:\b)(?:AKIA|ASIA)[0-9A-Z]{16}(?-u:\b)";
 pub(crate) const AWS_SECRET_KEY_PATTERN: &str =
     r#"(?i)aws(.{0,20})?(secret|access)?[_-]?key\s*[:=]\s*['"]?[A-Za-z0-9/+=]{40}['"]?"#;
-pub(crate) const AWS_SESSION_TOKEN_PATTERN: &str = r#"(?i)\baws[_-]?(?:session|security)[_-]?token\s*[:=]\s*(?:"(?:\\.|[^"\\\r\n]){8,}"|'(?:\\.|[^'\\\r\n]){8,}'|[^\s,;}\]]{8,})"#;
+pub(crate) const AWS_SESSION_TOKEN_PATTERN: &str = r#"(?i)(?-u:\b)aws[_-]?(?:session|security)[_-]?token\s*[:=]\s*(?:"(?:\\.|[^"\\\r\n]){8,}"|'(?:\\.|[^'\\\r\n]){8,}'|[^\s,;}\]]{8,})"#;
 pub(crate) const GITHUB_TOKEN_PATTERN: &str =
-    r"\b(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20,})\b";
+    r"(?-u:\b)(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20,})(?-u:\b)";
 pub(crate) const OPENAI_API_KEY_PATTERN: &str =
-    r"\b(?:sk-(?:proj-|admin-)[A-Za-z0-9_-]{19,}[A-Za-z0-9_]|sk-[A-Za-z0-9]{20,})\b";
+    r"(?-u:\b)(?:sk-(?:proj-|admin-)[A-Za-z0-9_-]{19,}[A-Za-z0-9_]|sk-[A-Za-z0-9]{20,})(?-u:\b)";
 pub(crate) const ANTHROPIC_API_KEY_PATTERN: &str =
-    r"\bsk-ant-(?:api[0-9]{2}-)?[A-Za-z0-9_-]{19,}[A-Za-z0-9_]\b";
-pub(crate) const BEARER_TOKEN_PATTERN: &str = r"(?i)\bBearer[ \t]+[A-Za-z0-9._~+/=-]{8,}";
-pub(crate) const JWT_PATTERN: &str = r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b";
+    r"(?-u:\b)sk-ant-(?:api[0-9]{2}-)?[A-Za-z0-9_-]{19,}[A-Za-z0-9_](?-u:\b)";
+pub(crate) const BEARER_TOKEN_PATTERN: &str = r"(?i)(?-u:\b)Bearer[ \t]+[A-Za-z0-9._~+/=-]{8,}";
+pub(crate) const JWT_PATTERN: &str =
+    r"(?-u:\b)eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+(?-u:\b)";
 pub(crate) const PRIVATE_KEY_BLOCK_PATTERN: &str = concat!(
     r"(?s)(?:",
     r"-----BEGIN RSA PRIVATE KEY-----.*?(?:-----END RSA PRIVATE KEY-----|\z)|", // ubs:ignore — public key-block regex, not embedded credentials.
@@ -126,10 +160,10 @@ pub(crate) const PRIVATE_KEY_BLOCK_PATTERN: &str = concat!(
     r")",
 );
 pub(crate) const DATABASE_URL_PATTERN: &str =
-    r#"(?i)\b(postgres|postgresql|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s'"]{8,}"#;
-pub(crate) const GENERIC_SECRET_ASSIGNMENT_PATTERN: &str = r#"(?i)\b(?:api[ _-]?(?:key|secret|token)|auth[ _-]?token|access[ _-]?(?:token|key)|secret[ _-]?key|session[ _-]?token|password|passwd|passphrase|token|secret|authorization)\s*[:=]\s*(?:"(?:\\.|[^"\\\r\n]){4,}"|'(?:\\.|[^'\\\r\n]){4,}'|[^\s,;}\]]{8,})"#;
-pub(crate) const SLACK_TOKEN_PATTERN: &str = r"\bxox[bpsaor]-[A-Za-z0-9\-]{10,}";
-pub(crate) const STRIPE_KEY_PATTERN: &str = r"\b[spr]k_live_[A-Za-z0-9]{20,}";
+    r#"(?i)(?-u:\b)(postgres|postgresql|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s'"]{8,}"#;
+pub(crate) const GENERIC_SECRET_ASSIGNMENT_PATTERN: &str = r#"(?i)(?-u:\b)(?:api[ _-]?(?:key|secret|token)|auth[ _-]?token|access[ _-]?(?:token|key)|secret[ _-]?key|session[ _-]?token|password|passwd|passphrase|token|secret|authorization)\s*[:=]\s*(?:"(?:\\.|[^"\\\r\n]){4,}"|'(?:\\.|[^'\\\r\n]){4,}'|[^\s,;}\]]{8,})"#;
+pub(crate) const SLACK_TOKEN_PATTERN: &str = r"(?-u:\b)xox[bpsaor]-[A-Za-z0-9\-]{10,}";
+pub(crate) const STRIPE_KEY_PATTERN: &str = r"(?-u:\b)[spr]k_live_[A-Za-z0-9]{20,}";
 
 /// All built-in patterns, compiled once on first use.
 static SECRET_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
@@ -337,7 +371,14 @@ pub fn fuzz_redact_json_with_memoizing_redactor(
 ///    for backward compatibility; `CASS_INDEX_REDACTION` wins when both
 ///    are set.
 pub fn redaction_enabled() -> bool {
-    if let Ok(val) = dotenvy::var("CASS_INDEX_REDACTION") {
+    redaction_enabled_from_values(
+        dotenvy::var("CASS_INDEX_REDACTION").ok().as_deref(),
+        dotenvy::var("CASS_REDACT_SECRETS").ok().as_deref(),
+    )
+}
+
+fn redaction_enabled_from_values(modern: Option<&str>, legacy: Option<&str>) -> bool {
+    if let Some(val) = modern {
         let normalized = val.trim().to_ascii_lowercase();
         match normalized.as_str() {
             "off" | "0" | "false" | "no" | "none" | "disabled" => return false,
@@ -353,10 +394,7 @@ pub fn redaction_enabled() -> bool {
             }
         }
     }
-    match dotenvy::var("CASS_REDACT_SECRETS") {
-        Ok(val) => !matches!(val.as_str(), "0" | "false" | "off" | "no"),
-        Err(_) => true,
-    }
+    !matches!(legacy, Some("0" | "false" | "off" | "no"))
 }
 
 /// Stable identifier for the compiled SECRET_PATTERNS list.
@@ -391,9 +429,9 @@ pub fn redaction_algorithm_fingerprint() -> String {
 /// content + metadata blob. Salvage replays, repeated assistant
 /// boilerplate, and historical re-ingest all feed identical content
 /// through the regex engine over and over. This wrapper keys
-/// [`ContentAddressedMemoCache`] on the input bytes plus the algorithm
-/// fingerprint so repeated content stops paying the regex cost while a
-/// pattern bump invalidates every prior entry transparently.
+/// [`crate::indexer::memoization::ContentAddressedMemoCache`] on the input
+/// bytes plus the algorithm fingerprint so repeated content stops paying the
+/// regex cost while a pattern bump invalidates every prior entry transparently.
 ///
 /// Prefilter-first scope (redaction-perf campaign, xu3jq): the cache is
 /// consulted only for inputs whose RegexSet prefilter reports at least
@@ -408,8 +446,8 @@ pub fn redaction_algorithm_fingerprint() -> String {
 /// contract byte-for-byte: see
 /// `memoizing_redactor_matches_uncached_for_arbitrary_input` for the
 /// equivalence gate. When the cache is hit, the recorded value is
-/// returned directly; on miss, the legacy regex path runs and the
-/// result is inserted under the content+algorithm key.
+/// returned directly; on miss, the legacy regex path runs. Retention is
+/// optional: byte-pressure refusal never skips or truncates redaction.
 ///
 /// `MemoizingRedactor` is `pub(crate)` so the live persist path can
 /// adopt it without leaking the memoization vocabulary into public
@@ -418,52 +456,73 @@ pub fn redaction_algorithm_fingerprint() -> String {
 pub(crate) struct MemoizingRedactor {
     text_cache: crate::indexer::memoization::ContentAddressedMemoCache<String>,
     algorithm_fingerprint: String,
+    retention: Arc<MemoRetentionBudget>,
+    last_retention_limit: usize,
 }
 
 #[allow(dead_code)]
 impl MemoizingRedactor {
-    /// Default cache capacity for typical refresh batches. Sized to
-    /// cover a few thousand distinct message bodies before LRU
-    /// eviction kicks in.
+    /// Default per-owner entry ceiling. Production owners additionally share
+    /// REDACTION_RETAINED_VALUE_BYTES, regardless of their number or capacity.
     pub(crate) const DEFAULT_CAPACITY: usize = 4096;
 
-    /// Byte ceiling for memoizing a single input (xu3jq round 3).
-    /// Candidate-bearing inputs larger than this are redacted directly
-    /// and never enter the cache: caching them would pin up to
-    /// `capacity x input_size` of message bodies in memory (the
-    /// original giant-rollout incident ran the host into swap), while
-    /// the hit-rate on multi-hundred-KB distinct tool outputs is ~0.
-    /// 64 KiB bounds worst-case cache value memory at
-    /// ~4096 x 64KiB = 256 MiB and still covers every capped codex
-    /// message body (128 KiB content cap applies upstream, but titles,
-    /// metadata blobs, and extra_json strings are typically far
-    /// smaller).
+    /// Inputs above this size bypass memoization entirely. Smaller inputs
+    /// still need byte admission for their actual owned output buffer; this
+    /// per-input cutoff alone is not an aggregate cache-memory bound.
     pub(crate) const MAX_MEMOIZED_INPUT_BYTES: usize = 64 * 1024;
 
+    /// Explicit isolated cache for callers such as equivalence tests and the
+    /// fuzz adapter. Live persistence workers use new(), sharing one allowance.
     pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self::with_retention_budget(
+            capacity,
+            MemoRetentionBudget::new(REDACTION_RETAINED_VALUE_BYTES),
+        )
+    }
+
+    fn with_retention_budget(capacity: usize, retention: Arc<MemoRetentionBudget>) -> Self {
         Self {
-            text_cache: crate::indexer::memoization::ContentAddressedMemoCache::with_capacity(
-                capacity,
-            ),
+            text_cache:
+                crate::indexer::memoization::ContentAddressedMemoCache::with_retention_budget(
+                    capacity,
+                    Arc::clone(&retention),
+                    String::capacity,
+                ),
             algorithm_fingerprint: redaction_algorithm_fingerprint(),
+            last_retention_limit: retention.limit(),
+            retention,
         }
     }
 
     pub(crate) fn new() -> Self {
-        Self::with_capacity(Self::configured_capacity())
+        Self::with_retention_budget(
+            Self::configured_capacity(),
+            Arc::clone(&REDACTION_RETENTION),
+        )
     }
 
-    /// Resolve the memo-cache capacity, honoring the optional
-    /// `CASS_REDACT_MEMO_CAPACITY` override (#291). On a very large,
-    /// subagent-heavy corpus the 4096 default thrashes ~one eviction per
-    /// insert; operators can raise the ceiling to cut that churn. A `0`,
-    /// empty, or unparseable value falls back to the default.
+    /// Resolve the per-owner entry ceiling, honoring the optional
+    /// `CASS_REDACT_MEMO_CAPACITY` override (#291). Raising it never bypasses
+    /// the shared byte allowance. A `0`, empty, or unparseable value falls
+    /// back to the default.
     pub(crate) fn configured_capacity() -> usize {
         dotenvy::var("CASS_REDACT_MEMO_CAPACITY")
             .ok()
             .and_then(|raw| raw.trim().parse::<usize>().ok())
             .filter(|&n| n > 0)
             .unwrap_or(Self::DEFAULT_CAPACITY)
+    }
+
+    /// One atomic read on the usual path; no key hashing, cache lookup, OS
+    /// probe or LRU traversal unless the memory allowance changed. Check even
+    /// empty/clean inputs so a previously warm cache can shed retained values
+    /// when the rest of a transcript contains no more secret candidates.
+    fn refresh_retention_limit(&mut self) {
+        let limit = self.retention.limit();
+        if limit != self.last_retention_limit {
+            self.last_retention_limit = limit;
+            self.text_cache.trim_to_budget();
+        }
     }
 
     pub(crate) fn algorithm_fingerprint(&self) -> &str {
@@ -475,10 +534,9 @@ impl MemoizingRedactor {
     }
 
     /// Memoized counterpart to [`redact_text`]. Returns an owned String
-    /// (not Cow) because caching forces a copy on first compute anyway,
-    /// and downstream callers (`map_to_internal`) immediately call
-    /// `.into_owned()` regardless. Skipping the Cow indirection keeps
-    /// the cached-hit path branchless.
+    /// (not Cow) because downstream callers (`map_to_internal`) immediately
+    /// call `.into_owned()` regardless. Cache admission is independent of
+    /// producing this output: a refused retained copy changes no source byte.
     ///
     /// Each cache decision emits a structured `tracing` event so
     /// operators can audit hit / miss / insert / evict / quarantine
@@ -503,6 +561,7 @@ impl MemoizingRedactor {
         String,
         Vec<crate::indexer::memoization::MemoCacheAuditRecord>,
     ) {
+        self.refresh_retention_limit();
         // Empty fast-path matches the uncached contract and bypasses
         // the cache entirely (see memoizing_redactor_empty_input_skips_cache).
         if input.is_empty() {
@@ -579,12 +638,9 @@ impl MemoizingRedactor {
     }
 
     /// Quarantine a cached entry: subsequent lookups will return
-    /// [`MemoLookup::Quarantined`] (handled by `redact_text` as a
-    /// fallthrough to the direct regex path) instead of the cached
-    /// value. The reason is preserved for operator inspection. Used
-    /// when telemetry detects a poisoned redaction (e.g. unexpected
-    /// regex behavior under a hot pattern bump that the algorithm
-    /// fingerprint didn't catch).
+    /// [`crate::indexer::memoization::MemoLookup::Quarantined`] (handled by
+    /// `redact_text` as a fallthrough to the direct regex path) instead of the
+    /// cached value. Memory pressure never lifts a quarantine.
     pub(crate) fn quarantine(&mut self, input: &str, reason: impl Into<String>) {
         if input.is_empty() {
             return;
@@ -627,6 +683,12 @@ impl MemoizingRedactor {
                 live_entries = audit.stats.live_entries,
                 evictions_capacity = audit.stats.evictions_capacity,
                 "redact memo eviction"
+            ),
+            MemoCacheEvent::BudgetBypass => tracing::debug!(
+                target: "cass::redact::memo",
+                algorithm = %audit.key.algorithm,
+                live_entries = audit.stats.live_entries,
+                "redact memo byte allowance refused retention; full redaction preserved"
             ),
             MemoCacheEvent::Invalidate => tracing::warn!(
                 target: "cass::redact::memo",
@@ -702,6 +764,35 @@ mod tests {
     use super::*;
     use serde_json::json;
     use serial_test::serial;
+
+    /// A Unicode `\b` in any pattern drops the whole RegexSet onto the PikeVM
+    /// for every non-ASCII message (26x slower on real session text); see the
+    /// note above AWS_ACCESS_KEY_PATTERN.
+    #[test]
+    fn secret_patterns_use_only_ascii_word_boundaries() {
+        for pattern in SECRET_PATTERNS.iter() {
+            let without_ascii_boundaries = pattern.pattern.replace(r"(?-u:\b)", "");
+            assert!(
+                !without_ascii_boundaries.contains(r"\b"),
+                "pattern uses a Unicode word boundary: {}",
+                pattern.pattern
+            );
+        }
+    }
+
+    #[test]
+    fn secret_touching_non_ascii_text_is_redacted() {
+        let token = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+        for input in [
+            format!("凭据{token}结束"),
+            format!("é{token}é"),
+            format!("🔐 {token} 测试"),
+        ] {
+            let output = redact_text(&input);
+            assert!(!output.contains(token), "{input:?} -> {output:?}");
+            assert!(output.contains(REDACTED), "{input:?} -> {output:?}");
+        }
+    }
 
     /// FROZEN reference implementation of the redaction algorithm as of
     /// the 2026-08 redaction-perf campaign baseline. This is a verbatim
@@ -1049,25 +1140,34 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn redaction_enabled_default() {
-        // When env var is not set, should be enabled
-        // Safety: only called in single-threaded test context
-        unsafe { std::env::remove_var("CASS_REDACT_SECRETS") };
-        assert!(redaction_enabled());
+    fn redaction_enabled_default() -> Result<(), String> {
+        for modern in [None, Some(""), Some(" \t\n")] {
+            if !redaction_enabled_from_values(modern, None) {
+                return Err(format!("unset policy must enable redaction: {modern:?}"));
+            }
+        }
+        Ok(())
     }
 
     #[test]
-    #[serial]
-    fn redaction_can_be_disabled() {
-        unsafe { std::env::set_var("CASS_REDACT_SECRETS", "0") };
-        assert!(!redaction_enabled());
-
-        unsafe { std::env::set_var("CASS_REDACT_SECRETS", "false") };
-        assert!(!redaction_enabled());
-
-        // Restore for other tests
-        unsafe { std::env::remove_var("CASS_REDACT_SECRETS") };
+    fn redaction_can_be_disabled() -> Result<(), String> {
+        for modern in [None, Some(""), Some(" \t\n")] {
+            for legacy in ["0", "false", "off", "no"] {
+                if redaction_enabled_from_values(modern, Some(legacy)) {
+                    return Err(format!(
+                        "legacy disable was ignored: {modern:?}, {legacy:?}"
+                    ));
+                }
+            }
+            for legacy in ["", "1", "true", "OFF", " false ", "unknown"] {
+                if !redaction_enabled_from_values(modern, Some(legacy)) {
+                    return Err(format!(
+                        "legacy exact matching changed: {modern:?}, {legacy:?}"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `CASS_INDEX_REDACTION` is the documented operator switch for
@@ -1075,65 +1175,24 @@ mod tests {
     /// over the legacy `CASS_REDACT_SECRETS` toggle and a warn+default
     /// path for unrecognized values.
     #[test]
-    #[serial]
-    fn cass_index_redaction_switch_controls_and_overrides_legacy() {
-        // Safety: serial test context; single-threaded env mutation.
-        unsafe {
-            std::env::remove_var("CASS_INDEX_REDACTION");
-            std::env::remove_var("CASS_REDACT_SECRETS");
+    fn cass_index_redaction_switch_controls_and_overrides_legacy() -> Result<(), String> {
+        for legacy in [None, Some("0"), Some("1"), Some("unknown")] {
+            for modern in ["off", "0", "false", "no", "none", "disabled", " OFF \t"] {
+                if redaction_enabled_from_values(Some(modern), legacy) {
+                    return Err(format!(
+                        "modern disable lost precedence: {modern:?}, {legacy:?}"
+                    ));
+                }
+            }
+            for modern in ["full", "on", "1", "true", "yes", " FULL \t", "lazy", "無効"] {
+                if !redaction_enabled_from_values(Some(modern), legacy) {
+                    return Err(format!(
+                        "modern full/fallback lost precedence: {modern:?}, {legacy:?}"
+                    ));
+                }
+            }
         }
-        assert!(redaction_enabled(), "default must be full redaction");
-
-        unsafe { std::env::set_var("CASS_INDEX_REDACTION", "off") };
-        assert!(!redaction_enabled(), "off must disable redaction");
-        unsafe { std::env::set_var("CASS_INDEX_REDACTION", "OFF") };
-        assert!(!redaction_enabled(), "value must be case-insensitive");
-        unsafe { std::env::set_var("CASS_INDEX_REDACTION", "full") };
-        assert!(redaction_enabled(), "full must enable redaction");
-
-        // Precedence: CASS_INDEX_REDACTION wins over the legacy switch
-        // in BOTH directions.
-        unsafe {
-            std::env::set_var("CASS_INDEX_REDACTION", "full");
-            std::env::set_var("CASS_REDACT_SECRETS", "0");
-        }
-        assert!(
-            redaction_enabled(),
-            "explicit full must override legacy disable"
-        );
-        unsafe {
-            std::env::set_var("CASS_INDEX_REDACTION", "off");
-            std::env::set_var("CASS_REDACT_SECRETS", "1");
-        }
-        assert!(
-            !redaction_enabled(),
-            "explicit off must override legacy enable"
-        );
-
-        // Unrecognized value: fail safe to full redaction.
-        unsafe {
-            std::env::set_var("CASS_INDEX_REDACTION", "lazy");
-            std::env::remove_var("CASS_REDACT_SECRETS");
-        }
-        assert!(
-            redaction_enabled(),
-            "unrecognized value must default to full redaction"
-        );
-
-        // Empty value behaves as unset: legacy switch applies again.
-        unsafe {
-            std::env::set_var("CASS_INDEX_REDACTION", "");
-            std::env::set_var("CASS_REDACT_SECRETS", "0");
-        }
-        assert!(
-            !redaction_enabled(),
-            "empty CASS_INDEX_REDACTION must fall through to legacy switch"
-        );
-
-        unsafe {
-            std::env::remove_var("CASS_INDEX_REDACTION");
-            std::env::remove_var("CASS_REDACT_SECRETS");
-        }
+        Ok(())
     }
 
     #[test]
@@ -1776,5 +1835,115 @@ mod tests {
         // Empty input quarantine is a no-op.
         redactor.quarantine("", "ignored");
         assert_eq!(redactor.stats().quarantined, 1);
+    }
+
+    #[test]
+    fn redaction_workers_share_retention_without_changing_parallel_output() {
+        let first = MemoizingRedactor::new();
+        let second = MemoizingRedactor::new();
+        assert!(Arc::ptr_eq(&first.retention, &second.retention));
+        assert!(Arc::ptr_eq(&first.retention, &REDACTION_RETENTION));
+
+        let budget = MemoRetentionBudget::new(64 * 1024);
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let budget = Arc::clone(&budget);
+                scope.spawn(move || {
+                    let mut redactor =
+                        MemoizingRedactor::with_retention_budget(4096, Arc::clone(&budget));
+                    for round in 0..16 {
+                        let input = format!(
+                            "worker {worker} message {round} {} password=hunter2hunter2",
+                            "unicode λ padding ".repeat(1024),
+                        );
+                        assert!(input.len() < MemoizingRedactor::MAX_MEMOIZED_INPUT_BYTES);
+                        let expected = redact_text_reference(&input).into_owned();
+                        assert_eq!(redactor.redact_text(&input), expected);
+                        assert_eq!(redactor.redact_text(&input), expected);
+                        assert!(budget.used() <= 64 * 1024);
+                    }
+                });
+            }
+        });
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn redaction_retention_pressure_releases_values_on_clean_input_and_recovers() {
+        let budget = MemoRetentionBudget::new(16 * 1024);
+        let mut redactor = MemoizingRedactor::with_retention_budget(16, Arc::clone(&budget));
+        let input = format!("{} password=hunter2hunter2", "padding ".repeat(256));
+        let expected = redact_text_reference(&input).into_owned();
+        assert_eq!(redactor.redact_text(&input), expected);
+        assert_eq!(redactor.redact_text(&input), expected);
+        assert_eq!(redactor.stats().hits, 1);
+        assert!(budget.used() > 0);
+
+        apply_redaction_retention_limit(&budget, 0);
+        let (clean, audit) = redactor.redact_text_with_audit("ordinary clean text");
+        assert_eq!(clean, "ordinary clean text");
+        assert!(audit.is_empty());
+        assert_eq!(budget.used(), 0);
+        assert_eq!(redactor.stats().live_entries, 0);
+        assert_eq!(redactor.stats().hits, 1);
+        assert_eq!(redactor.redact_text(&input), expected);
+        assert_eq!(budget.used(), 0);
+
+        apply_redaction_retention_limit(&budget, usize::MAX);
+        assert_eq!(budget.limit(), REDACTION_RETAINED_VALUE_BYTES);
+        assert_eq!(budget.used(), 0, "growth does not restore evicted values");
+        assert_eq!(redactor.redact_text(&input), expected);
+        assert_eq!(redactor.stats().hits, 1, "the old value must be recomputed");
+        assert_eq!(redactor.redact_text(&input), expected);
+        assert_eq!(redactor.stats().hits, 2);
+    }
+
+    #[test]
+    fn redaction_retention_bypass_never_bypasses_secret_redaction() {
+        use crate::indexer::memoization::MemoCacheEvent;
+        let budget = MemoRetentionBudget::new(8);
+        let mut redactor = MemoizingRedactor::with_retention_budget(16, Arc::clone(&budget));
+        let input = "Bearer abcdefghijklmnopqrstuvwxyz1234";
+        for _ in 0..2 {
+            let (output, audit) = redactor.redact_text_with_audit(input);
+            assert_eq!(output, REDACTED);
+            assert_eq!(output, redact_text_reference(input));
+            assert_eq!(audit.len(), 2);
+            assert_eq!(audit[0].event, MemoCacheEvent::Miss);
+            assert_eq!(audit[1].event, MemoCacheEvent::BudgetBypass);
+            assert!(!audit[1].changed);
+            assert_eq!(budget.used(), 0);
+        }
+        assert_eq!(redactor.stats().inserts, 0);
+        assert_eq!(redactor.stats().hits, 0);
+        assert_eq!(redactor.stats().misses, 2);
+    }
+
+    #[test]
+    fn redaction_retention_pressure_preserves_quarantine_and_nested_json() {
+        use crate::indexer::memoization::MemoCacheEvent;
+        let budget = MemoRetentionBudget::new(64 * 1024);
+        let mut redactor = MemoizingRedactor::with_retention_budget(16, Arc::clone(&budget));
+        let input = "line password=hunter2hunter2 trailing text";
+        redactor.redact_text(input);
+        redactor.quarantine(input, "retain quarantine through memory pressure");
+        apply_redaction_retention_limit(&budget, 0);
+        let value = json!({
+            "line": input,
+            "history": [input, "clean λ", null, 42],
+            "password": "opaque-short-value", // ubs:ignore — synthetic redaction fixture.
+            "api_key=abcdefgh12345678": "first", // ubs:ignore — synthetic collision fixture.
+            "password=abcdefgh12345678": "second", // ubs:ignore — synthetic collision fixture.
+            "[REDACTED]#2": "preexisting",
+        });
+        assert_eq!(redactor.redact_json(&value), redact_json(&value));
+        assert_eq!(budget.used(), 0);
+        assert_eq!(redactor.stats().quarantined, 1);
+        apply_redaction_retention_limit(&budget, 4096);
+        let (output, audit) = redactor.redact_text_with_audit(input);
+        assert_eq!(output, redact_text_reference(input));
+        assert_eq!(audit.len(), 1);
+        assert!(matches!(audit[0].event, MemoCacheEvent::Quarantine { .. }));
+        assert_eq!(budget.used(), 0);
     }
 }

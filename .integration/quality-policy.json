@@ -1,0 +1,12 @@
+{
+  "exemptions": [],
+  "schema_version": "1.0",
+  "thresholds": {
+    "max_added_logical_lines": 1200,
+    "max_complexity_increase": 80,
+    "max_function_line_increase": 50,
+    "max_function_lines": 140,
+    "max_new_duplicate_blocks": 3,
+    "max_structural_erosion_increase": 0.15
+  }
+}

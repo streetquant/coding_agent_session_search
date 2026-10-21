@@ -6,28 +6,34 @@
  * Uses virtual scrolling for long conversations with 50+ messages.
  */
 
-import { getConversation, getConversationMessages, checkMemoryPressure, getMemoryUsage } from './database.js';
 import {
-    createAttachmentElement,
-    getMessageAttachments,
-    initAttachments,
-    reset as resetAttachments,
-} from './attachments.js';
-import { copyTextToClipboard } from './share.js';
-import { VariableHeightVirtualList } from './virtual-list.js';
+  createAttachmentElement,
+  getMessageAttachments,
+  initAttachments,
+  reset as resetAttachments,
+} from "./attachments.js";
+import {
+  ConversationMessageSource,
+  checkMemoryPressure,
+  getConversation,
+  getMemoryUsage,
+  queryAll,
+} from "./database.js";
+import { copyTextToClipboard } from "./share.js";
+import { VariableHeightVirtualList } from "./virtual-list.js";
 
 // Virtual scrolling configuration
 const VIRTUAL_CONFIG = {
-    MESSAGE_THRESHOLD: 50, // Use virtual scrolling above this message count
-    ESTIMATED_MESSAGE_HEIGHT: 150, // Estimated average message height
-    OVERSCAN: 3, // Extra items to render above/below viewport
+  MESSAGE_THRESHOLD: 50, // Use virtual scrolling above this message count
+  ESTIMATED_MESSAGE_HEIGHT: 150, // Estimated average message height
+  OVERSCAN: 3, // Extra items to render above/below viewport
 };
 
 // Memory management configuration
 const MEMORY_CONFIG = {
-    MAX_LOADED_CONVERSATIONS: 5, // Maximum conversations to keep in memory
-    MEMORY_CHECK_INTERVAL: 30000, // Check memory every 30 seconds
-    MEMORY_WARNING_THRESHOLD: 80, // Warn at 80% memory usage
+  MAX_LOADED_CONVERSATIONS: 5, // Maximum conversations to keep in memory
+  MEMORY_CHECK_INTERVAL: 30000, // Check memory every 30 seconds
+  MEMORY_WARNING_THRESHOLD: 80, // Warn at 80% memory usage
 };
 
 // LRU cache for loaded conversations
@@ -36,18 +42,46 @@ let memoryCheckIntervalId = null;
 
 // DOMPurify configuration for XSS prevention
 const SANITIZE_CONFIG = {
-    ALLOWED_TAGS: [
-        'p', 'br', 'strong', 'em', 'b', 'i', 'code', 'pre', 'ul', 'ol', 'li',
-        'a', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'mark', 'span',
-        'table', 'thead', 'tbody', 'tr', 'th', 'td', 'hr', 'del', 'sup', 'sub',
-    ],
-    ALLOWED_ATTR: ['href', 'title', 'class', 'data-language', 'id', 'name'],
-    ALLOW_DATA_ATTR: false,
-    FORBID_TAGS: ['script', 'style', 'iframe', 'object', 'embed', 'form', 'input'],
-    FORBID_ATTR: ['onerror', 'onclick', 'onload', 'onmouseover', 'style'],
+  ALLOWED_TAGS: [
+    "p",
+    "br",
+    "strong",
+    "em",
+    "b",
+    "i",
+    "code",
+    "pre",
+    "ul",
+    "ol",
+    "li",
+    "a",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "blockquote",
+    "mark",
+    "span",
+    "table",
+    "thead",
+    "tbody",
+    "tr",
+    "th",
+    "td",
+    "hr",
+    "del",
+    "sup",
+    "sub",
+  ],
+  ALLOWED_ATTR: ["href", "title", "class", "data-language", "id", "name"],
+  ALLOW_DATA_ATTR: false,
+  FORBID_TAGS: ["script", "style", "iframe", "object", "embed", "form", "input"],
+  FORBID_ATTR: ["onerror", "onclick", "onload", "onmouseover", "style"],
 };
 const ALLOWED_TAGS = new Set(SANITIZE_CONFIG.ALLOWED_TAGS);
-const ALLOWED_ATTR = new Set([...SANITIZE_CONFIG.ALLOWED_ATTR, 'target', 'rel']);
+const ALLOWED_ATTR = new Set([...SANITIZE_CONFIG.ALLOWED_ATTR, "target", "rel"]);
 const FORBID_TAGS = new Set(SANITIZE_CONFIG.FORBID_TAGS);
 const FORBID_ATTR = new Set(SANITIZE_CONFIG.FORBID_ATTR);
 
@@ -62,10 +96,10 @@ let documentKeydownHandler = null;
 let copyFeedbackTimeoutId = null;
 
 // DOM element references
-let elements = {
-    container: null,
-    header: null,
-    messagesList: null,
+const elements = {
+  container: null,
+  header: null,
+  messagesList: null,
 };
 
 /**
@@ -74,10 +108,10 @@ let elements = {
  * @param {Function} backCallback - Callback when back button is clicked
  */
 export function initConversationViewer(container, backCallback) {
-    elements.container = container;
-    onBack = backCallback;
-    window.removeEventListener('cass:lock', handleArchiveLock);
-    window.addEventListener('cass:lock', handleArchiveLock);
+  elements.container = container;
+  onBack = backCallback;
+  window.removeEventListener("cass:lock", handleArchiveLock);
+  window.addEventListener("cass:lock", handleArchiveLock);
 }
 
 /**
@@ -86,132 +120,143 @@ export function initConversationViewer(container, backCallback) {
  * @param {number|null} highlightMessageId - Message ID to highlight/scroll to
  */
 export async function loadConversation(conversationId, highlightMessageId = null) {
-    const loadId = ++activeConversationLoadId;
-    try {
-        let conversation;
-        let messages;
+  cancelConversationCopy();
+  const loadId = ++activeConversationLoadId;
+  try {
+    let conversation;
+    let messages;
 
-        // Check if conversation is already in cache
-        if (loadedConversations.has(conversationId)) {
-            const cached = loadedConversations.get(conversationId);
-            // Move to end of map (most recently used)
-            loadedConversations.delete(conversationId);
-            loadedConversations.set(conversationId, cached);
-            conversation = cached.conversation;
-            messages = cached.messages;
-            console.debug(`[Conversation] Using cached conversation ${conversationId}`);
-        } else {
-            // Unload oldest conversation if at limit
-            if (loadedConversations.size >= MEMORY_CONFIG.MAX_LOADED_CONVERSATIONS) {
-                unloadOldestConversation();
-            }
+    // Check if conversation is already in cache
+    if (loadedConversations.has(conversationId)) {
+      const cached = loadedConversations.get(conversationId);
+      // Move to end of map (most recently used)
+      loadedConversations.delete(conversationId);
+      loadedConversations.set(conversationId, cached);
+      conversation = cached.conversation;
+      messages = cached.messages;
+      console.debug(`[Conversation] Using cached conversation ${conversationId}`);
+    } else {
+      // Unload oldest conversation if at limit
+      if (loadedConversations.size >= MEMORY_CONFIG.MAX_LOADED_CONVERSATIONS) {
+        unloadOldestConversation();
+      }
 
-            // Load conversation metadata
-            conversation = getConversation(conversationId);
+      // Load conversation metadata
+      conversation = getConversation(conversationId);
 
-            if (!conversation) {
-                if (loadId === activeConversationLoadId) {
-                    showError('Conversation not found');
-                }
-                return;
-            }
-
-            // Load messages
-            messages = getConversationMessages(conversationId);
-
-            // Cache the loaded data
-            loadedConversations.set(conversationId, {
-                conversation,
-                messages,
-                loadedAt: Date.now(),
-            });
-            console.debug(`[Conversation] Loaded and cached conversation ${conversationId} (cache size: ${loadedConversations.size})`);
+      if (!conversation) {
+        if (loadId === activeConversationLoadId) {
+          teardownDocumentListeners();
+          destroyVirtualList();
+          currentConversation = null;
+          currentMessages = [];
+          showError("Conversation not found");
         }
+        return;
+      }
 
-        // Check memory pressure
-        if (checkMemoryPressure()) {
-            showMemoryWarning();
-        }
+      // Read only the count now; the virtual renderer fetches visible
+      // bodies on demand through a bounded cache, not a whole transcript.
+      messages = new ConversationMessageSource(conversationId);
+      conversation = { ...conversation, message_count: messages.length };
 
-        await ensureAttachmentsReady(loadId);
-
-        if (loadId !== activeConversationLoadId) {
-            return;
-        }
-
-        currentConversation = conversation;
-        currentMessages = messages;
-
-        // Render the view
-        render(conversation, messages, highlightMessageId);
-    } catch (error) {
-        if (loadId !== activeConversationLoadId) {
-            return;
-        }
-
-        console.error(`[Conversation] Failed to load conversation ${conversationId}:`, error);
-        teardownDocumentListeners();
-        destroyVirtualList();
-        currentConversation = null;
-        currentMessages = [];
-        showError('Failed to load conversation');
+      // Cache the loaded data
+      loadedConversations.set(conversationId, {
+        conversation,
+        messages,
+        loadedAt: Date.now(),
+      });
+      console.debug(
+        `[Conversation] Loaded and cached conversation ${conversationId} (cache size: ${loadedConversations.size})`,
+      );
     }
+
+    // Check memory pressure
+    if (checkMemoryPressure()) {
+      showMemoryWarning();
+    }
+
+    await ensureAttachmentsReady(loadId);
+
+    if (loadId !== activeConversationLoadId) {
+      return;
+    }
+
+    currentConversation = conversation;
+    currentMessages = messages;
+
+    // Render the view
+    render(conversation, messages, highlightMessageId);
+  } catch (error) {
+    if (loadId !== activeConversationLoadId) {
+      return;
+    }
+
+    console.error(`[Conversation] Failed to load conversation ${conversationId}:`, error);
+    loadedConversations.get(conversationId)?.messages.dispose();
+    loadedConversations.delete(conversationId);
+    teardownDocumentListeners();
+    destroyVirtualList();
+    currentConversation = null;
+    currentMessages = [];
+    showError("Failed to load conversation");
+  }
 }
 
 function createAttachmentState() {
-    return {
-        ready: false,
-        available: false,
-        dek: null,
-        exportId: null,
-    };
+  return {
+    ready: false,
+    available: false,
+    dek: null,
+    exportId: null,
+  };
 }
 
 async function ensureAttachmentsReady(loadId = activeConversationLoadId) {
-    const state = attachmentState;
+  const state = attachmentState;
 
-    if (state.ready) {
-        return state.available;
+  if (state.ready) {
+    return state.available;
+  }
+
+  const session = window.cassSession;
+  const dekBase64 = session?.dek;
+  const exportIdBase64 = session?.config?.export_id;
+
+  if (!dekBase64 || !exportIdBase64) {
+    if (state === attachmentState && loadId === activeConversationLoadId) {
+      state.ready = true;
+      state.available = false;
+    }
+    return false;
+  }
+
+  try {
+    const dek = base64ToBytes(dekBase64);
+    const exportId = base64ToBytes(exportIdBase64);
+    const manifest = await initAttachments(dek, exportId);
+
+    if (state !== attachmentState || loadId !== activeConversationLoadId) {
+      return false;
     }
 
-    const session = window.cassSession;
-    const dekBase64 = session?.dek;
-    const exportIdBase64 = session?.config?.export_id;
-
-    if (!dekBase64 || !exportIdBase64) {
-        if (state === attachmentState && loadId === activeConversationLoadId) {
-            state.ready = true;
-            state.available = false;
-        }
-        return false;
+    state.dek = dek;
+    state.exportId = exportId;
+    state.available = Boolean(manifest?.entries?.length);
+    state.ready = true;
+    return state.available;
+  } catch (error) {
+    if (state !== attachmentState || loadId !== activeConversationLoadId) {
+      return false;
     }
-
-    try {
-        const dek = base64ToBytes(dekBase64);
-        const exportId = base64ToBytes(exportIdBase64);
-        const manifest = await initAttachments(dek, exportId);
-
-        if (state !== attachmentState || loadId !== activeConversationLoadId) {
-            return false;
-        }
-
-        state.dek = dek;
-        state.exportId = exportId;
-        state.available = Boolean(manifest?.entries?.length);
-        state.ready = true;
-        return state.available;
-    } catch (error) {
-        if (state !== attachmentState || loadId !== activeConversationLoadId) {
-            return false;
-        }
-        if (error?.code === 'ATTACHMENT_REQUEST_INVALIDATED') {
-            return false;
-        }
-        console.warn('[Conversation] Attachment manifest unavailable:', error);
-        state.ready = false;
-        state.available = false;
-        return false;
+    if (error?.code === "ATTACHMENT_REQUEST_INVALIDATED") {
+      return false;
     }
+    console.warn("[Conversation] Attachment manifest unavailable:", error);
+    state.ready = false;
+    state.available = false;
+    return false;
+  }
 }
 
 /**
@@ -219,27 +264,27 @@ async function ensureAttachmentsReady(loadId = activeConversationLoadId) {
  * Uses virtual scrolling for long conversations (> MESSAGE_THRESHOLD)
  */
 function render(conv, messages, highlightId) {
-    // Clean up previous virtual list
-    destroyVirtualList();
+  // Clean up previous virtual list
+  destroyVirtualList();
 
-    const formattedDate = formatDate(conv.started_at);
-    const duration = conv.ended_at ? formatDuration(conv.ended_at - conv.started_at) : null;
-    const useVirtualScrolling = messages.length > VIRTUAL_CONFIG.MESSAGE_THRESHOLD;
+  const formattedDate = formatDate(conv.started_at);
+  const duration = conv.ended_at ? formatDuration(conv.ended_at - conv.started_at) : null;
+  const useVirtualScrolling = messages.length > VIRTUAL_CONFIG.MESSAGE_THRESHOLD;
 
-    elements.container.innerHTML = `
+  elements.container.innerHTML = `
         <div class="conversation-container">
             <header class="conversation-header">
                 <button id="back-btn" type="button" class="back-btn" aria-label="Back to search">
                     ←
                 </button>
                 <div class="conversation-title">
-                    <h2>${escapeHtml(conv.title || 'Untitled conversation')}</h2>
+                    <h2>${escapeHtml(conv.title || "Untitled conversation")}</h2>
                     <div class="meta">
                         <span class="conv-agent">${escapeHtml(formatAgentName(conv.agent))}</span>
                         <span class="conv-date">${escapeHtml(formattedDate)}</span>
-                        ${duration ? `<span class="conv-duration">${escapeHtml(duration)}</span>` : ''}
-                        <span class="conv-count">${conv.message_count} message${conv.message_count !== 1 ? 's' : ''}</span>
-                        ${useVirtualScrolling ? '<span class="virtual-indicator" title="Virtual scrolling enabled for performance">⚡</span>' : ''}
+                        ${duration ? `<span class="conv-duration">${escapeHtml(duration)}</span>` : ""}
+                        <span class="conv-count">${conv.message_count} message${conv.message_count !== 1 ? "s" : ""}</span>
+                        ${useVirtualScrolling ? '<span class="virtual-indicator" title="Virtual scrolling enabled for performance">⚡</span>' : ""}
                     </div>
                 </div>
                 <div class="conversation-actions">
@@ -249,36 +294,40 @@ function render(conv, messages, highlightId) {
                 </div>
             </header>
 
-            ${conv.workspace ? `
+            ${
+              conv.workspace
+                ? `
                 <div class="conversation-workspace">
                     <span class="workspace-label">Workspace:</span>
                     <code>${escapeHtml(conv.workspace)}</code>
                 </div>
-            ` : ''}
+            `
+                : ""
+            }
 
-            <div class="messages-list ${useVirtualScrolling ? 'virtual-messages' : ''}" id="messages-list">
+            <div class="messages-list ${useVirtualScrolling ? "virtual-messages" : ""}" id="messages-list">
             </div>
         </div>
     `;
 
-    // Cache element references
-    elements.header = elements.container.querySelector('.conversation-header');
-    elements.messagesList = document.getElementById('messages-list');
+  // Cache element references
+  elements.header = elements.container.querySelector(".conversation-header");
+  elements.messagesList = document.getElementById("messages-list");
 
-    // Render messages (virtual or direct)
-    if (useVirtualScrolling) {
-        renderVirtualMessages(messages, highlightId);
-    } else {
-        renderDirectMessages(messages, highlightId);
-    }
+  // Render messages (virtual or direct)
+  if (useVirtualScrolling) {
+    renderVirtualMessages(messages, highlightId);
+  } else {
+    renderDirectMessages(messages, highlightId);
+  }
 
-    // Set up event listeners
-    setupEventListeners();
+  // Set up event listeners
+  setupEventListeners();
 
-    // Scroll to highlighted message (for direct rendering)
-    if (highlightId && !useVirtualScrolling) {
-        scrollToMessage(highlightId);
-    }
+  // Scroll to highlighted message (for direct rendering)
+  if (highlightId && !useVirtualScrolling) {
+    scrollToMessage(highlightId);
+  }
 }
 
 /**
@@ -286,31 +335,50 @@ function render(conv, messages, highlightId) {
  * @private
  */
 function renderVirtualMessages(messages, highlightId) {
-    // Set up container for virtual scrolling
-    elements.messagesList.style.height = 'calc(100vh - 200px)';
-    elements.messagesList.style.minHeight = '400px';
-    elements.messagesList.style.overflow = 'auto';
+  const loadId = activeConversationLoadId;
+  // Set up container for virtual scrolling
+  elements.messagesList.style.height = "calc(100vh - 200px)";
+  elements.messagesList.style.minHeight = "400px";
+  elements.messagesList.style.overflow = "auto";
 
-    // Create virtual list
-    messageVirtualList = new VariableHeightVirtualList({
-        container: elements.messagesList,
-        totalCount: messages.length,
-        estimatedItemHeight: VIRTUAL_CONFIG.ESTIMATED_MESSAGE_HEIGHT,
-        renderItem: (index) => createMessageElement(messages[index], index, messages[index].id === highlightId),
-        overscan: VIRTUAL_CONFIG.OVERSCAN,
-    });
+  // Create virtual list
+  messageVirtualList = new VariableHeightVirtualList({
+    container: elements.messagesList,
+    totalCount: messages.length,
+    estimatedItemHeight: VIRTUAL_CONFIG.ESTIMATED_MESSAGE_HEIGHT,
+    renderItem: (index) => {
+      if (loadId !== activeConversationLoadId) {
+        return document.createElement("span");
+      }
+      try {
+        const message = messages.get(index);
+        return createMessageElement(message, index, message.id === highlightId);
+      } catch (error) {
+        console.error("[Conversation] Failed to read message:", error);
+        const notice = document.createElement("article");
+        notice.className = "message message-error";
+        notice.setAttribute("role", "alert");
+        notice.textContent = "Unable to load this message. Reopen the conversation to retry.";
+        return notice;
+      }
+    },
+    overscan: VIRTUAL_CONFIG.OVERSCAN,
+  });
 
-    console.debug(`[Conversation] Using virtual scrolling for ${messages.length} messages`);
+  console.debug(`[Conversation] Using virtual scrolling for ${messages.length} messages`);
 
-    // Scroll to highlighted message if specified
-    if (highlightId) {
-        const highlightIndex = messages.findIndex(m => m.id === highlightId);
-        if (highlightIndex >= 0) {
-            setTimeout(() => {
-                messageVirtualList.scrollToIndex(highlightIndex, 'center');
-            }, 100);
+  // Scroll to highlighted message if specified
+  if (highlightId) {
+    const highlightIndex = messages.indexOfId(highlightId);
+    if (highlightIndex >= 0) {
+      const list = messageVirtualList;
+      setTimeout(() => {
+        if (loadId === activeConversationLoadId && list === messageVirtualList) {
+          list.scrollToIndex(highlightIndex, "center");
         }
+      }, 100);
     }
+  }
 }
 
 /**
@@ -318,12 +386,12 @@ function renderVirtualMessages(messages, highlightId) {
  * @private
  */
 function renderDirectMessages(messages, highlightId) {
-    const html = messages.map((msg, idx) => renderMessage(msg, idx, msg.id === highlightId)).join('');
-    elements.messagesList.innerHTML = html;
-    hydrateDirectMessageAttachments(messages);
+  const html = messages.map((msg, idx) => renderMessage(msg, idx, msg.id === highlightId)).join("");
+  elements.messagesList.innerHTML = html;
+  hydrateDirectMessageAttachments(messages);
 
-    // Apply syntax highlighting
-    applySyntaxHighlighting();
+  // Apply syntax highlighting
+  applySyntaxHighlighting();
 }
 
 /**
@@ -331,24 +399,24 @@ function renderDirectMessages(messages, highlightId) {
  * @private
  */
 function createMessageElement(message, index, isHighlighted = false) {
-    const roleClass = message.role === 'user' ? 'user' : 'assistant';
-    const highlightClass = isHighlighted ? 'highlighted' : '';
-    const time = message.created_at ? formatTime(message.created_at) : '';
+  const roleClass = message.role === "user" ? "user" : "assistant";
+  const highlightClass = isHighlighted ? "highlighted" : "";
+  const time = message.created_at ? formatTime(message.created_at) : "";
 
-    // Render markdown content
-    const renderedContent = renderMarkdown(message.content);
+  // Render markdown content
+  const renderedContent = renderMarkdown(message.content);
 
-    const article = document.createElement('article');
-    article.className = `message ${roleClass} ${highlightClass}`;
-    article.id = `message-${message.id}`;
-    article.dataset.messageId = message.id;
+  const article = document.createElement("article");
+  article.className = `message ${roleClass} ${highlightClass}`;
+  article.id = `message-${message.id}`;
+  article.dataset.messageId = message.id;
 
-    article.innerHTML = `
+  article.innerHTML = `
         <header class="message-header">
             <span class="message-role ${roleClass}">
-                ${roleClass === 'user' ? '👤 User' : '🤖 Assistant'}
+                ${roleClass === "user" ? "👤 User" : "🤖 Assistant"}
             </span>
-            ${message.model ? `<span class="message-model">${escapeHtml(message.model)}</span>` : ''}
+            ${message.model ? `<span class="message-model">${escapeHtml(message.model)}</span>` : ""}
             <span class="message-time">${escapeHtml(time)}</span>
         </header>
         <div class="message-content">
@@ -356,14 +424,14 @@ function createMessageElement(message, index, isHighlighted = false) {
         </div>
     `;
 
-    appendAttachmentsToMessage(article, message);
+  appendAttachmentsToMessage(article, message);
 
-    // Apply syntax highlighting after element is created
-    requestAnimationFrame(() => {
-        highlightCodeInElement(article);
-    });
+  // Apply syntax highlighting after element is created
+  requestAnimationFrame(() => {
+    highlightCodeInElement(article);
+  });
 
-    return article;
+  return article;
 }
 
 /**
@@ -371,20 +439,20 @@ function createMessageElement(message, index, isHighlighted = false) {
  * @private
  */
 function highlightCodeInElement(element) {
-    if (typeof window.Prism !== 'undefined') {
-        const codeBlocks = element.querySelectorAll('pre code[data-language]');
-        codeBlocks.forEach(block => {
-            const lang = block.dataset.language;
-            if (window.Prism.languages[lang]) {
-                block.innerHTML = window.Prism.highlight(
-                    block.textContent,
-                    window.Prism.languages[lang],
-                    lang
-                );
-                block.parentElement.classList.add(`language-${lang}`);
-            }
-        });
-    }
+  if (typeof window.Prism !== "undefined") {
+    const codeBlocks = element.querySelectorAll("pre code[data-language]");
+    codeBlocks.forEach((block) => {
+      const lang = block.dataset.language;
+      if (window.Prism.languages[lang]) {
+        block.innerHTML = window.Prism.highlight(
+          block.textContent,
+          window.Prism.languages[lang],
+          lang,
+        );
+        block.parentElement.classList.add(`language-${lang}`);
+      }
+    });
+  }
 }
 
 /**
@@ -392,24 +460,24 @@ function highlightCodeInElement(element) {
  * @private
  */
 function destroyVirtualList() {
-    if (messageVirtualList) {
-        messageVirtualList.destroy();
-        messageVirtualList = null;
-    }
+  if (messageVirtualList) {
+    messageVirtualList.destroy();
+    messageVirtualList = null;
+  }
 }
 
 /**
  * Render a single message
  */
 function renderMessage(message, index, isHighlighted = false) {
-    const roleClass = message.role === 'user' ? 'user' : 'assistant';
-    const highlightClass = isHighlighted ? 'highlighted' : '';
-    const time = message.created_at ? formatTime(message.created_at) : '';
+  const roleClass = message.role === "user" ? "user" : "assistant";
+  const highlightClass = isHighlighted ? "highlighted" : "";
+  const time = message.created_at ? formatTime(message.created_at) : "";
 
-    // Render markdown content
-    const renderedContent = renderMarkdown(message.content);
+  // Render markdown content
+  const renderedContent = renderMarkdown(message.content);
 
-    return `
+  return `
         <article
             class="message ${roleClass} ${highlightClass}"
             id="message-${message.id}"
@@ -417,9 +485,9 @@ function renderMessage(message, index, isHighlighted = false) {
         >
             <header class="message-header">
                 <span class="message-role ${roleClass}">
-                    ${roleClass === 'user' ? '👤 User' : '🤖 Assistant'}
+                    ${roleClass === "user" ? "👤 User" : "🤖 Assistant"}
                 </span>
-                ${message.model ? `<span class="message-model">${escapeHtml(message.model)}</span>` : ''}
+                ${message.model ? `<span class="message-model">${escapeHtml(message.model)}</span>` : ""}
                 <span class="message-time">${escapeHtml(time)}</span>
             </header>
             <div class="message-content">
@@ -430,98 +498,113 @@ function renderMessage(message, index, isHighlighted = false) {
 }
 
 function hydrateDirectMessageAttachments(messages) {
-    if (!attachmentState.available) {
-        return;
+  if (!attachmentState.available) {
+    return;
+  }
+
+  const byId = new Map(messages.map((message) => [String(message.id), message]));
+  const renderedMessages = elements.messagesList.querySelectorAll(".message[data-message-id]");
+
+  renderedMessages.forEach((messageElement) => {
+    const message = byId.get(messageElement.dataset.messageId);
+    if (message) {
+      appendAttachmentsToMessage(messageElement, message);
     }
-
-    const byId = new Map(messages.map(message => [String(message.id), message]));
-    const renderedMessages = elements.messagesList.querySelectorAll('.message[data-message-id]');
-
-    renderedMessages.forEach(messageElement => {
-        const message = byId.get(messageElement.dataset.messageId);
-        if (message) {
-            appendAttachmentsToMessage(messageElement, message);
-        }
-    });
+  });
 }
 
 function appendAttachmentsToMessage(messageElement, message) {
-    if (!attachmentState.available) {
-        return;
-    }
+  if (!attachmentState.available) {
+    return;
+  }
 
-    const attachments = getMessageAttachments(message.id);
-    if (!attachments.length) {
-        return;
-    }
+  const attachments = getMessageAttachments(message.id);
+  if (!attachments.length) {
+    return;
+  }
 
-    const contentElement = messageElement.querySelector('.message-content');
-    if (!contentElement || contentElement.querySelector('.message-attachments')) {
-        return;
-    }
+  const contentElement = messageElement.querySelector(".message-content");
+  if (!contentElement || contentElement.querySelector(".message-attachments")) {
+    return;
+  }
 
-    const attachmentsContainer = document.createElement('div');
-    attachmentsContainer.className = 'message-attachments';
+  const attachmentsContainer = document.createElement("div");
+  attachmentsContainer.className = "message-attachments";
 
-    const label = document.createElement('div');
-    label.className = 'message-attachments-label';
-    label.textContent = attachments.length === 1 ? 'Attachment' : 'Attachments';
-    attachmentsContainer.appendChild(label);
+  const label = document.createElement("div");
+  label.className = "message-attachments-label";
+  label.textContent = attachments.length === 1 ? "Attachment" : "Attachments";
+  attachmentsContainer.appendChild(label);
 
-    attachments.forEach(entry => {
-        attachmentsContainer.appendChild(
-            createAttachmentElement(entry, attachmentState.dek, attachmentState.exportId)
-        );
-    });
+  attachments.forEach((entry) => {
+    attachmentsContainer.appendChild(
+      createAttachmentElement(entry, attachmentState.dek, attachmentState.exportId),
+    );
+  });
 
-    contentElement.appendChild(attachmentsContainer);
+  contentElement.appendChild(attachmentsContainer);
 }
 
 function handleArchiveLock() {
-    activeConversationLoadId += 1;
-    currentConversation = null;
-    currentMessages = [];
-    teardownDocumentListeners();
-    destroyVirtualList();
-    clearAllCache();
-    attachmentState = createAttachmentState();
-    resetAttachments();
+  cancelConversationCopy();
+  activeConversationLoadId += 1;
+  currentMessages.dispose?.();
+  for (const cached of loadedConversations.values()) {
+    cached.messages.dispose();
+  }
+  currentConversation = null;
+  currentMessages = [];
+  teardownDocumentListeners();
+  destroyVirtualList();
+  clearAllCache();
+  attachmentState = createAttachmentState();
+  resetAttachments();
+  if (elements.container) {
+    elements.container.innerHTML = "";
+  }
 }
 
 /**
  * Set up event listeners
  */
 function setupEventListeners() {
-    teardownDocumentListeners();
+  teardownDocumentListeners();
 
-    // Back button
-    const backBtn = document.getElementById('back-btn');
-    backBtn?.addEventListener('click', () => {
-        if (onBack) {
-            onBack();
-        }
-    });
+  // Back button
+  const backBtn = document.getElementById("back-btn");
+  backBtn?.addEventListener("click", () => {
+    if (onBack) {
+      onBack();
+    }
+  });
 
-    // Copy button
-    const copyBtn = document.getElementById('copy-btn');
-    copyBtn?.addEventListener('click', () => {
-        copyConversation();
-    });
+  // Copy button
+  const copyBtn = document.getElementById("copy-btn");
+  const copyLoadId = activeConversationLoadId;
+  copyBtn?.addEventListener("click", () => {
+    // A new load can await attachments while the previous DOM still exists.
+    // Do not assign that old button's transcript to the new load generation.
+    if (copyLoadId === activeConversationLoadId) copyConversation();
+  });
 
-    // Escape key to go back
-    documentKeydownHandler = (e) => {
-        if (e.key === 'Escape' && onBack) {
-            onBack();
-        }
-    };
-    document.addEventListener('keydown', documentKeydownHandler);
+  // Escape key to go back
+  documentKeydownHandler = (e) => {
+    if (e.key === "Escape" && onBack) {
+      onBack();
+    }
+  };
+  document.addEventListener("keydown", documentKeydownHandler);
 }
 
 function teardownDocumentListeners() {
-    if (documentKeydownHandler) {
-        document.removeEventListener('keydown', documentKeydownHandler);
-        documentKeydownHandler = null;
-    }
+  if (copyFeedbackTimeoutId !== null) {
+    clearTimeout(copyFeedbackTimeoutId);
+    copyFeedbackTimeoutId = null;
+  }
+  if (documentKeydownHandler) {
+    document.removeEventListener("keydown", documentKeydownHandler);
+    documentKeydownHandler = null;
+  }
 }
 
 /**
@@ -529,260 +612,457 @@ function teardownDocumentListeners() {
  * Falls back to plain text if marked.js is not available
  */
 function renderMarkdown(content) {
-    if (!content) return '';
+  if (!content) return "";
 
-    // Check if marked is available
-    if (typeof window.marked !== 'undefined') {
-        try {
-            const html = window.marked.parse(content);
-            return sanitizeHtml(html);
-        } catch (error) {
-            console.warn('[Conversation] Markdown rendering failed:', error);
-        }
+  // Check if marked is available
+  if (typeof window.marked !== "undefined") {
+    try {
+      const html = window.marked.parse(content);
+      return sanitizeHtml(html);
+    } catch (error) {
+      console.warn("[Conversation] Markdown rendering failed:", error);
     }
+  }
 
-    // Fallback: simple markdown-like rendering
-    return sanitizeHtml(simpleMarkdown(content));
+  // Fallback: simple markdown-like rendering
+  return sanitizeHtml(simpleMarkdown(content));
 }
 
 function base64ToBytes(base64) {
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-        bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes;
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
 }
 
 export function sanitizeDestinationUrl(value) {
-    const url = typeof value === 'string' ? value.trim() : String(value ?? '').trim();
-    const normalized = Array.from(url)
-        .filter(ch => !/\s/.test(ch) && !/[\u0000-\u001F\u007F]/.test(ch))
-        .join('')
-        .toLowerCase();
+  const url = typeof value === "string" ? value.trim() : String(value ?? "").trim();
+  const normalized = Array.from(url)
+    .filter((ch) => !/\s/.test(ch) && !/[\u0000-\u001F\u007F]/.test(ch))
+    .join("")
+    .toLowerCase();
 
-    if (
-        normalized.startsWith('javascript:')
-        || normalized.startsWith('vbscript:')
-        || normalized.startsWith('data:')
-    ) {
-        return '#';
-    }
+  if (
+    normalized.startsWith("javascript:") ||
+    normalized.startsWith("vbscript:") ||
+    normalized.startsWith("data:")
+  ) {
+    return "#";
+  }
 
-    return url;
+  return url;
 }
 
 /**
  * Simple markdown-like rendering (fallback)
  */
 function simpleMarkdown(text) {
-    // Escape HTML first
-    let html = escapeHtml(text);
+  // Escape HTML first
+  let html = escapeHtml(text);
 
-    // Code blocks
-    html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
-        const langClass = lang ? ` data-language="${lang}"` : '';
-        return `<pre><code${langClass}>${code.trim()}</code></pre>`;
-    });
+  // Code blocks
+  html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    const langClass = lang ? ` data-language="${lang}"` : "";
+    return `<pre><code${langClass}>${code.trim()}</code></pre>`;
+  });
 
-    // Inline code
-    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // Inline code
+  html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
 
-    // Bold
-    html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-    html = html.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+  // Bold
+  html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/__([^_]+)__/g, "<strong>$1</strong>");
 
-    // Italic
-    html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
-    html = html.replace(/_([^_]+)_/g, '<em>$1</em>');
+  // Italic
+  html = html.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+  html = html.replace(/_([^_]+)_/g, "<em>$1</em>");
 
-    // Headers
-    html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
-    html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
-    html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+  // Headers
+  html = html.replace(/^### (.+)$/gm, "<h3>$1</h3>");
+  html = html.replace(/^## (.+)$/gm, "<h2>$1</h2>");
+  html = html.replace(/^# (.+)$/gm, "<h1>$1</h1>");
 
-    // Links
-    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, href) => {
-        const safeHref = escapeHtml(sanitizeDestinationUrl(href));
-        return `<a href="${safeHref}" target="_blank" rel="noopener noreferrer">${label}</a>`;
-    });
+  // Links
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, href) => {
+    const safeHref = escapeHtml(sanitizeDestinationUrl(href));
+    return `<a href="${safeHref}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+  });
 
-    // Line breaks
-    html = html.replace(/\n\n/g, '</p><p>');
-    html = `<p>${html}</p>`;
+  // Line breaks
+  html = html.replace(/\n\n/g, "</p><p>");
+  html = `<p>${html}</p>`;
 
-    // Clean up empty paragraphs
-    html = html.replace(/<p>\s*<\/p>/g, '');
-    html = html.replace(/<p>(<h[1-6]>)/g, '$1');
-    html = html.replace(/(<\/h[1-6]>)<\/p>/g, '$1');
-    html = html.replace(/<p>(<pre>)/g, '$1');
-    html = html.replace(/(<\/pre>)<\/p>/g, '$1');
+  // Clean up empty paragraphs
+  html = html.replace(/<p>\s*<\/p>/g, "");
+  html = html.replace(/<p>(<h[1-6]>)/g, "$1");
+  html = html.replace(/(<\/h[1-6]>)<\/p>/g, "$1");
+  html = html.replace(/<p>(<pre>)/g, "$1");
+  html = html.replace(/(<\/pre>)<\/p>/g, "$1");
 
-    return html;
+  return html;
 }
 
 /**
  * Sanitize HTML to prevent XSS
  */
 function sanitizeHtml(html) {
-    // Check if DOMPurify is available
-    if (typeof window.DOMPurify !== 'undefined') {
-        return window.DOMPurify.sanitize(html, SANITIZE_CONFIG);
+  // Check if DOMPurify is available
+  if (typeof window.DOMPurify !== "undefined") {
+    return window.DOMPurify.sanitize(html, SANITIZE_CONFIG);
+  }
+
+  // Fallback: create a document fragment and extract text/safe elements
+  const template = document.createElement("template");
+  template.innerHTML = html;
+
+  const allElements = Array.from(template.content.querySelectorAll("*"));
+  allElements.forEach((el) => {
+    const tag = el.tagName.toLowerCase();
+    if (FORBID_TAGS.has(tag)) {
+      el.remove();
+      return;
     }
 
-    // Fallback: create a document fragment and extract text/safe elements
-    const template = document.createElement('template');
-    template.innerHTML = html;
+    if (!ALLOWED_TAGS.has(tag)) {
+      el.replaceWith(...Array.from(el.childNodes));
+      return;
+    }
 
-    const allElements = Array.from(template.content.querySelectorAll('*'));
-    allElements.forEach(el => {
-        const tag = el.tagName.toLowerCase();
-        if (FORBID_TAGS.has(tag)) {
-            el.remove();
-            return;
-        }
+    Array.from(el.attributes).forEach((attr) => {
+      const name = attr.name.toLowerCase();
+      if (name.startsWith("on") || FORBID_ATTR.has(name) || !ALLOWED_ATTR.has(name)) {
+        el.removeAttribute(attr.name);
+        return;
+      }
 
-        if (!ALLOWED_TAGS.has(tag)) {
-            el.replaceWith(...Array.from(el.childNodes));
-            return;
-        }
-
-        Array.from(el.attributes).forEach(attr => {
-            const name = attr.name.toLowerCase();
-            if (name.startsWith('on') || FORBID_ATTR.has(name) || !ALLOWED_ATTR.has(name)) {
-                el.removeAttribute(attr.name);
-                return;
-            }
-
-            if (name === 'href') {
-                el.setAttribute('href', sanitizeDestinationUrl(attr.value));
-            }
-        });
-
-        if (tag === 'a') {
-            el.setAttribute('target', '_blank');
-            el.setAttribute('rel', 'noopener noreferrer');
-        }
+      if (name === "href") {
+        el.setAttribute("href", sanitizeDestinationUrl(attr.value));
+      }
     });
 
-    return template.innerHTML;
+    if (tag === "a") {
+      el.setAttribute("target", "_blank");
+      el.setAttribute("rel", "noopener noreferrer");
+    }
+  });
+
+  return template.innerHTML;
 }
 
 /**
  * Apply syntax highlighting to code blocks
  */
 function applySyntaxHighlighting() {
-    // Check if Prism is available
-    if (typeof window.Prism !== 'undefined') {
-        const codeBlocks = elements.container.querySelectorAll('pre code[data-language]');
-        codeBlocks.forEach(block => {
-            const lang = block.dataset.language;
-            if (window.Prism.languages[lang]) {
-                block.innerHTML = window.Prism.highlight(
-                    block.textContent,
-                    window.Prism.languages[lang],
-                    lang
-                );
-                block.parentElement.classList.add(`language-${lang}`);
-            }
-        });
-    }
+  // Check if Prism is available
+  if (typeof window.Prism !== "undefined") {
+    const codeBlocks = elements.container.querySelectorAll("pre code[data-language]");
+    codeBlocks.forEach((block) => {
+      const lang = block.dataset.language;
+      if (window.Prism.languages[lang]) {
+        block.innerHTML = window.Prism.highlight(
+          block.textContent,
+          window.Prism.languages[lang],
+          lang,
+        );
+        block.parentElement.classList.add(`language-${lang}`);
+      }
+    });
+  }
 }
 
 /**
  * Scroll to a specific message
  */
 function scrollToMessage(messageId) {
-    setTimeout(() => {
-        const messageEl = document.getElementById(`message-${messageId}`);
-        if (messageEl) {
-            messageEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            messageEl.classList.add('highlight-flash');
-            setTimeout(() => {
-                messageEl.classList.remove('highlight-flash');
-            }, 2000);
-        }
-    }, 100);
-}
-
-/**
- * Copy conversation to clipboard
- */
-async function copyConversation() {
-    if (!currentConversation || !currentMessages.length) return;
-
-    const text = formatConversationAsText(currentConversation, currentMessages);
-
-    try {
-        const copied = await copyTextToClipboard(text);
-        if (!copied) {
-            throw new Error('Clipboard copy failed');
-        }
-        showCopyFeedback('Copied!');
-    } catch (error) {
-        console.error('[Conversation] Copy failed:', error);
-        showCopyFeedback('Copy failed');
+  const loadId = activeConversationLoadId;
+  setTimeout(() => {
+    if (loadId !== activeConversationLoadId) {
+      return;
     }
+    const messageEl = document.getElementById(`message-${messageId}`);
+    if (messageEl) {
+      messageEl.scrollIntoView({ behavior: "smooth", block: "center" });
+      messageEl.classList.add("highlight-flash");
+      setTimeout(() => {
+        messageEl.classList.remove("highlight-flash");
+      }, 2000);
+    }
+  }, 100);
+}
+
+// Copy is all-or-error: never label a truncated transcript as a complete copy.
+// These limits bound hydrated text and formatting, not SQLite work for a single
+// huge value, total WASM memory, or copies retained by the browser/OS clipboard.
+const COPY_MAX_BYTES = 8 * 1024 * 1024;
+const COPY_MAX_MESSAGES = 100_000;
+let activeCopy = null;
+let readyCopy = null;
+
+function cancelConversationCopy() {
+  const previous = activeCopy;
+  activeCopy = null;
+  readyCopy = null;
+  // Invalidate producers too: clearing only readyCopy lets an in-flight
+  // preparation or late permission rejection repopulate the plaintext cache.
+  // Release our wait even if the browser never settles its permission prompt.
+  // This cannot retract data already supplied to a native clipboard request.
+  previous?.cancel();
+  if (copyFeedbackTimeoutId !== null) {
+    clearTimeout(copyFeedbackTimeoutId);
+    copyFeedbackTimeoutId = null;
+  }
+  const button = document.getElementById("copy-btn");
+  if (button) {
+    button.disabled = false;
+    if (button.dataset.defaultLabel) button.innerHTML = button.dataset.defaultLabel;
+  }
+}
+
+class ConversationCopyLimit extends Error {
+  constructor(message = "Copy limit: 8 MiB") {
+    super(message);
+  }
+}
+
+/** Copy one current view, without concurrent whole-transcript preparations. */
+async function copyConversation() {
+  if (!currentConversation || activeCopy?.loadId === activeConversationLoadId) return;
+  const operation = { loadId: activeConversationLoadId, cancel: null };
+  const controller = new AbortController();
+  const cancelled = new Promise(resolve => {
+    operation.cancel = () => { controller.abort(); resolve(false); };
+  });
+  const conversation = currentConversation;
+  const messages = currentMessages;
+  const copyBtn = document.getElementById("copy-btn");
+  activeCopy = operation;
+  const isCurrent = () => activeCopy === operation && operation.loadId === activeConversationLoadId
+    && currentConversation === conversation && currentMessages === messages;
+  try {
+    if (!messages.length) return;
+    if (copyBtn) {
+      copyBtn.dataset.defaultLabel ||= copyBtn.innerHTML;
+      if (copyFeedbackTimeoutId !== null) {
+        clearTimeout(copyFeedbackTimeoutId);
+        copyFeedbackTimeoutId = null;
+      }
+      copyBtn.disabled = true;
+      copyBtn.textContent = "Preparing copy…";
+    }
+    let copied;
+    if (readyCopy?.loadId === operation.loadId && readyCopy.conversation === conversation
+        && readyCopy.messages === messages) {
+      // Legacy fallback requires a NEW user gesture, not an asynchronous
+      // execCommand retry after preparation exhausted transient activation.
+      const text = readyCopy.text;
+      readyCopy = null;
+      copied = await Promise.race([
+        copyTextToClipboard(text, { isCurrent, signal: controller.signal }), cancelled,
+      ]);
+    } else {
+      readyCopy = null;
+      const prepared = formatConversationAsText(conversation, messages, isCurrent);
+      let writing = null;
+      const clipboard = globalThis.navigator?.clipboard;
+      if (typeof clipboard?.write === "function" && typeof globalThis.ClipboardItem === "function") {
+        // Start the request synchronously in the click handler. WebKit requires
+        // a user gesture; promise-backed ClipboardItem data may arrive later.
+        // No transcript bytes are supplied unless preparation AND currency
+        // checks succeed. Already-supplied clipboard data cannot be retracted.
+        const data = prepared.then(text => {
+          if (!isCurrent()) throw new Error("Conversation copy cancelled");
+          return new Blob([text], { type: "text/plain" });
+        });
+        // A constructor/permission failure may leave the browser not observing
+        // its data promise. Still handle cancellation/size errors on that path.
+        void data.catch(() => {});
+        try {
+          writing = Promise.resolve(clipboard.write([
+            new ClipboardItem({ "text/plain": data }),
+          ])).then(() => true, () => false);
+        } catch {
+          writing = Promise.resolve(false);
+        }
+      }
+      const text = await prepared;
+      if (!isCurrent()) return;
+      copied = writing ? await Promise.race([writing, cancelled]) : false;
+      if (!isCurrent()) return;
+      if (!copied) {
+        // Keep only this bounded result. Navigation, a new load or archive lock
+        // clears it. Never start another clipboard operation without a click.
+        readyCopy = { loadId: operation.loadId, conversation, messages, text };
+        showCopyFeedback("Ready — click to copy");
+        return;
+      }
+    }
+    if (!isCurrent()) return;
+    if (!copied) throw new Error("Clipboard copy failed");
+    showCopyFeedback("Copied!");
+  } catch (error) {
+    if (!isCurrent()) return;
+    console.error("[Conversation] Copy failed:", error);
+    showCopyFeedback(error instanceof ConversationCopyLimit ? error.message : "Copy failed");
+  } finally {
+    if (isCurrent() && copyBtn) copyBtn.disabled = false;
+    if (activeCopy === operation) activeCopy = null;
+  }
+}
+
+// Both passes use the viewer's NULL-first (idx, id) ordering, with bounded
+// keyset windows rather than OFFSET rescans or a transcript-sized ID list.
+function readCopyPage(conversationId, cursor, limit, withContent, byteLimit) {
+  const ranges = cursor === null ? [["", []]] : cursor.idx === null ? [
+    [" AND idx IS NULL AND id > ?", [cursor.id]],
+    [" AND idx IS NOT NULL", []],
+  ] : [[" AND (idx, id) > (?, ?)", [cursor.idx, cursor.id]]];
+  const columns = withContent
+    ? `, CASE role WHEN 'user' THEN 'User' WHEN 'assistant' THEN 'Assistant'
+         WHEN 'agent' THEN 'Assistant' WHEN 'system' THEN 'System'
+         WHEN 'tool' THEN 'Tool' ELSE 'Unknown' END AS copy_role,
+         CASE WHEN content IS NULL THEN ''
+           WHEN typeof(content) = 'text' AND length(CAST(content AS BLOB)) <= ?
+           THEN content ELSE NULL END AS copy_content`
+    : ", length(CAST(content AS BLOB)) AS content_bytes, typeof(content) AS content_type";
+  const rows = [];
+  for (const [condition, parameters] of ranges) {
+    if (rows.length === limit) break;
+    rows.push(...queryAll(
+      `SELECT id, idx${columns} FROM messages WHERE conversation_id = ?${condition}
+       ORDER BY idx ASC, id ASC LIMIT ?`,
+      [...(withContent ? [byteLimit] : []), conversationId, ...parameters, limit - rows.length],
+    ));
+  }
+  for (const row of rows) {
+    if (!Number.isSafeInteger(row.id) || row.id <= 0 ||
+        (row.idx !== null && !Number.isSafeInteger(row.idx))) {
+      throw new Error("Invalid message identity or ordering in conversation copy");
+    }
+  }
+  return rows;
 }
 
 /**
- * Format conversation as plain text
+ * Preflight size without hydrating bodies, then format bounded body pages.
+ * Yield actual macrotasks between pages so lock/navigation can cancel both
+ * passes. The owning message source checks database lifecycle on every page.
+ * The readonly export must remain immutable; this is not a writer snapshot.
  */
-function formatConversationAsText(conv, messages) {
-    const lines = [
-        `# ${conv.title || 'Untitled conversation'}`,
-        `Agent: ${conv.agent}`,
-        `Date: ${formatDate(conv.started_at)}`,
-        conv.workspace ? `Workspace: ${conv.workspace}` : '',
-        '',
-        '---',
-        '',
-    ];
+async function formatConversationAsText(conv, messages, isCurrent = () => true) {
+  const check = () => {
+    if (!isCurrent()) {
+      const error = new Error("Conversation copy cancelled");
+      error.name = "AbortError";
+      throw error;
+    }
+    // Accessing length also rejects disposed sources or a replaced database.
+    return messages.length;
+  };
+  const pause = async () => {
+    await new Promise(resolve => setTimeout(resolve, 0));
+    if (check() !== total) throw new Error("Conversation changed while preparing copy");
+  };
+  const total = check();
+  if (!Number.isSafeInteger(conv.id) || conv.id <= 0 ||
+      !Number.isSafeInteger(total) || total < 0) {
+    throw new Error("Invalid conversation copy identity or message count");
+  }
+  if (total > COPY_MAX_MESSAGES) throw new ConversationCopyLimit("Copy limit: 100k messages");
+  const metadataUnits = [conv.title, conv.agent, conv.workspace]
+    .reduce((sum, value) => sum + (typeof value === "string" ? value.length : 0), 0);
+  if (metadataUnits > COPY_MAX_BYTES) throw new ConversationCopyLimit();
+  const encoder = new TextEncoder();
+  const header = [
+    `# ${conv.title || "Untitled conversation"}`,
+    `Agent: ${conv.agent}`,
+    `Date: ${formatDate(conv.started_at)}`,
+    conv.workspace ? `Workspace: ${conv.workspace}` : "",
+    "", "---", "",
+  ].join("\n");
+  let used = encoder.encode(header).byteLength;
+  // 32 covers each fixed role label and all per-message separators. This is
+  // conservative admission; the exact final UTF-8 length is checked below.
+  let estimate = used + total * 32;
+  if (estimate > COPY_MAX_BYTES) throw new ConversationCopyLimit();
+  await pause();
+  for (let visited = 0, cursor = null; visited < total;) {
+    const limit = Math.min(128, total - visited);
+    const rows = readCopyPage(conv.id, cursor, limit, false, 0);
+    if (rows.length !== limit) throw new Error("Conversation changed while measuring copy");
+    for (const row of rows) {
+      const bytes = row.content_type === "null" ? 0 : row.content_bytes;
+      if (!["text", "null"].includes(row.content_type) || !Number.isSafeInteger(bytes) || bytes < 0) {
+        throw new Error("Invalid message content in conversation copy");
+      }
+      estimate += bytes;
+      if (estimate > COPY_MAX_BYTES) throw new ConversationCopyLimit();
+    }
+    cursor = rows.at(-1);
+    visited += rows.length;
+    await pause();
+  }
 
-    messages.forEach(msg => {
-        const role = msg.role === 'user' ? 'User' : 'Assistant';
-        lines.push(`## ${role}:`);
-        lines.push('');
-        lines.push(msg.content);
-        lines.push('');
-        lines.push('---');
-        lines.push('');
-    });
-
-    return lines.filter(line => line !== null).join('\n');
+  const parts = [header];
+  try {
+    for (let visited = 0, cursor = null; visited < total;) {
+      const limit = Math.min(32, total - visited);
+      // CASE refuses oversized values BEFORE returning their text to JS, even
+      // if a nonstandard caller altered the database after the size pass.
+      const rows = readCopyPage(conv.id, cursor, limit, true, COPY_MAX_BYTES - used);
+      if (rows.length !== limit) throw new Error("Conversation changed while reading copy");
+      for (const row of rows) {
+        if (typeof row.copy_content !== "string") throw new ConversationCopyLimit();
+        const part = `\n## ${row.copy_role}:\n\n${row.copy_content}\n\n---\n`;
+        used += encoder.encode(part).byteLength;
+        if (used > COPY_MAX_BYTES) throw new ConversationCopyLimit();
+        parts.push(part);
+      }
+      cursor = rows.at(-1);
+      visited += rows.length;
+      await pause();
+    }
+    check();
+    return parts.join("");
+  } finally {
+    // Drop retained references promptly on failure/cancellation. JS strings
+    // and clipboard buffers cannot be reliably zeroized by this component.
+    parts.length = 0;
+  }
 }
 
 /**
  * Show copy feedback
  */
 function showCopyFeedback(message) {
-    const copyBtn = document.getElementById('copy-btn');
-    if (copyBtn) {
-        if (!copyBtn.dataset.defaultLabel) {
-            copyBtn.dataset.defaultLabel = copyBtn.innerHTML;
-        }
-
-        if (copyFeedbackTimeoutId !== null) {
-            clearTimeout(copyFeedbackTimeoutId);
-            copyFeedbackTimeoutId = null;
-        }
-
-        const defaultLabel = copyBtn.dataset.defaultLabel;
-        copyBtn.innerHTML = message;
-        copyFeedbackTimeoutId = window.setTimeout(() => {
-            if (copyBtn.isConnected) {
-                copyBtn.innerHTML = defaultLabel;
-            }
-            copyFeedbackTimeoutId = null;
-        }, 2000);
+  const copyBtn = document.getElementById("copy-btn");
+  if (copyBtn) {
+    if (!copyBtn.dataset.defaultLabel) {
+      copyBtn.dataset.defaultLabel = copyBtn.innerHTML;
     }
+
+    if (copyFeedbackTimeoutId !== null) {
+      clearTimeout(copyFeedbackTimeoutId);
+      copyFeedbackTimeoutId = null;
+    }
+
+    const defaultLabel = copyBtn.dataset.defaultLabel;
+    copyBtn.innerHTML = message;
+    copyFeedbackTimeoutId = window.setTimeout(() => {
+      if (copyBtn.isConnected) {
+        copyBtn.innerHTML = defaultLabel;
+      }
+      copyFeedbackTimeoutId = null;
+    }, 2000);
+  }
 }
 
 /**
  * Show error message
  */
 function showError(message) {
-    elements.container.innerHTML = `
+  elements.container.innerHTML = `
         <div class="conversation-container">
             <div class="conversation-error">
                 <span class="error-icon">⚠️</span>
@@ -792,97 +1072,97 @@ function showError(message) {
         </div>
     `;
 
-    // Add CSP-safe event listener (no inline onclick)
-    const backBtn = document.getElementById('error-back-btn');
-    backBtn?.addEventListener('click', () => {
-        if (onBack) {
-            onBack();
-        } else {
-            history.back();
-        }
-    });
+  // Add CSP-safe event listener (no inline onclick)
+  const backBtn = document.getElementById("error-back-btn");
+  backBtn?.addEventListener("click", () => {
+    if (onBack) {
+      onBack();
+    } else {
+      history.back();
+    }
+  });
 }
 
 /**
  * Format agent name for display
  */
 function formatAgentName(agent) {
-    if (agent === undefined || agent === null || agent === '') return 'Unknown';
-    const value = String(agent);
-    return value.charAt(0).toUpperCase() + value.slice(1);
+  if (agent === undefined || agent === null || agent === "") return "Unknown";
+  const value = String(agent);
+  return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
 /**
  * Format timestamp as date string
  */
 function formatDate(timestamp) {
-    if (!timestamp) return '';
+  if (!timestamp) return "";
 
-    const date = new Date(timestamp);
-    return date.toLocaleDateString(undefined, {
-        weekday: 'short',
-        year: 'numeric',
-        month: 'short',
-        day: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit',
-    });
+  const date = new Date(timestamp);
+  return date.toLocaleDateString(undefined, {
+    weekday: "short",
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 /**
  * Format timestamp as time string
  */
 function formatTime(timestamp) {
-    if (!timestamp) return '';
+  if (!timestamp) return "";
 
-    const date = new Date(timestamp);
-    return date.toLocaleTimeString(undefined, {
-        hour: '2-digit',
-        minute: '2-digit',
-    });
+  const date = new Date(timestamp);
+  return date.toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 /**
  * Format duration in human-readable format
  */
 function formatDuration(ms) {
-    if (!ms || ms < 0) return '';
+  if (!ms || ms < 0) return "";
 
-    const seconds = Math.floor(ms / 1000);
-    const minutes = Math.floor(seconds / 60);
-    const hours = Math.floor(minutes / 60);
+  const seconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
 
-    if (hours > 0) {
-        return `${hours}h ${minutes % 60}m`;
-    }
-    if (minutes > 0) {
-        return `${minutes}m`;
-    }
-    return `${seconds}s`;
+  if (hours > 0) {
+    return `${hours}h ${minutes % 60}m`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m`;
+  }
+  return `${seconds}s`;
 }
 
 /**
  * Escape HTML special characters
  */
 function escapeHtml(text) {
-    if (!text) return '';
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
+  if (!text) return "";
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
 }
 
 /**
  * Get current conversation ID
  */
 export function getCurrentConversationId() {
-    return currentConversation?.id || null;
+  return currentConversation?.id || null;
 }
 
 /**
  * Get current conversation data
  */
 export function getCurrentConversation() {
-    return currentConversation;
+  return currentConversation;
 }
 
 /**
@@ -890,11 +1170,14 @@ export function getCurrentConversation() {
  * @private
  */
 function unloadOldestConversation() {
-    const oldest = loadedConversations.keys().next().value;
-    if (oldest !== undefined) {
-        loadedConversations.delete(oldest);
-        console.debug(`[Conversation] Unloaded oldest conversation ${oldest} (cache size: ${loadedConversations.size})`);
-    }
+  const oldest = loadedConversations.keys().next().value;
+  if (oldest !== undefined) {
+    loadedConversations.get(oldest).messages.clearCache();
+    loadedConversations.delete(oldest);
+    console.debug(
+      `[Conversation] Unloaded oldest conversation ${oldest} (cache size: ${loadedConversations.size})`,
+    );
+  }
 }
 
 /**
@@ -902,33 +1185,37 @@ function unloadOldestConversation() {
  * @param {number} [keepCount=1] - Number of recent conversations to keep
  */
 export function clearOldConversations(keepCount = 1) {
-    const entries = Array.from(loadedConversations.entries());
-    const toRemove = entries.length - keepCount;
+  cancelConversationCopy();
+  const entries = Array.from(loadedConversations.entries());
+  const toRemove = entries.length - keepCount;
 
-    if (toRemove > 0) {
-        // Remove oldest entries (first ones in the Map)
-        for (let i = 0; i < toRemove; i++) {
-            loadedConversations.delete(entries[i][0]);
-        }
-        console.debug(`[Conversation] Cleared ${toRemove} old conversations (cache size: ${loadedConversations.size})`);
+  if (toRemove > 0) {
+    // Remove oldest entries (first ones in the Map)
+    for (let i = 0; i < toRemove; i++) {
+      entries[i][1].messages.clearCache();
+      loadedConversations.delete(entries[i][0]);
     }
+    console.debug(
+      `[Conversation] Cleared ${toRemove} old conversations (cache size: ${loadedConversations.size})`,
+    );
+  }
 }
 
 /**
  * Show memory warning banner
  */
 function showMemoryWarning() {
-    // Check if warning already exists
-    if (document.getElementById('memory-warning')) return;
+  // Check if warning already exists
+  if (document.getElementById("memory-warning")) return;
 
-    const usage = getMemoryUsage();
-    const percent = usage ? usage.percent.toFixed(1) : 'N/A';
+  const usage = getMemoryUsage();
+  const percent = usage ? usage.percent.toFixed(1) : "N/A";
 
-    const banner = document.createElement('div');
-    banner.id = 'memory-warning';
-    banner.className = 'memory-warning-banner';
-    banner.setAttribute('role', 'alert');
-    banner.innerHTML = `
+  const banner = document.createElement("div");
+  banner.id = "memory-warning";
+  banner.className = "memory-warning-banner";
+  banner.setAttribute("role", "alert");
+  banner.innerHTML = `
         <span class="memory-warning-icon" aria-hidden="true">&#x26A0;&#xFE0F;</span>
         <span class="memory-warning-text">Memory usage is high (${percent}%). Consider closing some conversations.</span>
         <button id="memory-clear-btn" type="button" class="btn btn-small memory-clear-btn">
@@ -937,54 +1224,54 @@ function showMemoryWarning() {
         <button class="memory-dismiss-btn" type="button" aria-label="Dismiss">&#x2715;</button>
     `;
 
-    // Add to page
-    document.body.prepend(banner);
+  // Add to page
+  document.body.prepend(banner);
 
-    // Event listeners
-    const clearBtn = document.getElementById('memory-clear-btn');
-    clearBtn?.addEventListener('click', () => {
-        clearOldConversations(1);
-        hideMemoryWarning();
-    });
+  // Event listeners
+  const clearBtn = document.getElementById("memory-clear-btn");
+  clearBtn?.addEventListener("click", () => {
+    clearOldConversations(1);
+    hideMemoryWarning();
+  });
 
-    const dismissBtn = banner.querySelector('.memory-dismiss-btn');
-    dismissBtn?.addEventListener('click', hideMemoryWarning);
+  const dismissBtn = banner.querySelector(".memory-dismiss-btn");
+  dismissBtn?.addEventListener("click", hideMemoryWarning);
 }
 
 /**
  * Hide memory warning banner
  */
 function hideMemoryWarning() {
-    const banner = document.getElementById('memory-warning');
-    if (banner) {
-        banner.remove();
-    }
+  const banner = document.getElementById("memory-warning");
+  if (banner) {
+    banner.remove();
+  }
 }
 
 /**
  * Start periodic memory monitoring
  */
 export function startMemoryMonitoring() {
-    if (memoryCheckIntervalId) return; // Already running
+  if (memoryCheckIntervalId) return; // Already running
 
-    memoryCheckIntervalId = setInterval(() => {
-        if (checkMemoryPressure()) {
-            showMemoryWarning();
-        }
-    }, MEMORY_CONFIG.MEMORY_CHECK_INTERVAL);
+  memoryCheckIntervalId = setInterval(() => {
+    if (checkMemoryPressure()) {
+      showMemoryWarning();
+    }
+  }, MEMORY_CONFIG.MEMORY_CHECK_INTERVAL);
 
-    console.debug('[Conversation] Memory monitoring started');
+  console.debug("[Conversation] Memory monitoring started");
 }
 
 /**
  * Stop periodic memory monitoring
  */
 export function stopMemoryMonitoring() {
-    if (memoryCheckIntervalId) {
-        clearInterval(memoryCheckIntervalId);
-        memoryCheckIntervalId = null;
-        console.debug('[Conversation] Memory monitoring stopped');
-    }
+  if (memoryCheckIntervalId) {
+    clearInterval(memoryCheckIntervalId);
+    memoryCheckIntervalId = null;
+    console.debug("[Conversation] Memory monitoring stopped");
+  }
 }
 
 /**
@@ -992,55 +1279,68 @@ export function stopMemoryMonitoring() {
  * @returns {Object} Cache stats
  */
 export function getCacheStats() {
-    const memory = getMemoryUsage();
-    return {
-        cachedCount: loadedConversations.size,
-        maxCached: MEMORY_CONFIG.MAX_LOADED_CONVERSATIONS,
-        memoryUsed: memory?.used || 0,
-        memoryLimit: memory?.limit || 0,
-        memoryPercent: memory?.percent || 0,
-    };
+  const memory = getMemoryUsage();
+  const messageCaches = Array.from(loadedConversations.values(), (entry) =>
+    entry.messages.getCacheStats(),
+  );
+  return {
+    cachedCount: loadedConversations.size,
+    maxCached: MEMORY_CONFIG.MAX_LOADED_CONVERSATIONS,
+    cachedMessageBodies: messageCaches.reduce((sum, cache) => sum + cache.messages, 0),
+    cachedTextUnits: messageCaches.reduce((sum, cache) => sum + cache.textUnits, 0),
+    memoryUsed: memory?.used || 0,
+    memoryLimit: memory?.limit || 0,
+    memoryPercent: memory?.percent || 0,
+  };
 }
 
 /**
  * Clear the viewer
  */
 export function clearViewer() {
-    activeConversationLoadId += 1;
-    // Clean up virtual list
-    destroyVirtualList();
-    teardownDocumentListeners();
+  cancelConversationCopy();
+  activeConversationLoadId += 1;
+  // Clean up virtual list
+  destroyVirtualList();
+  teardownDocumentListeners();
 
-    currentConversation = null;
-    currentMessages = [];
-    elements.container.innerHTML = '';
+  currentConversation = null;
+  currentMessages = [];
+  elements.container.innerHTML = "";
 }
 
 export function cleanupConversationViewer() {
-    window.removeEventListener('cass:lock', handleArchiveLock);
-    clearViewer();
+  window.removeEventListener("cass:lock", handleArchiveLock);
+  clearViewer();
 }
 
 /**
  * Clear all cached conversations
  */
 export function clearAllCache() {
-    loadedConversations.clear();
-    hideMemoryWarning();
-    console.debug('[Conversation] All cached conversations cleared');
+  cancelConversationCopy();
+  // An active view may still use its source after a manual cache clear.
+  // Clear retained text without disabling scrolling; lock disposes sources.
+  currentMessages.clearCache?.();
+  for (const cached of loadedConversations.values()) {
+    cached.messages.clearCache();
+  }
+  loadedConversations.clear();
+  hideMemoryWarning();
+  console.debug("[Conversation] All cached conversations cleared");
 }
 
 // Export default
 export default {
-    initConversationViewer,
-    loadConversation,
-    getCurrentConversationId,
-    getCurrentConversation,
-    clearViewer,
-    cleanupConversationViewer,
-    clearAllCache,
-    clearOldConversations,
-    getCacheStats,
-    startMemoryMonitoring,
-    stopMemoryMonitoring,
+  initConversationViewer,
+  loadConversation,
+  getCurrentConversationId,
+  getCurrentConversation,
+  clearViewer,
+  cleanupConversationViewer,
+  clearAllCache,
+  clearOldConversations,
+  getCacheStats,
+  startMemoryMonitoring,
+  stopMemoryMonitoring,
 };

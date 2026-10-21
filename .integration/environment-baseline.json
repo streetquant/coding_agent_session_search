@@ -1,0 +1,72 @@
+{
+  "captured_at": "2026-10-20T19:13:41+00:00",
+  "diff_fingerprint": "ff0853fcad575ab06252a182229d13f54dde2bbaa57dea36033e76dd69f01130",
+  "errors": [],
+  "git_head": "3254b9701105ccd3808bfa2c424cedc10e597a0e",
+  "manifests": {
+    "Cargo.lock": "36f3fa4b978a3dda4fb7063bf9365cf7e9f4a5b889bf489fc6429335c9740653",
+    "Cargo.toml": "4018cbdac25cf840dbdc83e3b95bbe9b1e763f7c0e70779e2da95eb4c2792931",
+    "fuzz/Cargo.lock": "da249a009e8431472ebee00855a4fce870744c3fd50aa796ad0e634d5908365c",
+    "fuzz/Cargo.toml": "54168ed4025a224a1af22fab6837c33adaf5965578c598bc7ebf1feffb9addbd",
+    "tests/package-lock.json": "198a7a6ad347e2c7011f53580f5991feca2cc033576ddd2d5aa2f4c09379e900",
+    "tests/package.json": "7d7adfe2df4faac7f073d67e58c2533f1c10341936833b8e343daf226546b5f5",
+    "tests/performance/package.json": "090be78dd57d03a8e53a7df2060e0a242263b64955ede36bc71bf2cc60403804"
+  },
+  "platform": {
+    "machine": "x86_64",
+    "python_implementation": "CPython",
+    "python_version": "3.14.7",
+    "release": "6.18.55-1-lts",
+    "system": "Linux"
+  },
+  "policy_sha256": "7ebf98242892ee9f876cda406560216a8a7466257a3e4afa42ad18b0833645ce",
+  "repository_root": "/warp/projects/softwares/cass",
+  "safe_environment": {
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "NO_COLOR": "1",
+    "TZ": "Asia/Kolkata"
+  },
+  "schema_version": "1.0",
+  "snapshot_hash": "0f0900aa452ca4fd9ef9b18263167f150bd98a1af26d3435f2a10ea292eead91",
+  "submodules": "",
+  "tools": {
+    "br": {
+      "available": true,
+      "executable_sha256": "d88bd0f7ae3a22e15d917209519a0cca04cb10112015b08448fcddc1fb4e2108",
+      "path": "/home/arch/.local/bin/br",
+      "required": false,
+      "resolved_path": "/home/arch/.local/bin/br",
+      "version": "br 0.6.0",
+      "version_exit_code": 0
+    },
+    "bv": {
+      "available": true,
+      "executable_sha256": "9b994d14f0027ed0c7e5b3a0e9bfea262a85cb1c198ec0e38256aebb4bd68249",
+      "path": "/home/arch/.local/bin/bv",
+      "required": false,
+      "resolved_path": "/home/arch/.local/bin/bv",
+      "version": "bv v0.25.0",
+      "version_exit_code": 0
+    },
+    "git": {
+      "available": true,
+      "executable_sha256": "2912a2a32f408c9b8122e476251b32f4b35f4c3f0c15961686ae87ca456d384c",
+      "path": "/usr/bin/git",
+      "required": true,
+      "resolved_path": "/usr/bin/git",
+      "version": "git version 2.56.0",
+      "version_exit_code": 0
+    },
+    "python": {
+      "available": true,
+      "executable_sha256": "d78f9cf7178ecff09963551399855543c297f37ac207e626228bfe43cb26a70c",
+      "path": "/usr/bin/python",
+      "required": false,
+      "resolved_path": "/usr/bin/python3.14",
+      "version": "Python 3.14.7",
+      "version_exit_code": 0
+    }
+  },
+  "valid": true
+}

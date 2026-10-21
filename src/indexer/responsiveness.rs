@@ -39,6 +39,8 @@
 //! [`user_idle_gate`]. That gate is deliberately *not* consulted by foreground
 //! indexing: a human who typed `cass index` wants it to run now.
 
+mod resident;
+
 use std::collections::VecDeque;
 use std::sync::{
     Arc, LazyLock, Mutex,
@@ -95,6 +97,114 @@ static MACOS_PROCESS_MEMORY_SAMPLE: LazyLock<Mutex<MacosProcessMemorySample>> =
             bytes: None,
         })
     });
+
+/// Wall-clock bound for one OS telemetry probe (`footprint`, `ps`, `sysctl`,
+/// `vm_stat`, `ioreg`). Each normally answers in milliseconds. A probe that
+/// has not answered by then is killed with its process group and treated as
+/// "telemetry unavailable", which every caller already handles.
+///
+/// Observed on a Mac whose `footprint`/`sample` service had wedged: every
+/// `footprint --pid` call hung forever, and `cass index` sat at 0% CPU in
+/// `Command::output()` until the stall watchdog aborted it (exit 70).
+#[cfg(any(test, target_os = "macos"))]
+const OS_TELEMETRY_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Largest stdout/stderr accepted from one telemetry probe. `ioreg -c
+/// IOHIDSystem` is the largest at a few hundred KiB.
+#[cfg(any(all(test, unix), target_os = "macos"))]
+const OS_TELEMETRY_PROBE_MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Outcome of one bounded telemetry probe.
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Debug)]
+enum TelemetryProbe {
+    /// The command exited within the deadline (any status).
+    // Only the Unix probe runner constructs it; Windows test builds lack it.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Completed(std::process::Output),
+    /// The deadline passed; the command and its process group were killed.
+    TimedOut,
+    /// The command could not be spawned or its output could not be read.
+    Failed,
+}
+
+/// Run a telemetry command with no stdin, captured output, its own process
+/// group, and a hard wall-clock deadline. Never blocks past `timeout` on the
+/// child itself: a hung command is killed (SIGKILL to its group) and reaped.
+#[cfg(any(all(test, unix), target_os = "macos"))]
+fn run_bounded_telemetry_probe(
+    mut command: std::process::Command,
+    timeout: Duration,
+) -> TelemetryProbe {
+    use std::process::Stdio;
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::sources::configure_child_process_group(&mut command);
+    let Ok(child) = command.spawn() else {
+        return TelemetryProbe::Failed;
+    };
+    match crate::sources::wait_for_child_output_with_limit(
+        child,
+        timeout,
+        Some(OS_TELEMETRY_PROBE_MAX_OUTPUT_BYTES),
+    ) {
+        Ok(Some(output)) => TelemetryProbe::Completed(output),
+        Ok(None) => TelemetryProbe::TimedOut,
+        Err(_) => TelemetryProbe::Failed,
+    }
+}
+
+/// Successful stdout of a bounded telemetry probe, or `None` when the probe
+/// failed, exited nonzero, or timed out.
+#[cfg(target_os = "macos")]
+fn bounded_telemetry_stdout(command: std::process::Command) -> Option<String> {
+    match run_bounded_telemetry_probe(command, OS_TELEMETRY_PROBE_TIMEOUT) {
+        TelemetryProbe::Completed(output) if output.status.success() => {
+            Some(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+        _ => None,
+    }
+}
+
+/// Set once `footprint(1)` has timed out in this process. A wedged
+/// `footprint` service stays wedged, so later samples go straight to the
+/// `ps` RSS fallback instead of paying the probe deadline on every tick.
+#[cfg(target_os = "macos")]
+static FOOTPRINT_PROBE_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Physical footprint through `probe`, honouring and maintaining the
+/// `disabled` circuit breaker. Separated from the `footprint` command so the
+/// timeout policy is testable on every platform.
+#[cfg(any(test, target_os = "macos"))]
+fn phys_footprint_bytes_via_probe(
+    disabled: &std::sync::atomic::AtomicBool,
+    probe: impl FnOnce() -> TelemetryProbe,
+) -> Option<u64> {
+    use std::sync::atomic::Ordering;
+
+    if disabled.load(Ordering::Relaxed) {
+        return None;
+    }
+    match probe() {
+        TelemetryProbe::Completed(output) if output.status.success() => {
+            macos_phys_footprint_bytes_from_output(&String::from_utf8_lossy(&output.stdout))
+        }
+        TelemetryProbe::Completed(_) | TelemetryProbe::Failed => None,
+        TelemetryProbe::TimedOut => {
+            if !disabled.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    timeout_ms = OS_TELEMETRY_PROBE_TIMEOUT.as_millis() as u64,
+                    "footprint(1) did not answer within its deadline; using ps RSS for process memory from now on"
+                );
+            }
+            None
+        }
+    }
+}
 
 /// Fallback process-wide in-flight byte ceiling for responsiveness-governed
 /// maintenance work when memory telemetry is unavailable.
@@ -577,14 +687,9 @@ fn read_loadavg() -> Option<f32> {
 /// Fallback for [`read_loadavg`]: `sysctl -n vm.loadavg` prints `{ 1.23 1.45 1.50 }`.
 #[cfg(target_os = "macos")]
 fn read_loadavg_via_sysctl() -> Option<f32> {
-    let output = std::process::Command::new("sysctl")
-        .args(["-n", "vm.loadavg"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    macos_loadavg_1m_from_sysctl(&String::from_utf8_lossy(&output.stdout))
+    let mut command = std::process::Command::new("sysctl");
+    command.args(["-n", "vm.loadavg"]);
+    macos_loadavg_1m_from_sysctl(&bounded_telemetry_stdout(command)?)
 }
 
 /// Parse the 1-minute field out of `sysctl -n vm.loadavg` output
@@ -609,14 +714,9 @@ pub(crate) fn macos_loadavg_1m_from_sysctl(raw: &str) -> Option<f32> {
 pub(crate) fn user_idle_seconds() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("ioreg")
-            .args(["-c", "IOHIDSystem", "-d", "4", "-r"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        macos_hid_idle_seconds_from_ioreg(&String::from_utf8_lossy(&output.stdout))
+        let mut command = std::process::Command::new("ioreg");
+        command.args(["-c", "IOHIDSystem", "-d", "4", "-r"]);
+        macos_hid_idle_seconds_from_ioreg(&bounded_telemetry_stdout(command)?)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -766,6 +866,9 @@ pub(crate) struct GovernorTelemetry {
     /// and the quantiles the conformal policy is emitting for each
     /// signal × severity pairing.
     pub calibration: Option<CalibrationTelemetry>,
+    /// Live resident-memory observation, absent before the sampler has run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<resident::MemoryTelemetry>,
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize)]
@@ -1310,6 +1413,7 @@ impl Governor {
 
     fn run(&self) {
         loop {
+            resident::sample(&self.cfg);
             self.step_once();
             thread::sleep(self.cfg.tick);
         }
@@ -1471,6 +1575,7 @@ impl Governor {
             last_reason,
             recent_decisions: recent,
             calibration,
+            memory: resident::telemetry(),
         }
     }
 }
@@ -1497,7 +1602,9 @@ pub(crate) fn current_capacity_pct() -> u32 {
     }
     let g = GOVERNOR.clone();
     g.ensure_started();
-    g.current_capacity.load(Ordering::Relaxed)
+    g.current_capacity
+        .load(Ordering::Relaxed)
+        .min(resident::capacity_pct())
 }
 
 pub(crate) fn disabled_via_env() -> bool {
@@ -1517,7 +1624,11 @@ pub(crate) fn effective_worker_count(desired: usize) -> usize {
 /// producer-side in-flight byte budgets.
 pub(crate) fn effective_inflight_byte_limit(desired_bytes: usize) -> usize {
     let g = GOVERNOR.clone();
-    scale_inflight_byte_limit(desired_bytes, current_capacity_pct(), &g.cfg)
+    resident::limit_inflight_bytes(scale_inflight_byte_limit(
+        desired_bytes,
+        current_capacity_pct(),
+        &g.cfg,
+    ))
 }
 
 /// Return the configured governor policy without starting the background
@@ -1557,6 +1668,7 @@ pub(crate) fn telemetry_snapshot_passive() -> GovernorTelemetry {
         last_reason: None,
         recent_decisions: Vec::new(),
         calibration,
+        memory: resident::telemetry(),
     }
 }
 
@@ -1601,11 +1713,134 @@ fn default_max_inflight_bytes_for_available(available_bytes: Option<u64>) -> usi
     budget.clamp(DEFAULT_MAX_INFLIGHT_BYTES, ceiling)
 }
 
+/// GH #496: the memory this process may still use under its cgroup limits.
+///
+/// Host `MemAvailable` ignores systemd `MemoryMax`, container limits and
+/// memory-capped slices, so budgets sized from it (in-flight bytes, writer
+/// heaps, caches) could exceed the real ceiling and swap-thrash or OOM inside
+/// a 10 GB unit on a larger host. Walks from this process's cgroup to the
+/// root and returns the tightest level's headroom: `memory.max - usage`,
+/// crediting that level's reclaimable `inactive_file` page cache the way
+/// `MemAvailable` does. `None` when no level sets a limit.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cgroup_memory_budget(
+    proc_self_cgroup: &str,
+    cgroup_root: &std::path::Path,
+) -> Option<CgroupMemoryBudget> {
+    let read = |path: std::path::PathBuf| std::fs::read_to_string(path).ok();
+    let number = |text: Option<String>| text?.trim().parse::<u64>().ok();
+    let stat_field = |text: Option<String>, field: &str| {
+        text?.lines().find_map(|line| {
+            let (key, value) = line.split_once(' ')?;
+            (key == field).then(|| value.trim().parse::<u64>().ok())?
+        })
+    };
+    // cgroup v1 reports "no limit" as a page-rounded i64::MAX.
+    const V1_UNLIMITED_FLOOR: u64 = 1 << 62;
+    let mut tightest: Option<CgroupMemoryBudget> = None;
+    let mut consider = |limit: u64, usage: u64, inactive_file: u64, limit_level: String| {
+        let headroom = limit
+            .saturating_sub(usage.saturating_sub(inactive_file))
+            .min(limit);
+        tightest = Some(match tightest.take() {
+            // The walk runs leaf to root, so on a tie the deeper level keeps
+            // the attribution.
+            Some(current) if current.limit <= limit => CgroupMemoryBudget {
+                headroom: current.headroom.min(headroom),
+                ..current
+            },
+            Some(current) => CgroupMemoryBudget {
+                limit,
+                headroom: current.headroom.min(headroom),
+                limit_level,
+            },
+            None => CgroupMemoryBudget {
+                limit,
+                headroom,
+                limit_level,
+            },
+        });
+    };
+    let level_name = |version: &str, base: &std::path::Path, level: &std::path::Path| {
+        let relative = level.strip_prefix(base).unwrap_or(level);
+        format!("{version}:/{}", relative.display())
+    };
+    for line in proc_self_cgroup.lines() {
+        let mut fields = line.splitn(3, ':');
+        let (Some(_), Some(controllers), Some(relative)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let relative = relative.trim_start_matches('/');
+        let (base, v2) = if controllers.is_empty() {
+            (cgroup_root.to_path_buf(), true)
+        } else if controllers
+            .split(',')
+            .any(|controller| controller == "memory")
+        {
+            (cgroup_root.join("memory"), false)
+        } else {
+            continue;
+        };
+        let mut level = base.join(relative);
+        loop {
+            if v2 {
+                if let Some(limit) = number(read(level.join("memory.max"))) {
+                    let usage = number(read(level.join("memory.current"))).unwrap_or(0);
+                    let inactive = stat_field(read(level.join("memory.stat")), "inactive_file");
+                    consider(
+                        limit,
+                        usage,
+                        inactive.unwrap_or(0),
+                        level_name("cgroup_v2", &base, &level),
+                    );
+                }
+            } else if let Some(limit) = number(read(level.join("memory.limit_in_bytes")))
+                && limit < V1_UNLIMITED_FLOOR
+            {
+                let usage = number(read(level.join("memory.usage_in_bytes"))).unwrap_or(0);
+                let stat = read(level.join("memory.stat"));
+                let inactive = stat_field(stat.clone(), "total_inactive_file")
+                    .or_else(|| stat_field(stat, "inactive_file"));
+                consider(
+                    limit,
+                    usage,
+                    inactive.unwrap_or(0),
+                    level_name("cgroup_v1", &base, &level),
+                );
+            }
+            if level == base || !level.pop() || !level.starts_with(&base) {
+                break;
+            }
+        }
+    }
+    tightest
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CgroupMemoryBudget {
+    limit: u64,
+    headroom: u64,
+    /// The level whose `memory.max` / `memory.limit_in_bytes` is `limit`,
+    /// e.g. `cgroup_v2:/user.slice/app.scope`.
+    limit_level: String,
+}
+
+#[cfg(target_os = "linux")]
+fn current_cgroup_memory_budget() -> Option<CgroupMemoryBudget> {
+    let proc_self_cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    cgroup_memory_budget(&proc_self_cgroup, std::path::Path::new("/sys/fs/cgroup"))
+}
+
 pub(crate) fn available_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-        proc_kib_field_bytes(&meminfo, "MemAvailable:")
+        let host = proc_kib_field_bytes(&meminfo, "MemAvailable:")?;
+        Some(current_cgroup_memory_budget().map_or(host, |budget| host.min(budget.headroom)))
     }
     // #294: on macOS there is no `/proc/meminfo`, so the Linux probe returned
     // `None` and the entire host-memory-reserve throttle in the lexical
@@ -1615,11 +1850,7 @@ pub(crate) fn available_memory_bytes() -> Option<u64> {
     // memory) so the throttle actually engages.
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("vm_stat").output().ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
+        let text = bounded_telemetry_stdout(std::process::Command::new("vm_stat"))?;
         macos_available_memory_bytes_from_vm_stat(&text)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1629,28 +1860,67 @@ pub(crate) fn available_memory_bytes() -> Option<u64> {
 }
 
 pub(crate) fn total_memory_bytes() -> Option<u64> {
+    memory_total().map(|total| total.effective_bytes)
+}
+
+/// GH #496: the memory total budgets are sized from, the host total it was
+/// clamped from, and what set it. `status` reports all three, so an operator
+/// can see whether a `MemoryMax` or container limit actually reached this
+/// process instead of inferring it from derived budgets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", test)),
+    allow(dead_code)
+)]
+pub(crate) struct MemoryTotal {
+    pub(crate) effective_bytes: u64,
+    pub(crate) host_bytes: u64,
+    /// `host`, or the cgroup level whose limit is below the host total
+    /// (`cgroup_v2:/<path>` or `cgroup_v1:/<path>`).
+    pub(crate) limit_source: String,
+}
+
+pub(crate) fn memory_total() -> Option<MemoryTotal> {
     #[cfg(target_os = "linux")]
     {
         let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-        proc_kib_field_bytes(&meminfo, "MemTotal:")
+        let host = proc_kib_field_bytes(&meminfo, "MemTotal:")?;
+        Some(clamp_memory_total(host, current_cgroup_memory_budget()))
     }
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("sysctl")
-            .args(["-n", "hw.memsize"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        String::from_utf8_lossy(&output.stdout)
+        let mut command = std::process::Command::new("sysctl");
+        command.args(["-n", "hw.memsize"]);
+        let host = bounded_telemetry_stdout(command)?
             .trim()
             .parse::<u64>()
-            .ok()
+            .ok()?;
+        Some(MemoryTotal {
+            effective_bytes: host,
+            host_bytes: host,
+            limit_source: "host".to_owned(),
+        })
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         None
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn clamp_memory_total(host: u64, budget: Option<CgroupMemoryBudget>) -> MemoryTotal {
+    match budget {
+        Some(budget) if budget.limit < host => MemoryTotal {
+            effective_bytes: budget.limit,
+            host_bytes: host,
+            limit_source: budget.limit_level,
+        },
+        _ => MemoryTotal {
+            effective_bytes: host,
+            host_bytes: host,
+            limit_source: "host".to_owned(),
+        },
     }
 }
 
@@ -1700,28 +1970,20 @@ pub(crate) fn process_resident_memory_bytes() -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 fn read_macos_process_phys_footprint_bytes() -> Option<u64> {
-    let pid = std::process::id().to_string();
-    let output = std::process::Command::new("/usr/bin/footprint")
-        .args(["--pid", &pid, "--noCategories", "--format", "bytes"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    macos_phys_footprint_bytes_from_output(&String::from_utf8_lossy(&output.stdout))
+    phys_footprint_bytes_via_probe(&FOOTPRINT_PROBE_DISABLED, || {
+        let pid = std::process::id().to_string();
+        let mut command = std::process::Command::new("/usr/bin/footprint");
+        command.args(["--pid", &pid, "--noCategories", "--format", "bytes"]);
+        run_bounded_telemetry_probe(command, OS_TELEMETRY_PROBE_TIMEOUT)
+    })
 }
 
 #[cfg(target_os = "macos")]
 fn read_macos_process_rss_bytes() -> Option<u64> {
     let pid = std::process::id().to_string();
-    let output = std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    macos_rss_kib_to_bytes(&String::from_utf8_lossy(&output.stdout))
+    let mut command = std::process::Command::new("ps");
+    command.args(["-o", "rss=", "-p", &pid]);
+    macos_rss_kib_to_bytes(&bounded_telemetry_stdout(command)?)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1836,6 +2098,161 @@ fn macos_phys_footprint_bytes_from_output(text: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    fn cgroup_fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for (relative, contents) in files {
+            let path = root.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        root
+    }
+
+    /// GH #496: a 10 GB systemd unit on a 64 GB host must size budgets from
+    /// the unit, not the host; the tightest ancestor wins; reclaimable page
+    /// cache counts as headroom like MemAvailable does.
+    #[test]
+    fn cgroup_v2_budget_takes_the_tightest_ancestor_and_credits_page_cache() {
+        const GIB: u64 = 1 << 30;
+        let root = cgroup_fixture(&[
+            ("user.slice/memory.max", &format!("{}\n", 10 * GIB)),
+            ("user.slice/memory.current", &format!("{}\n", 3 * GIB)),
+            (
+                "user.slice/memory.stat",
+                &format!("anon 1\ninactive_file {}\n", GIB),
+            ),
+            ("user.slice/app.scope/memory.max", "max\n"),
+            (
+                "user.slice/app.scope/memory.current",
+                &format!("{}\n", 2 * GIB),
+            ),
+        ]);
+        let budget = cgroup_memory_budget("0::/user.slice/app.scope\n", root.path())
+            .expect("a limited ancestor must produce a budget");
+        assert_eq!(budget.limit, 10 * GIB);
+        assert_eq!(budget.headroom, 8 * GIB, "10 - (3 - 1 reclaimable) GiB");
+        assert_eq!(
+            budget.limit_level, "cgroup_v2:/user.slice",
+            "the unlimited leaf must not take the slice's attribution"
+        );
+
+        // A tighter leaf wins over the slice.
+        let root = cgroup_fixture(&[
+            ("user.slice/memory.max", &format!("{}\n", 10 * GIB)),
+            ("user.slice/memory.current", "0\n"),
+            ("user.slice/app.scope/memory.max", &format!("{}\n", 2 * GIB)),
+            ("user.slice/app.scope/memory.current", &format!("{}\n", GIB)),
+        ]);
+        let budget = cgroup_memory_budget("0::/user.slice/app.scope\n", root.path()).unwrap();
+        assert_eq!(
+            budget,
+            CgroupMemoryBudget {
+                limit: 2 * GIB,
+                headroom: GIB,
+                limit_level: "cgroup_v2:/user.slice/app.scope".to_owned(),
+            }
+        );
+
+        // The tightest headroom can sit at a different level from the
+        // tightest limit; the attribution follows the limit.
+        let root = cgroup_fixture(&[
+            ("user.slice/memory.max", &format!("{}\n", 10 * GIB)),
+            ("user.slice/memory.current", &format!("{}\n", 9 * GIB)),
+            ("user.slice/app.scope/memory.max", &format!("{}\n", 4 * GIB)),
+            ("user.slice/app.scope/memory.current", "0\n"),
+        ]);
+        let budget = cgroup_memory_budget("0::/user.slice/app.scope\n", root.path()).unwrap();
+        assert_eq!(
+            budget,
+            CgroupMemoryBudget {
+                limit: 4 * GIB,
+                headroom: GIB,
+                limit_level: "cgroup_v2:/user.slice/app.scope".to_owned(),
+            }
+        );
+    }
+
+    /// GH #496: `status` must say what set the memory total. A limit at or
+    /// above the host total changes nothing and is not named as the source.
+    #[test]
+    fn memory_total_names_the_cgroup_level_only_when_it_is_below_the_host() {
+        const GIB: u64 = 1 << 30;
+        let budget = |limit: u64| CgroupMemoryBudget {
+            limit,
+            headroom: limit,
+            limit_level: "cgroup_v2:/user.slice/run-r1.scope".to_owned(),
+        };
+        assert_eq!(
+            clamp_memory_total(64 * GIB, Some(budget(16 * GIB))),
+            MemoryTotal {
+                effective_bytes: 16 * GIB,
+                host_bytes: 64 * GIB,
+                limit_source: "cgroup_v2:/user.slice/run-r1.scope".to_owned(),
+            }
+        );
+        for unconstrained in [Some(budget(64 * GIB)), Some(budget(128 * GIB)), None] {
+            assert_eq!(
+                clamp_memory_total(64 * GIB, unconstrained),
+                MemoryTotal {
+                    effective_bytes: 64 * GIB,
+                    host_bytes: 64 * GIB,
+                    limit_source: "host".to_owned(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn cgroup_budget_is_none_without_a_limit_and_skips_malformed_lines() {
+        let root = cgroup_fixture(&[
+            ("user.slice/memory.max", "max\n"),
+            ("user.slice/memory.current", "123\n"),
+            (
+                "memory/legacy/memory.limit_in_bytes",
+                "9223372036854771712\n",
+            ),
+            ("memory/legacy/memory.usage_in_bytes", "123\n"),
+        ]);
+        assert_eq!(
+            cgroup_memory_budget("garbage\n0::/user.slice\n", root.path()),
+            None,
+            "'max' (v2) means unlimited"
+        );
+        assert_eq!(
+            cgroup_memory_budget("4:memory:/legacy\n", root.path()),
+            None,
+            "the v1 page-rounded i64::MAX sentinel means unlimited"
+        );
+        assert_eq!(cgroup_memory_budget("", root.path()), None);
+    }
+
+    #[test]
+    fn cgroup_v1_budget_reads_the_memory_controller_hierarchy() {
+        const MIB: u64 = 1 << 20;
+        let root = cgroup_fixture(&[
+            (
+                "memory/docker/abc/memory.limit_in_bytes",
+                &format!("{}\n", 512 * MIB),
+            ),
+            (
+                "memory/docker/abc/memory.usage_in_bytes",
+                &format!("{}\n", 300 * MIB),
+            ),
+            (
+                "memory/docker/abc/memory.stat",
+                &format!("total_inactive_file {}\n", 100 * MIB),
+            ),
+        ]);
+        let budget = cgroup_memory_budget(
+            "7:cpu,cpuacct:/docker/abc\n5:memory:/docker/abc\n",
+            root.path(),
+        )
+        .unwrap();
+        assert_eq!(budget.limit, 512 * MIB);
+        assert_eq!(budget.headroom, 312 * MIB);
+        assert_eq!(budget.limit_level, "cgroup_v1:/docker/abc");
+    }
 
     /// macOS load-average parser is pure so it runs on Linux CI too.
     #[test]
@@ -1966,6 +2383,127 @@ mod tests {
     fn macos_rss_parser_converts_kib_to_bytes() {
         assert_eq!(macos_rss_kib_to_bytes("  204800\n"), Some(204800 * 1024));
         assert_eq!(macos_rss_kib_to_bytes("not-a-number"), None);
+    }
+
+    /// A telemetry command that never answers (the wedged `footprint`
+    /// service) must come back as `TimedOut` near the deadline, with the
+    /// child's whole process group killed, instead of blocking the caller.
+    #[cfg(unix)]
+    #[test]
+    fn bounded_telemetry_probe_kills_a_hung_command_at_its_deadline() {
+        let marker = tempfile::tempdir().unwrap();
+        let grandchild_pid = marker.path().join("grandchild.pid");
+        let mut command = std::process::Command::new("sh");
+        // The grandchild inherits the pipes; only a group kill ends it.
+        command.args([
+            "-c",
+            &format!("sleep 60 & echo $! > '{}'; wait", grandchild_pid.display()),
+        ]);
+        let started = std::time::Instant::now();
+        // Long enough for the shell to record the grandchild's pid first.
+        let outcome = run_bounded_telemetry_probe(command, Duration::from_millis(1500));
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(outcome, TelemetryProbe::TimedOut),
+            "hung probe must report TimedOut, got {outcome:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "probe must return near its deadline, took {elapsed:?}"
+        );
+        let pid: i32 = std::fs::read_to_string(&grandchild_pid)
+            .expect("grandchild pid recorded")
+            .trim()
+            .parse()
+            .expect("numeric grandchild pid");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // `kill -0` fails once the grandchild is gone (killed and reaped
+            // by init after its parent group was SIGKILLed).
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .is_ok_and(|status| status.success());
+            if !alive {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild {pid} of the timed-out probe is still alive"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Positive control: a prompt command completes with its real output
+    /// and exit status, so the deadline does not swallow good telemetry.
+    #[cfg(unix)]
+    #[test]
+    fn bounded_telemetry_probe_returns_prompt_output() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "printf 'phys_footprint: 4096 B\\n'; exit 0"]);
+        let outcome = run_bounded_telemetry_probe(command, Duration::from_secs(10));
+        assert!(
+            matches!(&outcome, TelemetryProbe::Completed(output) if output.status.success()),
+            "prompt probe must complete successfully, got {outcome:?}"
+        );
+        if let TelemetryProbe::Completed(output) = outcome {
+            assert_eq!(
+                macos_phys_footprint_bytes_from_output(&String::from_utf8_lossy(&output.stdout)),
+                Some(4096)
+            );
+        }
+        let missing = std::process::Command::new("/nonexistent/cass-telemetry-probe");
+        assert!(matches!(
+            run_bounded_telemetry_probe(missing, Duration::from_secs(10)),
+            TelemetryProbe::Failed
+        ));
+    }
+
+    /// After one timeout the footprint path is disabled for the process:
+    /// later samples must not spawn (and wait on) the wedged tool again.
+    #[test]
+    fn footprint_timeout_disables_later_probes() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let disabled = AtomicBool::new(false);
+        let calls = AtomicUsize::new(0);
+        let timed_out = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            TelemetryProbe::TimedOut
+        };
+        assert_eq!(phys_footprint_bytes_via_probe(&disabled, timed_out), None);
+        assert!(
+            disabled.load(Ordering::SeqCst),
+            "a timeout trips the breaker"
+        );
+        assert_eq!(phys_footprint_bytes_via_probe(&disabled, timed_out), None);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a tripped breaker must not run the probe again"
+        );
+
+        // A failed (not hung) probe does not trip the breaker, and a healthy
+        // probe still yields the parsed footprint.
+        let healthy = AtomicBool::new(false);
+        assert_eq!(
+            phys_footprint_bytes_via_probe(&healthy, || TelemetryProbe::Failed),
+            None
+        );
+        assert!(!healthy.load(Ordering::SeqCst));
+        #[cfg(unix)]
+        {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", "printf 'phys_footprint: 8192 B\\n'"]);
+            assert_eq!(
+                phys_footprint_bytes_via_probe(&healthy, || run_bounded_telemetry_probe(
+                    command,
+                    Duration::from_secs(10)
+                )),
+                Some(8192)
+            );
+        }
     }
 
     #[test]

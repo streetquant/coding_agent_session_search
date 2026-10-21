@@ -7,7 +7,7 @@
 //! 2. Connector detection round-trip works correctly
 //! 3. Probe script generation uses FAD paths dynamically
 //! 4. Agent counts are consistent across all APIs
-//! 5. Detection-only connectors (continue, windsurf) are properly handled
+//! 5. Detection-only connectors (windsurf) are properly handled
 
 use coding_agent_search::indexer::get_connector_factories;
 use std::collections::HashSet;
@@ -51,23 +51,23 @@ fn probe_slugs() -> HashSet<String> {
 
 /// Detection-only connectors: have probe paths and detection entries but
 /// no parser implementation (no entry in `get_connector_factories()`).
-const DETECTION_ONLY: &[&str] = &["continue", "windsurf"];
+const DETECTION_ONLY: &[&str] = &["windsurf"];
 
 // Native CASS readers are not part of the pinned FAD remote probe registry.
 // In particular, a live Kilo SQLite/WAL must not be rsync-copied as though it
 // were an immutable transcript. Local detection and explicit exported roots
 // are supported; automatic SSH discovery is not advertised for these readers.
-const CASS_NATIVE: &[&str] = &["kilo", "cloudmcp"];
+const CASS_NATIVE: &[&str] = &["kilo", "cloudmcp", "openwebui"];
 
 /// Extract a function body from source code, including the braces.
 fn extract_function_body(source: &str, fn_prefix: &str) -> String {
     let start = source
         .find(fn_prefix)
-        .unwrap_or_else(|| panic!("function not found: {fn_prefix}"));
+        .unwrap_or_else(|| panic!("function not found: {fn_prefix}")); // ubs:ignore -- Test fixture must fail when the named source function is absent.
     let after = &source[start..];
     let open = after
         .find('{')
-        .unwrap_or_else(|| panic!("no opening brace for: {fn_prefix}"));
+        .unwrap_or_else(|| panic!("no opening brace for: {fn_prefix}")); // ubs:ignore -- Test fixture must fail when source extraction cannot start.
     let mut depth = 0usize;
     let mut end_idx = None;
     for (i, ch) in after[open..].char_indices() {
@@ -83,7 +83,7 @@ fn extract_function_body(source: &str, fn_prefix: &str) -> String {
             _ => {}
         }
     }
-    let end = end_idx.unwrap_or_else(|| panic!("no closing brace for: {fn_prefix}"));
+    let end = end_idx.unwrap_or_else(|| panic!("no closing brace for: {fn_prefix}")); // ubs:ignore -- Test fixture must fail on an incomplete function body.
     after[open..end].to_string()
 }
 
@@ -139,6 +139,7 @@ fn connector_factories_all_instantiate_and_detect() {
         "amp",
         "aider",
         "pi_agent",
+        "pi_durable",
         "factory",
         "omp",
         "openclaw",
@@ -162,7 +163,8 @@ fn connector_factories_all_instantiate_and_detect() {
 fn feature_gated_connectors_available() {
     let slugs = factory_fad_slugs();
     for gated in [
-        "chatgpt", "cursor", "opencode", "crush", "goose", "hermes", "devin",
+        "chatgpt", "cursor", "opencode", "crush", "goose", "hermes", "devin", "shelley",
+        "grok_bot", "codebuff",
     ] {
         assert!(
             slugs.contains(gated),
@@ -172,8 +174,8 @@ fn feature_gated_connectors_available() {
     }
     assert_eq!(
         slugs.len(),
-        31,
-        "Expected 29 FAD and 2 native CASS factories"
+        franken_agent_detection::get_connector_factories().len() + CASS_NATIVE.len(),
+        "Expected every FAD and native CASS factory"
     );
     for native in CASS_NATIVE {
         assert!(
@@ -236,13 +238,14 @@ fn probe_paths_cover_all_factory_connectors() {
 fn probe_paths_are_tilde_relative() {
     let paths = franken_agent_detection::default_probe_paths_tilde();
     for (slug, paths) in &paths {
-        if *slug == "shelley" {
+        if matches!(*slug, "shelley" | "pi_durable") {
             // A live SQLite database and WAL cannot yet be copied as a
-            // consistent remote bundle (GH #415). Local detection remains
-            // available, but advertising remote paths would be unsafe.
+            // consistent remote bundle (GH #415; Pi durable stores, FAD #28).
+            // Local detection remains available, but advertising remote paths
+            // would be unsafe.
             assert!(
                 paths.is_empty(),
-                "Shelley remote probes must remain disabled"
+                "{slug} remote probes must remain disabled"
             );
             continue;
         }
@@ -506,6 +509,217 @@ mod prime_ingestion {
     use std::io::Write;
     use std::time::Duration;
 
+    fn prime_command(home: &std::path::Path, data: &std::path::Path) -> std::process::Command {
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        command
+            .env_clear()
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("PATH", "")
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("CASS_CLOUDMCP_DATA_ROOT", home.join("cloudmcp"))
+            .env("CASS_OPENWEBUI_DATA_ROOT", home.join("openwebui"))
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_DATA_DIR", data)
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .current_dir(home);
+        if let Ok(system_root) = dotenvy::var("SystemRoot") {
+            command.env("SystemRoot", system_root);
+        }
+        command
+    }
+
+    fn write_prime(path: &std::path::Path, id: &str, text: &str) -> Vec<u8> {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = format!(
+            "{}\n{}\n",
+            json!({"type":"session","version":3,"id":id,"cwd":"/work/prime"}),
+            json!({"type":"message","id":"first","parentId":null,
+                "message":{"role":"user","content":text}})
+        )
+        .into_bytes();
+        fs::write(path, &bytes).unwrap();
+        bytes
+    }
+
+    fn prime_search(home: &std::path::Path, data: &std::path::Path, query: &str) -> Value {
+        let mut command = assert_cmd::Command::from_std(prime_command(home, data));
+        let output = command
+            .args([
+                "search",
+                query,
+                "--mode",
+                "lexical",
+                "--json",
+                "--no-maintenance",
+                "--timeout",
+                "3000",
+                "--limit",
+                "100",
+            ])
+            .timeout(Duration::from_secs(10))
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let result: Value = serde_json::from_slice(&output).unwrap();
+        assert_ne!(
+            result.pointer("/budget/timed_out").and_then(Value::as_bool),
+            Some(true),
+            "timed out search cannot prove absence: {result}"
+        );
+        assert!(result["hits"].is_array(), "missing hits: {result}");
+        result
+    }
+
+    #[test]
+    fn prime_explicit_file_watch_once_excludes_neighbors_and_replays_without_duplicates() {
+        let home = tempfile::tempdir().unwrap();
+        let data = home.path().join("cass-data");
+        let sessions = home.path().join(".prime/agent/sessions");
+        write_prime(
+            &sessions.join("baseline.jsonl"),
+            "baseline",
+            "primebaseline",
+        );
+        assert_cmd::Command::from_std(prime_command(home.path(), &data))
+            .args(["index", "--full", "--json"])
+            .timeout(Duration::from_secs(120))
+            .assert()
+            .success();
+        let target = sessions.join("chosen.jsonl");
+        let bytes = write_prime(&target, "chosen", "primechosenneedle");
+        let neighbor = sessions.join("neighbor.jsonl");
+        let neighbor_bytes = write_prime(&neighbor, "neighbor", "primeexcludedneedle");
+        let pi = home.path().join(".pi/agent/sessions/other.jsonl");
+        let pi_bytes = write_prime(&pi, "pi-neighbor", "primeexcludedneedle");
+        for _ in 0..2 {
+            assert_cmd::Command::from_std(prime_command(home.path(), &data))
+                .args(["index", "--watch", "--watch-once"])
+                .arg(&target)
+                .arg("--json")
+                .timeout(Duration::from_secs(120))
+                .assert()
+                .success();
+            let found = prime_search(home.path(), &data, "primechosenneedle");
+            let hits = found["hits"].as_array().unwrap();
+            assert_eq!(
+                hits.len(),
+                1,
+                "target must be indexed exactly once: {found}"
+            );
+            assert_eq!(hits[0]["agent"], "prime_agent");
+            // Watch-once indexes the canonical path (#377), which on macOS is
+            // /private/var/... for a temp dir under /var.
+            let indexed = Path::new(hits[0]["source_path"].as_str().unwrap())
+                .canonicalize()
+                .unwrap();
+            assert_eq!(indexed, target.canonicalize().unwrap());
+            let excluded = prime_search(home.path(), &data, "primeexcludedneedle");
+            assert!(
+                excluded["hits"].as_array().unwrap().is_empty(),
+                "neighbor leakage: {excluded}"
+            );
+        }
+        assert_eq!(fs::read(target).unwrap(), bytes);
+        assert_eq!(fs::read(neighbor).unwrap(), neighbor_bytes);
+        assert_eq!(fs::read(pi).unwrap(), pi_bytes);
+    }
+
+    #[test]
+    fn prime_configured_root_live_watch_indexes_new_file_without_unrelated_sources() {
+        use std::process::{Child, Stdio};
+        use std::time::Instant;
+        struct WatchChild(Child);
+        impl Drop for WatchChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let data = home.path().join("cass-data");
+        let sessions = home.path().join("configured-prime-store");
+        write_prime(
+            &sessions.join("baseline.jsonl"),
+            "baseline",
+            "primebaseline",
+        );
+        let stdout = home.path().join("watch.stdout");
+        let stderr = home.path().join("watch.stderr");
+        let logs = || {
+            format!(
+                "stdout:\n{}\nstderr:\n{}",
+                fs::read_to_string(&stdout).unwrap_or_default(),
+                fs::read_to_string(&stderr).unwrap_or_default()
+            )
+        };
+        let mut watch = WatchChild(
+            prime_command(home.path(), &data)
+                .env("PRIME_AGENT_SESSION_DIR", &sessions)
+                .env("RUST_LOG", "info")
+                .arg("--verbose")
+                .args(["index", "--watch", "--watch-interval", "1", "--json"])
+                .stdout(Stdio::from(fs::File::create(&stdout).unwrap()))
+                .stderr(Stdio::from(fs::File::create(&stderr).unwrap()))
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while !logs().contains("watch mode: minimum interval between scan cycles") {
+            assert!(
+                watch.0.try_wait().unwrap().is_none(),
+                "watch exited: {}",
+                logs()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "watch startup timeout: {}",
+                logs()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let unrelated = home.path().join("unrelated-store/session.jsonl");
+        let unrelated_bytes = write_prime(&unrelated, "unrelated", "primeunrelatedneedle");
+        let target = sessions.join("new-session.jsonl");
+        let bytes = write_prime(&target, "new-session", "primeliveneedle");
+        loop {
+            let found = prime_search(home.path(), &data, "primeliveneedle");
+            if !found["hits"].as_array().unwrap().is_empty() {
+                assert_eq!(found["hits"].as_array().unwrap().len(), 1, "{found}");
+                assert_eq!(found["hits"][0]["agent"], "prime_agent");
+                assert_eq!(
+                    found["hits"][0]["source_path"],
+                    target.to_string_lossy().as_ref()
+                );
+                break;
+            }
+            assert!(
+                watch.0.try_wait().unwrap().is_none(),
+                "watch exited: {}",
+                logs()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "new file never indexed: {}",
+                logs()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let excluded = prime_search(home.path(), &data, "primeunrelatedneedle");
+        assert!(
+            excluded["hits"].as_array().unwrap().is_empty(),
+            "{excluded}"
+        );
+        assert_eq!(fs::read(target).unwrap(), bytes);
+        assert_eq!(fs::read(unrelated).unwrap(), unrelated_bytes);
+    }
+
     #[test]
     fn prime_active_branch_survives_cli_ingestion_and_incremental_append() {
         let home = tempfile::tempdir().expect("isolated Prime home");
@@ -574,6 +788,8 @@ mod prime_ingestion {
                 .env("PATH", "")
                 .env("XDG_DATA_HOME", home.path().join(".local/share"))
                 .env("XDG_CONFIG_HOME", home.path().join(".config"))
+                .env("CASS_CLOUDMCP_DATA_ROOT", home.path().join("cloudmcp"))
+                .env("CASS_OPENWEBUI_DATA_ROOT", home.path().join("openwebui"))
                 .env("CASS_IGNORE_SOURCES_CONFIG", "1")
                 .env("CASS_AUTO_REFRESH", "0")
                 .env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0")
@@ -649,7 +865,32 @@ mod devin_ingestion {
     use coding_agent_search::franken_sync::{Connection, params};
     use serde_json::{Value, json};
     use std::fs;
+    use std::io::{Read, Seek, SeekFrom};
     use std::time::Duration;
+
+    fn bounded_watch_log(path: &Path) -> String {
+        const MAX_TAIL_BYTES: u64 = 8 * 1024;
+        let Ok(mut file) = fs::File::open(path) else {
+            return String::new();
+        };
+        let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+            return String::new();
+        };
+        let start = length.saturating_sub(MAX_TAIL_BYTES);
+        if file.seek(SeekFrom::Start(start)).is_err() {
+            return String::new();
+        }
+        let mut tail = Vec::with_capacity((length - start) as usize);
+        if file.read_to_end(&mut tail).is_err() {
+            return String::new();
+        }
+        let prefix = if start > 0 {
+            format!("[first {start} bytes omitted]\n")
+        } else {
+            String::new()
+        };
+        format!("{prefix}{}", String::from_utf8_lossy(&tail))
+    }
 
     fn seed_store(path: &Path) {
         let conn = Connection::open(path.to_string_lossy().as_ref()).expect("create Devin store");
@@ -759,6 +1000,8 @@ mod devin_ingestion {
             .env("XDG_DATA_HOME", home.join(".local/share"))
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("CASS_DEVIN_DATA_ROOT", home.join("sessions.db"))
+            .env("CASS_CLOUDMCP_DATA_ROOT", home.join("cloudmcp"))
+            .env("CASS_OPENWEBUI_DATA_ROOT", home.join("openwebui"))
             .env("CASS_IGNORE_SOURCES_CONFIG", "1")
             .env("CASS_AUTO_REFRESH", "0")
             .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
@@ -905,6 +1148,142 @@ mod devin_ingestion {
     }
 
     #[test]
+    fn devin_same_second_and_delayed_wal_commits_replay_without_duplicates() {
+        use coding_agent_search::storage::sqlite::SqliteStorage;
+
+        const SECOND: i64 = 1_700_001_000;
+        for streaming in ["0", "1"] {
+            let home = tempfile::tempdir().expect("isolated Devin precision home");
+            let db = home.path().join("sessions.db");
+            let data = home.path().join("cass-data");
+            seed_store(&db);
+            cass(home.path(), &data)
+                .env("CASS_STREAMING_INDEX", streaming)
+                .args(["index", "--full", "--json"])
+                .assert()
+                .success();
+
+            let save_watermark = || {
+                let storage = SqliteStorage::open(&data.join("agent_search.db"))
+                    .expect("open canonical metadata");
+                storage
+                    .set_last_scan_ts(SECOND * 1000 + 500)
+                    .expect("global watermark");
+                storage
+                    .set_connector_last_scan_ts("devin", SECOND * 1000 + 500)
+                    .expect("Devin watermark");
+                storage.close().expect("close canonical writer before CLI");
+            };
+            save_watermark();
+            let writer = Connection::open(db.to_string_lossy().as_ref()).expect("Devin WAL writer");
+            writer
+                .execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+                .expect("retain live WAL");
+            writer
+                .execute_compat(
+                    "INSERT INTO message_nodes VALUES (8, 'kept', 5, ?1, ?2)",
+                    params![
+                        json!({"role":"user", "content":"devinneedle followup"}).to_string(),
+                        SECOND
+                    ],
+                )
+                .expect("append boundary-second turn");
+            writer
+                .execute_compat(
+                    "UPDATE sessions SET main_chain_id = 8, last_activity_at = ?1 WHERE id = 'kept'",
+                    params![SECOND],
+                )
+                .expect("advance boundary-second chain");
+            writer
+                .execute_compat(
+                    "INSERT INTO sessions VALUES ('prior', 'prior second', NULL, NULL, NULL, ?1, ?1, 9, 0)",
+                    params![SECOND - 1],
+                )
+                .expect("insert delayed commit with older provider activity");
+            writer
+                .execute_compat(
+                    "INSERT INTO message_nodes VALUES (9, 'prior', NULL, ?1, ?2)",
+                    params![
+                        json!({"role":"user", "content":"priorsecondneedle"}).to_string(),
+                        SECOND - 1
+                    ],
+                )
+                .expect("insert prior-second control message");
+            assert!(
+                fs::metadata(db.with_extension("db-wal"))
+                    .expect("live WAL")
+                    .len()
+                    > 32
+            );
+            let before = source_bundle_bytes(&db);
+            let (_, factory) = get_connector_factories()
+                .into_iter()
+                .find(|(slug, _)| *slug == "devin")
+                .expect("Devin factory");
+            let mut ctx = ScanContext::with_roots(
+                home.path().to_path_buf(),
+                vec![ScanRoot::local(db.clone())],
+                None,
+            );
+            assert_eq!(
+                factory().scan(&ctx).expect("both visible controls").len(),
+                2
+            );
+            // The provider honors an explicit cutoff. The CLI deliberately
+            // omits it for Devin: a newly committed WAL row can have provider
+            // activity older than the filesystem scan watermark.
+            ctx.since_ts = Some(SECOND * 1000);
+            let eligible = factory().scan(&ctx).expect("native boundary cutoff");
+            assert_eq!(eligible.len(), 1, "prior second must remain excluded");
+            assert_eq!(eligible[0].external_id.as_deref(), Some("kept"));
+            assert_eq!(eligible[0].messages.len(), 5);
+
+            for replay in 0..2 {
+                // Persist an exact half-second watermark, avoiding wall-clock
+                // timing or sleeps. Reset it for replay so both invocations
+                // must parse the same boundary-second provider state.
+                if replay > 0 {
+                    save_watermark();
+                }
+                cass(home.path(), &data)
+                    .env("CASS_STREAMING_INDEX", streaming)
+                    .args(["index", "--json"])
+                    .assert()
+                    .success();
+                for (query, expected) in [("devinneedle", 5), ("priorsecondneedle", 1)] {
+                    let output = cass(home.path(), &data)
+                        .args([
+                            "search", query, "--mode", "lexical", "--agent", "devin", "--json",
+                            "--limit", "20",
+                        ])
+                        .assert()
+                        .success()
+                        .get_output()
+                        .stdout
+                        .clone();
+                    let result: Value = serde_json::from_slice(&output).expect("search JSON");
+                    assert_eq!(
+                        result["budget"]["timed_out"].as_bool(),
+                        Some(false),
+                        "a timed-out search cannot prove delayed-commit recovery: {result}"
+                    );
+                    assert_eq!(
+                        result["hits"].as_array().expect("hits").len(),
+                        expected,
+                        "streaming={streaming} replay={replay}: {result}"
+                    );
+                }
+                assert_eq!(
+                    source_bundle_bytes(&db),
+                    before,
+                    "source conservation during replay"
+                );
+            }
+            drop(writer);
+        }
+    }
+
+    #[test]
     fn devin_file_override_watch_ingests_wal_only_commit_without_touching_source() {
         use std::process::{Child, Stdio};
         use std::time::Instant;
@@ -936,22 +1315,25 @@ mod devin_ingestion {
         let watch_logs = || {
             format!(
                 "stdout:\n{}\nstderr:\n{}",
-                fs::read_to_string(&stdout_path).unwrap_or_default(),
-                fs::read_to_string(&stderr_path).unwrap_or_default(),
+                bounded_watch_log(&stdout_path),
+                bounded_watch_log(&stderr_path),
             )
         };
         let mut watch = WatchChild(
             cass_command(home.path(), &data)
-                // JSON mode suppresses the INFO readiness signal unless requested.
-                .arg("--verbose")
-                .args(["index", "--watch", "--watch-interval", "1", "--json"])
+                // Human mode honors RUST_LOG=info, so the readiness signal is
+                // visible without enabling dependency DEBUG log floods.
+                .args(["index", "--watch", "--watch-interval", "1"])
                 .env("RUST_LOG", "info")
                 .stdout(Stdio::from(fs::File::create(&stdout_path).unwrap()))
                 .stderr(Stdio::from(fs::File::create(&stderr_path).unwrap()))
                 .spawn()
                 .expect("start real Devin watcher"),
         );
-        let deadline = Instant::now() + Duration::from_secs(60);
+        // This is a test hang guard, not a watcher deadline. The isolated cold
+        // index can take nearly a minute, and sibling integration tests contend
+        // for the same host resources when this target runs concurrently.
+        let deadline = Instant::now() + Duration::from_secs(180);
         loop {
             let logs = watch_logs();
             if logs.contains("watch mode: minimum interval between scan cycles") {

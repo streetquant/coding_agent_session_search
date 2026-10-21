@@ -6,22 +6,22 @@
  */
 
 import {
-    buildConversationPath,
-    buildSearchPath,
-    parseConversationRouteParts,
-    splitRouteQuery,
-} from './router.js';
+  buildConversationPath,
+  buildSearchPath,
+  parseConversationRouteParts,
+  splitRouteQuery,
+} from "./router.js";
 
 /**
  * Get the base URL (everything before the hash)
  * @returns {string} Base URL
  */
 function getBaseUrl() {
-    const url = new URL(window.location.href);
-    // Remove hash and query params
-    url.hash = '';
-    url.search = '';
-    return url.toString();
+  const url = new URL(window.location.href);
+  // Remove hash and query params
+  url.hash = "";
+  url.search = "";
+  return url.toString();
 }
 
 /**
@@ -31,9 +31,9 @@ function getBaseUrl() {
  * @returns {string} Shareable URL
  */
 export function getConversationLink(conversationId, messageId = null) {
-    const base = getBaseUrl();
-    const path = buildConversationPath(conversationId, messageId);
-    return `${base}#${path}`;
+  const base = getBaseUrl();
+  const path = buildConversationPath(conversationId, messageId);
+  return `${base}#${path}`;
 }
 
 /**
@@ -43,9 +43,9 @@ export function getConversationLink(conversationId, messageId = null) {
  * @returns {string} Shareable URL
  */
 export function getSearchLink(query, filters = {}) {
-    const base = getBaseUrl();
-    const path = buildSearchPath(query, filters);
-    return `${base}#${path}`;
+  const base = getBaseUrl();
+  const path = buildSearchPath(query, filters);
+  return `${base}#${path}`;
 }
 
 /**
@@ -53,8 +53,8 @@ export function getSearchLink(query, filters = {}) {
  * @returns {string} Shareable URL
  */
 export function getSettingsLink() {
-    const base = getBaseUrl();
-    return `${base}#/settings`;
+  const base = getBaseUrl();
+  return `${base}#/settings`;
 }
 
 /**
@@ -62,8 +62,8 @@ export function getSettingsLink() {
  * @returns {string} Shareable URL
  */
 export function getStatsLink() {
-    const base = getBaseUrl();
-    return `${base}#/stats`;
+  const base = getBaseUrl();
+  return `${base}#/stats`;
 }
 
 /**
@@ -71,52 +71,90 @@ export function getStatsLink() {
  * @returns {string} Shareable URL
  */
 export function getHomeLink() {
-    const base = getBaseUrl();
-    return `${base}#/`;
+  const base = getBaseUrl();
+  return `${base}#/`;
 }
 
 /**
- * Copy text to the clipboard
+ * Copy text while the originating request is still current. Archive lock is
+ * a cancellation boundary even for callers without an explicit AbortSignal.
+ * Cancellation prevents NEW clipboard/fallback work; it cannot retract bytes
+ * already handed to the browser's non-cancellable writeText() operation.
  * @param {string} text - Text to copy
- * @returns {Promise<boolean>} True if successful
+ * @param {Object} options - Optional signal and synchronous isCurrent predicate
+ * @returns {Promise<boolean>} True only for a successful, still-current request
  */
-export async function copyTextToClipboard(text) {
+export async function copyTextToClipboard(text, { signal, isCurrent = () => true } = {}) {
+  if (typeof text !== "string" || typeof isCurrent !== "function") {
+    throw new TypeError("Clipboard copy requires text and a current-request predicate");
+  }
+  const lockEvents = globalThis.window;
+  let textArea = null;
+  let cancelled = false;
+  let releaseCancelled;
+  const cancellation = new Promise(resolve => { releaseCancelled = () => resolve(false); });
+  const clearTemporaryText = () => {
+    if (textArea) {
+      textArea.value = "";
+      textArea.parentNode?.removeChild(textArea);
+    }
+  };
+  const cancel = () => {
+    cancelled = true;
+    releaseCancelled();
+    clearTemporaryText();
+  };
+  const active = () => !cancelled && !signal?.aborted && isCurrent();
+
+  try {
+    lockEvents?.addEventListener("cass:lock", cancel);
+    signal?.addEventListener("abort", cancel, { once: true });
+    if (!active()) return false;
+
     const clipboard = globalThis.navigator?.clipboard;
     if (clipboard?.writeText) {
-        try {
-            await clipboard.writeText(text);
-            return true;
-        } catch (error) {
-            console.error('[Share] Failed to copy text via Clipboard API:', error);
-        }
+      try {
+        // Stop retaining the request/listeners when cancelled, even if a
+        // browser permission prompt never settles. The issued write itself
+        // is not cancelled. Promise.race also observes any later rejection.
+        const written = Promise.resolve(clipboard.writeText(text)).then(() => true);
+        if (!await Promise.race([written, cancellation])) return false;
+        return active();
+      } catch (error) {
+        // A permission prompt may outlive navigation, abort or archive lock.
+        // Never create a new plaintext textarea or retry copy after that.
+        if (!active()) return false;
+        console.error("[Share] Failed to copy text via Clipboard API:", error);
+      }
     }
 
-    let textArea = null;
-    try {
-        if (!document.body || typeof document.execCommand !== 'function') {
-            return false;
-        }
-
-        textArea = document.createElement('textarea');
-        textArea.value = text;
-        textArea.setAttribute('readonly', '');
-        textArea.style.position = 'fixed';
-        textArea.style.left = '-9999px';
-        textArea.style.top = '-9999px';
-        textArea.style.opacity = '0';
-        document.body.appendChild(textArea);
-        textArea.focus();
-        textArea.select();
-
-        return document.execCommand('copy');
-    } catch (fallbackError) {
-        console.error('[Share] Fallback copy failed:', fallbackError);
-        return false;
-    } finally {
-        if (textArea?.parentNode) {
-            textArea.parentNode.removeChild(textArea);
-        }
+    if (!active() || !document.body || typeof document.execCommand !== "function") {
+      return false;
     }
+    textArea = document.createElement("textarea");
+    textArea.value = text;
+    textArea.setAttribute("readonly", "");
+    textArea.style.position = "fixed";
+    textArea.style.left = "-9999px";
+    textArea.style.top = "-9999px";
+    textArea.style.opacity = "0";
+    document.body.appendChild(textArea);
+    textArea.focus();
+    // Focus/selection handlers may synchronously invalidate the request.
+    if (!active()) return false;
+    textArea.select();
+    if (!active()) return false;
+    return Boolean(document.execCommand("copy")) && active();
+  } catch (error) {
+    console.error("[Share] Clipboard copy failed:", error);
+    return false;
+  } finally {
+    lockEvents?.removeEventListener("cass:lock", cancel);
+    signal?.removeEventListener("abort", cancel);
+    clearTemporaryText();
+    // Drop this helper's reference; JS strings cannot be reliably zeroized.
+    text = "";
+  }
 }
 
 /**
@@ -125,7 +163,7 @@ export async function copyTextToClipboard(text) {
  * @returns {Promise<boolean>} True if successful
  */
 export async function copyLinkToClipboard(link) {
-    return copyTextToClipboard(link);
+  return copyTextToClipboard(link);
 }
 
 /**
@@ -135,9 +173,9 @@ export async function copyLinkToClipboard(link) {
  * @returns {Promise<{success: boolean, link: string}>} Result
  */
 export async function copyConversationLink(conversationId, messageId = null) {
-    const link = getConversationLink(conversationId, messageId);
-    const success = await copyLinkToClipboard(link);
-    return { success, link };
+  const link = getConversationLink(conversationId, messageId);
+  const success = await copyLinkToClipboard(link);
+  return { success, link };
 }
 
 /**
@@ -147,9 +185,9 @@ export async function copyConversationLink(conversationId, messageId = null) {
  * @returns {Promise<{success: boolean, link: string}>} Result
  */
 export async function copySearchLink(query, filters = {}) {
-    const link = getSearchLink(query, filters);
-    const success = await copyLinkToClipboard(link);
-    return { success, link };
+  const link = getSearchLink(query, filters);
+  const success = await copyLinkToClipboard(link);
+  return { success, link };
 }
 
 /**
@@ -161,21 +199,21 @@ export async function copySearchLink(query, filters = {}) {
  * @returns {Promise<boolean>} True if shared successfully
  */
 export async function shareLink(options) {
-    if (!navigator.share) {
-        console.debug('[Share] Web Share API not available');
-        return false;
-    }
+  if (!navigator.share) {
+    console.debug("[Share] Web Share API not available");
+    return false;
+  }
 
-    try {
-        await navigator.share(options);
-        return true;
-    } catch (error) {
-        // User cancelled or share failed
-        if (error.name !== 'AbortError') {
-            console.error('[Share] Share failed:', error);
-        }
-        return false;
+  try {
+    await navigator.share(options);
+    return true;
+  } catch (error) {
+    // User cancelled or share failed
+    if (error.name !== "AbortError") {
+      console.error("[Share] Share failed:", error);
     }
+    return false;
+  }
 }
 
 /**
@@ -186,15 +224,15 @@ export async function shareLink(options) {
  * @returns {Promise<boolean>} True if shared successfully
  */
 export async function shareConversation(conversationId, title, messageId = null) {
-    const link = getConversationLink(conversationId, messageId);
+  const link = getConversationLink(conversationId, messageId);
 
-    const shareOptions = {
-        title: title || 'Conversation',
-        text: `Check out this conversation${messageId ? ' (message #' + messageId + ')' : ''}`,
-        url: link,
-    };
+  const shareOptions = {
+    title: title || "Conversation",
+    text: `Check out this conversation${messageId ? " (message #" + messageId + ")" : ""}`,
+    url: link,
+  };
 
-    return shareLink(shareOptions);
+  return shareLink(shareOptions);
 }
 
 /**
@@ -202,7 +240,7 @@ export async function shareConversation(conversationId, title, messageId = null)
  * @returns {boolean} True if available
  */
 export function isWebShareAvailable() {
-    return !!navigator.share;
+  return !!navigator.share;
 }
 
 /**
@@ -211,79 +249,79 @@ export function isWebShareAvailable() {
  * @returns {Object|null} Parsed route info or null if invalid
  */
 export function parseShareLink(link) {
-    try {
-        const url = new URL(link);
-        const hash = url.hash.slice(1); // Remove #
+  try {
+    const url = new URL(link);
+    const hash = url.hash.slice(1); // Remove #
 
-        if (!hash) {
-            return { view: 'search', params: {}, query: {} };
-        }
-
-        const [pathPart, queryPart] = splitRouteQuery(hash);
-        const parts = pathPart.split('/').filter(Boolean);
-
-        // Parse query params
-        const query = {};
-        if (queryPart) {
-            const searchParams = new URLSearchParams(queryPart);
-            for (const [key, value] of searchParams) {
-                query[key] = value;
-            }
-        }
-
-        // Home/search
-        if (parts.length === 0) {
-            return { view: 'search', params: {}, query };
-        }
-
-        if (parts[0] === 'search' && parts.length === 1) {
-            return { view: 'search', params: {}, query };
-        }
-
-        // Conversation
-        if (parts[0] === 'c') {
-            const conversationParams = parseConversationRouteParts(parts);
-            if (!conversationParams) {
-                return null;
-            }
-
-            return {
-                view: 'conversation',
-                params: conversationParams,
-                query,
-            };
-        }
-
-        // Settings
-        if (parts[0] === 'settings' && parts.length === 1) {
-            return { view: 'settings', params: {}, query };
-        }
-
-        // Stats
-        if (parts[0] === 'stats' && parts.length === 1) {
-            return { view: 'stats', params: {}, query };
-        }
-
-        return null;
-    } catch (error) {
-        console.error('[Share] Failed to parse link:', error);
-        return null;
+    if (!hash) {
+      return { view: "search", params: {}, query: {} };
     }
+
+    const [pathPart, queryPart] = splitRouteQuery(hash);
+    const parts = pathPart.split("/").filter(Boolean);
+
+    // Parse query params
+    const query = {};
+    if (queryPart) {
+      const searchParams = new URLSearchParams(queryPart);
+      for (const [key, value] of searchParams) {
+        query[key] = value;
+      }
+    }
+
+    // Home/search
+    if (parts.length === 0) {
+      return { view: "search", params: {}, query };
+    }
+
+    if (parts[0] === "search" && parts.length === 1) {
+      return { view: "search", params: {}, query };
+    }
+
+    // Conversation
+    if (parts[0] === "c") {
+      const conversationParams = parseConversationRouteParts(parts);
+      if (!conversationParams) {
+        return null;
+      }
+
+      return {
+        view: "conversation",
+        params: conversationParams,
+        query,
+      };
+    }
+
+    // Settings
+    if (parts[0] === "settings" && parts.length === 1) {
+      return { view: "settings", params: {}, query };
+    }
+
+    // Stats
+    if (parts[0] === "stats" && parts.length === 1) {
+      return { view: "stats", params: {}, query };
+    }
+
+    return null;
+  } catch (error) {
+    console.error("[Share] Failed to parse link:", error);
+    return null;
+  }
 }
 
 // Export default
 export default {
-    getConversationLink,
-    getSearchLink,
-    getSettingsLink,
-    getStatsLink,
-    getHomeLink,
-    copyTextToClipboard,
-    copyLinkToClipboard,
-    copyConversationLink,
-    copySearchLink,
-    shareLink,
-    shareConversation,
-    isWebShareAvailable,
-    parseShareLink,
+  getConversationLink,
+  getSearchLink,
+  getSettingsLink,
+  getStatsLink,
+  getHomeLink,
+  copyTextToClipboard,
+  copyLinkToClipboard,
+  copyConversationLink,
+  copySearchLink,
+  shareLink,
+  shareConversation,
+  isWebShareAvailable,
+  parseShareLink,
 };

@@ -507,23 +507,26 @@ pub fn agent_css_class(slug: &str) -> &'static str {
         "antigravity" | "agy" => "agent-antigravity",
         "aider" => "agent-aider",
         "copilot" | "copilot_cli" | "github_copilot" | "github_copilot_cli" => "agent-copilot",
-        "cody" | "sourcegraph" => "agent-cody",
+        "cody" | "sourcegraph" | "continue" | "continue_dev" => "agent-cody",
         "windsurf" => "agent-windsurf",
         "amp" => "agent-amp",
-        "grok" => "agent-grok",
+        "grok" | "grok_bot" => "agent-grok",
         "cline" | "clawdbot" | "kimi" => "agent-gemini",
-        "opencode" | "qwen" => "agent-codex",
-        "pi_agent" | "omp" | "factory" | "droid" => "agent-aider",
+        "opencode" | "qwen" | "kilo" => "agent-codex",
+        "cloudmcp" => "agent-cody",
+        "openwebui" => "agent-chatgpt",
+        "pi_agent" | "pi_durable" | "omp" | "factory" | "droid" => "agent-aider",
         "openclaw" => "agent-copilot",
         "vibe" | "mistral" => "agent-chatgpt",
         "crush" => "agent-amp",
         "hermes" => "agent-hermes",
         "goose" => "agent-goose",
-        "openhands" | "open_hands" => "agent-aider",
+        "openhands" | "open_hands" | "shelley" => "agent-aider",
         "muse" | "muse_code" => "agent-amp",
         "prime_agent" => "agent-codex",
         "kiro" => "agent-gemini",
         "devin" => "agent-cursor",
+        "codebuff" | "freebuff" | "manicode" => "agent-codex",
         _ => "agent-default",
     }
 }
@@ -546,12 +549,17 @@ pub fn agent_display_name(slug: &str) -> &'static str {
         "copilot" | "github_copilot" => "GitHub Copilot",
         "copilot_cli" | "github_copilot_cli" => "GitHub Copilot CLI",
         "cody" | "sourcegraph" => "Cody",
+        "continue" | "continue_dev" => "Continue",
         "windsurf" => "Windsurf",
         "amp" => "Amp",
         "grok" => "Grok",
         "cline" => "Cline",
         "opencode" => "OpenCode",
+        "kilo" => "Kilo",
+        "cloudmcp" => "CloudMCP",
+        "openwebui" => "Open WebUI",
         "pi_agent" => "Pi Agent",
+        "pi_durable" => "Pi Durable",
         "omp" => "Oh My Pi",
         "factory" | "droid" => "Factory",
         "openclaw" => "OpenClaw",
@@ -568,6 +576,10 @@ pub fn agent_display_name(slug: &str) -> &'static str {
         "prime_agent" => "Prime Agent",
         "kiro" => "Kiro",
         "devin" => "Devin",
+        "shelley" => "Shelley",
+        "grok_bot" => "Grok Bot",
+        // One shared Manicode store; no per-chat writer marker exists (GH #423).
+        "codebuff" | "freebuff" | "manicode" => "Codebuff / Freebuff",
         _ => "AI Assistant",
     }
 }
@@ -1606,6 +1618,11 @@ mod tests {
         assert_eq!(agent_css_class("oh_my_pipeline"), "agent-default");
         assert_eq!(agent_css_class("hermes"), "agent-hermes");
         assert_eq!(agent_css_class("goose"), "agent-goose");
+        assert_eq!(agent_css_class("shelley"), "agent-aider");
+        assert_eq!(agent_css_class("pi_durable"), "agent-aider");
+        for alias in ["grok", "grok_bot", "grok-bot"] {
+            assert_eq!(agent_css_class(alias), "agent-grok", "Grok alias {alias:?}");
+        }
         assert_eq!(agent_css_class("unknown"), "agent-default");
     }
 
@@ -1617,6 +1634,7 @@ mod tests {
         assert_eq!(agent_display_name("copilot-cli"), "GitHub Copilot CLI");
         assert_eq!(agent_display_name("opencode"), "OpenCode");
         assert_eq!(agent_display_name("pi_agent"), "Pi Agent");
+        assert_eq!(agent_display_name("pi_durable"), "Pi Durable");
         for alias in ["omp", "Oh My Pi", "oh-my-pi", "oh_my_pi", "ohmypi"] {
             assert_eq!(agent_display_name(alias), "Oh My Pi", "OMP alias {alias:?}");
         }
@@ -1629,6 +1647,9 @@ mod tests {
         assert_eq!(agent_display_name("kimi"), "Kimi");
         assert_eq!(agent_display_name("qwen"), "Qwen");
         assert_eq!(agent_display_name("unknown"), "AI Assistant");
+        assert_eq!(agent_display_name("shelley"), "Shelley");
+        assert_eq!(agent_display_name("grok_bot"), "Grok Bot");
+        assert_eq!(agent_display_name("grok-bot"), "Grok Bot");
     }
 
     #[test]

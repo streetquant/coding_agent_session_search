@@ -367,12 +367,13 @@ active.
 | `Ctrl+D` | Cycle density (Compact / Cozy / Spacious) | |
 | `Tab` / `Shift+Tab` | Cycle focus (SearchInput -> Results -> Detail) | |
 | `Alt+h/j/k/l` | Vim-style directional pane nav | |
-| `Alt+g` / `Alt+G` | Jump first / last item in focused pane | |
+| `Alt+G` / `Alt+Shift+G` | Open / clear the agent filter | Aliases of F3 / Shift+F3 |
+| `Alt+F` | Cycle result grouping (Agent / Conversation / Workspace / Flat) | Also in the command palette |
 | `Alt+1..9` | Quick-switch to pane N | |
 | `Shift+=` / `+` | Increase pane size (+2 items, max 50) | |
 | `Alt+-` | Decrease pane size (-2 items, min 4) | |
 | `PageUp` / `PageDown` | Page-level scroll in focused pane | |
-| `Ctrl+1..9` | Save current view to slot N | Persists filters + ranking + density |
+| `Ctrl+1..9` | Save current view to slot N | Persists filters + ranking + grouping |
 | `Shift+1..9` | Load view from slot N | Toast confirms |
 
 #### 1.2 Search Input (when query bar has focus)
@@ -504,6 +505,11 @@ Actions: Copy selected paths, Copy selected content, Open selected in editor, Ex
 | `Esc` | Cancel export | |
 
 #### 1.12 Consent Dialog (semantic model download)
+
+Removed (2l1b0.66). Nothing ever opened it: model acquisition became the
+explicit `cass models install` step, and Alt+S into semantic or hybrid with
+no model now says to run it (`--from-file <dir>` offline). The table records
+the original design only.
 
 | Key | Action | Notes |
 |---|---|---|

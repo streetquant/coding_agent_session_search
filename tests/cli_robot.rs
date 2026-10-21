@@ -10,6 +10,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
@@ -22,14 +23,12 @@ use util::cass_bin;
 fn base_cmd() -> Command {
     let mut cmd = Command::new(cass_bin());
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
-    // WS-A.6 (2w1sc): 52 tests in this binary read the committed fixture
-    // archive IN PLACE (`tests/fixtures/search_demo_data`). Stale-on-read
-    // auto-refresh only stays quiet for data dirs under the OS temp dir, and
-    // the fixture is under the checkout, so on a fleet worker a `search` here
-    // spawned a detached `cass index --background` INTO the fixture, which
-    // ingested that worker's real sessions; every golden test that later
-    // copied the fixture absorbed them. These tests observe a fixture; they
-    // never want a live refresh.
+    // WS-A.6 (2w1sc): tests here used to read the committed fixture archive in
+    // place, and a `search` on a fleet worker spawned a detached
+    // `cass index --background` INTO it, ingesting that worker's real
+    // sessions. They now read copies (`shared_search_demo_data`,
+    // `isolated_search_demo_data`); these tests observe an archive and never
+    // want a live refresh.
     cmd.env("CASS_AUTO_REFRESH", "0");
     cmd
 }
@@ -50,6 +49,17 @@ where
 }
 
 const SEARCH_DEMO_DATA_DIR: &str = "tests/fixtures/search_demo_data";
+
+/// Subcommands the binary parses before the main CLI and registers for help,
+/// completions, capabilities and introspect (`register_external_subcommands`
+/// in src/main.rs).
+const BINARY_DISPATCHED_COMMANDS: [&str; 5] = [
+    "serve",
+    "archive",
+    "codex-layout-migrate",
+    "lexical-quarantine",
+    "semantic-reclaim",
+];
 
 fn is_transient_lexical_build_path(path: &Path) -> bool {
     path.components().any(|component| {
@@ -194,6 +204,51 @@ fn isolated_search_demo_data_for_current_workspace() -> Result<TempDir, Box<dyn 
     Ok(tmp)
 }
 
+/// One private copy of the demo archive per test binary, shared by the tests
+/// that only observe it, with its lexical index built before any of them runs
+/// (bead uxz8y). Derived indexes are gitignored, so the committed fixture has
+/// none for the current version: pointing those tests at it made the first
+/// searches rebuild an index inside the checkout, and the tests running in
+/// parallel against the same directory failed with exit 7 `index-busy`.
+/// `get_or_init` blocks every caller until the warm-up search has finished.
+/// The copy lives for the whole process; tests that mutate an archive keep
+/// using `isolated_search_demo_data`.
+fn shared_search_demo_data() -> &'static str {
+    static SHARED: OnceLock<(TempDir, String)> = OnceLock::new();
+    &SHARED
+        .get_or_init(|| {
+            let copy = isolated_search_demo_data().expect("copy the search demo fixture");
+            let path = copy
+                .path()
+                .to_str()
+                .expect("UTF-8 temporary directory")
+                .to_owned();
+            base_cmd()
+                .args(["search", "", "--json", "--limit", "1", "--data-dir", &path])
+                .assert()
+                .success();
+            (copy, path)
+        })
+        .1
+}
+
+/// uxz8y: bead xwi3f made this binary hermetic, then later tests pointed
+/// commands at the committed fixture again. Only `SEARCH_DEMO_DATA_DIR`, the
+/// copy source, may name it.
+#[test]
+fn commands_never_target_the_committed_demo_fixture() {
+    let fixture = concat!("tests/fixtures/", "search_demo_data");
+    let named = |source: &str| source.matches(fixture).count();
+    // Negative control: both spellings a test could use are counted.
+    let direct = format!(r#"cmd.args(["--data-dir", "{fixture}", "data_dir={fixture}"]);"#);
+    assert_eq!(named(&direct), 2);
+    assert_eq!(
+        named(include_str!("cli_robot.rs")),
+        1,
+        "point observers at shared_search_demo_data() and mutators at isolated_search_demo_data()"
+    );
+}
+
 fn decoded_cursor_offset(cursor: &str) -> u64 {
     let decoded = BASE64_STANDARD
         .decode(cursor)
@@ -285,7 +340,7 @@ fn hold_active_lexical_rebuild_lock(
     };
 
     let mut rebuild_state = serde_json::json!({
-        "version": 2,
+        "version": 3,
         "schema_hash": coding_agent_search::search::tantivy::SCHEMA_HASH,
         "db": {
             "db_path": db_path.display().to_string(),
@@ -312,6 +367,10 @@ fn hold_active_lexical_rebuild_lock(
     )
     .expect("write rebuild state");
 
+    hold_lexical_rebuild_lock_only(data_dir, db_path)
+}
+
+fn hold_lexical_rebuild_lock_only(data_dir: &Path, db_path: &Path) -> fs::File {
     let lock_path = data_dir.join("index-run.lock");
     let mut lock_file = fs::OpenOptions::new()
         .create(true)
@@ -786,7 +845,8 @@ fn capabilities_are_self_describing_for_agents() {
     assert!(
         recoveries.iter().any(|recovery| recovery["wrong"]
             == "cass view source_path=session.jsonl source_id=local line_number=42 --json"
-            && recovery["canonical"] == "cass view session.jsonl --source local --line 42 --json"
+            && recovery["canonical"]
+                == "cass view session.jsonl --source local --message-index 42 --json"
             && recovery["accepted"] == true),
         "capabilities should advertise search-hit field bundle recovery"
     );
@@ -986,6 +1046,56 @@ fn leading_json_before_search_attaches_to_search() {
         .expect("stderr should contain JSON error");
     let json: Value = serde_json::from_str(last_line).expect("valid JSON error");
     assert_eq!(json["error"]["kind"], "missing-index");
+}
+
+/// A human-mode error prints its remedy, not only its message. The hint used
+/// to reach robot envelopes alone, so `cass search` on an empty data dir said
+/// search "cannot run until the first index completes" without naming
+/// `cass index --full` (GH #518 hit the same with fuel exhaustion). Robot mode
+/// keeps the remedy inside the envelope and prints no extra line.
+#[test]
+fn human_mode_error_prints_its_hint() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_str().unwrap();
+    let mut human = base_cmd();
+    human
+        .env_remove("CASS_OUTPUT_FORMAT")
+        .env_remove("TOON_DEFAULT_FORMAT")
+        .args(["search", "foo", "--data-dir", data_dir]);
+    let output = human.assert().failure().get_output().clone();
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot run until the first index completes"),
+        "{stderr}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.starts_with("Hint: Run 'cass index --full'")),
+        "the remedy must reach a human reader: {stderr}"
+    );
+
+    let mut robot = base_cmd();
+    robot.args(["search", "foo", "--robot", "--data-dir", data_dir]);
+    let output = robot.assert().failure().get_output().clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.lines().any(|line| line.starts_with("Hint: ")),
+        "robot mode keeps the hint inside its envelope: {stderr}"
+    );
+    let last_line = stderr
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .expect("stderr should contain JSON error");
+    let json: Value = serde_json::from_str(last_line).expect("valid JSON error");
+    assert!(
+        json["error"]["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("cass index --full")),
+        "{json}"
+    );
 }
 
 #[test]
@@ -1438,7 +1548,7 @@ fn assert_pack_command_returns_evidence(command: &str, extra_args: &[&str]) {
     ] {
         index.env(key, home.join(relative));
     }
-    index
+    let indexed = index
         .env_remove("PI_CONFIG_DIR")
         .env_remove("PI_PROFILE")
         .env("CASS_AUTO_REFRESH", "0")
@@ -1446,7 +1556,15 @@ fn assert_pack_command_returns_evidence(command: &str, extra_args: &[&str]) {
         .arg(&data_dir)
         .timeout(std::time::Duration::from_secs(120))
         .assert()
-        .success();
+        .success()
+        .get_output()
+        .clone();
+    let report: Value = serde_json::from_slice(&indexed.stdout).expect("index fixture JSON");
+    assert_eq!(
+        report["conversations"], 1,
+        "only the seeded session is indexed"
+    );
+    assert_eq!(report["messages"], 1, "only the seeded message is indexed");
     let mut cmd = isolated_cass_cmd(home);
     cmd.args([command, "auth", "--json", "--data-dir"]);
     cmd.arg(&data_dir);
@@ -1465,18 +1583,63 @@ fn assert_pack_command_returns_evidence(command: &str, extra_args: &[&str]) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json: Value = serde_json::from_str(stdout.trim()).expect("valid pack JSON");
 
-    assert_eq!(json["schema_version"].as_str(), Some("cass.pack.v1"));
+    assert_eq!(json["schema_version"].as_str(), Some("cass.pack.v2"));
     assert_eq!(json["query"]["text"].as_str(), Some("auth"));
     assert_eq!(json["limits"]["max_evidence"].as_u64(), Some(1));
     assert_eq!(json["limits"]["max_sessions"].as_u64(), Some(1));
     assert_eq!(json["evidence"].as_array().expect("pack evidence").len(), 1);
     assert_eq!(json["evidence"][0]["excerpt"], "auth alias evidence");
     let citation = &json["evidence"][0]["citation"];
-    assert_eq!(
-        Path::new(citation["source_path"].as_str().expect("source path")),
-        source_path
+    // Pack redacts paths under a home directory, and a Windows temp dir is
+    // under one.
+    let cited = citation["source_path"].as_str().expect("source path");
+    assert!(
+        Path::new(cited) == source_path
+            || (cited.starts_with("[REDACTED_PATH]") && cited.ends_with(filename)),
+        "the citation names the indexed source, verbatim or redacted: {cited}"
     );
     assert_eq!(citation["verified"], true);
+
+    // GH #507: pack selects evidence lexically. A default (hybrid-preferred)
+    // request reports that fallback with its cause; an explicit lexical
+    // request is not a fallback at all.
+    let warnings: Vec<&str> = json["_meta"]["warnings"]
+        .as_array()
+        .expect("pack warnings")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let realized = &json["realized"];
+    if extra_args
+        .windows(2)
+        .any(|pair| pair == ["--mode", "lexical"])
+    {
+        assert_eq!(realized["search_mode"], "lexical", "{json}");
+        assert!(realized["fallback_mode"].is_null(), "{json}");
+        assert!(realized["fallback_reason"].is_null(), "{json}");
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.starts_with("semantic_fallback")),
+            "{json}"
+        );
+    } else {
+        assert_eq!(realized["fallback_mode"], "lexical", "{json}");
+        assert_eq!(
+            realized["fallback_reason"], "pack_enrichment_unavailable",
+            "{json}"
+        );
+        assert!(warnings.contains(&"semantic_fallback_lexical"), "{json}");
+        assert!(
+            !warnings.contains(&"semantic_fallback_reason_unreported"),
+            "{json}"
+        );
+    }
+}
+
+#[test]
+fn pack_explicit_lexical_mode_is_not_reported_as_a_fallback() {
+    assert_pack_command_returns_evidence("pack", &["--mode", "lexical"]);
 }
 
 #[test]
@@ -1582,7 +1745,7 @@ fn view_line_and_context_assignments_attach_to_options() {
 }
 
 #[test]
-fn view_accepts_search_result_line_number_aliases() {
+fn view_preserves_legacy_raw_line_number_aliases() {
     for line_arg in ["--line-number", "--line_number"] {
         let mut cmd = base_cmd();
         cmd.args([
@@ -1604,44 +1767,33 @@ fn view_accepts_search_result_line_number_aliases() {
 }
 
 #[test]
-fn view_line_number_assignment_attaches_to_line_option() {
-    let mut cmd = base_cmd();
-    cmd.args(["view", "README.md", "line_number=1", "context=0", "--json"]);
-    let output = cmd.assert().success().get_output().clone();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: Value = serde_json::from_str(stdout.trim()).expect("valid view JSON");
-
-    assert_eq!(json["path"], "README.md");
-    assert_eq!(json["target_line"].as_u64(), Some(1));
-    assert_eq!(
-        json["lines"].as_array().map(Vec::len),
-        Some(1),
-        "context=0 should produce only the target line"
-    );
-}
-
-#[test]
-fn view_search_hit_assignments_attach_to_path_source_and_line() {
-    let mut cmd = base_cmd();
-    cmd.args([
-        "view",
-        "source_path=README.md",
-        "source_id=local",
-        "line_number=1",
-        "context=0",
-        "--json",
-    ]);
-    let output = cmd.assert().success().get_output().clone();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: Value = serde_json::from_str(stdout.trim()).expect("valid view JSON");
-
-    assert_eq!(json["path"], "README.md");
-    assert_eq!(json["target_line"].as_u64(), Some(1));
-    assert_eq!(
-        json["lines"].as_array().map(Vec::len),
-        Some(1),
-        "context=0 should produce only the target line"
-    );
+fn view_search_hit_assignments_require_an_archive_instead_of_reading_raw_lines() {
+    let tmp = TempDir::new().unwrap();
+    let missing = tmp.path().join("missing.db");
+    for fields in [
+        vec!["README.md", "line_number=1", "context=0"],
+        vec![
+            "source_path=README.md",
+            "source_id=local",
+            "line_number=1",
+            "context=0",
+        ],
+    ] {
+        let mut cmd = base_cmd();
+        cmd.arg("--db")
+            .arg(&missing)
+            .arg("view")
+            .args(fields)
+            .arg("--json");
+        let output = cmd.assert().failure().get_output().clone();
+        assert!(output.stdout.is_empty(), "must not emit a raw-line target");
+        let error: Value = serde_json::from_slice(&output.stderr).expect("structured error");
+        assert_eq!(error["error"]["kind"], "indexed-session-required");
+        assert!(
+            !missing.exists(),
+            "read-only lookup must not create an archive"
+        );
+    }
 }
 
 #[test]
@@ -1813,22 +1965,41 @@ fn capabilities_output_json_alias_outputs_capabilities_json() {
     assert!(json["mistake_recoveries"].as_array().is_some());
 }
 
+/// A human-mode usage error states its message, then explains on a `Hint:`
+/// line what the parser rejected (v0.10.0 printed the message alone), and no
+/// line of it is a robot error envelope.
+fn assert_human_usage_error(stderr: &str, context: &str) {
+    let lines: Vec<&str> = stderr.lines().collect();
+    let message = lines
+        .iter()
+        .position(|line| *line == "Could not parse arguments")
+        .unwrap_or_else(|| panic!("{context}: no usage message in {stderr}"));
+    assert!(
+        lines
+            .get(message + 1)
+            .is_some_and(|line| line.starts_with("Hint: Argument parsing failed")),
+        "{context}: the parser's explanation should follow the message: {stderr}"
+    );
+    assert!(
+        stderr.contains("the following required arguments were not provided"),
+        "{context}: the hint should name what is missing: {stderr}"
+    );
+    assert!(
+        lines
+            .iter()
+            .all(|line| !serde_json::from_str::<Value>(line).is_ok_and(|value| value.is_object())),
+        "{context}: {stderr}"
+    );
+}
+
 #[test]
 fn export_format_json_missing_path_is_not_robot_error_wrapped() {
     let mut cmd = base_cmd();
     cmd.args(["export", "--format", "json"]);
     let output = cmd.assert().failure().code(2).get_output().clone();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let last_line = stderr
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .expect("stderr should contain a usage error");
-
-    assert_eq!(last_line, "Could not parse arguments");
-    assert!(
-        serde_json::from_str::<Value>(last_line).is_err(),
-        "export --format json is the export format enum, not robot mode"
+    assert_human_usage_error(
+        &String::from_utf8_lossy(&output.stderr),
+        "export --format json is the export format enum, not robot mode",
     );
 }
 
@@ -1837,17 +2008,9 @@ fn export_output_json_missing_path_is_not_robot_error_wrapped() {
     let mut cmd = base_cmd();
     cmd.args(["export", "--output", "json"]);
     let output = cmd.assert().failure().code(2).get_output().clone();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let last_line = stderr
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .expect("stderr should contain a usage error");
-
-    assert_eq!(last_line, "Could not parse arguments");
-    assert!(
-        serde_json::from_str::<Value>(last_line).is_err(),
-        "export --output json is an output file path, not robot mode"
+    assert_human_usage_error(
+        &String::from_utf8_lossy(&output.stderr),
+        "export --output json is an output file path, not robot mode",
     );
 }
 
@@ -2395,7 +2558,7 @@ fn search_cursor_and_token_budget() {
 
 #[test]
 fn search_cursor_jsonl_and_compact() {
-    let data_dir = "tests/fixtures/search_demo_data";
+    let data_dir = shared_search_demo_data();
     // JSONL meta line contains next_cursor
     let mut cmd = base_cmd();
     cmd.args([
@@ -2486,7 +2649,7 @@ fn search_cursor_jsonl_and_compact() {
 #[test]
 fn search_robot_format_sessions_matches_source_paths() {
     // rob.ctx.sessions: sessions output should match the unique sorted source_path set from JSON hits.
-    let data_dir = "tests/fixtures/search_demo_data";
+    let data_dir = shared_search_demo_data();
 
     // 1) Get source_path values via compact JSON.
     let mut compact = base_cmd();
@@ -2816,7 +2979,7 @@ fn search_returns_json_results() {
         "",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -2855,7 +3018,7 @@ fn search_respects_limit() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -2879,7 +3042,7 @@ fn search_empty_query_returns_all() {
         "",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -2903,7 +3066,7 @@ fn assert_search_limit_alias_limits_to_one(alias_args: &[&str]) {
     let mut cmd = base_cmd();
     let mut args = vec!["search", "", "--json"];
     args.extend(alias_args.iter().copied());
-    args.extend(["--data-dir", "tests/fixtures/search_demo_data"]);
+    args.extend(["--data-dir", shared_search_demo_data()]);
     cmd.args(args);
 
     let output = cmd.assert().success().get_output().clone();
@@ -2957,7 +3120,7 @@ fn search_filter_assignments_attach_to_options() {
         "agent=aider",
         "fields=minimal",
         "mode=lexical",
-        "data_dir=tests/fixtures/search_demo_data",
+        format!("data_dir={}", shared_search_demo_data()).as_str(),
     ]);
 
     let output = cmd.assert().success().get_output().clone();
@@ -2990,7 +3153,7 @@ fn search_time_window_assignments_attach_to_options() {
         "--dry-run",
         "last=7d",
         "before=now",
-        "data_dir=tests/fixtures/search_demo_data",
+        format!("data_dir={}", shared_search_demo_data()).as_str(),
     ]);
 
     let output = cmd.assert().success().get_output().clone();
@@ -3011,7 +3174,7 @@ fn search_since_now_assignment_filters_to_zero_hits() {
         "--json",
         "since=now",
         "limit=1",
-        "data_dir=tests/fixtures/search_demo_data",
+        format!("data_dir={}", shared_search_demo_data()).as_str(),
     ]);
 
     let output = cmd.assert().success().get_output().clone();
@@ -3034,7 +3197,7 @@ fn search_time_window_alias_flags_filter_to_zero_hits() {
         "7",
         "--before=now",
         "limit=1",
-        "data_dir=tests/fixtures/search_demo_data",
+        format!("data_dir={}", shared_search_demo_data()).as_str(),
     ]);
 
     let output = cmd.assert().success().get_output().clone();
@@ -3060,7 +3223,7 @@ fn search_no_match_returns_empty_hits() {
         "xyznonexistentquery12345",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -3094,7 +3257,7 @@ fn search_writes_trace_on_success() {
         "hello",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     cmd.assert().success();
@@ -3287,7 +3450,7 @@ fn search_json_includes_match_type() {
         "hello",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -3314,7 +3477,7 @@ fn search_robot_format_is_valid_json_lines() {
         "hello",
         "--robot",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -3342,7 +3505,7 @@ fn search_robot_meta_includes_fallback_and_cache_stats() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -3508,7 +3671,39 @@ fn search_robot_meta_includes_fallback_and_cache_stats() {
 fn search_cursor_manifest_marks_rebuilding_generation_best_effort() -> Result<(), Box<dyn Error>> {
     let data_dir = isolated_search_demo_data()?;
     let db_path = data_dir.path().join("agent_search.db");
-    let _lock = hold_active_lexical_rebuild_lock(data_dir.path(), &db_path, true, None);
+    util::prepare_copied_search_fixture(data_dir.path())?;
+    let index_path = coding_agent_search::search::tantivy::expected_index_dir(data_dir.path());
+    assert!(index_path.join("MANIFEST").is_file());
+    let checkpoint_path = index_path.join(".lexical-rebuild-state.json");
+    let checkpoint_bytes = fs::read(&checkpoint_path)?;
+    let checkpoint: Value = serde_json::from_slice(&checkpoint_bytes)?;
+    assert_eq!(
+        checkpoint["completed"], true,
+        "real fixture repair must finish"
+    );
+
+    let mut baseline = base_cmd();
+    baseline.args([
+        "search",
+        "hello",
+        "--json",
+        "--mode",
+        "lexical",
+        "--no-maintenance",
+        "--limit",
+        "1",
+        "--data-dir",
+        data_dir.path().to_str().expect("utf8 fixture path"),
+    ]);
+    let baseline_output = baseline.assert().success().get_output().clone();
+    let baseline_json: Value = serde_json::from_slice(&baseline_output.stdout)?;
+    assert!(
+        !baseline_json["hits"]
+            .as_array()
+            .expect("baseline hits")
+            .is_empty()
+    );
+    let _lock = hold_lexical_rebuild_lock_only(data_dir.path(), &db_path);
 
     let mut cmd = base_cmd();
     cmd.args([
@@ -3525,6 +3720,8 @@ fn search_cursor_manifest_marks_rebuilding_generation_best_effort() -> Result<()
     let assert = cmd.assert().success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
     let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert!(!json["hits"].as_array().expect("search hits").is_empty());
+    assert_eq!(fs::read(&checkpoint_path)?, checkpoint_bytes);
     let manifest = json["_meta"]
         .get("cursor_manifest")
         .and_then(Value::as_object)
@@ -3580,7 +3777,7 @@ fn search_robot_meta_reports_explicit_hybrid_fail_open() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -3631,7 +3828,7 @@ fn search_robot_meta_reports_explicit_lexical_override() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -3863,9 +4060,13 @@ fn introspect_commands_match_clap_subcommands() {
             .filter_map(|c| c["name"].as_str().map(|s| s.to_string()))
             .collect();
 
+        // The binary also registers the subcommands it dispatches before the
+        // main CLI parses (src/main.rs).
+        let mut expected = clap_commands;
+        expected.extend(BINARY_DISPATCHED_COMMANDS.map(String::from));
         assert_eq!(
-            clap_commands, introspect_commands,
-            "introspect should list exactly the Clap subcommands"
+            expected, introspect_commands,
+            "introspect should list exactly the Clap subcommands plus the binary-dispatched ones"
         );
 
         // Ensure no help/version pseudo-args leak into schemas
@@ -3878,6 +4079,82 @@ fn introspect_commands_match_clap_subcommands() {
                 "help/version flags should be hidden in introspect"
             );
         }
+    });
+}
+
+/// coding_agent_session_search-8fr1g: the binary parses `serve` and `archive`
+/// before the main CLI, so help, capabilities, introspect and robot-docs never
+/// listed them. They now come from their real parsers, with real arguments.
+#[test]
+fn binary_dispatched_serve_and_archive_are_discoverable() {
+    run_on_large_stack(|| {
+        let introspect = fetch_introspect_json();
+        let serve = find_command(&introspect, "serve");
+        for arg in ["index", "data-dir", "stdio"] {
+            find_arg(serve, arg);
+        }
+        let archive = find_command(&introspect, "archive");
+        // --db, --data-dir and --json are globals on the archive parser's root.
+        for arg in ["db", "data-dir", "json"] {
+            find_arg(archive, arg);
+        }
+        assert_eq!(archive["has_json_output"], true, "{archive}");
+        // Their own parsers reject the main CLI's global --robot-format, so
+        // the schemas must not offer it.
+        for command in [serve, archive] {
+            assert!(
+                command["arguments"]
+                    .as_array()
+                    .expect("arguments")
+                    .iter()
+                    .all(|arg| arg["name"] != "robot-format"),
+                "{command}"
+            );
+        }
+
+        let stdout = |args: &[&str]| -> String {
+            let mut cmd = base_cmd();
+            cmd.args(args);
+            String::from_utf8_lossy(&cmd.assert().success().get_output().stdout).into_owned()
+        };
+        let capabilities: Value =
+            serde_json::from_str(stdout(&["capabilities", "--json"]).trim()).expect("JSON");
+        let names: HashSet<&str> = capabilities["commands"]
+            .as_array()
+            .expect("commands array")
+            .iter()
+            .filter_map(|c| c["name"].as_str())
+            .collect();
+        assert!(
+            names.contains("serve") && names.contains("archive"),
+            "{names:?}"
+        );
+
+        let help = stdout(&["--help"]);
+        for name in ["serve", "archive"] {
+            assert!(
+                help.lines()
+                    .any(|line| line.trim_start().starts_with(&format!("{name} "))),
+                "--help must list {name}:\n{help}"
+            );
+        }
+        // `cass help <name>` reaches the main CLI, which alone does not know them.
+        for name in ["serve", "archive"] {
+            let help = stdout(&["help", name]);
+            assert!(help.contains(&format!("cass {name}")), "{help}");
+        }
+        // clap_complete's bash script routes each subcommand with a
+        // `<parent>,<name>)` case label.
+        let completions = stdout(&["completions", "bash"]);
+        assert!(
+            completions.contains("cass,serve)") && completions.contains("cass,archive)"),
+            "bash completions must offer serve and archive"
+        );
+        let docs = stdout(&["robot-docs", "commands"]);
+        assert!(
+            docs.contains("cass serve --stdio") && docs.contains("cass archive export"),
+            "{docs}"
+        );
     });
 }
 
@@ -3956,12 +4233,7 @@ fn introspect_sessions_command_exposes_workspace_current_and_limit() {
 #[test]
 fn diag_json_reports_paths_and_connectors() {
     let mut cmd = base_cmd();
-    cmd.args([
-        "diag",
-        "--json",
-        "--data-dir",
-        "tests/fixtures/search_demo_data",
-    ]);
+    cmd.args(["diag", "--json", "--data-dir", shared_search_demo_data()]);
 
     let output = cmd.assert().success().get_output().clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -4014,7 +4286,7 @@ fn status_json_reports_staleness_flags() {
         "status",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
         "--stale-threshold",
         "1",
     ]);
@@ -4080,7 +4352,7 @@ fn search_agent_filter_limits_hits() {
         "--agent",
         "aider",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let output = cmd.assert().success().get_output().clone();
@@ -4107,7 +4379,7 @@ fn search_provider_alias_filters_like_agent() {
         let mut cmd = base_cmd();
         cmd.args(["search", "", "--json", "--limit", "10"]);
         cmd.args(alias_args);
-        cmd.args(["--data-dir", "tests/fixtures/search_demo_data"]);
+        cmd.args(["--data-dir", shared_search_demo_data()]);
 
         let output = cmd.assert().success().get_output().clone();
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -4137,7 +4409,7 @@ fn search_offset_skips_results() {
         "--limit",
         "3",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     let full_bytes = cmd_full.assert().success().get_output().stdout.to_vec();
     let full_stdout = String::from_utf8_lossy(&full_bytes);
@@ -4158,7 +4430,7 @@ fn search_offset_skips_results() {
         "--offset",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     let offset_bytes = cmd_offset.assert().success().get_output().stdout.to_vec();
     let offset_stdout = String::from_utf8_lossy(&offset_bytes);
@@ -4189,7 +4461,7 @@ fn robot_mode_auto_quiet_suppresses_info_logs() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     let assert = cmd.assert().success();
     let output = assert.get_output();
@@ -4217,7 +4489,7 @@ fn non_robot_mode_shows_info_logs() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     let assert = cmd.assert().success();
     let output = assert.get_output();
@@ -4247,7 +4519,7 @@ fn fields_filters_to_requested_only() {
         "--fields",
         "source_path,line_number",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -4283,7 +4555,7 @@ fn fields_minimal_preset_expands() {
         "--fields",
         "minimal",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -4318,7 +4590,7 @@ fn fields_summary_preset_expands() {
         "--fields",
         "summary",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -4357,7 +4629,7 @@ fn fields_works_with_jsonl_format() {
         "--fields",
         "source_path,score",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -4397,7 +4669,7 @@ fn max_content_length_truncates_long_content() {
         "--max-content-length",
         "5",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -4441,7 +4713,7 @@ fn max_content_length_adds_truncated_indicator() {
         "--max-content-length",
         "3",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -4482,7 +4754,7 @@ fn max_content_length_preserves_short_content() {
         "--max-content-length",
         "1000",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -4524,7 +4796,7 @@ fn max_content_length_works_with_fields() {
         "--fields",
         "content,snippet",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -5161,7 +5433,7 @@ fn aggregate_single_field_returns_buckets() {
         "--aggregate",
         "agent",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -5210,7 +5482,7 @@ fn aggregate_multiple_fields_returns_all() {
         "--aggregate",
         "agent,workspace",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -5237,7 +5509,7 @@ fn aggregate_includes_total_matches() {
         "--aggregate",
         "agent",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -5270,7 +5542,7 @@ fn aggregate_with_limit_returns_both_hits_and_aggs() {
         "--limit",
         "2",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -5303,7 +5575,7 @@ fn aggregate_match_type_returns_exact_wildcard_buckets() {
         "--aggregate",
         "match_type",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -5346,7 +5618,7 @@ fn aggregate_empty_query_returns_aggs() {
         "--aggregate",
         "agent",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -5375,7 +5647,7 @@ fn aggregate_preserves_offset_when_not_aggregating() {
         "--offset",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let output = cmd_no_agg.assert().success().get_output().clone();
@@ -5620,7 +5892,7 @@ fn search_json_includes_suggestions_for_typos() {
         "gemenii",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -5674,7 +5946,7 @@ fn subcommand_alias_find_to_search() {
         "test query",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     // 'find' should be normalized to 'search'
     // May succeed or fail based on search results, but should not fail on parsing
@@ -5720,6 +5992,500 @@ fn robot_mode_auto_correction_emits_teaching_note_on_stderr() -> Result<(), Box<
     Ok(())
 }
 
+fn search_effective_meta(cmd: &mut Command) -> Result<(Value, String), Box<dyn Error>> {
+    let output = cmd.env("TZ", "UTC").output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "search should succeed; stderr: {stderr}"
+    );
+    let json: Value = serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim())?;
+    let effective = json["_meta"]["effective"].clone();
+    assert!(
+        effective.is_object(),
+        "--robot-meta must carry _meta.effective; _meta keys: {:?}",
+        json["_meta"]
+            .as_object()
+            .map(|m| m.keys().collect::<Vec<_>>())
+    );
+    Ok((effective, stderr))
+}
+
+/// 2l1b0.68: a robot search is budgeted and never spawns the warm-model
+/// daemon, so `--daemon` was accepted and silently ignored. `_meta.effective`
+/// now reports the request next to what applied. Negative control: before
+/// this change `_meta.effective.daemon` did not exist.
+#[test]
+fn search_robot_meta_reports_the_daemon_policy() -> Result<(), Box<dyn Error>> {
+    let data_dir = shared_search_demo_data();
+    let daemon_policy = |flag: Option<&str>| -> Result<Value, Box<dyn Error>> {
+        let mut args = vec![
+            "search",
+            "hello",
+            "--json",
+            "--robot-meta",
+            "--limit",
+            "1",
+            "--data-dir",
+            data_dir,
+        ];
+        args.extend(flag);
+        let (effective, _) = search_effective_meta(base_cmd().args(args))?;
+        Ok(effective["daemon"].clone())
+    };
+    assert_eq!(
+        daemon_policy(Some("--daemon"))?,
+        serde_json::json!({"use_existing": true, "auto_spawn_requested": true, "auto_spawn": false}),
+        "--daemon is echoed as requested, and a robot search does not spawn"
+    );
+    assert_eq!(
+        daemon_policy(None)?,
+        serde_json::json!({"use_existing": true, "auto_spawn_requested": false, "auto_spawn": false})
+    );
+    assert_eq!(
+        daemon_policy(Some("--no-daemon"))?,
+        serde_json::json!({"use_existing": false, "auto_spawn_requested": false, "auto_spawn": false})
+    );
+    Ok(())
+}
+
+/// 2l1b0.68: `_meta.effective` echoes how the lexical engine groups the
+/// query and the parentheses it recovered. The expected groupings are written
+/// by hand from the documented precedence (NOT > AND > OR). Negative control:
+/// before this change neither field existed, and the legacy grammar read
+/// `hello OR world tool` as `(hello OR world) AND tool`.
+#[test]
+fn search_robot_meta_echoes_the_query_grouping() -> Result<(), Box<dyn Error>> {
+    let data_dir = shared_search_demo_data();
+    let reading = |query: &str| -> Result<(Value, Value), Box<dyn Error>> {
+        let (effective, _) = search_effective_meta(base_cmd().args([
+            "search",
+            query,
+            "--json",
+            "--robot-meta",
+            "--limit",
+            "1",
+            "--data-dir",
+            data_dir,
+        ]))?;
+        Ok((
+            effective["query_structure"].clone(),
+            effective["query_recoveries"].clone(),
+        ))
+    };
+    assert_eq!(
+        reading("hello OR world tool")?,
+        (
+            serde_json::json!("hello OR (world AND tool)"),
+            serde_json::json!([])
+        )
+    );
+    assert_eq!(
+        reading("hello AND (world OR tool")?,
+        (
+            serde_json::json!("hello AND (world OR tool)"),
+            serde_json::json!(["1 unclosed '(' closed at the end of the query"])
+        )
+    );
+    assert_eq!(
+        reading("hello")?,
+        (serde_json::json!("hello"), serde_json::json!([]))
+    );
+    Ok(())
+}
+
+/// Midnight of a date in epoch milliseconds as a cass child run with TZ=UTC
+/// reads a bare `--since` date, computed with chrono rather than cass. cass
+/// takes local midnight in its own time zone: Unix honors TZ, so that is UTC
+/// midnight; Windows ignores TZ, so it is the host's (if17v: wlap runs at
+/// UTC+8).
+fn tz_utc_child_midnight_ms(year: i32, month: u32, day: u32) -> Result<i64, Box<dyn Error>> {
+    let midnight = chrono::NaiveDate::from_ymd_opt(year, month, day)
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .ok_or("valid date")?;
+    #[cfg(unix)]
+    let millis = midnight.and_utc().timestamp_millis();
+    #[cfg(not(unix))]
+    let millis = midnight
+        .and_local_timezone(chrono::Local)
+        .single()
+        .ok_or("unambiguous local midnight")?
+        .timestamp_millis();
+    Ok(millis)
+}
+
+/// 2l1b0.68: `_meta.effective` echoes what search actually ran. Every
+/// expected value here comes from outside cass: the fixture path, local
+/// midnight computed with chrono, and the flags as typed. Negative control: before
+/// 2l1b0.68 `_meta.effective` did not exist, so the first assertion fails.
+#[test]
+fn search_robot_meta_echoes_the_effective_interpretation() -> Result<(), Box<dyn Error>> {
+    let data_dir = shared_search_demo_data();
+    let (effective, _) = search_effective_meta(base_cmd().args([
+        "search",
+        "hello",
+        "--json",
+        "--robot-meta",
+        "--limit",
+        "1",
+        "--agent",
+        "codex",
+        "--agent",
+        "claude_code",
+        "--since",
+        "2026-01-01",
+        "--source",
+        "local",
+        "--data-dir",
+        data_dir,
+    ]))?;
+    assert_eq!(effective["command"], "search");
+    assert_eq!(effective["query"], "hello");
+    assert_eq!(
+        effective["db_path"].as_str(),
+        Some(
+            Path::new(data_dir)
+                .join("agent_search.db")
+                .to_str()
+                .ok_or("non-utf8 path")?
+        )
+    );
+    assert_eq!(effective["db_path_source"], "--data-dir");
+    // A bare date is local midnight in cass's time zone. This child runs
+    // with TZ=UTC: 2026-01-01T00:00:00Z on Unix, eight hours earlier on a
+    // UTC+8 Windows host, which ignores TZ.
+    assert_eq!(
+        effective["time_window"]["since_ms"],
+        tz_utc_child_midnight_ms(2026, 1, 1)?
+    );
+    assert_eq!(effective["time_window"]["since_from"], "--since 2026-01-01");
+    assert!(effective["time_window"]["until_ms"].is_null());
+    assert!(effective["time_window"]["until_from"].is_null());
+    assert_eq!(
+        effective["filters"]["agents"],
+        serde_json::json!(["claude_code", "codex"])
+    );
+    assert_eq!(effective["filters"]["workspaces"], serde_json::json!([]));
+    assert_eq!(effective["filters"]["source"], "local");
+    assert!(effective["filters"]["sessions_from_paths"].is_null());
+    assert_eq!(effective["auto_corrections"], serde_json::json!([]));
+    Ok(())
+}
+
+/// 2l1b0.68: `pack` runs a search and echoes what that search ran in
+/// `_meta.effective`, as `search --robot-meta` does, without the search-only
+/// daemon policy. Negative control: before this change pack's `_meta` had no
+/// `effective`, and its own `query.filters` is always empty.
+#[test]
+fn pack_echoes_the_effective_interpretation() -> Result<(), Box<dyn Error>> {
+    let data_dir = shared_search_demo_data();
+    let output = base_cmd()
+        .args([
+            "pack",
+            "hello OR world tool",
+            "--json",
+            "--agent",
+            "codex",
+            "--agent",
+            "claude_code",
+            "--since",
+            "2026-01-01",
+            "--source",
+            "local",
+            "--data-dir",
+            data_dir,
+        ])
+        .env("TZ", "UTC")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "pack failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim())?;
+    let effective = &json["_meta"]["effective"];
+    assert_eq!(effective["command"], "pack", "{effective}");
+    assert_eq!(effective["query"], "hello OR world tool");
+    assert_eq!(effective["query_structure"], "hello OR (world AND tool)");
+    assert_eq!(effective["query_recoveries"], serde_json::json!([]));
+    // Pack redacts private paths in `_meta.effective` like the rest of its
+    // envelope, so a temp dir under a home directory is echoed redacted.
+    let db_path = Path::new(data_dir).join("agent_search.db");
+    let db_path = db_path.to_str().ok_or("non-utf8 path")?;
+    let echoed = effective["db_path"].as_str().ok_or("db_path missing")?;
+    assert!(
+        echoed == db_path
+            || (echoed.contains("[REDACTED_PATH]") && echoed.ends_with("agent_search.db")),
+        "db_path is the data dir's database, verbatim or redacted: {effective}"
+    );
+    assert_eq!(effective["db_path_source"], "--data-dir");
+    // A bare date is local midnight in cass's time zone. This child runs
+    // with TZ=UTC: 2026-01-01T00:00:00Z on Unix, eight hours earlier on a
+    // UTC+8 Windows host, which ignores TZ.
+    assert_eq!(
+        effective["time_window"]["since_ms"],
+        tz_utc_child_midnight_ms(2026, 1, 1)?
+    );
+    assert_eq!(effective["time_window"]["since_from"], "--since 2026-01-01");
+    assert_eq!(
+        effective["filters"]["agents"],
+        serde_json::json!(["claude_code", "codex"])
+    );
+    assert_eq!(effective["filters"]["source"], "local");
+    assert!(
+        effective.get("daemon").is_none(),
+        "pack has no daemon policy to echo: {effective}"
+    );
+    Ok(())
+}
+
+/// 2l1b0.68: the database path's source distinguishes `--db`,
+/// `CASS_DB_PATH` and the data dir, and a preset window names its flag on
+/// both bounds it sets.
+#[test]
+fn search_effective_meta_names_the_db_source_and_window_preset() -> Result<(), Box<dyn Error>> {
+    let data_dir = shared_search_demo_data();
+    let db = Path::new(data_dir).join("agent_search.db");
+    let db = db.to_str().ok_or("non-utf8 path")?;
+
+    let (by_flag, _) = search_effective_meta(base_cmd().args([
+        "search",
+        "hello",
+        "--json",
+        "--robot-meta",
+        "--db",
+        db,
+        "--yesterday",
+    ]))?;
+    assert_eq!(by_flag["db_path"], db);
+    assert_eq!(by_flag["db_path_source"], "--db");
+    assert_eq!(by_flag["time_window"]["since_from"], "--yesterday");
+    assert_eq!(by_flag["time_window"]["until_from"], "--yesterday");
+    let since = by_flag["time_window"]["since_ms"]
+        .as_i64()
+        .ok_or("--yesterday sets since")?;
+    let until = by_flag["time_window"]["until_ms"]
+        .as_i64()
+        .ok_or("--yesterday sets until")?;
+    assert_eq!(until - since, 86_400_000, "--yesterday spans one UTC day");
+
+    let (by_env, _) = search_effective_meta(
+        base_cmd()
+            .args(["search", "hello", "--json", "--robot-meta", "--days", "3"])
+            .env("CASS_DB_PATH", db),
+    )?;
+    assert_eq!(by_env["db_path"], db);
+    assert_eq!(by_env["db_path_source"], "env:CASS_DB_PATH");
+    assert_eq!(by_env["time_window"]["since_from"], "--days 3");
+    assert!(by_env["time_window"]["until_from"].is_null());
+    Ok(())
+}
+
+/// 2l1b0.68: robot snippets carry the engine's `**` marks on matched terms
+/// with or without `--highlight`; the flag marks remaining literal
+/// occurrences and never marks a term twice. Negative control: applying the
+/// flag to robot output first printed `****hello****`.
+#[test]
+fn search_robot_highlight_marks_json_snippets() -> Result<(), Box<dyn Error>> {
+    let data_dir = shared_search_demo_data();
+    let snippets = |highlight: bool| -> Result<Vec<String>, Box<dyn Error>> {
+        let mut cmd = base_cmd();
+        cmd.args(["search", "hello", "--json", "--limit", "20"]);
+        if highlight {
+            cmd.arg("--highlight");
+        }
+        cmd.args(["--data-dir", data_dir]);
+        let output = cmd.output()?;
+        assert!(output.status.success(), "{output:?}");
+        let json: Value = serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim())?;
+        Ok(json["hits"]
+            .as_array()
+            .ok_or("hits array")?
+            .iter()
+            .filter_map(|hit| hit["snippet"].as_str().map(str::to_string))
+            .collect())
+    };
+    let plain = snippets(false)?;
+    let marked = snippets(true)?;
+    assert_eq!(plain.len(), marked.len(), "same hits either way");
+    let (plain_hit, marked_hit) = plain
+        .iter()
+        .zip(&marked)
+        .find(|(plain, _)| plain.to_lowercase().contains("hello"))
+        .ok_or("the demo fixture has a snippet containing the term")?;
+    assert!(
+        plain_hit.to_lowercase().contains("**hello**"),
+        "the engine marks matched terms without --highlight: {plain_hit}"
+    );
+    assert!(
+        marked_hit.to_lowercase().contains("**hello**") && !marked_hit.contains("****"),
+        "--highlight keeps one pair of marks per term: {marked_hit}"
+    );
+    assert_eq!(
+        marked_hit.replace("**", ""),
+        plain_hit.replace("**", ""),
+        "markers only"
+    );
+    Ok(())
+}
+
+/// 2l1b0.68: an auto-corrected invocation lists each correction in
+/// `_meta.effective.auto_corrections`, worded exactly as the stderr note.
+#[test]
+fn search_effective_meta_lists_the_stderr_auto_corrections() -> Result<(), Box<dyn Error>> {
+    let (effective, stderr) = search_effective_meta(base_cmd().args([
+        "find",
+        "hello",
+        "--json",
+        "--robot-meta",
+        "--data-dir",
+        shared_search_demo_data(),
+    ]))?;
+    let noted: Vec<&str> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("note: auto-corrected: "))
+        .collect();
+    assert!(
+        !noted.is_empty(),
+        "`find` is corrected to `search`: {stderr}"
+    );
+    assert_eq!(effective["auto_corrections"], serde_json::json!(noted));
+    Ok(())
+}
+
+/// 2l1b0.51: a flag typo on an exact subcommand must never run a different
+/// subcommand. Before the fix `cass status --jsn` ran `stats` instead (on an
+/// empty data dir: exit 3, "Database not found") and reported it only as a
+/// stderr note. Negative control: the `stats` payload keys never appear.
+#[test]
+fn flag_typo_on_exact_subcommand_runs_that_subcommand() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let data_dir = tmp.path().join("data");
+    let output = base_cmd()
+        .args(["status", "--jsn"])
+        .env("CASS_DATA_DIR", &data_dir)
+        .env("HOME", tmp.path())
+        .output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("to 'stats'"),
+        "status must not be rerouted to stats; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let payload: Value = serde_json::from_str(stdout.trim()).map_err(|error| {
+        format!("expected one JSON document on stdout ({error}); stdout={stdout} stderr={stderr}")
+    })?;
+    assert!(
+        payload.get("initialized").is_some() && payload.get("index").is_some(),
+        "expected the status payload, got {payload}"
+    );
+    assert!(
+        payload.get("by_agent").is_none(),
+        "the stats payload must not be returned for `status`: {payload}"
+    );
+    Ok(())
+}
+
+/// 2l1b0.57: `CASS_DB_PATH` was advertised (README, robot-docs env,
+/// capabilities) but never read, so commands silently used the default
+/// archive. It now means exactly `--db`: the archive it names is opened and
+/// derived assets follow its directory (#403).
+#[test]
+fn cass_db_path_env_selects_the_archive_like_db_flag() -> Result<(), Box<dyn Error>> {
+    let fixture = isolated_search_demo_data()?;
+    let empty = TempDir::new()?;
+    let status_with = |db_env: Option<&Path>| -> Result<Value, Box<dyn Error>> {
+        let mut cmd = base_cmd();
+        cmd.args(["status", "--json"])
+            .env("CASS_DATA_DIR", empty.path())
+            .env("HOME", empty.path())
+            .env_remove("CASS_DB_PATH");
+        if let Some(db) = db_env {
+            cmd.env("CASS_DB_PATH", db);
+        }
+        let output = cmd.output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(serde_json::from_str(stdout.trim()).map_err(|error| {
+            format!(
+                "status stdout is not JSON ({error}): {stdout}; stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })?)
+    };
+
+    // Control: without the variable, status reads the empty data dir.
+    let default_status = status_with(None)?;
+    assert_eq!(
+        default_status["initialized"], false,
+        "control must see the empty data dir: {default_status}"
+    );
+
+    let db_path = fixture.path().join("agent_search.db");
+    let env_status = status_with(Some(&db_path))?;
+    assert_eq!(
+        env_status["initialized"], true,
+        "CASS_DB_PATH must open the fixture archive: {env_status}"
+    );
+    let reported_dir = env_status["data_dir"].as_str().unwrap_or_default();
+    assert_eq!(
+        Path::new(reported_dir).canonicalize()?,
+        fixture.path().canonicalize()?,
+        "derived assets must follow the CASS_DB_PATH directory (#403): {env_status}"
+    );
+    Ok(())
+}
+
+/// 2l1b0.64: an unparseable `--since`/`--until` used to be dropped, so the
+/// search ran unfiltered with exit 0 (or, on an empty data dir, failed later
+/// with exit 3 missing-index). It is a usage error before anything opens.
+/// tsp52: timeline turned such a value (including `--since 5m`) into its
+/// 7-day default, and sessions only failed after opening the archive.
+#[test]
+fn unparseable_time_bound_is_a_usage_error() -> Result<(), Box<dyn Error>> {
+    for (args, flag) in [
+        (
+            &["search", "anything", "--since", "2026-13-01"][..],
+            "--since",
+        ),
+        (
+            &["search", "anything", "--until", "yesterdayish"],
+            "--until",
+        ),
+        (&["pack", "anything", "--since", "not-a-date"], "--since"),
+        (&["timeline", "--since", "5x"], "--since"),
+        (&["timeline", "--until", "yesterdayish"], "--until"),
+        (&["sessions", "--since", "5x"], "--since"),
+    ] {
+        let subcommand = args[0];
+        let value = args[args.len() - 1];
+        let tmp = TempDir::new()?;
+        let output = base_cmd()
+            .args(args)
+            .arg("--json")
+            .env("CASS_DATA_DIR", tmp.path().join("data"))
+            .env("HOME", tmp.path())
+            .output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{subcommand} {flag} {value}: expected exit 2; stderr: {stderr}"
+        );
+        let envelope_line = stderr
+            .lines()
+            .find(|line| line.trim_start().starts_with("{\"error\""))
+            .ok_or_else(|| format!("no error envelope on stderr: {stderr}"))?;
+        let envelope: Value = serde_json::from_str(envelope_line.trim())?;
+        assert_eq!(envelope["error"]["kind"], "usage", "{envelope}");
+        let message = envelope["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(flag),
+            "message must name {flag}: {message}"
+        );
+    }
+    Ok(())
+}
+
 /// Subcommand alias: query → search
 #[test]
 fn subcommand_alias_query_to_search() {
@@ -5729,7 +6495,7 @@ fn subcommand_alias_query_to_search() {
         "test",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     let assert = cmd.assert();
     assert.code(predicate::in_iter(vec![0, 1, 2, 3]));
@@ -6080,7 +6846,7 @@ fn implicit_robot_pack_query_uses_pack_when_pack_only_flags_present() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json: Value = serde_json::from_str(stdout.trim()).expect("valid pack JSON");
 
-    assert_eq!(json["schema_version"].as_str(), Some("cass.pack.v1"));
+    assert_eq!(json["schema_version"].as_str(), Some("cass.pack.v2"));
     assert_eq!(json["query"]["text"].as_str(), Some("auth failed"));
     assert_eq!(json["limits"]["max_evidence"].as_u64(), Some(1));
     assert_eq!(json["limits"]["max_sessions"].as_u64(), Some(1));
@@ -6244,9 +7010,14 @@ fn blocking_sessions_file_pack_returns_bounded_partial_without_fabricated_eviden
         return Err(format!("mkfifo failed with status {mkfifo:?}").into());
     }
 
+    // Nothing writes the FIFO, so a pack that waits on it never exits and the
+    // harness kills it at this timeout (a failed status below). The timeout
+    // is deliberately generous: it also covers process launch, which pack
+    // cannot control and which stalled for seconds in dyld on a macOS host
+    // (bead d32jo). Pack's own bound is checked on its budget clock instead.
     let started = std::time::Instant::now();
     let output = base_cmd()
-        .timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(30))
         .args([
             "pack",
             "hello",
@@ -6261,12 +7032,10 @@ fn blocking_sessions_file_pack_returns_bounded_partial_without_fabricated_eviden
         .args(["--data-dir"])
         .arg(data_dir.path())
         .output()?;
-    if started.elapsed() >= std::time::Duration::from_millis(1500) {
-        return Err("pack waited for the blocking sessions FIFO".into());
-    }
+    let wall = started.elapsed();
     if !output.status.success() {
         return Err(format!(
-            "FIFO-scoped pack failed: status={:?}; stderr={}",
+            "FIFO-scoped pack failed (a kill at the harness timeout means pack waited for the blocking sessions FIFO): status={:?}; wall={wall:?}; stderr={}",
             output.status,
             String::from_utf8_lossy(&output.stderr)
         )
@@ -6275,6 +7044,15 @@ fn blocking_sessions_file_pack_returns_bounded_partial_without_fabricated_eviden
 
     let payload: Value = serde_json::from_slice(&output.stdout)?;
     let budget = &payload["budget"];
+    let pack_elapsed_ms = budget["elapsed_ms"]
+        .as_u64()
+        .ok_or_else(|| format!("pack FIFO budget omitted elapsed_ms: {budget}"))?;
+    if pack_elapsed_ms >= 1_500 {
+        return Err(format!(
+            "pack waited for the blocking sessions FIFO: budget.elapsed_ms={pack_elapsed_ms} for a 120 ms budget (wall={wall:?})"
+        )
+        .into());
+    }
     let skipped = budget["skipped_sections"]
         .as_array()
         .ok_or("pack FIFO skipped_sections is not an array")?;
@@ -6533,7 +7311,7 @@ fn explicit_search_pack_only_flags_run_pack_in_robot_mode() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let json: Value = serde_json::from_str(stdout.trim()).expect("valid pack JSON");
 
-        assert_eq!(json["schema_version"].as_str(), Some("cass.pack.v1"));
+        assert_eq!(json["schema_version"].as_str(), Some("cass.pack.v2"));
         assert_eq!(json["query"]["text"].as_str(), Some("auth failed"));
         assert_eq!(json["limits"]["max_evidence"].as_u64(), Some(1));
         assert_eq!(json["limits"]["max_sessions"].as_u64(), Some(1));
@@ -6652,7 +7430,7 @@ fn search_json_includes_source_id_provenance() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -6690,7 +7468,7 @@ fn search_fields_provenance_preset_expands() {
         "--fields",
         "provenance,source_path",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -6731,7 +7509,7 @@ fn search_default_output_includes_provenance_fields() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -7005,18 +7783,20 @@ fn introspect_matches_golden_contract_structure() {
             .iter()
             .filter_map(|c| c["name"].as_str())
             .collect();
+        // Plus the subcommands the binary dispatches itself (src/main.rs).
         let clap_cmd = Cli::command();
-        let expected_cmd_names: HashSet<_> = clap_cmd
+        let mut expected_cmd_names: HashSet<_> = clap_cmd
             .get_subcommands()
             .map(|command| command.get_name().to_string())
             .collect();
+        expected_cmd_names.extend(BINARY_DISPATCHED_COMMANDS.map(String::from));
         assert_eq!(
             actual_cmd_names,
             expected_cmd_names
                 .iter()
                 .map(String::as_str)
                 .collect::<HashSet<_>>(),
-            "command names should match clap"
+            "command names should match clap plus serve and archive"
         );
     });
 }
@@ -7034,7 +7814,7 @@ fn exit_code_0_success_search() {
         "hello",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     cmd.assert().code(0);
 }
@@ -7153,7 +7933,7 @@ fn trace_includes_contract_fields_on_success() {
         "hello",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     cmd.assert().success();
@@ -7721,7 +8501,7 @@ fn introspect_index_semantic_flag() {
     );
 }
 
-/// Index command embedder should default to fastembed.
+/// Index command embedder is selected by runtime policy when omitted.
 #[test]
 fn introspect_index_embedder_default() {
     let json = fetch_introspect_json();
@@ -7732,10 +8512,7 @@ fn introspect_index_embedder_default() {
         embedder["value_type"], "string",
         "index --embedder should be string type"
     );
-    assert_eq!(
-        embedder["default"], "fastembed",
-        "index --embedder should default to fastembed"
-    );
+    assert!(embedder["default"].is_null());
 }
 
 /// Index command parsing should accept semantic + embedder flags.
@@ -7755,12 +8532,12 @@ fn parse_index_semantic_embedder_flags() {
         }) = command
         {
             assert!(*semantic, "semantic flag should be set");
-            assert_eq!(embedder.as_str(), "fastembed");
+            assert_eq!(embedder.as_deref(), Some("fastembed"));
         }
     });
 }
 
-/// Index command parsing should default embedder to fastembed.
+/// Index command parsing must distinguish an omitted embedder from an explicit alias.
 #[test]
 fn parse_index_embedder_default() {
     run_on_large_stack(|| {
@@ -7776,7 +8553,7 @@ fn parse_index_embedder_default() {
         }) = command
         {
             assert!(*semantic, "semantic flag should be set");
-            assert_eq!(embedder.as_str(), "fastembed");
+            assert!(embedder.is_none());
         }
     });
 }
@@ -8006,7 +8783,7 @@ fn robot_format_toon_is_valid_option() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     // Ensure the flag is accepted and command succeeds.
     cmd.assert().success();
@@ -8023,7 +8800,7 @@ fn cass_output_format_env_triggers_robot_mode() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     let output = cmd.assert().success().get_output().clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -8045,7 +8822,7 @@ fn toon_default_format_env_json_works() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     let output = cmd.assert().success().get_output().clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -8069,7 +8846,7 @@ fn cli_robot_format_overrides_env() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     let output = cmd.assert().success().get_output().clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -8136,7 +8913,7 @@ fn cass_output_format_takes_precedence() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     let output = cmd.assert().success().get_output().clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -8189,6 +8966,16 @@ fn isolated_cass_cmd(temp_home: &std::path::Path) -> Command {
     cmd.env("XDG_DATA_HOME", temp_home.join(".local/share"));
     cmd.env("XDG_CONFIG_HOME", temp_home.join(".config"));
     cmd.env("CODEX_HOME", temp_home.join(".codex"));
+    // These shared native stores do not derive their defaults from HOME.
+    cmd.env("CASS_CLOUDMCP_DATA_ROOT", temp_home.join("cloudmcp-empty"));
+    cmd.env(
+        "CASS_OPENWEBUI_DATA_ROOT",
+        temp_home.join("openwebui-empty"),
+    );
+    // HOME does not isolate Claude Code on Windows (its root comes from the
+    // profile known folder) or under an inherited CLAUDE_CONFIG_DIR. On wlap
+    // the pack alias tests cited the host's own sessions (if17v).
+    cmd.env("CLAUDE_CONFIG_DIR", temp_home.join(".claude"));
     cmd
 }
 
@@ -9020,4 +9807,122 @@ fn broken_stdout_pipe_terminates_via_sigpipe_not_abort() {
         Some(SIGPIPE),
         "expected quiet SIGPIPE termination on a closed stdout pipe, got {status:?}"
     );
+}
+
+/// uojcg.7.1: a search filtered to one workspace that comes back empty used to
+/// read exactly like "nothing matches". A trailing slash, a case difference or
+/// a moved checkout now carries a `zero_result_diagnosis` naming the indexed
+/// workspace; a correct filter carries none.
+#[test]
+fn workspace_filtered_empty_search_explains_the_filter() {
+    const INDEXED: &str = "/data/projects/coding_agent_session_search";
+    let data_dir = shared_search_demo_data();
+    let search = |workspace: &str| -> Value {
+        let out = base_cmd()
+            .args([
+                "search",
+                "hello",
+                "--json",
+                "--limit",
+                "3",
+                "--workspace",
+                workspace,
+                "--data-dir",
+                data_dir,
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        serde_json::from_slice(&out.stdout).expect("search JSON")
+    };
+
+    let exact = search(INDEXED);
+    assert!(
+        !exact["hits"].as_array().expect("hits array").is_empty(),
+        "the indexed workspace must match: {exact}"
+    );
+    assert!(
+        exact.get("zero_result_diagnosis").is_none(),
+        "a search with hits carries no diagnosis: {exact}"
+    );
+
+    for (filter, match_kind) in [
+        (format!("{INDEXED}/"), "path_normalized"),
+        (INDEXED.to_uppercase(), "case_insensitive"),
+        (
+            "/elsewhere/coding_agent_session_search".to_string(),
+            "basename_moved",
+        ),
+    ] {
+        let near = search(&filter);
+        assert!(
+            near["hits"].as_array().expect("hits array").is_empty(),
+            "{filter} must not match the indexed workspace: {near}"
+        );
+        let diagnosis = &near["zero_result_diagnosis"];
+        assert_eq!(
+            diagnosis["diagnosis"], "workspace_filter_likely_wrong",
+            "{filter}: {near}"
+        );
+        assert_eq!(
+            diagnosis["candidate_workspaces"][0]["workspace"], INDEXED,
+            "{filter}: {near}"
+        );
+        assert_eq!(
+            diagnosis["candidate_workspaces"][0]["match_kind"], match_kind,
+            "{filter}: {near}"
+        );
+        assert!(
+            diagnosis["suggested_rerun"]
+                .as_str()
+                .is_some_and(|rerun| rerun.contains(INDEXED)),
+            "{filter}: {near}"
+        );
+    }
+
+    let unrelated = search("/nowhere/at/all");
+    assert_eq!(
+        unrelated["zero_result_diagnosis"]["diagnosis"], "workspace_not_indexed",
+        "{unrelated}"
+    );
+}
+
+/// A page past the last match of a correctly filtered search is empty, but the
+/// search is not: it carries no `zero_result_diagnosis`, which used to claim
+/// the workspace had no match next to a nonzero `total_matches`.
+#[test]
+fn workspace_filtered_search_past_its_last_page_is_not_diagnosed() {
+    const INDEXED: &str = "/data/projects/coding_agent_session_search";
+    let data_dir = shared_search_demo_data();
+    let out = base_cmd()
+        .args([
+            "search",
+            "hello",
+            "--json",
+            "--limit",
+            "3",
+            "--offset",
+            "1000",
+            "--workspace",
+            INDEXED,
+            "--data-dir",
+            data_dir,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let page: Value = serde_json::from_slice(&out.stdout).expect("search JSON");
+    assert!(
+        page["hits"].as_array().expect("hits array").is_empty(),
+        "{page}"
+    );
+    assert!(
+        page["total_matches"]
+            .as_u64()
+            .is_some_and(|total| total > 0),
+        "{page}"
+    );
+    assert!(page.get("zero_result_diagnosis").is_none(), "{page}");
 }

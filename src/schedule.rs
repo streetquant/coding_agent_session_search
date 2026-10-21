@@ -10,15 +10,20 @@
 //!   "daily"` never had.
 //! * **nightly** (default 03:00 local): remote syncs that are due, a full
 //!   `cass index --full --background`, then bounded semantic backfill batches
-//!   (`cass models backfill --scheduled`) — first the fast (hash) tier, then
-//!   the quality (MiniLM) tier when the model is installed — until the
+//!   (`cass models backfill --scheduled --max-batches N`) in one worker per
+//!   tier — resume the pending checkpoint's owner first, otherwise start with
+//!   the fast (hash) tier, then the configured quality tier — until the
 //!   backlog drains or the scheduler gates (load, console idle) say stop.
 //!
-//! Priority is delegated to the OS: launchd `ProcessType=Background` +
-//! `Nice` + `LowPriorityIO`, systemd `Nice=19` + `IOSchedulingClass=idle` +
-//! `CPUSchedulingPolicy=idle`. Each job step is a child `cass` process, so the
-//! normal `index-run.lock` / exit-7 `index-busy` contract protects against a
-//! human running `cass index` at the same moment.
+//! Priority is delegated to the OS: launchd uses `Nice=15` without
+//! background I/O throttling, while systemd uses `Nice=19` +
+//! `IOSchedulingClass=idle` + `CPUSchedulingPolicy=idle`. Each job step is a
+//! child `cass` process, so the normal `index-run.lock` / exit-7 `index-busy`
+//! contract protects against a human running `cass index` at the same moment.
+//! Severe machine load skips a run, but an incremental run is skipped for load
+//! only until `CASS_SCHEDULE_MAX_LOAD_DEFERRAL_SECS` (default 3 h) have passed
+//! since the last completed one; a busy development machine would otherwise
+//! never refresh its index.
 //!
 //! Everything the job does is recorded under `<data_dir>/schedule/`:
 //! `state.json` (last run per job), `runs.jsonl` (append-only history), and
@@ -42,6 +47,12 @@ use tracing::{info, warn};
 
 use crate::indexer::background_refresh::background_index_args;
 use crate::indexer::responsiveness;
+
+mod discovery;
+mod execution;
+mod outcomes;
+
+pub use discovery::{SourceScheduleError, due_remote_sources};
 
 pub const DEFAULT_INTERVAL_MINS: u32 = 15;
 pub const DEFAULT_NIGHTLY_HOUR: u8 = 3;
@@ -235,14 +246,8 @@ pub fn render_launchd_plist(spec: &ScheduleSpec, job: ScheduleJob) -> String {
 {trigger}\
     <key>RunAtLoad</key>\n\
     <false/>\n\
-    <key>ProcessType</key>\n\
-    <string>Background</string>\n\
     <key>Nice</key>\n\
     <integer>15</integer>\n\
-    <key>LowPriorityIO</key>\n\
-    <true/>\n\
-    <key>LowPriorityBackgroundIO</key>\n\
-    <true/>\n\
     <key>StandardOutPath</key>\n\
     <string>{log}</string>\n\
     <key>StandardErrorPath</key>\n\
@@ -765,10 +770,11 @@ pub struct ScheduleState {
 }
 
 pub fn load_state(data_dir: &Path) -> ScheduleState {
-    std::fs::read_to_string(state_path(data_dir))
+    let state = std::fs::read_to_string(state_path(data_dir))
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    outcomes::normalize_state(state)
 }
 
 fn state_lock_path(data_dir: &Path) -> PathBuf {
@@ -831,19 +837,7 @@ fn append_run(data_dir: &Path, report: &JobReport) -> std::io::Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     let line = serde_json::to_string(report).map_err(std::io::Error::other)?;
     writeln!(file, "{line}")?;
-    file.sync_data()
-}
-
-fn persist_job_report(data_dir: &Path, report: &JobReport) -> std::io::Result<()> {
-    with_state_lock(data_dir, || {
-        let mut state = load_state(data_dir);
-        match report.job {
-            ScheduleJob::Incremental => state.last_incremental = Some(report.clone()),
-            ScheduleJob::Nightly => state.last_nightly = Some(report.clone()),
-        }
-        save_state_unlocked(data_dir, &state)?;
-        append_run(data_dir, report)
-    })
+    file.sync_all()
 }
 
 fn now_ms() -> i64 {
@@ -877,6 +871,7 @@ fn run_step(
     binary: &Path,
     data_dir: &Path,
     args: &[String],
+    environment: &[(&str, &str)],
     log: Option<&mut File>,
 ) -> StepReport {
     let started = Instant::now();
@@ -889,13 +884,16 @@ fn run_step(
     // (`sources sync`, `models status`) have no `--data-dir` flag and fall
     // back to the platform default otherwise — which would silently target
     // the wrong archive when `schedule run --data-dir` names a custom one.
-    let output = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .args(args)
+        .envs(environment.iter().copied())
         .stdin(Stdio::null())
         .env("CASS_INDEX_NO_PROGRESS_EVENTS", "1")
         .env("CASS_AUTO_REFRESH", "0")
-        .env("CASS_DATA_DIR", data_dir)
-        .output();
+        .env("CASS_DATA_DIR", data_dir);
+    crate::indexer::background_refresh::cap_malloc_arenas_for_background_child(&mut command);
+    let output = command.output();
     let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     match output {
         Ok(output) => {
@@ -953,35 +951,98 @@ fn skipped_step(name: &str, reason: impl Into<String>) -> StepReport {
     }
 }
 
-/// Remote sources whose `sync_schedule` is due right now (never `manual`).
-pub fn due_remote_sources(data_dir: &Path, now_ms: i64) -> Vec<(String, String)> {
-    use crate::sources::config::SourcesConfig;
-    use crate::sources::sync::{SourceSyncAction, SyncStatus};
+/// Longest an incremental run may be skipped for machine load, measured from
+/// the last incremental run that completed (`CASS_SCHEDULE_MAX_LOAD_DEFERRAL_SECS`,
+/// `0` = skip for load without limit).
+const DEFAULT_MAX_LOAD_DEFERRAL_SECS: u64 = 3 * 60 * 60;
 
-    let Ok(config) = SourcesConfig::load() else {
-        return Vec::new();
+/// How far back into `runs.jsonl` the gate looks for the last completed run.
+const RUN_HISTORY_TAIL_BYTES: u64 = 512 * 1024;
+
+fn max_load_deferral() -> Option<std::time::Duration> {
+    let secs = dotenvy::var("CASS_SCHEDULE_MAX_LOAD_DEFERRAL_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MAX_LOAD_DEFERRAL_SECS);
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+/// Whether a report is an incremental run whose index step ran and succeeded.
+fn completed_incremental_run(report: &JobReport) -> bool {
+    report.job == ScheduleJob::Incremental
+        && report.ok
+        && report.skipped_reason.is_none()
+        && report
+            .steps
+            .iter()
+            .any(|step| step.name == "index" && step.ok && step.skipped_reason.is_none())
+}
+
+/// When the last completed incremental run finished, from the tail of
+/// `runs.jsonl`. Unreadable or malformed lines are ignored.
+fn last_completed_incremental_ms(data_dir: &Path) -> Option<i64> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let mut file = File::open(runs_log_path(data_dir)).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(RUN_HISTORY_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    let tail = String::from_utf8_lossy(&tail);
+    // A seek into the middle of a line leaves a partial first line; it fails to
+    // parse and is skipped like any other malformed line.
+    tail.lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<JobReport>(line).ok())
+        .find(completed_incremental_run)
+        .map(|report| report.finished_ms)
+}
+
+/// Whether load may still defer an incremental run. A developer machine that
+/// runs builds all day sits above the severe-load line for hours, and skipping
+/// every firing left the index stale indefinitely while each skip recorded a
+/// successful run. The indexer already yields under pressure (`Nice`, and its
+/// governor drops to its capacity floor), so past the deferral bound the run
+/// goes ahead. With no completed run on record the index has never been
+/// refreshed by the scheduler, so there is nothing fresh to protect.
+fn load_may_defer(
+    last_completed_ms: Option<i64>,
+    now_ms: i64,
+    max_deferral: Option<std::time::Duration>,
+) -> bool {
+    let Some(max_deferral) = max_deferral else {
+        return true;
     };
-    let status = SyncStatus::load(data_dir).unwrap_or_default();
-    config
-        .remote_sources()
-        .filter_map(|source| {
-            let decision = status.decision_for_source_at(source, now_ms, false);
-            match decision.action {
-                SourceSyncAction::Sync => Some((source.name.clone(), decision.reasons.join("; "))),
-                SourceSyncAction::Skip | SourceSyncAction::Defer => None,
-            }
-        })
-        .collect()
+    let Some(last_completed_ms) = last_completed_ms else {
+        return false;
+    };
+    let max_ms = i64::try_from(max_deferral.as_millis()).unwrap_or(i64::MAX);
+    now_ms.saturating_sub(last_completed_ms) < max_ms
 }
 
 /// Decide whether a scheduled job should run now, and why not.
-pub fn job_gate(job: ScheduleJob) -> Option<String> {
+pub fn job_gate(job: ScheduleJob, data_dir: &Path) -> Option<String> {
     let pressure = responsiveness::machine_pressure_now();
     if pressure.severe {
-        return Some(format!(
-            "machine under severe load (load/core={:?}, psi={:?}); skipping this run",
-            pressure.load_per_core, pressure.psi_cpu_some_avg10
-        ));
+        let defer = match job {
+            ScheduleJob::Nightly => true,
+            ScheduleJob::Incremental => load_may_defer(
+                last_completed_incremental_ms(data_dir),
+                now_ms(),
+                max_load_deferral(),
+            ),
+        };
+        if defer {
+            return Some(format!(
+                "machine under severe load (load/core={:?}, psi={:?}); skipping this run",
+                pressure.load_per_core, pressure.psi_cpu_some_avg10
+            ));
+        }
+        info!(
+            load_per_core = ?pressure.load_per_core,
+            "severe load, but the last completed incremental run is older than the load-deferral bound; running at scheduler priority"
+        );
     }
     if matches!(job, ScheduleJob::Nightly) {
         let gate = responsiveness::user_idle_gate();
@@ -995,10 +1056,10 @@ pub fn job_gate(job: ScheduleJob) -> Option<String> {
     None
 }
 
-/// Execute one job end-to-end. Never panics; every failure is recorded in the
-/// report and the report is persisted before returning.
+/// Execute one job end-to-end. Admitted runs persist their report, treating
+/// persistence errors as failures. Admission refusals do not clobber an owner.
 pub fn run_job(job: ScheduleJob, cfg: &RunConfig) -> JobReport {
-    run_job_with_gate(job, cfg, job_gate(job))
+    run_job_with_gate(job, cfg, job_gate(job, &cfg.data_dir))
 }
 
 /// `--force`: run even when the load / console-idle gates would skip.
@@ -1011,6 +1072,12 @@ fn run_job_with_gate(
     cfg: &RunConfig,
     skipped_reason: Option<String>,
 ) -> JobReport {
+    // Hold this distinct scheduler lease through source sync, all child work,
+    // and receipt publication. The child's index lock alone is not enough.
+    let _lease = match execution::acquire(&cfg.data_dir) {
+        Ok(lease) => lease,
+        Err(error) => return error.report(job),
+    };
     let started_ms = now_ms();
     let mut steps = Vec::new();
     let pressure = serde_json::to_value(responsiveness::machine_pressure_now()).ok();
@@ -1032,7 +1099,42 @@ fn run_job_with_gate(
 
     if skipped_reason.is_none() {
         // 1. Remote syncs that are due.
-        let due = due_remote_sources(&cfg.data_dir, started_ms);
+        let discovery_started = Instant::now();
+        let due = match due_remote_sources(&cfg.data_dir, started_ms) {
+            Ok(due) => due,
+            Err(error) => {
+                steps.push(StepReport {
+                    name: "sources-discovery".to_string(),
+                    argv: Vec::new(),
+                    exit_code: None,
+                    ok: false,
+                    duration_ms: u64::try_from(discovery_started.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
+                    skipped_reason: None,
+                    result: Some(serde_json::json!({
+                        "status": "failed",
+                        "reason": error.reason_code(),
+                        "dependent_work_started": false,
+                    })),
+                    stderr_tail: Some(error.to_string()),
+                });
+                // No sync, index, or model process may start from an unknown
+                // source plan. Persist the failure, not fabricated freshness.
+                return persist_job_report(
+                    cfg,
+                    JobReport {
+                        job,
+                        started_ms,
+                        finished_ms: now_ms(),
+                        ok: false,
+                        skipped_reason: None,
+                        steps,
+                        pressure,
+                        user_idle,
+                    },
+                );
+            }
+        };
         if due.is_empty() {
             steps.push(skipped_step("sources-sync", "no remote source is due"));
         } else {
@@ -1052,15 +1154,25 @@ fn run_job_with_gate(
                     &cfg.binary,
                     &cfg.data_dir,
                     &args,
+                    &[],
                     log.as_mut(),
                 ));
             }
         }
 
-        // 2. Index. Exit 7 (`index-busy`: a human or another job holds the
-        // index lock) is an expected outcome for a scheduled run, not a
-        // failure — the next timer firing simply tries again.
+        // 2. Index. Exit 7 is an expected lock-contention deferral, but no
+        // indexing completed. Preserve the non-success outcome so repeated
+        // contention cannot masquerade as refreshed history; the next timer
+        // firing still retries normally.
         let full = matches!(job, ScheduleJob::Nightly);
+        // Retain the full source census: timestamp-only connectors can miss
+        // restored historical files. The indexer may reconcile a verified
+        // lexical generation inline instead of rebuilding the whole archive.
+        let index_environment: &[(&str, &str)] = if full {
+            &[("CASS_NIGHTLY_RECONCILIATION", "1")]
+        } else {
+            &[]
+        };
         let args: Vec<String> = background_index_args(&cfg.data_dir, &cfg.db_path, full)
             .into_iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1070,16 +1182,18 @@ fn run_job_with_gate(
             &cfg.binary,
             &cfg.data_dir,
             &args,
+            index_environment,
             log.as_mut(),
         );
         let index_busy = soften_busy_index_step(&mut index_step);
         steps.push(index_step);
+        let prerequisites_ok = steps.iter().all(|step| step.ok);
 
         // 3. Semantic backfill (nightly only). Two tiers: the fast (hash)
-        // tier needs no model files; the quality (MiniLM) tier only runs
-        // when the model is installed — requesting it without the model
-        // fails with a model-domain exit code, which must read as "tier not
-        // available", never as a failed nightly.
+        // tier needs no model files. The local quality tier requires an
+        // installed model; its missing-assets exit is an optional tier skip.
+        // Explicit external quality selection is different: endpoint failures
+        // must fail the nightly rather than masquerading as successful work.
         if full {
             if !cfg.semantic {
                 steps.push(skipped_step(
@@ -1091,56 +1205,106 @@ fn run_job_with_gate(
                     "semantic-backfill",
                     "index run was busy; leaving semantic backfill for the next night",
                 ));
+            } else if !prerequisites_ok {
+                steps.push(skipped_step(
+                    "semantic-backfill",
+                    "source sync or indexing failed; semantic backfill requires a successful run",
+                ));
             } else {
-                let (probe, model_installed) =
-                    minilm_model_probe(&cfg.binary, &cfg.data_dir, log.as_mut());
+                let (probe, model_installed, quality_policy) =
+                    quality_model_probe(&cfg.binary, &cfg.data_dir, log.as_mut());
+                let external_quality = crate::search::embedder_registry::selects_external(Some(
+                    &quality_policy.quality_tier_embedder,
+                ));
                 steps.push(probe);
-                let mut tiers = vec!["fast"];
-                if model_installed {
-                    tiers.push("quality");
-                } else {
+                if !model_installed {
                     steps.push(skipped_step(
                         "semantic-backfill:quality",
                         "MiniLM model not installed (`cass models install`); quality tier skipped",
                     ));
                 }
+                let tiers = match nightly_backfill_order(&cfg.data_dir, model_installed, || {
+                    scheduled_quality_identity(&cfg.data_dir, &quality_policy)
+                }) {
+                    Ok(tiers) => tiers,
+                    Err(reason) => {
+                        steps.push(StepReport {
+                            name: "semantic-backfill-plan".to_string(),
+                            argv: Vec::new(),
+                            exit_code: None,
+                            ok: false,
+                            duration_ms: 0,
+                            skipped_reason: None,
+                            result: Some(serde_json::json!({
+                                "status": "failed",
+                                "reason": "semantic_checkpoint_resume_required",
+                                "semantic_workers_started": false,
+                            })),
+                            stderr_tail: Some(reason),
+                        });
+                        Vec::new()
+                    }
+                };
                 let mut batches = 0u32;
-                'tiers: for tier in tiers {
-                    loop {
-                        if batches >= cfg.max_backfill_batches {
-                            steps.push(skipped_step(
-                                "semantic-backfill",
-                                format!("stopped after {batches} batches (CASS_SCHEDULE_MAX_BACKFILL_BATCHES)"),
-                            ));
-                            break 'tiers;
-                        }
-                        let args = vec![
-                            "--db".to_string(),
-                            cfg.db_path.display().to_string(),
-                            "--color=never".to_string(),
-                            "models".to_string(),
-                            "backfill".to_string(),
-                            "--tier".to_string(),
-                            tier.to_string(),
-                            "--scheduled".to_string(),
-                            "--data-dir".to_string(),
-                            cfg.data_dir.display().to_string(),
-                            "--json".to_string(),
-                        ];
-                        batches += 1;
-                        let mut step = run_step(
-                            &format!("semantic-backfill:{tier}:{batches}"),
-                            &cfg.binary,
-                            &cfg.data_dir,
-                            &args,
-                            log.as_mut(),
-                        );
-                        let model_unavailable = soften_model_unavailable_backfill_step(&mut step);
-                        let stop = model_unavailable || backfill_batch_should_stop(&step);
+                for tier in tiers {
+                    let remaining = cfg.max_backfill_batches - batches;
+                    if remaining == 0 {
+                        steps.push(skipped_step(
+                            "semantic-backfill",
+                            format!("stopped after {batches} batches (CASS_SCHEDULE_MAX_BACKFILL_BATCHES)"),
+                        ));
+                        break;
+                    }
+                    let mut args = vec![
+                        "--db".to_string(),
+                        cfg.db_path.display().to_string(),
+                        "--color=never".to_string(),
+                        "models".to_string(),
+                        "backfill".to_string(),
+                        "--tier".to_string(),
+                        tier.to_string(),
+                        "--max-batches".to_string(),
+                        remaining.to_string(),
+                        "--scheduled".to_string(),
+                        "--data-dir".to_string(),
+                        cfg.data_dir.display().to_string(),
+                        "--json".to_string(),
+                    ];
+                    if tier == "fast" {
+                        args.extend(["--embedder".to_string(), "hash".to_string()]);
+                    } else if external_quality {
+                        // Pin the selected provider in the worker invocation so
+                        // a configured endpoint failure cannot be mistaken for
+                        // an optional missing local model. Credentials stay in env.
+                        args.extend(["--embedder".to_string(), "external".to_string()]);
+                    }
+                    let mut step = run_step(
+                        &format!("semantic-backfill:{tier}:{}", batches + 1),
+                        &cfg.binary,
+                        &cfg.data_dir,
+                        &args,
+                        &[(crate::indexer::semantic::SCHEDULE_PRESERVE_CHECKPOINT, "1")],
+                        log.as_mut(),
+                    );
+                    let model_unavailable = soften_model_unavailable_backfill_step(&mut step);
+                    if model_unavailable || !step.ok {
                         steps.push(step);
-                        if stop {
-                            break;
-                        }
+                        break;
+                    }
+                    let Some(attempted) = backfill_worker_attempts(&step, remaining) else {
+                        step.ok = false;
+                        step.stderr_tail = Some(
+                            "backfill worker returned missing or invalid batch accounting; no further tiers were launched"
+                                .to_string(),
+                        );
+                        steps.push(step);
+                        break;
+                    };
+                    batches += attempted;
+                    let stop = backfill_worker_retains_tier(&step);
+                    steps.push(step);
+                    if stop {
+                        break;
                     }
                 }
             }
@@ -1158,10 +1322,61 @@ fn run_job_with_gate(
         pressure,
         user_idle,
     };
-    if let Err(error) = persist_job_report(&cfg.data_dir, &report) {
-        warn!(error = %error, "failed to persist schedule state and run history");
+    persist_job_report(cfg, report)
+}
+
+fn persist_job_report(cfg: &RunConfig, mut report: JobReport) -> JobReport {
+    let result = with_state_lock(&cfg.data_dir, || {
+        let mut state = load_state(&cfg.data_dir);
+        match report.job {
+            ScheduleJob::Incremental => state.last_incremental = Some(report.clone()),
+            ScheduleJob::Nightly => state.last_nightly = Some(report.clone()),
+        }
+        let state_saved = match save_state_unlocked(&cfg.data_dir, &state) {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(kind = ?error.kind(), "failed to persist schedule state");
+                record_persistence_failure(&mut report, "schedule_state_write_failed");
+                false
+            }
+        };
+        if let Err(error) = append_run(&cfg.data_dir, &report) {
+            warn!(kind = ?error.kind(), "failed to append schedule run history");
+            record_persistence_failure(&mut report, "schedule_history_write_failed");
+            // Do not leave a successful state receipt after history publication
+            // failed. Retry only this bounded correction, still under the lease.
+            if state_saved {
+                match report.job {
+                    ScheduleJob::Incremental => state.last_incremental = Some(report.clone()),
+                    ScheduleJob::Nightly => state.last_nightly = Some(report.clone()),
+                }
+                if let Err(error) = save_state_unlocked(&cfg.data_dir, &state) {
+                    warn!(kind = ?error.kind(), "failed to persist corrected schedule state");
+                    record_persistence_failure(&mut report, "schedule_state_write_failed");
+                }
+            }
+        }
+        Ok(())
+    });
+    if let Err(error) = result {
+        warn!(kind = ?error.kind(), "failed to lock schedule state and run history");
+        record_persistence_failure(&mut report, "schedule_state_lock_failed");
     }
     report
+}
+
+fn record_persistence_failure(report: &mut JobReport, reason: &str) {
+    report.ok = false;
+    report.steps.push(StepReport {
+        name: "schedule-persistence".to_string(),
+        argv: Vec::new(),
+        exit_code: None,
+        ok: false,
+        duration_ms: 0,
+        skipped_reason: None,
+        result: Some(serde_json::json!({"status": "failed", "reason": reason})),
+        stderr_tail: None,
+    });
 }
 
 /// Exit codes that mean "the semantic model / embedder is unavailable"
@@ -1174,7 +1389,16 @@ const MODEL_UNAVAILABLE_EXIT_CODES: [i32; 6] = [15, 20, 21, 22, 23, 24];
 /// into a skipped (non-failing) step. Returns true when the conversion
 /// applied, which also ends that tier's loop.
 pub fn soften_model_unavailable_backfill_step(step: &mut StepReport) -> bool {
-    if step.ok {
+    // Endpoint consent, configuration, preflight and transport failures are
+    // failures of an explicitly requested job, not optional asset discovery.
+    let external = step.argv.windows(2).any(|pair| {
+        pair[0] == "--embedder"
+            && crate::search::embedder_registry::selects_external(Some(&pair[1]))
+    }) || step.argv.iter().any(|arg| {
+        arg.strip_prefix("--embedder=")
+            .is_some_and(|name| crate::search::embedder_registry::selects_external(Some(name)))
+    });
+    if external || step.ok {
         return false;
     }
     let Some(code) = step.exit_code else {
@@ -1185,21 +1409,201 @@ pub fn soften_model_unavailable_backfill_step(step: &mut StepReport) -> bool {
     }
     step.ok = true;
     step.skipped_reason = Some(format!(
-        "semantic model unavailable (exit {code}); run `cass models install` to enable this tier"
+        "semantic provider unavailable (exit {code}); check the worker diagnostic and external consent/configuration, or run `cass models install` for the selected local model"
     ));
     true
 }
 
-/// Convert an exit-7 (`index-busy`) index step into a skipped step: a
-/// scheduled run losing the lock race to a human `cass index` is routine.
+/// Annotate exit-7 (`index-busy`) as a deferred step without claiming that
+/// indexing succeeded. The next timer firing retries, but callers and saved
+/// receipts must distinguish that retryable deferral from completed work.
 pub fn soften_busy_index_step(step: &mut StepReport) -> bool {
     if step.exit_code != Some(7) {
         return false;
     }
-    step.ok = true;
-    step.skipped_reason =
-        Some("another index run already holds the index lock; skipped this cycle".to_string());
+    step.ok = false;
+    // Exit 7 covers several causes; name the one the child reported. Only a
+    // child that saw another index run holding the lock is contention
+    // (GH #509: a database stuck in WAL-index recovery was reported as a
+    // held lock, so a permanently failing schedule read as a benign skip).
+    let message = step_error_field(step, "/error/message").unwrap_or_default();
+    step.skipped_reason = Some(
+        if step_error_field(step, "/error/kind").as_deref() == Some("migration-repair-pending") {
+            "the archive still needs its one-time storage migration repair; run `cass index --full` in the foreground".to_string()
+        } else if message.contains("another 'cass index' run is already active")
+            || message.contains("another cass index process already holds")
+        {
+            "another index run already holds the index lock; skipped this cycle".to_string()
+        } else if message.contains("canonical database is busy/locked") {
+            format!(
+                "the index run failed: the canonical database stayed busy and no other index run held the lock: {}",
+                bounded_reason(&message)
+            )
+        } else if message.is_empty() {
+            "the index run exited 7 (busy) without an error message; see stderr_tail".to_string()
+        } else {
+            format!(
+                "the index run exited 7 (busy): {}",
+                bounded_reason(&message)
+            )
+        },
+    );
     true
+}
+
+/// A field from the last JSON error envelope a step wrote to stderr.
+fn step_error_field(step: &StepReport, pointer: &str) -> Option<String> {
+    step.stderr_tail.as_deref()?.lines().rev().find_map(|line| {
+        serde_json::from_str::<serde_json::Value>(line.trim())
+            .ok()?
+            .pointer(pointer)?
+            .as_str()
+            .map(str::to_owned)
+    })
+}
+
+/// The first 300 characters of a child's error message, for a step reason.
+fn bounded_reason(message: &str) -> String {
+    let mut reason: String = message.chars().take(300).collect();
+    if reason.len() < message.len() {
+        reason.push('…');
+    }
+    reason
+}
+
+/// External selection is explicit policy, not discovery of a configured URL.
+/// The quality worker enforces consent and preflight; planning sends no text.
+fn quality_model_probe(
+    binary: &Path,
+    data_dir: &Path,
+    log: Option<&mut File>,
+) -> (StepReport, bool, crate::search::policy::SemanticPolicy) {
+    let policy = crate::search::policy::SemanticPolicy::resolve(
+        &crate::search::policy::CliSemanticOverrides::default(),
+    );
+    let (step, available) =
+        quality_model_probe_with_policy(&policy, || minilm_model_probe(binary, data_dir, log));
+    (step, available, policy)
+}
+
+/// Resolve only the explicitly selected producer's identity; never create an
+/// HTTP client or load model weights. Called lazily for a quality checkpoint.
+fn scheduled_quality_identity(
+    data_dir: &Path,
+    policy: &crate::search::policy::SemanticPolicy,
+) -> Result<String, String> {
+    use crate::search::embedder_registry::{EmbedderRegistry, selects_external};
+    use crate::search::external_embedder::ExternalEmbeddingConfig;
+
+    if selects_external(Some(&policy.quality_tier_embedder)) {
+        return ExternalEmbeddingConfig::from_env()
+            .map_err(|error| error.to_string())?
+            .map(|config| config.identity())
+            .ok_or_else(|| {
+                "external_disabled: consent is required to resume the external checkpoint".into()
+            });
+    }
+    // Match the CLI's default resolution, including its legacy fastembed alias.
+    let name = if policy
+        .quality_tier_embedder
+        .trim()
+        .eq_ignore_ascii_case("hash")
+    {
+        "hash"
+    } else {
+        crate::search::fastembed_embedder::FastEmbedder::canonical_name(
+            &policy.quality_tier_embedder,
+        )
+        .unwrap_or("minilm")
+    };
+    EmbedderRegistry::new(data_dir)
+        .get(name)
+        .map(|info| info.id.to_string())
+        .ok_or_else(|| "the selected quality provider has no registered identity".into())
+}
+
+/// The legacy manifest has one checkpoint slot for both tiers. Starting fast
+/// unconditionally can replace an interrupted quality build and authorize GC
+/// of its staged vectors. Resume its owner first; a changed/disabled producer
+/// is an explicit refusal, not permission to run another tier.
+fn nightly_backfill_order(
+    data_dir: &Path,
+    quality_available: bool,
+    quality_identity: impl FnOnce() -> Result<String, String>,
+) -> Result<Vec<&'static str>, String> {
+    use crate::search::semantic_manifest::{SemanticManifest, TierKind};
+
+    let checkpoint = SemanticManifest::load(data_dir)
+        .map_err(|_| {
+            "cannot read the durable semantic checkpoint; no semantic worker was started; repair the ledger before retrying".to_string()
+        })?
+        .and_then(|manifest| manifest.checkpoint);
+    if let Some(checkpoint) = checkpoint {
+        let expected = match checkpoint.tier {
+            TierKind::Fast => "fnv1a-384".to_string(),
+            TierKind::Quality => {
+                if !quality_available {
+                    return Err("unfinished quality checkpoint retained: its provider is unavailable; restore it before starting another tier".into());
+                }
+                quality_identity()
+                    .map_err(|reason| format!("unfinished quality checkpoint retained: {reason}"))?
+            }
+        };
+        if checkpoint.embedder_id != expected {
+            return Err("unfinished semantic checkpoint retained: selected provider differs from its owner; resume with the original provider configuration before switching tiers".into());
+        }
+        if checkpoint.tier == TierKind::Quality {
+            // Do not reject an old DB fingerprint here. Its matching owner
+            // must reconcile canonical edits/additions through the normal path.
+            return Ok(vec!["quality", "fast"]);
+        }
+    }
+    Ok(if quality_available {
+        vec!["fast", "quality"]
+    } else {
+        vec!["fast"]
+    })
+}
+
+fn backfill_worker_retains_tier(step: &StepReport) -> bool {
+    // Even with unused budget, a worker that stopped on a checkpoint has not
+    // released the single cursor slot. Pauses/disablement keep the same rule.
+    step.result.as_ref().is_some_and(|result| {
+        matches!(
+            result.get("status").and_then(serde_json::Value::as_str),
+            Some("paused" | "disabled" | "checkpointed")
+        )
+    })
+}
+
+fn quality_model_probe_with_policy(
+    policy: &crate::search::policy::SemanticPolicy,
+    local_probe: impl FnOnce() -> (StepReport, bool),
+) -> (StepReport, bool) {
+    if policy
+        .quality_tier_embedder
+        .trim()
+        .eq_ignore_ascii_case("hash")
+    {
+        return (
+            skipped_step(
+                "models-status",
+                "hash quality provider requires no model files",
+            ),
+            true,
+        );
+    }
+    if crate::search::embedder_registry::selects_external(Some(&policy.quality_tier_embedder)) {
+        (
+            skipped_step(
+                "models-status",
+                "external quality provider explicitly selected; consent and preflight are checked by the backfill worker",
+            ),
+            true,
+        )
+    } else {
+        local_probe()
+    }
 }
 
 /// Probe whether the MiniLM model is installed via `models status --json`.
@@ -1216,7 +1620,7 @@ fn minilm_model_probe(
         "status".to_string(),
         "--json".to_string(),
     ];
-    let mut step = run_step("models-status", binary, data_dir, &args, log);
+    let mut step = run_step("models-status", binary, data_dir, &args, &[], log);
     let installed = step
         .result
         .as_ref()
@@ -1232,32 +1636,25 @@ fn minilm_model_probe(
     (step, installed)
 }
 
-/// Stop looping `models backfill --scheduled` when the batch failed, the
-/// scheduler paused/disabled, nothing was processed, or the tier published.
-pub fn backfill_batch_should_stop(step: &StepReport) -> bool {
+/// Accept only exact, bounded worker accounting before spending the remainder
+/// of the global nightly allowance on another tier.
+fn backfill_worker_attempts(step: &StepReport, remaining: u32) -> Option<u32> {
     if !step.ok {
-        return true;
+        return None;
     }
-    let Some(result) = &step.result else {
-        return true;
-    };
-    let scheduler_state = result
-        .get("scheduler")
-        .and_then(|s| s.get("state"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("running");
-    if scheduler_state != "running" {
-        return true;
-    }
-    let processed = result
-        .get("conversations_processed")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let published = result
-        .get("published")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    processed == 0 || published
+    let result = step.result.as_ref()?;
+    let attempted = u32::try_from(result.get("batches_attempted")?.as_u64()?).ok()?;
+    let completed = u32::try_from(result.get("batches_completed")?.as_u64()?).ok()?;
+    let uncompleted = attempted.checked_sub(completed)?;
+    let initializations = result.get("model_initializations")?.as_u64()?;
+    let status = result.get("status")?.as_str()?;
+    let admitted = matches!(status, "checkpointed" | "published" | "unchanged" | "idle");
+    (attempted > 0
+        && attempted <= remaining
+        && initializations == u64::from(completed > 0)
+        && (admitted || matches!(status, "paused" | "disabled"))
+        && uncompleted == u32::from(!admitted))
+    .then_some(attempted)
 }
 
 // ---------------------------------------------------------------------------
@@ -1271,6 +1668,7 @@ pub struct UnitStatus {
     pub installed: bool,
     /// Scheduler-reported state, when the platform tool answered.
     pub loaded: Option<bool>,
+    /// Last persisted run outcome, followed by explicitly labeled probe status.
     pub detail: Option<String>,
 }
 
@@ -1289,6 +1687,7 @@ pub fn status(data_dir: &Path) -> StatusReport {
     let unit_dir = home_dir()
         .ok()
         .and_then(|home| unit_dir(platform, &home, xdg_config_home().as_deref()));
+    let state = load_state(data_dir);
     let mut units = Vec::new();
     if let Some(dir) = &unit_dir {
         let uid = current_uid();
@@ -1336,7 +1735,7 @@ pub fn status(data_dir: &Path) -> StatusReport {
                 unit_files: files,
                 installed,
                 loaded,
-                detail,
+                detail: outcomes::unit_detail(job, &state, detail),
             });
         }
     }
@@ -1344,7 +1743,7 @@ pub fn status(data_dir: &Path) -> StatusReport {
         platform,
         unit_dir,
         units,
-        state: load_state(data_dir),
+        state,
         auto_refresh: crate::indexer::background_refresh::load_state(data_dir),
         log_dir: schedule_dir(data_dir),
     }
@@ -1397,8 +1796,8 @@ mod tests {
         let inc = render_launchd_plist(&s, ScheduleJob::Incremental);
         assert!(inc.contains("<string>com.dicklesworthstone.cass.incremental</string>"));
         assert!(inc.contains("<key>StartInterval</key>\n    <integer>900</integer>"));
-        assert!(inc.contains("<string>Background</string>"));
-        assert!(inc.contains("<key>LowPriorityIO</key>"));
+        assert!(inc.contains("<key>Nice</key>"));
+        assert!(!inc.contains("<key>LowPriorityIO</key>"));
         assert!(inc.contains("/schedule/incremental.log</string>"));
         assert!(!inc.contains("StartCalendarInterval"));
 
@@ -1407,6 +1806,32 @@ mod tests {
         assert!(night.contains("<key>Hour</key>\n        <integer>3</integer>"));
         assert!(night.contains("<key>Minute</key>\n        <integer>30</integer>"));
         assert!(night.contains("<string>nightly</string>"));
+    }
+
+    #[test]
+    fn launchd_jobs_keep_cpu_niceness_without_background_io_throttling() {
+        for job in [ScheduleJob::Incremental, ScheduleJob::Nightly] {
+            let plist = render_launchd_plist(&spec(), job);
+            // The renderer's line-continuation literal drops indentation, so
+            // check the key/value pairing structurally rather than by exact
+            // whitespace: the value that follows `Nice` must be 15.
+            let nice_at = plist
+                .find("<key>Nice</key>")
+                .unwrap_or_else(|| panic!("{} must set Nice: {plist}", job.as_str()));
+            let after_nice = plist[nice_at + "<key>Nice</key>".len()..].trim_start();
+            assert!(
+                after_nice.starts_with("<integer>15</integer>"),
+                "{} must keep Nice=15: {plist}",
+                job.as_str()
+            );
+            for key in ["ProcessType", "LowPriorityIO", "LowPriorityBackgroundIO"] {
+                assert!(
+                    !plist.contains(&format!("<key>{key}</key>")),
+                    "{} must not request {key}: {plist}",
+                    job.as_str()
+                );
+            }
+        }
     }
 
     #[test]
@@ -1479,7 +1904,7 @@ mod tests {
     }
 
     #[test]
-    fn backfill_loop_stops_on_pause_publish_or_empty_batch() {
+    fn backfill_worker_accounting_rejects_missing_or_unbounded_counts() {
         let step = |ok: bool, result: Option<serde_json::Value>| StepReport {
             name: "b".into(),
             argv: vec![],
@@ -1490,22 +1915,252 @@ mod tests {
             result,
             stderr_tail: None,
         };
-        assert!(backfill_batch_should_stop(&step(false, None)));
-        assert!(backfill_batch_should_stop(&step(true, None)));
-        let running_more = serde_json::json!({
-            "scheduler": {"state": "running"},
-            "conversations_processed": 64,
-            "published": false
+        assert_eq!(backfill_worker_attempts(&step(false, None), 2), None);
+        assert_eq!(backfill_worker_attempts(&step(true, None), 2), None);
+        let counts = |attempted: serde_json::Value, completed, models| {
+            serde_json::json!({
+                "status": if completed > 0 { "checkpointed" } else { "paused" },
+                "batches_attempted": attempted,
+                "batches_completed": completed,
+                "model_initializations": models,
+            })
+        };
+        for invalid in [
+            counts(0.into(), 0, 0),
+            counts(3.into(), 2, 1),
+            counts(1.into(), 2, 1),
+            counts(2.into(), 1, 1),
+            counts(1.into(), 1, 0),
+            counts(2.into(), 2, 2),
+            counts(serde_json::json!(1.5), 1, 1),
+            counts(serde_json::json!(-1), 0, 0),
+            counts(serde_json::json!(u64::MAX), 0, 0),
+        ] {
+            assert_eq!(
+                backfill_worker_attempts(&step(true, Some(invalid)), 2),
+                None
+            );
+        }
+        for valid in [counts(1.into(), 0, 0), counts(2.into(), 2, 1)] {
+            let expected = valid["batches_attempted"].as_u64().unwrap() as u32;
+            assert_eq!(
+                backfill_worker_attempts(&step(true, Some(valid)), 2),
+                Some(expected)
+            );
+        }
+        for invalid_status in [serde_json::Value::Null, "failed".into(), "cancelled".into()] {
+            let mut report = counts(1.into(), 1, 1);
+            report["status"] = invalid_status;
+            assert_eq!(backfill_worker_attempts(&step(true, Some(report)), 2), None);
+        }
+        for (attempted, completed, models) in [(2, 2, 1), (2, 0, 0), (1, 0, 1)] {
+            let mut report = counts(attempted.into(), completed, models);
+            report["status"] = "paused".into();
+            assert_eq!(backfill_worker_attempts(&step(true, Some(report)), 2), None);
+        }
+        let mut paused_after_checkpoint = counts(2.into(), 1, 1);
+        paused_after_checkpoint["status"] = "paused".into();
+        assert_eq!(
+            backfill_worker_attempts(&step(true, Some(paused_after_checkpoint)), 2),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn external_quality_schedule_does_not_require_minilm_or_probe_http() {
+        let mut policy = crate::search::policy::SemanticPolicy::compiled_defaults();
+        policy.quality_tier_embedder = "external".into();
+        let (step, admitted) = quality_model_probe_with_policy(&policy, || {
+            panic!("external scheduling must not probe local assets")
         });
-        assert!(!backfill_batch_should_stop(&step(true, Some(running_more))));
-        let paused =
-            serde_json::json!({"scheduler": {"state": "paused"}, "conversations_processed": 64});
-        assert!(backfill_batch_should_stop(&step(true, Some(paused))));
-        let published = serde_json::json!({"scheduler": {"state": "running"}, "conversations_processed": 10, "published": true});
-        assert!(backfill_batch_should_stop(&step(true, Some(published))));
-        let empty =
-            serde_json::json!({"scheduler": {"state": "running"}, "conversations_processed": 0});
-        assert!(backfill_batch_should_stop(&step(true, Some(empty))));
+        assert!(admitted);
+        assert!(
+            step.skipped_reason
+                .unwrap()
+                .contains("consent and preflight")
+        );
+        policy.quality_tier_embedder = "hash".into();
+        let (_, admitted) = quality_model_probe_with_policy(&policy, || {
+            panic!("an explicit hash quality checkpoint needs no model files")
+        });
+        assert!(admitted);
+        policy.quality_tier_embedder = "minilm".into();
+        let (_, admitted) = quality_model_probe_with_policy(&policy, || {
+            (skipped_step("models-status", "missing local model"), false)
+        });
+        assert!(!admitted, "the default must retain local model admission");
+    }
+
+    fn checkpoint_fixture(
+        data_dir: &Path,
+        tier: crate::search::semantic_manifest::TierKind,
+        id: &str,
+    ) {
+        use crate::search::semantic_manifest::{BuildCheckpoint, SemanticManifest};
+        let mut manifest = SemanticManifest {
+            checkpoint: Some(BuildCheckpoint {
+                tier,
+                embedder_id: id.into(),
+                last_offset: 1,
+                docs_embedded: 1,
+                conversations_processed: 1,
+                total_conversations: 3,
+                db_fingerprint: "previous-canonical-snapshot".into(),
+                schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
+                chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
+                saved_at_ms: 1,
+                last_message_id: Some(1),
+                cursor_exhausted: false,
+            }),
+            ..SemanticManifest::default()
+        };
+        manifest.save(data_dir).unwrap();
+    }
+
+    #[test]
+    fn nightly_default_and_fast_resume_do_not_resolve_external_configuration() {
+        use crate::search::semantic_manifest::TierKind;
+        let dir = tempfile::tempdir().unwrap();
+        for quality in [false, true] {
+            let expected = if quality {
+                vec!["fast", "quality"]
+            } else {
+                vec!["fast"]
+            };
+            assert_eq!(
+                nightly_backfill_order(dir.path(), quality, || panic!("no quality checkpoint"))
+                    .unwrap(),
+                expected
+            );
+        }
+        checkpoint_fixture(dir.path(), TierKind::Fast, "fnv1a-384");
+        assert_eq!(
+            nightly_backfill_order(dir.path(), true, || panic!("fast checkpoint is local"))
+                .unwrap(),
+            ["fast", "quality"]
+        );
+    }
+
+    #[test]
+    fn nightly_resumes_quality_before_fast_without_rewriting_the_checkpoint() {
+        use crate::search::semantic_manifest::{SemanticManifest, TierKind};
+        let dir = tempfile::tempdir().unwrap();
+        for id in ["minilm-384", "external-fixture-identity"] {
+            checkpoint_fixture(dir.path(), TierKind::Quality, id);
+            let before = std::fs::read(SemanticManifest::path(dir.path())).unwrap();
+            let mut lookups = 0;
+            assert_eq!(
+                nightly_backfill_order(dir.path(), true, || {
+                    lookups += 1;
+                    Ok(id.to_string())
+                })
+                .unwrap(),
+                ["quality", "fast"]
+            );
+            assert_eq!(lookups, 1);
+            assert_eq!(
+                std::fs::read(SemanticManifest::path(dir.path())).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn nightly_foreign_or_unavailable_checkpoint_owner_blocks_all_tiers() {
+        use crate::search::semantic_manifest::{SemanticManifest, TierKind};
+        let dir = tempfile::tempdir().unwrap();
+        checkpoint_fixture(dir.path(), TierKind::Quality, "original-external-identity");
+        let before = std::fs::read(SemanticManifest::path(dir.path())).unwrap();
+        assert!(nightly_backfill_order(dir.path(), false, || panic!("missing provider")).is_err());
+        for id in [
+            "minilm-384",
+            "fnv1a-384",
+            "another-model-or-endpoint-identity",
+        ] {
+            assert!(nightly_backfill_order(dir.path(), true, || Ok(id.into())).is_err());
+        }
+        assert!(
+            nightly_backfill_order(dir.path(), true, || Err("external_disabled".into()))
+                .unwrap_err()
+                .contains("external_disabled")
+        );
+        assert_eq!(
+            std::fs::read(SemanticManifest::path(dir.path())).unwrap(),
+            before
+        );
+        checkpoint_fixture(dir.path(), TierKind::Fast, "not-the-hash-space");
+        assert!(nightly_backfill_order(dir.path(), true, || panic!("foreign fast owner")).is_err());
+    }
+
+    #[test]
+    fn nightly_corrupt_ledger_never_becomes_permission_to_start_fast() {
+        use crate::search::semantic_manifest::SemanticManifest;
+        let dir = tempfile::tempdir().unwrap();
+        let path = SemanticManifest::path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{truncated checkpoint").unwrap();
+        assert!(
+            nightly_backfill_order(dir.path(), true, || panic!("unreadable checkpoint")).is_err()
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"{truncated checkpoint");
+    }
+
+    #[test]
+    fn nightly_checkpointed_worker_does_not_release_the_cursor_slot() {
+        for (status, stop) in [
+            ("checkpointed", true),
+            ("paused", true),
+            ("disabled", true),
+            ("published", false),
+            ("unchanged", false),
+            ("idle", false),
+        ] {
+            let mut step = skipped_step("semantic-backfill", "fixture");
+            step.result = Some(serde_json::json!({"status": status}));
+            assert_eq!(backfill_worker_retains_tier(&step), stop, "{status}");
+        }
+    }
+
+    #[test]
+    fn nightly_local_checkpoint_identity_matches_cli_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut policy = crate::search::policy::SemanticPolicy::compiled_defaults();
+        for (name, id) in [
+            ("minilm", "minilm-384"),
+            ("fastembed", "minilm-384"),
+            ("multilingual-minilm", "multilingual-minilm-384"),
+            ("HASH", "fnv1a-384"),
+            ("unrecognized-policy", "minilm-384"),
+        ] {
+            policy.quality_tier_embedder = name.into();
+            assert_eq!(scheduled_quality_identity(dir.path(), &policy).unwrap(), id);
+        }
+    }
+
+    #[test]
+    fn explicit_external_failures_remain_failures_not_optional_model_skips() {
+        for code in [15, 20, 21, 22, 23, 24, 5, 130, 143] {
+            for selection in [vec!["--embedder", "external"], vec!["--embedder=external"]] {
+                let mut step = StepReport {
+                    name: "semantic-backfill:quality:2".into(),
+                    argv: ["cass", "models", "backfill", "--tier", "quality"]
+                        .into_iter()
+                        .chain(selection)
+                        .map(str::to_owned)
+                        .collect(),
+                    exit_code: Some(code),
+                    ok: false,
+                    duration_ms: 10,
+                    skipped_reason: None,
+                    result: Some(serde_json::json!({"status": "failed", "batches_completed": 1})),
+                    stderr_tail: Some("external_http_503: checkpoint retained".into()),
+                };
+                let before = serde_json::to_value(&step).unwrap();
+                assert!(!soften_model_unavailable_backfill_step(&mut step), "{code}");
+                assert_eq!(serde_json::to_value(&step).unwrap(), before);
+                assert!(!step.ok);
+            }
+        }
     }
 
     #[test]
@@ -1542,7 +2197,7 @@ mod tests {
     }
 
     #[test]
-    fn busy_index_step_softens_to_skip() {
+    fn busy_index_step_is_deferred_without_claiming_success() {
         let step = |exit: Option<i32>, ok: bool| StepReport {
             name: "index".into(),
             argv: vec![],
@@ -1555,13 +2210,61 @@ mod tests {
         };
         let mut busy = step(Some(7), false);
         assert!(soften_busy_index_step(&mut busy));
-        assert!(busy.ok);
+        assert!(!busy.ok);
         assert!(busy.skipped_reason.is_some());
         let mut fine = step(Some(0), true);
         assert!(!soften_busy_index_step(&mut fine));
         let mut failed = step(Some(3), false);
         assert!(!soften_busy_index_step(&mut failed));
         assert!(!failed.ok);
+
+        // GH #450: exit 7 from a deferred migration repair names that cause;
+        // lock contention keeps its own reason.
+        let with_stderr = |stderr: &str| StepReport {
+            stderr_tail: Some(stderr.to_string()),
+            ..step(Some(7), false)
+        };
+        let mut deferred = with_stderr(
+            "note: something\n{\"error\":{\"code\":7,\"kind\":\"migration-repair-pending\",\"retryable\":false}}",
+        );
+        assert!(soften_busy_index_step(&mut deferred));
+        assert!(!deferred.ok);
+        let reason = deferred.skipped_reason.unwrap();
+        assert!(reason.contains("migration repair"), "{reason}");
+        assert!(reason.contains("cass index --full"), "{reason}");
+        let mut locked = with_stderr(
+            "{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"message\":\"another 'cass index' run is already active for data dir /d (pid 42)\",\"retryable\":true}}",
+        );
+        assert!(soften_busy_index_step(&mut locked));
+        assert!(locked.skipped_reason.unwrap().contains("index lock"));
+        let mut held = with_stderr(
+            "{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"message\":\"index failed: another cass index process already holds /d/index-run.lock\",\"retryable\":true}}",
+        );
+        assert!(soften_busy_index_step(&mut held));
+        assert!(held.skipped_reason.unwrap().contains("index lock"));
+
+        // GH #509: the same exit 7 and kind from a database stuck in
+        // WAL-index recovery is not lock contention, and says what failed.
+        let mut stuck = with_stderr(
+            "ERROR group-commit callback failed\n{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"message\":\"index failed because the canonical database is busy/locked: ephemeral writer preflight write failed for serial batched indexing | database is busy (recovery in progress)\",\"retryable\":true}}",
+        );
+        assert!(soften_busy_index_step(&mut stuck));
+        assert!(!stuck.ok);
+        let reason = stuck.skipped_reason.unwrap();
+        assert!(!reason.contains("index lock"), "{reason}");
+        assert!(
+            reason.contains("no other index run held the lock"),
+            "{reason}"
+        );
+        assert!(reason.contains("recovery in progress"), "{reason}");
+
+        // Without a message the step claims no cause at all.
+        let mut bare =
+            with_stderr("{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"retryable\":true}}");
+        assert!(soften_busy_index_step(&mut bare));
+        let reason = bare.skipped_reason.unwrap();
+        assert!(!reason.contains("index lock"), "{reason}");
+        assert!(reason.contains("stderr_tail"), "{reason}");
     }
 
     #[test]
@@ -1600,6 +2303,92 @@ mod tests {
         assert_eq!(history.lines().count(), 2);
     }
 
+    fn index_run_report(job: ScheduleJob, finished_ms: i64, index_ok: bool) -> JobReport {
+        JobReport {
+            job,
+            started_ms: finished_ms - 1,
+            finished_ms,
+            ok: index_ok,
+            skipped_reason: None,
+            steps: vec![StepReport {
+                name: if job == ScheduleJob::Nightly {
+                    "index-full"
+                } else {
+                    "index"
+                }
+                .to_string(),
+                argv: Vec::new(),
+                exit_code: Some(if index_ok { 0 } else { 70 }),
+                ok: index_ok,
+                duration_ms: 1,
+                skipped_reason: None,
+                result: None,
+                stderr_tail: None,
+            }],
+            pressure: None,
+            user_idle: None,
+        }
+    }
+
+    #[test]
+    fn load_deferral_is_bounded_by_the_last_completed_run() {
+        let hour = std::time::Duration::from_secs(3600);
+        let now = 10 * 3_600_000;
+        // Recent completed run: load may still defer.
+        assert!(load_may_defer(Some(now - 3_600_000), now, Some(3 * hour)));
+        // Past the bound: the run goes ahead.
+        assert!(!load_may_defer(
+            Some(now - 3 * 3_600_000),
+            now,
+            Some(3 * hour)
+        ));
+        // Never completed: nothing fresh to protect.
+        assert!(!load_may_defer(None, now, Some(3 * hour)));
+        // 0 = the old unbounded skip.
+        assert!(load_may_defer(None, now, None));
+        assert!(load_may_defer(Some(0), now, None));
+    }
+
+    #[test]
+    fn last_completed_incremental_run_ignores_skips_failures_nightlies_and_junk() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(last_completed_incremental_ms(dir.path()), None);
+
+        append_run(
+            dir.path(),
+            &index_run_report(ScheduleJob::Incremental, 100, true),
+        )
+        .unwrap();
+        let mut skipped = index_run_report(ScheduleJob::Incremental, 200, true);
+        skipped.skipped_reason = Some("machine under severe load".to_string());
+        skipped.steps.clear();
+        append_run(dir.path(), &skipped).unwrap();
+        append_run(
+            dir.path(),
+            &index_run_report(ScheduleJob::Incremental, 300, false),
+        )
+        .unwrap();
+        append_run(
+            dir.path(),
+            &index_run_report(ScheduleJob::Nightly, 400, true),
+        )
+        .unwrap();
+        let mut history = OpenOptions::new()
+            .append(true)
+            .open(runs_log_path(dir.path()))
+            .unwrap();
+        writeln!(history, "{{not json").unwrap();
+
+        assert_eq!(last_completed_incremental_ms(dir.path()), Some(100));
+
+        append_run(
+            dir.path(),
+            &index_run_report(ScheduleJob::Incremental, 500, true),
+        )
+        .unwrap();
+        assert_eq!(last_completed_incremental_ms(dir.path()), Some(500));
+    }
+
     #[test]
     fn concurrent_job_reports_retain_both_state_slots_and_history() {
         use std::sync::{Arc, Barrier};
@@ -1616,19 +2405,37 @@ mod tests {
             pressure: None,
             user_idle: None,
         };
+        let make_config = |data_dir: PathBuf| RunConfig {
+            binary: PathBuf::from("unused-fixture-binary"),
+            db_path: data_dir.join("agent_search.db"),
+            data_dir,
+            semantic: false,
+            max_backfill_batches: 1,
+        };
 
         let incremental_dir = dir.path().to_path_buf();
         let incremental_barrier = Arc::clone(&barrier);
         let incremental = std::thread::spawn(move || {
             incremental_barrier.wait();
-            persist_job_report(&incremental_dir, &make_report(ScheduleJob::Incremental, 1))
-                .unwrap();
+            assert!(
+                persist_job_report(
+                    &make_config(incremental_dir),
+                    make_report(ScheduleJob::Incremental, 1),
+                )
+                .ok
+            );
         });
         let nightly_dir = dir.path().to_path_buf();
         let nightly_barrier = Arc::clone(&barrier);
         let nightly = std::thread::spawn(move || {
             nightly_barrier.wait();
-            persist_job_report(&nightly_dir, &make_report(ScheduleJob::Nightly, 2)).unwrap();
+            assert!(
+                persist_job_report(
+                    &make_config(nightly_dir),
+                    make_report(ScheduleJob::Nightly, 2),
+                )
+                .ok
+            );
         });
         incremental.join().unwrap();
         nightly.join().unwrap();

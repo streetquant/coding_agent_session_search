@@ -1,0 +1,287 @@
+{
+  "defaults": {
+    "max_output_bytes": 96000,
+    "repetitions": 2,
+    "timeout_sec": 120
+  },
+  "facets": [
+    {
+      "allow_baseline_final_match": false,
+      "baseline_expectation": {
+        "combined_contains": [
+          "coding-agent-search@0.8.0"
+        ],
+        "combined_not_contains": [],
+        "exit_codes": [
+          0
+        ]
+      },
+      "command": {
+        "argv": [
+          "cargo",
+          "pkgid",
+          "--offline"
+        ],
+        "cwd": ".",
+        "env": {},
+        "id": "diagnose-FACET-001",
+        "timeout_sec": 120
+      },
+      "component_ids": [
+        "INT-001"
+      ],
+      "final_expectation": {
+        "combined_contains": [
+          "coding-agent-search@0.10.0"
+        ],
+        "combined_not_contains": [
+          "coding-agent-search@0.8.0"
+        ],
+        "exit_codes": [
+          0
+        ]
+      },
+      "id": "FACET-001",
+      "mode": "direct_target",
+      "normalization": {
+        "regex_replacements": []
+      },
+      "runtime_evidence": {
+        "baseline": {
+          "contains": [
+            "coding-agent-search@0.8.0"
+          ],
+          "minimum_evidence_items": 1,
+          "require_nonempty_output": true,
+          "target_paths": [],
+          "target_symbols": []
+        },
+        "final": {
+          "contains": [
+            "coding-agent-search@0.10.0"
+          ],
+          "minimum_evidence_items": 1,
+          "require_nonempty_output": true,
+          "target_paths": [],
+          "target_symbols": []
+        }
+      },
+      "spec_ids": [
+        "SPEC-001"
+      ],
+      "statement": "Cargo resolves the target package metadata as upstream 0.10.0. This facet proves package adoption only; compiled behavior, preservation and remaining BR acceptance require separate evidence.",
+      "waiver": {
+        "approval": "",
+        "reason": ""
+      }
+    },
+    {
+      "allow_baseline_final_match": true,
+      "baseline_expectation": {
+        "exit_codes": [
+          0
+        ]
+      },
+      "command": {
+        "argv": [
+          "git",
+          "diff",
+          "--check"
+        ],
+        "cwd": ".",
+        "env": {},
+        "id": "diagnose-FACET-002",
+        "timeout_sec": 120
+      },
+      "component_ids": [
+        "INT-001"
+      ],
+      "final_expectation": {
+        "exit_codes": [
+          0
+        ]
+      },
+      "id": "FACET-002",
+      "mode": "diagnosis_only",
+      "normalization": {
+        "regex_replacements": []
+      },
+      "runtime_evidence": {
+        "baseline": {
+          "contains": [],
+          "target_paths": [],
+          "target_symbols": [],
+          "minimum_evidence_items": 0,
+          "require_nonempty_output": false
+        },
+        "final": {
+          "contains": [],
+          "target_paths": [],
+          "target_symbols": [],
+          "minimum_evidence_items": 0,
+          "require_nonempty_output": false
+        }
+      },
+      "spec_ids": [
+        "SPEC-002"
+      ],
+      "statement": "Observe whitespace health of the existing local diff; this is diagnostic evidence and does not certify preservation of native ingestion behavior.",
+      "waiver": {
+        "approval": "",
+        "reason": ""
+      }
+    },
+    {
+      "allow_baseline_final_match": true,
+      "baseline_expectation": {
+        "exit_codes": [
+          0
+        ],
+        "combined_contains": [
+          "id,status"
+        ]
+      },
+      "command": {
+        "argv": [
+          "br",
+          "list",
+          "--status",
+          "open",
+          "--status",
+          "in_progress",
+          "--status",
+          "blocked",
+          "--format",
+          "csv",
+          "--fields",
+          "id,status",
+          "--no-auto-flush",
+          "--no-auto-import"
+        ],
+        "cwd": ".",
+        "env": {},
+        "id": "diagnose-FACET-003",
+        "timeout_sec": 120
+      },
+      "component_ids": [
+        "INT-001"
+      ],
+      "final_expectation": {
+        "exit_codes": [
+          0
+        ],
+        "combined_contains": [
+          "id,status"
+        ]
+      },
+      "id": "FACET-003",
+      "mode": "diagnosis_only",
+      "normalization": {
+        "regex_replacements": []
+      },
+      "runtime_evidence": {
+        "baseline": {
+          "contains": [],
+          "target_paths": [],
+          "target_symbols": [],
+          "minimum_evidence_items": 0,
+          "require_nonempty_output": false
+        },
+        "final": {
+          "contains": [],
+          "target_paths": [],
+          "target_symbols": [],
+          "minimum_evidence_items": 0,
+          "require_nonempty_output": false
+        }
+      },
+      "spec_ids": [
+        "SPEC-003"
+      ],
+      "statement": "Observe the unfinished live BR work surface without changing claims; final closure still requires task-specific acceptance.",
+      "waiver": {
+        "approval": "",
+        "reason": ""
+      }
+    },
+    {
+      "allow_baseline_final_match": true,
+      "baseline_expectation": {
+        "exit_codes": [
+          1
+        ],
+        "combined_contains": [
+          "rch: command not found",
+          "STAGE=rch EXIT=127"
+        ]
+      },
+      "command": {
+        "argv": [
+          "bash",
+          "scripts/gate.sh"
+        ],
+        "cwd": ".",
+        "env": {
+          "GATE_RETRIES": "1",
+          "GATE_RETRY_SLEEP": "0"
+        },
+        "id": "diagnose-FACET-004",
+        "timeout_sec": 120
+      },
+      "component_ids": [
+        "INT-001"
+      ],
+      "final_expectation": {
+        "exit_codes": [
+          0
+        ],
+        "combined_contains": [
+          "STAGE=job-complete EXIT=0"
+        ]
+      },
+      "id": "FACET-004",
+      "mode": "diagnosis_only",
+      "normalization": {
+        "regex_replacements": [
+          {
+            "pattern": "\\d{2}:\\d{2}:\\d{2}",
+            "replacement": "TIME"
+          },
+          {
+            "pattern": "/tmp/cass-gate\\.[A-Za-z0-9]+",
+            "replacement": "/tmp/cass-gate.RECEIPT"
+          }
+        ]
+      },
+      "runtime_evidence": {
+        "baseline": {
+          "contains": [],
+          "target_paths": [],
+          "target_symbols": [],
+          "minimum_evidence_items": 0,
+          "require_nonempty_output": false
+        },
+        "final": {
+          "contains": [],
+          "target_paths": [],
+          "target_symbols": [],
+          "minimum_evidence_items": 0,
+          "require_nonempty_output": false
+        }
+      },
+      "spec_ids": [
+        "SPEC-004"
+      ],
+      "statement": "Attempt the repository-required gate through RCH and record missing runner admission; diagnosis-only until a real compiler/test run becomes available.",
+      "waiver": {
+        "approval": "",
+        "reason": ""
+      }
+    }
+  ],
+  "integration": {
+    "feature": "Update CASS from pinned upstream main, preserve native-history changes, and finish remaining existing BR implementation tasks",
+    "reference": "https://github.com/Dicklesworthstone/coding_agent_session_search/tree/main"
+  },
+  "schema_version": "1.0"
+}

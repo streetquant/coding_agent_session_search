@@ -80,26 +80,24 @@ impl UpdateState {
     }
 
     /// Save state to disk (synchronous)
-    #[cfg(test)]
-    fn save(&self) -> Result<()> {
-        let path = state_path();
-        save_update_state_to_path(self, &path)
+    #[cfg(all(test, unix))]
+    fn save(&self, path: &Path) -> Result<()> {
+        save_update_state_to_path(self, path)
     }
 
     /// Save state to disk (asynchronous)
-    #[cfg(test)]
-    async fn save_async(&self) -> Result<()> {
-        let path = state_path();
+    #[cfg(all(test, unix))]
+    async fn save_async(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             asupersync::fs::create_dir_all(parent)
                 .await
                 .with_context(|| format!("creating update state directory {}", parent.display()))?;
         }
         let json = serde_json::to_string_pretty(self).context("serializing update state")?;
-        let temp_path = write_update_state_temp_file_async(&path, json.as_bytes())
+        let temp_path = write_update_state_temp_file_async(path, json.as_bytes())
             .await
             .with_context(|| format!("writing temporary update state for {}", path.display()))?;
-        replace_update_state_file_from_temp(&temp_path, &path)
+        replace_update_state_file_from_temp(&temp_path, path)
             .with_context(|| format!("replacing {}", path.display()))?;
         Ok(())
     }
@@ -406,6 +404,7 @@ exec bash "$script" --easy-mode --verify --version "$3"
 #[cfg(any(test, target_os = "windows"))]
 fn windows_self_update_script() -> &'static str {
     r#"
+$ErrorActionPreference = 'Stop'
 $InstallUrl = $args[0]
 $ChecksumsUrl = $args[1]
 $Version = $args[2]
@@ -449,12 +448,108 @@ try {
         exit 1
     }
 
-    & $Script -EasyMode -Verify -Version $Version
-    exit $LASTEXITCODE
+    # install.ps1 comes from the target release, so its own self-test cannot
+    # be trusted: v0.10.0's resets $LASTEXITCODE at script scope, which shadows
+    # the code `cass --version` sets, and it fails every run as a file even
+    # after a good install. Verify the installed binary here instead.
+    & $Script -EasyMode -Version $Version
+    if ($LASTEXITCODE) {
+        exit $LASTEXITCODE
+    }
+    $Installed = Join-Path (Join-Path $HOME ".local\bin") "cass.exe"
+    $Reported = (& $Installed --version | Out-String).Trim()
+    $Wanted = '(^|\s)' + [regex]::Escape($Version.TrimStart('v')) + '(\s|$)'
+    if ($LASTEXITCODE -ne 0 -or $Reported -notmatch $Wanted) {
+        throw "installed $Installed reports '$Reported' (exit $LASTEXITCODE), expected $Version"
+    }
+    Write-Output "cass self-update verified: $Reported"
+    exit 0
+} catch {
+    [Console]::Error.WriteLine("cass self-update failed: $_")
+    exit 1
 } finally {
     Remove-Item -LiteralPath $Temp -Recurse -Force -ErrorAction SilentlyContinue
 }
 "#
+}
+
+/// Encode `& { <script> } '<arg>' ...` for `powershell -EncodedCommand`.
+///
+/// `powershell -Command <script> <arg>...` does not bind the trailing tokens
+/// to `$args`: PowerShell joins every token after `-Command` into the command
+/// text, so the script saw `$InstallUrl = $null` and the URL itself was run as
+/// a command (GH #381). A script block receives its arguments as `$args`, the
+/// arguments are single-quoted literals (every PowerShell single-quote
+/// character doubled, including the typographic ones it also accepts), and
+/// the whole command travels as base64 UTF-16LE, so no Windows command-line
+/// quoting can alter the script or split an argument.
+#[cfg(any(test, target_os = "windows"))]
+fn encode_powershell_script_invocation(script: &str, args: &[&str]) -> String {
+    use base64::prelude::*;
+    let mut command = String::with_capacity(script.len() + 16);
+    command.push_str("& {");
+    command.push_str(script);
+    command.push('}');
+    for arg in args {
+        command.push_str(" '");
+        for ch in arg.chars() {
+            if matches!(ch, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+                command.push(ch);
+            }
+            command.push(ch);
+        }
+        command.push('\'');
+    }
+    let utf16le: Vec<u8> = command.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    BASE64_STANDARD.encode(utf16le)
+}
+
+/// The complete `powershell.exe` argument vector for a Windows self-update.
+#[cfg(any(test, target_os = "windows"))]
+fn windows_self_update_powershell_args(version: &str) -> Vec<String> {
+    let install_url = release_asset_url(version, WINDOWS_INSTALL_ASSET);
+    let checksums_url = release_asset_url(version, CHECKSUMS_ASSET);
+    let checksums_alt_url = release_asset_url(version, CHECKSUMS_ASSET_ALT);
+    let install_checksum_url = release_asset_url(version, WINDOWS_INSTALL_CHECKSUM_ASSET);
+    let encoded = encode_powershell_script_invocation(
+        windows_self_update_script(),
+        &[
+            &install_url,
+            &checksums_url,
+            version,
+            &checksums_alt_url,
+            &install_checksum_url,
+        ],
+    );
+    [
+        "-ExecutionPolicy",
+        "Bypass",
+        "-NoProfile",
+        "-EncodedCommand",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .chain(std::iter::once(encoded))
+    .collect()
+}
+
+/// The Windows PowerShell 5.1 child that runs the self-update.
+///
+/// `PSModulePath` is removed from its environment. PowerShell 7 prepends its
+/// own module directories to that variable, and cass started from `pwsh`
+/// passes them on. Windows PowerShell then resolves its built-in
+/// `Microsoft.PowerShell.Utility` module to PowerShell 7's copy, which it
+/// cannot load, so `Get-FileHash` (used here and by install.ps1) is "not
+/// recognized" and no update installs. Without the variable it uses its own
+/// default module path, which is what `pwsh` itself arranges when it starts
+/// Windows PowerShell directly.
+#[cfg(any(test, target_os = "windows"))]
+fn windows_self_update_command(version: &str) -> std::process::Command {
+    let mut command = std::process::Command::new("powershell");
+    command
+        .args(windows_self_update_powershell_args(version))
+        .env_remove("PSModulePath");
+    command
 }
 
 /// Run the self-update installer script interactively.
@@ -495,25 +590,8 @@ pub fn run_self_update(version: &str) -> ! {
 
     #[cfg(target_os = "windows")]
     {
-        let install_url = release_asset_url(version, WINDOWS_INSTALL_ASSET);
-        let checksums_url = release_asset_url(version, CHECKSUMS_ASSET);
-        let checksums_alt_url = release_asset_url(version, CHECKSUMS_ASSET_ALT);
-        let install_checksum_url = release_asset_url(version, WINDOWS_INSTALL_CHECKSUM_ASSET);
         // Windows doesn't have exec(), so we spawn and wait.
-        let status = std::process::Command::new("powershell")
-            .args([
-                "-ExecutionPolicy",
-                "Bypass",
-                "-NoProfile",
-                "-Command",
-                windows_self_update_script(),
-                &install_url,
-                &checksums_url,
-                version,
-                &checksums_alt_url,
-                &install_checksum_url,
-            ])
-            .status();
+        let status = windows_self_update_command(version).status();
         match status {
             Ok(s) => std::process::exit(installer_process_exit_code(s)),
             Err(e) => {
@@ -650,7 +728,7 @@ fn write_update_state_temp_file_at(path: &Path, contents: &[u8]) -> std::io::Res
     file.sync_all()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn write_update_state_temp_file_async(
     path: &Path,
     contents: &[u8],
@@ -673,7 +751,7 @@ async fn write_update_state_temp_file_async(
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn write_update_state_temp_file_at_async(
     path: &Path,
     contents: &[u8],
@@ -1122,8 +1200,47 @@ mod tests {
         assert!(script.contains("if ($Expected)"));
         assert!(script.contains(&format!(r#"$Parts[1] -eq "{WINDOWS_INSTALL_ASSET}""#)));
         assert!(script.contains("Get-FileHash"));
-        assert!(script.contains("-EasyMode -Verify -Version $Version"));
+        assert!(script.contains("& $Script -EasyMode -Version $Version"));
+        // The installed binary is verified here, not by the release's own
+        // install.ps1 -Verify, whose v0.10.0 self-test always exits 1 when it
+        // runs as a file.
+        assert!(!script.contains("-Verify"));
+        assert!(script.contains("$Reported = (& $Installed --version | Out-String).Trim()"));
+        assert!(script.contains("$Reported -notmatch $Wanted"));
         assert!(script.contains("Remove-Item -LiteralPath $Temp"));
+        // A failed step must fail the process: run from pwsh, a missing
+        // Get-FileHash left nothing installed and still exited 0.
+        assert!(
+            script
+                .trim_start()
+                .starts_with("$ErrorActionPreference = 'Stop'")
+        );
+        assert!(script.contains("} catch {\n    [Console]::Error.WriteLine(\"cass self-update failed: $_\")\n    exit 1\n}"));
+    }
+
+    /// The Windows PowerShell child must not inherit PowerShell 7's module
+    /// path: with it, `Get-FileHash` was not recognized when cass ran from
+    /// `pwsh`, and no self-update could install (GH #381, Windows).
+    #[test]
+    fn test_windows_self_update_child_drops_inherited_module_path() {
+        let command = windows_self_update_command("v1.2.3");
+        assert_eq!(command.get_program(), "powershell");
+        assert_eq!(
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            windows_self_update_powershell_args("v1.2.3")
+        );
+        let envs: Vec<_> = command.get_envs().collect();
+        assert_eq!(
+            envs,
+            [(
+                std::ffi::OsStr::new("PSModulePath"),
+                None::<&std::ffi::OsStr>
+            )],
+            "the only environment change is removing PSModulePath"
+        );
     }
 
     #[test]
@@ -1142,6 +1259,120 @@ mod tests {
         let script = windows_self_update_script();
         assert!(script.contains(&format!(r#"$Parts[1] -eq "{WINDOWS_INSTALL_ASSET}""#)));
         assert!(script.contains("@($ChecksumsUrl, $args[3], $args[4])"));
+    }
+
+    fn decode_powershell_encoded_command(encoded: &str) -> String {
+        use base64::prelude::*;
+        let bytes = BASE64_STANDARD.decode(encoded).expect("valid base64");
+        assert_eq!(bytes.len() % 2, 0, "UTF-16LE payload has whole code units");
+        let units: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .collect();
+        String::from_utf16(&units).expect("valid UTF-16")
+    }
+
+    /// GH #381: `powershell -Command <script> <url>...` never binds the URLs
+    /// to `$args` (PowerShell folds them into the command text), so every
+    /// Windows self-update ran with `$InstallUrl = $null`. No release URL may
+    /// appear as its own process argument; they must reach the script block.
+    #[test]
+    fn test_windows_self_update_passes_urls_to_the_script_block_not_the_command_line() {
+        let version = "v1.2.3";
+        let args = windows_self_update_powershell_args(version);
+        assert_eq!(
+            args[..4],
+            [
+                "-ExecutionPolicy",
+                "Bypass",
+                "-NoProfile",
+                "-EncodedCommand"
+            ]
+        );
+        assert_eq!(args.len(), 5, "only the encoded command follows: {args:?}");
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "-Command" || arg.starts_with("https://")),
+            "no URL or -Command token may reach powershell's own argv: {args:?}"
+        );
+
+        let command = decode_powershell_encoded_command(&args[4]);
+        let expected_args = [
+            release_asset_url(version, WINDOWS_INSTALL_ASSET),
+            release_asset_url(version, CHECKSUMS_ASSET),
+            version.to_string(),
+            release_asset_url(version, CHECKSUMS_ASSET_ALT),
+            release_asset_url(version, WINDOWS_INSTALL_CHECKSUM_ASSET),
+        ];
+        let suffix: String = expected_args
+            .iter()
+            .map(|arg| format!(" '{arg}'"))
+            .collect();
+        assert_eq!(
+            command,
+            format!("& {{{}}}{suffix}", windows_self_update_script()),
+            "the script must run as a script block whose $args are, in order, \
+             install URL, checksums URL, version, alternate checksums, standalone checksum"
+        );
+    }
+
+    #[test]
+    fn test_powershell_invocation_doubles_every_single_quote_form() {
+        let encoded = encode_powershell_script_invocation(
+            "Write-Output $args[0]",
+            &[
+                "it's",
+                "typographic \u{2018}a\u{2019} \u{201A}b\u{201B}",
+                "",
+            ],
+        );
+        assert_eq!(
+            decode_powershell_encoded_command(&encoded),
+            "& {Write-Output $args[0]} 'it''s' \
+             'typographic \u{2018}\u{2018}a\u{2019}\u{2019} \u{201A}\u{201A}b\u{201B}\u{201B}' ''"
+        );
+    }
+
+    /// Executes the encoding through a real PowerShell when one is installed
+    /// (Windows CI, or pwsh on Unix); skipped otherwise.
+    #[test]
+    fn test_powershell_invocation_binds_arguments_in_a_real_shell() {
+        // A fixed allowlist of interpreters, each named by a literal.
+        let interpreters: [fn() -> std::process::Command; 2] = [
+            || std::process::Command::new("pwsh"),
+            || std::process::Command::new("powershell"),
+        ];
+        let Some(shell) = interpreters.into_iter().find(|shell| {
+            shell()
+                .args(["-NoProfile", "-Command", "exit 0"])
+                .output()
+                .is_ok_and(|output| output.status.success())
+        }) else {
+            eprintln!("skipping: no PowerShell on PATH");
+            return;
+        };
+        let args = [
+            "https://example.invalid/a?x=1&y=2",
+            "it's; Write-Output injected",
+            "v1.2.3",
+        ];
+        let output = shell()
+            .args([
+                "-NoProfile",
+                "-EncodedCommand",
+                &encode_powershell_script_invocation("Write-Output ($args -join '|')", &args),
+            ])
+            .output()
+            .expect("run PowerShell");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            args.join("|"),
+            "arguments must arrive verbatim and unexecuted"
+        );
     }
 
     #[test]
@@ -1675,36 +1906,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[serial]
     fn test_update_state_save_replaces_existing_symlink() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let (_outside_dir, target_file) = install_update_state_symlink(temp_dir.path());
-        unsafe {
-            std::env::set_var("CASS_DATA_DIR", temp_dir.path());
-        }
-
         let state = UpdateState {
             last_check_ts: 42,
             skipped_version: Some("0.2.0".to_string()),
         };
-        state.save().unwrap();
-
-        unsafe {
-            std::env::remove_var("CASS_DATA_DIR");
-        }
+        state
+            .save(&temp_dir.path().join("update_state.json"))
+            .unwrap();
         assert_update_state_symlink_was_replaced(temp_dir.path(), &target_file, 42);
     }
 
     #[cfg(unix)]
     #[test]
-    #[serial]
     fn test_update_state_save_async_replaces_existing_symlink() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let (_outside_dir, target_file) = install_update_state_symlink(temp_dir.path());
-        unsafe {
-            std::env::set_var("CASS_DATA_DIR", temp_dir.path());
-        }
-
         let state = UpdateState {
             last_check_ts: 43,
             skipped_version: Some("0.2.0".to_string()),
@@ -1712,11 +1931,9 @@ mod tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("build test runtime");
-        runtime.block_on(state.save_async()).unwrap();
-
-        unsafe {
-            std::env::remove_var("CASS_DATA_DIR");
-        }
+        runtime
+            .block_on(state.save_async(&temp_dir.path().join("update_state.json")))
+            .unwrap();
         assert_update_state_symlink_was_replaced(temp_dir.path(), &target_file, 43);
     }
 
@@ -2177,34 +2394,40 @@ mod tests {
     #[test]
     #[serial]
     fn integration_force_check_bypasses_cadence_even_when_state_save_fails() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp_dir = tempfile::TempDir::new().unwrap();
         let state_file = temp_dir.path().join("update_state.json");
         let state = UpdateState {
             last_check_ts: now_unix(),
             skipped_version: None,
         };
-        std::fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+        let seeded_bytes = serde_json::to_vec_pretty(&state).unwrap();
+        std::fs::write(&state_file, &seeded_bytes).unwrap();
+        assert!(!state.should_check(), "seeded state must enforce cadence");
+
+        // A directory cannot be opened as the writable lock file, even by root.
+        let lock_path = update_state_lock_path(&state_file);
+        std::fs::create_dir(&lock_path).unwrap();
+        let before_error =
+            mutate_persisted_update_state_at(&state_file, &state_file, UpdateState::mark_checked)
+                .expect_err("the lock directory must prevent state persistence");
+        assert_eq!(
+            before_error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::IsADirectory),
+            "expected an actual lock-path directory error: {before_error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&state_file).unwrap(),
+            seeded_bytes,
+            "failed persistence must preserve the seeded cadence and preferences"
+        );
 
         let release_json = r#"{
             "tag_name": "v9.9.9",
             "html_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v9.9.9"
         }"#;
         let (addr, handle) = start_test_server(release_json, 200);
-
-        let dir_metadata = std::fs::metadata(temp_dir.path()).unwrap();
-        let file_metadata = std::fs::metadata(&state_file).unwrap();
-        let dir_mode = dir_metadata.permissions().mode();
-        let file_mode = file_metadata.permissions().mode();
-
-        let mut readonly_dir = dir_metadata.permissions();
-        readonly_dir.set_mode(0o555);
-        std::fs::set_permissions(temp_dir.path(), readonly_dir).unwrap();
-
-        let mut readonly_file = file_metadata.permissions();
-        readonly_file.set_mode(0o444);
-        std::fs::set_permissions(&state_file, readonly_file).unwrap();
 
         unsafe {
             std::env::set_var("CASS_DATA_DIR", temp_dir.path());
@@ -2219,14 +2442,7 @@ mod tests {
             .build()
             .expect("build test runtime");
         let result = runtime.block_on(force_check("0.1.0"));
-
-        let mut restore_file = std::fs::metadata(&state_file).unwrap().permissions();
-        restore_file.set_mode(file_mode);
-        std::fs::set_permissions(&state_file, restore_file).unwrap();
-
-        let mut restore_dir = std::fs::metadata(temp_dir.path()).unwrap().permissions();
-        restore_dir.set_mode(dir_mode);
-        std::fs::set_permissions(temp_dir.path(), restore_dir).unwrap();
+        let after_save = mark_update_check_complete();
 
         unsafe {
             std::env::remove_var("CASS_UPDATE_API_BASE_URL");
@@ -2235,6 +2451,20 @@ mod tests {
 
         handle.join().expect("server thread");
 
+        let after_error =
+            after_save.expect_err("the real update-check writer must still fail after force_check");
+        assert_eq!(
+            after_error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::IsADirectory),
+            "expected the same lock-path directory error after force_check: {after_error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&state_file).unwrap(),
+            seeded_bytes,
+            "force_check must preserve the seeded state when persistence fails"
+        );
         let info = result.expect("force check should bypass cadence and succeed");
         assert_eq!(info.latest_version, "9.9.9");
         assert!(info.is_newer);

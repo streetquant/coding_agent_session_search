@@ -82,6 +82,7 @@ pub(crate) enum SearchMaintenanceJobKind {
     LexicalRefresh,
     SemanticAcquire,
     SemanticRebuild,
+    AnalyticsRebuild,
 }
 
 impl SearchMaintenanceJobKind {
@@ -90,6 +91,7 @@ impl SearchMaintenanceJobKind {
             Self::LexicalRefresh => "lexical_refresh",
             Self::SemanticAcquire => "semantic_acquire",
             Self::SemanticRebuild => "semantic_rebuild",
+            Self::AnalyticsRebuild => "analytics_rebuild",
         }
     }
 
@@ -98,6 +100,7 @@ impl SearchMaintenanceJobKind {
             "lexical_refresh" => Some(Self::LexicalRefresh),
             "semantic_acquire" => Some(Self::SemanticAcquire),
             "semantic_rebuild" => Some(Self::SemanticRebuild),
+            "analytics_rebuild" => Some(Self::AnalyticsRebuild),
             _ => None,
         }
     }
@@ -558,6 +561,9 @@ pub(crate) struct SemanticAssetState {
     pub vector_index_path: Option<PathBuf>,
     pub model_dir: Option<PathBuf>,
     pub hnsw_path: Option<PathBuf>,
+    /// Presence is not native admission. Bounded inspection never loads a graph.
+    pub hnsw_present: bool,
+    pub hnsw_state: &'static str,
     pub hnsw_ready: bool,
     pub progressive_ready: bool,
     pub progressive_reason_code: Option<&'static str>,
@@ -784,6 +790,8 @@ fn semantic_state_not_inspected(
         vector_index_path: None,
         model_dir: preference_surface.model_dir,
         hnsw_path: None,
+        hnsw_present: false,
+        hnsw_state: "not_inspected",
         hnsw_ready: false,
         progressive_ready: false,
         progressive_reason_code: None,
@@ -952,7 +960,7 @@ pub(crate) fn semantic_state_from_availability(
     } else {
         runtime.hnsw_path.or(base_hnsw_path)
     };
-    let hnsw_ready = hnsw_path.as_ref().is_some_and(|path| path.is_file());
+    let (hnsw_present, hnsw_state) = bounded_ann_presence(hnsw_path.as_deref());
 
     // Sub-fix 3 for cass#257: report quality-tier readiness as a
     // first-class flag so operators querying `--mode semantic` can
@@ -974,7 +982,12 @@ pub(crate) fn semantic_state_from_availability(
         vector_index_path,
         model_dir,
         hnsw_path,
-        hnsw_ready,
+        hnsw_present,
+        hnsw_state,
+        // Only serving/deep admission against the retained exact owner may
+        // advertise native readiness. A metadata entry alone proves nothing
+        // about graph integrity, completeness, or source identity.
+        hnsw_ready: false,
         progressive_ready,
         progressive_reason_code,
         quality_tier_published,
@@ -984,6 +997,19 @@ pub(crate) fn semantic_state_from_availability(
         quality_tier,
         backlog,
         checkpoint,
+    }
+}
+
+fn bounded_ann_presence(path: Option<&Path>) -> (bool, &'static str) {
+    let Some(path) = path else {
+        return (false, "absent");
+    };
+    match std::fs::symlink_metadata(path) {
+        // Report even a dangling symlink as present, without following it or
+        // claiming that its target is a usable native accelerator.
+        Ok(_) => (true, "present_unverified"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (false, "absent"),
+        Err(_) => (false, "inspection_failed"),
     }
 }
 
@@ -2517,6 +2543,7 @@ mod tests {
             SearchMaintenanceJobKind::LexicalRefresh,
             SearchMaintenanceJobKind::SemanticAcquire,
             SearchMaintenanceJobKind::SemanticRebuild,
+            SearchMaintenanceJobKind::AnalyticsRebuild,
         ] {
             assert_eq!(
                 SearchMaintenanceJobKind::parse_lock_value(kind.as_lock_value()),
@@ -4025,11 +4052,52 @@ mod tests {
             "human summary and JSON reason code must agree: {}",
             state.summary
         );
-        assert!(state.hnsw_ready);
+        assert!(state.hnsw_present);
+        assert_eq!(state.hnsw_state, "present_unverified");
+        assert!(
+            !state.hnsw_ready,
+            "arbitrary bytes cannot prove native admission"
+        );
         assert_eq!(
             state.embedder_id.as_deref(),
             Some(FastEmbedder::embedder_id_static())
         );
+    }
+
+    #[test]
+    fn bounded_ann_presence_does_not_read_or_modify_sidecar_contents() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("ann.chsw");
+        assert_eq!(bounded_ann_presence(None), (false, "absent"));
+        assert_eq!(bounded_ann_presence(Some(&path)), (false, "absent"));
+        std::fs::write(&path, b"not native ANN metadata").expect("write decoy");
+        let before = std::fs::metadata(&path).expect("metadata before");
+        assert_eq!(
+            bounded_ann_presence(Some(&path)),
+            (true, "present_unverified")
+        );
+        let after = std::fs::metadata(&path).expect("metadata after");
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        assert_eq!(before.permissions(), after.permissions());
+        assert_eq!(std::fs::read(&path).unwrap(), b"not native ANN metadata");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_ann_presence_reports_dangling_symlink_without_following_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("absent-target");
+        let link = temp.path().join("ann.chsw");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+        assert_eq!(
+            bounded_ann_presence(Some(&link)),
+            (true, "present_unverified")
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
     }
 
     #[test]
@@ -5006,5 +5074,111 @@ mod tests {
             events[8].kind,
             MaintenanceEventKind::Cancelled { .. }
         ));
+    }
+
+    #[test]
+    fn inspect_lexical_assets_primes_fingerprint_cache_for_skip_open_health() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = crate::search::tantivy::expected_index_dir(temp.path());
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
+
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open canonical archive");
+        let fingerprint = crate::indexer::lexical_storage_fingerprint_for_storage(&storage)
+            .expect("compute storage fingerprint");
+        storage.close().expect("close storage");
+
+        let checkpoint_json = serde_json::json!({
+            "version": 3,
+            "schema_hash": SCHEMA_HASH,
+            "page_size": LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
+            "db": {
+                "db_path": db_path.display().to_string(),
+                "total_conversations": 0,
+                "total_messages": 0,
+                "storage_fingerprint": fingerprint,
+            },
+            "committed_offset": 0,
+            "committed_conversation_id": null,
+            "processed_conversations": 0,
+            "indexed_docs": 0,
+            "committed_meta_fingerprint": "test-meta",
+            "pending": null,
+            "completed": true,
+            "updated_at_ms": 1_733_000_000_000_i64,
+        });
+        std::fs::write(
+            index_path.join(".lexical-rebuild-state.json"),
+            serde_json::to_vec(&checkpoint_json).expect("serialize checkpoint"),
+        )
+        .expect("write checkpoint");
+
+        // Before priming the sidecar cache, skip-open health inspection cannot
+        // observe the fingerprint and therefore marks an age-exceeded archive stale.
+        let unprimed_health = inspect_lexical_assets(InspectLexicalAssetsInput {
+            data_dir: temp.path(),
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_ms: 1_733_000_600_000,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            db_available: true,
+            compute_lexical_fingerprint: false,
+        })
+        .expect("unprimed skip-open inspection");
+        assert_eq!(
+            unprimed_health.fingerprint.current_db_fingerprint, None,
+            "without sidecar cache, skip-open health has no fingerprint"
+        );
+        assert!(unprimed_health.stale);
+
+        // Status-mode inspection computes the fingerprint and primes the sidecar cache.
+        let status_view = inspect_lexical_assets(InspectLexicalAssetsInput {
+            data_dir: temp.path(),
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_ms: 1_733_000_600_000,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            db_available: true,
+            compute_lexical_fingerprint: true,
+        })
+        .expect("status inspection");
+        assert_eq!(status_view.status, "ready");
+        assert!(!status_view.stale);
+        assert_eq!(
+            status_view.fingerprint.matches_current_db_fingerprint,
+            Some(true)
+        );
+
+        // Subsequent skip-open health inspection now reads the primed sidecar cache
+        // and agrees with status on fingerprint and freshness.
+        let primed_health = inspect_lexical_assets(InspectLexicalAssetsInput {
+            data_dir: temp.path(),
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_ms: 1_733_000_600_000,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            db_available: true,
+            compute_lexical_fingerprint: false,
+        })
+        .expect("primed skip-open inspection");
+        assert_eq!(primed_health.status, "ready");
+        assert!(!primed_health.stale);
+        assert!(primed_health.fresh);
+        assert_eq!(
+            primed_health.fingerprint.current_db_fingerprint,
+            status_view.fingerprint.current_db_fingerprint
+        );
+        assert_eq!(
+            primed_health.fingerprint.matches_current_db_fingerprint,
+            Some(true)
+        );
     }
 }

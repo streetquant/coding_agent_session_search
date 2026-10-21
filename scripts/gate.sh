@@ -18,6 +18,7 @@
 #   scripts/gate.sh                 # fmt, clippy, lib tests, targeted integration, goldens
 #   scripts/gate.sh --lib-filter 'quill_bridge::tests health_watermark'   # narrow the lib run
 #   scripts/gate.sh --no-lib        # skip the lib suite (e.g. while bet45 wedge is open)
+#   scripts/gate.sh --no-bin        # skip the cass bin's own unit tests (stage bin-cass)
 #   scripts/gate.sh --local         # run stages locally (only where rch is not required)
 #   GATE_RETRIES=40 GATE_RETRY_SLEEP=90 scripts/gate.sh   # keep retrying fleet refusals
 #
@@ -27,21 +28,59 @@
 set -uo pipefail
 
 test_log_counts() {
-    awk '
+    local log="$1"
+    shift
+    local filters_nl=""
+    if [ "$#" -gt 0 ]; then
+        printf -v filters_nl '%s\n' "$@"
+    fi
+    GATE_TEST_FILTERS="$filters_nl" awk '
+        BEGIN {
+            n = split(ENVIRON["GATE_TEST_FILTERS"], raw_filters, "\n")
+            for (i = 1; i <= n; i++) {
+                if (length(raw_filters[i]) > 0) {
+                    filters[++filter_count] = raw_filters[i]
+                }
+            }
+        }
         /^running [0-9]+ tests?$/ {
-            if (started != binaries) incomplete++
-            started++
+            announced[++depth] = $2
+            next
         }
-        /^test result: ok\. [0-9]+ passed;/ {
-            if (started != binaries + 1) incomplete++
-            binaries++; passed += $4; if ($4 == 0) empty++
+        depth == 1 && /^test [^ ].* \.\.\. ok$/ {
+            line = $0
+            sub(/^test /, "", line)
+            sub(/ \.\.\. ok$/, "", line)
+            sub(/ - should panic$/, "", line)
+            for (f = 1; f <= filter_count; f++) {
+                if (index(line, filters[f]) > 0) {
+                    matched[f]++
+                }
+            }
+            next
         }
-        /^test result: FAILED\./ { empty++ }
+        /^test result: ok\. [0-9]+ passed; [0-9]+ failed; [0-9]+ ignored; [0-9]+ measured; [0-9]+ filtered out/ {
+            if (depth == 0) { incomplete++; next }
+            if ($6 != 0 || $4 + $6 + $8 + $10 != announced[depth]) incomplete++
+            if ($4 == 0) empty++
+            delete announced[depth--]
+            # Inherited subprocess output nests inside its parent test run.
+            # Count each top-level binary once; every child must still finish.
+            if (depth == 0) { binaries++; passed += $4 }
+            next
+        }
+        /^test result:/ { incomplete++ }
         END {
-            if (binaries == 0 || empty > 0 || incomplete > 0 || started != binaries) exit 1
+            for (f = 1; f <= filter_count; f++) {
+                if (!matched[f]) {
+                    printf "gate: test filter matched 0 passing tests: %s\n", filters[f] > "/dev/stderr"
+                    unmatched++
+                }
+            }
+            if (binaries == 0 || empty > 0 || incomplete > 0 || depth != 0 || unmatched > 0) exit 1
             printf "PASSED=%d BINARIES=%d\n", passed, binaries
         }
-    ' "$1"
+    ' "$log"
 }
 
 verify_receipt() {
@@ -135,7 +174,8 @@ if [ "${1:-}" = --verify-receipt ]; then
     exit $?
 fi
 if [ "${1:-}" = --verify-test-log ]; then
-    test_log_counts "$2"
+    shift
+    test_log_counts "$@"
     exit $?
 fi
 if [ "${1:-}" = --verify-fmt ]; then
@@ -147,12 +187,13 @@ if [ "${1:-}" = --verify-compile-inputs ]; then
     exit $?
 fi
 
-PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$PROJECT_ROOT"
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)" || exit 1
+cd "$PROJECT_ROOT" || exit 1
 
 LIB_FILTER=""
 RUN_LIB=1
 RUN_INTEGRATION=1
+RUN_BIN=1
 RUN_GOLDENS=1
 LOCAL=0
 REGEN_GOLDENS=0
@@ -160,7 +201,14 @@ RUN_DOCS_TRUTH=0
 UBS_FILES=()
 # Each entry is `<test-binary>` or `<test-binary>:<filter words>`; the filter
 # is passed after `--` so one admission can run only the tests a change touches.
-INTEGRATION_TESTS=(cli_robot bookmarks_cli)
+# search_metamorphic is the set-algebra oracle for search semantics (terms,
+# Boolean grammar, time windows; bead 2l1b0.68): a wrong-answer regression
+# there is invisible to every golden. pages_bundle holds the Pages viewer's
+# safety checks (CSP, sanitizer, crypto worker, auth expiry, service worker);
+# 20 of them sat red for days because no gate ran the target (2l1b0.77).
+# search_service compiles the `cass serve` sources and their unit tests (the
+# cass bin itself is `test = false`); 8 of them sat red for 9 days (5188e).
+INTEGRATION_TESTS=(cli_robot bookmarks_cli search_metamorphic pages_bundle search_service)
 while [ $# -gt 0 ]; do
     case "$1" in
         --lib-filter) LIB_FILTER="$2"; shift 2 ;;
@@ -179,6 +227,7 @@ while [ $# -gt 0 ]; do
         # second run with `--no-lib` for integration + goldens.
         --lib-only) RUN_INTEGRATION=0; RUN_GOLDENS=0; shift ;;
         --no-goldens) RUN_GOLDENS=0; shift ;;
+        --no-bin) RUN_BIN=0; shift ;;
         # README ↔ code truth (WS-A.9): key bindings, `cass … --flag` usages
         # and env vars, checked with the debug binary the integration stage
         # just built. Opt-in until the README is clean against main.
@@ -215,6 +264,25 @@ if [ "${#UBS_FILES[@]}" -eq 0 ]; then
         git ls-files --others --exclude-standard -z -- '*.rs' '*.py' '*.sh' '*.js' '*.ts' '*.tsx' '*.jsx'
     } | sort -zu)
 fi
+# Honour .ubsignore. The pinned runner scans every file it is named, even one
+# its own .ubsignore, --ignore-file or --exclude covers, so the config-level
+# suppression AGENTS.md prescribes only takes effect if the gate drops those
+# paths before naming them. Each skipped path is printed in the receipt.
+if [ -f .ubsignore ] && [ "${#UBS_FILES[@]}" -gt 0 ]; then
+    declare -A ubs_ignored=()
+    while IFS= read -r -d '' path; do
+        ubs_ignored["$path"]=1
+    done < <(git ls-files -z -c -o -i --exclude-from=.ubsignore -- "${UBS_FILES[@]}")
+    ubs_kept=()
+    for path in "${UBS_FILES[@]}"; do
+        if [ -n "${ubs_ignored[${path#./}]:-}" ]; then
+            echo "gate: UBS skips .ubsignore path ${path}"
+        else
+            ubs_kept+=("$path")
+        fi
+    done
+    UBS_FILES=("${ubs_kept[@]}")
+fi
 UBS_FILES_ARG=""
 if [ "${#UBS_FILES[@]}" -gt 0 ]; then
     for path in "${UBS_FILES[@]}"; do
@@ -235,9 +303,15 @@ source_digest() {
 SOURCE_DIFF="$(source_digest)" || exit 1
 # RCH 1.0.63 does not combine --job with clean-overlay/content-receipt.
 # Verify the transferred inputs ourselves before running any stage.
+# rch's global transfer excludes drop every `.beads/` directory, so tracked
+# files such as tests/.beads/* never reach the worker. Hashing them made the
+# identity verdict depend on stale leftovers of whichever worker was chosen
+# (green on one worker, red on another for the same tree). No build or test
+# reads them, so they are not inputs this gate can or needs to verify.
 SOURCE_PATHS="$(git ls-files --cached --others --exclude-standard -z -- \
     Cargo.toml Cargo.lock rust-toolchain.toml build.rs src tests benches scripts \
-    .cargo .github README.md | sort -zu | gzip -c | base64 -w0)" || exit 1
+    .cargo .github README.md ':(exclude,glob)**/.beads/**' | \
+    sort -zu | gzip -c | base64 -w0)" || exit 1
 SOURCE_CONTENT="$(printf '%s' "$SOURCE_PATHS" | base64 -d | gzip -d | \
     xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1)" || exit 1
 
@@ -246,6 +320,11 @@ SOURCE_CONTENT="$(printf '%s' "$SOURCE_PATHS" | base64 -d | gzip -d | \
 run_tests() {
     local stage="$1"
     shift
+    local -a filters=()
+    while [ "${1:-}" = --filter ]; do
+        filters+=("$2")
+        shift 2
+    done
     local log rc counts
     local -a statuses
     log="$(mktemp -t cass-gate-tests.XXXXXX)"
@@ -254,7 +333,7 @@ run_tests() {
     rc=${statuses[0]}
     [ "${statuses[1]}" -eq 0 ] || rc=1
     if [ "$rc" -eq 0 ]; then
-        if counts="$(test_log_counts "$log")"; then
+        if counts="$(test_log_counts "$log" "${filters[@]}")"; then
             echo "TEST_COUNT=${stage} ${counts}"
         else
             echo "gate: ${stage} has missing or empty test binaries (log=${log})" >&2
@@ -265,24 +344,27 @@ run_tests() {
 }
 
 run_ubs() {
-    local expected actual scanner expected_sha tool_dir
+    local expected actual scanner installed expected_sha expected_contract_sha tool_dir
     expected="$(tr -d '[:space:]' < .github/workflows/ubs-version.txt)"
     # The runner verifies its language modules against embedded release hashes.
     # Updating the pin also requires reviewing the new runner digest here.
-    if [ "$expected" != v5.3.13 ]; then
+    if [ "$expected" != v5.4.4 ]; then
         echo "gate: no reviewed UBS runner digest for ${expected}" >&2
         return 1
     fi
-    expected_sha=47474fd2adee9be2af4796b656a68cb2074c95b9f50b8a7de492873b4528703f
-    scanner="$(command -v ubs || true)"
-    if [ -z "$scanner" ] || [ "$(sha256sum "$scanner" | cut -d' ' -f1)" != "$expected_sha" ]; then
-        # Preserve the worker's installed tool. A fresh private directory also
-        # prevents an unrelated tool update from racing this invocation.
-        tool_dir="$(mktemp -d -t cass-gate-ubs.XXXXXX)" || return 1
-        scanner="$tool_dir/ubs"
+    expected_sha=bdeccbb35f2056e6177c73b3f0f9966d20d1cbeff22b7f084133c4a6ac625ee2
+    expected_contract_sha=7319b2e5e085d0dd2434e5114291b2dee9fbbb96e2cfe02027eb263abcb06ac3
+    # Keep both runner and modules private: a different pinned UBS invocation
+    # would otherwise replace the shared module cache while this one scans.
+    tool_dir="$(mktemp -d -t cass-gate-ubs.XXXXXX)" || return 1
+    scanner="$tool_dir/ubs"
+    installed="$(command -v ubs || true)"
+    if [ -n "$installed" ] && [ "$(sha256sum "$installed" | cut -d' ' -f1)" = "$expected_sha" ]; then
+        cp "$installed" "$scanner" || return 1
+    else
         echo "gate: acquiring pinned UBS ${expected} in ${tool_dir}"
         curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            --max-time 60 --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' \
+            --max-time 60 --user-agent 'cass-gate (+https://github.com/Dicklesworthstone/coding_agent_session_search)' \
             "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/${expected}/ubs" \
             --output "$scanner" || return 1
     fi
@@ -290,16 +372,42 @@ run_ubs() {
         echo "gate: UBS runner bytes differ from the pinned release" >&2
         return 1
     fi
+    # Multi-file language routing runs before module acquisition. A private
+    # runner without its contract would classify every explicit target as
+    # unsupported and exit without scanning anything.
+    mkdir -p "$tool_dir/modules" || return 1
+    # A prior admission may seed a fresh private copy of the same pinned
+    # release. The runner still verifies every module/helper before execution.
+    # Copy bytes rather than retaining links to another invocation's cache.
+    if [ -n "${GATE_UBS_MODULE_SEED_DIR:-}" ]; then
+        if [ ! -d "$GATE_UBS_MODULE_SEED_DIR" ] || \
+           [ ! -f "$GATE_UBS_MODULE_SEED_DIR/contract.json" ] || \
+           [ "$(sha256sum "$GATE_UBS_MODULE_SEED_DIR/contract.json" | cut -d' ' -f1)" != "$expected_contract_sha" ]; then
+            echo "gate: UBS module seed does not match the pinned release contract" >&2
+            return 1
+        fi
+        cp -RL "$GATE_UBS_MODULE_SEED_DIR/." "$tool_dir/modules/" || return 1
+        echo "UBS_MODULE_SEED=private-copy"
+    fi
+    curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+        --max-time 60 --user-agent 'cass-gate (+https://github.com/Dicklesworthstone/coding_agent_session_search)' \
+        "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/${expected}/modules/contract.json" \
+        --output "$tool_dir/modules/contract.json" || return 1
+    if [ "$(sha256sum "$tool_dir/modules/contract.json" | cut -d' ' -f1)" != "$expected_contract_sha" ]; then
+        echo "gate: UBS routing contract bytes differ from the pinned release" >&2
+        return 1
+    fi
     actual="$(bash "$scanner" --version)" || return 1
     echo "UBS_VERSION=${actual} UBS_PIN=${expected} UBS_SHA256=${expected_sha}"
+    echo "UBS_MODULE_DIR=${tool_dir}/modules"
+    echo "UBS_CONTRACT_SHA256=${expected_contract_sha}"
     if [ "$#" -eq 0 ]; then
         echo "UBS_FILES=0 (no changed scanner-supported source files)"
         return 0
     fi
     printf 'UBS_FILE=%s\n' "$@"
-    # The pinned runner emits only aggregate Rust counts in JSON/JSONL mode.
     # Text retains categories and source samples needed to diagnose a red gate.
-    bash "$scanner" --no-auto-update --format=text --ci --fail-on-warning "$@"
+    UBS_ALLOW_UNVERIFIED_HELPERS=0 bash "$scanner" --module-dir="$tool_dir/modules" --no-auto-update --format=text --ci --fail-on-warning "$@"
 }
 
 # Every stage records its own exit code and preserves complete test output.
@@ -315,8 +423,15 @@ if [ "$RUN_LIB" = 1 ]; then
     fi
     read -r -a filter_words <<< "$LIB_FILTER"
     filter_args=""
-    [ "${#filter_words[@]}" -eq 0 ] || printf -v filter_args ' %q' "${filter_words[@]}"
-    lib_stage="run_tests lib-tests timeout ${LIB_TIMEOUT} cargo test --locked -j ${BUILD_JOBS} --lib -- --test-threads=${BUILD_JOBS} ${filter_args};"
+    filter_check_args=""
+    if [ "${#filter_words[@]}" -gt 0 ]; then
+        printf -v filter_args ' %q' "${filter_words[@]}"
+        for fw in "${filter_words[@]}"; do
+            printf -v fw_q ' --filter %q' "$fw"
+            filter_check_args+="$fw_q"
+        done
+    fi
+    lib_stage="run_tests lib-tests${filter_check_args} timeout ${LIB_TIMEOUT} cargo test --locked -j ${BUILD_JOBS} --lib -- --test-threads=${BUILD_JOBS} ${filter_args};"
 fi
 # Every stage the remote script will run, in order. The receipt check below
 # requires each one to report: a job cut short by the fleet's SSH ceiling
@@ -344,10 +459,37 @@ if [ "$RUN_INTEGRATION" = 1 ]; then
         fi
         read -r -a filter_words <<< "$filter"
         filter_args=""
-        [ "${#filter_words[@]}" -eq 0 ] || printf -v filter_args ' %q' "${filter_words[@]}"
-        integration_stage+="run_tests test-${t} cargo test --locked -j ${BUILD_JOBS} --test ${t} -- --test-threads=${BUILD_JOBS} ${filter_args};"
+        filter_check_args=""
+        if [ "${#filter_words[@]}" -gt 0 ]; then
+            printf -v filter_args ' %q' "${filter_words[@]}"
+            for fw in "${filter_words[@]}"; do
+                printf -v fw_q ' --filter %q' "$fw"
+                filter_check_args+="$fw_q"
+            done
+        fi
+        integration_stage+="run_tests test-${t}${filter_check_args} cargo test --locked -j ${BUILD_JOBS} --test ${t} -- --test-threads=${BUILD_JOBS} ${filter_args};"
         EXPECTED_STAGES+=("test-${t}")
     done
+fi
+if [ "$RUN_INTEGRATION" = 1 ] && [ "$RUN_BIN" = 1 ]; then
+    # The cass bin is `test = false`, so the unit tests of its own modules
+    # (logical_archive's backup/restore codec, the CLI modules) ran in no gate;
+    # one hung for hours unseen (m5cob). search_service's share runs as
+    # --test search_service. Every other skip names the bead whose fix
+    # removes it.
+    BIN_TIMEOUT="${GATE_BIN_TIMEOUT_SECS:-900}"
+    if [[ ! "$BIN_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+        echo "gate: GATE_BIN_TIMEOUT_SECS must be a positive integer" >&2
+        exit 2
+    fi
+    BIN_SKIPS=(
+        search_service::
+        logical_archive::import::publication_tests::publication_materializes_wal_rows_without_borrowing_replay_sidecars # svhcf
+        logical_archive::export::ordering_tests::explicit_or_unattested_collations_keep_binary_order_and_verify # p94yt
+    )
+    printf -v bin_skip_args ' --skip %q' "${BIN_SKIPS[@]}"
+    integration_stage+="run_tests bin-cass timeout ${BIN_TIMEOUT} cargo test --locked -j ${BUILD_JOBS} --bin cass -- --test-threads=${BUILD_JOBS}${bin_skip_args};"
+    EXPECTED_STAGES+=(bin-cass)
 fi
 golden_regen_stage=""
 golden_stage=""
@@ -377,6 +519,12 @@ REMOTE_SCRIPT="$(declare -f test_log_counts run_tests run_fmt run_ubs prepare_co
 set -o pipefail
 echo SOURCE_HEAD=${SOURCE_HEAD}
 prepare_compile_inputs '${SOURCE_PATHS}' '${SOURCE_CONTENT}' || exit 1
+# These native stores live outside HOME. A test that replaces HOME must never
+# discover the host's shared transcripts. Individual connector fixtures can
+# explicitly override these roots in their own child process.
+native_fixture_root=\"\$(mktemp -d -t cass-gate-native.XXXXXX)\" || exit 1
+export CASS_CLOUDMCP_DATA_ROOT=\"\${native_fixture_root}/cloudmcp\"
+export CASS_OPENWEBUI_DATA_ROOT=\"\${native_fixture_root}/openwebui\"
 run_fmt; echo STAGE=fmt EXIT=\$?; \
 cargo clippy --locked -j ${BUILD_JOBS} --all-targets -- -D warnings; echo STAGE=clippy EXIT=\$?; \
 ${lib_stage} ${integration_stage} ${golden_regen_stage} ${golden_stage} ${docs_truth_stage} \

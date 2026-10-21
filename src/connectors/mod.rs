@@ -4,6 +4,8 @@
 //! This module provides re-export stubs plus the CASS-specific wrappers used by
 //! every connector factory exposed to the indexer.
 
+pub(crate) mod source_dependencies;
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -95,7 +97,10 @@ pub struct CodexScanPreflight {
 /// directory root: `franken_agent_detection` includes `.codex/sessions/...` in
 /// the external ID from that shape, while explicit file roots make the ID
 /// relative to `sessions/`. Unreadable or ambiguous roots similarly fall back
-/// so the connector's existing behavior remains the source of truth.
+/// so the connector's existing behavior remains the source of truth. A home
+/// with archived_sessions keeps its directory scope too: archive discovery
+/// owns its distinct cutoff and identity policy. An empty expansion must not
+/// turn an explicit selection into ScanContext's implicit default-home scan.
 #[doc(hidden)]
 #[must_use]
 pub fn preflight_codex_explicit_file_roots(
@@ -111,18 +116,18 @@ pub fn preflight_codex_explicit_file_roots(
             if is_codex_rollout_file(&root.path) {
                 explicit_file_roots = explicit_file_roots.saturating_add(1);
             }
-            scan_roots.push(root.clone());
+            scan_roots.push(root.clone()); // ubs:ignore -- Return an owned root while preserving the caller's borrowed source provenance.
             continue;
         }
 
         match codex_explicit_file_roots_for_root(root, since_ts) {
-            Ok(expanded) => {
+            Ok(expanded) if !expanded.is_empty() => {
                 explicit_file_roots = explicit_file_roots.saturating_add(expanded.len());
                 scan_roots.extend(expanded);
             }
-            Err(_) => {
+            Ok(_) | Err(_) => {
                 fallback_roots = fallback_roots.saturating_add(1);
-                scan_roots.push(root.clone());
+                scan_roots.push(root.clone()); // ubs:ignore -- Fallback must preserve the full borrowed root in the owned output.
             }
         }
     }
@@ -143,6 +148,20 @@ fn codex_explicit_file_roots_for_root(
         return Err(io::Error::other(
             "parent codex roots keep directory scan to preserve external IDs",
         ));
+    }
+
+    // Full-home discovery includes archived_sessions, including old rollouts
+    // moved there without an mtime change. Narrowing that home to active files
+    // would drop the archive and its stable-ID/cutoff rules. Even an unreadable
+    // or dangling archive entry must retain the authoritative directory path.
+    match fs::symlink_metadata(root.path.join("archived_sessions")) {
+        Ok(_) => {
+            return Err(io::Error::other(
+                "codex homes with archives keep directory discovery",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
 
     let sessions = codex_sessions_dir(&root.path);
@@ -202,12 +221,17 @@ fn collect_codex_rollout_files(sessions: &Path, since_ts: Option<i64>) -> io::Re
             let file_type = entry.file_type()?;
             let path = entry.path();
             if file_type.is_dir() {
-                pending_dirs.push(path);
+                pending_dirs.push(path); // ubs:ignore -- Read-only DirEntry traversal; no archive extraction or destination write, and symlink directories are not followed.
             } else if file_type.is_file()
                 && is_codex_rollout_file(&path)
+                // Match FAD's directory discovery during compression: prefer
+                // the plain representation before applying the time cutoff,
+                // rather than ingesting two snapshots of the same session.
+                && !(franken_agent_detection::connectors::codex::is_compressed_rollout(&path)
+                    && path.with_extension("").is_file())
                 && file_modified_since(&path, since_ts)
             {
-                files.push(path);
+                files.push(path); // ubs:ignore -- Collect a read-only rollout source from DirEntry; no archive extraction or destination write.
             }
         }
     }
@@ -218,6 +242,11 @@ fn collect_codex_rollout_files(sessions: &Path, since_ts: Option<i64>) -> io::Re
 }
 
 fn is_codex_rollout_file(path: &Path) -> bool {
+    // CASS unconditionally enables FAD's codex-zstd reader. Share its filename
+    // recognition so compressed-only histories cannot disappear in preflight.
+    if franken_agent_detection::connectors::codex::is_compressed_rollout(path) {
+        return true;
+    }
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
@@ -239,7 +268,9 @@ pub mod claude_code;
 pub mod clawdbot;
 pub mod cline;
 pub mod cloudmcp;
+pub mod codebuff;
 pub mod codex;
+pub mod continue_dev;
 pub mod copilot;
 pub mod copilot_cli;
 pub mod crush;
@@ -256,12 +287,16 @@ pub mod omp;
 pub mod openclaw;
 pub mod opencode;
 pub mod openhands;
+pub mod openwebui;
 pub mod pi_agent;
 pub mod qwen;
 pub mod vibe;
 
 /// Constructor function used by the runtime connector registry.
 pub type ConnectorFactory = fn() -> Box<dyn Connector + Send>;
+
+/// Runtime factories that can retain the receiving archive's state directory.
+pub(crate) type ArchiveConnectorFactory = Box<dyn Fn() -> Box<dyn Connector + Send> + Send + Sync>;
 
 fn claude_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(claude_code::ClaudeCodeConnector::new())
@@ -283,42 +318,118 @@ fn cursor_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(cursor::CursorConnector::new())
 }
 
+fn codebuff_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(codebuff::CodebuffConnector::new())
+}
+
+fn continue_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(continue_dev::ContinueConnector::new())
+}
+
 fn omp_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(omp::OmpConnector::new())
+}
+
+fn opencode_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(opencode::OpenCodeConnector::new())
 }
 
 fn pi_agent_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(pi_agent::PiAgentConnector::new())
 }
 
+fn grok_bot_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(grok::GrokBotConnector::new())
+}
+
+fn copilot_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(copilot::CopilotConnector::new())
+}
+
 /// Return connector factories with CASS-specific wrappers applied.
 ///
 /// Codex passes through CASS's enrichment wrapper so modern `function_call`
 /// arguments reach the production indexer. Cursor passes through the
-/// `.workspace-trusted` authority adapter while registry 0.2.3 remains pinned.
+/// `.workspace-trusted` authority adapter to preserve local attribution rules.
 /// OMP passes through its profile
 /// provenance adapter, and Pi Agent passes through the OMP identity boundary
 /// that prevents broad explicit roots from indexing the same store twice.
+/// OpenClaw passes through its native-store WAL and state-directory adapter.
+/// Copilot passes through a detection widening that also recognises VS Code's
+/// native chat stores, which the upstream scanner reads but never detected.
+/// Codebuff delegates parsing to FAD while adding per-transcript checkpoints.
+/// Continue applies source exclusions and ledger-first retries before parsing.
 #[must_use]
 pub fn get_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
-    let mut factories: Vec<(&'static str, ConnectorFactory)> =
-        franken_agent_detection::get_connector_factories()
-            .into_iter()
-            .map(|(name, factory)| {
-                let factory = match name {
-                    "antigravity" => antigravity_connector_factory as ConnectorFactory,
-                    "claude" => claude_connector_factory as ConnectorFactory,
-                    "cline" => cline_connector_factory as ConnectorFactory,
-                    "codex" => codex_connector_factory as ConnectorFactory,
-                    "cursor" => cursor_connector_factory as ConnectorFactory,
-                    "omp" => omp_connector_factory as ConnectorFactory,
-                    "pi_agent" => pi_agent_connector_factory as ConnectorFactory,
-                    _ => factory,
-                };
-                (name, factory)
-            })
-            .collect();
-    factories.push(("kilo", || Box::new(kilo::KiloConnector::new())));
-    factories.push(("cloudmcp", || Box::new(cloudmcp::CloudMcpConnector::new())));
-    factories
+    get_connector_registrations()
+        .into_iter()
+        .map(|registration| (registration.name, registration.factory))
+        .collect()
 }
+
+/// Bind production connectors to their receiving archive while preserving the
+/// discovery registry and independently injected test factories.
+pub(crate) fn get_connector_factories_for_archive(
+    data_dir: &Path,
+) -> Vec<(&'static str, ArchiveConnectorFactory)> {
+    get_connector_factories()
+        .into_iter()
+        .map(|(name, factory)| {
+            let data_dir = data_dir.to_path_buf();
+            let bound: ArchiveConnectorFactory = Box::new(move || {
+                if name == "codex" {
+                    Box::new(codex::CodexConnector::new().with_archive_data_dir(&data_dir))
+                } else {
+                    factory()
+                }
+            });
+            (name, bound)
+        })
+        .collect()
+}
+
+/// Runtime factories and their explicit source-dependency capabilities.
+pub(crate) fn get_connector_registrations() -> Vec<source_dependencies::ConnectorRegistration> {
+    use source_dependencies::ConnectorRegistration;
+
+    let mut registrations: Vec<_> = franken_agent_detection::get_connector_factories()
+        .into_iter()
+        .map(|(name, factory)| {
+            let mut registration = match name {
+                "antigravity" => ConnectorRegistration::new(name, antigravity_connector_factory),
+                "cline" => ConnectorRegistration::new(name, cline_connector_factory),
+                "cursor" => ConnectorRegistration::new(name, cursor_connector_factory),
+                "opencode" => ConnectorRegistration::new(name, opencode_connector_factory),
+                "claude" => {
+                    ConnectorRegistration::new(name, claude_connector_factory)
+                        .with_source_capability::<claude_code::ClaudeCodeConnector>("claude_code")
+                }
+                "codex" => ConnectorRegistration::new(name, codex_connector_factory)
+                    .with_source_capability::<codex::CodexConnector>("codex"),
+                "codebuff" => ConnectorRegistration::new(name, codebuff_connector_factory)
+                    .with_source_capability::<codebuff::CodebuffConnector>("codebuff"),
+                "continue" => ConnectorRegistration::new(name, continue_connector_factory),
+                "omp" => ConnectorRegistration::new(name, omp_connector_factory),
+                "pi_agent" => ConnectorRegistration::new(name, pi_agent_connector_factory),
+                "grok_bot" => ConnectorRegistration::new(name, grok_bot_connector_factory),
+                "copilot" => ConnectorRegistration::new(name, copilot_connector_factory),
+                _ => ConnectorRegistration::new(name, factory),
+            };
+            registration.factory = openclaw::with_wal_freshness(name, registration.factory);
+            registration
+        })
+        .collect();
+    registrations.push(ConnectorRegistration::new("kilo", || {
+        Box::new(kilo::KiloConnector::new())
+    }));
+    registrations.push(ConnectorRegistration::new("cloudmcp", || {
+        Box::new(cloudmcp::CloudMcpConnector::new())
+    }));
+    registrations.push(ConnectorRegistration::new("openwebui", || {
+        Box::new(openwebui::OpenWebUiConnector::new())
+    }));
+    registrations
+}
+
+#[cfg(test)]
+mod preflight_tests;

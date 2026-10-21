@@ -158,6 +158,7 @@ fn answer_pack_perf_render_request(
     limits: PackPlannerLimits,
 ) -> PackRenderRequest {
     PackRenderRequest {
+        effective: None,
         query_text: "checkout failure answer pack freshness".to_string(),
         normalized_query: "checkout failure answer pack freshness".to_string(),
         generated_at_ms: ANSWER_PACK_PERF_NOW_MS,
@@ -174,6 +175,7 @@ fn answer_pack_perf_render_request(
         limits,
         search_mode: "lexical".to_string(),
         fallback_mode: Some("lexical".to_string()),
+        fallback_reason: Some("pack_enrichment_unavailable".to_string()),
         semantic_joined: false,
         freshness_policy: PackFreshnessPolicy::PreferRecent,
         freshness_window_seconds: ANSWER_PACK_FRESHNESS_WINDOW_SECONDS,

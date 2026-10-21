@@ -1,0 +1,3642 @@
+{
+  "architecture_map_hash": "25ffde3a62b1eb07bb25c59db477d9a05756f3a22f4508d1e21cab82ea65d2d7",
+  "architecture_map_sha256": "5d26a6d60377a6c6765cdbee44e9dd1ded1f5cd9e91e6da9d41417f52c0dc3bc",
+  "blind_spots": [
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/artifact-manifests/rc_a1c43fcb8313c042ff8c0b696e61aa62-0.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/0217e9528602769638ecb62a7b9cfe49.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/038260dcd4e133d40f6747144a97d305.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/0bc8101f13e2af4f01722d1a48a6c693.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/15ab68e03cebaebb6f2065387d4b39bc.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/1a841c53a4f4858445595741b3cda81f.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/1e488c59e04ea5f44d0e0bb3dc781d4a.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/2880c5f0f30e988a2c07aed72969a668.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/2883ea2ae50d05898b716372b35c51e6.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/301f2919f1c6847f51ce03e9181383d0.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/42b3c13541a335807ef37d46b560536c.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/4efa7bea9f84e0cd743818094a3e75ac.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/514cfe43686924bb9c82ebc607a3f185.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/554851f7bdb5463a56d6b4ef74bc49c6.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/6740d3286cbc5d0ac294ae58a5c9b94f.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/699833d7c2fef8f76b0e64d0f6ae8d9b.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/6c41a2b8bea7a698a140f77c82683261.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/779141dea6f3d8b0d1136559867fa3f0.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/77aed2b82eb0553ede6b6d7a8bef1c0e.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/813d9fbf6d1510b597f77a8d1d662f9f.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/8ddc5551df8f88b66c9d9545a0b0d370.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/99e9b340b207023d310076357ca47903.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/9ca68fe72f31925ab91e10385f44c0e6.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/9d9059345a341f0cabc1bec93c159348.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/9f41df2f240b3b69e1545ddd78588f0b.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/a062eee39ced223ecc7018e68aec5fbf.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/a823f270c5774cd557fd0a012812f4da.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/afa77f964aff6607c31ea670d63f8ad8.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/b652bf54c05ba6af4fb53384a42f5751.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/c3dcc08db50abcd2b9821f6279dd822b.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/c4d2c8cc032e7ac1474243c8a9eeebbe.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/d7f5fdf4d6c049c933b422fb1afa6fab.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/d90b752cd223a3bc621dc9b75eb1f098.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/ddf038b857e2a6dbe1a611d434f55185.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/dfb77e320856b4266afb6220ccdfe6c5.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/ledgers/ff2042072d23d34cc69ace7ef7918c27.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_036b55269e1f0a8d1a02376af3bccfe4.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_03f2a9c334d1d83373fffbe7f9cca534.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_062fc17fa1848a11b5c42e735de4bb34.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_06bc53fdcc1ba17dcc471abd5ea7e3cf.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_0788f20ae35c142841488e1c51d739b1.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_083dc0163c49a1bfec7d711e1d80d969.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_0a3e67eb2091678cb2e7bc18dd27b2fd.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_0d05d7d8343cd15740dcbdffc17cca5a.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_0e0e1a2e5411337748ef17153f88db56.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_107b030fb8bc693bbacdf07922dab8d6.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_1733d965c33e9a535b5ad814e25712e0.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_1f3dda46c79b627ce85dded2735358b2.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_21ae14f34fbbb49a248d56fc96a69efa.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_230bc3cd7e18215bbb2dc5863913ad75.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_24b2933712a97290ea75471f67231634.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_2556c2a6985424d8a488c72f3f532022.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_26788b37fb748d51f9d89596fd071acf.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_272e865fb8f7d5d7cbed521c4c1fe3b0.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_2a6ece4212e5a040cc85916cf7ee7e1f.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_2dfc78cfe506183d0cda7557932dfe28.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_2efb1e37053545c9baea199468711ac4.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_324f08acd1cf6097afa056d730a357c9.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_32e0c396846f4faa41862e84414ec2d3.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_373185c6b251830da3c379ed1c31e468.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_41728f0b201e4fa0a0a004804094aecc.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_4c43371280a7fd6c4909fe8451515307.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_526fa02c1a21aaa573faf673540daa5b.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_5676dc43fd1cb24afa907d815e4cfe1c.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_5758e9726bdf9cdff24dd2c04bc2ad24.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_5a65350f5508685927d37b763fbda346.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_5b86f761ac55bd89c626f6830dbcc9df.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_5eee77ba8d66a7994b3ae1a01f07d714.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_6aa7d7f9fc8fd710fecfb747b341757a.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_6cf1a4f0f9b2e334da0b79e814638516.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_714c864eed0eb06c510a5e519fca5936.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_7433c859c1d8db05a7c98ca9b75c15e6.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_7dfad24ffc8fde70ebaf41a5b2131105.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_8340db4f819085fe06d0b95b91881a16.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_96fb894d28c7eed96a7be5cc880c1e44.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_9d8029f236e2c1b55fd32b2dee647002.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_9ed85fb372992267a13ca0bfa9d7b4c6.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_a1bde74ab09da83f14b5e00be2272dd5.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_a1c43fcb8313c042ff8c0b696e61aa62.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_a24e9a1ebf0dc6da5dcbe22f02050da7.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_a5afe803c7cbe7c198757d990eb752b1.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_b055935a29b37156a218429e3202e57d.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_bd059aaed04d61a5f991bab1c7f0b3ef.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_c199c056b86275965150398a45bcada9.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_c2325f959ce020582837857c5a0651b1.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_c40b76f1e773f1f29cd4552329de1823.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_c68c37dd1f8209abf4af3835e5e175a9.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_cc795da36110a83d254eaa662400797f.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_cf99283d6fa82e24d435693843fc2c30.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_d74018a3e112c1987eba7e0f521225d4.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_db74671fa6a27e592610d8aedcedddb0.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_dd2f2b2623b44ef61d272955ccf27eb1.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_df2df5c80cb7102bb30489e3471a1ec3.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_e6319836f3bdddcfe850ff8462cb9cf5.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_e6aab2c4b55340030a9de29620533577.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_e7c05cfc051f6334afacbe90b40a5498.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_e939f0c434c4a2393834f2af76dfa25d.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_eae96b312202da5ec990a61336d483f9.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_f2a74ed6268c86a74e407d24350a5597.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/pending/rc_f4491e3fa7d1be884d05162a39846871.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_036b55269e1f0a8d1a02376af3bccfe4.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_03f2a9c334d1d83373fffbe7f9cca534.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_062fc17fa1848a11b5c42e735de4bb34.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_06bc53fdcc1ba17dcc471abd5ea7e3cf.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_0788f20ae35c142841488e1c51d739b1.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_083dc0163c49a1bfec7d711e1d80d969.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_0a3e67eb2091678cb2e7bc18dd27b2fd.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_0d05d7d8343cd15740dcbdffc17cca5a.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_0e0e1a2e5411337748ef17153f88db56.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_107b030fb8bc693bbacdf07922dab8d6.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_1733d965c33e9a535b5ad814e25712e0.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_1f3dda46c79b627ce85dded2735358b2.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_21ae14f34fbbb49a248d56fc96a69efa.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_230bc3cd7e18215bbb2dc5863913ad75.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_24b2933712a97290ea75471f67231634.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_2556c2a6985424d8a488c72f3f532022.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_26788b37fb748d51f9d89596fd071acf.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_272e865fb8f7d5d7cbed521c4c1fe3b0.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_2a6ece4212e5a040cc85916cf7ee7e1f.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_2dfc78cfe506183d0cda7557932dfe28.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_2efb1e37053545c9baea199468711ac4.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_324f08acd1cf6097afa056d730a357c9.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_32e0c396846f4faa41862e84414ec2d3.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_373185c6b251830da3c379ed1c31e468.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_41728f0b201e4fa0a0a004804094aecc.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_4c43371280a7fd6c4909fe8451515307.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_526fa02c1a21aaa573faf673540daa5b.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_5676dc43fd1cb24afa907d815e4cfe1c.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_5758e9726bdf9cdff24dd2c04bc2ad24.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_5a65350f5508685927d37b763fbda346.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_5b86f761ac55bd89c626f6830dbcc9df.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_5eee77ba8d66a7994b3ae1a01f07d714.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_6aa7d7f9fc8fd710fecfb747b341757a.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_6cf1a4f0f9b2e334da0b79e814638516.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_714c864eed0eb06c510a5e519fca5936.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_7433c859c1d8db05a7c98ca9b75c15e6.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_7dfad24ffc8fde70ebaf41a5b2131105.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_8340db4f819085fe06d0b95b91881a16.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_96fb894d28c7eed96a7be5cc880c1e44.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_9d8029f236e2c1b55fd32b2dee647002.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_9ed85fb372992267a13ca0bfa9d7b4c6.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_a1bde74ab09da83f14b5e00be2272dd5.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_a1c43fcb8313c042ff8c0b696e61aa62.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_a24e9a1ebf0dc6da5dcbe22f02050da7.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_a5afe803c7cbe7c198757d990eb752b1.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_b055935a29b37156a218429e3202e57d.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_bd059aaed04d61a5f991bab1c7f0b3ef.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_c199c056b86275965150398a45bcada9.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_c2325f959ce020582837857c5a0651b1.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_c40b76f1e773f1f29cd4552329de1823.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_c68c37dd1f8209abf4af3835e5e175a9.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_cc795da36110a83d254eaa662400797f.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_cf99283d6fa82e24d435693843fc2c30.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_d74018a3e112c1987eba7e0f521225d4.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_db74671fa6a27e592610d8aedcedddb0.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_dd2f2b2623b44ef61d272955ccf27eb1.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_df2df5c80cb7102bb30489e3471a1ec3.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_e6319836f3bdddcfe850ff8462cb9cf5.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_e6aab2c4b55340030a9de29620533577.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_e7c05cfc051f6334afacbe90b40a5498.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_e939f0c434c4a2393834f2af76dfa25d.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_eae96b312202da5ec990a61336d483f9.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_f2a74ed6268c86a74e407d24350a5597.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "configuration",
+      "path": ".ai-bridge/remote-session-capture/receipts/rc_f4491e3fa7d1be884d05162a39846871.json",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "source",
+      "path": "scripts/collect_ubs_report.py",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    },
+    {
+      "kind": "source",
+      "path": "src/connector_ingest_diagnostics.rs",
+      "reason": "no graph-reachable test and no mapped verification declaration"
+    }
+  ],
+  "changed_components": {
+    "INT-001": {
+      "changed_paths": [
+        "src/connectors/cline.rs",
+        "src/connectors/cloudmcp.rs",
+        "src/connectors/mod.rs",
+        "src/connectors/opencode.rs",
+        "src/connectors/openwebui.rs",
+        "src/indexer/mod.rs",
+        "src/lib.rs",
+        "src/search/quill_bridge.rs",
+        "src/search/tantivy.rs",
+        "src/storage/sqlite.rs",
+        "src/storage/sqlite/openwebui_snapshot.rs",
+        "tests/agent_detection_completeness.rs",
+        "tests/cli_sessions_exact.rs",
+        "tests/connector_cline_cli.rs",
+        "tests/connector_cloudmcp.rs",
+        "tests/connector_opencode2.rs",
+        "tests/connector_openwebui.rs",
+        "tests/golden/robot/capabilities.json.golden",
+        "tests/golden/robot/diag.json.golden",
+        "tests/golden/robot/diag_quarantine.json.golden",
+        "tests/golden/robot/introspect.json.golden",
+        "tests/native_history_acceptance.rs",
+        "tests/spec_view_expand_error_envelopes.rs"
+      ],
+      "declared_tests": [
+        "final-full"
+      ]
+    }
+  },
+  "changed_paths": [
+    ".ai-bridge/.cloudmcp-goal-owner.json",
+    ".ai-bridge/README.md",
+    ".ai-bridge/agent-status.md",
+    ".ai-bridge/cloudmcp-goal-history.jsonl",
+    ".ai-bridge/cloudmcp-goal.json",
+    ".ai-bridge/cloudmcp-goal.md",
+    ".ai-bridge/cloudmcp-status.md",
+    ".ai-bridge/current-plan.md",
+    ".ai-bridge/decisions.md",
+    ".ai-bridge/execution-log.jsonl",
+    ".ai-bridge/implementation-diff.patch",
+    ".ai-bridge/open-questions.md",
+    ".ai-bridge/remote-session-capture/artifact-manifests/rc_a1c43fcb8313c042ff8c0b696e61aa62-0.json",
+    ".ai-bridge/remote-session-capture/artifacts/baeb03caa5c0eee299a4eab9dee27ccbb459e81589879c8c80f887c490084f8e",
+    ".ai-bridge/remote-session-capture/ledgers/0217e9528602769638ecb62a7b9cfe49.json",
+    ".ai-bridge/remote-session-capture/ledgers/038260dcd4e133d40f6747144a97d305.json",
+    ".ai-bridge/remote-session-capture/ledgers/0bc8101f13e2af4f01722d1a48a6c693.json",
+    ".ai-bridge/remote-session-capture/ledgers/15ab68e03cebaebb6f2065387d4b39bc.json",
+    ".ai-bridge/remote-session-capture/ledgers/1a841c53a4f4858445595741b3cda81f.json",
+    ".ai-bridge/remote-session-capture/ledgers/1e488c59e04ea5f44d0e0bb3dc781d4a.json",
+    ".ai-bridge/remote-session-capture/ledgers/2880c5f0f30e988a2c07aed72969a668.json",
+    ".ai-bridge/remote-session-capture/ledgers/2883ea2ae50d05898b716372b35c51e6.json",
+    ".ai-bridge/remote-session-capture/ledgers/301f2919f1c6847f51ce03e9181383d0.json",
+    ".ai-bridge/remote-session-capture/ledgers/42b3c13541a335807ef37d46b560536c.json",
+    ".ai-bridge/remote-session-capture/ledgers/4efa7bea9f84e0cd743818094a3e75ac.json",
+    ".ai-bridge/remote-session-capture/ledgers/514cfe43686924bb9c82ebc607a3f185.json",
+    ".ai-bridge/remote-session-capture/ledgers/554851f7bdb5463a56d6b4ef74bc49c6.json",
+    ".ai-bridge/remote-session-capture/ledgers/6740d3286cbc5d0ac294ae58a5c9b94f.json",
+    ".ai-bridge/remote-session-capture/ledgers/699833d7c2fef8f76b0e64d0f6ae8d9b.json",
+    ".ai-bridge/remote-session-capture/ledgers/6c41a2b8bea7a698a140f77c82683261.json",
+    ".ai-bridge/remote-session-capture/ledgers/779141dea6f3d8b0d1136559867fa3f0.json",
+    ".ai-bridge/remote-session-capture/ledgers/77aed2b82eb0553ede6b6d7a8bef1c0e.json",
+    ".ai-bridge/remote-session-capture/ledgers/813d9fbf6d1510b597f77a8d1d662f9f.json",
+    ".ai-bridge/remote-session-capture/ledgers/8ddc5551df8f88b66c9d9545a0b0d370.json",
+    ".ai-bridge/remote-session-capture/ledgers/99e9b340b207023d310076357ca47903.json",
+    ".ai-bridge/remote-session-capture/ledgers/9ca68fe72f31925ab91e10385f44c0e6.json",
+    ".ai-bridge/remote-session-capture/ledgers/9d9059345a341f0cabc1bec93c159348.json",
+    ".ai-bridge/remote-session-capture/ledgers/9f41df2f240b3b69e1545ddd78588f0b.json",
+    ".ai-bridge/remote-session-capture/ledgers/a062eee39ced223ecc7018e68aec5fbf.json",
+    ".ai-bridge/remote-session-capture/ledgers/a823f270c5774cd557fd0a012812f4da.json",
+    ".ai-bridge/remote-session-capture/ledgers/afa77f964aff6607c31ea670d63f8ad8.json",
+    ".ai-bridge/remote-session-capture/ledgers/b652bf54c05ba6af4fb53384a42f5751.json",
+    ".ai-bridge/remote-session-capture/ledgers/c3dcc08db50abcd2b9821f6279dd822b.json",
+    ".ai-bridge/remote-session-capture/ledgers/c4d2c8cc032e7ac1474243c8a9eeebbe.json",
+    ".ai-bridge/remote-session-capture/ledgers/d7f5fdf4d6c049c933b422fb1afa6fab.json",
+    ".ai-bridge/remote-session-capture/ledgers/d90b752cd223a3bc621dc9b75eb1f098.json",
+    ".ai-bridge/remote-session-capture/ledgers/ddf038b857e2a6dbe1a611d434f55185.json",
+    ".ai-bridge/remote-session-capture/ledgers/dfb77e320856b4266afb6220ccdfe6c5.json",
+    ".ai-bridge/remote-session-capture/ledgers/ff2042072d23d34cc69ace7ef7918c27.json",
+    ".ai-bridge/remote-session-capture/pending/rc_036b55269e1f0a8d1a02376af3bccfe4.json",
+    ".ai-bridge/remote-session-capture/pending/rc_03f2a9c334d1d83373fffbe7f9cca534.json",
+    ".ai-bridge/remote-session-capture/pending/rc_062fc17fa1848a11b5c42e735de4bb34.json",
+    ".ai-bridge/remote-session-capture/pending/rc_06bc53fdcc1ba17dcc471abd5ea7e3cf.json",
+    ".ai-bridge/remote-session-capture/pending/rc_0788f20ae35c142841488e1c51d739b1.json",
+    ".ai-bridge/remote-session-capture/pending/rc_083dc0163c49a1bfec7d711e1d80d969.json",
+    ".ai-bridge/remote-session-capture/pending/rc_0a3e67eb2091678cb2e7bc18dd27b2fd.json",
+    ".ai-bridge/remote-session-capture/pending/rc_0d05d7d8343cd15740dcbdffc17cca5a.json",
+    ".ai-bridge/remote-session-capture/pending/rc_0e0e1a2e5411337748ef17153f88db56.json",
+    ".ai-bridge/remote-session-capture/pending/rc_107b030fb8bc693bbacdf07922dab8d6.json",
+    ".ai-bridge/remote-session-capture/pending/rc_1733d965c33e9a535b5ad814e25712e0.json",
+    ".ai-bridge/remote-session-capture/pending/rc_1f3dda46c79b627ce85dded2735358b2.json",
+    ".ai-bridge/remote-session-capture/pending/rc_21ae14f34fbbb49a248d56fc96a69efa.json",
+    ".ai-bridge/remote-session-capture/pending/rc_230bc3cd7e18215bbb2dc5863913ad75.json",
+    ".ai-bridge/remote-session-capture/pending/rc_24b2933712a97290ea75471f67231634.json",
+    ".ai-bridge/remote-session-capture/pending/rc_2556c2a6985424d8a488c72f3f532022.json",
+    ".ai-bridge/remote-session-capture/pending/rc_26788b37fb748d51f9d89596fd071acf.json",
+    ".ai-bridge/remote-session-capture/pending/rc_272e865fb8f7d5d7cbed521c4c1fe3b0.json",
+    ".ai-bridge/remote-session-capture/pending/rc_2a6ece4212e5a040cc85916cf7ee7e1f.json",
+    ".ai-bridge/remote-session-capture/pending/rc_2dfc78cfe506183d0cda7557932dfe28.json",
+    ".ai-bridge/remote-session-capture/pending/rc_2efb1e37053545c9baea199468711ac4.json",
+    ".ai-bridge/remote-session-capture/pending/rc_324f08acd1cf6097afa056d730a357c9.json",
+    ".ai-bridge/remote-session-capture/pending/rc_32e0c396846f4faa41862e84414ec2d3.json",
+    ".ai-bridge/remote-session-capture/pending/rc_373185c6b251830da3c379ed1c31e468.json",
+    ".ai-bridge/remote-session-capture/pending/rc_41728f0b201e4fa0a0a004804094aecc.json",
+    ".ai-bridge/remote-session-capture/pending/rc_4c43371280a7fd6c4909fe8451515307.json",
+    ".ai-bridge/remote-session-capture/pending/rc_526fa02c1a21aaa573faf673540daa5b.json",
+    ".ai-bridge/remote-session-capture/pending/rc_5676dc43fd1cb24afa907d815e4cfe1c.json",
+    ".ai-bridge/remote-session-capture/pending/rc_5758e9726bdf9cdff24dd2c04bc2ad24.json",
+    ".ai-bridge/remote-session-capture/pending/rc_5a65350f5508685927d37b763fbda346.json",
+    ".ai-bridge/remote-session-capture/pending/rc_5b86f761ac55bd89c626f6830dbcc9df.json",
+    ".ai-bridge/remote-session-capture/pending/rc_5eee77ba8d66a7994b3ae1a01f07d714.json",
+    ".ai-bridge/remote-session-capture/pending/rc_6aa7d7f9fc8fd710fecfb747b341757a.json",
+    ".ai-bridge/remote-session-capture/pending/rc_6cf1a4f0f9b2e334da0b79e814638516.json",
+    ".ai-bridge/remote-session-capture/pending/rc_714c864eed0eb06c510a5e519fca5936.json",
+    ".ai-bridge/remote-session-capture/pending/rc_7433c859c1d8db05a7c98ca9b75c15e6.json",
+    ".ai-bridge/remote-session-capture/pending/rc_7dfad24ffc8fde70ebaf41a5b2131105.json",
+    ".ai-bridge/remote-session-capture/pending/rc_8340db4f819085fe06d0b95b91881a16.json",
+    ".ai-bridge/remote-session-capture/pending/rc_96fb894d28c7eed96a7be5cc880c1e44.json",
+    ".ai-bridge/remote-session-capture/pending/rc_9d8029f236e2c1b55fd32b2dee647002.json",
+    ".ai-bridge/remote-session-capture/pending/rc_9ed85fb372992267a13ca0bfa9d7b4c6.json",
+    ".ai-bridge/remote-session-capture/pending/rc_a1bde74ab09da83f14b5e00be2272dd5.json",
+    ".ai-bridge/remote-session-capture/pending/rc_a1c43fcb8313c042ff8c0b696e61aa62.json",
+    ".ai-bridge/remote-session-capture/pending/rc_a24e9a1ebf0dc6da5dcbe22f02050da7.json",
+    ".ai-bridge/remote-session-capture/pending/rc_a5afe803c7cbe7c198757d990eb752b1.json",
+    ".ai-bridge/remote-session-capture/pending/rc_b055935a29b37156a218429e3202e57d.json",
+    ".ai-bridge/remote-session-capture/pending/rc_bd059aaed04d61a5f991bab1c7f0b3ef.json",
+    ".ai-bridge/remote-session-capture/pending/rc_c199c056b86275965150398a45bcada9.json",
+    ".ai-bridge/remote-session-capture/pending/rc_c2325f959ce020582837857c5a0651b1.json",
+    ".ai-bridge/remote-session-capture/pending/rc_c40b76f1e773f1f29cd4552329de1823.json",
+    ".ai-bridge/remote-session-capture/pending/rc_c68c37dd1f8209abf4af3835e5e175a9.json",
+    ".ai-bridge/remote-session-capture/pending/rc_cc795da36110a83d254eaa662400797f.json",
+    ".ai-bridge/remote-session-capture/pending/rc_cf99283d6fa82e24d435693843fc2c30.json",
+    ".ai-bridge/remote-session-capture/pending/rc_d74018a3e112c1987eba7e0f521225d4.json",
+    ".ai-bridge/remote-session-capture/pending/rc_db74671fa6a27e592610d8aedcedddb0.json",
+    ".ai-bridge/remote-session-capture/pending/rc_dd2f2b2623b44ef61d272955ccf27eb1.json",
+    ".ai-bridge/remote-session-capture/pending/rc_df2df5c80cb7102bb30489e3471a1ec3.json",
+    ".ai-bridge/remote-session-capture/pending/rc_e6319836f3bdddcfe850ff8462cb9cf5.json",
+    ".ai-bridge/remote-session-capture/pending/rc_e6aab2c4b55340030a9de29620533577.json",
+    ".ai-bridge/remote-session-capture/pending/rc_e7c05cfc051f6334afacbe90b40a5498.json",
+    ".ai-bridge/remote-session-capture/pending/rc_e939f0c434c4a2393834f2af76dfa25d.json",
+    ".ai-bridge/remote-session-capture/pending/rc_eae96b312202da5ec990a61336d483f9.json",
+    ".ai-bridge/remote-session-capture/pending/rc_f2a74ed6268c86a74e407d24350a5597.json",
+    ".ai-bridge/remote-session-capture/pending/rc_f4491e3fa7d1be884d05162a39846871.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_036b55269e1f0a8d1a02376af3bccfe4.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_03f2a9c334d1d83373fffbe7f9cca534.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_062fc17fa1848a11b5c42e735de4bb34.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_06bc53fdcc1ba17dcc471abd5ea7e3cf.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_0788f20ae35c142841488e1c51d739b1.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_083dc0163c49a1bfec7d711e1d80d969.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_0a3e67eb2091678cb2e7bc18dd27b2fd.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_0d05d7d8343cd15740dcbdffc17cca5a.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_0e0e1a2e5411337748ef17153f88db56.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_107b030fb8bc693bbacdf07922dab8d6.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_1733d965c33e9a535b5ad814e25712e0.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_1f3dda46c79b627ce85dded2735358b2.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_21ae14f34fbbb49a248d56fc96a69efa.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_230bc3cd7e18215bbb2dc5863913ad75.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_24b2933712a97290ea75471f67231634.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_2556c2a6985424d8a488c72f3f532022.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_26788b37fb748d51f9d89596fd071acf.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_272e865fb8f7d5d7cbed521c4c1fe3b0.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_2a6ece4212e5a040cc85916cf7ee7e1f.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_2dfc78cfe506183d0cda7557932dfe28.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_2efb1e37053545c9baea199468711ac4.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_324f08acd1cf6097afa056d730a357c9.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_32e0c396846f4faa41862e84414ec2d3.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_373185c6b251830da3c379ed1c31e468.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_41728f0b201e4fa0a0a004804094aecc.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_4c43371280a7fd6c4909fe8451515307.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_526fa02c1a21aaa573faf673540daa5b.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_5676dc43fd1cb24afa907d815e4cfe1c.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_5758e9726bdf9cdff24dd2c04bc2ad24.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_5a65350f5508685927d37b763fbda346.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_5b86f761ac55bd89c626f6830dbcc9df.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_5eee77ba8d66a7994b3ae1a01f07d714.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_6aa7d7f9fc8fd710fecfb747b341757a.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_6cf1a4f0f9b2e334da0b79e814638516.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_714c864eed0eb06c510a5e519fca5936.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_7433c859c1d8db05a7c98ca9b75c15e6.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_7dfad24ffc8fde70ebaf41a5b2131105.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_8340db4f819085fe06d0b95b91881a16.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_96fb894d28c7eed96a7be5cc880c1e44.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_9d8029f236e2c1b55fd32b2dee647002.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_9ed85fb372992267a13ca0bfa9d7b4c6.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_a1bde74ab09da83f14b5e00be2272dd5.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_a1c43fcb8313c042ff8c0b696e61aa62.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_a24e9a1ebf0dc6da5dcbe22f02050da7.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_a5afe803c7cbe7c198757d990eb752b1.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_b055935a29b37156a218429e3202e57d.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_bd059aaed04d61a5f991bab1c7f0b3ef.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_c199c056b86275965150398a45bcada9.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_c2325f959ce020582837857c5a0651b1.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_c40b76f1e773f1f29cd4552329de1823.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_c68c37dd1f8209abf4af3835e5e175a9.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_cc795da36110a83d254eaa662400797f.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_cf99283d6fa82e24d435693843fc2c30.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_d74018a3e112c1987eba7e0f521225d4.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_db74671fa6a27e592610d8aedcedddb0.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_dd2f2b2623b44ef61d272955ccf27eb1.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_df2df5c80cb7102bb30489e3471a1ec3.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_e6319836f3bdddcfe850ff8462cb9cf5.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_e6aab2c4b55340030a9de29620533577.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_e7c05cfc051f6334afacbe90b40a5498.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_e939f0c434c4a2393834f2af76dfa25d.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_eae96b312202da5ec990a61336d483f9.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_f2a74ed6268c86a74e407d24350a5597.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_f4491e3fa7d1be884d05162a39846871.json",
+    ".ai-bridge/session-log.jsonl",
+    ".ai-bridge/skill-activation-history.jsonl",
+    ".ai-bridge/skill-activation.json",
+    ".codex-workspace-id.json",
+    "config/systemd/cass-incremental.service.d/40-opencode2-native-source.conf",
+    "docs/LOCAL_NATIVE_CAPTURE.md",
+    "scripts/collect_ubs_report.py",
+    "scripts/tests/test_collect_ubs_report.py",
+    "src/connector_ingest_diagnostics.rs",
+    "src/connectors/cline.rs",
+    "src/connectors/cloudmcp.rs",
+    "src/connectors/mod.rs",
+    "src/connectors/opencode.rs",
+    "src/connectors/openwebui.rs",
+    "src/indexer/mod.rs",
+    "src/lib.rs",
+    "src/search/quill_bridge.rs",
+    "src/search/tantivy.rs",
+    "src/storage/sqlite.rs",
+    "src/storage/sqlite/openwebui_snapshot.rs",
+    "tests/agent_detection_completeness.rs",
+    "tests/cli_sessions_exact.rs",
+    "tests/connector_cline_cli.rs",
+    "tests/connector_cloudmcp.rs",
+    "tests/connector_opencode2.rs",
+    "tests/connector_openwebui.rs",
+    "tests/golden/robot/capabilities.json.golden",
+    "tests/golden/robot/diag.json.golden",
+    "tests/golden/robot/diag_quarantine.json.golden",
+    "tests/golden/robot/introspect.json.golden",
+    "tests/native_history_acceptance.rs",
+    "tests/spec_view_expand_error_envelopes.rs"
+  ],
+  "diff_fingerprint": "ff0853fcad575ab06252a182229d13f54dde2bbaa57dea36033e76dd69f01130",
+  "errors": [],
+  "feature_map_sha256": "670a0bd3089a0ed5594ec905f4aadfceefd15a9d98d3a6db731d917507477ad9",
+  "git_head": "3254b9701105ccd3808bfa2c424cedc10e597a0e",
+  "impacted_non_tests": [
+    {
+      "changed_from": [
+        "src/search/quill_bridge.rs",
+        "src/search/tantivy.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/search/mod.rs",
+          "target": "src/search/quill_bridge.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "source",
+      "path": "src/search/mod.rs",
+      "rank": 0.01908597869
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/ui/theme.rs",
+          "target": "src/connectors/openwebui.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "source",
+      "path": "src/ui/theme.rs",
+      "rank": 0.003659417541
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/pages/export.rs",
+          "target": "src/connectors/openwebui.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "source",
+      "path": "src/pages/export.rs",
+      "rank": 0.003311969612
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/ui/data.rs",
+          "target": "src/connectors/openwebui.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "source",
+      "path": "src/ui/data.rs",
+      "rank": 0.002978860237
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/ui/components/export_modal.rs",
+          "target": "src/connectors/openwebui.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "source",
+      "path": "src/ui/components/export_modal.rs",
+      "rank": 0.002347602809
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/pages/config_input.rs",
+          "target": "src/connectors/openwebui.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "source",
+      "path": "src/pages/config_input.rs",
+      "rank": 0.001794205019
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/ui/components/breadcrumbs.rs",
+          "target": "src/connectors/openwebui.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "source",
+      "path": "src/ui/components/breadcrumbs.rs",
+      "rank": 0.00174797921
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/ui/components/palette.rs",
+          "target": "src/connectors/openwebui.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "source",
+      "path": "src/ui/components/palette.rs",
+      "rank": 0.00174797921
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        }
+      ],
+      "distance": 1,
+      "kind": "source",
+      "path": "scripts/historical_recovery/inventory_sqlite_sources.py",
+      "rank": 0.001721300798
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/ui/style_system.rs",
+          "target": "src/connectors/openwebui.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "source",
+      "path": "src/ui/style_system.rs",
+      "rank": 0.001434290177
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/e2e/live_fleet_search.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        }
+      ],
+      "distance": 1,
+      "kind": "source",
+      "path": "scripts/e2e/live_fleet_search.py",
+      "rank": 0.000977019477
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/merge_historical_bundle.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        }
+      ],
+      "distance": 1,
+      "kind": "source",
+      "path": "scripts/historical_recovery/merge_historical_bundle.py",
+      "rank": 0.000876793582
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/run_watch_once_batches.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        }
+      ],
+      "distance": 1,
+      "kind": "source",
+      "path": "scripts/historical_recovery/run_watch_once_batches.py",
+      "rank": 0.00062948153
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/install_shared_cass.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        }
+      ],
+      "distance": 1,
+      "kind": "source",
+      "path": "scripts/install_shared_cass.py",
+      "rank": 0.00062948153
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/check_bench_regression.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        }
+      ],
+      "distance": 1,
+      "kind": "source",
+      "path": "scripts/check_bench_regression.py",
+      "rank": 0.000423831992
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/import_codex_rollouts.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        }
+      ],
+      "distance": 1,
+      "kind": "source",
+      "path": "scripts/historical_recovery/import_codex_rollouts.py",
+      "rank": 0.000423831992
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/recover_historical_bundle.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        }
+      ],
+      "distance": 1,
+      "kind": "source",
+      "path": "scripts/historical_recovery/recover_historical_bundle.py",
+      "rank": 0.000423831992
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/screen_bundle_delta.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        }
+      ],
+      "distance": 1,
+      "kind": "source",
+      "path": "scripts/historical_recovery/screen_bundle_delta.py",
+      "rank": 0.000423831992
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json",
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/merge_historical_bundle.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/pages/mod.rs",
+          "target": "scripts/historical_recovery/merge_historical_bundle.py"
+        }
+      ],
+      "distance": 2,
+      "kind": "source",
+      "path": "src/pages/mod.rs",
+      "rank": 0.022304909577
+    },
+    {
+      "changed_from": [
+        "src/connectors/mod.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "verifies",
+          "source": "tests/e2e_analytics_models.rs",
+          "target": "src/connectors/mod.rs"
+        },
+        {
+          "kind": "imports",
+          "source": "src/daemon/mod.rs",
+          "target": "tests/e2e_analytics_models.rs"
+        }
+      ],
+      "distance": 2,
+      "kind": "source",
+      "path": "src/daemon/mod.rs",
+      "rank": 0.01725717688
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/ui/data.rs",
+          "target": "src/connectors/openwebui.rs"
+        },
+        {
+          "kind": "imports",
+          "source": "src/ui/mod.rs",
+          "target": "src/ui/data.rs"
+        }
+      ],
+      "distance": 2,
+      "kind": "source",
+      "path": "src/ui/mod.rs",
+      "rank": 0.010668079785
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/ui/components/breadcrumbs.rs",
+          "target": "src/connectors/openwebui.rs"
+        },
+        {
+          "kind": "imports",
+          "source": "src/ui/components/mod.rs",
+          "target": "src/ui/components/breadcrumbs.rs"
+        }
+      ],
+      "distance": 2,
+      "kind": "source",
+      "path": "src/ui/components/mod.rs",
+      "rank": 0.010031895493
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        }
+      ],
+      "distance": 2,
+      "kind": "source",
+      "path": "src/sources/index.rs",
+      "rank": 0.004461603968
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/search/query.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        }
+      ],
+      "distance": 2,
+      "kind": "source",
+      "path": "src/search/query.rs",
+      "rank": 0.003504378124
+    },
+    {
+      "changed_from": [
+        "src/connectors/mod.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "verifies",
+          "source": "tests/e2e_analytics_models.rs",
+          "target": "src/connectors/mod.rs"
+        },
+        {
+          "kind": "imports",
+          "source": "src/daemon/core.rs",
+          "target": "tests/e2e_analytics_models.rs"
+        }
+      ],
+      "distance": 2,
+      "kind": "source",
+      "path": "src/daemon/core.rs",
+      "rank": 0.002736867836
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/merge_historical_bundle.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/pages/verify.rs",
+          "target": "scripts/historical_recovery/merge_historical_bundle.py"
+        }
+      ],
+      "distance": 2,
+      "kind": "source",
+      "path": "src/pages/verify.rs",
+      "rank": 0.002161361566
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/search/vector_index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        }
+      ],
+      "distance": 2,
+      "kind": "source",
+      "path": "src/search/vector_index.rs",
+      "rank": 0.001781783786
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/ui/analytics_charts.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        }
+      ],
+      "distance": 2,
+      "kind": "source",
+      "path": "src/ui/analytics_charts.rs",
+      "rank": 0.001756618407
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/config_validation.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        }
+      ],
+      "distance": 2,
+      "kind": "source",
+      "path": "src/sources/config_validation.rs",
+      "rank": 0.001580054707
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/ui/theme.rs",
+          "target": "src/connectors/openwebui.rs"
+        },
+        {
+          "kind": "imports",
+          "source": "src/ui/components/toast.rs",
+          "target": "src/ui/theme.rs"
+        }
+      ],
+      "distance": 2,
+      "kind": "source",
+      "path": "src/ui/components/toast.rs",
+      "rank": 0.001533257047
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/schedule.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        }
+      ],
+      "distance": 2,
+      "kind": "source",
+      "path": "src/schedule.rs",
+      "rank": 0.000575132014
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/search/query.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "imports",
+          "source": "src/analytics/mod.rs",
+          "target": "src/search/query.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "source",
+      "path": "src/analytics/mod.rs",
+      "rank": 0.016830994516
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/search/query.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "imports",
+          "source": "src/analytics/validate.rs",
+          "target": "src/search/query.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "source",
+      "path": "src/analytics/validate.rs",
+      "rank": 0.002286592396
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/search/query.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "imports",
+          "source": "src/search/pack_planner.rs",
+          "target": "src/search/query.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "source",
+      "path": "src/search/pack_planner.rs",
+      "rank": 0.001467301318
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/cli_index.rs",
+          "target": "src/sources/index.rs"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/mod.rs",
+          "target": "tests/cli_index.rs"
+        }
+      ],
+      "distance": 4,
+      "kind": "source",
+      "path": "src/sources/mod.rs",
+      "rank": 0.018174483174
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/cli_index.rs",
+          "target": "src/sources/index.rs"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/setup.rs",
+          "target": "tests/cli_index.rs"
+        }
+      ],
+      "distance": 4,
+      "kind": "source",
+      "path": "src/sources/setup.rs",
+      "rank": 0.004021069707
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/indexer_memoization_policy.rs",
+          "target": "src/sources/index.rs"
+        },
+        {
+          "kind": "imports",
+          "source": "src/search/semantic_manifest.rs",
+          "target": "tests/indexer_memoization_policy.rs"
+        }
+      ],
+      "distance": 4,
+      "kind": "source",
+      "path": "src/search/semantic_manifest.rs",
+      "rank": 0.00131589525
+    }
+  ],
+  "impacted_tests": [
+    {
+      "changed_from": [
+        ".ai-bridge/README.md",
+        "src/connectors/mod.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "tests/docs/mod.rs",
+          "target": ".ai-bridge/README.md"
+        }
+      ],
+      "distance": 1,
+      "kind": "test",
+      "path": "tests/docs/mod.rs",
+      "rank": 0.014251967549
+    },
+    {
+      "changed_from": [
+        "src/connectors/mod.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "verifies",
+          "source": "tests/util/mod.rs",
+          "target": "src/connectors/mod.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "test",
+      "path": "tests/util/mod.rs",
+      "rank": 0.01366351911
+    },
+    {
+      "changed_from": [
+        "src/connectors/mod.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "verifies",
+          "source": "tests/recovery/mod.rs",
+          "target": "src/connectors/mod.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "test",
+      "path": "tests/recovery/mod.rs",
+      "rank": 0.012913372054
+    },
+    {
+      "changed_from": [
+        "src/connectors/mod.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "verifies",
+          "source": "tests/upgrade/mod.rs",
+          "target": "src/connectors/mod.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "test",
+      "path": "tests/upgrade/mod.rs",
+      "rank": 0.012604260024
+    },
+    {
+      "changed_from": [
+        "src/connectors/mod.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "verifies",
+          "source": "tests/fixtures/html_export/mod.rs",
+          "target": "src/connectors/mod.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "test",
+      "path": "tests/fixtures/html_export/mod.rs",
+      "rank": 0.012136888031
+    },
+    {
+      "changed_from": [
+        "src/connectors/mod.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "verifies",
+          "source": "tests/e2e_analytics_models.rs",
+          "target": "src/connectors/mod.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "test",
+      "path": "tests/e2e_analytics_models.rs",
+      "rank": 0.005870685313
+    },
+    {
+      "changed_from": [
+        "src/connectors/mod.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "verifies",
+          "source": "scripts/tests/vz9t8_6_analytics_models_e2e.sh",
+          "target": "src/connectors/mod.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "test",
+      "path": "scripts/tests/vz9t8_6_analytics_models_e2e.sh",
+      "rank": 0.004852205421
+    },
+    {
+      "changed_from": [
+        "src/connectors/mod.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "verifies",
+          "source": "tests/cli_model_lifecycle_contract.rs",
+          "target": "src/connectors/mod.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "test",
+      "path": "tests/cli_model_lifecycle_contract.rs",
+      "rank": 0.004837617958
+    },
+    {
+      "changed_from": [
+        "src/connectors/mod.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "verifies",
+          "source": "tests/e2e_model_acquisition_no_download_gate.rs",
+          "target": "src/connectors/mod.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "test",
+      "path": "tests/e2e_model_acquisition_no_download_gate.rs",
+      "rank": 0.004480694951
+    },
+    {
+      "changed_from": [
+        "src/connectors/mod.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "verifies",
+          "source": "tests/e2e_models_build_hnsw_gate.rs",
+          "target": "src/connectors/mod.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "test",
+      "path": "tests/e2e_models_build_hnsw_gate.rs",
+      "rank": 0.004325258101
+    },
+    {
+      "changed_from": [
+        "src/search/tantivy.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "verifies",
+          "source": "tests/indexer_tantivy.rs",
+          "target": "src/search/tantivy.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "test",
+      "path": "tests/indexer_tantivy.rs",
+      "rank": 0.000834107279
+    },
+    {
+      "changed_from": [
+        "src/connectors/cline.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "verifies",
+          "source": "tests/connector_cline.rs",
+          "target": "src/connectors/cline.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "test",
+      "path": "tests/connector_cline.rs",
+      "rank": 0.000620086946
+    },
+    {
+      "changed_from": [
+        "src/connectors/opencode.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "verifies",
+          "source": "tests/connector_opencode.rs",
+          "target": "src/connectors/opencode.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "test",
+      "path": "tests/connector_opencode.rs",
+      "rank": 0.000587742677
+    },
+    {
+      "changed_from": [
+        "src/connectors/cline.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "verifies",
+          "source": "tests/fixtures/html_export/real_sessions/cline_vscode_setup.jsonl",
+          "target": "src/connectors/cline.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "test",
+      "path": "tests/fixtures/html_export/real_sessions/cline_vscode_setup.jsonl",
+      "rank": 0.000487667634
+    },
+    {
+      "changed_from": [
+        "src/connectors/opencode.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "verifies",
+          "source": "tests/fixtures/message_grouping/opencode_session.jsonl",
+          "target": "src/connectors/opencode.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "test",
+      "path": "tests/fixtures/message_grouping/opencode_session.jsonl",
+      "rank": 0.00042403965
+    },
+    {
+      "changed_from": [
+        "src/connectors/opencode.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "verifies",
+          "source": "tests/fixtures/html_export/real_sessions/opencode_rust_cli.jsonl",
+          "target": "src/connectors/opencode.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "test",
+      "path": "tests/fixtures/html_export/real_sessions/opencode_rust_cli.jsonl",
+      "rank": 0.000277725505
+    },
+    {
+      "changed_from": [
+        "src/storage/sqlite/openwebui_snapshot.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "verifies",
+          "source": "tests/ui_snap.rs",
+          "target": "src/storage/sqlite/openwebui_snapshot.rs"
+        }
+      ],
+      "distance": 1,
+      "kind": "test",
+      "path": "tests/ui_snap.rs",
+      "rank": 0.000222415065
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/pages/export.rs",
+          "target": "src/connectors/openwebui.rs"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/html_export/html_export_encryption.test.js",
+          "target": "src/pages/export.rs"
+        }
+      ],
+      "distance": 2,
+      "kind": "test",
+      "path": "tests/html_export/html_export_encryption.test.js",
+      "rank": 0.001395256253
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/pages/export.rs",
+          "target": "src/connectors/openwebui.rs"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/metamorphic_html_export.rs",
+          "target": "src/pages/export.rs"
+        }
+      ],
+      "distance": 2,
+      "kind": "test",
+      "path": "tests/metamorphic_html_export.rs",
+      "rank": 0.001047160023
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/ui/theme.rs",
+          "target": "src/connectors/openwebui.rs"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/e2e/interactivity/theme-toggle.spec.ts",
+          "target": "src/ui/theme.rs"
+        }
+      ],
+      "distance": 2,
+      "kind": "test",
+      "path": "tests/e2e/interactivity/theme-toggle.spec.ts",
+      "rank": 0.000960407859
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/ui/theme.rs",
+          "target": "src/connectors/openwebui.rs"
+        },
+        {
+          "kind": "verifies",
+          "source": "scripts/tests/3n06q_markdown_theme_e2e.sh",
+          "target": "src/ui/theme.rs"
+        }
+      ],
+      "distance": 2,
+      "kind": "test",
+      "path": "scripts/tests/3n06q_markdown_theme_e2e.sh",
+      "rank": 0.000885412628
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/ui/theme.rs",
+          "target": "src/connectors/openwebui.rs"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/markdown_theme_distinct_colors.rs",
+          "target": "src/ui/theme.rs"
+        }
+      ],
+      "distance": 2,
+      "kind": "test",
+      "path": "tests/markdown_theme_distinct_colors.rs",
+      "rank": 0.000870825165
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/pages/export.rs",
+          "target": "src/connectors/openwebui.rs"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/pages_export.rs",
+          "target": "src/pages/export.rs"
+        }
+      ],
+      "distance": 2,
+      "kind": "test",
+      "path": "tests/pages_export.rs",
+      "rank": 0.000848217491
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/pages/export.rs",
+          "target": "src/connectors/openwebui.rs"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/e2e/export/html-export-e2e.spec.ts",
+          "target": "src/pages/export.rs"
+        }
+      ],
+      "distance": 2,
+      "kind": "test",
+      "path": "tests/e2e/export/html-export-e2e.spec.ts",
+      "rank": 0.000488534259
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/ui/data.rs",
+          "target": "src/connectors/openwebui.rs"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/fixtures/html_export/real_sessions/amp_data_pipeline.jsonl",
+          "target": "src/ui/data.rs"
+        }
+      ],
+      "distance": 2,
+      "kind": "test",
+      "path": "tests/fixtures/html_export/real_sessions/amp_data_pipeline.jsonl",
+      "rank": 0.000483868282
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/ui/data.rs",
+          "target": "src/connectors/openwebui.rs"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/.beads/metadata.json",
+          "target": "src/ui/data.rs"
+        }
+      ],
+      "distance": 2,
+      "kind": "test",
+      "path": "tests/.beads/metadata.json",
+      "rank": 0.000425595464
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/pages/export.rs",
+          "target": "src/connectors/openwebui.rs"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/html_export_e2e.rs",
+          "target": "src/pages/export.rs"
+        }
+      ],
+      "distance": 2,
+      "kind": "test",
+      "path": "tests/html_export_e2e.rs",
+      "rank": 0.000398951565
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/pages/export.rs",
+          "target": "src/connectors/openwebui.rs"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/html_export_integration.rs",
+          "target": "src/pages/export.rs"
+        }
+      ],
+      "distance": 2,
+      "kind": "test",
+      "path": "tests/html_export_integration.rs",
+      "rank": 0.000398951565
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/pages/export.rs",
+          "target": "src/connectors/openwebui.rs"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/html_export_sanitization_security.rs",
+          "target": "src/pages/export.rs"
+        }
+      ],
+      "distance": 2,
+      "kind": "test",
+      "path": "tests/html_export_sanitization_security.rs",
+      "rank": 0.000398951565
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/pages/export.rs",
+          "target": "src/connectors/openwebui.rs"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/pages_export_golden.rs",
+          "target": "src/pages/export.rs"
+        }
+      ],
+      "distance": 2,
+      "kind": "test",
+      "path": "tests/pages_export_golden.rs",
+      "rank": 0.000398951565
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/pages/export.rs",
+          "target": "src/connectors/openwebui.rs"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/pages_export_integration.rs",
+          "target": "src/pages/export.rs"
+        }
+      ],
+      "distance": 2,
+      "kind": "test",
+      "path": "tests/pages_export_integration.rs",
+      "rank": 0.000398951565
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/pages/export.rs",
+          "target": "src/connectors/openwebui.rs"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/spec_export_html_envelopes.rs",
+          "target": "src/pages/export.rs"
+        }
+      ],
+      "distance": 2,
+      "kind": "test",
+      "path": "tests/spec_export_html_envelopes.rs",
+      "rank": 0.000398951565
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/ui/data.rs",
+          "target": "src/connectors/openwebui.rs"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/e2e_large_dataset.rs",
+          "target": "src/ui/data.rs"
+        }
+      ],
+      "distance": 2,
+      "kind": "test",
+      "path": "tests/e2e_large_dataset.rs",
+      "rank": 0.000247494931
+    },
+    {
+      "changed_from": [
+        "src/connectors/openwebui.rs",
+        "tests/connector_openwebui.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "src/ui/data.rs",
+          "target": "src/connectors/openwebui.rs"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/fixtures/cline/task1/task_metadata.json",
+          "target": "src/ui/data.rs"
+        }
+      ],
+      "distance": 2,
+      "kind": "test",
+      "path": "tests/fixtures/cline/task1/task_metadata.json",
+      "rank": 0.000247494931
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/e2e_index_tui.rs",
+          "target": "src/sources/index.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/e2e_index_tui.rs",
+      "rank": 0.002937377039
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/indexer_memoization_policy.rs",
+          "target": "src/sources/index.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/indexer_memoization_policy.rs",
+      "rank": 0.001456185057
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/e2e_search_index.rs",
+          "target": "src/sources/index.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/e2e_search_index.rs",
+      "rank": 0.001120837948
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/cli_index.rs",
+          "target": "src/sources/index.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/cli_index.rs",
+      "rank": 0.000963514039
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/streaming_index.rs",
+          "target": "src/sources/index.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/streaming_index.rs",
+      "rank": 0.000963514039
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/search/query.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/reproduce_query_bug.rs",
+          "target": "src/search/query.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/reproduce_query_bug.rs",
+      "rank": 0.000585829969
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/e2e_search_stale_index_warning_gate.rs",
+          "target": "src/sources/index.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/e2e_search_stale_index_warning_gate.rs",
+      "rank": 0.000568780888
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/merge_historical_bundle.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/pages/verify.rs",
+          "target": "scripts/historical_recovery/merge_historical_bundle.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/pages_verify.rs",
+          "target": "src/pages/verify.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/pages_verify.rs",
+      "rank": 0.000540690656
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/merge_historical_bundle.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/pages/verify.rs",
+          "target": "scripts/historical_recovery/merge_historical_bundle.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/release_verify_cli.rs",
+          "target": "src/pages/verify.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/release_verify_cli.rs",
+      "rank": 0.000450601811
+    },
+    {
+      "changed_from": [
+        "src/connectors/mod.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "verifies",
+          "source": "tests/e2e_analytics_models.rs",
+          "target": "src/connectors/mod.rs"
+        },
+        {
+          "kind": "imports",
+          "source": "src/daemon/core.rs",
+          "target": "tests/e2e_analytics_models.rs"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/e2e/accessibility/axe-core.spec.ts",
+          "target": "src/daemon/core.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/e2e/accessibility/axe-core.spec.ts",
+      "rank": 0.000432807489
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/golden/regression/claude_indexed_search_matrix.json",
+          "target": "src/sources/index.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/golden/regression/claude_indexed_search_matrix.json",
+      "rank": 0.000419390264
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/search_latency_under_indexing.rs",
+          "target": "src/sources/index.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/search_latency_under_indexing.rs",
+      "rank": 0.000419390264
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/real_index_performance_e2e.rs",
+          "target": "src/sources/index.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/real_index_performance_e2e.rs",
+      "rank": 0.000396075569
+    },
+    {
+      "changed_from": [
+        "src/connectors/mod.rs"
+      ],
+      "dependency_path": [
+        {
+          "kind": "verifies",
+          "source": "tests/e2e_analytics_models.rs",
+          "target": "src/connectors/mod.rs"
+        },
+        {
+          "kind": "imports",
+          "source": "src/daemon/core.rs",
+          "target": "tests/e2e_analytics_models.rs"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/accessibility/axe-core.test.js",
+          "target": "src/daemon/core.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/accessibility/axe-core.test.js",
+      "rank": 0.000343224795
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/fixtures/pages_verify/missing_required/site/index.html",
+          "target": "src/sources/index.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/fixtures/pages_verify/missing_required/site/index.html",
+      "rank": 0.000262066355
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/fixtures/pages_verify/missing_required_no_viewer/site/index.html",
+          "target": "src/sources/index.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/fixtures/pages_verify/missing_required_no_viewer/site/index.html",
+      "rank": 0.000262066355
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/fixtures/pages_verify/secret_leak/site/index.html",
+          "target": "src/sources/index.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/fixtures/pages_verify/secret_leak/site/index.html",
+      "rank": 0.000262066355
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/fixtures/pages_verify/unencrypted/site/index.html",
+          "target": "src/sources/index.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/fixtures/pages_verify/unencrypted/site/index.html",
+      "rank": 0.000262066355
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/fixtures/pages_verify/valid/site/index.html",
+          "target": "src/sources/index.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/fixtures/pages_verify/valid/site/index.html",
+      "rank": 0.000262066355
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/fixtures/sources/probe/empty_index_host.json",
+          "target": "src/sources/index.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/fixtures/sources/probe/empty_index_host.json",
+      "rank": 0.000262066355
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/fixtures/sources/probe/indexed_host.json",
+          "target": "src/sources/index.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/fixtures/sources/probe/indexed_host.json",
+      "rank": 0.000262066355
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/fixtures/sources/probe/not_indexed_host.json",
+          "target": "src/sources/index.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/fixtures/sources/probe/not_indexed_host.json",
+      "rank": 0.000262066355
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/spec_index_idempotency.rs",
+          "target": "src/sources/index.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/spec_index_idempotency.rs",
+      "rank": 0.000262066355
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/schedule.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/cli_schedule.rs",
+          "target": "src/schedule.rs"
+        }
+      ],
+      "distance": 3,
+      "kind": "test",
+      "path": "tests/cli_schedule.rs",
+      "rank": 0.000197750235
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/search/query.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "imports",
+          "source": "src/analytics/validate.rs",
+          "target": "src/search/query.rs"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/ci_workflow_validates_ubs_gate.rs",
+          "target": "src/analytics/validate.rs"
+        }
+      ],
+      "distance": 4,
+      "kind": "test",
+      "path": "tests/ci_workflow_validates_ubs_gate.rs",
+      "rank": 0.000508704558
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/cli_index.rs",
+          "target": "src/sources/index.rs"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/setup.rs",
+          "target": "tests/cli_index.rs"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/e2e/setup/global-setup.ts",
+          "target": "src/sources/setup.rs"
+        }
+      ],
+      "distance": 5,
+      "kind": "test",
+      "path": "tests/e2e/setup/global-setup.ts",
+      "rank": 0.000788178619
+    },
+    {
+      "changed_from": [
+        ".ai-bridge/.cloudmcp-goal-owner.json",
+        ".ai-bridge/cloudmcp-goal.json",
+        ".ai-bridge/skill-activation.json",
+        ".codex-workspace-id.json"
+      ],
+      "dependency_path": [
+        {
+          "kind": "imports",
+          "source": "scripts/historical_recovery/inventory_sqlite_sources.py",
+          "target": ".ai-bridge/.cloudmcp-goal-owner.json"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/index.rs",
+          "target": "scripts/historical_recovery/inventory_sqlite_sources.py"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/cli_index.rs",
+          "target": "src/sources/index.rs"
+        },
+        {
+          "kind": "imports",
+          "source": "src/sources/setup.rs",
+          "target": "tests/cli_index.rs"
+        },
+        {
+          "kind": "verifies",
+          "source": "tests/setup_workflow.rs",
+          "target": "src/sources/setup.rs"
+        }
+      ],
+      "distance": 5,
+      "kind": "test",
+      "path": "tests/setup_workflow.rs",
+      "rank": 0.000268882587
+    }
+  ],
+  "mapped_changed_paths": [
+    ".ai-bridge/.cloudmcp-goal-owner.json",
+    ".ai-bridge/README.md",
+    ".ai-bridge/agent-status.md",
+    ".ai-bridge/cloudmcp-goal-history.jsonl",
+    ".ai-bridge/cloudmcp-goal.json",
+    ".ai-bridge/cloudmcp-goal.md",
+    ".ai-bridge/cloudmcp-status.md",
+    ".ai-bridge/current-plan.md",
+    ".ai-bridge/decisions.md",
+    ".ai-bridge/execution-log.jsonl",
+    ".ai-bridge/open-questions.md",
+    ".ai-bridge/remote-session-capture/artifact-manifests/rc_a1c43fcb8313c042ff8c0b696e61aa62-0.json",
+    ".ai-bridge/remote-session-capture/ledgers/0217e9528602769638ecb62a7b9cfe49.json",
+    ".ai-bridge/remote-session-capture/ledgers/038260dcd4e133d40f6747144a97d305.json",
+    ".ai-bridge/remote-session-capture/ledgers/0bc8101f13e2af4f01722d1a48a6c693.json",
+    ".ai-bridge/remote-session-capture/ledgers/15ab68e03cebaebb6f2065387d4b39bc.json",
+    ".ai-bridge/remote-session-capture/ledgers/1a841c53a4f4858445595741b3cda81f.json",
+    ".ai-bridge/remote-session-capture/ledgers/1e488c59e04ea5f44d0e0bb3dc781d4a.json",
+    ".ai-bridge/remote-session-capture/ledgers/2880c5f0f30e988a2c07aed72969a668.json",
+    ".ai-bridge/remote-session-capture/ledgers/2883ea2ae50d05898b716372b35c51e6.json",
+    ".ai-bridge/remote-session-capture/ledgers/301f2919f1c6847f51ce03e9181383d0.json",
+    ".ai-bridge/remote-session-capture/ledgers/42b3c13541a335807ef37d46b560536c.json",
+    ".ai-bridge/remote-session-capture/ledgers/4efa7bea9f84e0cd743818094a3e75ac.json",
+    ".ai-bridge/remote-session-capture/ledgers/514cfe43686924bb9c82ebc607a3f185.json",
+    ".ai-bridge/remote-session-capture/ledgers/554851f7bdb5463a56d6b4ef74bc49c6.json",
+    ".ai-bridge/remote-session-capture/ledgers/6740d3286cbc5d0ac294ae58a5c9b94f.json",
+    ".ai-bridge/remote-session-capture/ledgers/699833d7c2fef8f76b0e64d0f6ae8d9b.json",
+    ".ai-bridge/remote-session-capture/ledgers/6c41a2b8bea7a698a140f77c82683261.json",
+    ".ai-bridge/remote-session-capture/ledgers/779141dea6f3d8b0d1136559867fa3f0.json",
+    ".ai-bridge/remote-session-capture/ledgers/77aed2b82eb0553ede6b6d7a8bef1c0e.json",
+    ".ai-bridge/remote-session-capture/ledgers/813d9fbf6d1510b597f77a8d1d662f9f.json",
+    ".ai-bridge/remote-session-capture/ledgers/8ddc5551df8f88b66c9d9545a0b0d370.json",
+    ".ai-bridge/remote-session-capture/ledgers/99e9b340b207023d310076357ca47903.json",
+    ".ai-bridge/remote-session-capture/ledgers/9ca68fe72f31925ab91e10385f44c0e6.json",
+    ".ai-bridge/remote-session-capture/ledgers/9d9059345a341f0cabc1bec93c159348.json",
+    ".ai-bridge/remote-session-capture/ledgers/9f41df2f240b3b69e1545ddd78588f0b.json",
+    ".ai-bridge/remote-session-capture/ledgers/a062eee39ced223ecc7018e68aec5fbf.json",
+    ".ai-bridge/remote-session-capture/ledgers/a823f270c5774cd557fd0a012812f4da.json",
+    ".ai-bridge/remote-session-capture/ledgers/afa77f964aff6607c31ea670d63f8ad8.json",
+    ".ai-bridge/remote-session-capture/ledgers/b652bf54c05ba6af4fb53384a42f5751.json",
+    ".ai-bridge/remote-session-capture/ledgers/c3dcc08db50abcd2b9821f6279dd822b.json",
+    ".ai-bridge/remote-session-capture/ledgers/c4d2c8cc032e7ac1474243c8a9eeebbe.json",
+    ".ai-bridge/remote-session-capture/ledgers/d7f5fdf4d6c049c933b422fb1afa6fab.json",
+    ".ai-bridge/remote-session-capture/ledgers/d90b752cd223a3bc621dc9b75eb1f098.json",
+    ".ai-bridge/remote-session-capture/ledgers/ddf038b857e2a6dbe1a611d434f55185.json",
+    ".ai-bridge/remote-session-capture/ledgers/dfb77e320856b4266afb6220ccdfe6c5.json",
+    ".ai-bridge/remote-session-capture/ledgers/ff2042072d23d34cc69ace7ef7918c27.json",
+    ".ai-bridge/remote-session-capture/pending/rc_036b55269e1f0a8d1a02376af3bccfe4.json",
+    ".ai-bridge/remote-session-capture/pending/rc_03f2a9c334d1d83373fffbe7f9cca534.json",
+    ".ai-bridge/remote-session-capture/pending/rc_062fc17fa1848a11b5c42e735de4bb34.json",
+    ".ai-bridge/remote-session-capture/pending/rc_06bc53fdcc1ba17dcc471abd5ea7e3cf.json",
+    ".ai-bridge/remote-session-capture/pending/rc_0788f20ae35c142841488e1c51d739b1.json",
+    ".ai-bridge/remote-session-capture/pending/rc_083dc0163c49a1bfec7d711e1d80d969.json",
+    ".ai-bridge/remote-session-capture/pending/rc_0a3e67eb2091678cb2e7bc18dd27b2fd.json",
+    ".ai-bridge/remote-session-capture/pending/rc_0d05d7d8343cd15740dcbdffc17cca5a.json",
+    ".ai-bridge/remote-session-capture/pending/rc_0e0e1a2e5411337748ef17153f88db56.json",
+    ".ai-bridge/remote-session-capture/pending/rc_107b030fb8bc693bbacdf07922dab8d6.json",
+    ".ai-bridge/remote-session-capture/pending/rc_1733d965c33e9a535b5ad814e25712e0.json",
+    ".ai-bridge/remote-session-capture/pending/rc_1f3dda46c79b627ce85dded2735358b2.json",
+    ".ai-bridge/remote-session-capture/pending/rc_21ae14f34fbbb49a248d56fc96a69efa.json",
+    ".ai-bridge/remote-session-capture/pending/rc_230bc3cd7e18215bbb2dc5863913ad75.json",
+    ".ai-bridge/remote-session-capture/pending/rc_24b2933712a97290ea75471f67231634.json",
+    ".ai-bridge/remote-session-capture/pending/rc_2556c2a6985424d8a488c72f3f532022.json",
+    ".ai-bridge/remote-session-capture/pending/rc_26788b37fb748d51f9d89596fd071acf.json",
+    ".ai-bridge/remote-session-capture/pending/rc_272e865fb8f7d5d7cbed521c4c1fe3b0.json",
+    ".ai-bridge/remote-session-capture/pending/rc_2a6ece4212e5a040cc85916cf7ee7e1f.json",
+    ".ai-bridge/remote-session-capture/pending/rc_2dfc78cfe506183d0cda7557932dfe28.json",
+    ".ai-bridge/remote-session-capture/pending/rc_2efb1e37053545c9baea199468711ac4.json",
+    ".ai-bridge/remote-session-capture/pending/rc_324f08acd1cf6097afa056d730a357c9.json",
+    ".ai-bridge/remote-session-capture/pending/rc_32e0c396846f4faa41862e84414ec2d3.json",
+    ".ai-bridge/remote-session-capture/pending/rc_373185c6b251830da3c379ed1c31e468.json",
+    ".ai-bridge/remote-session-capture/pending/rc_41728f0b201e4fa0a0a004804094aecc.json",
+    ".ai-bridge/remote-session-capture/pending/rc_4c43371280a7fd6c4909fe8451515307.json",
+    ".ai-bridge/remote-session-capture/pending/rc_526fa02c1a21aaa573faf673540daa5b.json",
+    ".ai-bridge/remote-session-capture/pending/rc_5676dc43fd1cb24afa907d815e4cfe1c.json",
+    ".ai-bridge/remote-session-capture/pending/rc_5758e9726bdf9cdff24dd2c04bc2ad24.json",
+    ".ai-bridge/remote-session-capture/pending/rc_5a65350f5508685927d37b763fbda346.json",
+    ".ai-bridge/remote-session-capture/pending/rc_5b86f761ac55bd89c626f6830dbcc9df.json",
+    ".ai-bridge/remote-session-capture/pending/rc_5eee77ba8d66a7994b3ae1a01f07d714.json",
+    ".ai-bridge/remote-session-capture/pending/rc_6aa7d7f9fc8fd710fecfb747b341757a.json",
+    ".ai-bridge/remote-session-capture/pending/rc_6cf1a4f0f9b2e334da0b79e814638516.json",
+    ".ai-bridge/remote-session-capture/pending/rc_714c864eed0eb06c510a5e519fca5936.json",
+    ".ai-bridge/remote-session-capture/pending/rc_7433c859c1d8db05a7c98ca9b75c15e6.json",
+    ".ai-bridge/remote-session-capture/pending/rc_7dfad24ffc8fde70ebaf41a5b2131105.json",
+    ".ai-bridge/remote-session-capture/pending/rc_8340db4f819085fe06d0b95b91881a16.json",
+    ".ai-bridge/remote-session-capture/pending/rc_96fb894d28c7eed96a7be5cc880c1e44.json",
+    ".ai-bridge/remote-session-capture/pending/rc_9d8029f236e2c1b55fd32b2dee647002.json",
+    ".ai-bridge/remote-session-capture/pending/rc_9ed85fb372992267a13ca0bfa9d7b4c6.json",
+    ".ai-bridge/remote-session-capture/pending/rc_a1bde74ab09da83f14b5e00be2272dd5.json",
+    ".ai-bridge/remote-session-capture/pending/rc_a1c43fcb8313c042ff8c0b696e61aa62.json",
+    ".ai-bridge/remote-session-capture/pending/rc_a24e9a1ebf0dc6da5dcbe22f02050da7.json",
+    ".ai-bridge/remote-session-capture/pending/rc_a5afe803c7cbe7c198757d990eb752b1.json",
+    ".ai-bridge/remote-session-capture/pending/rc_b055935a29b37156a218429e3202e57d.json",
+    ".ai-bridge/remote-session-capture/pending/rc_bd059aaed04d61a5f991bab1c7f0b3ef.json",
+    ".ai-bridge/remote-session-capture/pending/rc_c199c056b86275965150398a45bcada9.json",
+    ".ai-bridge/remote-session-capture/pending/rc_c2325f959ce020582837857c5a0651b1.json",
+    ".ai-bridge/remote-session-capture/pending/rc_c40b76f1e773f1f29cd4552329de1823.json",
+    ".ai-bridge/remote-session-capture/pending/rc_c68c37dd1f8209abf4af3835e5e175a9.json",
+    ".ai-bridge/remote-session-capture/pending/rc_cc795da36110a83d254eaa662400797f.json",
+    ".ai-bridge/remote-session-capture/pending/rc_cf99283d6fa82e24d435693843fc2c30.json",
+    ".ai-bridge/remote-session-capture/pending/rc_d74018a3e112c1987eba7e0f521225d4.json",
+    ".ai-bridge/remote-session-capture/pending/rc_db74671fa6a27e592610d8aedcedddb0.json",
+    ".ai-bridge/remote-session-capture/pending/rc_dd2f2b2623b44ef61d272955ccf27eb1.json",
+    ".ai-bridge/remote-session-capture/pending/rc_df2df5c80cb7102bb30489e3471a1ec3.json",
+    ".ai-bridge/remote-session-capture/pending/rc_e6319836f3bdddcfe850ff8462cb9cf5.json",
+    ".ai-bridge/remote-session-capture/pending/rc_e6aab2c4b55340030a9de29620533577.json",
+    ".ai-bridge/remote-session-capture/pending/rc_e7c05cfc051f6334afacbe90b40a5498.json",
+    ".ai-bridge/remote-session-capture/pending/rc_e939f0c434c4a2393834f2af76dfa25d.json",
+    ".ai-bridge/remote-session-capture/pending/rc_eae96b312202da5ec990a61336d483f9.json",
+    ".ai-bridge/remote-session-capture/pending/rc_f2a74ed6268c86a74e407d24350a5597.json",
+    ".ai-bridge/remote-session-capture/pending/rc_f4491e3fa7d1be884d05162a39846871.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_036b55269e1f0a8d1a02376af3bccfe4.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_03f2a9c334d1d83373fffbe7f9cca534.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_062fc17fa1848a11b5c42e735de4bb34.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_06bc53fdcc1ba17dcc471abd5ea7e3cf.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_0788f20ae35c142841488e1c51d739b1.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_083dc0163c49a1bfec7d711e1d80d969.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_0a3e67eb2091678cb2e7bc18dd27b2fd.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_0d05d7d8343cd15740dcbdffc17cca5a.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_0e0e1a2e5411337748ef17153f88db56.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_107b030fb8bc693bbacdf07922dab8d6.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_1733d965c33e9a535b5ad814e25712e0.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_1f3dda46c79b627ce85dded2735358b2.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_21ae14f34fbbb49a248d56fc96a69efa.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_230bc3cd7e18215bbb2dc5863913ad75.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_24b2933712a97290ea75471f67231634.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_2556c2a6985424d8a488c72f3f532022.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_26788b37fb748d51f9d89596fd071acf.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_272e865fb8f7d5d7cbed521c4c1fe3b0.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_2a6ece4212e5a040cc85916cf7ee7e1f.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_2dfc78cfe506183d0cda7557932dfe28.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_2efb1e37053545c9baea199468711ac4.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_324f08acd1cf6097afa056d730a357c9.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_32e0c396846f4faa41862e84414ec2d3.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_373185c6b251830da3c379ed1c31e468.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_41728f0b201e4fa0a0a004804094aecc.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_4c43371280a7fd6c4909fe8451515307.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_526fa02c1a21aaa573faf673540daa5b.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_5676dc43fd1cb24afa907d815e4cfe1c.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_5758e9726bdf9cdff24dd2c04bc2ad24.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_5a65350f5508685927d37b763fbda346.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_5b86f761ac55bd89c626f6830dbcc9df.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_5eee77ba8d66a7994b3ae1a01f07d714.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_6aa7d7f9fc8fd710fecfb747b341757a.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_6cf1a4f0f9b2e334da0b79e814638516.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_714c864eed0eb06c510a5e519fca5936.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_7433c859c1d8db05a7c98ca9b75c15e6.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_7dfad24ffc8fde70ebaf41a5b2131105.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_8340db4f819085fe06d0b95b91881a16.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_96fb894d28c7eed96a7be5cc880c1e44.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_9d8029f236e2c1b55fd32b2dee647002.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_9ed85fb372992267a13ca0bfa9d7b4c6.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_a1bde74ab09da83f14b5e00be2272dd5.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_a1c43fcb8313c042ff8c0b696e61aa62.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_a24e9a1ebf0dc6da5dcbe22f02050da7.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_a5afe803c7cbe7c198757d990eb752b1.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_b055935a29b37156a218429e3202e57d.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_bd059aaed04d61a5f991bab1c7f0b3ef.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_c199c056b86275965150398a45bcada9.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_c2325f959ce020582837857c5a0651b1.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_c40b76f1e773f1f29cd4552329de1823.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_c68c37dd1f8209abf4af3835e5e175a9.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_cc795da36110a83d254eaa662400797f.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_cf99283d6fa82e24d435693843fc2c30.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_d74018a3e112c1987eba7e0f521225d4.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_db74671fa6a27e592610d8aedcedddb0.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_dd2f2b2623b44ef61d272955ccf27eb1.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_df2df5c80cb7102bb30489e3471a1ec3.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_e6319836f3bdddcfe850ff8462cb9cf5.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_e6aab2c4b55340030a9de29620533577.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_e7c05cfc051f6334afacbe90b40a5498.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_e939f0c434c4a2393834f2af76dfa25d.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_eae96b312202da5ec990a61336d483f9.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_f2a74ed6268c86a74e407d24350a5597.json",
+    ".ai-bridge/remote-session-capture/receipts/rc_f4491e3fa7d1be884d05162a39846871.json",
+    ".ai-bridge/session-log.jsonl",
+    ".ai-bridge/skill-activation-history.jsonl",
+    ".ai-bridge/skill-activation.json",
+    ".codex-workspace-id.json",
+    "docs/LOCAL_NATIVE_CAPTURE.md",
+    "scripts/collect_ubs_report.py",
+    "scripts/tests/test_collect_ubs_report.py",
+    "src/connector_ingest_diagnostics.rs",
+    "src/connectors/cline.rs",
+    "src/connectors/cloudmcp.rs",
+    "src/connectors/mod.rs",
+    "src/connectors/opencode.rs",
+    "src/connectors/openwebui.rs",
+    "src/search/quill_bridge.rs",
+    "src/search/tantivy.rs",
+    "src/storage/sqlite/openwebui_snapshot.rs",
+    "tests/agent_detection_completeness.rs",
+    "tests/cli_sessions_exact.rs",
+    "tests/connector_cline_cli.rs",
+    "tests/connector_cloudmcp.rs",
+    "tests/connector_opencode2.rs",
+    "tests/connector_openwebui.rs",
+    "tests/native_history_acceptance.rs",
+    "tests/spec_view_expand_error_envelopes.rs"
+  ],
+  "max_depth": 6,
+  "plan_hash": "5d7624c1bb814841ccf48e4b8a58875e78a7c755209ecd4c31283738d5092b21",
+  "schema_version": "1.0",
+  "summary": {
+    "blind_spot_count": 166,
+    "changed_path_count": 209,
+    "impacted_non_test_count": 37,
+    "impacted_test_count": 61,
+    "recommended_test_paths": [
+      "tests/docs/mod.rs",
+      "tests/util/mod.rs",
+      "tests/recovery/mod.rs",
+      "tests/upgrade/mod.rs",
+      "tests/fixtures/html_export/mod.rs",
+      "tests/e2e_analytics_models.rs",
+      "scripts/tests/vz9t8_6_analytics_models_e2e.sh",
+      "tests/cli_model_lifecycle_contract.rs",
+      "tests/e2e_model_acquisition_no_download_gate.rs",
+      "tests/e2e_models_build_hnsw_gate.rs",
+      "tests/indexer_tantivy.rs",
+      "tests/connector_cline.rs",
+      "tests/connector_opencode.rs",
+      "tests/fixtures/html_export/real_sessions/cline_vscode_setup.jsonl",
+      "tests/fixtures/message_grouping/opencode_session.jsonl",
+      "tests/fixtures/html_export/real_sessions/opencode_rust_cli.jsonl",
+      "tests/ui_snap.rs",
+      "tests/html_export/html_export_encryption.test.js",
+      "tests/metamorphic_html_export.rs",
+      "tests/e2e/interactivity/theme-toggle.spec.ts",
+      "scripts/tests/3n06q_markdown_theme_e2e.sh",
+      "tests/markdown_theme_distinct_colors.rs",
+      "tests/pages_export.rs",
+      "tests/e2e/export/html-export-e2e.spec.ts",
+      "tests/fixtures/html_export/real_sessions/amp_data_pipeline.jsonl",
+      "tests/.beads/metadata.json",
+      "tests/html_export_e2e.rs",
+      "tests/html_export_integration.rs",
+      "tests/html_export_sanitization_security.rs",
+      "tests/pages_export_golden.rs",
+      "tests/pages_export_integration.rs",
+      "tests/spec_export_html_envelopes.rs",
+      "tests/e2e_large_dataset.rs",
+      "tests/fixtures/cline/task1/task_metadata.json",
+      "tests/e2e_index_tui.rs",
+      "tests/indexer_memoization_policy.rs",
+      "tests/e2e_search_index.rs",
+      "tests/cli_index.rs",
+      "tests/streaming_index.rs",
+      "tests/reproduce_query_bug.rs",
+      "tests/e2e_search_stale_index_warning_gate.rs",
+      "tests/pages_verify.rs",
+      "tests/release_verify_cli.rs",
+      "tests/e2e/accessibility/axe-core.spec.ts",
+      "tests/golden/regression/claude_indexed_search_matrix.json",
+      "tests/search_latency_under_indexing.rs",
+      "tests/real_index_performance_e2e.rs",
+      "tests/accessibility/axe-core.test.js",
+      "tests/fixtures/pages_verify/missing_required/site/index.html",
+      "tests/fixtures/pages_verify/missing_required_no_viewer/site/index.html",
+      "tests/fixtures/pages_verify/secret_leak/site/index.html",
+      "tests/fixtures/pages_verify/unencrypted/site/index.html",
+      "tests/fixtures/pages_verify/valid/site/index.html",
+      "tests/fixtures/sources/probe/empty_index_host.json",
+      "tests/fixtures/sources/probe/indexed_host.json",
+      "tests/fixtures/sources/probe/not_indexed_host.json",
+      "tests/spec_index_idempotency.rs",
+      "tests/cli_schedule.rs",
+      "tests/ci_workflow_validates_ubs_gate.rs",
+      "tests/e2e/setup/global-setup.ts",
+      "tests/setup_workflow.rs"
+    ],
+    "unmapped_changed_count": 10
+  },
+  "unmapped_changed_paths": [
+    ".ai-bridge/implementation-diff.patch",
+    ".ai-bridge/remote-session-capture/artifacts/baeb03caa5c0eee299a4eab9dee27ccbb459e81589879c8c80f887c490084f8e",
+    "config/systemd/cass-incremental.service.d/40-opencode2-native-source.conf",
+    "src/indexer/mod.rs",
+    "src/lib.rs",
+    "src/storage/sqlite.rs",
+    "tests/golden/robot/capabilities.json.golden",
+    "tests/golden/robot/diag.json.golden",
+    "tests/golden/robot/diag_quarantine.json.golden",
+    "tests/golden/robot/introspect.json.golden"
+  ],
+  "valid": true,
+  "warnings": [
+    "changed source paths are absent from the architecture map: src/indexer/mod.rs, src/lib.rs, src/storage/sqlite.rs",
+    "impact closure has verification blind spots: .ai-bridge/remote-session-capture/artifact-manifests/rc_a1c43fcb8313c042ff8c0b696e61aa62-0.json, .ai-bridge/remote-session-capture/ledgers/0217e9528602769638ecb62a7b9cfe49.json, .ai-bridge/remote-session-capture/ledgers/038260dcd4e133d40f6747144a97d305.json, .ai-bridge/remote-session-capture/ledgers/0bc8101f13e2af4f01722d1a48a6c693.json, .ai-bridge/remote-session-capture/ledgers/15ab68e03cebaebb6f2065387d4b39bc.json, .ai-bridge/remote-session-capture/ledgers/1a841c53a4f4858445595741b3cda81f.json, .ai-bridge/remote-session-capture/ledgers/1e488c59e04ea5f44d0e0bb3dc781d4a.json, .ai-bridge/remote-session-capture/ledgers/2880c5f0f30e988a2c07aed72969a668.json, .ai-bridge/remote-session-capture/ledgers/2883ea2ae50d05898b716372b35c51e6.json, .ai-bridge/remote-session-capture/ledgers/301f2919f1c6847f51ce03e9181383d0.json, .ai-bridge/remote-session-capture/ledgers/42b3c13541a335807ef37d46b560536c.json, .ai-bridge/remote-session-capture/ledgers/4efa7bea9f84e0cd743818094a3e75ac.json, .ai-bridge/remote-session-capture/ledgers/514cfe43686924bb9c82ebc607a3f185.json, .ai-bridge/remote-session-capture/ledgers/554851f7bdb5463a56d6b4ef74bc49c6.json, .ai-bridge/remote-session-capture/ledgers/6740d3286cbc5d0ac294ae58a5c9b94f.json, .ai-bridge/remote-session-capture/ledgers/699833d7c2fef8f76b0e64d0f6ae8d9b.json, .ai-bridge/remote-session-capture/ledgers/6c41a2b8bea7a698a140f77c82683261.json, .ai-bridge/remote-session-capture/ledgers/779141dea6f3d8b0d1136559867fa3f0.json, .ai-bridge/remote-session-capture/ledgers/77aed2b82eb0553ede6b6d7a8bef1c0e.json, .ai-bridge/remote-session-capture/ledgers/813d9fbf6d1510b597f77a8d1d662f9f.json, .ai-bridge/remote-session-capture/ledgers/8ddc5551df8f88b66c9d9545a0b0d370.json, .ai-bridge/remote-session-capture/ledgers/99e9b340b207023d310076357ca47903.json, .ai-bridge/remote-session-capture/ledgers/9ca68fe72f31925ab91e10385f44c0e6.json, .ai-bridge/remote-session-capture/ledgers/9d9059345a341f0cabc1bec93c159348.json, .ai-bridge/remote-session-capture/ledgers/9f41df2f240b3b69e1545ddd78588f0b.json, .ai-bridge/remote-session-capture/ledgers/a062eee39ced223ecc7018e68aec5fbf.json, .ai-bridge/remote-session-capture/ledgers/a823f270c5774cd557fd0a012812f4da.json, .ai-bridge/remote-session-capture/ledgers/afa77f964aff6607c31ea670d63f8ad8.json, .ai-bridge/remote-session-capture/ledgers/b652bf54c05ba6af4fb53384a42f5751.json, .ai-bridge/remote-session-capture/ledgers/c3dcc08db50abcd2b9821f6279dd822b.json, .ai-bridge/remote-session-capture/ledgers/c4d2c8cc032e7ac1474243c8a9eeebbe.json, .ai-bridge/remote-session-capture/ledgers/d7f5fdf4d6c049c933b422fb1afa6fab.json, .ai-bridge/remote-session-capture/ledgers/d90b752cd223a3bc621dc9b75eb1f098.json, .ai-bridge/remote-session-capture/ledgers/ddf038b857e2a6dbe1a611d434f55185.json, .ai-bridge/remote-session-capture/ledgers/dfb77e320856b4266afb6220ccdfe6c5.json, .ai-bridge/remote-session-capture/ledgers/ff2042072d23d34cc69ace7ef7918c27.json, .ai-bridge/remote-session-capture/pending/rc_036b55269e1f0a8d1a02376af3bccfe4.json, .ai-bridge/remote-session-capture/pending/rc_03f2a9c334d1d83373fffbe7f9cca534.json, .ai-bridge/remote-session-capture/pending/rc_062fc17fa1848a11b5c42e735de4bb34.json, .ai-bridge/remote-session-capture/pending/rc_06bc53fdcc1ba17dcc471abd5ea7e3cf.json, .ai-bridge/remote-session-capture/pending/rc_0788f20ae35c142841488e1c51d739b1.json, .ai-bridge/remote-session-capture/pending/rc_083dc0163c49a1bfec7d711e1d80d969.json, .ai-bridge/remote-session-capture/pending/rc_0a3e67eb2091678cb2e7bc18dd27b2fd.json, .ai-bridge/remote-session-capture/pending/rc_0d05d7d8343cd15740dcbdffc17cca5a.json, .ai-bridge/remote-session-capture/pending/rc_0e0e1a2e5411337748ef17153f88db56.json, .ai-bridge/remote-session-capture/pending/rc_107b030fb8bc693bbacdf07922dab8d6.json, .ai-bridge/remote-session-capture/pending/rc_1733d965c33e9a535b5ad814e25712e0.json, .ai-bridge/remote-session-capture/pending/rc_1f3dda46c79b627ce85dded2735358b2.json, .ai-bridge/remote-session-capture/pending/rc_21ae14f34fbbb49a248d56fc96a69efa.json, .ai-bridge/remote-session-capture/pending/rc_230bc3cd7e18215bbb2dc5863913ad75.json, .ai-bridge/remote-session-capture/pending/rc_24b2933712a97290ea75471f67231634.json, .ai-bridge/remote-session-capture/pending/rc_2556c2a6985424d8a488c72f3f532022.json, .ai-bridge/remote-session-capture/pending/rc_26788b37fb748d51f9d89596fd071acf.json, .ai-bridge/remote-session-capture/pending/rc_272e865fb8f7d5d7cbed521c4c1fe3b0.json, .ai-bridge/remote-session-capture/pending/rc_2a6ece4212e5a040cc85916cf7ee7e1f.json, .ai-bridge/remote-session-capture/pending/rc_2dfc78cfe506183d0cda7557932dfe28.json, .ai-bridge/remote-session-capture/pending/rc_2efb1e37053545c9baea199468711ac4.json, .ai-bridge/remote-session-capture/pending/rc_324f08acd1cf6097afa056d730a357c9.json, .ai-bridge/remote-session-capture/pending/rc_32e0c396846f4faa41862e84414ec2d3.json, .ai-bridge/remote-session-capture/pending/rc_373185c6b251830da3c379ed1c31e468.json, .ai-bridge/remote-session-capture/pending/rc_41728f0b201e4fa0a0a004804094aecc.json, .ai-bridge/remote-session-capture/pending/rc_4c43371280a7fd6c4909fe8451515307.json, .ai-bridge/remote-session-capture/pending/rc_526fa02c1a21aaa573faf673540daa5b.json, .ai-bridge/remote-session-capture/pending/rc_5676dc43fd1cb24afa907d815e4cfe1c.json, .ai-bridge/remote-session-capture/pending/rc_5758e9726bdf9cdff24dd2c04bc2ad24.json, .ai-bridge/remote-session-capture/pending/rc_5a65350f5508685927d37b763fbda346.json, .ai-bridge/remote-session-capture/pending/rc_5b86f761ac55bd89c626f6830dbcc9df.json, .ai-bridge/remote-session-capture/pending/rc_5eee77ba8d66a7994b3ae1a01f07d714.json, .ai-bridge/remote-session-capture/pending/rc_6aa7d7f9fc8fd710fecfb747b341757a.json, .ai-bridge/remote-session-capture/pending/rc_6cf1a4f0f9b2e334da0b79e814638516.json, .ai-bridge/remote-session-capture/pending/rc_714c864eed0eb06c510a5e519fca5936.json, .ai-bridge/remote-session-capture/pending/rc_7433c859c1d8db05a7c98ca9b75c15e6.json, .ai-bridge/remote-session-capture/pending/rc_7dfad24ffc8fde70ebaf41a5b2131105.json, .ai-bridge/remote-session-capture/pending/rc_8340db4f819085fe06d0b95b91881a16.json, .ai-bridge/remote-session-capture/pending/rc_96fb894d28c7eed96a7be5cc880c1e44.json, .ai-bridge/remote-session-capture/pending/rc_9d8029f236e2c1b55fd32b2dee647002.json, .ai-bridge/remote-session-capture/pending/rc_9ed85fb372992267a13ca0bfa9d7b4c6.json, .ai-bridge/remote-session-capture/pending/rc_a1bde74ab09da83f14b5e00be2272dd5.json, .ai-bridge/remote-session-capture/pending/rc_a1c43fcb8313c042ff8c0b696e61aa62.json, .ai-bridge/remote-session-capture/pending/rc_a24e9a1ebf0dc6da5dcbe22f02050da7.json, .ai-bridge/remote-session-capture/pending/rc_a5afe803c7cbe7c198757d990eb752b1.json, .ai-bridge/remote-session-capture/pending/rc_b055935a29b37156a218429e3202e57d.json, .ai-bridge/remote-session-capture/pending/rc_bd059aaed04d61a5f991bab1c7f0b3ef.json, .ai-bridge/remote-session-capture/pending/rc_c199c056b86275965150398a45bcada9.json, .ai-bridge/remote-session-capture/pending/rc_c2325f959ce020582837857c5a0651b1.json, .ai-bridge/remote-session-capture/pending/rc_c40b76f1e773f1f29cd4552329de1823.json, .ai-bridge/remote-session-capture/pending/rc_c68c37dd1f8209abf4af3835e5e175a9.json, .ai-bridge/remote-session-capture/pending/rc_cc795da36110a83d254eaa662400797f.json, .ai-bridge/remote-session-capture/pending/rc_cf99283d6fa82e24d435693843fc2c30.json, .ai-bridge/remote-session-capture/pending/rc_d74018a3e112c1987eba7e0f521225d4.json, .ai-bridge/remote-session-capture/pending/rc_db74671fa6a27e592610d8aedcedddb0.json, .ai-bridge/remote-session-capture/pending/rc_dd2f2b2623b44ef61d272955ccf27eb1.json, .ai-bridge/remote-session-capture/pending/rc_df2df5c80cb7102bb30489e3471a1ec3.json, .ai-bridge/remote-session-capture/pending/rc_e6319836f3bdddcfe850ff8462cb9cf5.json, .ai-bridge/remote-session-capture/pending/rc_e6aab2c4b55340030a9de29620533577.json, .ai-bridge/remote-session-capture/pending/rc_e7c05cfc051f6334afacbe90b40a5498.json, .ai-bridge/remote-session-capture/pending/rc_e939f0c434c4a2393834f2af76dfa25d.json, .ai-bridge/remote-session-capture/pending/rc_eae96b312202da5ec990a61336d483f9.json, .ai-bridge/remote-session-capture/pending/rc_f2a74ed6268c86a74e407d24350a5597.json, .ai-bridge/remote-session-capture/pending/rc_f4491e3fa7d1be884d05162a39846871.json, .ai-bridge/remote-session-capture/receipts/rc_036b55269e1f0a8d1a02376af3bccfe4.json, .ai-bridge/remote-session-capture/receipts/rc_03f2a9c334d1d83373fffbe7f9cca534.json, .ai-bridge/remote-session-capture/receipts/rc_062fc17fa1848a11b5c42e735de4bb34.json, .ai-bridge/remote-session-capture/receipts/rc_06bc53fdcc1ba17dcc471abd5ea7e3cf.json, .ai-bridge/remote-session-capture/receipts/rc_0788f20ae35c142841488e1c51d739b1.json, .ai-bridge/remote-session-capture/receipts/rc_083dc0163c49a1bfec7d711e1d80d969.json, .ai-bridge/remote-session-capture/receipts/rc_0a3e67eb2091678cb2e7bc18dd27b2fd.json, .ai-bridge/remote-session-capture/receipts/rc_0d05d7d8343cd15740dcbdffc17cca5a.json, .ai-bridge/remote-session-capture/receipts/rc_0e0e1a2e5411337748ef17153f88db56.json, .ai-bridge/remote-session-capture/receipts/rc_107b030fb8bc693bbacdf07922dab8d6.json, .ai-bridge/remote-session-capture/receipts/rc_1733d965c33e9a535b5ad814e25712e0.json, .ai-bridge/remote-session-capture/receipts/rc_1f3dda46c79b627ce85dded2735358b2.json, .ai-bridge/remote-session-capture/receipts/rc_21ae14f34fbbb49a248d56fc96a69efa.json, .ai-bridge/remote-session-capture/receipts/rc_230bc3cd7e18215bbb2dc5863913ad75.json, .ai-bridge/remote-session-capture/receipts/rc_24b2933712a97290ea75471f67231634.json, .ai-bridge/remote-session-capture/receipts/rc_2556c2a6985424d8a488c72f3f532022.json, .ai-bridge/remote-session-capture/receipts/rc_26788b37fb748d51f9d89596fd071acf.json, .ai-bridge/remote-session-capture/receipts/rc_272e865fb8f7d5d7cbed521c4c1fe3b0.json, .ai-bridge/remote-session-capture/receipts/rc_2a6ece4212e5a040cc85916cf7ee7e1f.json, .ai-bridge/remote-session-capture/receipts/rc_2dfc78cfe506183d0cda7557932dfe28.json, .ai-bridge/remote-session-capture/receipts/rc_2efb1e37053545c9baea199468711ac4.json, .ai-bridge/remote-session-capture/receipts/rc_324f08acd1cf6097afa056d730a357c9.json, .ai-bridge/remote-session-capture/receipts/rc_32e0c396846f4faa41862e84414ec2d3.json, .ai-bridge/remote-session-capture/receipts/rc_373185c6b251830da3c379ed1c31e468.json, .ai-bridge/remote-session-capture/receipts/rc_41728f0b201e4fa0a0a004804094aecc.json, .ai-bridge/remote-session-capture/receipts/rc_4c43371280a7fd6c4909fe8451515307.json, .ai-bridge/remote-session-capture/receipts/rc_526fa02c1a21aaa573faf673540daa5b.json, .ai-bridge/remote-session-capture/receipts/rc_5676dc43fd1cb24afa907d815e4cfe1c.json, .ai-bridge/remote-session-capture/receipts/rc_5758e9726bdf9cdff24dd2c04bc2ad24.json, .ai-bridge/remote-session-capture/receipts/rc_5a65350f5508685927d37b763fbda346.json, .ai-bridge/remote-session-capture/receipts/rc_5b86f761ac55bd89c626f6830dbcc9df.json, .ai-bridge/remote-session-capture/receipts/rc_5eee77ba8d66a7994b3ae1a01f07d714.json, .ai-bridge/remote-session-capture/receipts/rc_6aa7d7f9fc8fd710fecfb747b341757a.json, .ai-bridge/remote-session-capture/receipts/rc_6cf1a4f0f9b2e334da0b79e814638516.json, .ai-bridge/remote-session-capture/receipts/rc_714c864eed0eb06c510a5e519fca5936.json, .ai-bridge/remote-session-capture/receipts/rc_7433c859c1d8db05a7c98ca9b75c15e6.json, .ai-bridge/remote-session-capture/receipts/rc_7dfad24ffc8fde70ebaf41a5b2131105.json, .ai-bridge/remote-session-capture/receipts/rc_8340db4f819085fe06d0b95b91881a16.json, .ai-bridge/remote-session-capture/receipts/rc_96fb894d28c7eed96a7be5cc880c1e44.json, .ai-bridge/remote-session-capture/receipts/rc_9d8029f236e2c1b55fd32b2dee647002.json, .ai-bridge/remote-session-capture/receipts/rc_9ed85fb372992267a13ca0bfa9d7b4c6.json, .ai-bridge/remote-session-capture/receipts/rc_a1bde74ab09da83f14b5e00be2272dd5.json, .ai-bridge/remote-session-capture/receipts/rc_a1c43fcb8313c042ff8c0b696e61aa62.json, .ai-bridge/remote-session-capture/receipts/rc_a24e9a1ebf0dc6da5dcbe22f02050da7.json, .ai-bridge/remote-session-capture/receipts/rc_a5afe803c7cbe7c198757d990eb752b1.json, .ai-bridge/remote-session-capture/receipts/rc_b055935a29b37156a218429e3202e57d.json, .ai-bridge/remote-session-capture/receipts/rc_bd059aaed04d61a5f991bab1c7f0b3ef.json, .ai-bridge/remote-session-capture/receipts/rc_c199c056b86275965150398a45bcada9.json, .ai-bridge/remote-session-capture/receipts/rc_c2325f959ce020582837857c5a0651b1.json, .ai-bridge/remote-session-capture/receipts/rc_c40b76f1e773f1f29cd4552329de1823.json, .ai-bridge/remote-session-capture/receipts/rc_c68c37dd1f8209abf4af3835e5e175a9.json, .ai-bridge/remote-session-capture/receipts/rc_cc795da36110a83d254eaa662400797f.json, .ai-bridge/remote-session-capture/receipts/rc_cf99283d6fa82e24d435693843fc2c30.json, .ai-bridge/remote-session-capture/receipts/rc_d74018a3e112c1987eba7e0f521225d4.json, .ai-bridge/remote-session-capture/receipts/rc_db74671fa6a27e592610d8aedcedddb0.json, .ai-bridge/remote-session-capture/receipts/rc_dd2f2b2623b44ef61d272955ccf27eb1.json, .ai-bridge/remote-session-capture/receipts/rc_df2df5c80cb7102bb30489e3471a1ec3.json, .ai-bridge/remote-session-capture/receipts/rc_e6319836f3bdddcfe850ff8462cb9cf5.json, .ai-bridge/remote-session-capture/receipts/rc_e6aab2c4b55340030a9de29620533577.json, .ai-bridge/remote-session-capture/receipts/rc_e7c05cfc051f6334afacbe90b40a5498.json, .ai-bridge/remote-session-capture/receipts/rc_e939f0c434c4a2393834f2af76dfa25d.json, .ai-bridge/remote-session-capture/receipts/rc_eae96b312202da5ec990a61336d483f9.json, .ai-bridge/remote-session-capture/receipts/rc_f2a74ed6268c86a74e407d24350a5597.json, .ai-bridge/remote-session-capture/receipts/rc_f4491e3fa7d1be884d05162a39846871.json, scripts/collect_ubs_report.py, src/connector_ingest_diagnostics.rs"
+  ]
+}

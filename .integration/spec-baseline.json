@@ -1,0 +1,121 @@
+{
+  "commitments": [
+    {
+      "id": "SPEC-001",
+      "payload": {
+        "acceptance_criteria": [
+          {
+            "given": "the target repository is at the recorded baseline and required configuration is present",
+            "id": "AC-001",
+            "then": "the target adopts the pinned upstream implementation and dependency contract with every intentional difference enumerated",
+            "when": "the upstream tree is integrated on main"
+          }
+        ],
+        "component_ids": [
+          "INT-001"
+        ],
+        "id": "SPEC-001",
+        "source": {
+          "kind": "user_request",
+          "reference": "https://github.com/Dicklesworthstone/coding_agent_session_search/tree/main"
+        },
+        "statement": "Integrate upstream cc7bdf13dceca8995628aecbb552a1067f7b43de on main, including its 0.10.0 implementation and pinned dependency family.",
+        "verifier_command_ids": [
+          "final-focused"
+        ]
+      },
+      "payload_sha256": "74a27f0102eada19bb6d746d2d1eef1894b96704265d0b04dab70bea32fb72fa",
+      "stability": "frozen",
+      "status": "active"
+    },
+    {
+      "id": "SPEC-002",
+      "payload": {
+        "acceptance_criteria": [
+          {
+            "given": "the baseline patch, path hashes, and local-only history",
+            "id": "AC-002",
+            "then": "local identities, ingestion paths and safety fixes remain represented, no existing path is deleted, and peer edits remain unstaged",
+            "when": "upstream is integrated"
+          }
+        ],
+        "component_ids": [
+          "INT-001"
+        ],
+        "id": "SPEC-002",
+        "source": {
+          "kind": "repository_policy",
+          "reference": "AGENTS.md:13-29 and user-supplied launch-root BR rules"
+        },
+        "statement": "Preserve pre-existing committed and uncommitted native-history behavior and all existing files; keep the launch-root BR ledger authoritative and live archives unchanged.",
+        "verifier_command_ids": [
+          "final-focused",
+          "final-full"
+        ]
+      },
+      "payload_sha256": "f7f2f9aa01c32f39be398411d7c5aaf05c679369739ac7fcc7e1bec31cf978ae",
+      "stability": "frozen",
+      "status": "active"
+    },
+    {
+      "id": "SPEC-003",
+      "payload": {
+        "acceptance_criteria": [
+          {
+            "given": "the all-status live BR ledger and integrated upstream implementation",
+            "id": "AC-003",
+            "then": "every required outcome has current source and runtime acceptance, with no missing or blocked requirement represented as complete",
+            "when": "each unfinished outcome is reconciled"
+          }
+        ],
+        "component_ids": [
+          "INT-001"
+        ],
+        "id": "SPEC-003",
+        "source": {
+          "kind": "user_request",
+          "reference": "update the cass from upstream and finish whatever is left to implement"
+        },
+        "statement": "Finish the remaining implementation outcomes in existing BR tasks after checking each against the integrated source and runtime; accept existing implementations only with current acceptance evidence.",
+        "verifier_command_ids": [
+          "final-full"
+        ]
+      },
+      "payload_sha256": "1b9d63c4bfb57bb2803700e9088fc56e4438fb5881a030bf764be4a409cf5bb0",
+      "stability": "frozen",
+      "status": "active"
+    },
+    {
+      "id": "SPEC-004",
+      "payload": {
+        "acceptance_criteria": [
+          {
+            "given": "the exact final candidate and dependencies",
+            "id": "AC-004",
+            "then": "passing receipts identify the tested candidate and prove required behavior, and unavailable runners or unexecuted cases remain explicit blockers",
+            "when": "the prescribed gates execute"
+          }
+        ],
+        "component_ids": [
+          "INT-001"
+        ],
+        "id": "SPEC-004",
+        "source": {
+          "kind": "repository_policy",
+          "reference": "AGENTS.md:251-288,377-426"
+        },
+        "statement": "Verify the integrated candidate through repository-required formatting, compiler, clippy, meaningful regression tests, UBS and relevant end-to-end acceptance before declaring completion.",
+        "verifier_command_ids": [
+          "final-full"
+        ]
+      },
+      "payload_sha256": "dcac0099c4fd693d7d23cbe8bd5255d057bc4e5f723a637b983a6f94652df9b7",
+      "stability": "frozen",
+      "status": "active"
+    }
+  ],
+  "frozen_at": "2026-10-20T19:27:11+00:00",
+  "ledger_path": ".integration/spec-ledger.json",
+  "ledger_sha256": "9b155581bcacd6df0047d8d6910049c1374691034e87205454a0556f348785c8",
+  "schema_version": "1.0"
+}

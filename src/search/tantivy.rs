@@ -107,20 +107,10 @@ fn positive_usize_env(name: &str) -> Option<usize> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_available_memory_bytes() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
-            return kb.checked_mul(1024);
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "linux")]
 fn host_memory_bytes_for_tantivy_default() -> Option<u64> {
-    linux_available_memory_bytes()
+    // GH #496: MemAvailable clamped to this process's cgroup headroom, so a
+    // memory-capped unit does not size its writer heap from the whole host.
+    crate::indexer::responsiveness::available_memory_bytes()
 }
 
 #[cfg(target_os = "macos")]
@@ -950,6 +940,27 @@ pub fn validate_searchable_index_contract(index_path: &Path) -> Result<()> {
     open_validated_lexical_index(index_path).map(|_| ())
 }
 
+/// [`validate_searchable_index_contract`] plus the [`SearchableIndexSummary`]
+/// of the same open. Asking for the summary first and validating afterwards
+/// opened the index twice, and every Quill open hashes every live segment.
+pub fn validated_searchable_index_summary(index_path: &Path) -> Result<SearchableIndexSummary> {
+    let opened = open_validated_lexical_index(index_path)?;
+    if let Some((reader, _)) = opened.reader.as_ref() {
+        return Ok(SearchableIndexSummary {
+            docs: usize::try_from(reader.doc_count()?).unwrap_or(usize::MAX),
+            segments: reader.segment_count()?,
+        });
+    }
+    // A federated bundle validated each shard above; its summary comes from
+    // the bundle manifest without another open.
+    searchable_index_summary(index_path)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "validated lexical index has no summary: {}",
+            index_path.display()
+        )
+    })
+}
+
 pub(crate) fn open_validated_lexical_index(index_path: &Path) -> Result<OpenedLexicalIndex> {
     if let Some(readers) = open_federated_search_readers(index_path)? {
         return Ok(OpenedLexicalIndex {
@@ -1499,6 +1510,10 @@ pub struct TantivyIndex {
 }
 
 impl TantivyIndex {
+    pub(crate) fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
     pub fn open_or_create(path: &Path) -> Result<Self> {
         materialize_federated_search_bundle_for_write(path)?;
         wipe_index_dir_on_schema_hash_mismatch(path)?;
@@ -1607,6 +1622,12 @@ impl TantivyIndex {
     /// Returns Ok(true) if merge was triggered, Ok(false) if skipped.
     pub fn optimize_if_idle(&mut self) -> Result<bool> {
         self.inner.optimize_if_idle(now_unix_millis())
+    }
+
+    /// At most one bounded segment merge; see
+    /// [`QuillCassIndex::fold_largest_small_run`].
+    pub fn fold_largest_small_run(&mut self) -> Result<bool> {
+        self.inner.fold_largest_small_run(now_unix_millis())
     }
 
     /// Force immediate segment merge and wait for completion.
@@ -1945,6 +1966,102 @@ impl TantivyIndex {
         }
     }
 
+    /// Reconcile selected canonical messages under their stable identities.
+    /// A replacement filtered as noise removes its old live document. Each
+    /// bounded engine batch publishes independently; errors propagate and a
+    /// retry converges without promising whole-conversation atomicity.
+    pub fn reconcile_messages_from_packet(
+        &mut self,
+        packet: &ConversationPacket,
+        message_indices: &[usize],
+        conversation_id_override: Option<i64>,
+    ) -> Result<()> {
+        self.reconcile_packet_messages_with_limits(
+            packet,
+            message_indices,
+            conversation_id_override,
+            tantivy_add_batch_max_messages(),
+            tantivy_add_batch_max_chars(),
+        )
+    }
+
+    fn reconcile_packet_messages_with_limits(
+        &mut self,
+        packet: &ConversationPacket,
+        message_indices: &[usize],
+        conversation_id_override: Option<i64>,
+        max_messages: usize,
+        max_chars: usize,
+    ) -> Result<()> {
+        let messages = &packet.payload.messages;
+        // Reject invalid selectors before publishing even the first batch.
+        if let Some(index) = message_indices
+            .iter()
+            .find(|&&index| index >= messages.len())
+        {
+            anyhow::bail!(
+                "packet message index {} out of range for packet with {} messages",
+                index,
+                messages.len()
+            );
+        }
+        let mut context = cass_doc_context_from_packet(packet);
+        if let Some(id) = conversation_id_override {
+            context.conversation_id = Some(id);
+        }
+        let mut docs = Vec::new();
+        let mut removals = Vec::new();
+        let mut pending_indices = BTreeSet::new();
+        let mut pending_bytes = 0usize;
+        for &index in message_indices {
+            let message = messages
+                .get(index)
+                .context("validated packet index disappeared")?;
+            let msg_idx = message.idx.max(0) as u64;
+            // Repeated selectors are valid replay, but one engine batch may
+            // not contain a duplicate live identity.
+            if pending_indices.contains(&msg_idx) {
+                self.flush_packet_revisions(&mut docs, &mut removals)?;
+                pending_indices.clear();
+                pending_bytes = 0;
+            }
+            pending_indices.insert(msg_idx);
+            if let Some(doc) = cass_document_for_packet_message(&context, message) {
+                pending_bytes = pending_bytes.saturating_add(doc.content.len());
+                docs.push(doc);
+            } else {
+                let identity = frankensearch::quill::cass::cass_document_identity(
+                    &context.source_id,
+                    frankensearch::quill::cass::CassConversationKey {
+                        source_path: &context.source_path,
+                        id: context.conversation_id,
+                    },
+                    msg_idx,
+                );
+                pending_bytes = pending_bytes.saturating_add(identity.len());
+                removals.push(identity);
+            }
+            if pending_indices.len() >= max_messages.max(1) || pending_bytes >= max_chars.max(1) {
+                self.flush_packet_revisions(&mut docs, &mut removals)?;
+                pending_indices.clear();
+                pending_bytes = 0;
+            }
+        }
+        self.flush_packet_revisions(&mut docs, &mut removals)
+    }
+
+    fn flush_packet_revisions(
+        &mut self,
+        docs: &mut Vec<FsCassDocument>,
+        removals: &mut Vec<String>,
+    ) -> Result<()> {
+        self.inner.upsert_cass_documents(docs)?;
+        self.inner.delete_cass_document_ids(removals)?;
+        docs.clear();
+        removals.clear();
+        Ok(())
+    }
+
     /// Total live documents in the published snapshot.
     pub fn doc_count(&self) -> Result<u64> {
         self.inner.doc_count()
@@ -1971,6 +2088,48 @@ impl TantivyIndex {
             .iter()
             .filter_map(|msg| cass_document_for_packet_message(&context, msg))
             .collect()
+    }
+
+    pub fn reconcile_snapshot_packet(
+        &mut self,
+        packet: &ConversationPacket,
+        conversation_id: i64,
+        historical_indices: &[i64],
+    ) -> Result<usize> {
+        let documents = Self::build_packet_documents(packet, Some(conversation_id));
+        let live_indices: BTreeSet<u64> =
+            documents.iter().map(|document| document.msg_idx).collect();
+        let context = cass_doc_context_from_packet(packet);
+        let mut identity_document = FsCassDocument {
+            agent: context.agent,
+            workspace: context.workspace,
+            workspace_original: context.workspace_original,
+            source_path: context.source_path,
+            msg_idx: 0,
+            created_at: None,
+            title: None,
+            content: String::new(),
+            conversation_id: Some(conversation_id),
+            source_id: context.source_id,
+            origin_kind: context.origin_kind,
+            origin_host: context.origin_host,
+        };
+        let mut retired = Vec::new();
+        for index in historical_indices {
+            let index = u64::try_from(*index).context("negative native snapshot lexical index")?;
+            if !live_indices.contains(&index) {
+                identity_document.msg_idx = index;
+                retired.push(identity_document.to_schema_document().id);
+            }
+        }
+        let upserted = self.upsert_prebuilt_documents_slice(&documents)?;
+        if !retired.is_empty() {
+            self.commit()?;
+            for chunk in retired.chunks(tantivy_prebuilt_add_batch_max_messages()) {
+                self.inner.delete_document_ids(chunk)?;
+            }
+        }
+        Ok(upserted)
     }
 
     /// Upsert prebuilt documents in bounded batches under their stable
@@ -2547,6 +2706,258 @@ mod tests {
             cooldown_ms: 300_000,
         };
         assert!(status.should_merge());
+    }
+
+    fn gh423_lexical_packet(count: usize) -> ConversationPacket {
+        let conv = NormalizedConversation {
+            agent_slug: "codebuff".into(),
+            external_id: Some("shared-lineage-chat".into()),
+            title: Some("Shared lineage".into()),
+            workspace: Some(PathBuf::from("/work/project")),
+            source_path: PathBuf::from("/shared/manicode/chat-messages.json"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_000),
+            metadata: serde_json::json!({"cass":{"origin":{"source_id":"remote-source","kind":"ssh","host":"remote-host"}}}),
+            messages: (0..count)
+                .map(|position| NormalizedMessage {
+                    idx: i64::try_from(position).unwrap() * 3 + 5,
+                    role: "assistant".into(),
+                    author: None,
+                    created_at: Some(1_700_000_000_000),
+                    content: format!("oldrevision marker{position}"),
+                    extra: Value::Null,
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                })
+                .collect(),
+        };
+        ConversationPacket::from_normalized_conversation(
+            &conv,
+            ConversationPacketProvenance::local(),
+        )
+    }
+
+    /// The indexer preflight asked for the summary, then validated the
+    /// contract: two opens, and each Quill open hashes every live segment.
+    #[test]
+    fn validated_summary_takes_its_counts_from_one_index_open() {
+        let dir = TempDir::new().expect("temp dir");
+        {
+            let mut index = TantivyIndex::open_or_create(dir.path()).expect("create");
+            index
+                .add_messages_from_packet(&gh423_lexical_packet(3), None, Some(7), |_| Ok(()))
+                .expect("add messages");
+            index.commit().expect("commit");
+        }
+        let opens = crate::search::quill_bridge::reader_open_count();
+        let summary = searchable_index_summary(dir.path())
+            .expect("summary")
+            .expect("summary present");
+        validate_searchable_index_contract(dir.path()).expect("contract");
+        assert_eq!(crate::search::quill_bridge::reader_open_count() - opens, 2);
+
+        let opens = crate::search::quill_bridge::reader_open_count();
+        let validated = validated_searchable_index_summary(dir.path()).expect("validated");
+        assert_eq!(crate::search::quill_bridge::reader_open_count() - opens, 1);
+        assert_eq!(
+            (validated.docs, validated.segments),
+            (summary.docs, summary.segments)
+        );
+        assert_eq!(validated.docs, 3);
+
+        let empty = TempDir::new().expect("temp dir");
+        assert!(
+            validated_searchable_index_summary(empty.path()).is_err(),
+            "a directory without an index fails validation"
+        );
+    }
+
+    fn gh423_lexical_hits(index: &TantivyIndex, term: &str) -> BTreeSet<String> {
+        let reader = index.reader().unwrap();
+        let parser = frankensearch::quill::query::CassQueryParser::new(
+            frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
+        )
+        .unwrap();
+        let query = parser.parse(
+            term,
+            &frankensearch::quill::query::CassQueryFilters::default(),
+        );
+        let page =
+            crate::search::quill_bridge::search_paginated(&reader, &query.query, 128, 0, true)
+                .unwrap();
+        let hits: BTreeSet<_> = page
+            .hits
+            .iter()
+            .map(|hit| hit.document_id.clone())
+            .collect();
+        assert_eq!(
+            hits.len(),
+            page.hits.len(),
+            "each stable identity is live exactly once"
+        );
+        assert_eq!(page.total_count, Some(hits.len()));
+        hits
+    }
+
+    fn gh423_lexical_identity(
+        packet: &ConversationPacket,
+        position: usize,
+        conversation_id: i64,
+    ) -> String {
+        let context = cass_doc_context_from_packet(packet);
+        frankensearch::quill::cass::cass_document_identity(
+            &context.source_id,
+            frankensearch::quill::cass::CassConversationKey {
+                source_path: &context.source_path,
+                id: Some(conversation_id),
+            },
+            packet.payload.messages[position].idx.max(0) as u64,
+        )
+    }
+
+    #[test]
+    fn gh423_lexical_revisions_replace_all_32_and_preserve_untouched_across_batches() {
+        let dir = TempDir::new().unwrap();
+        let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        let mut packet = gh423_lexical_packet(33);
+        index
+            .add_messages_from_packet(&packet, None, Some(77), |_| Ok(()))
+            .unwrap();
+        index.commit().unwrap();
+        assert_eq!(index.doc_count().unwrap(), 33);
+        let indices: Vec<usize> = (0..32).collect();
+        let expected: BTreeSet<String> = indices
+            .iter()
+            .map(|&idx| gh423_lexical_identity(&packet, idx, 77))
+            .collect();
+        let untouched = gh423_lexical_identity(&packet, 32, 77);
+        for &position in &indices {
+            packet.payload.messages[position].content =
+                format!("newrevision completed response marker{position}");
+        }
+        // Run the production batching body with small limits to cross both
+        // document and content thresholds without a giant fixture or env race.
+        index
+            .reconcile_packet_messages_with_limits(&packet, &indices, Some(77), 7, 80)
+            .unwrap();
+        index.commit().unwrap();
+        assert_eq!(index.doc_count().unwrap(), 33);
+        assert_eq!(gh423_lexical_hits(&index, "newrevision"), expected);
+        assert_eq!(
+            gh423_lexical_hits(&index, "oldrevision"),
+            BTreeSet::from([untouched.clone()])
+        );
+        let mut repeated_selectors = indices.clone();
+        repeated_selectors.push(0);
+        index
+            .reconcile_messages_from_packet(&packet, &repeated_selectors, Some(77))
+            .unwrap();
+        index.commit().unwrap();
+        assert_eq!(index.doc_count().unwrap(), 33);
+        assert_eq!(gh423_lexical_hits(&index, "newrevision"), expected);
+        for &position in &indices {
+            packet.payload.messages[position].content.clear();
+        }
+        index
+            .reconcile_packet_messages_with_limits(&packet, &indices, Some(77), 7, 80)
+            .unwrap();
+        assert_eq!(index.doc_count().unwrap(), 1);
+        assert_eq!(
+            gh423_lexical_hits(&index, "oldrevision"),
+            BTreeSet::from([untouched])
+        );
+        assert!(gh423_lexical_hits(&index, "newrevision").is_empty());
+        index
+            .reconcile_messages_from_packet(&packet, &indices, Some(77))
+            .unwrap();
+        assert_eq!(
+            index.doc_count().unwrap(),
+            1,
+            "repeated removals are idempotent"
+        );
+    }
+
+    #[test]
+    fn gh423_lexical_noise_removal_commits_pending_work_and_preserves_sibling_identity() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let dir = TempDir::new().unwrap();
+        let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let heartbeat = Arc::clone(&ticks);
+        index.set_heartbeat(Some(Arc::new(move || {
+            heartbeat.fetch_add(1, Ordering::Relaxed);
+        })));
+        let mut packet = gh423_lexical_packet(3);
+        index
+            .add_messages_from_packet(&packet, None, Some(77), |_| Ok(()))
+            .unwrap();
+        index
+            .add_messages_from_packet(&packet, None, Some(88), |_| Ok(()))
+            .unwrap();
+        index.commit().unwrap();
+        let mut pending = gh423_lexical_packet(1);
+        pending.payload.identity.source_path = "/pending/chat-messages.json".into();
+        pending.payload.messages[0].content = "pendingneedle survives removal".into();
+        index
+            .add_messages_from_packet(&pending, None, Some(99), |_| Ok(()))
+            .unwrap();
+        assert_eq!(
+            index.doc_count().unwrap(),
+            6,
+            "plain addition is still pending"
+        );
+        let before_ticks = ticks.load(Ordering::Relaxed);
+        packet.payload.messages[0].content = "   \n\t".into();
+        packet.payload.messages[1].content = "OK".into();
+        index
+            .reconcile_messages_from_packet(&packet, &[0, 1], Some(77))
+            .unwrap();
+        assert!(
+            ticks.load(Ordering::Relaxed) >= before_ticks + 2,
+            "commit and removal both tick liveness"
+        );
+        assert_eq!(index.doc_count().unwrap(), 5);
+        let mut survivors: BTreeSet<String> = (0..3)
+            .map(|position| gh423_lexical_identity(&packet, position, 88))
+            .collect();
+        survivors.insert(gh423_lexical_identity(&packet, 2, 77));
+        assert_eq!(gh423_lexical_hits(&index, "oldrevision"), survivors);
+        assert_eq!(
+            gh423_lexical_hits(&index, "pendingneedle"),
+            BTreeSet::from([gh423_lexical_identity(&pending, 0, 99)])
+        );
+        index
+            .reconcile_messages_from_packet(&packet, &[0, 1], Some(77))
+            .unwrap();
+        assert_eq!(index.doc_count().unwrap(), 5);
+        index.set_heartbeat(None);
+    }
+
+    #[test]
+    fn gh423_lexical_out_of_range_selector_refuses_before_any_publication() {
+        let dir = TempDir::new().unwrap();
+        let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        let mut packet = gh423_lexical_packet(2);
+        index
+            .add_messages_from_packet(&packet, None, Some(77), |_| Ok(()))
+            .unwrap();
+        index.commit().unwrap();
+        let before = gh423_lexical_hits(&index, "oldrevision");
+        packet.payload.messages[0].content = "newrevision must not publish".into();
+        let error = index
+            .reconcile_messages_from_packet(&packet, &[0, 2], Some(77))
+            .unwrap_err();
+        assert!(error.to_string().contains("out of range"));
+        assert_eq!(index.doc_count().unwrap(), 2);
+        assert_eq!(gh423_lexical_hits(&index, "oldrevision"), before);
+        assert!(gh423_lexical_hits(&index, "newrevision").is_empty());
+        index
+            .reconcile_messages_from_packet(&packet, &[], Some(77))
+            .unwrap();
+        assert_eq!(index.doc_count().unwrap(), 2);
     }
 
     /// #440: an armed resume reconcile routes exactly the owed leading
@@ -3829,6 +4240,90 @@ mod tests {
             reader.doc_count().expect("doc count"),
             4,
             "two conversations × two messages each ⇒ four lexical docs"
+        );
+    }
+
+    /// GH #499 (2l1b0.49): a date-filtered search over a sealed segment that
+    /// holds a tombstone. Under frankensearch-quill 0.3.1 the numeric window
+    /// was scored on the segment's at-seal rows while the term leaf used its
+    /// live rows, and cass reported "posting cursor invariant failed: Boolean
+    /// children belong to different segment domains" (exit 9) for every
+    /// `--days`/`--since` search on a long-lived index. Quill 0.3.2 carries
+    /// the fix. The window deliberately excludes one row: a window over every
+    /// row lowers to a whole-segment match and would pass on the old engine.
+    #[test]
+    fn gh499_date_window_over_a_tombstoned_sealed_segment() {
+        let message = |idx: i64, created_at: i64, content: &str| NormalizedMessage {
+            idx,
+            role: "user".to_string(),
+            author: None,
+            created_at: Some(created_at),
+            content: content.to_string(),
+            extra: Value::Null,
+            snippets: Vec::new(),
+            invocations: Vec::new(),
+        };
+        let dir = TempDir::new().expect("temp dir");
+        let conversation = NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some("gh499".to_string()),
+            title: Some("window".to_string()),
+            workspace: None,
+            source_path: dir.path().join("gh499.jsonl"),
+            started_at: Some(100),
+            ended_at: None,
+            metadata: Value::Null,
+            messages: vec![
+                message(0, 100, "window early"),
+                message(1, 500, "window middle"),
+                message(2, 900, "window late"),
+            ],
+        };
+        let index_dir = dir.path().join("index");
+        let mut idx = TantivyIndex::open_or_create(&index_dir).expect("idx");
+        idx.add_conversation(&conversation).expect("seed");
+        idx.commit().expect("seal the first segment");
+
+        // Re-ingesting a message under its stable identity tombstones the
+        // sealed row, as an incremental index run does.
+        let edited = message(1, 500, "window middle, edited");
+        let replacement =
+            cass_document_for_message(&cass_doc_context(&conversation, None), &edited)
+                .expect("replacement document");
+        idx.upsert_prebuilt_documents_slice(&[replacement])
+            .expect("upsert");
+        idx.commit().expect("publish the replacement");
+
+        let live = crate::search::quill_bridge::manifest_live_doc_count(&index_dir)
+            .expect("published manifest");
+        assert!(
+            live.tombstones > 0 && live.segments >= 2,
+            "the fixture needs a tombstone in a sealed segment: {live:?}"
+        );
+
+        let client = crate::search::query::SearchClient::open(&index_dir, None)
+            .expect("open search client")
+            .expect("index present");
+        let filters = crate::search::query::SearchFilters {
+            created_from: Some(400),
+            created_to: Some(1_000),
+            ..Default::default()
+        };
+        let hits = client
+            .search(
+                "window",
+                filters,
+                10,
+                0,
+                crate::search::query::FieldMask::FULL,
+            )
+            .expect("a date-filtered search over a tombstoned segment must succeed");
+        let mut stamps: Vec<i64> = hits.iter().filter_map(|hit| hit.created_at).collect();
+        stamps.sort_unstable();
+        assert_eq!(stamps, vec![500, 900], "{hits:?}");
+        assert!(
+            hits.iter().any(|hit| hit.content.contains("edited")),
+            "the live replacement is served, not the tombstoned row: {hits:?}"
         );
     }
 }

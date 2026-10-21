@@ -524,6 +524,28 @@ mod tests {
     }
 
     #[test]
+    fn structured_redaction_tally_counts_changed_fields_and_is_idempotent() {
+        let input = json!({
+            "password": (["a", "bc"].concat()),
+            "pin": 1234,
+            "api_key": { "nested": (["tiny", "-secret"].concat()) },
+            "safe": { "label": "fixture" },
+            "already": { "token": "[REDACTED]" },
+        });
+        let mut tally = RedactionTally::default();
+        let output = redact_value(&input, &mut tally);
+        assert_eq!(tally.fields_scrubbed, 3);
+        assert_eq!(tally.strings_seen, 12);
+        for key in ["password", "pin", "api_key"] {
+            assert_eq!(output[key], "[REDACTED]");
+        }
+        assert_eq!(output["safe"], input["safe"]);
+        let mut second_tally = RedactionTally::default();
+        assert_eq!(redact_value(&output, &mut second_tally), output);
+        assert_eq!(second_tally.fields_scrubbed, 0);
+    }
+
+    #[test]
     fn rerun_uses_real_share_safe_fixture_surface() {
         let out = render_repro_capsule_fixture("capsule", Some(&risky_source("redacted")));
         assert_eq!(out["rerun"]["targets_live_data"], json!(false));

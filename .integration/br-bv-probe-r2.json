@@ -1,0 +1,249 @@
+{
+  "bv_data_hashes": {
+    "bv-insights": [],
+    "bv-plan": [
+      "6b7e8b5d4040348a525f1a6da75852eb045c52d39cac264be679a0614707d47c",
+      "a9986d3c004727f9a971ed6754093d18ec474b6ea8420d5b4e8d883d9bf544d6"
+    ],
+    "bv-triage": [
+      "6b7e8b5d4040348a525f1a6da75852eb045c52d39cac264be679a0614707d47c",
+      "a9986d3c004727f9a971ed6754093d18ec474b6ea8420d5b4e8d883d9bf544d6"
+    ]
+  },
+  "commands": {
+    "br-capabilities": {
+      "argv": [
+        "/home/arch/.local/bin/br",
+        "capabilities",
+        "--format",
+        "json"
+      ],
+      "data_hashes": [],
+      "duration_seconds": 0.114443,
+      "json_parsed": true,
+      "parsed_summary": {},
+      "returncode": 0,
+      "schema_or_contract_versions": [
+        "br.capabilities.v1"
+      ],
+      "stderr_tail": "",
+      "stdout_sha256": "8d4b9d58810e648a8e0777955405c57677de2609d83a051a1c6ca0d35e55baf9",
+      "stdout_tail": "[...truncated...]\n:\"required\",\"machine_output\":[\"json\",\"toon\",\"text\"],\"examples\":[\"br ready --json\"]},{\"name\":\"reopen\",\"summary\":\"Reopen an issue\",\"operation\":\"write\",\"workspace\":\"required\",\"machine_output\":[\"json\",\"toon\",\"text\"],\"examples\":[\"br reopen br-abc --json\"]},{\"name\":\"robot-docs\",\"summary\":\"Print concise in-tool docs for automation agents\",\"operation\":\"read\",\"workspace\":\"none\",\"machine_output\":[\"json\",\"toon\",\"text\"],\"examples\":[\"br robot-docs guide\"]},{\"name\":\"scheduler\",\"summary\":\"Rank ready work for agent swarms with explainable evidence\",\"operation\":\"read\",\"workspace\":\"required\",\"machine_output\":[\"json\",\"toon\",\"text\"],\"examples\":[\"br scheduler --json\",\"br scheduler --limit 5 --candidate-limit 100 --format json\"]},{\"name\":\"schema\",\"summary\":\"Emit JSON Schemas and per-command output envelope shapes (for agent/tooling integration)\",\"operation\":\"read\",\"workspace\":\"none\",\"machine_output\":[\"json\",\"toon\",\"text\"],\"examples\":[\"br schema commands --format json\"]},{\"name\":\"search\",\"summary\":\"Search issues (matches title, description, id, and comment text)\",\"operation\":\"read\",\"workspace\":\"required\",\"machine_output\":[\"json\",\"toon\",\"csv\",\"text\"],\"examples\":[\"br search \\\"auth\\\" --format json\",\"br search \\\"auth\\\" --status open --priority 0 --format toon\"]},{\"name\":\"show\",\"summary\":\"Show issue details\",\"operation\":\"read\",\"workspace\":\"required\",\"machine_output\":[\"json\",\"toon\",\"text\"],\"examples\":[\"br show br-abc --json\"]},{\"name\":\"stale\",\"summary\":\"List stale issues\",\"operation\":\"read\",\"workspace\":\"required\",\"machine_output\":[\"json\",\"toon\",\"text\"],\"examples\":[\"br stale --days 30 --json\"]},{\"name\":\"stats\",\"summary\":\"Show project statistics\",\"operation\":\"read\",\"workspace\":\"required\",\"machine_output\":[\"json\",\"toon\",\"text\"],\"examples\":[\"br stats --format json\"]},{\"name\":\"status\",\"summary\":\"Alias for stats\",\"operation\":\"read\",\"workspace\":\"required\",\"machine_output\":[\"json\",\"toon\",\"text\"],\"examples\":[\"br stats --format json\"]},{\"name\":\"sync\",\"summary\":\"Sync database with JSONL file (export or import)\",\"operation\":\"mixed\",\"workspace\":\"required\",\"machine_output\":[\"json\",\"text\"],\"examples\":[\"br sync --status --json\",\"br sync --flush-only\"]},{\"name\":\"undefer\",\"summary\":\"Undefer issues (make ready again)\",\"operation\":\"write\",\"workspace\":\"required\",\"machine_output\":[\"json\",\"toon\",\"text\"],\"examples\":[\"br undefer br-abc --json\"]},{\"name\":\"update\",\"summary\":\"Update an issue\",\"operation\":\"write\",\"workspace\":\"required\",\"machine_output\":[\"json\",\"toon\",\"text\"],\"examples\":[\"br update br-abc --claim --json\",\"br update br-abc --status in_progress --assignee agent-name --json\",\"br update br-abc --add-label needs-review --json\"]},{\"name\":\"vcs-status\",\"summary\":\"Explicitly inspect Git visibility for the configured JSONL export\",\"operation\":\"read\",\"workspace\":\"required\",\"machine_output\":[\"json\",\"toon\",\"text\"],\"examples\":[\"br vcs-status --json\",\"br vcs-status --timeout-ms 5000 --robot\"]},{\"name\":\"upgrade\",\"summary\":\"Upgrade br to the latest version\",\"operation\":\"write\",\"workspace\":\"none\",\"machine_output\":[\"json\",\"text\"],\"examples\":[\"br upgrade --check --json\"]},{\"name\":\"version\",\"summary\":\"Show version information\",\"operation\":\"read\",\"workspace\":\"none\",\"machine_output\":[\"json\",\"toon\",\"text\"],\"examples\":[\"br version --json\"]},{\"name\":\"where\",\"summary\":\"Show the active .beads directory\",\"operation\":\"read\",\"workspace\":\"optional\",\"machine_output\":[\"json\",\"toon\",\"text\"],\"examples\":[\"br where --json\"]}],\"global_flags\":[{\"flag\":\"--json\",\"description\":\"Request machine-readable JSON output when a command supports it.\"},{\"flag\":\"--no-color\",\"description\":\"Disable ANSI styling for human-readable output.\"},{\"flag\":\"-q, --quiet\",\"description\":\"Suppress non-error output.\"},{\"flag\":\"--db <PATH>\",\"description\":\"Override the discovered .beads SQLite database path.\"},{\"flag\":\"--actor <NAME>\",\"description\":\"Set the actor recorded in mutation audit events.\"}],\"output_formats\":[\"text\",\"json\",\"toon\"],\"exit_codes\":[{\"code\":0,\"category\":\"success\",\"description\":\"Command completed successfully.\"},{\"code\":1,\"category\":\"internal\",\"description\":\"Unexpected internal error.\"},{\"code\":2,\"category\":\"database\",\"description\":\"Database initialization, schema, or storage error.\"},{\"code\":3,\"category\":\"issue\",\"description\":\"Issue lookup, ambiguity, or issue-state error.\"},{\"code\":4,\"category\":\"validation\",\"description\":\"Invalid command input, flag value, or required field.\"},{\"code\":5,\"category\":\"dependency\",\"description\":\"Dependency graph error such as a cycle or self-dependency.\"},{\"code\":6,\"category\":\"sync_jsonl\",\"description\":\"JSONL import/export, merge, or sync safety error.\"},{\"code\":7,\"category\":\"config\",\"description\":\"Configuration or workspace discovery error.\"},{\"code\":8,\"category\":\"io\",\"description\":\"Filesystem or terminal I/O error.\"}],\"env_vars\":[{\"name\":\"BD_DB / BD_DATABASE / BEADS_DB\",\"description\":\"Override the SQLite database path.\"},{\"name\":\"BEADS_JSONL\",\"description\":\"Override the JSONL path when explicitly allowed.\"},{\"name\":\"BR_OUTPUT_FORMAT\",\"description\":\"Default output format: text, json, or toon.\"},{\"name\":\"TOON_DEFAULT_FORMAT\",\"description\":\"Fallback default that can select TOON output.\"},{\"name\":\"NO_COLOR\",\"description\":\"Disable colored human-readable output.\"},{\"name\":\"RUST_LOG\",\"description\":\"Set logging verbosity; use RUST_LOG=error for routine agent runs.\"}],\"safety\":[{\"name\":\"no_automatic_git_operations\",\"guarantee\":\"br never commits, pushes, pulls, or installs hooks automatically.\"},{\"name\":\"sync_path_allowlist\",\"guarantee\":\"sync writes stay inside .beads unless an external JSONL path is explicitly allowed.\"},{\"name\":\"write_lock_for_storage_mutations\",\"guarantee\":\"mutating commands acquire the workspace write lock before storage writes.\"},{\"name\":\"structured_errors\",\"guarantee\":\"machine-output contexts render structured error envelopes on stdout; stderr carries diagnostics.\"}],\"recommended_entrypoints\":[\"br capabilities --format json\",\"br robot-docs guide\",\"br ready --json\",\"br coordination status --json\",\"br schema commands --format json\"]}\n",
+      "timed_out": false
+    },
+    "br-coordination": {
+      "argv": [
+        "/home/arch/.local/bin/br",
+        "coordination",
+        "status",
+        "--json"
+      ],
+      "data_hashes": [],
+      "duration_seconds": 0.415674,
+      "json_parsed": false,
+      "returncode": 0,
+      "schema_or_contract_versions": [],
+      "stderr_tail": "",
+      "stdout_sha256": "77a4d850ad1f6c9f0b607a2cbf84835a30dd53dcf5f4a6a84efd076676bd450b",
+      "stdout_tail": "[...truncated...]\nogress\",\"priority\":3,\"issue_type\":\"task\",\"labels\":[],\"dependency_count\":1,\"dependent_count\":0,\"latest_comments\":[{\"author\":\"ubuntu\",\"text\":\"Claimed from bv --robot-next at 2026-07-22T14:48Z (score 0.1388). Root is auditing HTML/pages export security acceptance now; browser-suite execution remains deferred per AGENTS.md, so proof will use non-browser unit/integration contracts locally through RCH and preserve browser E2E for the project-approved environment.\",\"created_at\":\"2026-07-22T14:48:56Z\"}]},\"assessment\":{\"assignee\":\"codex-root\",\"owner_kind\":\"swarm_agent\",\"updated_at\":\"2026-07-23T22:54:52.942464586Z\",\"updated_age_minutes\":127941,\"stale_threshold_minutes\":120,\"abandoned_threshold_minutes\":480,\"reservation\":{\"state\":\"no_snapshot\"},\"classification\":\"no_mail_snapshot\",\"recommended_action\":\"inspect_mail\",\"evidence_sources\":[\"issue_metadata\",\"policy_threshold\",\"no_agent_mail_snapshot\"]},\"reclaim_allowed_by_policy\":false,\"required_human_confirmation\":false,\"evidence_summary\":\"updated_at=2026-07-23 22:54:52.942464586 UTC, assignee=codex-root, owner_kind=swarm_agent, age_minutes=127941, stale_threshold_minutes=120, abandoned_threshold_minutes=480, reservation_status=no_snapshot\",\"suggested_commands\":[]},{\"issue\":{\"id\":\"coding_agent_session_search-cass-fleet-resilience-20260608-uojcg.2.6\",\"title\":\"Wire bounded execution budget into view/search/triage/pack/fleet robot surfaces\",\"status\":\"in_progress\",\"priority\":0,\"issue_type\":\"task\",\"labels\":[\"proof-required\",\"robot-json\",\"search\",\"timeout\",\"view\"],\"dependency_count\":1,\"dependent_count\":1,\"latest_comments\":[{\"author\":\"codex-root\",\"text\":\"2026-07-23 implementation checkpoint: commit e1ad3575 (pushed on main) wires the typed additive budget block through view/search/triage/pack with deterministic slow-path tests. Current follow-up tree hard-bounds fleet/source SSH children, preserves timed-out host identity, truthfully distinguishes contacted vs pre-shed hosts, and caps local verification children by the remaining total budget. RCH compile/targeted proof and reviewed robot goldens are in progress; bead remains in_progress until all gates are green.\",\"created_at\":\"2026-07-23T17:59:30Z\"},{\"author\":\"ubuntu\",\"text\":\"VIEW SURFACE LANDED (commit 1d8eb9a2). run_view emits a top-level budget block {elapsed_ms, budget_ms (env CASS_VIEW_BUDGET_MS, default 10000), timed_out}; additive, existing view JSON (incl. 2.3 source_exists/archive_only) unchanged. rch cargo check (lib) GREEN; tests/cli_view_budget.rs 2 E2E (within-budget=timed_out false; 1ms=timed_out true, content still returned, valid JSON); ubs --ci exit 0. E2E exec pending stable build. REMAINING: search (run_cli_search ~19677), triage (run_triage ~65321), pack (run_cli_pack ~20684), fleet probes — same RobotBudget+budget-block pattern. Bead stays open. (status+doctor surfaces already shipped under 2.2: 1f76ab78/5a90fe83.)\",\"created_at\":\"2026-06-09T16:12:11Z\"}]},\"assessment\":{\"assignee\":\"codex-root\",\"owner_kind\":\"swarm_agent\",\"updated_at\":\"2026-07-23T17:59:30.534666557Z\",\"updated_age_minutes\":128237,\"stale_threshold_minutes\":120,\"abandoned_threshold_minutes\":480,\"reservation\":{\"state\":\"no_snapshot\"},\"classification\":\"no_mail_snapshot\",\"recommended_action\":\"inspect_mail\",\"evidence_sources\":[\"issue_metadata\",\"policy_threshold\",\"no_agent_mail_snapshot\"]},\"reclaim_allowed_by_policy\":false,\"required_human_confirmation\":false,\"evidence_summary\":\"updated_at=2026-07-23 17:59:30.534666557 UTC, assignee=codex-root, owner_kind=swarm_agent, age_minutes=128237, stale_threshold_minutes=120, abandoned_threshold_minutes=480, reservation_status=no_snapshot\",\"suggested_commands\":[]},{\"issue\":{\"id\":\"coding_agent_session_search-leli0\",\"title\":\"gh #320: index --full 13.4G physical footprint on 16GB macOS host — profile ingest+FTS memory after fsqlite 0.1.13 bump\",\"status\":\"in_progress\",\"priority\":1,\"issue_type\":\"bug\",\"labels\":[],\"dependency_count\":0,\"dependent_count\":1,\"latest_comments\":[{\"author\":\"ubuntu\",\"text\":\"Claimed from bv --robot-triage top pick at 2026-07-22T07:14:21Z (score 0.1534757887). Current #320 remains open after v0.6.22 reporter retest; existing main mitigates unbounded WAL but lacks proof that the 16GB macOS physical-footprint target is met. Beginning current-code profiling and bounded-memory investigation; no closure without measured proof.\",\"created_at\":\"2026-07-22T07:15:33Z\"},{\"author\":\"ubuntu\",\"text\":\"Profiled on Linux (fresh CASS_DATA_DIR, ~6GB raw corpus, cass 0.6.22): ingest-phase RSS ~= ~2.6GB parse/ingest base + ~1.0x WAL bytes; WAL unbounded because bulk mode sets wal_autocheckpoint=0 AND fsqlite's inline autocheckpoint advisor never backfills under this workload (db stays 308KB while WAL passes 2.5GB even with wal_autocheckpoint=65536 set via env). Paired runs: 5.16GB RSS @ 2.56GB WAL vs 4.05GB RSS @ 1.56GB WAL at same instant. cass-side mitigation landing on main: bounded bulk autocheckpoint default (65536 pages) + explicit PRAGMA wal_checkpoint(PASSIVE) at ingest batch boundaries when WAL > CASS_INDEX_INGEST_WAL_CHECKPOINT_BYTES (default 512MB). Remaining (upstream fsqlite): pager retains ~1x WAL in memory; autocheckpoint advisor doesn't fire/backfill mid-bulk-ingest. macOS 13-14GB footprint = same shape + compressed-freed-pages accounting.\",\"created_at\":\"2026-07-10T18:17:14Z\"}]},\"assessment\":{\"assignee\":\"codex-root\",\"owner_kind\":\"swarm_agent\",\"updated_at\":\"2026-07-22T07:15:33.620901851Z\",\"updated_age_minutes\":130321,\"stale_threshold_minutes\":120,\"abandoned_threshold_minutes\":480,\"reservation\":{\"state\":\"no_snapshot\"},\"classification\":\"no_mail_snapshot\",\"recommended_action\":\"inspect_mail\",\"evidence_sources\":[\"issue_metadata\",\"policy_threshold\",\"no_agent_mail_snapshot\"]},\"reclaim_allowed_by_policy\":false,\"required_human_confirmation\":false,\"evidence_summary\":\"updated_at=2026-07-22 07:15:33.620901851 UTC, assignee=codex-root, owner_kind=swarm_agent, age_minutes=130321, stale_threshold_minutes=120, abandoned_threshold_minutes=480, reservation_status=no_snapshot\",\"suggested_commands\":[]}]}\n",
+      "timed_out": false
+    },
+    "br-ready": {
+      "argv": [
+        "/home/arch/.local/bin/br",
+        "ready",
+        "--json"
+      ],
+      "data_hashes": [],
+      "duration_seconds": 0.26487,
+      "json_parsed": true,
+      "returncode": 0,
+      "schema_or_contract_versions": [],
+      "stderr_tail": "",
+      "stdout_sha256": "f6da12b5c71cdf0ec049804c6690196c1c1fd52504eaf5ee175f1567dbe806c5",
+      "stdout_tail": "[...truncated...]\nxact source, executed binary, corpus/model/generation, command, platform, nonzero test counts and terminal exit. Refused/missing/stale/zero-test runs remain non-passes. No private session contents or credentials in logs. Existing owners retain overlapping work; first inspect current source and Beads before implementing.\",\"id\":\"coding_agent_session_search-2l1b0.27\",\"issue_type\":\"task\",\"labels\":[\"reality-check-20260904\"],\"notes\":\"Refinement 4: scope-decision completion must never be interpreted as functional implementation. A historical mechanism may be superseded with evidence that its user goal is already met; any retained unmet capability must remain open as an explicit implementation task. No removal of working SSH, export or installer functionality.\",\"priority\":3,\"status\":\"open\",\"title\":\"Resolve historical Rust-installer and logical archive-portability promises explicitly\",\"updated_at\":\"2026-09-04T21:36:49.989898509Z\"},{\"created_at\":\"2026-09-04T21:26:56.011449745Z\",\"created_by\":\"CyanKnoll\",\"description\":\"Problem and user outcome\\nSix inspected files total 292,303 lines including tests; src/lib.rs alone has 120,672. This increases review, build and shared-edit risk. Past whole-file restores removed recently committed callers. File size alone does not justify a broad rewrite.\\n\\nImplementation boundary\\nSelect one cohesive seam needed by current retrieval/gate work using call graph and churn evidence. Reserve shared monoliths, move into appropriate existing modules when possible, and create a file only if a genuinely independent responsibility cannot fit existing modules. Preserve symbols and on-disk semantics, public output and performance; do not replace durable caches with in-process lookalikes. Recheck landed symbols after peer commits.\\n\\nTests and acceptance\\nExisting meaningful behavioral/golden tests plus focused cross-module integration and before/after build/latency evidence where relevant. Review an isomorphic diff with no functionality removed. All-target clippy/fmt and exact changed-file UBS; no unrelated cleanup, broad format rewrite or peer staging.\\n\\nBaseline and evidence discipline: source fe6927706f6dff075d3639a868abd3df08e9e1c7, September 4 2026. Issue timings are reported historical evidence unless reproduced. Follow AGENTS: FrankenSQLite for all new SQLite code, explicit model acquisition, reserved shared files, no deletions or source/archive mutation by inspection, no peer overwrites/staging. Run substantive Rust validation through one RCH batched admission with RUST_MIN_STACK=16777216; include changed-file UBS and reviewed goldens. Use existing proof manifests/logging, with exact source, executed binary, corpus/model/generation, command, platform, nonzero test counts and terminal exit. Refused/missing/stale/zero-test runs remain non-passes. No private session contents or credentials in logs. Existing owners retain overlapping work; first inspect current source and Beads before implementing.\",\"id\":\"coding_agent_session_search-2l1b0.28\",\"issue_type\":\"task\",\"labels\":[\"reality-check-20260904\"],\"priority\":2,\"status\":\"open\",\"title\":\"Extract measured shared-module seams without losing behavior or peer work\",\"updated_at\":\"2026-09-04T21:26:56.011449745Z\"},{\"created_at\":\"2026-09-04T21:26:57.096906426Z\",\"created_by\":\"CyanKnoll\",\"description\":\"Problem and user outcome\\nThe initial 2146-Bead tracker has 100 unfinished tasks, including old dependency-migration work whose code already landed; several recent GitHub reports lacked dedicated issue references. Finishing every old task would still miss live integrations and full-command release acceptance.\\n\\nImplementation boundary\\nAudit open/in-progress/blocked Beads against current source, actual owners and the new journey graph. Identify duplicate or superseded migration/dependency tasks (including bo000, cljkz, 2amyb, yxcga) and already-landed code awaiting proof. Add evidence/relationships without stealing claims; close only with owner-aware acceptance, never based on title or commit alone. Map each open GH issue to a self-contained Bead with reporter numbers and a proposed triage handoff.\\n\\nTests and acceptance\\nUse br only for changes; inspect exported descriptions/dependencies and bv triage/cycles. Verify no uncovered issue, orphan acceptance gate or wrong dependency direction in the scoped campaign. External GitHub comments are a separate authorized action; record pending handoffs rather than sending them implicitly.\\n\\nBaseline and evidence discipline: source fe6927706f6dff075d3639a868abd3df08e9e1c7, September 4 2026. Issue timings are reported historical evidence unless reproduced. Follow AGENTS: FrankenSQLite for all new SQLite code, explicit model acquisition, reserved shared files, no deletions or source/archive mutation by inspection, no peer overwrites/staging. Run substantive Rust validation through one RCH batched admission with RUST_MIN_STACK=16777216; include changed-file UBS and reviewed goldens. Use existing proof manifests/logging, with exact source, executed binary, corpus/model/generation, command, platform, nonzero test counts and terminal exit. Refused/missing/stale/zero-test runs remain non-passes. No private session contents or credentials in logs. Existing owners retain overlapping work; first inspect current source and Beads before implementing.\",\"id\":\"coding_agent_session_search-2l1b0.30\",\"issue_type\":\"task\",\"labels\":[\"reality-check-20260904\"],\"notes\":\"Refinement 4: issue-linked campaign Beads now cover previously absent GH452/450/449/447/443/423/391/402/381/379 references, with GH438/GH395 dedicated acceptance follow-through. Reconcile against live issue state again at handoff; no automatic issue comments or bulk closure. Legacy migration tasks retain original assignee/status until their actual acceptance and ownership are resolved.\",\"priority\":2,\"status\":\"open\",\"title\":\"Reconcile stale Beads and GitHub coverage using source and acceptance evidence\",\"updated_at\":\"2026-09-04T21:36:49.443300655Z\"}]\n",
+      "timed_out": false
+    },
+    "bv-insights": {
+      "argv": [
+        "/home/arch/.local/bin/bv",
+        "--robot-insights"
+      ],
+      "data_hashes": [],
+      "duration_seconds": 0.615552,
+      "json_parsed": false,
+      "returncode": 0,
+      "schema_or_contract_versions": [],
+      "stderr_tail": "",
+      "stdout_sha256": "595914e375fe4216c7c74bd5e3ef548a5e6f0033bb1c19f61fa846a3b6ce6292",
+      "stdout_tail": "[...truncated...]\n,\"marginal_gain\":[1,0,0,0,0],\"how_to_use\":\"Best k issues to complete for max downstream unlock. Work these in order.\"},\"coverage_set\":{\"status\":{\"state\":\"available\",\"capped\":true,\"count\":5,\"limited\":53},\"items\":[{\"id\":\"coding_agent_session_search-2l1b0.25\",\"title\":\"Certify exact release artifacts and restore an executable cross-platform acceptance path\",\"edges_added\":12,\"total_degree\":12,\"selection_seq\":1},{\"id\":\"coding_agent_session_search-ds7uy\",\"title\":\"Semantic writer/readiness/query paths are mutually unsatisfiable\",\"edges_added\":12,\"total_degree\":12,\"selection_seq\":2},{\"id\":\"coding_agent_session_search-91njy\",\"title\":\"Release CASS v0.8.0 with FrankenSQLite 0.3.18 and the implemented bridge features\",\"edges_added\":9,\"total_degree\":9,\"selection_seq\":3},{\"id\":\"coding_agent_session_search-ds7uy.4\",\"title\":\"One semantic readiness and RecoveryPlan state machine across all truth surfaces\",\"edges_added\":6,\"total_degree\":7,\"selection_seq\":4},{\"id\":\"coding_agent_session_search-2l1b0.11\",\"title\":\"Prove the complete retrieval journey on scaled archives and exact release candidates\",\"edges_added\":4,\"total_degree\":5,\"selection_seq\":5}],\"edges_covered\":43,\"total_edges\":53,\"coverage_ratio\":0.8113207547169812,\"rationale\":\"Greedy vertex-cover heuristic: iteratively pick highest uncovered degree until edges are covered or cap is reached.\",\"how_to_use\":\"Greedy dependency-edge coverage. Check coverage_ratio and capped before treating it as complete.\"},\"k_paths\":{\"status\":{\"state\":\"available\",\"count\":5,\"limited\":5},\"paths\":[{\"rank\":1,\"length\":7,\"issue_ids\":[\"coding_agent_session_search-cass-fsvi-semantic-witness-xbq0b\",\"coding_agent_session_search-ds7uy.1\",\"coding_agent_session_search-ds7uy.3\",\"coding_agent_session_search-ds7uy.4\",\"coding_agent_session_search-ds7uy.5\",\"coding_agent_session_search-ds7uy\",\"coding_agent_session_search-jyfuq\"]},{\"rank\":2,\"length\":3,\"issue_ids\":[\"coding_agent_session_search-2l1b0.1\",\"coding_agent_session_search-2l1b0.11\",\"coding_agent_session_search-2l1b0.25\"]},{\"rank\":3,\"length\":2,\"issue_ids\":[\"coding_agent_session_search-2l1b0.16\",\"coding_agent_session_search-2l1b0.18\"]},{\"rank\":4,\"length\":2,\"issue_ids\":[\"coding_agent_session_search-2l1b0.2\",\"coding_agent_session_search-2l1b0.29\"]},{\"rank\":5,\"length\":2,\"issue_ids\":[\"coding_agent_session_search-90y8u\",\"coding_agent_session_search-91njy\"]}],\"how_to_use\":\"Representative longest critical paths. Focus on issues appearing in multiple paths.\"},\"parallel_cut\":{\"status\":{\"state\":\"available\"},\"max_parallel\":123,\"how_to_use\":\"Issues that enable parallel work. Complete to maximize team throughput.\"},\"parallel_gain\":{\"status\":{\"state\":\"computed\",\"capped\":true,\"count\":5,\"limited\":6,\"duration_ms\":26},\"current_parallel\":67,\"metrics\":[{\"id\":\"coding_agent_session_search-2l1b0\",\"title\":\"Reality-check 2026-09-04: archive-safe, bounded, proven user journeys\",\"current_parallel\":67,\"potential_parallel\":81,\"gain\":14,\"gain_percent\":20.8955223880597},{\"id\":\"coding_agent_session_search-cass-fleet-resilience-20260608-uojcg\",\"title\":\"Epic: Operational resilience from 2026-06-08 CASS fleet/session analysis\",\"current_parallel\":67,\"potential_parallel\":81,\"gain\":14,\"gain_percent\":20.8955223880597},{\"id\":\"coding_agent_session_search-rustsec-zero-vulnerability-baseline-gothf\",\"title\":\"Restore a zero-vulnerability cargo-audit baseline without weakening policy\",\"current_parallel\":67,\"potential_parallel\":69,\"gain\":2,\"gain_percent\":2.9850746268656714},{\"id\":\"coding_agent_session_search-cass-fleet-resilience-20260608-uojcg.15\",\"title\":\"Epic: Peripheral subsystem resilience and user-visible surface regression coverage\",\"current_parallel\":67,\"potential_parallel\":68,\"gain\":1,\"gain_percent\":1.4925373134328357},{\"id\":\"coding_agent_session_search-cass-fleet-resilience-20260608-uojcg.2\",\"title\":\"Epic: Quiet bounded robot commands and archive-capable view\",\"current_parallel\":67,\"potential_parallel\":68,\"gain\":1,\"gain_percent\":1.4925373134328357}],\"how_to_use\":\"Independent work tracks gained by closing each actionable issue now (gain = tracks after - tracks now). Pick high-gain issues to widen parallel work; unblocks lists what opens up.\"},\"cycle_break\":{\"status\":{\"state\":\"skipped\",\"reason\":\"cycle detection skipped: graph too large (\\u003e2000 nodes)\"},\"cycle_count\":0,\"how_to_use\":\"Structural fix suggestions. Apply BEFORE working on cycle members.\",\"advisory\":\"Cycle analysis is unavailable; do not infer that the dependency graph is acyclic.\"},\"config\":{\"topk_set_limit\":5,\"coverage_set_limit\":5,\"k_paths_limit\":5,\"path_length_cap\":50,\"cycle_break_limit\":5,\"parallel_cut_limit\":5,\"parallel_gain_limit\":5},\"usage_hints\":{\"coverage_set\":\"Greedy dependency-edge coverage. Check coverage_ratio and capped before treating it as complete.\",\"cycle_break\":\"Structural fix suggestions. Apply BEFORE working on cycle members.\",\"k_paths\":\"Representative longest critical paths. Focus on issues appearing in multiple paths.\",\"parallel_cut\":\"Issues that enable parallel work. Complete to maximize team throughput.\",\"parallel_gain\":\"Independent work tracks gained by closing each actionable issue now (gain = tracks after - tracks now). Pick high-gain issues to widen parallel work; unblocks lists what opens up.\",\"topk_set\":\"Best k issues to complete for max downstream unlock. Work these in order.\"}},\"usage_hints\":[\"jq '.Bottlenecks[:5] | map(.ID)' - Top 5 bottleneck IDs\",\"jq '.Keystones[:3]' - Top 3 critical path scores\",\"jq '.top_what_ifs[] | select(.delta.direct_unblocks \\u003e 2)' - High-impact items\",\"jq '.full_stats.pagerank | to_entries | sort_by(-.value)[:5]' - Top PageRank\",\"jq '.full_stats.core_number | to_entries | sort_by(-.value)[:5]' - Strongly embedded nodes (k-core)\",\"jq '.full_stats.articulation_points' - Structural cut points\",\"jq '.Slack[:5]' - Nodes with slack (good parallel work candidates)\",\"jq '.Cycles | length' - Count of detected cycles\",\"jq '.advanced_insights.cycle_break' - Cycle break suggestions (bv-181)\",\"BV_INSIGHTS_MAP_LIMIT=50 bv --robot-insights - Reduce map sizes\"]}\n",
+      "timed_out": false
+    },
+    "bv-plan": {
+      "argv": [
+        "/home/arch/.local/bin/bv",
+        "--robot-plan"
+      ],
+      "data_hashes": [
+        "6b7e8b5d4040348a525f1a6da75852eb045c52d39cac264be679a0614707d47c",
+        "a9986d3c004727f9a971ed6754093d18ec474b6ea8420d5b4e8d883d9bf544d6"
+      ],
+      "duration_seconds": 0.415188,
+      "json_parsed": true,
+      "parsed_summary": {
+        "status": {
+          "Articulation": {
+            "state": "computed"
+          },
+          "Betweenness": {
+            "reason": "not computed for --robot-plan",
+            "state": "skipped"
+          },
+          "Critical": {
+            "state": "skipped"
+          },
+          "Cycles": {
+            "reason": "not computed for --robot-plan",
+            "state": "skipped"
+          },
+          "Eigenvector": {
+            "state": "skipped"
+          },
+          "HITS": {
+            "reason": "not computed for --robot-plan",
+            "state": "skipped"
+          },
+          "KCore": {
+            "ms": 1.154483,
+            "state": "computed"
+          },
+          "PageRank": {
+            "state": "skipped"
+          },
+          "Slack": {
+            "ms": 0.581394,
+            "state": "computed"
+          }
+        }
+      },
+      "returncode": 0,
+      "schema_or_contract_versions": [],
+      "stderr_tail": "",
+      "stdout_sha256": "fa3664bdacc4be575df93ec45ecfcaa310a0aadadcf6b92ff24f57bcaa8b688b",
+      "stdout_tail": "[...truncated...]\nonable item\"},{\"track_id\":\"track-AP\",\"items\":[{\"id\":\"coding_agent_session_search-mt24v\",\"title\":\"Apply complete secret scrubbing to strict swarm evidence\",\"priority\":1,\"status\":\"in_progress\",\"unblocks\":[]}],\"reason\":\"Single actionable item\"},{\"track_id\":\"track-AQ\",\"items\":[{\"id\":\"coding_agent_session_search-njx4p\",\"title\":\"Kiro connector: reimplement PR#385 independently via FAD boundary\",\"priority\":2,\"status\":\"open\",\"unblocks\":[]}],\"reason\":\"Single actionable item\"},{\"track_id\":\"track-AR\",\"items\":[{\"id\":\"coding_agent_session_search-of9i7\",\"title\":\"gh460-incremental-ann: keep accelerated retrieval current after small vector updates\",\"priority\":1,\"status\":\"open\",\"unblocks\":[]}],\"reason\":\"Single actionable item\"},{\"track_id\":\"track-AS\",\"items\":[{\"id\":\"coding_agent_session_search-orz9w\",\"title\":\"Fail closed when proof run has no exit status\",\"priority\":1,\"status\":\"in_progress\",\"unblocks\":[]}],\"reason\":\"Single actionable item\"},{\"track_id\":\"track-AT\",\"items\":[{\"id\":\"coding_agent_session_search-povuc\",\"title\":\"Adopt PR#384 companion ideas: checkpoint compaction deferral, fingerprint reuse, zero-norm hash recovery (gh#383)\",\"priority\":2,\"status\":\"in_progress\",\"unblocks\":[]}],\"reason\":\"Single actionable item\"},{\"track_id\":\"track-AU\",\"items\":[{\"id\":\"coding_agent_session_search-prxuj\",\"title\":\"Normalize Oh My Pi aliases across HTML export identity\",\"priority\":3,\"status\":\"in_progress\",\"unblocks\":[]}],\"reason\":\"Single actionable item\"},{\"track_id\":\"track-AV\",\"items\":[{\"id\":\"coding_agent_session_search-robsafei\",\"title\":\"Idempotency Keys\",\"priority\":3,\"status\":\"in_progress\",\"unblocks\":[]}],\"reason\":\"Single actionable item\"},{\"track_id\":\"track-AW\",\"items\":[{\"id\":\"coding_agent_session_search-rril3\",\"title\":\"analytics + incident-discovery --source local/remote still classify by source_id, not kind (follow-up to 5bf29)\",\"priority\":3,\"status\":\"in_progress\",\"unblocks\":[]}],\"reason\":\"Single actionable item\"},{\"track_id\":\"track-AX\",\"items\":[{\"id\":\"coding_agent_session_search-rustsec-zero-vulnerability-baseline-gothf\",\"title\":\"Restore a zero-vulnerability cargo-audit baseline without weakening policy\",\"priority\":0,\"status\":\"open\",\"unblocks\":[]},{\"id\":\"coding_agent_session_search-rustsec-zero-vulnerability-baseline-gothf.11\",\"title\":\"Eliminate nix 0.28/0.30/0.31 future-incompat warnings before nightly makes them hard errors\",\"priority\":1,\"status\":\"open\",\"unblocks\":[]},{\"id\":\"coding_agent_session_search-rustsec-zero-vulnerability-baseline-gothf.8\",\"title\":\"Eliminate unmaintained paste 1.0.15 from tokenizer and reranker builds\",\"priority\":1,\"status\":\"open\",\"unblocks\":[]},{\"id\":\"coding_agent_session_search-rustsec-zero-vulnerability-baseline-gothf.9\",\"title\":\"Eliminate unmaintained rustls-pemfile 2.2.0 through asupersync TLS ownership\",\"priority\":1,\"status\":\"open\",\"unblocks\":[]}],\"reason\":\"Independent work stream\"},{\"track_id\":\"track-AY\",\"items\":[{\"id\":\"coding_agent_session_search-sxhgy\",\"title\":\"gh459-cursor-workspace: prefer explicit metadata and repair canonical attribution\",\"priority\":1,\"status\":\"in_progress\",\"unblocks\":[]}],\"reason\":\"Single actionable item\"},{\"track_id\":\"track-AZ\",\"items\":[{\"id\":\"coding_agent_session_search-u3vho\",\"title\":\"GH#422: bound search-triggered lexical refresh and preserve pure-read search\",\"priority\":1,\"status\":\"in_progress\",\"unblocks\":[]}],\"reason\":\"Single actionable item\"},{\"track_id\":\"track-BA\",\"items\":[{\"id\":\"coding_agent_session_search-uc7nz\",\"title\":\"Preserve OMP thinking and tool interactions in HTML export\",\"priority\":2,\"status\":\"in_progress\",\"unblocks\":[]}],\"reason\":\"Single actionable item\"},{\"track_id\":\"track-BB\",\"items\":[{\"id\":\"coding_agent_session_search-ul46p\",\"title\":\"Prime Agent connector (~/.prime/agent/sessions) — gh#388\",\"priority\":2,\"status\":\"in_progress\",\"unblocks\":[]}],\"reason\":\"Single actionable item\"},{\"track_id\":\"track-BC\",\"items\":[{\"id\":\"coding_agent_session_search-uvii3\",\"title\":\"SQLite source-scan fallback mis-evaluates NOT/OR and quoted phrases\",\"priority\":1,\"status\":\"in_progress\",\"unblocks\":[]}],\"reason\":\"Single actionable item\"},{\"track_id\":\"track-BD\",\"items\":[{\"id\":\"coding_agent_session_search-wxuu2\",\"title\":\"Redact structured credential fields by key semantics\",\"priority\":1,\"status\":\"in_progress\",\"unblocks\":[]}],\"reason\":\"Single actionable item\"},{\"track_id\":\"track-BE\",\"items\":[{\"id\":\"coding_agent_session_search-xhw6y\",\"title\":\"Wire the finished bookmarks module into a cass bookmarks CLI\",\"priority\":2,\"status\":\"in_progress\",\"unblocks\":[]}],\"reason\":\"Single actionable item\"},{\"track_id\":\"track-BF\",\"items\":[{\"id\":\"coding_agent_session_search-y7vcg\",\"title\":\"SQLite source-scan cap is applied before query filters\",\"priority\":1,\"status\":\"in_progress\",\"unblocks\":[]}],\"reason\":\"Single actionable item\"},{\"track_id\":\"track-BG\",\"items\":[{\"id\":\"coding_agent_session_search-zp700\",\"title\":\"gh453 adopt published receipt-aged Quill GC and verify continued publication\",\"priority\":1,\"status\":\"in_progress\",\"unblocks\":[]}],\"reason\":\"Single actionable item\"},{\"track_id\":\"track-BH\",\"items\":[{\"id\":\"coding_agent_session_search-zrtrr\",\"title\":\"Fail closed when redacting structured swarm failure-pattern fields\",\"priority\":1,\"status\":\"in_progress\",\"unblocks\":[]}],\"reason\":\"Single actionable item\"},{\"track_id\":\"track-BI\",\"items\":[{\"id\":\"coding_agent_session_search-ztlan\",\"title\":\"sigpipe SIG_DFL makes child-stdin writes lethal in a narrow race (adversarial-review F2)\",\"priority\":2,\"status\":\"in_progress\",\"unblocks\":[]}],\"reason\":\"Single actionable item\"}],\"total_actionable\":123,\"total_blocked\":31,\"summary\":{\"highest_impact\":\"coding_agent_session_search-2l1b0.2\",\"impact_reason\":\"Unblocks 1 task\",\"unblocks_count\":1}},\"usage_hints\":[\"jq '.plan.tracks | length' - Number of parallel execution tracks\",\"jq '.plan.tracks[0].items | map(.id)' - First track item IDs\",\"jq '.plan.tracks[].items[] | select(.unblocks | length \\u003e 0)' - Items that unblock others\",\"jq '.plan.summary' - High-level execution summary\",\"jq '[.plan.tracks[].items[]] | length' - Total items across all tracks\"]}\n",
+      "timed_out": false
+    },
+    "bv-triage": {
+      "argv": [
+        "/home/arch/.local/bin/bv",
+        "--robot-triage",
+        "--brief"
+      ],
+      "data_hashes": [
+        "6b7e8b5d4040348a525f1a6da75852eb045c52d39cac264be679a0614707d47c",
+        "a9986d3c004727f9a971ed6754093d18ec474b6ea8420d5b4e8d883d9bf544d6"
+      ],
+      "duration_seconds": 0.465185,
+      "json_parsed": true,
+      "parsed_summary": {
+        "quick_ref": {
+          "actionable_count": 123,
+          "blocked_count": 11,
+          "in_progress_count": 81,
+          "not_actionable_count": 31,
+          "not_closed_count": 154,
+          "open_count": 62,
+          "top_picks": [
+            {
+              "id": "coding_agent_session_search-2l1b0.2",
+              "reasons": [
+                "🔓 Unblocks 1 item(s): coding_agent_session_search-2l1b0.29",
+                "🕐 No activity in 45 days - may need review",
+                "✅ Currently unclaimed - available for work",
+                "🚨 High priority (P0) - prioritize this work"
+              ],
+              "score": 0.24542476652560197,
+              "title": "gh391 reproduce recurring rowid-order damage and prove writer lifecycle integrity",
+              "unblocks": 1
+            },
+            {
+              "id": "coding_agent_session_search-scohn",
+              "reasons": [
+                "🕐 No activity in 46 days - may need review",
+                "✅ Currently unclaimed - available for work",
+                "🚨 High priority (P0) - prioritize this work"
+              ],
+              "score": 0.20821602443580364,
+              "title": "owner archive integrity: C SQLite quick_check on a quiescent copy (2026-09-03 23:10) reports freelist double-reference, doubled child references in conversations (tree 29), and free-space corruption in usage_hourly/sqlite_master/others — needs the engine verdict (fsqlite integrity_check) and a decision before any further writes",
+              "unblocks": 0
+            },
+            {
+              "id": "coding_agent_session_search-aegfi",
+              "reasons": [
+                "🕐 No activity in 53 days - may need review",
+                "✅ Currently unclaimed - available for work",
+                "🚨 High priority (P0) - prioritize this work"
+              ],
+              "score": 0.2069375851087938,
+              "title": "GH#429: prove Windows Quill writer admission in the release candidate",
+              "unblocks": 0
+            }
+          ]
+        }
+      },
+      "returncode": 0,
+      "schema_or_contract_versions": [],
+      "stderr_tail": "",
+      "stdout_sha256": "f1cf84ff6aad0b2eb6186b13198e2e157533f379ff74c30d2fa1c2c50af023c8",
+      "stdout_tail": "[...truncated...]\ns/beads.db\",\"--no-auto-import\",\"--no-auto-flush\",\"show\",\"--json\",\"--\",\"coding_agent_session_search-cjugu\"],\"shell\":\"cd -- '/warp/projects/softwares/cass' \\u0026\\u0026 'env' 'BEADS_DIR=/warp/projects/softwares/cass/.beads' 'BEADS_DB=/warp/projects/softwares/cass/.beads/beads.db' 'BD_DB=/warp/projects/softwares/cass/.beads/beads.db' '/home/arch/.local/bin/br' '--db' '/warp/projects/softwares/cass/.beads/beads.db' '--no-auto-import' '--no-auto-flush' 'show' '--json' '--' 'coding_agent_session_search-cjugu'\"},\"unavailable_reason\":\"snapshot does not establish claim readiness\"}},{\"id\":\"coding_agent_session_search-g3zyo\",\"title\":\"gh382-owner-archive: frankensqlite writable open takes ~30 min on the owner 10 GB archive with a 200 MB WAL (per-page WAL tail rescan); fixed upstream 8d012706a, waits on a release\",\"status\":\"blocked\",\"score\":0.21760545403296921,\"actions\":{\"working_directory\":\"/warp/projects/softwares/cass\",\"local_id\":\"coding_agent_session_search-g3zyo\",\"tracker\":\"br\",\"show\":{\"working_directory\":\"/warp/projects/softwares/cass\",\"argv\":[\"env\",\"BEADS_DIR=/warp/projects/softwares/cass/.beads\",\"BEADS_DB=/warp/projects/softwares/cass/.beads/beads.db\",\"BD_DB=/warp/projects/softwares/cass/.beads/beads.db\",\"/home/arch/.local/bin/br\",\"--db\",\"/warp/projects/softwares/cass/.beads/beads.db\",\"--no-auto-import\",\"--no-auto-flush\",\"show\",\"--json\",\"--\",\"coding_agent_session_search-g3zyo\"],\"shell\":\"cd -- '/warp/projects/softwares/cass' \\u0026\\u0026 'env' 'BEADS_DIR=/warp/projects/softwares/cass/.beads' 'BEADS_DB=/warp/projects/softwares/cass/.beads/beads.db' 'BD_DB=/warp/projects/softwares/cass/.beads/beads.db' '/home/arch/.local/bin/br' '--db' '/warp/projects/softwares/cass/.beads/beads.db' '--no-auto-import' '--no-auto-flush' 'show' '--json' '--' 'coding_agent_session_search-g3zyo'\"},\"unavailable_reason\":\"snapshot does not establish claim readiness\"}},{\"id\":\"coding_agent_session_search-2l1b0.1\",\"title\":\"Make the batched gate enforce UBS, nonempty tests and immutable build receipts\",\"status\":\"blocked\",\"assignee\":\"CyanKnoll\",\"score\":0.2113530192981429,\"actions\":{\"working_directory\":\"/warp/projects/softwares/cass\",\"local_id\":\"coding_agent_session_search-2l1b0.1\",\"tracker\":\"br\",\"show\":{\"working_directory\":\"/warp/projects/softwares/cass\",\"argv\":[\"env\",\"BEADS_DIR=/warp/projects/softwares/cass/.beads\",\"BEADS_DB=/warp/projects/softwares/cass/.beads/beads.db\",\"BD_DB=/warp/projects/softwares/cass/.beads/beads.db\",\"/home/arch/.local/bin/br\",\"--db\",\"/warp/projects/softwares/cass/.beads/beads.db\",\"--no-auto-import\",\"--no-auto-flush\",\"show\",\"--json\",\"--\",\"coding_agent_session_search-2l1b0.1\"],\"shell\":\"cd -- '/warp/projects/softwares/cass' \\u0026\\u0026 'env' 'BEADS_DIR=/warp/projects/softwares/cass/.beads' 'BEADS_DB=/warp/projects/softwares/cass/.beads/beads.db' 'BD_DB=/warp/projects/softwares/cass/.beads/beads.db' '/home/arch/.local/bin/br' '--db' '/warp/projects/softwares/cass/.beads/beads.db' '--no-auto-import' '--no-auto-flush' 'show' '--json' '--' 'coding_agent_session_search-2l1b0.1'\"},\"unavailable_reason\":\"snapshot does not establish claim readiness\"}}],\"quick_wins\":[{\"id\":\"coding_agent_session_search-2l1b0.2\",\"title\":\"gh391 reproduce recurring rowid-order damage and prove writer lifecycle integrity\",\"status\":\"open\",\"score\":0.9,\"reason\":\"Unblocks 1 items, high priority\",\"unblocks_ids\":[\"coding_agent_session_search-2l1b0.29\"]},{\"id\":\"coding_agent_session_search-2l1b0.10\",\"title\":\"gh452 align agent recipes with versioned bounded history retrieval\",\"status\":\"open\",\"score\":0.5,\"reason\":\"Low complexity, high priority\"},{\"id\":\"coding_agent_session_search-2l1b0.22\",\"title\":\"gh395 prove large-archive first frame and core TUI journeys on the real terminal stack\",\"status\":\"open\",\"score\":0.5,\"reason\":\"Low complexity, high priority\"},{\"id\":\"coding_agent_session_search-2l1b0.23\",\"title\":\"Prove Pages export privacy, browser unlock and publication recovery end to end\",\"status\":\"open\",\"score\":0.5,\"reason\":\"Low complexity, high priority\"},{\"id\":\"coding_agent_session_search-2l1b0.24\",\"title\":\"Prove source sync and scheduled freshness without duplicate work or authority loss\",\"status\":\"open\",\"score\":0.5,\"reason\":\"Low complexity, high priority\"}],\"blockers_to_clear\":[{\"id\":\"coding_agent_session_search-cass-fsvi-semantic-witness-xbq0b\",\"title\":\"Bind CASS generation lease to one immutable FSVI v2 identity witness and search owner\",\"unblocks_count\":2,\"unblocks_ids\":[\"coding_agent_session_search-ds7uy.1\",\"coding_agent_session_search-wfm4e\"],\"actionable\":false},{\"id\":\"coding_agent_session_search-ds7uy.1\",\"title\":\"Authoritative immutable semantic generation manifest and atomic current pointer\",\"unblocks_count\":2,\"unblocks_ids\":[\"coding_agent_session_search-ds7uy.2\",\"coding_agent_session_search-ds7uy.3\"],\"actionable\":false,\"blocked_by\":[\"coding_agent_session_search-cass-fsvi-semantic-witness-xbq0b\"]},{\"id\":\"coding_agent_session_search-ds7uy.3\",\"title\":\"Manifest-only semantic reader with exact tier identities and real QualityOnly/FullProgressive retrieval\",\"unblocks_count\":2,\"unblocks_ids\":[\"coding_agent_session_search-ds7uy.3.2\",\"coding_agent_session_search-ds7uy.3.3\"],\"actionable\":false,\"blocked_by\":[\"coding_agent_session_search-ds7uy.1\"]},{\"id\":\"coding_agent_session_search-ds7uy.4\",\"title\":\"One semantic readiness and RecoveryPlan state machine across all truth surfaces\",\"unblocks_count\":2,\"unblocks_ids\":[\"coding_agent_session_search-ds7uy.4.1\",\"coding_agent_session_search-ds7uy.4.2\"],\"actionable\":false,\"blocked_by\":[\"coding_agent_session_search-ds7uy.1\",\"coding_agent_session_search-ds7uy.3\",\"coding_agent_session_search-ds7uy.3.2\",\"coding_agent_session_search-ds7uy.3.3\",\"coding_agent_session_search-wfm4e\"]},{\"id\":\"coding_agent_session_search-jyfuq\",\"title\":\"No-mock CASS semantic lifecycle E2E: provision, index, persist, restart, query, degrade, recover\",\"unblocks_count\":2,\"unblocks_ids\":[\"coding_agent_session_search-jyfuq.1\",\"coding_agent_session_search-jyfuq.2\"],\"actionable\":false,\"blocked_by\":[\"coding_agent_session_search-ds7uy\"]}]}\n",
+      "timed_out": false
+    }
+  },
+  "diff_fingerprint": "ff0853fcad575ab06252a182229d13f54dde2bbaa57dea36033e76dd69f01130",
+  "errors": [
+    "BV robot calls observed inconsistent data_hash values; refresh BR JSONL state and rerun"
+  ],
+  "feature_map": {
+    "path": ".integration/feature-map.json",
+    "present": true,
+    "sha256": "69d766af207a4621945a2bfe2b91fb179faccf02c41754887ad075ea132e2213"
+  },
+  "generated_at": "2026-10-20T19:16:46+00:00",
+  "git_head": "3254b9701105ccd3808bfa2c424cedc10e597a0e",
+  "mode": "degraded",
+  "probe_hash": "0d013c41bdfdd90b04e28ebdfb8a4e42722f5b913074ea80f085747cfb67ad0b",
+  "required_bead_ids": [],
+  "root": "/warp/projects/softwares/cass",
+  "schema_version": "1.1",
+  "summary": {
+    "br_available": true,
+    "bv_available": true,
+    "consistent_bv_data_hash": null,
+    "required_bead_count": 0,
+    "robot_command_count": 6,
+    "verified_bead_count": 0
+  },
+  "tools": {
+    "br": {
+      "available": true,
+      "path": "/home/arch/.local/bin/br",
+      "version": "br 0.6.0",
+      "version_exit_code": 0
+    },
+    "bv": {
+      "available": true,
+      "path": "/home/arch/.local/bin/bv",
+      "version": "bv v0.25.0",
+      "version_exit_code": 0
+    }
+  },
+  "valid": false,
+  "verified_bead_ids": [],
+  "warnings": [
+    "INT-001: bead_id is required for BR graph verification",
+    "feature map has no non-rejected BR bead IDs to verify",
+    "br-coordination did not return parseable JSON",
+    "bv-insights did not return parseable JSON"
+  ],
+  "workspace_present": true
+}

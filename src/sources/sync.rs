@@ -150,6 +150,11 @@ fn run_rsync_command(
     arg_protection: RsyncArgProtection,
 ) -> std::io::Result<std::process::Output> {
     let mut cmd = Command::new("rsync");
+    // Keep each negotiated attempt authoritative: inherited RSYNC_PROTECT_ARGS
+    // would otherwise re-enable -s on the rrsync compatibility retry (#531).
+    // RSYNC_OLD_ARGS disables rsync's own remote-shell escaping; never inherit it.
+    cmd.env("RSYNC_PROTECT_ARGS", "0")
+        .env_remove("RSYNC_OLD_ARGS");
     cmd.args(["-avz", "--links", "--safe-links", "--stats", "--partial"]);
     if let Some(flag) = arg_protection.flag() {
         cmd.arg(flag);
@@ -177,6 +182,24 @@ fn rsync_arg_protection_remote_rejected(stderr: &str) -> bool {
         || lower.contains("unknown option -- protect-args")
         // BSD/macOS getopt error format (openrsync uses getopt which prints "illegal option"):
         || lower.contains("illegal option -- s")
+        // GH #531: rrsync must inspect server arguments, so it refuses -s
+        // even when both rsync binaries support it. Match the complete
+        // diagnostic, not a generic disabled-option or authentication error.
+        // The existing one-shot retry retains rsync's own path escaping,
+        // strict SSH host-key checks, and additive/read-only transfer shape.
+        || lower.lines().any(|line| {
+            // Stock rrsync includes argv[0] (e.g. /usr/bin/rrsync), not
+            // necessarily only its basename. Keep the message anchored and
+            // reject arbitrary prose containing that diagnostic.
+            line.trim()
+                .strip_suffix(" error: option -s has been disabled on this server.")
+                .is_some_and(|program| {
+                    program == "rrsync"
+                        || (program.starts_with('/')
+                            && program.ends_with("/rrsync")
+                            && !program.chars().any(char::is_whitespace))
+                })
+        })
 }
 
 /// Return `true` if the first line of `rsync --version` output indicates
@@ -2566,9 +2589,10 @@ fn parse_rsync_stats(output: &str) -> RsyncStats {
     for line in output.lines() {
         let line = line.trim();
 
-        // Parse "Number of regular files transferred: N"
-        if line.starts_with("Number of regular files transferred:")
-            && let Some(num_str) = line.split(':').nth(1)
+        // GNU rsync includes "regular"; the local openrsync client omits it.
+        if let Some(num_str) = line
+            .strip_prefix("Number of regular files transferred:")
+            .or_else(|| line.strip_prefix("Number of files transferred:"))
         {
             stats.files_transferred = num_str.trim().replace(',', "").parse().unwrap_or(0);
         }
@@ -2758,10 +2782,14 @@ impl SourceSyncDecision {
                 ));
                 SourceHealthKind::Flapping
             }
-            Some(info) if info.duration_ms >= SOURCE_HIGH_LATENCY_MS => {
+            Some(info) if sync_was_high_latency(info) => {
                 reasons.push(format!(
-                    "last sync took {}ms, above {}ms high-latency guard",
-                    info.duration_ms, SOURCE_HIGH_LATENCY_MS
+                    "last sync took {}ms, above {}ms high-latency guard, moving {} bytes \
+                     (below the {} bytes/s of a bulk copy)",
+                    info.duration_ms,
+                    SOURCE_HIGH_LATENCY_MS,
+                    info.bytes_transferred,
+                    SOURCE_BULK_TRANSFER_MIN_BYTES_PER_SEC
                 ));
                 SourceHealthKind::HighLatency
             }
@@ -2942,6 +2970,10 @@ impl SyncStatus {
 }
 
 const SOURCE_HIGH_LATENCY_MS: u64 = 60_000;
+/// A long sync that moved data at least this fast was a bulk copy (a first
+/// sync of a large tree), not a slow host. Below it, a long sync still counts
+/// as high latency, including one that scanned for minutes and moved nothing.
+const SOURCE_BULK_TRANSFER_MIN_BYTES_PER_SEC: u64 = 1024 * 1024;
 const SOURCE_FAILURE_BACKOFF_BASE_MS: i64 = 5 * 60 * 1000;
 const SOURCE_FAILURE_BACKOFF_MAX_MS: i64 = 60 * 60 * 1000;
 
@@ -2967,6 +2999,12 @@ fn sync_schedule_due(last_sync: Option<i64>, period_ms: Option<i64>, now_ms: i64
         (Some(_), None) => false,
         (Some(last_sync), Some(period_ms)) => last_sync.saturating_add(period_ms) <= now_ms,
     }
+}
+
+fn sync_was_high_latency(info: &SourceSyncInfo) -> bool {
+    info.duration_ms >= SOURCE_HIGH_LATENCY_MS
+        && info.bytes_transferred.saturating_mul(1000) / info.duration_ms
+            < SOURCE_BULK_TRANSFER_MIN_BYTES_PER_SEC
 }
 
 fn automatic_source_sync_action(
@@ -3694,6 +3732,135 @@ Total transferred file size: 1,234 bytes
         let stats = parse_rsync_stats("");
         assert_eq!(stats.files_transferred, 0);
         assert_eq!(stats.bytes_transferred, 0);
+    }
+
+    #[test]
+    fn test_parse_rsync_stats_openrsync_reported_output() {
+        // Captured local macOS output from GH468, not a live macOS execution.
+        let output = "Number of files: 3\nNumber of files transferred: 2\n\
+                      Total file size: 16 B\nTotal transferred file size: 16 B\n\
+                      Total sent: 231 B\nTotal received: 70 B\n";
+        let stats = parse_rsync_stats(output);
+        assert_eq!((stats.files_transferred, stats.bytes_transferred), (2, 16));
+
+        // Also preserve the reporter's full sync scale and persisted counters.
+        let stats = parse_rsync_stats(
+            "Number of files transferred: 252\nTotal transferred file size: 73,703,557 B\n",
+        );
+        let mut report = SyncReport::new("gh468", SyncMethod::Rsync);
+        report.add_path_result(PathSyncResult {
+            files_transferred: stats.files_transferred,
+            bytes_transferred: stats.bytes_transferred,
+            success: true,
+            ..Default::default()
+        });
+        let temp = TempDir::new().expect("status tempdir");
+        let mut status = SyncStatus::default();
+        status.update("gh468", &report);
+        status.save(temp.path()).expect("save sync counters");
+        let loaded = SyncStatus::load(temp.path()).expect("reload sync counters");
+        assert_eq!(loaded.sources["gh468"].files_synced, 252);
+        assert_eq!(loaded.sources["gh468"].bytes_transferred, 73_703_557);
+    }
+
+    #[test]
+    fn test_parse_rsync_stats_variants_empty_files_and_invalid_counts() {
+        for label in [
+            "Number of regular files transferred:",
+            "Number of files transferred:",
+        ] {
+            for (value, expected) in [
+                ("0", 0),
+                ("1", 1),
+                ("1,234", 1234),
+                ("", 0),
+                ("unknown", 0),
+                ("-1", 0),
+                ("18446744073709551616", 0),
+            ] {
+                let output = format!(
+                    "Number of files: 9000\n {label} {value}\n\
+                     Total file size: 999 bytes\nTotal transferred file size: 0 B\n\
+                     Total sent: 200 B\nTotal received: 100 B\n"
+                );
+                let stats = parse_rsync_stats(&output);
+                assert_eq!(stats.files_transferred, expected, "{output}");
+                assert_eq!(stats.bytes_transferred, 0, "{output}");
+            }
+        }
+        for output in [
+            "Number of files: 252\nTotal file size: 73,703,557 B\n",
+            "Number of files transferred unexpectedly: 252\n",
+            "Total transferred file size: unknown bytes\n",
+            "Total transferred file size: 18446744073709551616 B\n",
+        ] {
+            let stats = parse_rsync_stats(output);
+            assert_eq!((stats.files_transferred, stats.bytes_transferred), (0, 0));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a real rsync executable"]
+    fn test_parse_rsync_stats_real_transfers_and_noop() {
+        let temp = TempDir::new().expect("rsync tempdir");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        std::fs::create_dir_all(&source).expect("source directory");
+        std::fs::create_dir_all(&destination).expect("destination directory");
+        std::fs::write(source.join("first.txt"), b"first\n").expect("first source");
+        std::fs::write(source.join("second.txt"), b"second\n").expect("second source");
+        let transfer = || {
+            let output = assert_cmd::Command::new("rsync")
+                .args(["-a", "--stats"])
+                .arg(format!("{}/", source.display()))
+                .arg(&destination)
+                .env("LC_ALL", "C")
+                .timeout(std::time::Duration::from_secs(30))
+                .output()
+                .expect("execute real rsync");
+            assert!(
+                output.status.success(),
+                "rsync failed: {:?}\nstdout={}\nstderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            parse_rsync_stats(&String::from_utf8(output.stdout).expect("rsync UTF-8 stats"))
+        };
+
+        let first = transfer();
+        assert_eq!((first.files_transferred, first.bytes_transferred), (2, 13));
+        assert_eq!(
+            std::fs::read(destination.join("first.txt")).unwrap(),
+            b"first\n"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("second.txt")).unwrap(),
+            b"second\n"
+        );
+        let unchanged = transfer();
+        assert_eq!(
+            (unchanged.files_transferred, unchanged.bytes_transferred),
+            (0, 0)
+        );
+
+        std::fs::write(source.join("empty.jsonl"), b"").expect("empty source");
+        let empty_file = transfer();
+        assert_eq!(
+            (empty_file.files_transferred, empty_file.bytes_transferred),
+            (1, 0)
+        );
+        assert_eq!(
+            std::fs::metadata(destination.join("empty.jsonl"))
+                .unwrap()
+                .len(),
+            0
+        );
+        let unchanged = transfer();
+        assert_eq!(
+            (unchanged.files_transferred, unchanged.bytes_transferred),
+            (0, 0)
+        );
     }
 
     #[test]
@@ -4471,6 +4638,62 @@ Total transferred file size: 1,234 bytes
     }
 
     #[test]
+    fn source_sync_decision_does_not_call_a_bulk_first_sync_high_latency() {
+        // GH #531: a first sync of ~9 GB / 148,673 files took 83 s, about
+        // 110 MB/s. That is a large copy, not a slow host.
+        let now_ms = 1_700_000_000_000;
+        let source = source_with_schedule(SyncSchedule::Hourly);
+        let status = status_with_info(SourceSyncInfo {
+            last_sync: Some(now_ms - 10 * 60 * 1000),
+            last_result: SyncResult::Success,
+            files_synced: 148_673,
+            bytes_transferred: 9_000_000_000,
+            duration_ms: 83_000,
+            ..Default::default()
+        });
+
+        let decision = status.decision_for_source_at(&source, now_ms, false);
+
+        assert_eq!(decision.health, SourceHealthKind::Healthy);
+        assert!(!decision.fallback_active);
+        assert_eq!(decision.action, SourceSyncAction::Skip);
+    }
+
+    #[test]
+    fn source_sync_decision_keeps_slow_small_transfers_high_latency() {
+        let now_ms = 1_700_000_000_000;
+        let source = source_with_schedule(SyncSchedule::Hourly);
+        let health_for = |bytes_transferred: u64, duration_ms: u64| {
+            status_with_info(SourceSyncInfo {
+                last_sync: Some(now_ms - 10 * 60 * 1000),
+                last_result: SyncResult::Success,
+                bytes_transferred,
+                duration_ms,
+                ..Default::default()
+            })
+            .decision_for_source_at(&source, now_ms, false)
+            .health
+        };
+
+        // 10 MiB in 61 s, and a minute of scanning that moved nothing.
+        assert_eq!(
+            health_for(10 * 1024 * 1024, 61_000),
+            SourceHealthKind::HighLatency
+        );
+        assert_eq!(health_for(0, 120_000), SourceHealthKind::HighLatency);
+        // The bulk-copy floor is inclusive: exactly 1 MiB/s over 60 s is a
+        // bulk copy, one byte less is still high latency.
+        let floor = SOURCE_BULK_TRANSFER_MIN_BYTES_PER_SEC * 60;
+        assert_eq!(health_for(floor, 60_000), SourceHealthKind::Healthy);
+        assert_eq!(health_for(floor - 1, 60_000), SourceHealthKind::HighLatency);
+        // Below the duration guard, throughput does not matter.
+        assert_eq!(
+            health_for(0, SOURCE_HIGH_LATENCY_MS - 1),
+            SourceHealthKind::Healthy
+        );
+    }
+
+    #[test]
     fn source_sync_decision_manual_override_forces_sync() {
         let now_ms = 1_700_000_000_000;
         let source = source_with_schedule(SyncSchedule::Manual);
@@ -4634,3 +4857,6 @@ Total transferred file size: 1,234 bytes
         assert_eq!(expanded, path);
     }
 }
+
+#[cfg(test)]
+mod rrsync_tests;

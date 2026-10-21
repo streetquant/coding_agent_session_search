@@ -1,0 +1,92 @@
+{
+  "applicability": "assess",
+  "evidence_sources": [
+    {
+      "id": "UP-001",
+      "kind": "migration_guide",
+      "line_ranges": [
+        {
+          "end": 1,
+          "start": 1
+        }
+      ],
+      "path": "REPLACE_WITH_PINNED_REFERENCE_EVIDENCE_PATH"
+    }
+  ],
+  "locator": {
+    "case_sensitive": true,
+    "exclude_globs": [
+      ".git/**",
+      ".integration/**",
+      ".beads/**",
+      "**/vendor/**",
+      "**/node_modules/**",
+      "**/dist/**",
+      "**/build/**"
+    ],
+    "include_globs": [
+      "**"
+    ],
+    "max_file_bytes": 1000000,
+    "max_matches_per_rule": 500,
+    "max_repository_files": 20000,
+    "max_rule_file_pairs": 200000,
+    "max_total_matches": 5000
+  },
+  "migrations": [
+    {
+      "classification": "REPLACE_WITH_direct_rename_import_migration_compound_api_migration_paradigm_shift_configuration_protocol_behavioral_build_toolchain_or_mixed",
+      "component_ids": [
+        "INT-001"
+      ],
+      "ecosystem": "REPLACE_WITH_ECOSYSTEM",
+      "evidence_source_ids": [
+        "UP-001"
+      ],
+      "from_version": "REPLACE_WITH_OLD_VERSION_OR_REFERENCE_STATE",
+      "id": "MIG-001",
+      "manifest_paths": [
+        "REPLACE_WITH_TARGET_MANIFEST_OR_CONTRACT_PATH"
+      ],
+      "package": "REPLACE_WITH_DEPENDENCY_API_OR_PROTOCOL_NAME",
+      "rule_ids": [
+        "RULE-001"
+      ],
+      "structural_strategy": "Describe coordinated structural work when the change is not a mechanical substitution.",
+      "to_version": "REPLACE_WITH_NEW_VERSION_OR_REFERENCE_STATE"
+    }
+  ],
+  "not_applicable": {
+    "approval": "",
+    "reason": ""
+  },
+  "rules": [
+    {
+      "consumer_patterns": [],
+      "description": "Distill one actionable consumer-visible change from the pinned upstream evidence.",
+      "evidence_source_ids": [
+        "UP-001"
+      ],
+      "expected_anchor_max": null,
+      "expected_anchor_min": 1,
+      "final_new_anchor_max": null,
+      "final_new_anchor_min": 1,
+      "final_old_anchor_max": 0,
+      "id": "RULE-001",
+      "kind": "direct_rename",
+      "match_mode": "exact_token",
+      "migration_id": "MIG-001",
+      "new_surfaces": [
+        "REPLACE_WITH_NEW_API_SURFACE"
+      ],
+      "old_surfaces": [
+        "REPLACE_WITH_OLD_API_SURFACE"
+      ],
+      "waiver": {
+        "approval": "",
+        "reason": ""
+      }
+    }
+  ],
+  "schema_version": "1.0"
+}

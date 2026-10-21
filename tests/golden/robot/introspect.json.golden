@@ -711,11 +711,10 @@
         },
         {
           "name": "embedder",
-          "description": "Embedder to use for semantic indexing (hash, minilm, multilingual-minilm)",
+          "description": "Embedder for semantic indexing (hash, minilm, multilingual-minilm, external); defaults to semantic policy",
           "arg_type": "option",
           "value_type": "string",
-          "required": false,
-          "default": "fastembed"
+          "required": false
         },
         {
           "name": "data-dir",
@@ -780,6 +779,18 @@
           "enum_values": [
             "true",
             "false"
+          ]
+        },
+        {
+          "name": "rebuild-profile",
+          "description": "Lexical-rebuild settings preset (GH #483). `bounded` is the single-core, low-memory recipe for a wedged or memory-starved archive: one rebuild worker and one page-prep thread, a one-page pipeline, 64 conversations per fetch and a durable commit every 64 MiB of text. An explicit CASS_TANTIVY_REBUILD_* value still wins over the preset. Applies to any lexical rebuild this run performs (`--full`, or resuming an interrupted rebuild); it never changes what gets indexed. `--json` reports the values used under `rebuild_profile`",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "default": "default",
+          "enum_values": [
+            "default",
+            "bounded"
           ]
         },
         {
@@ -941,7 +952,7 @@
         },
         {
           "name": "fields",
-          "description": "Select specific fields in JSON output (comma-separated). Use 'minimal' for `source_path,line_number,agent` or 'summary' for `source_path,line_number,agent,title,score`. Example: --fields `source_path,line_number`",
+          "description": "Select specific fields in JSON output (comma-separated). Use 'minimal' for `source_path,line_number,agent,source_id,conversation_id` or 'summary' for `source_path,line_number,agent,title,score,source_id,conversation_id`. Example: --fields `source_path,line_number`",
           "arg_type": "option",
           "value_type": "string",
           "required": false,
@@ -1075,14 +1086,14 @@
         },
         {
           "name": "timeout",
-          "description": "Timeout in milliseconds. Returns partial results and error if exceeded",
+          "description": "Timeout in milliseconds; 0 explicitly disables the search deadline. Returns partial results and error if a positive timeout is exceeded",
           "arg_type": "option",
           "value_type": "integer",
           "required": false
         },
         {
           "name": "highlight",
-          "description": "Highlight matching terms in snippets with **bold** markers (text and JSON output)",
+          "description": "Also mark query-term occurrences the engine left unmarked; snippets always mark matched terms with **bold** (text and JSON output)",
           "arg_type": "flag",
           "required": false,
           "enum_values": [
@@ -1118,7 +1129,7 @@
         },
         {
           "name": "approximate",
-          "description": "Use approximate nearest neighbor (ANN) search with HNSW for faster semantic/hybrid queries. Trades slight accuracy loss for O(log n) search complexity instead of O(n). Only affects semantic and hybrid modes; ignored for lexical search. Requires an HNSW index built with `cass index --semantic --approximate`",
+          "description": "Use approximate nearest neighbor (ANN) search with HNSW for faster semantic/hybrid queries. Trades slight accuracy loss for O(log n) search complexity instead of O(n). Only affects semantic and hybrid modes; ignored for lexical search. Requires an HNSW index built with `cass index --semantic --build-hnsw`",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -1129,7 +1140,7 @@
         },
         {
           "name": "model",
-          "description": "Embedding model to use for semantic search. Available models depend on what's been downloaded. Use `cass models --list` to see available options",
+          "description": "Embedding model to use for semantic search. Available models depend on what's been downloaded. `cass models status --json` lists them",
           "arg_type": "option",
           "value_type": "string",
           "required": false
@@ -1147,7 +1158,7 @@
         },
         {
           "name": "reranker",
-          "description": "Reranker model to use (requires --rerank). Use `cass models --list` to see available options",
+          "description": "Reranker model to use (requires --rerank). Defaults to `ms-marco`, the only registered reranker",
           "arg_type": "option",
           "value_type": "string",
           "required": false
@@ -2063,7 +2074,7 @@
     },
     {
       "name": "view",
-      "description": "View a source file at a specific line (follow up on search results)",
+      "description": "Inspect file lines, or follow a search hit with --message-index",
       "arguments": [
         {
           "name": "path",
@@ -2089,7 +2100,14 @@
         {
           "name": "line",
           "short": "n",
-          "description": "Line number to show (1-indexed)",
+          "description": "Physical file line (1-based), NOT search's line_number; use --message-index for hits",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "message-index",
+          "description": "Canonical message ordinal: pass search's line_number unchanged (1-based). Reads the archive only; never substitutes a physical file line",
           "arg_type": "option",
           "value_type": "integer",
           "required": false
@@ -2511,6 +2529,17 @@
           ]
         },
         {
+          "name": "repair-leaked-pages",
+          "description": "Free leaked pages (integrity_check's \"page N is never used\": pages no table, index or freelist owns) in place. Refuses any other integrity damage. Supports `--dry-run`; mutation requires `--yes` and backs up the live bundle first (`cass doctor backups restore`)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "cleanup-interrupted-artifacts",
           "description": "Quarantine interrupted `raw_mirror_capture` staging artifacts that block doctor mutation, instead of forcing a manual `rm` inside the data dir. Requires `--yes`; artifacts are renamed into a quarantine dir, never deleted",
           "arg_type": "flag",
@@ -2619,6 +2648,35 @@
             "true",
             "false"
           ]
+        },
+        {
+          "name": "exact-source-id",
+          "description": "Select native identities from this literal stored source ID; requires agent and external ID",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "exact-agent",
+          "description": "Original stored agent slug for exact native identity selection",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "exact-external-id",
+          "description": "Native external session ID to select (repeatable, at most 256; ambiguous identities fail)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "exact-workspace",
+          "description": "Require the exact literal stored workspace; no path normalization or ancestor matching",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
         },
         {
           "name": "limit",
@@ -2929,8 +2987,9 @@
         },
         {
           "name": "include-tools",
-          "description": "Include tool calls in export (default: true)",
-          "arg_type": "flag",
+          "description": "Include tool calls in the export; `--include-tools=false` omits them (default: true)",
+          "arg_type": "option",
+          "value_type": "enum",
           "required": false,
           "default": "true",
           "enum_values": [
@@ -2940,8 +2999,9 @@
         },
         {
           "name": "show-timestamps",
-          "description": "Show message timestamps",
-          "arg_type": "flag",
+          "description": "Show message timestamps; `--show-timestamps=false` hides them (default: true)",
+          "arg_type": "option",
+          "value_type": "enum",
           "required": false,
           "default": "true",
           "enum_values": [
@@ -3040,7 +3100,7 @@
     },
     {
       "name": "expand",
-      "description": "Show messages around a specific line in a session file",
+      "description": "Expand a search hit with --message-index, or inspect raw JSONL with --line",
       "arguments": [
         {
           "name": "path",
@@ -3059,10 +3119,24 @@
         {
           "name": "line",
           "short": "n",
-          "description": "Line number to show context around",
+          "description": "Physical file line, NOT search's line_number; use --message-index for hits",
           "arg_type": "option",
           "value_type": "integer",
-          "required": true
+          "required": false
+        },
+        {
+          "name": "message-index",
+          "description": "Canonical message ordinal: pass search's line_number unchanged (1-based). Reads the archive only; never substitutes a physical file line",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "conversation-id",
+          "description": "Exact conversation_id from search (disambiguates shared source paths)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
         },
         {
           "name": "context",
@@ -3250,6 +3324,18 @@
             "basename",
             "full",
             "hash"
+          ]
+        },
+        {
+          "name": "share-profile",
+          "description": "Share profile applied to every exported text: public (home paths, usernames, project names, hostnames, emails and other personal data), team (home paths and personal data), personal (nothing). Credentials are never rewritten; the secret scan rejects them. Default: public for a plaintext export, team when encrypted",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "public",
+            "team",
+            "personal"
           ]
         },
         {
@@ -3471,7 +3557,7 @@
     },
     {
       "name": "forget",
-      "description": "Prune an already-indexed subset of conversations by source-path glob (dry-run by default; `--apply` to commit). Removes matching rows from the canonical DB and rebuilds derived search/analytics assets",
+      "description": "Prune an already-indexed subset of conversations by source-path glob (dry-run by default; `--apply` to commit). Removes matching rows from the canonical DB and rebuilds derived search/analytics assets. Source files are kept: a source that changes afterwards is indexed again",
       "arguments": [
         {
           "name": "source-glob",
@@ -3827,6 +3913,386 @@
             "compact",
             "sessions",
             "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "serve",
+      "description": "Reuse read-only search readers, or run one supervised request and exit. Semantic retrieval and refinement require explicit opt-in. See docs/SEARCH_SERVICE.md",
+      "arguments": [
+        {
+          "name": "index",
+          "description": "Published lexical index directory, instead of --data-dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "data-dir",
+          "description": "Select the compiled lexical index beneath this explicit data directory. Resolves the path only; never opens or repairs the canonical database",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "stdio",
+          "description": "Use newline-delimited JSON requests and responses on standard I/O",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "query",
+          "description": "Run one query and exit; emit a bounded JSON reply without reading stdin. Uses the service's read-only readers, fallback consent and resource supervision",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "transcript",
+          "description": "Read one bounded canonical transcript page and exit without reading stdin. JSON selects source_path, source_id, conversation_id, optional cursor and limit. Requires --db; never opens source files, lexical readers or models",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "mode",
+          "description": "Retrieval mode for --query (default lexical). Semantic and hybrid require --semantic-embedder, --data-dir and --db. No models are downloaded",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "lexical",
+            "semantic",
+            "hybrid"
+          ]
+        },
+        {
+          "name": "approximate",
+          "description": "Request approximate retrieval with an explicit semantic/hybrid --mode. The service currently uses exact search and reports ANN as unavailable",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "limit",
+          "description": "Maximum hits for --query (default 10, maximum 100)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "offset",
+          "description": "Result offset for --query (default 0; offset + limit + 1 must be at most 1024)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "agent",
+          "description": "Agent name or supported alias for --query; repeat for multiple agents. Unknown names fail before opening the index or archive",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "workspace",
+          "description": "Exact workspace for --query; repeat for multiple workspaces",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "source-id",
+          "description": "Exact source ID for --query, not the synthetic remote group",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "created-from",
+          "description": "Inclusive lower creation timestamp in epoch milliseconds for --query",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "created-to",
+          "description": "Inclusive upper creation timestamp in epoch milliseconds for --query",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "refine",
+          "description": "Refine one bounded lexical shortlist and exit without reading stdin. JSON selects query, lexical_query, filters, candidate_limit and limit. Requires an installed --reranker-model; never downloads model files",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "mcp",
+          "description": "Speak MCP instead of the CASS JSON-lines protocol on the same stdio transport",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "db",
+          "description": "Opt in to canonical view requests against this fixed read-only archive. Search stays index-only unless --lexical-fallback is also supplied",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "lexical-fallback",
+          "description": "Recover Quill fuel refusals using this explicit archive's SQLite lane. Admits at most 64 MiB of database plus WAL; shares the request deadline. Results identify the changed backend and are not Quill-score equivalent",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "reranker-model",
+          "description": "Opt in to candidate-only refinement with this installed local reranker. Never downloads files; ordinary search, startup and status stay model-free",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "semantic-embedder",
+          "description": "Opt in to retained semantic/hybrid retrieval using installed assets. Requires explicit --data-dir and --db; ordinary search stays lexical",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "minilm",
+            "multilingual-minilm",
+            "hash",
+            "external"
+          ]
+        },
+        {
+          "name": "request-timeout-ms",
+          "description": "Whole-request deadline, including setup, search, teardown and one-shot output. For --stdio, starts at the first frame byte; idle sessions are not timed out. Expiry exits the worker with code 124",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "default": "30000"
+        },
+        {
+          "name": "admission-dir",
+          "description": "Shared local control directory for nonblocking cross-process reader admission. Writes only pool metadata; never place this directory inside a search index",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "admission-slots",
+          "description": "Maximum reader-owning processes sharing the same admission directory",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "max-resident-mib",
+          "description": "Terminate this worker with exit 126 when sampled resident memory exceeds this many MiB. Sampling includes idle readers; it is not a kernel-enforced allocation limit",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "default": "4096"
+        }
+      ],
+      "has_json_output": false
+    },
+    {
+      "name": "archive",
+      "description": "Export, verify or restore a bounded, versioned logical canonical archive",
+      "arguments": [
+        {
+          "name": "db",
+          "description": "Existing canonical archive. Export never creates or repairs this file",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "data-dir",
+          "description": "Explicit canonical archive directory (also accepts CASS_DATA_DIR)",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Receipts are JSON regardless of this compatibility flag",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "codex-layout-migrate",
+      "description": "Prove a same-source flat/dated Codex transition before indexing its second layout. Dry-run by default. --apply registers a receipt without rewriting archive rows",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Explicit CASS directory containing the existing agent_search.db; no custom DB",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "source",
+          "description": "Exact named local source configured in sources.toml and the archive",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": true
+        },
+        {
+          "name": "from",
+          "description": "Existing flat or native dated rollout. Both inputs must remain accessible",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "to",
+          "description": "Matching rollout in the other layout, belonging to the same local source",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "apply",
+          "description": "Register the proven identity before indexing the second layout; default is dry-run",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "json",
+          "description": "Emit the migration report as JSON. Fatal errors use stderr, not stdout",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "lexical-quarantine",
+      "description": "Inspect retained failed lexical rebuilds without opening the database. Read-only by default; --apply requires the exact fingerprint from --plan",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Explicit archive directory; never defaults to another user's archive",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "json",
+          "description": "Emit one complete inventory; complete=false exits with code 8",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "plan",
+          "description": "Preview the complete cleanup policy and its approval fingerprint; no writes",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "apply",
+          "description": "Apply only a matching preview under the indexer lock. Preserves newest/recent evidence",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "semantic-reclaim",
+      "description": "Preview or reclaim unreferenced semantic backfill scratch",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Existing CASS data directory; no default archive is guessed",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "dry-run",
+          "description": "Explicitly preview without deleting artifacts (also the default)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "apply",
+          "description": "Delete only the candidates in a still-current approved preview",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "plan-fingerprint",
+          "description": "Exact plan_fingerprint from a prior preview of this archive",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Emit one JSON result on stdout and structured failures on stderr",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
           ]
         }
       ],
@@ -4224,6 +4690,20 @@
         },
         "build_commit_date": {
           "type": "string"
+        },
+        "source_ingest_reuse": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "disabled_by": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
         },
         "api_version": {
           "type": "integer"
@@ -5940,6 +6420,12 @@
                 "string",
                 "null"
               ]
+            },
+            "hnsw_present": {
+              "type": "boolean"
+            },
+            "hnsw_state": {
+              "type": "string"
             },
             "hnsw_ready": {
               "type": "boolean"
@@ -8264,6 +8750,10 @@
             },
             "sole_copy_warning_count": {
               "type": "integer"
+            },
+            "raw_mirror_capture_disabled": {
+              "type": "boolean",
+              "description": "CASS_RAW_MIRROR turned raw capture off: new session files are not copied into the raw mirror, so archive rows without a raw copy are expected and a file its provider deletes survives only in the archive DB."
             },
             "recommended_action": {
               "type": "string"
@@ -19624,7 +20114,7 @@
         },
         "archive_coverage_state": {
           "type": "string",
-          "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+          "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_capture_disabled (CASS_RAW_MIRROR is off), raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
         },
         "source_mirror_state": {
           "type": "string",
@@ -26506,6 +26996,12 @@
                 "null"
               ]
             },
+            "hnsw_present": {
+              "type": "boolean"
+            },
+            "hnsw_state": {
+              "type": "string"
+            },
             "hnsw_ready": {
               "type": "boolean"
             },
@@ -27529,7 +28025,7 @@
         },
         "archive_coverage_state": {
           "type": "string",
-          "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+          "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_capture_disabled (CASS_RAW_MIRROR is off), raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
         },
         "source_mirror_state": {
           "type": "string",
@@ -28943,7 +29439,7 @@
             },
             "archive_coverage_state": {
               "type": "string",
-              "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+              "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_capture_disabled (CASS_RAW_MIRROR is off), raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
             },
             "source_mirror_state": {
               "type": "string",
@@ -29239,6 +29735,10 @@
             "sole_copy_warning_count": {
               "type": "integer"
             },
+            "raw_mirror_capture_disabled": {
+              "type": "boolean",
+              "description": "CASS_RAW_MIRROR turned raw capture off: new session files are not copied into the raw mirror, so archive rows without a raw copy are expected and a file its provider deletes survives only in the archive DB."
+            },
             "recommended_action": {
               "type": "string"
             }
@@ -29320,6 +29820,9 @@
               ]
             },
             "quarantined_conversations": {
+              "type": "integer"
+            },
+            "deferred_conversations": {
               "type": "integer"
             },
             "recent_quarantined_conversations": {
@@ -29846,6 +30349,30 @@
                   "type": "object",
                   "description": "Lexical rebuild pipeline settings plus optional runtime telemetry.",
                   "additionalProperties": true
+                },
+                "expected_docs_scan": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "description": "Saved position of a running or interrupted full expected-docs scan; the next index run resumes it when the archive is unchanged or only grew.",
+                  "properties": {
+                    "last_conversation_id": {
+                      "type": "integer"
+                    },
+                    "max_conversation_id": {
+                      "type": "integer"
+                    },
+                    "expected_docs_so_far": {
+                      "type": "integer"
+                    },
+                    "saved_at": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
                 }
               }
             },
@@ -29899,6 +30426,12 @@
                     "string",
                     "null"
                   ]
+                },
+                "hnsw_present": {
+                  "type": "boolean"
+                },
+                "hnsw_state": {
+                  "type": "string"
                 },
                 "hnsw_ready": {
                   "type": "boolean"
@@ -30160,6 +30693,9 @@
                   ]
                 },
                 "quarantined_conversations": {
+                  "type": "integer"
+                },
+                "deferred_conversations": {
                   "type": "integer"
                 },
                 "recent_quarantined_conversations": {
@@ -30504,6 +31040,66 @@
         "indexing_stats": {
           "type": "object",
           "additionalProperties": true
+        },
+        "rebuild_profile": {
+          "type": "object",
+          "description": "--rebuild-profile echo (GH #483): the selected preset, where each of its knobs came from, and the lexical-rebuild settings this process would use after the responsiveness governor at report time",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "default | bounded"
+            },
+            "settings": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "env": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "type": "integer"
+                  },
+                  "source": {
+                    "type": "string",
+                    "description": "profile, or env when an explicit environment value overrides the preset"
+                  }
+                }
+              }
+            },
+            "effective": {
+              "type": "object",
+              "properties": {
+                "workers": {
+                  "type": "integer"
+                },
+                "page_prep_workers": {
+                  "type": "integer"
+                },
+                "staged_shard_builders": {
+                  "type": "integer"
+                },
+                "staged_merge_workers": {
+                  "type": "integer"
+                },
+                "tantivy_writer_threads": {
+                  "type": "integer"
+                },
+                "pipeline_channel_size": {
+                  "type": "integer"
+                },
+                "steady_batch_fetch_conversations": {
+                  "type": "integer"
+                },
+                "steady_commit_every_message_bytes": {
+                  "type": "integer"
+                },
+                "pipeline_max_message_bytes_in_flight": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
         },
         "error": {
           "type": [
@@ -31048,6 +31644,122 @@
               "items": {
                 "type": "string"
               }
+            },
+            "effective": {
+              "type": "object",
+              "description": "What the search (or the search behind a pack) actually ran: command, database and path source, resolved time window with the flag behind each bound, parsed filters, argv auto-corrections, how the lexical engine groups the query, and, for search only, the daemon policy.",
+              "properties": {
+                "command": {
+                  "type": "string"
+                },
+                "query": {
+                  "type": "string"
+                },
+                "query_structure": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Operand grouping the lexical engine applies, every compound group parenthesized (e.g. `a OR (b AND c)`); null for a query without operands."
+                },
+                "query_recoveries": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Parentheses recovered instead of rejected (an unclosed `(` closes at the end of the query; an empty `()` is skipped)."
+                },
+                "db_path": {
+                  "type": "string"
+                },
+                "db_path_source": {
+                  "type": "string",
+                  "enum": [
+                    "--db",
+                    "env:CASS_DB_PATH",
+                    "--data-dir",
+                    "env:CASS_DATA_DIR",
+                    "env:XDG_DATA_HOME",
+                    "default"
+                  ]
+                },
+                "time_window": {
+                  "type": "object",
+                  "properties": {
+                    "since_ms": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "since_from": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "until_ms": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "until_from": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "filters": {
+                  "type": "object",
+                  "properties": {
+                    "agents": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "workspaces": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "source": {
+                      "type": "string"
+                    },
+                    "sessions_from_paths": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "daemon": {
+                  "type": "object",
+                  "description": "Warm-model daemon policy: robot searches use an already-running daemon unless --no-daemon, and never spawn one even with --daemon.",
+                  "properties": {
+                    "use_existing": {
+                      "type": "boolean"
+                    },
+                    "auto_spawn_requested": {
+                      "type": "boolean"
+                    },
+                    "auto_spawn": {
+                      "type": "boolean"
+                    }
+                  }
+                },
+                "auto_corrections": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
             }
           }
         },
@@ -31088,6 +31800,13 @@
                 "string",
                 "null"
               ]
+            },
+            "fallback_reason": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "Why the pack's search fell back to fallback_mode, as the executor recorded it (the typed codes of search's _meta.semantic_fallback_reason; pack_enrichment_unavailable means pack itself selects evidence lexically). Null when there was no fallback, or when none was supplied, which also adds the warning semantic_fallback_reason_unreported."
             },
             "semantic_joined": {
               "type": "boolean"
@@ -31435,11 +32154,21 @@
               "source_path": {
                 "type": "string"
               },
+              "conversation_id": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 1,
+                "description": "Canonical conversation identity in the archive used by search. Pass with source_id, source_path and line_number to view/expand --message-index. Null means no canonical identity is available."
+              },
               "line_number": {
                 "type": [
                   "integer",
                   "null"
-                ]
+                ],
+                "minimum": 1,
+                "description": "Canonical message index (messages.idx + 1), not a physical file line. Pass unchanged to view/expand --message-index with source_id and conversation_id."
               },
               "agent": {
                 "type": "string"
@@ -31601,6 +32330,19 @@
             },
             "wildcard_fallback": {
               "type": "boolean"
+            },
+            "wildcard_fallback_skipped": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "index_over_automatic_limit",
+                "automatic_retry_disabled",
+                "long_query_term",
+                "query_fuel_exhausted",
+                null
+              ]
             },
             "cache_stats": {
               "type": "object",
@@ -32018,6 +32760,122 @@
                 ]
               }
             },
+            "effective": {
+              "type": "object",
+              "description": "What the search (or the search behind a pack) actually ran: command, database and path source, resolved time window with the flag behind each bound, parsed filters, argv auto-corrections, how the lexical engine groups the query, and, for search only, the daemon policy.",
+              "properties": {
+                "command": {
+                  "type": "string"
+                },
+                "query": {
+                  "type": "string"
+                },
+                "query_structure": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Operand grouping the lexical engine applies, every compound group parenthesized (e.g. `a OR (b AND c)`); null for a query without operands."
+                },
+                "query_recoveries": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Parentheses recovered instead of rejected (an unclosed `(` closes at the end of the query; an empty `()` is skipped)."
+                },
+                "db_path": {
+                  "type": "string"
+                },
+                "db_path_source": {
+                  "type": "string",
+                  "enum": [
+                    "--db",
+                    "env:CASS_DB_PATH",
+                    "--data-dir",
+                    "env:CASS_DATA_DIR",
+                    "env:XDG_DATA_HOME",
+                    "default"
+                  ]
+                },
+                "time_window": {
+                  "type": "object",
+                  "properties": {
+                    "since_ms": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "since_from": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "until_ms": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "until_from": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "filters": {
+                  "type": "object",
+                  "properties": {
+                    "agents": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "workspaces": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "source": {
+                      "type": "string"
+                    },
+                    "sessions_from_paths": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "daemon": {
+                  "type": "object",
+                  "description": "Warm-model daemon policy: robot searches use an already-running daemon unless --no-daemon, and never spawn one even with --daemon.",
+                  "properties": {
+                    "use_existing": {
+                      "type": "boolean"
+                    },
+                    "auto_spawn_requested": {
+                      "type": "boolean"
+                    },
+                    "auto_spawn": {
+                      "type": "boolean"
+                    }
+                  }
+                },
+                "auto_corrections": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
             "timing": {
               "type": "object",
               "properties": {
@@ -32408,6 +33266,30 @@
                       "type": "object",
                       "description": "Lexical rebuild pipeline settings plus optional runtime telemetry.",
                       "additionalProperties": true
+                    },
+                    "expected_docs_scan": {
+                      "type": [
+                        "object",
+                        "null"
+                      ],
+                      "description": "Saved position of a running or interrupted full expected-docs scan; the next index run resumes it when the archive is unchanged or only grew.",
+                      "properties": {
+                        "last_conversation_id": {
+                          "type": "integer"
+                        },
+                        "max_conversation_id": {
+                          "type": "integer"
+                        },
+                        "expected_docs_so_far": {
+                          "type": "integer"
+                        },
+                        "saved_at": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      }
                     }
                   }
                 },
@@ -32461,6 +33343,12 @@
                         "string",
                         "null"
                       ]
+                    },
+                    "hnsw_present": {
+                      "type": "boolean"
+                    },
+                    "hnsw_state": {
+                      "type": "string"
                     },
                     "hnsw_ready": {
                       "type": "boolean"
@@ -32722,6 +33610,9 @@
                       ]
                     },
                     "quarantined_conversations": {
+                      "type": "integer"
+                    },
+                    "deferred_conversations": {
                       "type": "integer"
                     },
                     "recent_quarantined_conversations": {
@@ -33094,6 +33985,13 @@
             "type": "object",
             "additionalProperties": true
           }
+        },
+        "zero_result_diagnosis": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
         },
         "explanation": {
           "type": [
@@ -33682,6 +34580,30 @@
               "type": "object",
               "description": "Lexical rebuild pipeline settings plus optional runtime telemetry.",
               "additionalProperties": true
+            },
+            "expected_docs_scan": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "description": "Saved position of a running or interrupted full expected-docs scan; the next index run resumes it when the archive is unchanged or only grew.",
+              "properties": {
+                "last_conversation_id": {
+                  "type": "integer"
+                },
+                "max_conversation_id": {
+                  "type": "integer"
+                },
+                "expected_docs_so_far": {
+                  "type": "integer"
+                },
+                "saved_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
             }
           }
         },
@@ -33869,6 +34791,12 @@
                 "string",
                 "null"
               ]
+            },
+            "hnsw_present": {
+              "type": "boolean"
+            },
+            "hnsw_state": {
+              "type": "string"
             },
             "hnsw_ready": {
               "type": "boolean"
@@ -34132,6 +35060,9 @@
             "quarantined_conversations": {
               "type": "integer"
             },
+            "deferred_conversations": {
+              "type": "integer"
+            },
             "recent_quarantined_conversations": {
               "type": "integer"
             },
@@ -34264,13 +35195,28 @@
                   "type": [
                     "integer",
                     "null"
-                  ]
+                  ],
+                  "description": "Memory budgets are sized from: the host total clamped to the tightest cgroup limit on this process's chain"
                 },
                 "memory_available_bytes": {
                   "type": [
                     "integer",
                     "null"
                   ]
+                },
+                "host_memory_total_bytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "description": "The host's own total before any cgroup limit"
+                },
+                "memory_limit_source": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "What set memory_total_bytes: host, or cgroup_v2:/<path> / cgroup_v1:/<path> for the level whose limit is below the host total"
                 }
               }
             },
@@ -34722,7 +35668,7 @@
             },
             "archive_coverage_state": {
               "type": "string",
-              "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+              "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_capture_disabled (CASS_RAW_MIRROR is off), raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
             },
             "source_mirror_state": {
               "type": "string",
@@ -35017,6 +35963,10 @@
             },
             "sole_copy_warning_count": {
               "type": "integer"
+            },
+            "raw_mirror_capture_disabled": {
+              "type": "boolean",
+              "description": "CASS_RAW_MIRROR turned raw capture off: new session files are not copied into the raw mirror, so archive rows without a raw copy are expected and a file its provider deletes survives only in the archive DB."
             },
             "recommended_action": {
               "type": "string"
@@ -35806,6 +36756,30 @@
               "type": "object",
               "description": "Lexical rebuild pipeline settings plus optional runtime telemetry.",
               "additionalProperties": true
+            },
+            "expected_docs_scan": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "description": "Saved position of a running or interrupted full expected-docs scan; the next index run resumes it when the archive is unchanged or only grew.",
+              "properties": {
+                "last_conversation_id": {
+                  "type": "integer"
+                },
+                "max_conversation_id": {
+                  "type": "integer"
+                },
+                "expected_docs_so_far": {
+                  "type": "integer"
+                },
+                "saved_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
             }
           }
         },
@@ -35993,6 +36967,12 @@
                 "string",
                 "null"
               ]
+            },
+            "hnsw_present": {
+              "type": "boolean"
+            },
+            "hnsw_state": {
+              "type": "string"
             },
             "hnsw_ready": {
               "type": "boolean"
@@ -36256,6 +37236,9 @@
             "quarantined_conversations": {
               "type": "integer"
             },
+            "deferred_conversations": {
+              "type": "integer"
+            },
             "recent_quarantined_conversations": {
               "type": "integer"
             },
@@ -36388,13 +37371,28 @@
                   "type": [
                     "integer",
                     "null"
-                  ]
+                  ],
+                  "description": "Memory budgets are sized from: the host total clamped to the tightest cgroup limit on this process's chain"
                 },
                 "memory_available_bytes": {
                   "type": [
                     "integer",
                     "null"
                   ]
+                },
+                "host_memory_total_bytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "description": "The host's own total before any cgroup limit"
+                },
+                "memory_limit_source": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "What set memory_total_bytes: host, or cgroup_v2:/<path> / cgroup_v1:/<path> for the level whose limit is below the host total"
                 }
               }
             },
@@ -36850,7 +37848,7 @@
             },
             "archive_coverage_state": {
               "type": "string",
-              "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+              "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_capture_disabled (CASS_RAW_MIRROR is off), raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
             },
             "source_mirror_state": {
               "type": "string",
@@ -37145,6 +38143,10 @@
             },
             "sole_copy_warning_count": {
               "type": "integer"
+            },
+            "raw_mirror_capture_disabled": {
+              "type": "boolean",
+              "description": "CASS_RAW_MIRROR turned raw capture off: new session files are not copied into the raw mirror, so archive rows without a raw copy are expected and a file its provider deletes survives only in the archive DB."
             },
             "recommended_action": {
               "type": "string"
@@ -37941,6 +38943,30 @@
                   "description": "Lexical rebuild pipeline settings plus optional runtime telemetry.",
                   "additionalProperties": true
                 },
+                "expected_docs_scan": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "description": "Saved position of a running or interrupted full expected-docs scan; the next index run resumes it when the archive is unchanged or only grew.",
+                  "properties": {
+                    "last_conversation_id": {
+                      "type": "integer"
+                    },
+                    "max_conversation_id": {
+                      "type": "integer"
+                    },
+                    "expected_docs_so_far": {
+                      "type": "integer"
+                    },
+                    "saved_at": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                },
                 "inspected": {
                   "type": "boolean"
                 }
@@ -38133,6 +39159,12 @@
                     "string",
                     "null"
                   ]
+                },
+                "hnsw_present": {
+                  "type": "boolean"
+                },
+                "hnsw_state": {
+                  "type": "string"
                 },
                 "hnsw_ready": {
                   "type": "boolean"
@@ -38399,6 +39431,9 @@
                 "quarantined_conversations": {
                   "type": "integer"
                 },
+                "deferred_conversations": {
+                  "type": "integer"
+                },
                 "recent_quarantined_conversations": {
                   "type": "integer"
                 },
@@ -38596,6 +39631,32 @@
         "archive_only": {
           "type": "boolean"
         },
+        "coordinate_space": {
+          "type": "string",
+          "enum": [
+            "file_line",
+            "message_index"
+          ]
+        },
+        "content_source": {
+          "type": "string",
+          "enum": [
+            "file",
+            "archive"
+          ]
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "conversation_id": {
+          "type": "integer"
+        },
+        "target_message_index": {
+          "type": "integer"
+        },
+        "total_messages": {
+          "type": "integer"
+        },
         "budget": {
           "type": "object",
           "properties": {
@@ -38633,8 +39694,46 @@
               "number": {
                 "type": "integer"
               },
+              "file_line": {
+                "type": "integer"
+              },
+              "message_index": {
+                "type": "integer"
+              },
+              "coordinate_space": {
+                "type": "string",
+                "enum": [
+                  "file_line",
+                  "message_index"
+                ]
+              },
+              "content_source": {
+                "type": "string",
+                "enum": [
+                  "file",
+                  "archive"
+                ]
+              },
+              "message_id": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "conversation_id": {
+                "type": "integer"
+              },
+              "source_id": {
+                "type": "string"
+              },
+              "role": {
+                "type": "string"
+              },
               "content": {
                 "type": "string"
+              },
+              "is_target": {
+                "type": "boolean"
               },
               "highlighted": {
                 "type": "boolean"

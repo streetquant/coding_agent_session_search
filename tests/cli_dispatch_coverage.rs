@@ -1060,6 +1060,12 @@ fn context_json_with_nonexistent_path() {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&data_dir).unwrap();
+    drop(
+        coding_agent_search::storage::sqlite::FrankenStorage::open(
+            &data_dir.join("agent_search.db"),
+        )
+        .unwrap(),
+    );
 
     let mut cmd = base_cmd(tmp.path());
     cmd.args([
@@ -1070,10 +1076,194 @@ fn context_json_with_nonexistent_path() {
         data_dir.to_str().unwrap(),
     ]);
 
-    // May fail or return empty results - either is acceptable
-    let output = cmd.assert().get_output().clone();
-    let _stdout = String::from_utf8_lossy(&output.stdout);
-    // Test passes if command completes (success or failure with message)
+    cmd.timeout(Duration::from_secs(10))
+        .assert()
+        .code(4)
+        .stderr(contains("No session found at path"));
+}
+
+#[test]
+fn context_legacy_nulls_and_zero_limit_remain_readonly_before_migration() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("agent_search.db");
+    let conn = FrankenConnection::open(db_path.to_string_lossy().as_ref()).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+         INSERT INTO meta VALUES('schema_version', '20');
+         CREATE TABLE agents(id INTEGER PRIMARY KEY, slug TEXT);
+         INSERT INTO agents VALUES(1, NULL);
+         CREATE TABLE workspaces(id INTEGER PRIMARY KEY, path TEXT);
+         INSERT INTO workspaces VALUES(1, '/legacy-workspace');
+         CREATE TABLE conversations(
+             id INTEGER PRIMARY KEY, agent_id INTEGER, workspace_id INTEGER,
+             source_path TEXT, title TEXT, started_at INTEGER, source_id TEXT, origin_host TEXT
+         );
+         INSERT INTO conversations VALUES
+             (1, NULL, 1, '/legacy/source.jsonl', NULL, 100, NULL, NULL),
+             (2, 1, 1, '/legacy/related.jsonl', NULL, 200, '   ', 'user@remote');",
+    )
+    .unwrap();
+    conn.close().unwrap();
+    let before = fs::read(&db_path).unwrap();
+    for limit in [1, 0] {
+        let output = base_cmd(tmp.path())
+            .args(["context", "/legacy/source.jsonl", "--json", "--limit"])
+            .arg(limit.to_string())
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .timeout(Duration::from_secs(10))
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(payload["source"]["title"], "");
+        assert_eq!(payload["source"]["agent"], "unknown");
+        assert_eq!(payload["source"]["source_id"], "local");
+        assert_eq!(payload["counts"]["same_agent"], 0);
+        assert_eq!(payload["counts"]["same_workspace"], limit);
+        assert_eq!(payload["counts"]["same_day"], limit);
+        if limit == 1 {
+            let related = &payload["related"]["same_workspace"][0];
+            assert_eq!(related["path"], "/legacy/related.jsonl");
+            assert_eq!(related["agent"], "unknown");
+            assert_eq!(related["title"], "");
+            assert_eq!(related["source_id"], "user@remote");
+        }
+    }
+    assert_eq!(fs::read(&db_path).unwrap(), before);
+}
+
+#[test]
+fn context_wide_archive_limit_one_is_bounded_and_readonly() {
+    use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, FrankenStorage};
+
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("agent_search.db");
+    let storage = FrankenStorage::open(&db_path).unwrap();
+    let conn = storage.raw();
+    conn.execute_batch(
+        "DROP INDEX idx_conversations_context;
+         DELETE FROM _schema_migrations WHERE version >= 21;
+         UPDATE meta SET value = '20' WHERE key = 'schema_version';
+         INSERT INTO agents(id, slug, name, kind, created_at, updated_at)
+             VALUES(1, 'codex', 'Codex', 'cli', 0, 0),
+                   (2, 'claude', 'Claude', 'cli', 0, 0);
+         INSERT INTO workspaces(id, path) VALUES(1, '/context-workspace'), (2, '/elsewhere');
+         INSERT INTO sources(id, kind, created_at, updated_at)
+             VALUES('  local  ', 'local', 0, 0), ('   ', 'ssh', 0, 0);",
+    )
+    .unwrap();
+    // Reporter shape: 5,600 conversations with about 84 KiB metadata each.
+    // No message population is needed: context never queries messages.
+    let metadata = rmp_serde::to_vec_named(&json!({"padding": "x".repeat(84 * 1024)})).unwrap();
+    for batch in 0..56_i64 {
+        conn.execute("BEGIN IMMEDIATE").unwrap();
+        for offset in 1..=100_i64 {
+            let id = batch * 100 + offset;
+            conn.execute_compat(
+                "INSERT INTO conversations
+                 (id, agent_id, workspace_id, source_path, title, started_at, metadata_bin)
+                 VALUES(?1, 2, 2, ?2, 'wide archive session', ?3, ?4)",
+                fparams![
+                    id,
+                    format!("/wide/{id}.jsonl"),
+                    86_400_000_i64 + id,
+                    metadata.as_slice()
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+    }
+    // The source and related sessions are older than all the unrelated rows,
+    // preventing a newest-first table walk from passing by stopping early.
+    conn.execute_batch(
+        "UPDATE conversations SET agent_id = 1, workspace_id = 1, started_at = 100,
+             title = 'source' WHERE id = 1;
+         UPDATE conversations SET workspace_id = 1, started_at = 300,
+             title = NULL, source_id = '  local  ' WHERE id = 2;
+         UPDATE conversations SET agent_id = 1, started_at = 200,
+             source_id = '   ', origin_host = 'user@remote' WHERE id = 3;",
+    )
+    .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    drop(storage);
+    // Upgrade a populated file through the ordinary writable open, then prove
+    // every metadata payload survived the index build before invoking the CLI.
+    let storage = FrankenStorage::open(&db_path).unwrap();
+    assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    {
+        let rows = storage
+            .raw()
+            .query("SELECT metadata_bin FROM conversations")
+            .unwrap();
+        assert_eq!(rows.len(), 5600);
+        for row in rows {
+            assert_eq!(row.get_typed::<Vec<u8>>(0).unwrap(), metadata);
+        }
+    }
+    storage
+        .raw()
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    drop(storage);
+    let before = blake3::hash(&fs::read(&db_path).unwrap());
+    let wal_path = data_dir.join("agent_search.db-wal");
+    let wal_before = wal_path.exists().then(|| fs::read(&wal_path).unwrap());
+    let started = std::time::Instant::now();
+    let output = base_cmd(tmp.path())
+        .args([
+            "context",
+            "/wide/1.jsonl",
+            "--json",
+            "--limit",
+            "1",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .timeout(Duration::from_secs(30))
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let elapsed = started.elapsed();
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["source"]["title"], "source");
+    assert_eq!(
+        payload["counts"],
+        json!({"same_workspace": 1, "same_day": 1, "same_agent": 1})
+    );
+    let workspace = &payload["related"]["same_workspace"][0];
+    assert_eq!(workspace["path"], "/wide/2.jsonl");
+    assert_eq!(workspace["title"], "");
+    assert_eq!(workspace["agent"], "claude");
+    assert_eq!(workspace["source_id"], "local");
+    assert_eq!(payload["related"]["same_day"][0], *workspace);
+    assert_eq!(payload["related"]["same_agent"][0]["path"], "/wide/3.jsonl");
+    assert_eq!(
+        payload["related"]["same_agent"][0]["source_id"],
+        "user@remote"
+    );
+    assert_eq!(
+        blake3::hash(&fs::read(&db_path).unwrap()),
+        before,
+        "context must not migrate or rewrite the archive"
+    );
+    assert_eq!(
+        wal_path.exists().then(|| fs::read(&wal_path).unwrap()),
+        wal_before,
+        "context must preserve the WAL too"
+    );
+    eprintln!(
+        "GH463: conversations=5600 metadata_bytes={} limit=1 elapsed_ms={}",
+        5600 * metadata.len(),
+        elapsed.as_millis()
+    );
 }
 
 #[test]
@@ -1090,6 +1280,259 @@ fn context_help_shows_options() {
 // =============================================================================
 // Timeline command tests
 // =============================================================================
+
+// Deliberately keep message bodies in the fixture: GH#521 was caused by the
+// engine materializing those bodies for a join, even outside the time window.
+fn seed_timeline_count_fixture(db_path: &Path, archive_messages: i64, body_bytes: usize) {
+    let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT);
+         CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+         CREATE TABLE conversations (
+             id INTEGER PRIMARY KEY, agent_id INTEGER, title TEXT,
+             started_at INTEGER, ended_at INTEGER, source_path TEXT,
+             source_id TEXT, origin_host TEXT);
+         CREATE INDEX timeline_started_at ON conversations(started_at);
+         CREATE TABLE messages (
+             id INTEGER PRIMARY KEY, conversation_id INTEGER, idx INTEGER,
+             content TEXT, UNIQUE(conversation_id, idx));
+         INSERT INTO agents VALUES (1, 'codex'), (2, 'claude_code');
+         INSERT INTO sources VALUES ('local', 'local'), ('laptop', 'ssh'),
+                                    ('named-local', 'local');
+         INSERT INTO conversations VALUES
+             (1, 1, 'lower boundary', 1700000000000, 1700000005000, '/one', 'local', NULL),
+             (2, 2, 'remote', 1700000030000, NULL, '/two', 'laptop', 'laptop'),
+             (3, 1, 'empty upper boundary', 1700000060000, NULL, '/three', 'local', NULL),
+             (4, 1, 'old archive', 1699999999999, NULL, '/four', 'local', NULL),
+             (5, 1, 'after window', 1700000060001, NULL, '/five', 'local', NULL),
+             (6, NULL, NULL, 1700000020000, NULL, '/six', NULL, NULL),
+             (7, 1, 'named local', 1700000010000, NULL, '/seven', 'named-local', NULL),
+             (8, 1, 'undated', NULL, NULL, '/eight', 'local', NULL);
+         INSERT INTO messages (conversation_id, idx, content) VALUES
+             (1, 0, 'one'), (1, 4, 'two'), (1, 9, 'three'),
+             (2, 0, 'remote'), (5, 0, 'future'), (6, 0, 'unknown'),
+             (7, 0, 'named local');",
+    )
+    .unwrap();
+    let body = "x".repeat(body_bytes);
+    conn.execute("BEGIN").unwrap();
+    if archive_messages > 128 {
+        // Match the report's conversation cardinality with a tiny window.
+        for id in 9..=12_667_i64 {
+            conn.execute_compat(
+                "INSERT INTO conversations (id, agent_id, title, started_at,
+                     source_path, source_id) VALUES (?1, 1, 'archive',
+                     1600000000000, '/archive', 'local')",
+                fparams![id],
+            )
+            .unwrap();
+        }
+    }
+    for idx in 0..archive_messages {
+        conn.execute_compat(
+            "INSERT INTO messages (conversation_id, idx, content) VALUES (4, ?1, ?2)",
+            fparams![idx, body.as_str()],
+        )
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    conn.close().unwrap();
+}
+
+fn timeline_window_command(home: &Path, db_path: &Path) -> Command {
+    let mut cmd = base_cmd(home);
+    cmd.args([
+        "timeline",
+        "--since",
+        "2023-11-14T22:13:20Z",
+        "--until",
+        "2023-11-14T22:14:20Z",
+        "--json",
+        "--db",
+    ]);
+    cmd.arg(db_path);
+    cmd.timeout(Duration::from_secs(60));
+    cmd
+}
+
+#[test]
+fn timeline_counts_only_filtered_sessions_and_preserves_order() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("timeline.db");
+    seed_timeline_count_fixture(&db_path, 128, 4096);
+    for (filters, expected) in [
+        (vec![], vec![(3, 0), (2, 1), (6, 1), (7, 1), (1, 3)]),
+        (vec!["--agent", "codex"], vec![(3, 0), (7, 1), (1, 3)]),
+        (vec!["--agent", "claude_code"], vec![(2, 1)]),
+        (
+            vec!["--source", "local"],
+            vec![(3, 0), (6, 1), (7, 1), (1, 3)],
+        ),
+        (vec!["--source", "remote"], vec![(2, 1)]),
+        (vec!["--source", "named-local"], vec![(7, 1)]),
+        (vec!["--agent", "codex", "--source", "remote"], vec![]),
+    ] {
+        for grouping in ["none", "hour", "day"] {
+            let output = timeline_window_command(tmp.path(), &db_path)
+                .args(&filters)
+                .args(["--group-by", grouping])
+                .assert()
+                .success()
+                .get_output()
+                .clone();
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["total_sessions"], expected.len());
+            assert_eq!(value["range"]["start"], 1_700_000_000_000_i64);
+            assert_eq!(value["range"]["end"], 1_700_000_060_000_i64);
+            let rows: Vec<&Value> = if grouping == "none" {
+                value["sessions"].as_array().unwrap().iter().collect()
+            } else {
+                value["groups"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .flat_map(|group| group.as_array().unwrap())
+                    .collect()
+            };
+            let actual: Vec<_> = rows
+                .iter()
+                .map(|row| {
+                    (
+                        row["id"].as_i64().unwrap(),
+                        row["message_count"].as_i64().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(actual, expected, "filters={filters:?}, grouping={grouping}");
+            if let Some(unknown) = rows.iter().find(|row| row["id"] == 6) {
+                assert_eq!(unknown["agent"], "unknown");
+                assert!(unknown["title"].is_null());
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn timeline_measured_output(cmd: &Command) -> Value {
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let mut measured = std::process::Command::new(cmd.get_program());
+    measured.args(cmd.get_args());
+    for (key, value) in cmd.get_envs() {
+        if let Some(value) = value {
+            measured.env(key, value);
+        } else {
+            measured.env_remove(key);
+        }
+    }
+    let mut child = measured
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let status_path = format!("/proc/{}/status", child.id());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut peak_kib = 0_u64;
+    loop {
+        if let Ok(status) = fs::read_to_string(&status_path) {
+            for line in status.lines() {
+                if let Some(value) = line.strip_prefix("VmHWM:") {
+                    peak_kib =
+                        peak_kib.max(value.split_whitespace().next().unwrap().parse().unwrap());
+                }
+            }
+        }
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= deadline || peak_kib >= 192 * 1024 {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "timeline exceeded time/memory budget: peak={peak_kib} KiB, stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(peak_kib > 0, "no child RSS measurement captured");
+    assert!(
+        peak_kib < 192 * 1024,
+        "timeline retained archive payloads: {peak_kib} KiB"
+    );
+    eprintln!(
+        "timeline {:?} peak_rss_kib={peak_kib}",
+        cmd.get_args().collect::<Vec<_>>()
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "256 MiB archive RSS probe; run explicitly with --ignored --test-threads=1"]
+fn timeline_large_archive_peak_memory_is_bounded() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("timeline-large.db");
+    seed_timeline_count_fixture(&db_path, 4096, 64 * 1024);
+    assert!(fs::metadata(&db_path).unwrap().len() >= 256 * 1024 * 1024);
+    for filters in [vec![], vec!["--agent", "codex"], vec!["--source", "local"]] {
+        let mut cmd = timeline_window_command(tmp.path(), &db_path);
+        cmd.args(&filters).args(["--group-by", "none"]);
+        let value = timeline_measured_output(&cmd);
+        assert_eq!(
+            value["total_sessions"],
+            if filters.is_empty() {
+                5
+            } else if filters[0] == "--agent" {
+                3
+            } else {
+                4
+            }
+        );
+    }
+    for window in ["--today", "--since"] {
+        let mut cmd = base_cmd(tmp.path());
+        cmd.args(["timeline", "--json", "--group-by", "none", "--db"])
+            .arg(&db_path)
+            .arg(window);
+        if window == "--since" {
+            cmd.arg("5m");
+        }
+        let value = timeline_measured_output(&cmd);
+        assert_eq!(value["total_sessions"], 0);
+    }
+    // Move the payload-heavy conversation into the window to verify that even
+    // a very large selected session is counted without collecting its bodies.
+    let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    conn.execute("UPDATE conversations SET started_at = 1700000040000 WHERE id = 4")
+        .unwrap();
+    conn.close().unwrap();
+    let mut cmd = timeline_window_command(tmp.path(), &db_path);
+    cmd.args(["--group-by", "none"]);
+    let value = timeline_measured_output(&cmd);
+    let large = value["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == 4)
+        .unwrap();
+    assert_eq!(large["message_count"], 4096);
+    for filters in [vec!["--agent", "claude_code"], vec!["--source", "remote"]] {
+        let mut cmd = timeline_window_command(tmp.path(), &db_path);
+        cmd.args(&filters).args(["--group-by", "none"]);
+        let value = timeline_measured_output(&cmd);
+        assert_eq!(value["total_sessions"], 1);
+        assert_eq!(value["sessions"][0]["id"], 2);
+        assert_eq!(value["sessions"][0]["message_count"], 1);
+    }
+}
 
 #[test]
 fn timeline_json_outputs_valid_structure() {
@@ -1400,9 +1843,14 @@ fn expand_requires_path_and_line() {
 fn expand_help_shows_options() {
     let mut cmd = simple_cmd();
     cmd.args(["expand", "--help"]);
+    // Since #493 (aa5d5068) expand is described by its two coordinate systems
+    // instead of "messages around": a hit's canonical ordinal or a raw line.
     cmd.assert()
         .success()
-        .stdout(contains("messages around"))
+        .stdout(contains(
+            "Expand a search hit with --message-index, or inspect raw JSONL with --line",
+        ))
+        .stdout(contains("--message-index"))
         .stdout(contains("--line"))
         .stdout(contains("--context"))
         .stdout(contains("--json"));
@@ -1429,6 +1877,568 @@ fn export_help_shows_formats() {
         .stdout(contains("--format"))
         .stdout(contains("--output"))
         .stdout(contains("markdown").or(contains("Markdown")));
+}
+
+// GH #519: a complete file is not sufficient proof of a successful export.
+// Exercise the real process through normal return, including its thread-local
+// database/runtime teardown, and check both the transcript and the exit status.
+fn gh519_opencode_database(db_path: &Path, session_id: &str) -> PathBuf {
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let conn = FrankenConnection::open(db_path.to_string_lossy().as_ref()).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         CREATE TABLE session (
+             id TEXT PRIMARY KEY, project_id TEXT, slug TEXT, directory TEXT,
+             title TEXT, version TEXT, time_created INTEGER, time_updated INTEGER
+         );
+         CREATE TABLE message (
+             id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER,
+             time_updated INTEGER, data TEXT
+         );
+         CREATE TABLE part (
+             id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+             time_created INTEGER, time_updated INTEGER, data TEXT
+         );
+         CREATE TABLE export_wal_activity (id INTEGER PRIMARY KEY, generation INTEGER);
+         INSERT INTO export_wal_activity VALUES (1, 0);
+         BEGIN IMMEDIATE;",
+    )
+    .unwrap();
+    conn.execute_compat(
+        "INSERT INTO session VALUES (?1, 'project', 'export', '/work/export',
+         'GH519 complete conversation', '1.14.46', 1700000000000, 1700000000008)",
+        fparams![session_id],
+    )
+    .unwrap();
+    for index in 0..9_i64 {
+        let message_id = format!("msg_{index}");
+        let role = if index % 2 == 0 { "user" } else { "assistant" };
+        conn.execute_compat(
+            "INSERT INTO message VALUES (?1, ?2, ?3, ?3, ?4)",
+            fparams![
+                message_id.as_str(),
+                session_id,
+                1_700_000_000_000_i64 + index,
+                json!({"role": role}).to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+            fparams![
+                format!("part_{index}"),
+                message_id,
+                session_id,
+                1_700_000_000_000_i64 + index,
+                json!({"type": "text", "text": format!("GH519 message {index}: complete 🪟")})
+                    .to_string()
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    conn.close().unwrap();
+    db_path.join(session_id)
+}
+
+fn gh519_export_cmd(home: &Path, session: &Path) -> Command {
+    let mut cmd = base_cmd(home);
+    cmd.current_dir(home)
+        .env("USERPROFILE", home)
+        .env("LOCALAPPDATA", home.join("AppData/Local"))
+        .env("APPDATA", home.join("AppData/Roaming"))
+        .env("OPENCODE_SQLITE_DB", session.parent().unwrap())
+        .env("OPENCODE_STORAGE_ROOT", home.join("empty-opencode-storage"))
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_OUTPUT_FORMAT", "json")
+        .env("RUST_BACKTRACE", "full")
+        .arg("export")
+        .arg(session)
+        .args(["--format", "json", "--include-tools"])
+        .timeout(Duration::from_secs(60));
+    cmd
+}
+
+fn gh519_assert_messages(bytes: &[u8]) {
+    let payload: Value = serde_json::from_slice(bytes).expect("complete, valid exported JSON");
+    let messages = payload.as_array().expect("export is a message array");
+    assert_eq!(messages.len(), 9, "every expected message must survive");
+    for (index, message) in messages.iter().enumerate() {
+        assert_eq!(
+            message["content"],
+            format!("GH519 message {index}: complete 🪟")
+        );
+        assert_eq!(
+            message["role"],
+            if index % 2 == 0 { "user" } else { "assistant" }
+        );
+    }
+}
+
+fn gh519_assert_success(output: &std::process::Output) {
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a complete export must also exit successfully; status={}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("panicked at"), "{stderr}");
+    assert!(
+        !stderr.contains("threads should not terminate unexpectedly"),
+        "{stderr}"
+    );
+}
+
+fn gh519_assert_error(output: &std::process::Output, expected_kind: &str) {
+    assert_eq!(output.status.code(), Some(9), "{output:?}");
+    assert!(
+        output.stdout.is_empty(),
+        "no export success on failure: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("panicked at"), "{stderr}");
+    let envelope = stderr
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+        .expect("typed error envelope must survive database/runtime shutdown");
+    assert_eq!(envelope["error"]["code"], 9, "{stderr}");
+    assert_eq!(envelope["error"]["kind"], expected_kind, "{stderr}");
+    assert!(envelope["error"]["retryable"].is_boolean(), "{stderr}");
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Gh519WalActivity {
+    Commits,
+    Truncate,
+}
+
+/// The writer lives in this test process; every reader is a separate real cass
+/// process. The selected nine messages stay fixed while unrelated transactions
+/// repeatedly commit to the same WAL, optionally resetting it after each commit.
+fn gh519_exports_with_wal_writer(
+    db_path: &Path,
+    commands: Vec<Command>,
+    activity: Gh519WalActivity,
+) -> Vec<std::process::Output> {
+    use std::io::Read;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let commits = Arc::new(AtomicUsize::new(0));
+    let salt_changes = Arc::new(AtomicUsize::new(0));
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let writer_stop = Arc::clone(&stop);
+    let writer_commits = Arc::clone(&commits);
+    let writer_salt_changes = Arc::clone(&salt_changes);
+    let db_path = db_path.to_path_buf();
+    let writer = std::thread::Builder::new()
+        .name("gh519-live-wal-writer".into())
+        .stack_size(128 * 1024 * 1024)
+        .spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                let conn = FrankenConnection::open(db_path.to_string_lossy().as_ref())?;
+                conn.execute_batch(
+                    "PRAGMA journal_mode = WAL;
+                     PRAGMA wal_autocheckpoint = 0;
+                     PRAGMA busy_timeout = 1000;",
+                )?;
+                let wal_path = db_path.with_file_name(format!(
+                    "{}-wal",
+                    db_path.file_name().unwrap().to_string_lossy()
+                ));
+                let mut ready_tx = Some(ready_tx);
+                let mut previous_salt = None;
+                while !writer_stop.load(Ordering::Acquire) {
+                    conn.execute(
+                        "UPDATE export_wal_activity SET generation = generation + 1 WHERE id = 1",
+                    )?;
+                    // Inspect actual WAL headers to distinguish ordinary live
+                    // commits from the separately tested reset contention.
+                    let mut header = [0_u8; 24];
+                    fs::File::open(&wal_path)?.read_exact(&mut header)?;
+                    let salt: [u8; 8] = header[16..24].try_into().unwrap();
+                    if previous_salt.is_some_and(|previous| previous != salt) {
+                        writer_salt_changes.fetch_add(1, Ordering::Release);
+                    }
+                    previous_salt = Some(salt);
+                    if matches!(activity, Gh519WalActivity::Truncate) {
+                        conn.query("PRAGMA wal_checkpoint(TRUNCATE)")?;
+                    }
+                    writer_commits.fetch_add(1, Ordering::Release);
+                    if let Some(ready_tx) = ready_tx.take() {
+                        ready_tx.send(())?;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                conn.close()?;
+                Ok(())
+            })();
+            let drained = coding_agent_search::shutdown_thread_local_bridge_runtimes();
+            assert!(drained, "writer runtime must finish before thread exit");
+            result
+        })
+        .expect("spawn live WAL writer");
+
+    let ready = ready_rx.recv_timeout(Duration::from_secs(30));
+    let before = commits.load(Ordering::Acquire);
+    let salts_before = salt_changes.load(Ordering::Acquire);
+    // Save fallible subprocess results until after stopping and joining the
+    // writer, so a failed export cannot leave the test's writer running.
+    let outputs: Vec<_> = if ready.is_ok() {
+        commands.into_iter().map(|mut cmd| cmd.output()).collect()
+    } else {
+        Vec::new()
+    };
+    stop.store(true, Ordering::Release);
+    writer
+        .join()
+        .expect("WAL writer panicked")
+        .expect("WAL writer failed");
+    ready.expect("WAL writer became ready");
+    let concurrent_commits = commits.load(Ordering::Acquire) - before;
+    let concurrent_resets = salt_changes.load(Ordering::Acquire) - salts_before;
+    assert!(concurrent_commits > 0, "no concurrent writes occurred");
+    match activity {
+        Gh519WalActivity::Commits => assert_eq!(
+            concurrent_resets, 0,
+            "steady writer must not reset the WAL during exports"
+        ),
+        Gh519WalActivity::Truncate => assert!(
+            concurrent_resets > 0,
+            "no WAL generation changed while cass exports ran"
+        ),
+    }
+    eprintln!(
+        "GH519 WAL {activity:?}: {concurrent_commits} concurrent commits, \
+         {concurrent_resets} salt changes during {} exports",
+        outputs.len()
+    );
+    outputs
+        .into_iter()
+        .map(|output| output.expect("run cass export"))
+        .collect()
+}
+
+#[test]
+fn gh519_export_opencode_sqlite_stdout_exits_successfully() {
+    let tmp = TempDir::new().unwrap();
+    let session = gh519_opencode_database(&tmp.path().join("opencode.db"), "ses_gh519");
+    let output = gh519_export_cmd(tmp.path(), &session).output().unwrap();
+    gh519_assert_success(&output);
+    gh519_assert_messages(&output.stdout);
+}
+
+#[test]
+fn gh519_export_opencode_sqlite_live_wal_exits_successfully_repeatedly() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("opencode.db");
+    let session = gh519_opencode_database(&db_path, "ses_gh519");
+    let paths: Vec<_> = (0..3)
+        .map(|run| tmp.path().join(format!("out-{run}.json")))
+        .collect();
+    let commands = paths
+        .iter()
+        .map(|path| {
+            let mut cmd = gh519_export_cmd(tmp.path(), &session);
+            cmd.args(["--source", "local"]).arg("-o").arg(path);
+            cmd
+        })
+        .collect();
+    let outputs = gh519_exports_with_wal_writer(&db_path, commands, Gh519WalActivity::Commits);
+    for (path, output) in paths.iter().zip(outputs) {
+        gh519_assert_success(&output);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Exported to:"));
+        gh519_assert_messages(&fs::read(path).expect("published export"));
+    }
+}
+
+#[test]
+fn gh519_export_indexed_source_live_wal_exits_successfully_repeatedly() {
+    use coding_agent_search::sources::provenance::{Source, SourceKind};
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("agent_search.db");
+    let storage = FrankenStorage::open(&db_path).unwrap();
+    storage
+        .upsert_source(&Source {
+            id: "work-laptop".into(),
+            kind: SourceKind::Ssh,
+            host_label: Some("work-laptop".into()),
+            machine_id: None,
+            platform: None,
+            config_json: None,
+            created_at: None,
+            updated_at: None,
+        })
+        .unwrap();
+    let agent_id = storage
+        .ensure_agent(&sample_agent("opencode", "OpenCode"))
+        .unwrap();
+    // Deliberately absent: --source must read the archive, not a local store.
+    let session = tmp.path().join("remote/opencode.db/ses_gh519");
+    let messages = (0..9)
+        .map(|index| {
+            sample_message(
+                index,
+                if index % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Agent
+                },
+                1_700_000_000_000 + index,
+                &format!("GH519 message {index}: complete 🪟"),
+            )
+        })
+        .collect();
+    let mut conversation = sample_conversation(
+        "opencode",
+        tmp.path(),
+        &session,
+        "ses_gh519",
+        "GH519 complete conversation",
+        1_700_000_000_000,
+        messages,
+    );
+    conversation.source_id = "work-laptop".into();
+    conversation.origin_host = Some("work-laptop".into());
+    storage
+        .insert_conversation_tree(agent_id, None, &conversation)
+        .unwrap();
+    storage
+        .raw()
+        .execute_batch(
+            "CREATE TABLE export_wal_activity (id INTEGER PRIMARY KEY, generation INTEGER);
+         INSERT INTO export_wal_activity VALUES (1, 0);",
+        )
+        .unwrap();
+    drop(storage);
+
+    let paths: Vec<_> = (0..3)
+        .map(|run| tmp.path().join(format!("archive-{run}.json")))
+        .collect();
+    let commands = paths
+        .iter()
+        .map(|path| {
+            let mut cmd = gh519_export_cmd(tmp.path(), &session);
+            cmd.args(["--source", "work-laptop"])
+                .arg("--db")
+                .arg(&db_path)
+                .arg("-o")
+                .arg(path);
+            cmd
+        })
+        .collect();
+    let outputs = gh519_exports_with_wal_writer(&db_path, commands, Gh519WalActivity::Commits);
+    for (path, output) in paths.iter().zip(outputs) {
+        gh519_assert_success(&output);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Exported to:"));
+        gh519_assert_messages(&fs::read(path).expect("published archive export"));
+    }
+}
+
+#[test]
+fn gh519_export_opencode_sqlite_wal_resets_complete_or_fail_cleanly() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("opencode.db");
+    let session = gh519_opencode_database(&db_path, "ses_gh519");
+    let paths: Vec<_> = (0..6)
+        .map(|run| tmp.path().join(format!("reset-{run}.json")))
+        .collect();
+    let commands = paths
+        .iter()
+        .map(|path| {
+            let mut cmd = gh519_export_cmd(tmp.path(), &session);
+            cmd.args(["--source", "local"]).arg("-o").arg(path);
+            cmd
+        })
+        .collect();
+    let outputs = gh519_exports_with_wal_writer(&db_path, commands, Gh519WalActivity::Truncate);
+    let mut completed = 0;
+    let mut refused = 0;
+    // Upstream independently reproduced a read refusal when TRUNCATE leaves
+    // the WAL header briefly empty. That is separate from GH519's panic after
+    // writing a complete file. Check every attempt; never retry or discard a
+    // nonzero exit, and never accept published output paired with an error.
+    for (path, output) in paths.iter().zip(outputs) {
+        if output.status.code() == Some(0) {
+            gh519_assert_success(&output);
+            assert!(String::from_utf8_lossy(&output.stdout).contains("Exported to:"));
+            gh519_assert_messages(&fs::read(path).expect("complete reset-contention export"));
+            completed += 1;
+        } else {
+            gh519_assert_error(&output, "opencode-sqlite-parse");
+            assert!(
+                !path.exists(),
+                "a refused read must not publish an incomplete or misleading export"
+            );
+            refused += 1;
+        }
+    }
+    assert_eq!(
+        completed + refused,
+        6,
+        "every subprocess outcome is checked"
+    );
+    eprintln!("GH519 WAL reset outcomes: {completed} complete, {refused} clean read refusals");
+
+    // The helper has stopped and joined the writer. Always demand complete
+    // success now, so permanent unreadability cannot satisfy the refusal arm.
+    let destination = tmp.path().join("after-resets.json");
+    let output = gh519_export_cmd(tmp.path(), &session)
+        .args(["--source", "local"])
+        .arg("-o")
+        .arg(&destination)
+        .output()
+        .unwrap();
+    gh519_assert_success(&output);
+    gh519_assert_messages(&fs::read(destination).expect("complete export after WAL writer stops"));
+}
+
+#[test]
+fn gh519_export_corrupt_opencode_database_fails_without_publishing() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("opencode.db");
+    fs::write(&db_path, b"not a SQLite database").unwrap();
+    let session = db_path.join("ses_gh519");
+    let destination = tmp.path().join("out.json");
+    for previous in [None, Some(b"previous complete export".as_slice())] {
+        if let Some(previous) = previous {
+            fs::write(&destination, previous).unwrap();
+        }
+        let output = gh519_export_cmd(tmp.path(), &session)
+            .arg("-o")
+            .arg(&destination)
+            .output()
+            .unwrap();
+        gh519_assert_error(&output, "opencode-sqlite-parse");
+        if let Some(previous) = previous {
+            assert_eq!(fs::read(&destination).unwrap(), previous);
+        } else {
+            assert!(
+                !destination.exists(),
+                "failed read must not publish an export"
+            );
+        }
+    }
+}
+
+#[test]
+fn gh519_export_unreadable_committed_wal_fails_without_publishing() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("opencode.db");
+    let session = gh519_opencode_database(&db_path, "ses_gh519");
+    let conn = FrankenConnection::open(db_path.to_string_lossy().as_ref()).unwrap();
+    conn.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+    let main_before = fs::read(&db_path).unwrap();
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    conn.execute_compat(
+        "INSERT INTO message VALUES ('msg_9', 'ses_gh519', 1700000000009,
+         1700000000009, ?1)",
+        fparams![json!({"role": "assistant"}).to_string()],
+    )
+    .unwrap();
+    conn.execute_compat(
+        "INSERT INTO part VALUES ('part_9', 'msg_9', 'ses_gh519', 1700000000009,
+         1700000000009, ?1)",
+        fparams![json!({"type": "text", "text": "GH519 committed WAL-only message"}).to_string()],
+    )
+    .unwrap();
+    conn.execute("COMMIT").unwrap();
+    conn.close_without_checkpoint().unwrap();
+    let wal_path = tmp.path().join("opencode.db-wal");
+    assert!(fs::metadata(&wal_path).unwrap().len() > 32);
+    assert_eq!(
+        fs::read(&db_path).unwrap(),
+        main_before,
+        "the tenth committed message must require the WAL"
+    );
+
+    let complete = gh519_export_cmd(tmp.path(), &session).output().unwrap();
+    gh519_assert_success(&complete);
+    let messages: Vec<Value> = serde_json::from_slice(&complete.stdout).unwrap();
+    assert_eq!(messages.len(), 10);
+    assert_eq!(messages[9]["content"], "GH519 committed WAL-only message");
+    assert_eq!(fs::read(&db_path).unwrap(), main_before);
+
+    // A directory gives a portable WAL I/O failure, unlike an obsolete salt
+    // or invalid header the engine may legitimately treat as an empty WAL.
+    // Retain the original committed bytes for diagnosis instead of deleting.
+    let retained_wal = tmp.path().join("retained-committed.wal");
+    fs::rename(&wal_path, &retained_wal).unwrap();
+    fs::create_dir(&wal_path).unwrap();
+    let destination = tmp.path().join("out.json");
+    for previous in [None, Some(complete.stdout.as_slice())] {
+        if let Some(previous) = previous {
+            fs::write(&destination, previous).unwrap();
+        }
+        let output = gh519_export_cmd(tmp.path(), &session)
+            .arg("-o")
+            .arg(&destination)
+            .output()
+            .unwrap();
+        gh519_assert_error(&output, "opencode-sqlite-parse");
+        if let Some(previous) = previous {
+            assert_eq!(fs::read(&destination).unwrap(), previous);
+        } else {
+            assert!(!destination.exists(), "an incomplete read must not publish");
+        }
+    }
+    assert!(wal_path.is_dir());
+    assert!(retained_wal.is_file());
+    assert_eq!(fs::read(&db_path).unwrap(), main_before);
+}
+
+#[test]
+fn gh519_export_output_failure_exits_cleanly_after_opencode_read() {
+    let tmp = TempDir::new().unwrap();
+    let session = gh519_opencode_database(&tmp.path().join("opencode.db"), "ses_gh519");
+    let destination = tmp.path().join("missing-directory/out.json");
+    let output = gh519_export_cmd(tmp.path(), &session)
+        .arg("-o")
+        .arg(&destination)
+        .output()
+        .unwrap();
+    gh519_assert_error(&output, "file-create");
+    assert!(!destination.exists());
+
+    #[cfg(target_os = "linux")]
+    {
+        // Unlike a missing parent directory, /dev/full opens successfully and
+        // rejects write_all with ENOSPC after the connector has returned data.
+        let output = gh519_export_cmd(tmp.path(), &session)
+            .args(["-o", "/dev/full"])
+            .output()
+            .unwrap();
+        gh519_assert_error(&output, "file-write");
+    }
+}
+
+#[test]
+fn gh519_export_missing_session_does_not_use_another_opencode_store() {
+    let tmp = TempDir::new().unwrap();
+    let requested_db = tmp.path().join("requested/opencode.db");
+    gh519_opencode_database(&requested_db, "different_session");
+    let default_db = tmp.path().join("default/opencode.db");
+    gh519_opencode_database(&default_db, "ses_gh519");
+    let destination = tmp.path().join("out.json");
+    let output = gh519_export_cmd(tmp.path(), &requested_db.join("ses_gh519"))
+        .env("OPENCODE_SQLITE_DB", &default_db)
+        .arg("-o")
+        .arg(&destination)
+        .output()
+        .unwrap();
+    gh519_assert_error(&output, "opencode-sqlite-parse");
+    assert!(
+        !destination.exists(),
+        "another database's session must not be substituted"
+    );
 }
 
 // =============================================================================
@@ -2065,7 +3075,7 @@ fn parse_expand_with_context() {
             ..
         }) => {
             assert_eq!(path.to_str().unwrap(), "/path/to/session.jsonl");
-            assert_eq!(line, 100);
+            assert_eq!(line, Some(100));
             assert_eq!(context, 5);
         }
         other => panic!("expected expand command, got {other:?}"),
@@ -3018,7 +4028,7 @@ fn analytics_subcommands_emit_uniform_json_envelope() {
             vec!["analytics", "models", "--group-by", "month"],
         ),
         ("analytics/incidents", vec!["analytics", "incidents"]),
-        ("analytics/rebuild", vec!["analytics", "rebuild", "--force"]),
+        ("analytics/rebuild", vec!["analytics", "rebuild"]),
         ("analytics/validate", vec!["analytics", "validate", "--fix"]),
     ];
 
@@ -4315,30 +5325,34 @@ fn analytics_validate_fix_refuses_when_source_schema_is_missing() {
     );
 }
 
+/// 2l1b0.68: help no longer advertises the removed `--force`.
 #[test]
-fn analytics_rebuild_help_shows_force_flag() {
+fn analytics_rebuild_help_omits_the_removed_force_flag() {
     let mut cmd = simple_cmd();
     cmd.args(["analytics", "rebuild", "--help"]);
     cmd.assert()
         .success()
-        .stdout(contains("--force"))
+        .stdout(contains("--force").not())
         .stdout(contains("--json"));
 }
 
+/// 2l1b0.68: `analytics rebuild` always rebuilds, so the former `--force`
+/// (parsed, then ignored) is gone rather than accepted as a silent no-op.
 #[test]
-fn analytics_rebuild_parses_force_and_json_flags() {
-    let cli = parse_cli_ok(
+fn analytics_rebuild_parses_json_and_rejects_force() {
+    let err = parse_cli_err(
         ["cass", "analytics", "rebuild", "--force", "--json"],
-        "parse analytics rebuild with force+json",
+        "analytics rebuild --force must be rejected",
+    );
+    assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+
+    let cli = parse_cli_ok(
+        ["cass", "analytics", "rebuild", "--json"],
+        "parse analytics rebuild with json",
     );
 
     match cli.command {
-        Some(Commands::Analytics(AnalyticsCommand::Rebuild {
-            common,
-            force,
-            track,
-        })) => {
-            assert!(force, "--force should be true");
+        Some(Commands::Analytics(AnalyticsCommand::Rebuild { common, track })) => {
             assert!(common.json, "--json should be true");
             assert_eq!(
                 track,
