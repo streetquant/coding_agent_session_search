@@ -363,6 +363,8 @@ fn cass(home: &Path) -> Command {
         .env("XDG_DATA_HOME", home.join(".local/share"))
         .env("CASS_DATA_DIR", home.join("data"))
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("CASS_CLOUDMCP_DATA_ROOT", home.join("isolated-cloudmcp"))
+        .env("CASS_OPENWEBUI_DATA_ROOT", home.join("isolated-openwebui"))
         .env("CASS_STREAMING_INDEX", "1")
         .env("CASS_AUTO_REFRESH", "0")
         .env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0")
