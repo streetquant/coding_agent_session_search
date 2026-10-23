@@ -7919,6 +7919,7 @@ impl SearchClient {
         let epoch = self.reload_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         self.metrics.record_reload(elapsed);
         let current_generation = self.federated_generation_signature(readers);
+        // ubs:ignore[rust.security.constant-time-compare] -- Public cache-generation metadata is not a credential.
         if cached_generation != current_generation {
             self.metrics
                 .record_cache_lookup(crate::daemon_runtime_state::CacheLookup {
@@ -23305,6 +23306,7 @@ mod tests {
             FieldMask::FULL,
         )?;
         assert!(!hits.is_empty(), "Should find JWT authentication");
+        // ubs:ignore[rust.security.constant-time-compare] -- The test compares a public provider label, not authentication material.
         assert!(hits.iter().any(|h| h.agent == "claude_code"));
         assert!(
             hits.iter()
