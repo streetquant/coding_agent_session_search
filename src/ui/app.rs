@@ -10118,7 +10118,7 @@ impl CassApp {
                 let msg_hit_rank =
                     msg_line_from_idx.and_then(|line| session_hit_rank.get(&line).copied());
                 let msg_is_current_session_hit =
-                    msg_hit_rank.is_some_and(|rank| rank == current_session_hit_rank && rank > 0);
+                    msg_hit_rank.is_some_and(|rank| rank == current_session_hit_rank && rank > 0); // ubs:ignore[rust.security.constant-time-compare] Public search-result ranks position a TUI highlight; no secret is compared.
                 let role_s = Self::role_style(&msg.role, styles);
                 let gutter_s = Self::role_gutter_style(&msg.role, styles);
                 let prefix = Self::role_prefix(&msg.role);
@@ -13471,7 +13471,7 @@ impl CassApp {
 
         // Output directory.
         if y < inner.y + inner.height {
-            let focused = state.focused == ExportField::OutputDir;
+            let focused = state.focused == ExportField::OutputDir; // ubs:ignore[rust.security.constant-time-compare] ExportField is a public TUI focus enum, not a credential.
             let editing = state.output_dir_editing;
             let display_path = if editing {
                 state.output_dir_buffer.as_str()
@@ -13518,7 +13518,7 @@ impl CassApp {
                 break;
             }
             let mark = if checked { "[x]" } else { "[ ]" };
-            let focused = state.focused == field;
+            let focused = state.focused == field; // ubs:ignore[rust.security.constant-time-compare] These ExportField values select public TUI controls, not secret contents.
             let row_style = if focused { accent_style } else { text_style };
             let line = format!(" {mark} {label}");
             Paragraph::new(line)
@@ -13529,7 +13529,7 @@ impl CassApp {
 
         // Password row (only if encrypt is enabled).
         if state.encrypt && y < inner.y + inner.height {
-            let focused = state.focused == ExportField::Password;
+            let focused = state.focused == ExportField::Password; // ubs:ignore[rust.security.constant-time-compare] This selects the password input field; it does not compare the password.
             let display = if state.password_visible {
                 state.password.clone()
             } else {
@@ -13552,7 +13552,7 @@ impl CassApp {
         // Show timestamps checkbox.
         if y < inner.y + inner.height {
             let mark = if state.show_timestamps { "[x]" } else { "[ ]" };
-            let focused = state.focused == ExportField::ShowTimestamps;
+            let focused = state.focused == ExportField::ShowTimestamps; // ubs:ignore[rust.security.constant-time-compare] ExportField is a public TUI focus enum, not a credential.
             let row_style = if focused { accent_style } else { text_style };
             let line = format!(" {mark} Show timestamps");
             Paragraph::new(line)
@@ -13631,6 +13631,7 @@ impl CassApp {
         if footer_y > y {
             let can_export = state.can_export();
             let export_label = if can_export && state.focused == ExportField::ExportButton {
+                // ubs:ignore[rust.security.constant-time-compare] This public focus enum selects the button label, not an authentication secret.
                 " [EXPORT] "
             } else if can_export {
                 " Enter=Export "
@@ -13638,6 +13639,7 @@ impl CassApp {
                 " (set password) "
             };
             let btn_style = if can_export && state.focused == ExportField::ExportButton {
+                // ubs:ignore[rust.security.constant-time-compare] This public focus enum selects TUI styling, not an authentication secret.
                 selected_style
             } else if can_export {
                 accent_style
@@ -16476,6 +16478,7 @@ impl super::ftui_adapter::Model for CassApp {
                     if text.is_empty() {
                         // Backspace
                         if state.focused == ExportField::Password {
+                            // ubs:ignore[rust.security.constant-time-compare] Public focus enum routes key input; password contents are not compared.
                             state.password_pop();
                         } else if state.focused == ExportField::OutputDir
                             && state.output_dir_editing
@@ -16485,6 +16488,7 @@ impl super::ftui_adapter::Model for CassApp {
                     } else {
                         for c in text.chars() {
                             if state.focused == ExportField::Password {
+                                // ubs:ignore[rust.security.constant-time-compare] Public focus enum routes key input; password contents are not compared.
                                 state.password_push(c);
                             } else if state.focused == ExportField::OutputDir
                                 && state.output_dir_editing
@@ -16515,8 +16519,10 @@ impl super::ftui_adapter::Model for CassApp {
                     // Note: Enter maps to DetailOpened in the key dispatch;
                     // QuerySubmitted is also handled for programmatic sends.
                     if state.focused == ExportField::OutputDir && state.output_dir_editing {
+                        // ubs:ignore[rust.security.constant-time-compare] Public focus enum and edit flag route Enter; no secret is compared.
                         state.toggle_current();
                     } else if state.focused == ExportField::Password {
+                        // ubs:ignore[rust.security.constant-time-compare] Public focus enum routes Enter; password contents are not compared.
                         // Enter in password field = move to next.
                         state.next_field();
                     } else if state.can_export() {

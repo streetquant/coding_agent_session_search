@@ -302,7 +302,7 @@ function invalidateQrScannerSession() {
 }
 
 function isCurrentQrScannerSession(sessionToken) {
-  return sessionToken === activeQrScannerSession;
+  return sessionToken === activeQrScannerSession; // ubs:ignore[javascript.ctcompare.unsafe_secret_compare] Monotonic scanner attempt IDs only cancel stale UI callbacks; they are not authentication tokens.
 }
 
 function clearActiveSessionExpiryTimer() {
@@ -738,7 +738,7 @@ function togglePasswordVisibility() {
   const input = elements.passwordInput;
   const icon = elements.togglePassword.querySelector(".eye-icon");
 
-  if (input.type === "password") {
+  if (input.type === "password") { // ubs:ignore[javascript.ctcompare.unsafe_secret_compare] The public HTML input type controls visibility; no password value is compared.
     input.type = "text";
     icon.textContent = "🙈";
   } else {
@@ -916,7 +916,7 @@ function handleQrError(error) {
  * Handle messages from crypto worker
  */
 function handleWorkerMessage(event) {
-  const payload = event?.data && typeof event.data === "object" ? event.data : null;
+  const payload = event?.data && typeof event.data === "object" ? event.data : null; // ubs:ignore[javascript.ctcompare.unsafe_secret_compare] This compares a JavaScript type tag, not message contents or a secret.
   if (!payload || typeof payload.type !== "string" || payload.type.length === 0) {
     console.warn("Ignoring malformed worker message payload");
     void handleWorkerError(new Error("Malformed worker response"));

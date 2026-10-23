@@ -484,6 +484,11 @@ ubs_delta_gate() {
     fi
     echo "UBS_DELTA_BASE=${base_commit}"
     echo "UBS_DELTA_HEAD=${head_commit}"
+    # The pinned runner starts one process per detected language by default.
+    # Keep its complete rule set and file set, but admit one language at a time
+    # so a mixed Rust/Python/JS/Bash release scan has a bounded process peak.
+    # This is the runner's documented JOBS setting, not a finding filter.
+    echo "UBS_DELTA_RUNNER_JOBS=1"
     if [ "$base_commit" = "$head_commit" ]; then
         echo "UBS_DELTA_NEW=0 (HEAD is the base commit: this branch introduced no finding)"
         return 0
@@ -556,7 +561,7 @@ ubs_delta_gate() {
         echo "UBS_DELTA_BASE_FILES=${#base_files[@]}"
         if [ "${#base_files[@]}" -gt 0 ]; then
             base_scan_json="$base_tree/base.json"
-            ( cd "$base_tree" && UBS_ALLOW_UNVERIFIED_HELPERS=0 bash "$scanner" --module-dir="$modules" --no-auto-update --format=json --ci --save-baseline="$baseline_json" "${base_files[@]}" ) >"$base_scan_json" 2>"$base_tree/base.err"
+            ( cd "$base_tree" && JOBS=1 UBS_ALLOW_UNVERIFIED_HELPERS=0 bash "$scanner" --module-dir="$modules" --no-auto-update --format=json --ci --save-baseline="$baseline_json" "${base_files[@]}" ) >"$base_scan_json" 2>"$base_tree/base.err"
             base_rc=$?
             # The scanner exits non-zero when it finds anything, so the exit
             # code is not a failure signal here: the baseline file is.
@@ -600,7 +605,7 @@ ubs_delta_gate() {
             break
         done
         if [ -n "$control_rel" ]; then
-            ( cd "$base_tree" && UBS_ALLOW_UNVERIFIED_HELPERS=0 bash "$scanner" --module-dir="$modules" --no-auto-update --format=json --ci --baseline="$baseline_json" --new-only --fail-on-warning "$control_rel" ) >"$base_tree/control_clean.json" 2>"$base_tree/control_clean.err"
+            ( cd "$base_tree" && JOBS=1 UBS_ALLOW_UNVERIFIED_HELPERS=0 bash "$scanner" --module-dir="$modules" --no-auto-update --format=json --ci --baseline="$baseline_json" --new-only --fail-on-warning "$control_rel" ) >"$base_tree/control_clean.json" 2>"$base_tree/control_clean.err"
             clean_rc=$?
             cp "$base_tree/$control_rel" "$base_tree/control_rel.orig" || return 1
             # The probe is planted above the file's first #[cfg(test)] or
@@ -636,7 +641,7 @@ planted = [line + "\n" for line in probe_lines]
 target.write_text("".join(lines[:insert_at] + planted + lines[insert_at:]), encoding="utf-8")
 Path(sys.argv[2]).write_text("%d %d\n" % (insert_at + 1, insert_at + len(planted)), encoding="utf-8")
 PYPLANT
-            ( cd "$base_tree" && UBS_ALLOW_UNVERIFIED_HELPERS=0 bash "$scanner" --module-dir="$modules" --no-auto-update --format=json --ci --baseline="$baseline_json" --new-only --fail-on-warning "$control_rel" ) >"$base_tree/control_planted.json" 2>"$base_tree/control_planted.err"
+            ( cd "$base_tree" && JOBS=1 UBS_ALLOW_UNVERIFIED_HELPERS=0 bash "$scanner" --module-dir="$modules" --no-auto-update --format=json --ci --baseline="$baseline_json" --new-only --fail-on-warning "$control_rel" ) >"$base_tree/control_planted.json" 2>"$base_tree/control_planted.err"
             planted_rc=$?
             mv "$base_tree/control_rel.orig" "$base_tree/$control_rel"
             control_clean_json="$base_tree/control_clean.json"
@@ -651,17 +656,17 @@ PYPLANT
         else
             echo "UBS_DELTA_CONTROL=skipped (no production file in the scanned set to control)"
         fi
-        ( cd "$repo_root" && UBS_ALLOW_UNVERIFIED_HELPERS=0 bash "$scanner" --module-dir="$modules" --no-auto-update --format=json --ci --baseline="$baseline_json" --new-only --fail-on-warning "$@" ) >"$delta_json" 2>"${delta_json}.err"
+        ( cd "$repo_root" && JOBS=1 UBS_ALLOW_UNVERIFIED_HELPERS=0 bash "$scanner" --module-dir="$modules" --no-auto-update --format=json --ci --baseline="$baseline_json" --new-only --fail-on-warning "$@" ) >"$delta_json" 2>"${delta_json}.err"
     else
-        ( cd "$repo_root" && UBS_ALLOW_UNVERIFIED_HELPERS=0 bash "$scanner" --module-dir="$modules" --no-auto-update --format=json --ci --fail-on-warning "$@" ) >"$delta_json" 2>"${delta_json}.err"
+        ( cd "$repo_root" && JOBS=1 UBS_ALLOW_UNVERIFIED_HELPERS=0 bash "$scanner" --module-dir="$modules" --no-auto-update --format=json --ci --fail-on-warning "$@" ) >"$delta_json" 2>"${delta_json}.err"
     fi
     delta_rc=$?
     # The JSON delta is the verdict: a text-format delta reports nothing and
     # exits 0, which is exactly the gate that never fails.
     # The verdict is the filtered delta, not the scanner's exit code. The
-    # pinned v5.4.4 meta-runner rejects --exclude-tests, so the rule is
-    # applied gate-side. A finding counts as test code only when Rust itself
-    # does not compile it without `cfg(test)`:
+    # pinned v5.4.4 meta-runner rejects --exclude-tests, so reviewed per-rule
+    # exemptions are applied gate-side. A finding is eligible for an exemption
+    # only when Rust itself does not compile it without `cfg(test)`:
     #   a tests//benches/ path component, a file that is only reachable
     #   through cfg(test)-gated `mod` declarations
     #   (ubs_core.analyzers.cfg_test_only_rust.compute_test_only), or a line
@@ -682,6 +687,7 @@ import json
 import os
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 delta_path = sys.argv[1]
@@ -692,6 +698,37 @@ control_planted_path = sys.argv[5] if len(sys.argv) > 5 else ""
 control_probe_path = sys.argv[6] if len(sys.argv) > 6 else ""
 
 BLOCKING = ("critical", "warning")
+# Only these blocking Rust rules are inapplicable to code that the non-test
+# binary never compiles. Every other rule, including a future rule, remains
+# enforced in tests. Informational findings remain visible as well. The
+# per-rule reasons below are part of the receipt, not a blanket test filter.
+TEST_ONLY_EXEMPTIONS = {
+    "rust.async.lock-unwrap": "A poisoned fixture lock fails the test, not a shipped request.",
+    "rust.collections.clone-in-loop": "Fixture allocation does not affect a production hot path.",
+    "rust.numeric.instant-subtraction": "A bad test clock bound fails the test.",
+    "rust.ownership.panic-macro": "An explicit panic is a test failure or expected failure probe.",
+    "rust.ownership.unreachable-macro": "The sentinel fails its test if the fixture branch is reached.",
+    "rust.ownership.unwrap-expect": "A missing fixture value fails the test.",
+    "rust.panic.assert-macros": "Assertions define the test's expected outcome.",
+    "rust.panic.direct-indexing": "An out-of-range fixture access fails the test.",
+    "rust.parsing.env-var-unwrap": "A missing test environment variable fails the test.",
+    "rust.parsing.parse-unwrap": "An invalid literal fixture fails the test.",
+    "rust.parsing.serde-unwrap": "Invalid fixture JSON fails the test.",
+    "rust.perf.string-alloc-in-loop": "Test-only rendering and setup are not production hot paths.",
+    "rust.security.archive-entry-path": "Test fixture traversal stacks hold adversarial paths, not extraction sinks.",
+    "rust.security.constant-time-compare": "Test assertions have no deployed timing oracle; current values are fixture labels or local round-trip bytes.",
+    "rust.security.path-traversal": "Test fixture joins and symlinks have no shipped untrusted path sink.",
+}
+# Pinned UBS 5.4.4's Python lifecycle analyzer is intraprocedural and its
+# registry findings bypass the source suppression parser. These three retained
+# workers have explicit kill/wait ownership in their callers or close methods.
+# Admit only the reviewed assignment and same-line rule-specific marker; all
+# other Python lifecycle findings remain blocking.
+PYTHON_POPEN_SITES = {
+    "scripts/cass_lexical_ipc.py": "self.process",
+    "scripts/benchmark_lexical_admission.py": "self.proc",
+    "scripts/benchmark_lexical_ipc.py": "process",
+}
 MOD_TESTS_RE = re.compile(r"^\s*mod tests(\s|\{|;|$)")
 INCLUDE_RE = re.compile(r'include!\s*\(\s*"([^"]+)"')
 SKIP_DIRS = {".git", "target", ".local-state", "node_modules", "vendor", ".venv"}
@@ -960,21 +997,51 @@ def load_findings(path):
     return doc.get("findings") or []
 
 
+def reviewed_python_popen(item):
+    if (finding_rule(item) != "python.lifecycle.popen_handle"
+            or finding_severity(item) not in BLOCKING):
+        return False
+    path = finding_path(item).replace("\\", "/")
+    for relative, binding in PYTHON_POPEN_SITES.items():
+        if path != relative and not path.endswith("/" + relative):
+            continue
+        line_no = finding_line(item)
+        if line_no <= 0:
+            return False
+        try:
+            lines = (repo_root / relative).read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return False
+        if line_no > len(lines):
+            return False
+        line = lines[line_no - 1]
+        return (f"{binding} = subprocess.Popen(" in line
+                and "ubs:ignore[python.lifecycle.popen_handle]" in line
+                and finding_message(item) ==
+                f"subprocess handle {binding} never waited/terminated")
+    return False
+
+
 def classify(findings, test_only):
     excluded = []
-    production = []
+    enforced = []
     upstream_excluded = []
+    python_site_excluded = []
     for item in findings:
         path = finding_path(item)
         lang = (item.get("lang") or "").lower()
         rust = lang == "rust" or path.endswith(".rs")
         if rust and is_test_line_upstream(path, finding_line(item), test_only):
             upstream_excluded.append(item)
-        if rust and is_test_line(path, finding_line(item), test_only):
+        if (rust and is_test_line(path, finding_line(item), test_only)
+                and finding_severity(item) in BLOCKING
+                and finding_rule(item) in TEST_ONLY_EXEMPTIONS):
             excluded.append(item)
+        elif reviewed_python_popen(item):
+            python_site_excluded.append(item)
         else:
-            production.append(item)
-    return excluded, production, upstream_excluded
+            enforced.append(item)
+    return excluded, enforced, upstream_excluded, python_site_excluded
 
 
 universe = repo_rust_files(repo_root)
@@ -1021,13 +1088,30 @@ findings = doc.get("findings") or []
 totals = doc.get("totals") or {}
 status = doc.get("status")
 failed_modules = doc.get("failed_modules") or []
-excluded, production, upstream_excluded = classify(findings, test_only)
-blocking = [item for item in production if finding_severity(item) in BLOCKING]
+excluded, enforced, upstream_excluded, python_site_excluded = classify(findings, test_only)
+blocking = [item for item in enforced if finding_severity(item) in BLOCKING]
+if len(python_site_excluded) > len(PYTHON_POPEN_SITES):
+    print("gate: Python lifecycle waiver matched more findings than reviewed sites")
+    sys.exit(3)
+for relative, binding in PYTHON_POPEN_SITES.items():
+    unmarked_probe = {
+        "rule": "python.lifecycle.popen_handle", "severity": "warning",
+        "path": relative, "line": 1,
+        "message": f"subprocess handle {binding} never waited/terminated",
+    }
+    if reviewed_python_popen(unmarked_probe):
+        print("gate: Python lifecycle waiver admitted an unmarked site in %s" % relative)
+        sys.exit(3)
 print("UBS_DELTA_NEW=%d critical=%s warning=%s info=%s" % (
     len(findings), totals.get("critical", 0), totals.get("warning", 0), totals.get("info", 0)))
-print("UBS_DELTA_TEST_EXCLUDED=%d (test-only file or #[cfg(test)] region, rust only)" % len(excluded))
+print("UBS_DELTA_TEST_EXCLUDED=%d (reviewed blocking rules in test-only Rust code)" % len(excluded))
+print("UBS_DELTA_PYTHON_SITE_EXCLUDED=%d (three reviewed retained-worker ownership sites)" % len(python_site_excluded))
+print("UBS_DELTA_PYTHON_SITE_CONTROL=unmarked same-file findings remain blocking")
 print("UBS_DELTA_UPSTREAM_TEST_EXCLUDED=%d (upstream --exclude-tests boundary rule, for the win/lose split)" % len(upstream_excluded))
-print("UBS_DELTA_PRODUCTION_BLOCKING=%d" % len(blocking))
+print("UBS_DELTA_ENFORCED_BLOCKING=%d" % len(blocking))
+for rule, count in sorted(Counter(finding_rule(item) for item in excluded).items()):
+    print("UBS_DELTA_TEST_RULE_EXEMPT=%s count=%d reason=%s" % (
+        rule, count, TEST_ONLY_EXEMPTIONS[rule]))
 upstream_only = [item for item in upstream_excluded if item not in excluded]
 print("UBS_DELTA_UPSTREAM_ONLY=%d (findings upstream --exclude-tests would drop that this gate keeps)" % len(upstream_only))
 for item in upstream_only[:50]:
@@ -1035,6 +1119,9 @@ for item in upstream_only[:50]:
         finding_rule(item), finding_path(item), finding_line(item), finding_severity(item)))
 for item in excluded[:20]:
     print("UBS_DELTA_TEST_EXCLUDED_FINDING=%s | %s:%s | %s" % (
+        finding_rule(item), finding_path(item), finding_line(item), finding_severity(item)))
+for item in python_site_excluded:
+    print("UBS_DELTA_PYTHON_SITE_EXCLUDED_FINDING=%s | %s:%s | %s | reason=retained worker has explicit kill/wait cleanup" % (
         finding_rule(item), finding_path(item), finding_line(item), finding_severity(item)))
 for item in blocking[:50]:
     print("UBS_DELTA_FINDING=%s | %s:%s | %s | %s" % (
@@ -1053,10 +1140,10 @@ if control_clean_path and control_planted_path:
     if clean_findings is None or planted_findings is None:
         print("gate: UBS delta control findings could not be read")
         sys.exit(3)
-    clean_excluded, clean_production, _ = classify(clean_findings, test_only)
-    planted_excluded, planted_production, _ = classify(planted_findings, test_only)
-    clean_blocking = [item for item in clean_production if finding_severity(item) in BLOCKING]
-    planted_blocking = [item for item in planted_production if finding_severity(item) in BLOCKING]
+    clean_excluded, clean_enforced, _, _ = classify(clean_findings, test_only)
+    planted_excluded, planted_enforced, _, _ = classify(planted_findings, test_only)
+    clean_blocking = [item for item in clean_enforced if finding_severity(item) in BLOCKING]
+    planted_blocking = [item for item in planted_enforced if finding_severity(item) in BLOCKING]
     clean_verdict = 1 if clean_blocking else 0
     planted_verdict = 1 if planted_blocking else 0
     print("UBS_DELTA_CONTROL_VERDICT=clean=%d planted=%d (clean_new=%d planted_new=%d)" % (

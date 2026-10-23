@@ -119,13 +119,17 @@ def run_client(command, timeout):
 
 
 def start_native(cass, index, timeout):
-    process = subprocess.Popen(
+    process = subprocess.Popen(  # ubs:ignore[python.lifecycle.popen_handle] Callers finish or clean up this worker; setup failures also kill and wait below.
         [cass, "serve", "--stdio", "--index", str(index),
          "--request-timeout-ms", str(int(timeout * 1000))],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         start_new_session=True)
-    os.set_blocking(process.stdin.fileno(), False)
-    os.set_blocking(process.stdout.fileno(), False)
+    try:
+        os.set_blocking(process.stdin.fileno(), False)
+        os.set_blocking(process.stdout.fileno(), False)
+    except BaseException:
+        cleanup(process)
+        raise
     return process
 
 

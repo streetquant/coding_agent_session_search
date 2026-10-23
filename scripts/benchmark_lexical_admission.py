@@ -53,28 +53,31 @@ class Service:
         self.stderr = tempfile.TemporaryFile()
         self.cpu_before = child_cpu()
         self.started = time.perf_counter()
-        try:
-            self.proc = subprocess.Popen(
-                [str(binary), 'serve', '--stdio', '--index', str(index),
-                 '--request-timeout-ms', str(max(1, min(300_000, int(timeout * 1000))))],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr,
-            )
-        except BaseException:
-            self.stderr.close()
-            raise
         self.timeout = timeout
         self.sequence = 0
         self.pending = bytearray()
         self.closed = False
-        self.selector = selectors.DefaultSelector()
-        assert self.proc.stdout is not None
-        self.selector.register(self.proc.stdout, selectors.EVENT_READ)
+        self.selector = None
+        self.proc = None
         try:
+            self.selector = selectors.DefaultSelector()
+            self.proc = subprocess.Popen(  # ubs:ignore[python.lifecycle.popen_handle] Service.close waits or kills this worker; constructor failures now take the same close path.
+                [str(binary), 'serve', '--stdio', '--index', str(index),
+                 '--request-timeout-ms', str(max(1, min(300_000, int(timeout * 1000))))],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr,
+            )
+            assert self.proc.stdout is not None
+            self.selector.register(self.proc.stdout, selectors.EVENT_READ)
             ready, _ = self.request('status')
             if ready.get('ok') is not True:
                 raise RuntimeError(f'service status failed: {ready}')
         except BaseException:
-            self.close(check=False)
+            if self.proc is not None:
+                self.close(check=False)
+            else:
+                if self.selector is not None:
+                    self.selector.close()
+                self.stderr.close()
             raise
 
     def request(self, op: str, **fields: Any) -> tuple[dict[str, Any], dict[str, Any]]:

@@ -439,7 +439,7 @@ class Owner:
                 # Only this root capability crosses exec; the guard's other
                 # descriptors and the owner's socket/lock remain private.
                 root_fd = self.guard.nodes[0][0]
-                self.process = subprocess.Popen(
+                self.process = subprocess.Popen(  # ubs:ignore[python.lifecycle.popen_handle] Owner.search catches failures and Owner.close kills, waits, and closes this retained worker.
                     [self.cass, "serve", "--stdio", "--index",
                      f"/proc/self/fd/{root_fd}",
                      "--request-timeout-ms", str(int(self.timeout * 1000))],

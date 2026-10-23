@@ -1056,6 +1056,7 @@ pub fn deduplicate_probe_results(
                     _ => 0,
                 };
                 if a_sessions != b_sessions {
+                    // ubs:ignore[rust.security.constant-time-compare] These are public indexed-session counts used only to sort source rows.
                     return b_sessions.cmp(&a_sessions);
                 }
 
