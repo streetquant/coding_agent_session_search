@@ -5167,8 +5167,7 @@ fn gh441_801_segment_query_fuel_boundary_and_incremental_repair() {
 /// proven with clock injection in the engine's own suite
 /// (`later_publications_do_not_postpone_a_receipted_retirement`,
 /// `retired_merge_inputs_are_reclaimed_while_an_older_reader_keeps_working`);
-/// `gh453_gc_reclaims_folded_segments_after_the_grace_period` (ignored)
-/// waits it out against the real binary.
+/// The two `gh453_gc_reclaims_*` tests also wait it out against the real binary.
 #[test]
 fn gh453_back_to_back_runs_report_retired_segments_and_size_headroom_from_live_bytes() {
     let tmp = TempDir::new().unwrap();
@@ -5177,7 +5176,7 @@ fn gh453_back_to_back_runs_report_retired_segments_and_size_headroom_from_live_b
     fs::create_dir_all(&data_dir).unwrap();
     let codex_root = home.join(".codex");
 
-    let snapshot = gh453_run_rounds(home, &data_dir, &codex_root, 3);
+    let snapshot = gh453_run_rounds(home, &data_dir, &codex_root, 3, |_| {});
     assert!(
         snapshot.segment_files > snapshot.live_segments,
         "folded inputs must still be on disk after back-to-back runs: {snapshot:?}"
@@ -5209,7 +5208,7 @@ fn gh453_back_to_back_runs_report_retired_segments_and_size_headroom_from_live_b
     assert!(retired_note.contains("cass index --gc"), "{retired_note}");
 
     // `cass index --gc` inside the grace period: a truthful no-op report.
-    let gc = base_cmd(home)
+    let gc = gh453_cmd(home)
         .current_dir(home)
         .args(["index", "--gc", "--json", "--data-dir"])
         .arg(&data_dir)
@@ -5242,14 +5241,14 @@ fn gh453_back_to_back_runs_report_retired_segments_and_size_headroom_from_live_b
     );
 
     // The flag is exclusive with a real run and refuses without an index.
-    let conflict = base_cmd(home)
+    let conflict = gh453_cmd(home)
         .current_dir(home)
         .args(["index", "--gc", "--full", "--data-dir"])
         .arg(&data_dir)
         .output()
         .expect("conflicting flags");
     assert!(!conflict.status.success());
-    let missing = base_cmd(home)
+    let missing = gh453_cmd(home)
         .current_dir(home)
         .args(["index", "--gc", "--json", "--data-dir"])
         .arg(home.join("no_such_data_dir"))
@@ -5270,21 +5269,23 @@ fn gh453_back_to_back_runs_report_retired_segments_and_size_headroom_from_live_b
 
 /// GH #453, the slow half: with the grace period elapsed, `cass index --gc`
 /// unlinks every folded input and the live figure equals the directory.
-/// Ignored because it sleeps past the engine's 300 s grace; run with
-/// `cargo test --test cli_index gh453_gc_reclaims -- --ignored --nocapture`.
+/// This exercises the shipped 300 s window without clock or grace overrides.
+#[cfg(unix)]
 #[test]
-#[ignore = "sleeps past the engine's 300 s garbage grace period"]
 fn gh453_gc_reclaims_folded_segments_after_the_grace_period() {
     gh453_assert_reclamation_after_grace(false);
 }
 
 /// Later publications must not restart the grace clock for older retirements.
+/// A reader mapped before the merge must still search its original segments
+/// after the sweep unlinks them.
+#[cfg(unix)]
 #[test]
-#[ignore = "sleeps past the engine's 300 s garbage grace period"]
 fn gh453_gc_reclaims_despite_publication_during_the_grace_period() {
     gh453_assert_reclamation_after_grace(true);
 }
 
+#[cfg(unix)]
 fn gh453_assert_reclamation_after_grace(publish_during_grace: bool) {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path();
@@ -5296,7 +5297,29 @@ fn gh453_assert_reclamation_after_grace(publish_during_grace: bool) {
     // segment below the four-segment merge threshold. The quiet control keeps
     // its original three-round fixture.
     let rounds = if publish_during_grace { 2 } else { 3 };
-    let before = gh453_run_rounds(home, &data_dir, &codex_root, rounds);
+    let mut pinned = None;
+    let before = gh453_run_rounds(home, &data_dir, &codex_root, rounds, |index_dir| {
+        if publish_during_grace {
+            let manifest =
+                frankensearch::quill::load_manifest_pair(index_dir).expect("fragmented manifest");
+            let paths: Vec<_> = manifest
+                .manifest
+                .segments
+                .iter()
+                .map(|segment| index_dir.join(format!("seg-{:016x}.fslx", segment.segment_id)))
+                .collect();
+            let reader = coding_agent_search::search::quill_bridge::open_cass_reader(index_dir)
+                .expect("pin the fragmented generation before the merge");
+            let hits = gh453_pinned_hits(&reader);
+            assert_eq!(
+                hits.len(),
+                16,
+                "the pinned reader serves both messages from every seed session"
+            );
+            assert!(paths.iter().all(|path| path.is_file()));
+            pinned = Some((reader, hits, paths));
+        }
+    });
     assert!(before.retired_segment_files > 0, "{before:?}");
     eprintln!("gh453: before grace: {before:?}");
     let grace_start = std::time::Instant::now();
@@ -5311,7 +5334,7 @@ fn gh453_assert_reclamation_after_grace(publish_during_grace: bool) {
             "reclaimprobe publication during grace",
         );
         let publication_start = std::time::Instant::now();
-        let run = base_cmd(home)
+        let run = gh453_cmd(home)
             .current_dir(home)
             .args(["index", "--json", "--no-progress-events", "--data-dir"])
             .arg(&data_dir)
@@ -5344,7 +5367,13 @@ fn gh453_assert_reclamation_after_grace(publish_during_grace: bool) {
     };
     std::thread::sleep(std::time::Duration::from_secs(305).saturating_sub(grace_start.elapsed()));
 
-    let gc = base_cmd(home)
+    if let Some((_, _, paths)) = pinned.as_ref() {
+        assert!(
+            paths.iter().all(|path| path.is_file()),
+            "the original mapped segments must still exist immediately before GC: {paths:?}"
+        );
+    }
+    let gc = gh453_cmd(home)
         .current_dir(home)
         .args(["index", "--gc", "--json", "--data-dir"])
         .arg(&data_dir)
@@ -5372,9 +5401,27 @@ fn gh453_assert_reclamation_after_grace(publish_during_grace: bool) {
         gc_json["reclaimed_files"].as_u64().unwrap_or(0) >= before.retired_segment_files,
         "{gc_json}"
     );
+    assert_eq!(gc_json["grace_secs"], 300, "{gc_json}");
+
+    if let Some((reader, hits, paths)) = pinned {
+        assert!(
+            paths.iter().all(|path| !path.exists()),
+            "every original segment must actually have been reclaimed: {paths:?}"
+        );
+        assert_eq!(
+            gh453_pinned_hits(&reader),
+            hits,
+            "the retained reader must execute and hydrate from its unlinked mappings"
+        );
+        eprintln!(
+            "gh453: retained_reader_hits={} reclaimed_original_segments={}",
+            hits.len(),
+            paths.len()
+        );
+    }
 
     // Search still answers over the consolidated generation.
-    let search = base_cmd(home)
+    let search = gh453_cmd(home)
         .current_dir(home)
         .args([
             "search",
@@ -5391,8 +5438,9 @@ fn gh453_assert_reclamation_after_grace(publish_during_grace: bool) {
         .expect("search after gc");
     assert!(search.status.success());
     let hits: serde_json::Value = serde_json::from_slice(&search.stdout).expect("search json");
-    assert!(
-        hits["hits"].as_array().is_some_and(|hits| hits.len() >= 3),
+    assert_eq!(
+        hits["hits"].as_array().map(Vec::len),
+        Some(2 * (8 + rounds + usize::from(publish_during_grace))),
         "{hits}"
     );
     if publish_during_grace {
@@ -5407,6 +5455,55 @@ fn gh453_assert_reclamation_after_grace(publish_during_grace: bool) {
             "the intervening publication must remain searchable after GC: {hits}"
         );
     }
+}
+
+#[cfg(unix)]
+fn gh453_pinned_hits(
+    reader: &frankensearch::quill::QuillSearchIndex,
+) -> std::collections::BTreeMap<String, String> {
+    use coding_agent_search::search::quill_bridge::{
+        QuillCassFields, search_paginated, stored_text,
+    };
+    let parser = frankensearch::quill::query::CassQueryParser::new(
+        frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
+    )
+    .expect("CASS query parser");
+    let query = parser.parse(
+        "reclaimprobe",
+        &frankensearch::quill::query::CassQueryFilters::default(),
+    );
+    let page = search_paginated(reader, &query.query, 100, 0, true)
+        .expect("execute the retained reader without a refresh or query-result cache");
+    assert_eq!(page.total_count, Some(page.hits.len()));
+    page.hits
+        .into_iter()
+        .map(|hit| {
+            // CASS indexes full content without storing it. Production readers
+            // hydrate this stored preview, which holds each short fixture in full.
+            let preview = stored_text(
+                reader,
+                QuillCassFields::compiled().preview,
+                hit.global_docid,
+            )
+            .expect("hydrate the retained mapping")
+            .expect("stored seed preview");
+            assert!(preview.starts_with("reclaimprobe seed "), "{preview}");
+            (hit.document_id, preview)
+        })
+        .collect()
+}
+
+fn gh453_cmd(home: &std::path::Path) -> Command {
+    let mut command = base_cmd(home);
+    command
+        .env_remove("CASS_DB_PATH")
+        .env_remove("CASS_DATA_DIR")
+        .env_remove("CASS_ROBOT_FORMAT")
+        .env("CASS_CLOUDMCP_DATA_ROOT", home.join("cloudmcp-empty"))
+        .env("CASS_OPENWEBUI_DATA_ROOT", home.join("openwebui-empty"))
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("CASS_AUTO_REFRESH", "0");
+    command
 }
 
 #[derive(Debug)]
@@ -5434,6 +5531,7 @@ fn gh453_run_rounds(
     data_dir: &std::path::Path,
     codex_root: &std::path::Path,
     rounds: usize,
+    before_incremental: impl FnOnce(&std::path::Path),
 ) -> Gh453Snapshot {
     for n in 0..8 {
         make_codex_session(
@@ -5443,7 +5541,7 @@ fn gh453_run_rounds(
             &format!("reclaimprobe seed {n}"),
         );
     }
-    let fragment = base_cmd(home)
+    let fragment = gh453_cmd(home)
         .current_dir(home)
         .args([
             "index",
@@ -5478,6 +5576,9 @@ fn gh453_run_rounds(
         fragmented.live_segments >= 8,
         "the planted build must be fragmented: {fragmented:?}"
     );
+    before_incremental(&coding_agent_search::search::tantivy::expected_index_dir(
+        data_dir,
+    ));
 
     for round in 0..rounds {
         make_codex_session(
@@ -5486,7 +5587,7 @@ fn gh453_run_rounds(
             &format!("rollout-453-round-{round}.jsonl"),
             &format!("reclaimprobe round {round}"),
         );
-        let run = base_cmd(home)
+        let run = gh453_cmd(home)
             .current_dir(home)
             .args(["index", "--json", "--no-progress-events", "--data-dir"])
             .arg(data_dir)
@@ -5519,7 +5620,7 @@ fn gh453_snapshot(home: &std::path::Path, data_dir: &std::path::Path) -> Gh453Sn
         .map(|metadata| metadata.len())
         .sum();
 
-    let out = base_cmd(home)
+    let out = gh453_cmd(home)
         .current_dir(home)
         .args(["doctor", "--check", "--json", "--data-dir"])
         .arg(data_dir)
