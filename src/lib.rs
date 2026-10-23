@@ -23074,9 +23074,12 @@ fn state_meta_json_inner(
     // likewise metadata-only and survives the writer process, so status and
     // health can report the last CASS-owned consolidation without opening the
     // engine or inventing a timestamp for an older index.
+    let quill_manifest = crate::search::quill_bridge::manifest_live_doc_count(&index_path);
+    let lexical_manifest_source = quill_manifest.map(|manifest| {
+        crate::search::quill_bridge::manifest_source_token(manifest.manifest_source)
+    });
     let lexical_segment_count: Option<u64> = if lexical.exists {
-        crate::search::quill_bridge::manifest_live_doc_count(&index_path)
-            .map(|manifest| u64::try_from(manifest.segments).unwrap_or(u64::MAX))
+        quill_manifest.map(|manifest| u64::try_from(manifest.segments).unwrap_or(u64::MAX))
     } else {
         None
     };
@@ -23394,6 +23397,23 @@ fn state_meta_json_inner(
                 "reason": lexical_repair_deferred_reason,
             }),
         );
+    }
+    // A reader may serve MANIFEST.prev even while the current slot is absent.
+    // Report that authority independently of the current-file existence probe.
+    if let Some(source) = lexical_manifest_source
+        && let Some(index) = state
+            .get_mut("index")
+            .and_then(|value| value.as_object_mut())
+    {
+        index.insert("manifest_source".to_string(), serde_json::json!(source));
+        if let Some(reason) = manifest_previous_health_error(Some(source)) {
+            index.insert(
+                "status".to_string(),
+                serde_json::json!("recovered_previous"),
+            );
+            index.insert("reason".to_string(), serde_json::json!(reason));
+            index.insert("fresh".to_string(), serde_json::json!(false));
+        }
     }
     // #441: expose the live segment and merge-pressure evidence once a
     // published Quill index exists.  Keeping these fields absent for an
@@ -32286,6 +32306,13 @@ fn execute_search_operation(
     };
     mode_meta.lexical_degrade_reason = client.lexical_degrade_reason();
     mode_meta.wildcard_fallback_skipped = client.wildcard_fallback_skipped_reason();
+    mode_meta.manifest_source = client.lexical_manifest_source().map_err(|error| CliError {
+        code: 9,
+        kind: CliErrorKind::Search.kind_str(),
+        message: format!("failed to inspect the searched lexical manifest authority: {error}"),
+        hint: Some("Retry the search with a readable lexical publication.".to_string()),
+        retryable: true,
+    })?;
     Ok((result, mode_meta))
 }
 
@@ -36708,6 +36735,8 @@ struct SearchModeMeta {
     /// `long_query_term`), or kept its own hits because the retry ran out of
     /// query fuel (`query_fuel_exhausted`, 7hvlg).
     wildcard_fallback_skipped: Option<&'static str>,
+    /// Durable manifest slot retained by the lexical reader used for this query.
+    manifest_source: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36840,6 +36869,7 @@ impl SearchModeMeta {
             semantic_work_completed: true,
             lexical_degrade_reason: None,
             wildcard_fallback_skipped: None,
+            manifest_source: None,
         }
     }
 
@@ -38158,6 +38188,7 @@ fn output_robot_results(
                     "refinement_level": search_mode_meta.realized_refinement(),
                     "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
                     "lexical_degrade_reason": search_mode_meta.lexical_degrade_reason,
+                    "manifest_source": search_mode_meta.manifest_source,
                     "wildcard_fallback": result.wildcard_fallback,
                     "wildcard_fallback_skipped": search_mode_meta.wildcard_fallback_skipped,
                     "cache_stats": {
@@ -38317,6 +38348,7 @@ fn output_robot_results(
                         "refinement_level": search_mode_meta.realized_refinement(),
                         "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
                     "lexical_degrade_reason": search_mode_meta.lexical_degrade_reason,
+                        "manifest_source": search_mode_meta.manifest_source,
                         "wildcard_fallback": result.wildcard_fallback,
                         "wildcard_fallback_skipped": search_mode_meta.wildcard_fallback_skipped,
                         "cache_stats": {
@@ -38545,6 +38577,7 @@ fn output_robot_results(
                     "refinement_level": search_mode_meta.realized_refinement(),
                     "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
                     "lexical_degrade_reason": search_mode_meta.lexical_degrade_reason,
+                    "manifest_source": search_mode_meta.manifest_source,
                     "wildcard_fallback": result.wildcard_fallback,
                     "wildcard_fallback_skipped": search_mode_meta.wildcard_fallback_skipped,
                     "tokens_estimated": tokens_estimated,
@@ -38729,6 +38762,7 @@ fn output_robot_results(
                     "refinement_level": search_mode_meta.realized_refinement(),
                     "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
                     "lexical_degrade_reason": search_mode_meta.lexical_degrade_reason,
+                    "manifest_source": search_mode_meta.manifest_source,
                     "wildcard_fallback": result.wildcard_fallback,
                     "wildcard_fallback_skipped": search_mode_meta.wildcard_fallback_skipped,
                     "tokens_estimated": tokens_estimated,
@@ -87659,6 +87693,11 @@ fn run_status(
         .and_then(|i| i.get("hollow"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let manifest_previous_error = manifest_previous_health_error(
+        state
+            .pointer("/index/manifest_source")
+            .and_then(serde_json::Value::as_str),
+    );
     let index_age_secs = state
         .get("index")
         .and_then(|i| i.get("age_seconds"))
@@ -87781,6 +87820,9 @@ fn run_status(
         .map(str::to_string);
     let live_integrity_corrupt = db_integrity == "corrupt";
     let mut warnings = Vec::<String>::new();
+    if let Some(error) = manifest_previous_error {
+        warnings.push(error.to_string());
+    }
     if let Some(error) = &ingest_quarantine_state_error {
         warnings.push(format!(
             "the structured ingest quarantine checkpoint is malformed or unreadable: {error}"
@@ -87835,6 +87877,7 @@ fn run_status(
         && db_available
         && index_exists
         && index_fresh
+        && manifest_previous_error.is_none()
         && !rebuild_active
         && !index_empty_with_messages
         && !ingest_quarantine_critical
@@ -87886,6 +87929,8 @@ fn run_status(
         Some("Run 'cass index --full' to create the database".to_string())
     } else if !db_available {
         Some("Run 'cass doctor check --json' before any repair; indexing will not replace an unreadable canonical database".to_string())
+    } else if manifest_previous_error.is_some() {
+        Some(MANIFEST_PREVIOUS_RECOMMENDED_ACTION.to_string())
     } else if !index_exists {
         Some("Run 'cass index --full' to rebuild the search index".to_string())
     } else if index_engine_incompatible {
@@ -89140,6 +89185,20 @@ const HOLLOW_INDEX_HEALTH_ERROR: &str = "index hollow — the published lexical 
 /// for a hollow lexical generation.
 const HOLLOW_INDEX_RECOMMENDED_ACTION: &str = "Run 'cass index' to rebuild the hollow search index from the canonical database (the published generation serves far fewer documents than its completed checkpoint certified; the pre-scan repair rebuilds it, and 'cass index --full' does the same after a full rescan).";
 
+const MANIFEST_PREVIOUS_RECOMMENDED_ACTION: &str = "Run 'cass index' to repair the lexical index: the current MANIFEST slot is missing or corrupt, and readers are serving the previous generation.";
+
+fn manifest_previous_health_error(source: Option<&str>) -> Option<&'static str> {
+    match source {
+        Some("previous_after_corrupt_current") => Some(
+            "index manifest is not the current generation: the current MANIFEST is corrupt, so readers are serving the previous generation; run 'cass index' to repair the current slot",
+        ),
+        Some("previous_after_missing_current") => Some(
+            "index manifest is not the current generation: the current MANIFEST is absent (the crash window between the durable renames), so readers are serving the previous generation; run 'cass index' to repair the current slot",
+        ),
+        _ => None,
+    }
+}
+
 /// Minimal health check (<50ms). Exit 0=healthy, 1=unhealthy.
 /// Designed for agent pre-flight checks before complex operations.
 ///
@@ -89199,6 +89258,11 @@ fn run_health(
         .and_then(|i| i.get("hollow"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let manifest_previous_error = manifest_previous_health_error(
+        state
+            .pointer("/index/manifest_source")
+            .and_then(serde_json::Value::as_str),
+    );
     let rebuild_active = state
         .get("rebuild")
         .and_then(|r| r.get("active"))
@@ -89292,6 +89356,7 @@ fn run_health(
         && db_opened
         && index_exists
         && index_fresh
+        && manifest_previous_error.is_none()
         && !rebuild_active
         && !index_empty_with_messages
         && !ingest_quarantine_critical
@@ -89320,6 +89385,8 @@ fn run_health(
         // b4uax: mirror run_status — a legacy Tantivy generation needs the
         // one-time full rebuild, and an incremental refresh cannot help.
         Some("Run 'cass index --full' to rebuild the search index for the current engine (a legacy Tantivy generation was found; one-time full lexical rebuild, cost scales with message count).".to_string())
+    } else if manifest_previous_error.is_some() {
+        Some(MANIFEST_PREVIOUS_RECOMMENDED_ACTION.to_string())
     } else if index_hollow {
         // GH #457: mirror run_status — name the repair, not the generic
         // stale advice, so the operator knows why the run will rebuild.
@@ -89336,6 +89403,9 @@ fn run_health(
 
     // Collect structured errors for the JSON response.
     let mut errors: Vec<String> = Vec::new();
+    if let Some(error) = manifest_previous_error {
+        errors.push(error.to_string());
+    }
     if let Some(ref err) = db_open_error {
         errors.push(err.clone());
     }
@@ -89567,6 +89637,9 @@ fn run_health(
             println!("  - {HOLLOW_INDEX_HEALTH_ERROR}");
         } else if index_exists && !index_fresh {
             println!("  - index stale");
+        }
+        if let Some(error) = manifest_previous_error {
+            println!("  - {error}");
         }
         if index_empty_with_messages {
             println!("  - index has 0 documents but database has messages");

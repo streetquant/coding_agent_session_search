@@ -10355,6 +10355,24 @@ fn filters_fingerprint(filters: &SearchFilters) -> String {
 }
 
 impl SearchClient {
+    /// Manifest slot of this client's retained single-directory reader.
+    ///
+    /// This reads the pinned engine snapshot, never the current filesystem
+    /// slot. Federated and semantic-only clients have no single slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reader cannot attest its retained publication.
+    pub fn lexical_manifest_source(&self) -> Result<Option<&'static str>> {
+        self.reader
+            .get()
+            .map(|(reader, _)| {
+                crate::search::quill_bridge::reader_manifest_source(&reader)
+                    .map(crate::search::quill_bridge::manifest_source_token)
+            })
+            .transpose()
+    }
+
     /// Return the total number of indexed Tantivy documents.
     pub fn total_docs(&self) -> usize {
         if let Some((reader, _)) = self.reader.get() {

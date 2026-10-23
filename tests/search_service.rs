@@ -790,3 +790,322 @@ fn binary_refinement_opt_in_is_lazy_and_mcp_rejects_invalid_work_before_access()
     }
     Ok(())
 }
+
+// GH501 constructs the canonical archive and two distinct publications directly.
+// No connector scan, model acquisition, or host session history is involved.
+fn gh501_manifest_fixture(root: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use coding_agent_search::search::tantivy::{TantivyIndex, expected_index_dir};
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+    use frankensearch::quill::cass::CassDocument;
+    use serde_json::json;
+
+    let storage = FrankenStorage::open(&root.join("agent_search.db"))?;
+    let agent = storage.ensure_agent(&Agent {
+        id: None,
+        slug: "codex".into(),
+        name: "Codex".into(),
+        version: None,
+        kind: AgentKind::Cli,
+    })?;
+    let path = expected_index_dir(root);
+    let mut writer = TantivyIndex::open_or_create(&path)?;
+    let now = chrono::Utc::now().timestamp_millis();
+    for ordinal in 0..2 {
+        let source_path = format!("/fixture/manifest-{ordinal}.jsonl");
+        let content = format!("manifestneedle generation {ordinal}");
+        let inserted = storage.insert_conversation_tree(
+            agent,
+            None,
+            &Conversation {
+                id: None,
+                agent_slug: "codex".into(),
+                workspace: None,
+                external_id: Some(format!("gh501-{ordinal}")),
+                title: Some("manifest fixture".into()),
+                source_path: source_path.clone().into(),
+                started_at: Some(now),
+                ended_at: Some(now),
+                approx_tokens: None,
+                metadata_json: json!({}),
+                source_id: "local".into(),
+                origin_host: None,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::Agent,
+                    author: None,
+                    created_at: Some(now),
+                    content: content.clone(),
+                    extra_json: json!({}),
+                    snippets: Vec::new(),
+                }],
+            },
+        )?;
+        writer.add_prebuilt_documents_slice(&[CassDocument {
+            agent: "codex".into(),
+            workspace: None,
+            workspace_original: None,
+            source_path,
+            msg_idx: 0,
+            created_at: Some(now),
+            title: Some("manifest fixture".into()),
+            content,
+            source_id: "local".into(),
+            origin_kind: "local".into(),
+            origin_host: None,
+            conversation_id: Some(inserted.conversation_id),
+        }])?;
+        writer.commit()?;
+    }
+    storage.set_last_indexed_at(now)?;
+    drop(writer);
+    drop(storage);
+    Ok(path)
+}
+
+fn gh501_command(root: &std::path::Path) -> Command {
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+    command
+        .current_dir(root)
+        .env_remove("CASS_DB_PATH")
+        .env_remove("CASS_DATA_DIR")
+        .env_remove("CASS_ROBOT_FORMAT")
+        .env_remove("CASS_QUILL_QUERY_FUEL_BUDGET")
+        .env("HOME", root)
+        .env("XDG_DATA_HOME", root.join(".local/share"))
+        .env("XDG_CONFIG_HOME", root.join(".config"))
+        .env("CODEX_HOME", root.join(".codex"))
+        .env("CASS_CLOUDMCP_DATA_ROOT", root.join("cloudmcp-empty"))
+        .env("CASS_OPENWEBUI_DATA_ROOT", root.join("openwebui-empty"))
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    command
+}
+
+fn gh501_run(mut command: Command, input: &str) -> anyhow::Result<std::process::Output> {
+    use std::io::Read;
+    let mut child = DeadlineChild(
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    let mut stdout = child
+        .0
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("child stdout"))?;
+    let mut stderr = child
+        .0
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("child stderr"))?;
+    let out = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let err = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let mut stdin = child
+        .0
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("child stdin"))?;
+    stdin.write_all(input.as_bytes())?;
+    drop(stdin);
+    let status = child
+        .0
+        .wait_timeout(Duration::from_secs(60))?
+        .ok_or_else(|| anyhow::anyhow!("GH501 child exceeded its deadline"))?;
+    Ok(std::process::Output {
+        status,
+        stdout: out
+            .join()
+            .map_err(|_| anyhow::anyhow!("stdout reader panicked"))??,
+        stderr: err
+            .join()
+            .map_err(|_| anyhow::anyhow!("stderr reader panicked"))??,
+    })
+}
+
+fn gh501_advance_slot(path: &std::path::Path, state: usize) -> anyhow::Result<()> {
+    let manifest = path.join("MANIFEST");
+    match state {
+        0 => {}
+        1 => {
+            let mut bytes = std::fs::read(&manifest)?;
+            let middle = bytes.len() / 2;
+            bytes[middle] ^= 0x80;
+            std::fs::write(manifest, bytes)?;
+        }
+        2 => std::fs::rename(manifest, path.join("MANIFEST.fixture-corrupt"))?,
+        _ => anyhow::bail!("unknown fixture slot state"),
+    }
+    Ok(())
+}
+
+const GH501_SOURCES: [&str; 3] = [
+    "current",
+    "previous_after_corrupt_current",
+    "previous_after_missing_current",
+];
+
+#[test]
+fn gh501_manifest_source_health_and_status_distinguish_all_durable_slots() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = gh501_manifest_fixture(temp.path())?;
+    for (state, source) in GH501_SOURCES.iter().enumerate() {
+        gh501_advance_slot(&path, state)?;
+        let before = std::fs::read(path.join("MANIFEST")).ok();
+        let previous = std::fs::read(path.join("MANIFEST.prev"))?;
+        for operation in ["health", "status"] {
+            let mut command = gh501_command(temp.path());
+            command
+                .args([operation, "--json", "--data-dir"])
+                .arg(temp.path());
+            let output = gh501_run(command, "")?;
+            assert_eq!(
+                output.status.code(),
+                Some(if operation == "health" && state != 0 {
+                    1
+                } else {
+                    0
+                }),
+                "{operation}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            let index = if operation == "health" {
+                &value["state"]["index"]
+            } else {
+                &value["index"]
+            };
+            assert_eq!(index["manifest_source"], *source, "{value}");
+            assert_eq!(value["healthy"], state == 0, "{value}");
+            if state != 0 {
+                assert_eq!(index["status"], "recovered_previous");
+                assert_eq!(index["fresh"], false);
+                assert!(
+                    value["recommended_action"]
+                        .as_str()
+                        .is_some_and(|action| action.contains("cass index"))
+                );
+                let reason = index["reason"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("manifest reason"))?;
+                assert!(
+                    reason.contains(if state == 1 { "corrupt" } else { "absent" }),
+                    "{reason}"
+                );
+                if state == 2 {
+                    assert!(!reason.contains("is corrupt"), "{reason}");
+                }
+            }
+        }
+        assert_eq!(std::fs::read(path.join("MANIFEST")).ok(), before);
+        assert_eq!(std::fs::read(path.join("MANIFEST.prev"))?, previous);
+    }
+    Ok(())
+}
+
+#[test]
+fn gh501_manifest_source_search_robot_formats_report_the_served_generation() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = gh501_manifest_fixture(temp.path())?;
+    for (state, source) in GH501_SOURCES[..2].iter().enumerate() {
+        gh501_advance_slot(&path, state)?;
+        let before = std::fs::read(path.join("MANIFEST"))?;
+        for format in ["json", "jsonl", "compact", "toon"] {
+            let mut command = gh501_command(temp.path());
+            command
+                .args([
+                    "search",
+                    "manifestneedle",
+                    "--mode",
+                    "lexical",
+                    "--robot-meta",
+                    "--no-maintenance",
+                    "--limit",
+                    "10",
+                    "--robot-format",
+                    format,
+                    "--data-dir",
+                ])
+                .arg(temp.path());
+            let output = gh501_run(command, "")?;
+            assert!(
+                output.status.success(),
+                "{format}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if format == "toon" {
+                let text = std::str::from_utf8(&output.stdout)?;
+                assert!(
+                    text.contains(&format!("manifest_source: {source}")),
+                    "{text}"
+                );
+            } else {
+                let text = std::str::from_utf8(&output.stdout)?;
+                let first = if format == "jsonl" {
+                    text.lines().next().unwrap_or_default()
+                } else {
+                    text
+                };
+                let value: serde_json::Value = serde_json::from_str(first)?;
+                assert_eq!(value["_meta"]["manifest_source"], *source, "{value}");
+                if format != "jsonl" {
+                    assert_eq!(
+                        value["hits"].as_array().map(Vec::len),
+                        Some(if state == 0 { 2 } else { 1 }),
+                        "{value}"
+                    );
+                }
+            }
+            assert_eq!(std::fs::read(path.join("MANIFEST"))?, before);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn gh501_manifest_source_serve_reports_all_slots_without_repair() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = gh501_manifest_fixture(temp.path())?;
+    for (state, source) in GH501_SOURCES.iter().enumerate() {
+        gh501_advance_slot(&path, state)?;
+        let before = std::fs::read(path.join("MANIFEST")).ok();
+        let mut command = gh501_command(temp.path());
+        command.args(["serve", "--stdio", "--index"]).arg(&path);
+        let output = gh501_run(
+            command,
+            "{\"op\":\"search\",\"id\":1,\"query\":\"manifestneedle\",\"limit\":10}\n{\"op\":\"status\",\"id\":2}\n",
+        )?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let replies: Vec<serde_json::Value> = std::str::from_utf8(&output.stdout)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0]["ok"], true, "{}", replies[0]);
+        assert_eq!(
+            replies[0]["result"]["count"],
+            if state == 0 { 2 } else { 1 }
+        );
+        for snapshot in [&replies[0]["result"]["snapshot"], &replies[1]["result"]] {
+            assert_eq!(snapshot["manifest_source"], *source, "{snapshot}");
+            assert_eq!(snapshot["snapshot_manifest_source"], *source, "{snapshot}");
+            assert_eq!(snapshot["maintenance_performed"], false);
+        }
+        assert_eq!(std::fs::read(path.join("MANIFEST")).ok(), before);
+    }
+    Ok(())
+}

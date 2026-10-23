@@ -656,9 +656,45 @@ pub struct QuillManifestLiveDocs {
     pub segments: usize,
     /// Monotone publication generation of the MANIFEST that was read.
     pub generation: u64,
-    /// `true` when `MANIFEST` was missing or corrupt and the contents came
-    /// from `MANIFEST.prev` (the engine's own read-only crash recovery).
-    pub recovered_from_previous: bool,
+    /// Durable slot selected by the engine's read-only two-slot recovery.
+    pub manifest_source: frankensearch::quill::ManifestSource,
+}
+
+/// Stable robot token for the manifest authority retained by a Quill reader.
+#[must_use]
+pub const fn manifest_source_token(source: frankensearch::quill::ManifestSource) -> &'static str {
+    use frankensearch::quill::ManifestSource;
+    match source {
+        ManifestSource::Current => "current",
+        ManifestSource::PreviousAfterMissingCurrent => "previous_after_missing_current",
+        ManifestSource::PreviousAfterCorruptCurrent => "previous_after_corrupt_current",
+        ManifestSource::InMemory => "in_memory",
+    }
+}
+
+/// Manifest authority of the immutable snapshot this reader actually retains.
+///
+/// The pinned Quill release exposes reader snapshots through its production
+/// candidate-hydration context. Requesting zero candidates returns that pin
+/// before parsing a query or traversing postings; no file is reopened.
+///
+/// # Errors
+///
+/// Returns an error if Quill cannot supply its typed snapshot pin.
+pub fn reader_manifest_source(
+    reader: &QuillSearchIndex,
+) -> Result<frankensearch::quill::ManifestSource> {
+    let batch = drive(|cx| async move {
+        frankensearch::LexicalRead::search_candidates(reader, &cx, "", 0).await
+    })?;
+    let context = batch
+        .context()
+        .filter(|context| context.backend() == frankensearch::quill::QUILL_LEXICAL_BACKEND)
+        .ok_or_else(|| anyhow!("Quill did not retain a manifest provenance context"))?;
+    let snapshot = context
+        .downcast_ref::<Arc<frankensearch::quill::QuillSearchSnapshot>>()
+        .ok_or_else(|| anyhow!("Quill returned an unsupported manifest provenance pin"))?;
+    Ok(snapshot.keeper_snapshot().loaded_manifest().source)
 }
 
 /// Read [`QuillManifestLiveDocs`] for the Quill index at `path`.
@@ -685,10 +721,7 @@ pub fn manifest_live_doc_count(path: &Path) -> Option<QuillManifestLiveDocs> {
         tombstones,
         segments: manifest.segments.len(),
         generation: manifest.generation,
-        recovered_from_previous: !matches!(
-            loaded.source,
-            frankensearch::quill::ManifestSource::Current
-        ),
+        manifest_source: loaded.source,
     })
 }
 
@@ -3384,7 +3417,10 @@ mod tests {
         assert_eq!(live.sealed_docs, 3);
         assert_eq!(live.tombstones, 0);
         assert!(live.segments >= 1, "a commit seals at least one segment");
-        assert!(!live.recovered_from_previous);
+        assert_eq!(
+            live.manifest_source,
+            frankensearch::quill::ManifestSource::Current
+        );
         assert_eq!(live.live_docs, index.doc_count().expect("engine count"));
 
         index.delete_all().expect("publish the hollow successor");
@@ -3396,6 +3432,69 @@ mod tests {
             "the hollow successor is a later generation"
         );
         assert_eq!(index.doc_count().expect("engine count"), 0);
+    }
+
+    #[test]
+    fn manifest_source_names_current_corrupt_and_missing_slots_without_opening_a_reader() {
+        use frankensearch::quill::ManifestSource;
+
+        let directory = tempfile::tempdir().expect("manifest fixture");
+        let mut writer = QuillCassIndex::open_or_create(directory.path()).expect("writer");
+        writer
+            .add_cass_documents(&[sample("first", 0, "priorneedle")])
+            .expect("first doc");
+        writer.commit().expect("first publish");
+        writer
+            .add_cass_documents(&[sample("second", 0, "currentneedle")])
+            .expect("second doc");
+        writer.commit().expect("second publish");
+        drop(writer);
+
+        let opens = reader_open_count();
+        let current = manifest_live_doc_count(directory.path()).expect("current manifest");
+        assert_eq!(current.live_docs, 2);
+        assert_eq!(manifest_source_token(current.manifest_source), "current");
+        let manifest = directory.path().join("MANIFEST");
+        let mut damaged = std::fs::read(&manifest).expect("manifest bytes");
+        let middle = damaged.len() / 2;
+        damaged[middle] ^= 0x80;
+        std::fs::write(&manifest, &damaged).expect("damage current fixture slot");
+
+        let corrupt = manifest_live_doc_count(directory.path()).expect("previous manifest");
+        assert_eq!(
+            corrupt.manifest_source,
+            ManifestSource::PreviousAfterCorruptCurrent
+        );
+        assert_eq!(
+            manifest_source_token(corrupt.manifest_source),
+            "previous_after_corrupt_current"
+        );
+        assert_eq!(corrupt.live_docs, 1);
+        assert!(corrupt.generation < current.generation);
+        assert_eq!(
+            std::fs::read(&manifest).expect("unchanged corrupt slot"),
+            damaged
+        );
+
+        std::fs::rename(&manifest, directory.path().join("MANIFEST.fixture-corrupt"))
+            .expect("retain fixture slot while simulating crash window");
+        let missing = manifest_live_doc_count(directory.path()).expect("previous after missing");
+        assert_eq!(
+            missing.manifest_source,
+            ManifestSource::PreviousAfterMissingCurrent
+        );
+        assert_eq!(
+            manifest_source_token(missing.manifest_source),
+            "previous_after_missing_current"
+        );
+        assert_eq!(missing.generation, corrupt.generation);
+        assert_eq!(missing.live_docs, 1);
+        assert!(!manifest.exists());
+        assert_eq!(
+            reader_open_count(),
+            opens,
+            "metadata probes never open a reader"
+        );
     }
 
     /// The streaming-ingest fold merges one run per call and then honours the

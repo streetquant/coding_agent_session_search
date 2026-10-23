@@ -85,6 +85,67 @@ fn invalid_requests_and_status_do_not_open_or_create_an_index() -> Result<()> {
 }
 
 #[test]
+fn manifest_source_distinguishes_live_slots_from_the_pinned_snapshot() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("index");
+    let mut writer = index(&path, &[document(1, "manifestneedle prior", "local")])?;
+    writer.add_prebuilt_documents_slice(&[document(2, "manifestneedle current", "local")])?;
+    writer.commit()?;
+    drop(writer);
+    let mut session = Session::new(path.clone());
+    assert!(session.status()["snapshot_manifest_source"].is_null());
+    assert_eq!(search(&mut session, 1, "manifestneedle")["count"], 2);
+    assert_eq!(session.status()["manifest_source"], "current");
+    assert_eq!(session.status()["snapshot_manifest_source"], "current");
+
+    let manifest = path.join("MANIFEST");
+    let mut damaged = std::fs::read(&manifest)?;
+    let middle = damaged.len() / 2;
+    damaged[middle] ^= 0x80;
+    std::fs::write(&manifest, &damaged)?;
+    assert_eq!(
+        session.status()["manifest_source"],
+        "previous_after_corrupt_current"
+    );
+    assert_eq!(session.status()["snapshot_manifest_source"], "current");
+    assert_eq!(search(&mut session, 2, "manifestneedle")["count"], 2);
+
+    let (reply, stopped) = session.handle(request(json!({"op":"reload", "id":3})));
+    assert!(!stopped);
+    assert!(reply.ok, "{reply:?}");
+    assert_eq!(
+        session.status()["snapshot_manifest_source"],
+        "previous_after_corrupt_current"
+    );
+    assert_eq!(search(&mut session, 4, "manifestneedle")["count"], 1);
+    assert_eq!(std::fs::read(&manifest)?, damaged);
+
+    std::fs::rename(&manifest, path.join("MANIFEST.fixture-corrupt"))?;
+    assert_eq!(
+        session.status()["manifest_source"],
+        "previous_after_missing_current"
+    );
+    assert_eq!(
+        session.status()["snapshot_manifest_source"],
+        "previous_after_corrupt_current"
+    );
+    let (reply, _) = session.handle(request(json!({"op":"reload", "id":5})));
+    assert!(reply.ok, "{reply:?}");
+    assert_eq!(
+        session.status()["snapshot_manifest_source"],
+        "previous_after_missing_current"
+    );
+    assert_eq!(search(&mut session, 6, "manifestneedle")["count"], 1);
+    assert!(
+        !manifest.exists(),
+        "readers must not repair the missing current slot"
+    );
+    session.unload();
+    assert!(session.status()["snapshot_manifest_source"].is_null());
+    Ok(())
+}
+
+#[test]
 fn protocol_rejects_unsupported_work_instead_of_silently_downgrading() {
     for value in [
         json!({"op":"search", "id":1, "query":"x", "mode":"semantic"}),

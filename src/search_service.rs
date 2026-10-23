@@ -360,6 +360,7 @@ struct Session {
     canonical_read_attempts: u64,
     canonical_reads_completed: u64,
     client: Option<SearchClient>,
+    snapshot_manifest_source: Option<&'static str>,
     // Declaration/drop order matters: reader destruction precedes lease release.
     reader_lease: Option<admission::Lease>,
     admission_pool: Option<admission::Pool>,
@@ -382,6 +383,7 @@ impl Session {
             canonical_read_attempts: 0,
             canonical_reads_completed: 0,
             client: None,
+            snapshot_manifest_source: None,
             reader_lease: None,
             admission_pool: None,
             open_attempts: 0,
@@ -399,7 +401,9 @@ impl Session {
             };
             self.open_attempts = self.open_attempts.saturating_add(1);
             let client = open_snapshot(&self.index)?;
+            let manifest_source = client.lexical_manifest_source()?;
             self.successful_opens = self.successful_opens.saturating_add(1);
+            self.snapshot_manifest_source = manifest_source;
             self.client = Some(client);
             if lease.is_some() {
                 self.reader_lease = lease;
@@ -421,10 +425,19 @@ impl Session {
         self.refiner.unload();
         self.semantic.unload();
         drop(self.client.take());
+        self.snapshot_manifest_source = None;
         drop(self.reader_lease.take());
     }
 
     fn status(&self) -> Value {
+        let manifest_source = coding_agent_search::search::quill_bridge::manifest_live_doc_count(
+            &self.index,
+        )
+        .map(|manifest| {
+            coding_agent_search::search::quill_bridge::manifest_source_token(
+                manifest.manifest_source,
+            )
+        });
         let memory = self.memory_observation.as_ref().map(|observation| {
             let sample = observation.sample();
             json!({
@@ -453,6 +466,8 @@ impl Session {
             "successful_opens": self.successful_opens,
             "queries_completed": self.queries_completed,
             "snapshot_policy": "pinned_until_reload",
+            "manifest_source": manifest_source,
+            "snapshot_manifest_source": self.snapshot_manifest_source,
             "freshness": "not_checked",
             "canonical_view_enabled": self.archive.is_some(),
             "canonical_database_accessed": self.canonical_read_attempts != 0
