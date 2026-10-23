@@ -58475,7 +58475,7 @@ mod tests {
         let db_path = data_dir.join("agent_search.db");
         std::fs::File::create(&db_path)
             .unwrap()
-            .set_len(300 * 1024 * 1024)
+            .set_len(320 * 1024 * 1024)
             .unwrap();
         let index_path = plant_merged_quill_index(&data_dir, 2);
         let before = lexical_index_footprint(&data_dir);
@@ -58510,8 +58510,13 @@ mod tests {
 
         let projection = full_rebuild_headroom_projection(&data_dir, &db_path);
         assert_eq!(projection.rebuild_staging_bytes, staged);
-        // db(300 MiB)*2 clears the 512 MiB floor even after the 96 MiB credit,
-        // so the requirement is exactly 2*db + 2*live - staging.
+        // db(320 MiB)*2 clears the 512 MiB floor after the 96 MiB credit,
+        // independently of the live index's accumulator/segment layout.
+        assert!(
+            projection.db_bundle_bytes * 2 - staged > INDEX_MIN_FREE_SPACE_BYTES,
+            "the fixture must exercise staging credit above the absolute floor"
+        );
+        // Above the floor, the requirement is exactly 2*db + 2*live - staging.
         assert_eq!(
             projection.required_bytes,
             projection.db_bundle_bytes * 2 + after.live_bytes * 2 - staged

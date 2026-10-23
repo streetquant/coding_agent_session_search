@@ -115,6 +115,9 @@ pub fn is_engine_invariant_failure(error: &anyhow::Error) -> bool {
 /// * `query_fuel_budget` honours [`CASS_QUILL_QUERY_FUEL_BUDGET_ENV`].
 /// * `tier_fanout` disables automatic concat merges that can exceed Quill's
 ///   per-term position limit on the shared historical corpus.
+/// * `max_ingest_shards` is one: CASS's wide schema takes Quill's serial
+///   ingest path. Striping serial batches across CPU-count shards retains
+///   one accumulator budget per shard without creating parallel workers.
 ///
 /// Other settings keep the pinned engine defaults.
 #[must_use]
@@ -123,6 +126,7 @@ pub fn cass_quill_config() -> QuillConfig {
         max_visibility_lag_ms: u64::MAX,
         query_fuel_budget: CASS_QUERY_FUEL_BUDGET,
         tier_fanout: CASS_TIER_FANOUT,
+        max_ingest_shards: 1,
         ..QuillConfig::default()
     };
     if let Some(budget) = query_fuel_budget_override(
@@ -2796,6 +2800,32 @@ mod tests {
             .expect("index documents");
         index.commit().expect("commit");
         assert_eq!(index.doc_count().expect("doc count"), 2);
+    }
+
+    #[test]
+    fn serial_batches_share_one_bounded_accumulator() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open or create");
+        for message in 0..64 {
+            index
+                .add_cass_documents(&[sample("bounded", message, "retained batch content")])
+                .expect("index batch");
+        }
+        index.commit().expect("commit");
+        assert_eq!(index.doc_count().expect("document count"), 64);
+        assert_eq!(
+            index.segment_count(),
+            1,
+            "serial batches below one accumulator budget must not fan out into per-CPU buffers"
+        );
+        assert_eq!(
+            index
+                .reader()
+                .expect("fresh reader")
+                .doc_count()
+                .expect("reader count"),
+            64
+        );
     }
 
     /// Counting documents on a writer reads its verified snapshot. A reader

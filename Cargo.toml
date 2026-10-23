@@ -218,6 +218,11 @@ socket2 = { version = "0.6.5", features = ["all"] }
 [target.'cfg(not(windows))'.dependencies]
 openssl = { version = "0.10.79", features = ["vendored"] }
 
+# The skewed-ingest memory qualification attributes substantial RSS to
+# freed buffers retained by the system allocator between giant batches.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+tikv-jemallocator = "=0.7.0"
+
 # Restores the default SIGPIPE disposition at startup (#356): with Rust's
 # ignore-SIGPIPE default plus the release profile's panic=abort, every stdout
 # write to a closed pipe (`cass ... | head`) became a SIGABRT crash report.

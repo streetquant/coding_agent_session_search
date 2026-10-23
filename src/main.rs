@@ -2,6 +2,10 @@
 // `#[allow(unsafe_code)]` + a SAFETY comment (startup env writes, unavoidable FFI per AGENTS.md).
 #![cfg_attr(not(test), deny(unsafe_code))]
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod codex_layout_cli;
 mod lexical_quarantine_cli;
 mod logical_archive;
