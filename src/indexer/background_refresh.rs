@@ -245,7 +245,15 @@ pub fn last_indexed_at_ms_from_freshness(index_freshness: &serde_json::Value) ->
 /// Read the canonical source-scan watermark without mutating the archive.
 /// Missing/unreadable metadata is unknown, never synthesized as epoch zero.
 pub fn source_scan_completed_at_ms_from_db(db_path: &Path) -> Option<i64> {
-    let storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).ok()?;
+    // This is an optional read-path hint. Ordinary readonly opens may repair
+    // the WAL index or checkpoint a dirty WAL, and may wait 30 seconds for
+    // doctor. Neither is appropriate after a search has already completed.
+    let storage = crate::storage::sqlite::FrankenStorage::open_strict_readonly_with_timeout(
+        db_path,
+        Duration::from_millis(50),
+    )
+    .ok()?;
+    storage.raw().execute("PRAGMA busy_timeout = 0;").ok()?;
     storage
         .get_last_scan_ts()
         .ok()
