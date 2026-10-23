@@ -166,6 +166,15 @@ prepare_compile_inputs() (
     [ "$freshness_rc" -eq 0 ]
 )
 
+run_encoded_remote_script() (
+    set -o pipefail
+    local decoded_script
+    # A truncated gzip stream can print a complete shell command before it
+    # fails its trailer check. Finish decoding successfully before executing.
+    decoded_script="$(printf '%s' "$1" | base64 -d | gzip -d)" || return "$?"
+    bash -c "$decoded_script"
+)
+
 # Exercise the exact receipt parser without admitting a build or substituting
 # tools. The shell regression suite feeds it recorded terminal-output shapes.
 if [ "${1:-}" = --verify-receipt ]; then
@@ -184,6 +193,10 @@ if [ "${1:-}" = --verify-fmt ]; then
 fi
 if [ "${1:-}" = --verify-compile-inputs ]; then
     prepare_compile_inputs "$2" "$3"
+    exit $?
+fi
+if [ "${1:-}" = --verify-remote-payload ]; then
+    run_encoded_remote_script "$2"
     exit $?
 fi
 
@@ -455,6 +468,8 @@ ubs_delta_gate() {
     local base_rc delta_rc clean_rc planted_rc control_rel rel f d
     local control_clean_json="" control_planted_json="" control_probe="" filter_rc
     local fmt_rc rustfmt_bin rustfmt_version
+    local ast_grep_bin ast_grep_version="not-required" ast_grep_sha="not-required"
+    local scanner_sha contract_sha engine_identity
     local -a base_files=() fmt_roots=()
 
     head_commit="$(git rev-parse HEAD 2>/dev/null)" || head_commit="${SOURCE_HEAD:-HEAD}"
@@ -473,6 +488,27 @@ ubs_delta_gate() {
         echo "UBS_DELTA_NEW=0 (HEAD is the base commit: this branch introduced no finding)"
         return 0
     fi
+
+    # Without ast-grep the Rust module silently omits AST rules, including
+    # the unwrap negative control. Refuse partial coverage before caching it.
+    for f in "$@"; do
+        case "$f" in
+            *.rs)
+                ast_grep_bin="$(command -v ast-grep)" || {
+                    echo "gate: Rust UBS coverage requires ast-grep" >&2
+                    return 1
+                }
+                ast_grep_version="$("$ast_grep_bin" --version)" || return 1
+                ast_grep_sha="$(sha256sum "$ast_grep_bin" | cut -d' ' -f1)" || return 1
+                echo "UBS_AST_GREP_VERSION=${ast_grep_version} UBS_AST_GREP_SHA256=${ast_grep_sha}"
+                break
+                ;;
+        esac
+    done
+    scanner_sha="$(sha256sum "$scanner" | cut -d' ' -f1)" || return 1
+    contract_sha="$(sha256sum "$modules/contract.json" | cut -d' ' -f1)" || return 1
+    engine_identity="$(printf '%s\n' "$scanner_sha" "$contract_sha" "$ast_grep_version" "$ast_grep_sha" | sha256sum | cut -d' ' -f1)" || return 1
+    echo "UBS_DELTA_ENGINE_SHA256=${engine_identity}"
 
     # The base tree carries every file the named set had at the base commit.
     # It is unpacked on every run because the negative control below needs it
@@ -499,12 +535,14 @@ ubs_delta_gate() {
     fi
 
     # The baseline depends on the base commit, the named file set and the
-    # rustfmt that normalized the base, and the base moves far less often
+    # rustfmt that normalized the base, and the actual scanner/AST engine.
+    # A baseline from a partial or different engine cannot excuse findings.
+    # The base moves far less often
     # than the branch does. Cache it under the gate's target dir so a
     # repeated admission does not rescan the base.
     rustfmt_version="$("$rustfmt_bin" --version 2>/dev/null)"
     cache_dir="${GATE_UBS_BASELINE_CACHE:-${CARGO_TARGET_DIR:-$repo_root/.local-state}/ubs-baseline}"
-    cache_key="$( { printf '%s\n' "$base_commit" "$rustfmt_version"; printf '%s\n' "$@"; } | sha256sum | cut -d' ' -f1)"
+    cache_key="$( { printf '%s\n' "$base_commit" "$rustfmt_version" "$engine_identity"; printf '%s\n' "$@"; } | sha256sum | cut -d' ' -f1)"
     baseline_json="$cache_dir/$cache_key.json"
     mkdir -p "$cache_dir" 2>/dev/null || true
 
@@ -1196,7 +1234,16 @@ run_once() {
         env CARGO_TARGET_DIR="$TARGET_DIR" RUST_MIN_STACK=134217728 UBS_MODULE_TIMEOUT="$UBS_TIMEOUT" bash -c "$REMOTE_SCRIPT"
         return $?
     fi
-    RCH_REQUIRE_REMOTE=1 rch exec --job --result-dir tests/golden -- env CARGO_TARGET_DIR="$TARGET_DIR" RUST_MIN_STACK=134217728 UBS_MODULE_TIMEOUT="$UBS_TIMEOUT" bash -c "$REMOTE_SCRIPT"
+    # RCH percent-encodes the command into a protocol line capped at 64 KiB.
+    # Compress the same script, including its expected source identity, so
+    # the transport fits without dropping checks or changing their receipts.
+    local payload dispatcher
+    payload="$(printf '%s' "$REMOTE_SCRIPT" | gzip -c | base64 -w0)" || return "$?"
+    dispatcher="$(declare -f run_encoded_remote_script)
+run_encoded_remote_script \"\$1\""
+    echo "REMOTE_SCRIPT_BYTES=${#REMOTE_SCRIPT} REMOTE_PAYLOAD_BYTES=${#payload}"
+    # Retain cargo in argv[0] so RCH keeps its per-worker Cargo cache isolation.
+    RCH_REQUIRE_REMOTE=1 rch exec --job --result-dir tests/golden -- env CARGO_TARGET_DIR="$TARGET_DIR" RUST_MIN_STACK=134217728 UBS_MODULE_TIMEOUT="$UBS_TIMEOUT" bash -c "$dispatcher" cass-cargo-gate "$payload"
 }
 
 # The receipt survives a RED run for post-mortem (GATE_RECEIPT_FILE overrides).

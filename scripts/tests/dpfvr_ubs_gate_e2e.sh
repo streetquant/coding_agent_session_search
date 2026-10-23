@@ -71,6 +71,26 @@ SH
         [ "$fail" -eq 0 ]
         exit $?
     fi
+    # Exercise the production transport decoder with real shell execution.
+    # Decode failures must not execute even a completely emitted command.
+    cat > "$proof_dir/remote-script.sh" <<'REMOTE'
+printf '%s\n' 'quotes: "double", $dollar, `backtick`, \backslash' 'unicode: λ'
+REMOTE
+    bash "$proof_dir/remote-script.sh" > "$proof_dir/remote-script.expected"
+    payload="$(gzip -c < "$proof_dir/remote-script.sh" | base64 -w0)"
+    check_exit remote-payload-roundtrip 0 bash "$gate" --verify-remote-payload "$payload"
+    check_exit remote-payload-literal-output 0 cmp -s "$proof_dir/remote-script.expected" "$proof_dir/remote-payload-roundtrip.log"
+    failure_payload="$(printf 'exit 42\n' | gzip -c | base64 -w0)"
+    check_exit remote-payload-failure 42 bash "$gate" --verify-remote-payload "$failure_payload"
+    printf 'printf executed > %q\n' "$proof_dir/corrupt-payload-executed" > "$proof_dir/remote-side-effect.sh"
+    gzip -c < "$proof_dir/remote-side-effect.sh" > "$proof_dir/remote-side-effect.gz"
+    side_effect_payload="$(base64 -w0 < "$proof_dir/remote-side-effect.gz")"
+    check_exit remote-payload-invalid-base64 1 bash "$gate" --verify-remote-payload "${side_effect_payload}!"
+    check_exit remote-payload-invalid-no-execution 0 test ! -e "$proof_dir/corrupt-payload-executed"
+    truncated_payload="$(head -c -8 "$proof_dir/remote-side-effect.gz" | base64 -w0)"
+    check_exit remote-payload-truncated-gzip 1 bash "$gate" --verify-remote-payload "$truncated_payload"
+    check_exit remote-payload-truncated-no-execution 0 test ! -e "$proof_dir/corrupt-payload-executed"
+
     receipt="$proof_dir/complete.txt"
     cat > "$receipt" <<'RECEIPT'
 STAGE=source-identity EXIT=0
