@@ -71,8 +71,18 @@ pub(super) struct Pool {
 
 #[derive(Debug)]
 pub(super) struct Lease {
-    // Keep the sole handle alive for the entire admitted reader lifetime.
+    // Keep the lock alive for the entire admitted reader lifetime.
     _file: File,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // A concurrently spawned process can inherit a duplicate until exec.
+        // Closing only our handle would leave its shared lock held meanwhile.
+        // Explicitly unlock the open-file description before closing it; File
+        // drop remains the fallback if the filesystem refuses the unlock.
+        let _ = self._file.unlock();
+    }
 }
 
 impl Pool {
@@ -110,14 +120,15 @@ impl Pool {
 
         // Serialize first initialization and policy checking, without ever waiting
         // for another worker. All cooperating workers must agree on the pool size.
-        let mut policy = open_control(&self.path.join("policy-v1"))?;
+        let policy = open_control(&self.path.join("policy-v1"))?;
         lock(&policy)?;
+        let mut policy = Lease { _file: policy };
         let expected = format!("CASS-READER-POOL-1\nslots={}\n", self.slots);
         let mut actual = String::new();
-        (&mut policy).take(513).read_to_string(&mut actual)?;
+        (&mut policy._file).take(513).read_to_string(&mut actual)?;
         if actual.is_empty() {
-            policy.write_all(expected.as_bytes())?;
-            policy.sync_all()?;
+            policy._file.write_all(expected.as_bytes())?;
+            policy._file.sync_all()?;
         } else if actual != expected {
             // A crash-partial policy is not repaired by overwriting it. No reader
             // is admitted until the operator resolves the configuration safely.
@@ -225,6 +236,53 @@ mod tests {
         drop(pool.acquire()?);
         assert_eq!(fs::read(path.join("policy-v1"))?, before);
         assert_eq!(fs::read_dir(path)?.count(), 3);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropped_slot_owner_releases_lock_while_duplicate_handle_lives() -> Result<(), Refusal> {
+        let path = directory();
+        let pool = Pool::new(path.clone(), 1)?;
+        let lease = pool.acquire()?;
+        // A fork inherits this same open-file description until exec closes
+        // the descriptor. A safe duplicate reproduces that state without a race.
+        let inherited = lease._file.try_clone()?;
+        drop(lease);
+
+        let replacement = pool.acquire()?;
+        assert!(matches!(pool.acquire(), Err(Refusal::Busy)));
+        drop(inherited);
+        // Closing the old alias must not release the replacement's own lock.
+        assert!(matches!(pool.acquire(), Err(Refusal::Busy)));
+        drop(replacement);
+        drop(pool.acquire()?);
+        assert_eq!(fs::read_dir(path)?.count(), 2);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropped_policy_owner_releases_lock_while_duplicate_handle_lives() -> Result<(), Refusal> {
+        let path = directory();
+        fs::create_dir(&path)?;
+        let policy = Lease {
+            _file: open_control(&path.join("policy-v1"))?,
+        };
+        lock(&policy._file)?;
+        let inherited = policy._file.try_clone()?;
+        drop(policy);
+
+        let pool = Pool::new(path.clone(), 1)?;
+        let lease = pool.acquire()?;
+        drop(inherited);
+        assert!(matches!(pool.acquire(), Err(Refusal::Busy)));
+        drop(lease);
+        drop(pool.acquire()?);
+        assert_eq!(
+            fs::read_to_string(path.join("policy-v1"))?,
+            "CASS-READER-POOL-1\nslots=1\n"
+        );
         Ok(())
     }
 
