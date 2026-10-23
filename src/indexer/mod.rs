@@ -35041,12 +35041,27 @@ fn should_skip_raw_mirror_capture_for_logical_source(path: &Path) -> bool {
     }
 }
 
+fn raw_mirror_source_requires_conversation_admission(provider: &str, source_path: &Path) -> bool {
+    // VS Code keeps unrelated workspace state in these files even when the
+    // user has never used Copilot. Discovery (or a failed parse) is not proof
+    // of chat content. An admitted conversation captures its physical source
+    // through prepare_conversation_for_ingest instead; workspace.json only
+    // supplies the workspace already persisted with that conversation.
+    provider == "copilot"
+        && matches!(
+            source_path.file_name().and_then(|name| name.to_str()),
+            Some("state.vscdb" | "workspace.json")
+        )
+}
+
 fn capture_discovered_source_file_before_parse(
     data_dir: &Path,
     provider: &str,
     source: &crate::connectors::DiscoveredSourceFile,
 ) {
-    if !crate::raw_mirror::capture_enabled() {
+    if !crate::raw_mirror::capture_enabled()
+        || raw_mirror_source_requires_conversation_admission(provider, &source.source_path)
+    {
         return;
     }
     if let Err(reason) = validate_discovered_source_path(source) {
@@ -35227,7 +35242,9 @@ fn capture_scan_root_file_before_parse(
     if should_skip_active_session_source(active_source_filter, root.origin.kind, &root.path) {
         return true;
     }
-    if !crate::raw_mirror::capture_enabled() {
+    if !crate::raw_mirror::capture_enabled()
+        || raw_mirror_source_requires_conversation_admission(provider, &root.path)
+    {
         return false;
     }
     match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
@@ -43034,6 +43051,380 @@ mod tests {
                 .cmp(&right["original_path"].as_str())
         });
         manifests
+    }
+
+    fn write_copilot_workspace_state(
+        path: &Path,
+        sessions: Option<&serde_json::Value>,
+        editor_state: &str,
+    ) {
+        std::fs::create_dir_all(path.parent().expect("state parent")).expect("workspace dir");
+        let conn = crate::franken_sync::Connection::open(path.to_string_lossy().as_ref())
+            .expect("workspace state database");
+        conn.execute("PRAGMA journal_mode = WAL")
+            .expect("workspace WAL");
+        conn.execute("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT)")
+            .expect("workspace state table");
+        conn.execute_compat(
+            "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)",
+            &[
+                ParamValue::from("workbench.editor.state"),
+                ParamValue::from(editor_state),
+            ],
+        )
+        .expect("unrelated editor state");
+        if let Some(sessions) = sessions {
+            conn.execute_compat(
+                "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)",
+                &[
+                    ParamValue::from("interactive.sessions"),
+                    ParamValue::from(sessions.to_string()),
+                ],
+            )
+            .expect("legacy chat sessions");
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint workspace fixture");
+    }
+
+    fn copilot_workspace_session(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "version": 3,
+            "sessionId": id,
+            "creationDate": 1_755_000_000_000_i64,
+            "responderUsername": "GitHub Copilot",
+            "requests": [{
+                "requestId": "request-1",
+                "message": {"text": "Explain the capture policy"},
+                "response": [{"value": "Only admitted chat sources are captured."}],
+                "agent": {
+                    "id": "github.copilot.default",
+                    "extensionId": {"value": "GitHub.copilot-chat"}
+                },
+                "timestamp": 1_755_000_060_000_i64
+            }]
+        })
+    }
+
+    fn index_copilot_workspace_fixture(
+        storage: &FrankenStorage,
+        data_dir: &Path,
+        user_root: &Path,
+    ) -> NonWatchIngestOutcome {
+        let opts = IndexOptions {
+            full: true,
+            force_rebuild: false,
+            watch: false,
+            watch_once_paths: None,
+            db_path: data_dir.join("archive.db"),
+            data_dir: data_dir.to_path_buf(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        };
+        let roots = HashMap::from([("copilot".to_string(), vec![user_root.to_path_buf()])]);
+        run_batch_index_with_connector_factories(
+            storage,
+            None,
+            &opts,
+            None,
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            Vec::new(),
+            Some(Arc::new(roots)),
+            vec![("copilot", || {
+                Box::new(crate::connectors::copilot::CopilotConnector::new())
+                    as Box<dyn Connector + Send>
+            })],
+            Some(FrankenStorage::now_millis()),
+            None,
+        )
+        .expect("index only the explicit Copilot fixture")
+    }
+
+    fn raw_mirror_workspace_blob_count(data_dir: &Path) -> usize {
+        let blobs = data_dir.join("raw-mirror/v1/blobs");
+        if !blobs.exists() {
+            return 0;
+        }
+        walkdir::WalkDir::new(blobs)
+            .into_iter()
+            .map(|entry| entry.expect("read raw mirror blob directory"))
+            .filter(|entry| entry.file_type().is_file())
+            .count()
+    }
+
+    #[test]
+    fn raw_mirror_capture_skips_vscode_workspace_state_without_copilot_chats() {
+        use crate::connectors::DiscoveredSourceRole;
+
+        let temp = TempDir::new().expect("tempdir");
+        let user_root = temp.path().join(".config/Code - Insiders/User");
+        let workspace = user_root.join("workspaceStorage/no-copilot");
+        let state_path = workspace.join("state.vscdb");
+        write_copilot_workspace_state(&state_path, None, "private editor state, revision one");
+        std::fs::write(
+            workspace.join("workspace.json"),
+            r#"{"folder":"file:///private/project"}"#,
+        )
+        .expect("workspace sidecar");
+        let data_dir = temp.path().join("cass-data");
+        let storage = FrankenStorage::open(&data_dir.join("archive.db")).expect("archive");
+        ensure_fts_schema(&storage);
+
+        // Pin actual discovery at the shipped FAD rev so an empty discovery
+        // cannot make this negative test pass without exercising admission.
+        let connector = crate::connectors::copilot::CopilotConnector::new();
+        let ctx = ScanContext::with_roots(
+            data_dir.clone(),
+            vec![ScanRoot::local(user_root.clone())],
+            None,
+        );
+        let discovered = connector
+            .discover_source_files(&ctx)
+            .expect("discover stores");
+        assert_eq!(discovered.len(), 2);
+        assert!(discovered.iter().any(|source| {
+            source.source_path == state_path
+                && source.role == DiscoveredSourceRole::SqliteDatabase
+                && source.required_for_reconstruction
+        }));
+        assert!(discovered.iter().any(|source| {
+            source.source_path == workspace.join("workspace.json")
+                && source.role == DiscoveredSourceRole::MetadataSidecar
+                && !source.required_for_reconstruction
+        }));
+
+        let first = index_copilot_workspace_fixture(&storage, &data_dir, &user_root);
+        assert_eq!(first.inserted_conversations, 0);
+        assert!(raw_mirror_manifest_values(&data_dir).is_empty());
+        assert_eq!(raw_mirror_workspace_blob_count(&data_dir), 0);
+
+        let before = std::fs::read(&state_path).expect("initial state bytes");
+        write_copilot_workspace_state(
+            &state_path,
+            Some(&serde_json::json!([])),
+            "private editor state, revision two, with another open editor",
+        );
+        assert_ne!(
+            std::fs::read(&state_path).expect("rewritten state bytes"),
+            before
+        );
+        let second = index_copilot_workspace_fixture(&storage, &data_dir, &user_root);
+        assert_eq!(second.inserted_conversations, 0);
+        assert!(raw_mirror_manifest_values(&data_dir).is_empty());
+        assert_eq!(raw_mirror_workspace_blob_count(&data_dir), 0);
+
+        write_copilot_workspace_state(
+            &state_path,
+            Some(&serde_json::json!([])),
+            "private editor state, revision three",
+        );
+        let third = index_copilot_workspace_fixture(&storage, &data_dir, &user_root);
+        assert_eq!(third.inserted_conversations, 0);
+        assert!(raw_mirror_manifest_values(&data_dir).is_empty());
+        assert_eq!(raw_mirror_workspace_blob_count(&data_dir), 0);
+
+        let mut other_provider = copilot_workspace_session("other-provider");
+        other_provider["responderUsername"] = serde_json::json!("Continue");
+        other_provider["requests"][0]["agent"] = serde_json::json!({
+            "id": "continue.default",
+            "extensionId": {"value": "Continue.continue"}
+        });
+        write_copilot_workspace_state(
+            &state_path,
+            Some(&serde_json::json!([other_provider])),
+            "private editor state beside a different chat provider",
+        );
+        let other = index_copilot_workspace_fixture(&storage, &data_dir, &user_root);
+        assert_eq!(other.inserted_conversations, 0);
+        assert!(raw_mirror_manifest_values(&data_dir).is_empty());
+        assert_eq!(raw_mirror_workspace_blob_count(&data_dir), 0);
+    }
+
+    #[test]
+    fn raw_mirror_capture_copilot_modern_chat_copies_only_the_transcript() {
+        let temp = TempDir::new().expect("tempdir");
+        let user_root = temp.path().join("AppData/Roaming/Code/User");
+        let workspace = user_root.join("workspaceStorage/modern-chat");
+        write_copilot_workspace_state(&workspace.join("state.vscdb"), None, "private editor state");
+        std::fs::write(
+            workspace.join("workspace.json"),
+            r#"{"folder":"file:///private/project"}"#,
+        )
+        .expect("workspace sidecar");
+        let chats = workspace.join("chatSessions");
+        std::fs::create_dir_all(&chats).expect("chat sessions");
+        let transcript = chats.join("modern.json");
+        let bytes = serde_json::to_vec(&copilot_workspace_session("modern")).expect("session json");
+        std::fs::write(&transcript, &bytes).expect("modern chat");
+        let data_dir = temp.path().join("cass-data");
+        let storage = FrankenStorage::open(&data_dir.join("archive.db")).expect("archive");
+        ensure_fts_schema(&storage);
+
+        let outcome = index_copilot_workspace_fixture(&storage, &data_dir, &user_root);
+        assert_eq!(outcome.inserted_conversations, 1);
+        let manifests = raw_mirror_manifest_values(&data_dir);
+        let manifest = manifests.first().expect("transcript manifest");
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(
+            manifest["original_path"],
+            transcript.to_string_lossy().as_ref()
+        );
+        assert_eq!(manifest["db_links"].as_array().map(Vec::len), Some(1));
+        assert_eq!(raw_mirror_workspace_blob_count(&data_dir), 1);
+        assert_eq!(
+            std::fs::read(&transcript).expect("source remains intact"),
+            bytes
+        );
+    }
+
+    #[test]
+    fn raw_mirror_capture_copilot_legacy_store_is_linked_and_unchanged_replay_deduplicates() {
+        let temp = TempDir::new().expect("tempdir");
+        let user_root = temp.path().join(".config/Code/User");
+        let workspace = user_root.join("workspaceStorage/legacy-chat");
+        let state_path = workspace.join("state.vscdb");
+        write_copilot_workspace_state(
+            &state_path,
+            Some(&serde_json::json!([
+                copilot_workspace_session("legacy-first"),
+                copilot_workspace_session("legacy-second")
+            ])),
+            "private editor state",
+        );
+        std::fs::write(
+            workspace.join("workspace.json"),
+            r#"{"folder":"file:///private/project"}"#,
+        )
+        .expect("workspace sidecar");
+        let data_dir = temp.path().join("cass-data");
+        let storage = FrankenStorage::open(&data_dir.join("archive.db")).expect("archive");
+        ensure_fts_schema(&storage);
+
+        let first = index_copilot_workspace_fixture(&storage, &data_dir, &user_root);
+        assert_eq!(first.inserted_conversations, 2);
+        let manifests = raw_mirror_manifest_values(&data_dir);
+        assert_eq!(manifests.len(), 1);
+        let manifest = manifests.first().expect("admitted store manifest");
+        assert_eq!(
+            manifest["original_path"],
+            state_path.to_string_lossy().as_ref()
+        );
+        assert_eq!(manifest["db_links"].as_array().map(Vec::len), Some(2));
+        assert_eq!(raw_mirror_workspace_blob_count(&data_dir), 1);
+
+        let second = index_copilot_workspace_fixture(&storage, &data_dir, &user_root);
+        assert_eq!(second.inserted_conversations, 0);
+        assert_eq!(raw_mirror_manifest_values(&data_dir).len(), 1);
+        assert_eq!(raw_mirror_workspace_blob_count(&data_dir), 1);
+    }
+
+    #[test]
+    fn raw_mirror_capture_copilot_unreadable_store_is_not_copied() {
+        let temp = TempDir::new().expect("tempdir");
+        let user_root = temp.path().join(".config/Code/User");
+        let workspace = user_root.join("workspaceStorage/unreadable");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(
+            workspace.join("state.vscdb"),
+            b"not a SQLite database: private editor state",
+        )
+        .expect("corrupt state");
+        std::fs::write(
+            workspace.join("workspace.json"),
+            b"{invalid private workspace",
+        )
+        .expect("invalid sidecar");
+        let data_dir = temp.path().join("cass-data");
+        let storage = FrankenStorage::open(&data_dir.join("archive.db")).expect("archive");
+        ensure_fts_schema(&storage);
+
+        let outcome = index_copilot_workspace_fixture(&storage, &data_dir, &user_root);
+        assert_eq!(outcome.inserted_conversations, 0);
+        assert!(raw_mirror_manifest_values(&data_dir).is_empty());
+        assert_eq!(raw_mirror_workspace_blob_count(&data_dir), 0);
+    }
+
+    #[test]
+    fn raw_mirror_capture_copilot_admission_preserves_other_provider_and_transcript_forensics() {
+        use crate::connectors::{DiscoveredSourceFile, DiscoveredSourceRole};
+
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let root = ScanRoot::local(temp.path().to_path_buf());
+        let state = temp.path().join("state.vscdb");
+        let sidecar = temp.path().join("workspace.json");
+        let transcript = temp.path().join("chat.json");
+        std::fs::write(&state, b"private workspace store").expect("state");
+        std::fs::write(&sidecar, b"private workspace name").expect("sidecar");
+        std::fs::write(&transcript, b"malformed chat transcript").expect("transcript");
+        let sources = vec![
+            DiscoveredSourceFile::new(
+                "copilot",
+                &root,
+                state.clone(),
+                DiscoveredSourceRole::SqliteDatabase,
+                true,
+            ),
+            DiscoveredSourceFile::new(
+                "copilot",
+                &root,
+                sidecar.clone(),
+                DiscoveredSourceRole::MetadataSidecar,
+                false,
+            ),
+            DiscoveredSourceFile::new(
+                "copilot",
+                &root,
+                transcript.clone(),
+                DiscoveredSourceRole::PrimarySessionLog,
+                true,
+            ),
+        ];
+        let connector = FailingDiscoveryConnector { sources };
+        let ctx = ScanContext::with_roots(data_dir.clone(), vec![root.clone()], None);
+        let active_filter = ActiveSessionSourceFilter::default();
+        capture_connector_sources_before_parse(
+            &connector,
+            &ctx,
+            &data_dir,
+            "copilot",
+            std::slice::from_ref(&root),
+            None,
+            &active_filter,
+        );
+        assert!(connector.scan(&ctx).is_err());
+        let manifests = raw_mirror_manifest_values(&data_dir);
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(
+            manifests.first().expect("failed transcript preserved")["original_path"],
+            transcript.to_string_lossy().as_ref()
+        );
+
+        // Legacy explicit-file fallback must enforce the same policy, even
+        // when discovery failed before it could report roles or sidecars.
+        for path in [state.clone(), sidecar] {
+            capture_scan_sources_before_parse(
+                &data_dir,
+                "copilot",
+                &ScanRoot::local(path),
+                None,
+                &active_filter,
+            );
+        }
+        assert_eq!(raw_mirror_manifest_values(&data_dir).len(), 1);
+        let other_provider = DiscoveredSourceFile::new(
+            "cursor",
+            &root,
+            state,
+            DiscoveredSourceRole::SqliteDatabase,
+            true,
+        );
+        capture_discovered_source_file_before_parse(&data_dir, "cursor", &other_provider);
+        assert_eq!(raw_mirror_manifest_values(&data_dir).len(), 2);
+        assert_eq!(raw_mirror_workspace_blob_count(&data_dir), 2);
     }
 
     #[test]
