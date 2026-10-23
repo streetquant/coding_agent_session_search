@@ -34,6 +34,10 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Added
 
+- **Semantic generation leases expose validated rows.** The row source borrows
+  vectors, document IDs, tombstone flags and complete frozen identity bytes from
+  the lease's retained immutable FSVI owner, so replacing its old pathname cannot
+  change the exposed rows.
 - **Continue sessions are indexed.** Continue's IDE extension and CLI keep one
   JSON snapshot per session under `~/.continue/sessions` (or
   `$CONTINUE_GLOBAL_DIR/sessions`). A full index picks them up. `cass index
