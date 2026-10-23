@@ -7,9 +7,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::prelude::*;
 use chrono::Utc;
 use ring::rand::{SecureRandom, SystemRandom};
+#[cfg(target_os = "linux")]
+use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 #[cfg(test)]
 use std::io::BufWriter;
@@ -190,9 +193,434 @@ struct BundlePublishJournal {
 #[derive(Debug)]
 struct BundlePublishGuard {
     final_dir: PathBuf,
+    parent: BundlePublishParent,
     lock_path: PathBuf,
     lock_identity: crate::franken_sync::FileIdentity,
     lock_file: File,
+}
+
+/// The publication namespace is pinned for the entire transaction. Linux
+/// resolves every component with NOFOLLOW and performs namespace operations
+/// against retained directory descriptors, including recursive cleanup.
+/// Locks arbitrate cooperating exporters. A hostile writer of the parent
+/// namespace can force refusal or retained recovery artifacts; an exchanged
+/// symlink is moved as an entry and fails subsequent tree validation. Its
+/// referent is never traversed by publication or cleanup.
+#[derive(Debug)]
+struct BundlePublishParent {
+    path: PathBuf,
+    lock_identity: Option<(PathBuf, crate::franken_sync::FileIdentity)>,
+    #[cfg(target_os = "linux")]
+    dir: File,
+}
+
+impl BundlePublishParent {
+    fn open(path: &Path, create: bool) -> std::io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+            let mut dir = File::from(rustix::fs::open(
+                if path.is_absolute() { "/" } else { "." },
+                flags,
+                Mode::empty(),
+            )?);
+            for component in path.components() {
+                let name = match component {
+                    std::path::Component::RootDir | std::path::Component::CurDir => continue,
+                    std::path::Component::Normal(name) => name,
+                    std::path::Component::ParentDir => OsStr::new(".."),
+                    std::path::Component::Prefix(_) => {
+                        return Err(std::io::Error::other("invalid publish parent prefix"));
+                    }
+                };
+                let next = match rustix::fs::openat(&dir, name, flags, Mode::empty()) {
+                    Err(rustix::io::Errno::NOENT) if create => {
+                        match rustix::fs::mkdirat(&dir, name, Mode::from_raw_mode(0o755)) {
+                            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                        rustix::fs::openat(&dir, name, flags, Mode::empty())?
+                    }
+                    other => other?,
+                };
+                dir = File::from(next);
+            }
+            Ok(Self {
+                path: path.to_path_buf(),
+                lock_identity: None,
+                dir,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if create {
+                fs::create_dir_all(path)?;
+            }
+            ensure_existing_parent_ancestors_are_real_dirs(&path.join("entry"), "publish parent")
+                .map_err(std::io::Error::other)?;
+            if !fs::metadata(path)?.is_dir() {
+                return Err(std::io::Error::other("publish parent is not a directory"));
+            }
+            Ok(Self {
+                path: path.to_path_buf(),
+                lock_identity: None,
+            })
+        }
+    }
+
+    fn for_output(path: &Path, create: bool) -> std::io::Result<Self> {
+        Self::open(Self::parent_path(path), create)
+    }
+
+    fn parent_path(path: &Path) -> &Path {
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+    }
+
+    fn name<'a>(&self, path: &'a Path) -> std::io::Result<&'a OsStr> {
+        if Self::parent_path(path) != self.path {
+            return Err(std::io::Error::other(format!(
+                "Pages bundle entries must share the same parent directory: {} and {}",
+                path.display(),
+                self.path.display()
+            )));
+        }
+        path.file_name()
+            .ok_or_else(|| std::io::Error::other("publish entry has no file name"))
+    }
+
+    fn metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
+        let name = self.name(path)?;
+        #[cfg(target_os = "linux")]
+        {
+            let file = File::from(rustix::fs::openat(
+                &self.dir,
+                name,
+                OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?);
+            file.metadata()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            fs::symlink_metadata(self.path.join(name)) // ubs:ignore[rust.security.path-traversal] -- name() accepts only one basename in this verified parent.
+        }
+    }
+
+    fn exists(&self, path: &Path) -> Result<bool> {
+        match self.metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error)
+                .with_context(|| format!("failed inspecting bundle path entry {}", path.display())),
+        }
+    }
+
+    fn ensure_directory(&self, path: &Path, label: &str) -> Result<bool> {
+        match self.metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!("{label} must not be a symlink: {}", path.display())
+            }
+            Ok(metadata) if !metadata.is_dir() => bail!(
+                "{label} points to a file, expected a directory: {}",
+                path.display()
+            ),
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => {
+                Err(error).with_context(|| format!("failed inspecting {label} {}", path.display()))
+            }
+        }
+    }
+
+    fn open_file(&self, path: &Path, writable: bool, create_new: bool) -> std::io::Result<File> {
+        let name = self.name(path)?;
+        #[cfg(target_os = "linux")]
+        {
+            let mut flags = OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+            flags |= if writable {
+                OFlags::RDWR
+            } else {
+                OFlags::RDONLY
+            };
+            if create_new {
+                flags |= OFlags::CREATE | OFlags::EXCL;
+            }
+            Ok(File::from(rustix::fs::openat(
+                &self.dir,
+                name,
+                flags,
+                Mode::from_raw_mode(0o600),
+            )?))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut options = OpenOptions::new();
+            options.read(true).write(writable).create_new(create_new);
+            #[cfg(unix)]
+            options.mode(0o600);
+            options.open(self.path.join(name)) // ubs:ignore[rust.security.path-traversal] -- name() accepts only one basename in this verified parent.
+        }
+    }
+
+    fn directory(&self, path: &Path) -> std::io::Result<Self> {
+        let name = self.name(path)?;
+        #[cfg(target_os = "linux")]
+        {
+            let dir = File::from(rustix::fs::openat(
+                &self.dir,
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?);
+            Ok(Self {
+                path: path.to_path_buf(),
+                lock_identity: None,
+                dir,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::open(&self.path.join(name), false) // ubs:ignore[rust.security.path-traversal] -- name() accepts only one basename in this verified parent.
+        }
+    }
+
+    fn duplicate(&self) -> std::io::Result<Self> {
+        Ok(Self {
+            path: self.path.clone(),
+            lock_identity: None,
+            #[cfg(target_os = "linux")]
+            dir: self.dir.try_clone()?,
+        })
+    }
+
+    fn entries(&self, limit: usize) -> std::io::Result<Vec<PathBuf>> {
+        let mut entries = Vec::new();
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            for entry in rustix::fs::Dir::read_from(&self.dir)? {
+                let entry = entry?;
+                let name = entry.file_name().to_bytes();
+                if name == b"." || name == b".." {
+                    continue;
+                }
+                if entries.len() >= limit {
+                    return Err(std::io::Error::other("directory exceeds entry bound"));
+                }
+                entries.push(self.path.join(OsStr::from_bytes(name)));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        for entry in fs::read_dir(&self.path)? {
+            if entries.len() >= limit {
+                return Err(std::io::Error::other("directory exceeds entry bound"));
+            }
+            entries.push(entry?.path());
+        }
+        entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+        Ok(entries)
+    }
+
+    fn verify_identity(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let current = Self::open(&self.path, false).with_context(|| {
+                format!(
+                    "Pages bundle publish parent {} changed identity or became a symlink",
+                    self.path.display()
+                )
+            })?;
+            if crate::franken_sync::FileIdentity::from_file(&current.dir)?
+                != crate::franken_sync::FileIdentity::from_file(&self.dir)?
+            {
+                bail!(
+                    "Pages bundle publish parent {} changed identity",
+                    self.path.display()
+                );
+            }
+        }
+        if let Some((path, identity)) = &self.lock_identity {
+            let metadata = self.metadata(path)?;
+            if !metadata.is_file() {
+                bail!(
+                    "Pages bundle publish lock is no longer a regular file: {}",
+                    path.display()
+                );
+            }
+            #[cfg(unix)]
+            if metadata.nlink() != 1 {
+                bail!(
+                    "Pages bundle publish lock gained hard links: {}",
+                    path.display()
+                );
+            }
+            let probe = self.open_file(path, false, false)?;
+            if crate::franken_sync::FileIdentity::from_file(&probe)?.as_ref() != Some(identity) {
+                bail!(
+                    "Pages bundle publish lock pathname changed identity: {}",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn sync(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            self.dir.sync_all().with_context(|| {
+                format!(
+                    "failed syncing pinned publish parent {}",
+                    self.path.display()
+                )
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            sync_parent_directory(&self.path.join("entry"))
+        }
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        self.rename_with(from, to, || Ok(()))
+    }
+
+    fn rename_with<F>(&self, from: &Path, to: &Path, after_validation: F) -> std::io::Result<()>
+    where
+        F: FnOnce() -> std::io::Result<()>,
+    {
+        self.verify_identity().map_err(std::io::Error::other)?;
+        let from_name = self.name(from)?;
+        let to_name = self.name(to)?;
+        after_validation()?;
+        #[cfg(target_os = "linux")]
+        {
+            rustix::fs::renameat_with(
+                &self.dir,
+                from_name,
+                &self.dir,
+                to_name,
+                RenameFlags::NOREPLACE,
+            )
+            .map_err(Into::into)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            fs::rename(self.path.join(from_name), self.path.join(to_name)) // ubs:ignore[rust.security.path-traversal] -- Both names passed name() and contain one local basename.
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exchange(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        self.verify_identity().map_err(std::io::Error::other)?;
+        rustix::fs::renameat_with(
+            &self.dir,
+            self.name(from)?,
+            &self.dir,
+            self.name(to)?,
+            RenameFlags::EXCHANGE,
+        )
+        .map_err(Into::into)
+    }
+
+    fn unlink(&self, path: &Path, directory: bool) -> std::io::Result<()> {
+        self.verify_identity().map_err(std::io::Error::other)?;
+        let name = self.name(path)?;
+        #[cfg(target_os = "linux")]
+        {
+            rustix::fs::unlinkat(
+                &self.dir,
+                name,
+                if directory {
+                    AtFlags::REMOVEDIR
+                } else {
+                    AtFlags::empty()
+                },
+            )
+            .map_err(Into::into)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if directory {
+                fs::remove_dir(self.path.join(name)) // ubs:ignore[rust.security.path-traversal] -- name() accepts only one basename in this verified parent.
+            } else {
+                fs::remove_file(self.path.join(name)) // ubs:ignore[rust.security.path-traversal] -- name() accepts only one basename in this verified parent.
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn remove_tree(&self, path: &Path, expected: &BundleTreeEvidence) -> Result<()> {
+        ensure_bundle_tree_matches(path, "journaled cleanup tree", expected, self)?;
+        fs::remove_dir_all(path).context("failed removing validated bundle tree")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn remove_tree(&self, path: &Path, expected: &BundleTreeEvidence) -> Result<()> {
+        let tree = self.directory(path)?;
+        let observed = inspect_open_bundle_tree(
+            &tree,
+            "journaled cleanup tree",
+            BUNDLE_TREE_EVIDENCE_ENTRY_LIMIT,
+        )?;
+        if observed != *expected {
+            bail!(
+                "journaled cleanup tree changed identity or content: {}",
+                path.display()
+            );
+        }
+        // Retain each opened directory while deleting its children. A swapped
+        // pathname can never redirect traversal into a symlink referent.
+        let entries = tree.entries(BUNDLE_TREE_EVIDENCE_ENTRY_LIMIT)?;
+        let mut stack = vec![(tree, entries.into_iter())];
+        let mut visited = 0_usize;
+        while let Some((directory, entries)) = stack.last_mut() {
+            self.verify_identity()?;
+            if let Some(entry) = entries.next() {
+                visited += 1;
+                if visited > BUNDLE_TREE_EVIDENCE_ENTRY_LIMIT {
+                    bail!(
+                        "journaled cleanup exceeds the entry bound: {}",
+                        path.display()
+                    );
+                }
+                let metadata = directory.metadata(&entry)?;
+                if metadata.is_dir() {
+                    let child = directory.directory(&entry)?;
+                    let entries =
+                        child.entries(BUNDLE_TREE_EVIDENCE_ENTRY_LIMIT.saturating_sub(visited))?;
+                    stack.push((child, entries.into_iter()));
+                } else if metadata.is_file() {
+                    directory.unlink(&entry, false)?;
+                } else {
+                    bail!(
+                        "journaled cleanup entry changed file type: {}",
+                        entry.display()
+                    );
+                }
+            } else {
+                let (directory, _) = stack
+                    .pop()
+                    .ok_or_else(|| anyhow!("cleanup directory missing"))?;
+                let parent = stack.last().map(|frame| &frame.0).unwrap_or(self);
+                #[cfg(target_os = "linux")]
+                {
+                    let metadata = parent.metadata(&directory.path)?;
+                    let opened = directory.dir.metadata()?;
+                    if metadata.dev() != opened.dev() || metadata.ino() != opened.ino() {
+                        bail!(
+                            "journaled cleanup directory changed identity: {}",
+                            directory.path.display()
+                        );
+                    }
+                }
+                parent.unlink(&directory.path, true)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Integrity entry for a single file
@@ -330,6 +758,7 @@ impl BundleBuilder {
     ) -> Result<BundleResult> {
         let encrypted_dir = encrypted_dir.as_ref();
         let output_dir = output_dir.as_ref();
+        ensure_existing_parent_ancestors_are_real_dirs(output_dir, "bundle output path")?;
 
         // Heal an interrupted fallback publish before doing potentially long
         // archive validation/copying work, so a parked prior generation is
@@ -349,8 +778,10 @@ impl BundleBuilder {
         if recovery_evidence {
             let early_guard = acquire_bundle_publish_guard(output_dir)?;
             require_bundle_publish_guard(output_dir, &early_guard)?;
-            recover_interrupted_bundle_publish(output_dir)?;
-            ensure_replaceable_bundle_output_dir(output_dir)?;
+            recover_interrupted_bundle_publish(output_dir, &early_guard.parent)?;
+            early_guard
+                .parent
+                .ensure_directory(output_dir, "bundle output path")?;
         }
 
         // Validate encrypted_dir has required files
@@ -386,11 +817,12 @@ impl BundleBuilder {
         let final_site_dir = output_dir.join("site");
         let final_private_dir = output_dir.join("private");
         let mut retain_temp_on_replace_error = false;
+        let mut staging_root = None;
         let result = (|| -> Result<BundleResult> {
             progress("setup", "Creating directory structure...");
 
             // Stage the bundle under a unique temp root so reruns do not retain stale files.
-            create_bundle_staging_root(&temp_output_dir)?;
+            staging_root = Some(create_bundle_staging_root(&temp_output_dir)?);
             let site_dir = temp_output_dir.join("site");
             let private_dir = temp_output_dir.join("private");
 
@@ -561,7 +993,11 @@ impl BundleBuilder {
 
         match result {
             Err(build_error) if !retain_temp_on_replace_error => {
-                match cleanup_rejected_bundle_temp(&temp_output_dir) {
+                let cleanup = match staging_root.as_ref() {
+                    Some(root) => cleanup_rejected_bundle_temp(&temp_output_dir, root),
+                    None => Ok(()),
+                };
+                match cleanup {
                     Ok(()) => Err(build_error),
                     Err(cleanup_error) => Err(build_error.context(format!(
                         "failed to remove rejected staged bundle: {cleanup_error:#}"
@@ -573,35 +1009,57 @@ impl BundleBuilder {
     }
 }
 
-fn create_bundle_staging_root(path: &Path) -> Result<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
+fn create_bundle_staging_root(path: &Path) -> Result<BundlePublishParent> {
+    #[cfg(target_os = "linux")]
     {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("failed creating bundle staging parent {}", parent.display())
-        })?;
-    }
-
-    #[cfg(unix)]
-    {
-        let mut builder = fs::DirBuilder::new();
-        builder.mode(0o700);
-        builder.create(path).with_context(|| {
+        let parent = BundlePublishParent::for_output(path, true)?;
+        rustix::fs::mkdirat(&parent.dir, parent.name(path)?, Mode::from_raw_mode(0o700))
+            .with_context(|| {
+                format!(
+                    "failed creating private bundle staging root {}",
+                    path.display()
+                )
+            })?;
+        parent.directory(path).with_context(|| {
             format!(
-                "failed creating private bundle staging root {}",
+                "failed pinning private bundle staging root {}",
                 path.display()
             )
-        })?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("failed securing bundle staging root {}", path.display()))?;
+        })
     }
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "linux"))]
     {
-        fs::create_dir(path)
-            .with_context(|| format!("failed creating bundle staging root {}", path.display()))?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed creating bundle staging parent {}", parent.display())
+            })?;
+        }
+
+        #[cfg(unix)]
+        {
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(path).with_context(|| {
+                format!(
+                    "failed creating private bundle staging root {}",
+                    path.display()
+                )
+            })?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).with_context(|| {
+                format!("failed securing bundle staging root {}", path.display())
+            })?;
+        }
+        #[cfg(not(unix))]
+        {
+            fs::create_dir(path).with_context(|| {
+                format!("failed creating bundle staging root {}", path.display())
+            })?;
+        }
+        BundlePublishParent::open(path, false).context("failed pinning private bundle staging root")
     }
-    Ok(())
 }
 
 fn prepare_bundle_root_for_publish(path: &Path) -> Result<()> {
@@ -617,14 +1075,35 @@ fn prepare_bundle_root_for_publish(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cleanup_rejected_bundle_temp(path: &Path) -> Result<()> {
-    match fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("failed removing staged bundle {}", path.display()))
+fn cleanup_rejected_bundle_temp(path: &Path, staged: &BundlePublishParent) -> Result<()> {
+    let parent = BundlePublishParent::for_output(path, false).with_context(|| {
+        format!(
+            "failed reopening rejected staging parent; preserved bundle {}",
+            path.display()
+        )
+    })?;
+    if !parent.exists(path)? {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let current = parent.metadata(path)?;
+        let opened = staged.dir.metadata()?;
+        if current.dev() != opened.dev() || current.ino() != opened.ino() {
+            bail!(
+                "rejected staging pathname changed identity; preserved it without mutation: {}",
+                path.display()
+            );
         }
     }
+    let evidence = inspect_open_bundle_tree(
+        staged,
+        "rejected staged bundle",
+        BUNDLE_TREE_EVIDENCE_ENTRY_LIMIT,
+    )?;
+    parent
+        .remove_tree(path, &evidence)
+        .with_context(|| format!("failed removing staged bundle {}", path.display()))
 }
 
 fn unique_bundle_dir(path: &Path, suffix: &str) -> Result<PathBuf> {
@@ -663,19 +1142,10 @@ fn bundle_publish_lock_path(path: &Path) -> PathBuf {
 
 fn acquire_bundle_publish_guard(final_dir: &Path) -> Result<BundlePublishGuard> {
     ensure_existing_parent_ancestors_are_real_dirs(final_dir, "bundle publish lock")?;
-    if let Some(parent) = final_dir
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed creating Pages bundle publish-lock parent {}",
-                parent.display()
-            )
-        })?;
-    }
+    let mut parent = BundlePublishParent::for_output(final_dir, true)
+        .context("failed opening verified Pages bundle publish parent")?;
     let lock_path = bundle_publish_lock_path(final_dir);
-    let lock_exists = match fs::symlink_metadata(&lock_path) {
+    let lock_exists = match parent.metadata(&lock_path) {
         Ok(metadata) if metadata.file_type().is_file() => {
             #[cfg(unix)]
             if metadata.nlink() != 1 {
@@ -701,21 +1171,32 @@ fn acquire_bundle_publish_guard(final_dir: &Path) -> Result<BundlePublishGuard> 
             });
         }
     };
-    let mut options = OpenOptions::new();
-    options.read(true).write(true);
-    if lock_exists {
-        options.create(false);
-    } else {
-        options.create_new(true);
+    let lock_file = match parent.open_file(&lock_path, true, !lock_exists) {
+        Err(error) if !lock_exists && error.kind() == std::io::ErrorKind::AlreadyExists => {
+            parent.open_file(&lock_path, true, false)
+        }
+        other => other,
     }
-    #[cfg(unix)]
-    options.mode(0o600);
-    let lock_file = options.open(&lock_path).with_context(|| {
+    .with_context(|| {
         format!(
             "failed opening Pages bundle publish lock {}",
             lock_path.display()
         )
     })?;
+    let opened_metadata = lock_file.metadata()?;
+    if !opened_metadata.is_file() {
+        bail!(
+            "Pages bundle publish lock is not a regular file: {}",
+            lock_path.display()
+        );
+    }
+    #[cfg(unix)]
+    if opened_metadata.nlink() != 1 {
+        bail!(
+            "Pages bundle publish lock has additional hard links: {}",
+            lock_path.display()
+        );
+    }
     let lock_identity = crate::franken_sync::FileIdentity::from_file(&lock_file)
         .with_context(|| {
             format!(
@@ -747,8 +1228,10 @@ fn acquire_bundle_publish_guard(final_dir: &Path) -> Result<BundlePublishGuard> 
             });
         }
     }
+    parent.lock_identity = Some((lock_path.clone(), lock_identity));
     let guard = BundlePublishGuard {
         final_dir: final_dir.to_path_buf(),
+        parent,
         lock_path,
         lock_identity,
         lock_file,
@@ -765,6 +1248,7 @@ fn require_bundle_publish_guard(final_dir: &Path, guard: &BundlePublishGuard) ->
             final_dir.display()
         );
     }
+    guard.parent.verify_identity()?;
     let held_identity = crate::franken_sync::FileIdentity::from_file(&guard.lock_file)
         .context("failed re-identifying held Pages bundle publish lock")?
         .ok_or_else(|| {
@@ -779,7 +1263,7 @@ fn require_bundle_publish_guard(final_dir: &Path, guard: &BundlePublishGuard) ->
             guard.lock_path.display()
         );
     }
-    let metadata = fs::symlink_metadata(&guard.lock_path).with_context(|| {
+    let metadata = guard.parent.metadata(&guard.lock_path).with_context(|| {
         format!(
             "failed re-inspecting Pages bundle publish lock {}",
             guard.lock_path.display()
@@ -799,12 +1283,15 @@ fn require_bundle_publish_guard(final_dir: &Path, guard: &BundlePublishGuard) ->
             metadata.nlink()
         );
     }
-    let probe = File::open(&guard.lock_path).with_context(|| {
-        format!(
-            "failed re-opening Pages bundle publish lock {}",
-            guard.lock_path.display()
-        )
-    })?;
+    let probe = guard
+        .parent
+        .open_file(&guard.lock_path, false, false)
+        .with_context(|| {
+            format!(
+                "failed re-opening Pages bundle publish lock {}",
+                guard.lock_path.display()
+            )
+        })?;
     let path_identity = crate::franken_sync::FileIdentity::from_file(&probe)
         .context("failed re-identifying Pages bundle publish lock pathname")?
         .ok_or_else(|| {
@@ -910,9 +1397,12 @@ fn validate_bundle_publish_journal(
     journal_bundle_backup_path(final_dir, journal)
 }
 
-fn read_bundle_publish_journal(final_dir: &Path) -> Result<Option<BundlePublishJournal>> {
+fn read_bundle_publish_journal(
+    final_dir: &Path,
+    parent: &BundlePublishParent,
+) -> Result<Option<BundlePublishJournal>> {
     let journal_path = bundle_publish_recovery_journal_path(final_dir);
-    let metadata = match fs::symlink_metadata(&journal_path) {
+    let metadata = match parent.metadata(&journal_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -946,12 +1436,31 @@ fn read_bundle_publish_journal(final_dir: &Path) -> Result<Option<BundlePublishJ
         );
     }
 
-    let mut file = File::open(&journal_path).with_context(|| {
-        format!(
-            "failed opening Pages bundle publish journal {}",
+    let mut file = parent
+        .open_file(&journal_path, false, false)
+        .with_context(|| {
+            format!(
+                "failed opening Pages bundle publish journal {}",
+                journal_path.display()
+            )
+        })?;
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.is_file() {
+        bail!(
+            "Pages bundle publish journal changed file type while opening: {}",
             journal_path.display()
-        )
-    })?;
+        );
+    }
+    #[cfg(unix)]
+    if opened_metadata.nlink() != 1
+        || opened_metadata.dev() != metadata.dev()
+        || opened_metadata.ino() != metadata.ino()
+    {
+        bail!(
+            "Pages bundle publish journal changed identity while opening: {}",
+            journal_path.display()
+        );
+    }
     let opened_identity = crate::franken_sync::FileIdentity::from_file(&file)
         .with_context(|| {
             format!(
@@ -983,12 +1492,14 @@ fn read_bundle_publish_journal(final_dir: &Path) -> Result<Option<BundlePublishJ
             journal_path.display()
         );
     }
-    let path_probe = File::open(&journal_path).with_context(|| {
-        format!(
-            "failed re-opening Pages bundle publish journal {}",
-            journal_path.display()
-        )
-    })?;
+    let path_probe = parent
+        .open_file(&journal_path, false, false)
+        .with_context(|| {
+            format!(
+                "failed re-opening Pages bundle publish journal {}",
+                journal_path.display()
+            )
+        })?;
     let path_identity = crate::franken_sync::FileIdentity::from_file(&path_probe)
         .with_context(|| {
             format!(
@@ -1008,7 +1519,7 @@ fn read_bundle_publish_journal(final_dir: &Path) -> Result<Option<BundlePublishJ
             journal_path.display()
         );
     }
-    let observed_metadata = fs::symlink_metadata(&journal_path).with_context(|| {
+    let observed_metadata = parent.metadata(&journal_path).with_context(|| {
         format!(
             "failed re-inspecting Pages bundle publish journal {}",
             journal_path.display()
@@ -1043,6 +1554,7 @@ fn write_bundle_publish_journal(
     backup_dir: &Path,
     prior: &BundleTreeEvidence,
     candidate: &BundleTreeEvidence,
+    parent: &BundlePublishParent,
 ) -> Result<BundlePublishJournal> {
     let backup_file_name = backup_dir
         .file_name()
@@ -1068,11 +1580,8 @@ fn write_bundle_publish_journal(
     let bytes =
         serde_json::to_vec(&journal).context("failed serializing Pages bundle publish journal")?;
     let journal_path = bundle_publish_recovery_journal_path(final_dir);
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(&journal_path).with_context(|| {
+    parent.verify_identity()?;
+    let mut file = parent.open_file(&journal_path, true, true).with_context(|| {
         format!(
             "failed exclusively creating Pages bundle publish journal {}; preserved the live and staged generations",
             journal_path.display()
@@ -1103,18 +1612,20 @@ fn write_bundle_publish_journal(
             journal_path.display()
         )
     })?;
-    sync_parent_directory(&journal_path).with_context(|| {
+    parent.sync().with_context(|| {
         format!(
             "failed durably publishing Pages bundle journal {}; preserved it for recovery",
             journal_path.display()
         )
     })?;
-    let path_probe = File::open(&journal_path).with_context(|| {
-        format!(
-            "failed re-opening newly created Pages bundle publish journal {}",
-            journal_path.display()
-        )
-    })?;
+    let path_probe = parent
+        .open_file(&journal_path, false, false)
+        .with_context(|| {
+            format!(
+                "failed re-opening newly created Pages bundle publish journal {}",
+                journal_path.display()
+            )
+        })?;
     let path_identity = crate::franken_sync::FileIdentity::from_file(&path_probe)
         .context("failed re-identifying newly created Pages bundle publish journal")?
         .ok_or_else(|| {
@@ -1129,7 +1640,7 @@ fn write_bundle_publish_journal(
             journal_path.display()
         );
     }
-    let observed = read_bundle_publish_journal(final_dir)?.ok_or_else(|| {
+    let observed = read_bundle_publish_journal(final_dir, parent)?.ok_or_else(|| {
         anyhow!(
             "newly created Pages bundle publish journal disappeared before publication: {}",
             journal_path.display()
@@ -1144,9 +1655,13 @@ fn write_bundle_publish_journal(
     Ok(journal)
 }
 
-fn remove_bundle_publish_journal(final_dir: &Path, expected: &BundlePublishJournal) -> Result<()> {
+fn remove_bundle_publish_journal(
+    final_dir: &Path,
+    expected: &BundlePublishJournal,
+    parent: &BundlePublishParent,
+) -> Result<()> {
     let journal_path = bundle_publish_recovery_journal_path(final_dir);
-    let observed = read_bundle_publish_journal(final_dir)?.ok_or_else(|| {
+    let observed = read_bundle_publish_journal(final_dir, parent)?.ok_or_else(|| {
         anyhow!(
             "completed Pages bundle publish journal disappeared before validated cleanup: {}",
             journal_path.display()
@@ -1158,60 +1673,50 @@ fn remove_bundle_publish_journal(final_dir: &Path, expected: &BundlePublishJourn
             journal_path.display()
         );
     }
-    fs::remove_file(&journal_path).with_context(|| {
+    parent.unlink(&journal_path, false).with_context(|| {
         format!(
             "failed removing completed Pages bundle publish journal {}",
             journal_path.display()
         )
     })?;
-    sync_parent_directory(&journal_path)
+    parent.sync()
 }
 
 fn first_unowned_bundle_publish_backup(
     final_dir: &Path,
     owned_backup: Option<&Path>,
 ) -> Result<Option<PathBuf>> {
+    let parent = match BundlePublishParent::for_output(final_dir, false) {
+        Ok(parent) => parent,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("failed opening Pages bundle recovery namespace"),
+    };
+    first_unowned_bundle_publish_backup_in_parent(final_dir, owned_backup, &parent)
+}
+
+fn first_unowned_bundle_publish_backup_in_parent(
+    final_dir: &Path,
+    owned_backup: Option<&Path>,
+    parent: &BundlePublishParent,
+) -> Result<Option<PathBuf>> {
+    let owned_name = owned_backup.map(|path| parent.name(path)).transpose()?;
     let legacy_path = legacy_bundle_publish_in_progress_backup_path(final_dir);
-    if owned_backup != Some(legacy_path.as_path()) && bundle_path_entry_exists(&legacy_path)? {
+    if owned_backup != Some(legacy_path.as_path()) && parent.exists(&legacy_path)? {
         return Ok(Some(legacy_path));
     }
 
-    let Some(parent) = final_dir.parent() else {
-        return Ok(None);
-    };
-    let entries = match fs::read_dir(parent) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "failed scanning Pages bundle publish namespace {}",
-                    parent.display()
-                )
-            });
-        }
-    };
+    let entries = parent.entries(BUNDLE_PUBLISH_BACKUP_SCAN_LIMIT).with_context(|| format!(
+        "Pages bundle publish namespace {} exceeds the {}-entry recovery scan bound or cannot be read; preserved every entry",
+        parent.path.display(), BUNDLE_PUBLISH_BACKUP_SCAN_LIMIT
+    ))?;
     let prefix = bundle_publish_backup_prefix(final_dir)?;
-    for (index, entry) in entries.enumerate() {
-        if index >= BUNDLE_PUBLISH_BACKUP_SCAN_LIMIT {
-            bail!(
-                "Pages bundle publish namespace {} exceeds the {}-entry recovery scan bound; preserved every entry",
-                parent.display(),
-                BUNDLE_PUBLISH_BACKUP_SCAN_LIMIT
-            );
-        }
-        let entry = entry.with_context(|| {
-            format!(
-                "failed reading Pages bundle publish namespace {}",
-                parent.display()
-            )
-        })?;
-        let path = entry.path();
-        if owned_backup == Some(path.as_path()) {
+    for path in entries {
+        if owned_name.is_some_and(|name| path.file_name() == Some(name)) {
             continue;
         }
-        if entry
+        if path
             .file_name()
+            .unwrap_or_default()
             .to_str()
             .is_some_and(|name| name.starts_with(&prefix))
         {
@@ -1230,48 +1735,65 @@ fn update_bundle_evidence_path(hasher: &mut Sha256, kind: u8, path: &str) -> Res
     Ok(())
 }
 
-fn inspect_bundle_tree(path: &Path, label: &str) -> Result<BundleTreeEvidence> {
-    inspect_bundle_tree_with_entry_limit(path, label, BUNDLE_TREE_EVIDENCE_ENTRY_LIMIT)
+fn inspect_bundle_tree(
+    path: &Path,
+    label: &str,
+    parent: &BundlePublishParent,
+) -> Result<BundleTreeEvidence> {
+    inspect_bundle_tree_with_entry_limit(path, label, BUNDLE_TREE_EVIDENCE_ENTRY_LIMIT, parent)
 }
 
 fn inspect_bundle_tree_with_entry_limit(
     path: &Path,
     label: &str,
     entry_limit: usize,
+    parent: &BundlePublishParent,
 ) -> Result<BundleTreeEvidence> {
-    if !ensure_bundle_directory_entry(path, label)? {
+    if !parent.ensure_directory(path, label)? {
         bail!("{label} does not exist: {}", path.display());
     }
+    let tree = parent
+        .directory(path)
+        .with_context(|| format!("failed opening pinned {label} {}", path.display()))?;
+    let evidence = inspect_open_bundle_tree(&tree, label, entry_limit)?;
+    #[cfg(target_os = "linux")]
+    {
+        let current = parent.metadata(path)?;
+        let opened = tree.dir.metadata()?;
+        if current.dev() != opened.dev() || current.ino() != opened.ino() {
+            bail!(
+                "{label} changed identity while inspected: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(evidence)
+}
+
+fn inspect_open_bundle_tree(
+    tree: &BundlePublishParent,
+    label: &str,
+    entry_limit: usize,
+) -> Result<BundleTreeEvidence> {
+    let path = &tree.path;
 
     let mut hasher = Sha256::new();
     hasher.update(BUNDLE_TREE_EVIDENCE_DOMAIN);
     let mut file_count = 0_u64;
     let mut total_size_bytes = 0_u64;
     let mut entry_count = 0_usize;
-    let mut pending_directories = vec![path.to_path_buf()];
+    let mut pending_directories = vec![tree.duplicate()?];
     let mut buffer = [0_u8; 64 * 1024];
 
     while let Some(directory) = pending_directories.pop() {
-        let read_dir = fs::read_dir(&directory)
-            .with_context(|| format!("failed reading {label} directory {}", directory.display()))?;
-        let mut entries = Vec::new();
-        for entry in read_dir {
-            if entry_count >= entry_limit {
-                bail!(
-                    "{label} exceeds the {entry_limit}-entry recovery-evidence bound; preserved the tree without mutation: {}",
-                    path.display()
-                );
-            }
-            entries.push(entry.with_context(|| {
-                format!("failed walking {label} directory {}", directory.display())
-            })?);
-            entry_count += 1;
-        }
-        entries.sort_by_key(|entry| entry.file_name());
+        let entries = directory.entries(entry_limit.saturating_sub(entry_count)).with_context(|| format!( // ubs:ignore[rust.perf.string-alloc-in-loop] -- with_context invokes this allocation only on a failed directory read.
+            "{label} exceeds the {entry_limit}-entry recovery-evidence bound or cannot be read; preserved the tree without mutation: {}",
+            path.display()
+        ))?;
+        entry_count += entries.len();
         let mut child_directories = Vec::new();
 
-        for entry in entries {
-            let entry_path = entry.path();
+        for entry_path in entries {
             let relative = entry_path.strip_prefix(path).with_context(|| {
                 format!(
                     "{label} entry escaped its root {}: {}",
@@ -1285,7 +1807,7 @@ fn inspect_bundle_tree_with_entry_limit(
                     entry_path.display()
                 )
             })?;
-            let metadata = fs::symlink_metadata(&entry_path).with_context(|| {
+            let metadata = directory.metadata(&entry_path).with_context(|| {
                 format!("failed inspecting {label} entry {}", entry_path.display())
             })?;
             let file_type = metadata.file_type();
@@ -1297,7 +1819,7 @@ fn inspect_bundle_tree_with_entry_limit(
             }
             if file_type.is_dir() {
                 update_bundle_evidence_path(&mut hasher, b'D', relative)?;
-                child_directories.push(entry_path);
+                child_directories.push(directory.directory(&entry_path)?);
                 continue;
             }
             if !file_type.is_file() {
@@ -1307,7 +1829,8 @@ fn inspect_bundle_tree_with_entry_limit(
                 );
             }
 
-            let mut file = File::open(&entry_path)
+            let mut file = directory
+                .open_file(&entry_path, false, false)
                 .with_context(|| format!("failed opening {label} file {}", entry_path.display()))?;
             let opened_metadata = file.metadata().with_context(|| {
                 format!(
@@ -1363,9 +1886,11 @@ fn inspect_bundle_tree_with_entry_limit(
                     entry_path.display()
                 );
             }
-            let path_probe = File::open(&entry_path).with_context(|| {
-                format!("failed re-opening {label} file {}", entry_path.display())
-            })?;
+            let path_probe = directory
+                .open_file(&entry_path, false, false)
+                .with_context(|| {
+                    format!("failed re-opening {label} file {}", entry_path.display())
+                })?;
             let path_identity = crate::franken_sync::FileIdentity::from_file(&path_probe)
                 .with_context(|| {
                     format!(
@@ -1385,7 +1910,7 @@ fn inspect_bundle_tree_with_entry_limit(
                     entry_path.display()
                 );
             }
-            let observed_metadata = fs::symlink_metadata(&entry_path).with_context(|| {
+            let observed_metadata = directory.metadata(&entry_path).with_context(|| {
                 format!("failed re-inspecting {label} file {}", entry_path.display())
             })?;
             if !observed_metadata.file_type().is_file()
@@ -1411,6 +1936,7 @@ fn inspect_bundle_tree_with_entry_limit(
                 .ok_or_else(|| anyhow!("{label} total size overflow"))?;
         }
 
+        directory.verify_identity()?;
         for child in child_directories.into_iter().rev() {
             pending_directories.push(child);
         }
@@ -1443,8 +1969,9 @@ fn ensure_bundle_tree_matches(
     path: &Path,
     label: &str,
     expected: &BundleTreeEvidence,
+    parent: &BundlePublishParent,
 ) -> Result<BundleTreeEvidence> {
-    let observed = inspect_bundle_tree(path, label)?;
+    let observed = inspect_bundle_tree(path, label, parent)?;
     if observed != *expected {
         bail!(
             "{label} changed identity or content; preserved it without mutation: {}",
@@ -1473,10 +2000,6 @@ fn bundle_sidecar_random_nonce() -> Result<u128> {
         .fill(&mut bytes)
         .map_err(|_| anyhow!("failed to generate random bundle sidecar nonce"))?;
     Ok(u128::from_le_bytes(bytes))
-}
-
-fn ensure_replaceable_bundle_output_dir(path: &Path) -> Result<bool> {
-    ensure_bundle_directory_entry(path, "bundle output path")
 }
 
 fn ensure_bundle_directory_entry(path: &Path, label: &str) -> Result<bool> {
@@ -1569,21 +2092,23 @@ fn replace_dir_from_temp(
     }
 
     let publish_guard = acquire_bundle_publish_guard(final_dir)?;
+    let parent = &publish_guard.parent;
+    parent.name(temp_dir)?;
     require_bundle_publish_guard(final_dir, &publish_guard)?;
-    recover_interrupted_bundle_publish(final_dir)?;
+    recover_interrupted_bundle_publish(final_dir, parent)?;
     require_bundle_publish_guard(final_dir, &publish_guard)?;
-    let candidate = inspect_bundle_tree(temp_dir, "staged bundle path")?;
-    if !ensure_replaceable_bundle_output_dir(final_dir)? {
+    let candidate = inspect_bundle_tree(temp_dir, "staged bundle path", parent)?;
+    if !parent.ensure_directory(final_dir, "bundle output path")? {
         require_bundle_publish_guard(final_dir, &publish_guard)?;
-        fs::rename(temp_dir, final_dir).with_context(|| {
+        parent.rename(temp_dir, final_dir).with_context(|| {
             format!(
                 "failed renaming completed bundle {} into place at {}",
                 temp_dir.display(),
                 final_dir.display()
             )
         })?;
-        ensure_bundle_tree_matches(final_dir, "first published bundle", &candidate)?;
-        sync_parent_directory(final_dir).with_context(|| {
+        ensure_bundle_tree_matches(final_dir, "first published bundle", &candidate, parent)?;
+        parent.sync().with_context(|| {
             format!(
                 "completed bundle is live at {}, but its first publication could not be durably synced",
                 final_dir.display()
@@ -1592,24 +2117,24 @@ fn replace_dir_from_temp(
         return Ok(());
     }
 
-    let prior = inspect_bundle_tree(final_dir, "prior live bundle")?;
+    let prior = inspect_bundle_tree(final_dir, "prior live bundle", parent)?;
     let backup_dir = unpredictable_bundle_publish_backup_path(final_dir)?;
-    if bundle_path_entry_exists(&backup_dir)? {
+    if parent.exists(&backup_dir)? {
         bail!(
             "unpredictable Pages bundle backup path unexpectedly exists; preserved every generation: {}",
             backup_dir.display()
         );
     }
     require_bundle_publish_guard(final_dir, &publish_guard)?;
-    let journal = write_bundle_publish_journal(final_dir, &backup_dir, &prior, &candidate)?;
-    if bundle_path_entry_exists(&backup_dir)? {
+    let journal = write_bundle_publish_journal(final_dir, &backup_dir, &prior, &candidate, parent)?;
+    if parent.exists(&backup_dir)? {
         bail!(
             "journaled Pages bundle backup path {} appeared before publication; preserved every generation and the journal",
             backup_dir.display()
         );
     }
-    ensure_bundle_tree_matches(final_dir, "prior live bundle", &prior)?;
-    ensure_bundle_tree_matches(temp_dir, "staged bundle path", &candidate)?;
+    ensure_bundle_tree_matches(final_dir, "prior live bundle", &prior, parent)?;
+    ensure_bundle_tree_matches(temp_dir, "staged bundle path", &candidate, parent)?;
     require_bundle_publish_guard(final_dir, &publish_guard)?;
 
     #[cfg(target_os = "linux")]
@@ -1622,6 +2147,8 @@ fn replace_dir_from_temp(
             &prior,
             &candidate,
             retain_temp_on_error,
+            parent,
+            || {},
         )? {
             return Ok(());
         }
@@ -1635,12 +2162,18 @@ fn replace_dir_from_temp(
         &prior,
         &candidate,
         retain_temp_on_error,
+        parent,
     )
 }
 
-fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
-    let Some(journal) = read_bundle_publish_journal(final_dir)? else {
-        if let Some(unowned_backup) = first_unowned_bundle_publish_backup(final_dir, None)? {
+fn recover_interrupted_bundle_publish(
+    final_dir: &Path,
+    parent: &BundlePublishParent,
+) -> Result<()> {
+    let Some(journal) = read_bundle_publish_journal(final_dir, parent)? else {
+        if let Some(unowned_backup) =
+            first_unowned_bundle_publish_backup_in_parent(final_dir, None, parent)?
+        {
             bail!(
                 "unowned Pages bundle recovery artifact {} was preserved; refusing to infer ownership or modify live path {}",
                 unowned_backup.display(),
@@ -1650,7 +2183,8 @@ fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
         return Ok(());
     };
     let backup_dir = validate_bundle_publish_journal(final_dir, &journal)?;
-    if let Some(unowned_backup) = first_unowned_bundle_publish_backup(final_dir, Some(&backup_dir))?
+    if let Some(unowned_backup) =
+        first_unowned_bundle_publish_backup_in_parent(final_dir, Some(&backup_dir), parent)?
     {
         bail!(
             "Pages bundle publish journal identifies {}, but additional unowned recovery artifact {} also exists; preserved every generation",
@@ -1660,18 +2194,20 @@ fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
     }
     let prior = journal_prior_evidence(&journal);
     let candidate = journal_candidate_evidence(&journal);
-    let final_evidence = if ensure_replaceable_bundle_output_dir(final_dir)? {
+    let final_evidence = if parent.ensure_directory(final_dir, "bundle output path")? {
         Some(inspect_bundle_tree(
             final_dir,
             "interrupted bundle publish destination",
+            parent,
         )?)
     } else {
         None
     };
-    let backup_evidence = if bundle_path_entry_exists(&backup_dir)? {
+    let backup_evidence = if parent.exists(&backup_dir)? {
         Some(inspect_bundle_tree(
             &backup_dir,
             "journaled bundle publish backup",
+            parent,
         )?)
     } else {
         None
@@ -1679,30 +2215,36 @@ fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
 
     match (final_evidence, backup_evidence) {
         (None, Some(backup)) if backup == prior => {
-            if bundle_path_entry_exists(final_dir)? {
+            if parent.exists(final_dir)? {
                 bail!(
                     "journaled prior Pages bundle {} was ready to restore, but live path {} was concurrently repopulated; preserved every entry and the journal",
                     backup_dir.display(),
                     final_dir.display()
                 );
             }
-            ensure_bundle_tree_matches(&backup_dir, "journaled prior Pages bundle", &prior)?;
-            fs::rename(&backup_dir, final_dir).with_context(|| {
+            ensure_bundle_tree_matches(
+                &backup_dir,
+                "journaled prior Pages bundle",
+                &prior,
+                parent,
+            )?;
+            parent.verify_identity()?;
+            parent.rename(&backup_dir, final_dir).with_context(|| {
                 format!(
                     "failed restoring journaled prior Pages bundle {} to missing live path {}; preserved the backup and journal",
                     backup_dir.display(),
                     final_dir.display()
                 )
             })?;
-            ensure_bundle_tree_matches(final_dir, "restored prior Pages bundle", &prior)?;
-            sync_parent_directory(final_dir).with_context(|| {
+            ensure_bundle_tree_matches(final_dir, "restored prior Pages bundle", &prior, parent)?;
+            parent.sync().with_context(|| {
                 format!(
                     "restored the prior Pages bundle at {}, but could not durably sync the recovery; journal retained at {}",
                     final_dir.display(),
                     bundle_publish_recovery_journal_path(final_dir).display()
                 )
             })?;
-            remove_bundle_publish_journal(final_dir, &journal)
+            remove_bundle_publish_journal(final_dir, &journal, parent)
         }
         (None, Some(_)) => bail!(
             "journaled Pages bundle backup {} does not match the prior generation while live path {} is missing; preserved the backup and journal",
@@ -1714,24 +2256,32 @@ fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
                 final_dir,
                 "journaled live candidate Pages bundle",
                 &candidate,
+                parent,
             )?;
             cleanup_journaled_bundle_tree_after_publish(
                 &backup_dir,
                 final_dir,
                 "journaled prior Pages bundle",
                 &prior,
+                parent,
             )?;
-            remove_bundle_publish_journal(final_dir, &journal)
+            remove_bundle_publish_journal(final_dir, &journal, parent)
         }
         (Some(live), Some(backup)) if live == prior && backup == candidate => {
-            ensure_bundle_tree_matches(final_dir, "journaled prior live Pages bundle", &prior)?;
+            ensure_bundle_tree_matches(
+                final_dir,
+                "journaled prior live Pages bundle",
+                &prior,
+                parent,
+            )?;
             cleanup_journaled_bundle_tree_after_publish(
                 &backup_dir,
                 final_dir,
                 "journaled rejected candidate Pages bundle",
                 &candidate,
+                parent,
             )?;
-            remove_bundle_publish_journal(final_dir, &journal)
+            remove_bundle_publish_journal(final_dir, &journal, parent)
         }
         (Some(_), Some(_)) => bail!(
             "journaled Pages bundle recovery found live {} and backup {}, but their exact tree evidence does not match a valid publish state; preserved both and the journal",
@@ -1739,8 +2289,13 @@ fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
             backup_dir.display()
         ),
         (Some(live), None) if live == prior || live == candidate => {
-            ensure_bundle_tree_matches(final_dir, "journaled surviving Pages bundle", &live)?;
-            remove_bundle_publish_journal(final_dir, &journal)
+            ensure_bundle_tree_matches(
+                final_dir,
+                "journaled surviving Pages bundle",
+                &live,
+                parent,
+            )?;
+            remove_bundle_publish_journal(final_dir, &journal, parent)
         }
         (Some(_), None) => bail!(
             "Pages bundle publish journal remains at {}, but live tree {} matches neither journaled generation; preserved both",
@@ -1761,10 +2316,20 @@ fn cleanup_journaled_bundle_tree_after_publish(
     final_dir: &Path,
     label: &str,
     expected: &BundleTreeEvidence,
+    parent: &BundlePublishParent,
 ) -> Result<()> {
-    cleanup_journaled_bundle_tree_after_publish_with(tree_dir, final_dir, label, expected, |path| {
-        fs::remove_dir_all(path)
-    })
+    cleanup_journaled_bundle_tree_after_publish_with(
+        tree_dir,
+        final_dir,
+        label,
+        expected,
+        |path| {
+            parent
+                .remove_tree(path, expected)
+                .map_err(std::io::Error::other)
+        },
+        parent,
+    )
 }
 
 fn cleanup_journaled_bundle_tree_after_publish_with<F>(
@@ -1773,11 +2338,12 @@ fn cleanup_journaled_bundle_tree_after_publish_with<F>(
     label: &str,
     expected: &BundleTreeEvidence,
     remove_dir: F,
+    parent: &BundlePublishParent,
 ) -> Result<()>
 where
     F: FnOnce(&Path) -> std::io::Result<()>,
 {
-    ensure_bundle_tree_matches(tree_dir, label, expected)?;
+    ensure_bundle_tree_matches(tree_dir, label, expected, parent)?;
     remove_dir(tree_dir).with_context(|| {
         format!(
             "new bundle is live at {}, but failed to remove {label} containing private artifacts retained at {}",
@@ -1785,7 +2351,7 @@ where
             tree_dir.display()
         )
     })?;
-    sync_parent_directory(final_dir).with_context(|| {
+    parent.sync().with_context(|| {
         format!(
             "removed {label} after publishing {}, but could not durably sync its parent directory",
             final_dir.display()
@@ -1794,7 +2360,8 @@ where
 }
 
 #[cfg(target_os = "linux")]
-fn try_publish_linux_bundle_via_atomic_exchange(
+#[allow(clippy::too_many_arguments)]
+fn try_publish_linux_bundle_via_atomic_exchange<F>(
     temp_dir: &Path,
     final_dir: &Path,
     backup_dir: &Path,
@@ -1802,26 +2369,36 @@ fn try_publish_linux_bundle_via_atomic_exchange(
     prior: &BundleTreeEvidence,
     candidate: &BundleTreeEvidence,
     retain_temp_on_error: &mut bool,
-) -> Result<bool> {
-    fs::rename(temp_dir, backup_dir).with_context(|| {
+    parent: &BundlePublishParent,
+    after_staging: F,
+) -> Result<bool>
+where
+    F: FnOnce(),
+{
+    parent.verify_identity()?;
+    parent.rename(temp_dir, backup_dir).with_context(|| {
         format!(
             "failed moving staged bundle {} to journaled atomic-exchange path {}",
             temp_dir.display(),
             backup_dir.display()
         )
     })?;
-    if let Err(error) =
-        ensure_bundle_tree_matches(backup_dir, "journaled atomic-exchange candidate", candidate)
-    {
+    if let Err(error) = ensure_bundle_tree_matches(
+        backup_dir,
+        "journaled atomic-exchange candidate",
+        candidate,
+        parent,
+    ) {
         *retain_temp_on_error = true;
         return Err(error);
     }
-    if let Err(sync_error) = sync_parent_directory(backup_dir) {
+    if let Err(sync_error) = parent.sync() {
         return match restore_linux_atomic_staged_candidate(
             backup_dir,
             temp_dir,
             candidate,
             retain_temp_on_error,
+            parent,
         ) {
             Ok(()) => Err(sync_error).with_context(|| {
                 format!(
@@ -1838,9 +2415,13 @@ fn try_publish_linux_bundle_via_atomic_exchange(
         };
     }
 
-    match crate::indexer::atomic_exchange_paths(final_dir, backup_dir) {
+    after_staging();
+    match parent
+        .exchange(final_dir, backup_dir)
+        .map_err(anyhow::Error::from)
+    {
         Ok(()) => {
-            if let Err(sync_error) = sync_parent_directory(final_dir) {
+            if let Err(sync_error) = parent.sync() {
                 *retain_temp_on_error = true;
                 bail!(
                     "new bundle is live at {} after atomic exchange, but the parent directory sync failed: {}; prior bundle containing private artifacts retained at {}",
@@ -1849,9 +2430,12 @@ fn try_publish_linux_bundle_via_atomic_exchange(
                     backup_dir.display()
                 );
             }
-            if let Err(error) =
-                ensure_bundle_tree_matches(final_dir, "published Pages bundle candidate", candidate)
-            {
+            if let Err(error) = ensure_bundle_tree_matches(
+                final_dir,
+                "published Pages bundle candidate",
+                candidate,
+                parent,
+            ) {
                 *retain_temp_on_error = true;
                 return Err(error);
             }
@@ -1860,11 +2444,12 @@ fn try_publish_linux_bundle_via_atomic_exchange(
                 final_dir,
                 "journaled prior Pages bundle",
                 prior,
+                parent,
             ) {
                 *retain_temp_on_error = true;
                 return Err(cleanup_error);
             }
-            remove_bundle_publish_journal(final_dir, journal)?;
+            remove_bundle_publish_journal(final_dir, journal, parent)?;
             Ok(true)
         }
         Err(exchange_error)
@@ -1875,6 +2460,7 @@ fn try_publish_linux_bundle_via_atomic_exchange(
                 temp_dir,
                 candidate,
                 retain_temp_on_error,
+                parent,
             )
             .context(
                 "atomic bundle exchange is unsupported and the staged candidate could not be restored for rename-pair publication",
@@ -1892,6 +2478,7 @@ fn try_publish_linux_bundle_via_atomic_exchange(
                 temp_dir,
                 candidate,
                 retain_temp_on_error,
+                parent,
             ) {
                 Ok(()) => Err(exchange_error).with_context(|| {
                     format!(
@@ -1917,8 +2504,9 @@ fn restore_linux_atomic_staged_candidate(
     temp_dir: &Path,
     candidate: &BundleTreeEvidence,
     retain_temp_on_error: &mut bool,
+    parent: &BundlePublishParent,
 ) -> Result<()> {
-    if let Err(restore_error) = fs::rename(backup_dir, temp_dir) {
+    if let Err(restore_error) = parent.rename(backup_dir, temp_dir) {
         *retain_temp_on_error = true;
         bail!(
             "failed restoring staged bundle from journaled atomic-exchange path {} to {}; staged bundle containing private artifacts retained at {}: {}",
@@ -1932,11 +2520,12 @@ fn restore_linux_atomic_staged_candidate(
         temp_dir,
         "restored staged Pages bundle candidate",
         candidate,
+        parent,
     ) {
         *retain_temp_on_error = true;
         return Err(error);
     }
-    sync_parent_directory(temp_dir).with_context(|| {
+    parent.sync().with_context(|| {
         format!(
             "restored staged bundle to {}, but could not durably sync the rename from {}",
             temp_dir.display(),
@@ -1945,6 +2534,7 @@ fn restore_linux_atomic_staged_candidate(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replace_dir_from_temp_via_recoverable_rename_pair(
     temp_dir: &Path,
     final_dir: &Path,
@@ -1953,16 +2543,18 @@ fn replace_dir_from_temp_via_recoverable_rename_pair(
     prior: &BundleTreeEvidence,
     candidate: &BundleTreeEvidence,
     retain_temp_on_error: &mut bool,
+    parent: &BundlePublishParent,
 ) -> Result<()> {
-    ensure_bundle_tree_matches(final_dir, "prior live Pages bundle", prior)?;
-    ensure_bundle_tree_matches(temp_dir, "staged Pages bundle candidate", candidate)?;
-    if bundle_path_entry_exists(backup_dir)? {
+    ensure_bundle_tree_matches(final_dir, "prior live Pages bundle", prior, parent)?;
+    ensure_bundle_tree_matches(temp_dir, "staged Pages bundle candidate", candidate, parent)?;
+    if parent.exists(backup_dir)? {
         bail!(
             "journaled Pages bundle backup path appeared before rename-pair publication; preserved every generation: {}",
             backup_dir.display()
         );
     }
-    fs::rename(final_dir, backup_dir).with_context(|| {
+    parent.verify_identity()?;
+    parent.rename(final_dir, backup_dir).with_context(|| {
         format!(
             "failed parking live bundle {} at journaled recovery path {}",
             final_dir.display(),
@@ -1970,17 +2562,22 @@ fn replace_dir_from_temp_via_recoverable_rename_pair(
         )
     })?;
     if let Err(error) =
-        ensure_bundle_tree_matches(backup_dir, "journaled prior Pages bundle", prior)
+        ensure_bundle_tree_matches(backup_dir, "journaled prior Pages bundle", prior, parent)
     {
         *retain_temp_on_error = true;
         return Err(error);
     }
 
-    if let Err(park_sync_error) = sync_parent_directory(final_dir) {
-        return match fs::rename(backup_dir, final_dir) {
+    if let Err(park_sync_error) = parent.sync() {
+        return match parent.rename(backup_dir, final_dir) {
             Ok(()) => {
-                ensure_bundle_tree_matches(final_dir, "restored prior Pages bundle", prior)?;
-                sync_parent_directory(final_dir).with_context(|| {
+                ensure_bundle_tree_matches(
+                    final_dir,
+                    "restored prior Pages bundle",
+                    prior,
+                    parent,
+                )?;
+                parent.sync().with_context(|| {
                     format!(
                         "failed syncing recovery after restoring prior live bundle at {}",
                         final_dir.display()
@@ -2009,15 +2606,18 @@ fn replace_dir_from_temp_via_recoverable_rename_pair(
         };
     }
 
-    match fs::rename(temp_dir, final_dir) {
+    match parent.rename(temp_dir, final_dir) {
         Ok(()) => {
-            if let Err(error) =
-                ensure_bundle_tree_matches(final_dir, "published Pages bundle candidate", candidate)
-            {
+            if let Err(error) = ensure_bundle_tree_matches(
+                final_dir,
+                "published Pages bundle candidate",
+                candidate,
+                parent,
+            ) {
                 *retain_temp_on_error = true;
                 return Err(error);
             }
-            if let Err(sync_error) = sync_parent_directory(final_dir) {
+            if let Err(sync_error) = parent.sync() {
                 *retain_temp_on_error = true;
                 bail!(
                     "new bundle was moved into place at {}, but the publish could not be durably synced: {}; prior bundle containing private artifacts retained at {}",
@@ -2031,16 +2631,22 @@ fn replace_dir_from_temp_via_recoverable_rename_pair(
                 final_dir,
                 "journaled prior Pages bundle",
                 prior,
+                parent,
             ) {
                 *retain_temp_on_error = true;
                 return Err(cleanup_error);
             }
-            remove_bundle_publish_journal(final_dir, journal)
+            remove_bundle_publish_journal(final_dir, journal, parent)
         }
-        Err(publish_error) => match fs::rename(backup_dir, final_dir) {
+        Err(publish_error) => match parent.rename(backup_dir, final_dir) {
             Ok(()) => {
-                ensure_bundle_tree_matches(final_dir, "restored prior Pages bundle", prior)?;
-                sync_parent_directory(final_dir)?;
+                ensure_bundle_tree_matches(
+                    final_dir,
+                    "restored prior Pages bundle",
+                    prior,
+                    parent,
+                )?;
+                parent.sync()?;
                 Err(publish_error).with_context(|| {
                     format!(
                         "failed publishing staged bundle {} at {}; restored the prior live bundle",
@@ -3090,6 +3696,83 @@ mod tests {
     use crate::pages::archive_config::{ArchiveConfig, UnencryptedPayload};
     use tempfile::TempDir;
 
+    // Fixture operations use the same verified parent and lock as production.
+    fn inspect_bundle_tree(path: &Path, label: &str) -> Result<BundleTreeEvidence> {
+        super::inspect_bundle_tree(path, label, &BundlePublishParent::for_output(path, false)?)
+    }
+
+    fn inspect_bundle_tree_with_entry_limit(
+        path: &Path,
+        label: &str,
+        limit: usize,
+    ) -> Result<BundleTreeEvidence> {
+        super::inspect_bundle_tree_with_entry_limit(
+            path,
+            label,
+            limit,
+            &BundlePublishParent::for_output(path, false)?,
+        )
+    }
+
+    fn write_bundle_publish_journal(
+        final_dir: &Path,
+        backup: &Path,
+        prior: &BundleTreeEvidence,
+        candidate: &BundleTreeEvidence,
+    ) -> Result<BundlePublishJournal> {
+        let guard = acquire_bundle_publish_guard(final_dir)?;
+        super::write_bundle_publish_journal(final_dir, backup, prior, candidate, &guard.parent)
+    }
+
+    fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
+        let guard = acquire_bundle_publish_guard(final_dir)?;
+        super::recover_interrupted_bundle_publish(final_dir, &guard.parent)
+    }
+
+    fn cleanup_journaled_bundle_tree_after_publish_with<F>(
+        tree: &Path,
+        final_dir: &Path,
+        label: &str,
+        expected: &BundleTreeEvidence,
+        remove: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&Path) -> std::io::Result<()>,
+    {
+        let guard = acquire_bundle_publish_guard(final_dir)?;
+        super::cleanup_journaled_bundle_tree_after_publish_with(
+            tree,
+            final_dir,
+            label,
+            expected,
+            remove,
+            &guard.parent,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn replace_dir_from_temp_via_recoverable_rename_pair(
+        temp: &Path,
+        final_dir: &Path,
+        backup: &Path,
+        journal: &BundlePublishJournal,
+        prior: &BundleTreeEvidence,
+        candidate: &BundleTreeEvidence,
+        retain: &mut bool,
+    ) -> Result<()> {
+        let guard = acquire_bundle_publish_guard(final_dir)?;
+        super::replace_dir_from_temp_via_recoverable_rename_pair(
+            temp,
+            final_dir,
+            backup,
+            journal,
+            prior,
+            candidate,
+            retain,
+            &guard.parent,
+        )
+    }
+
     fn write_unencrypted_source(root: &Path, payload_name: &str, body: &str) {
         let payload_dir = root.join("payload");
         fs::create_dir_all(&payload_dir).unwrap();
@@ -3255,6 +3938,7 @@ mod tests {
         write_private_artifact_file(&private_dir, "master-key.json", b"new generation")?;
 
         let installed = fs::read(private_dir.join("master-key.json"))?;
+        // ubs:ignore[rust.security.constant-time-compare] -- These are public synthetic generation markers in a filesystem test.
         if installed != b"new generation" {
             return Err(anyhow!(
                 "private artifact replacement published stale bytes"
@@ -4120,6 +4804,405 @@ mod tests {
                 .is_none(),
             "completed publication should not leave a recovery backup"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn publish_parent_swap_after_validation_cannot_redirect_rename() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new()?;
+        let parent_path = temp.path().join("publish");
+        let parked_parent = temp.path().join("pinned");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(parent_path.join("staged"))?;
+        fs::create_dir_all(&outside)?;
+        fs::write(parent_path.join("staged/secret"), "candidate")?;
+        let parent = BundlePublishParent::open(&parent_path, false)?;
+        parent.rename_with(
+            &parent_path.join("staged"),
+            &parent_path.join("live"),
+            || {
+                fs::rename(&parent_path, &parked_parent)?;
+                symlink(&outside, &parent_path)
+            },
+        )?;
+        assert_eq!(
+            fs::read_to_string(parked_parent.join("live/secret"))?,
+            "candidate"
+        );
+        assert!(!outside.join("live").exists());
+        assert!(!outside.join("staged").exists());
+        assert!(parent.verify_identity().is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn publication_refuses_symlinked_ancestor_and_pins_nested_parent() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new()?;
+        let real = temp.path().join("real");
+        let alias = temp.path().join("alias");
+        fs::create_dir_all(real.join("nested"))?;
+        symlink(&real, &alias)?;
+        assert!(BundlePublishParent::open(&alias.join("nested"), false).is_err());
+        let final_dir = real.join("nested/bundle");
+        let guard = acquire_bundle_publish_guard(&final_dir)?;
+        fs::rename(&real, temp.path().join("parked"))?;
+        fs::create_dir_all(real.join("nested"))?;
+        let error = require_bundle_publish_guard(&final_dir, &guard)
+            .expect_err("a new real directory cannot inherit the pinned namespace");
+        assert!(format!("{error:#}").contains("changed identity"));
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn publish_open_refuses_entry_swapped_to_symlink_after_metadata() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new()?;
+        let entry = temp.path().join("entry");
+        let saved = temp.path().join("saved");
+        let outside = temp.path().join("outside-secret");
+        fs::write(&entry, "owned")?;
+        fs::write(&outside, "outside")?;
+        let parent = BundlePublishParent::open(temp.path(), false)?;
+        assert!(parent.metadata(&entry)?.is_file());
+        fs::rename(&entry, &saved)?;
+        symlink(&outside, &entry)?;
+        assert!(parent.open_file(&entry, true, false).is_err());
+        assert_eq!(fs::read_to_string(&outside)?, "outside");
+        assert_eq!(fs::read_to_string(&saved)?, "owned");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn publish_lock_symlink_hardlink_and_replacement_cannot_authorize_rename() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new()?;
+        let outside = temp.path().join("outside");
+        fs::write(&outside, "unchanged")?;
+        let symlink_output = temp.path().join("symlink-output");
+        symlink(&outside, bundle_publish_lock_path(&symlink_output))?;
+        assert!(acquire_bundle_publish_guard(&symlink_output).is_err());
+        let hardlink_output = temp.path().join("hardlink-output");
+        fs::hard_link(&outside, bundle_publish_lock_path(&hardlink_output))?;
+        assert!(acquire_bundle_publish_guard(&hardlink_output).is_err());
+        let final_dir = temp.path().join("bundle");
+        let staged = temp.path().join("staged");
+        fs::create_dir(&staged)?;
+        let guard = acquire_bundle_publish_guard(&final_dir)?;
+        fs::rename(&guard.lock_path, temp.path().join("original-lock"))?;
+        fs::write(&guard.lock_path, "replacement")?;
+        assert!(guard.parent.rename(&staged, &final_dir).is_err());
+        assert!(staged.is_dir());
+        assert!(!final_dir.exists());
+        assert_eq!(fs::read_to_string(&outside)?, "unchanged");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn publication_noreplace_preserves_concurrently_repopulated_destination() -> Result<()> {
+        let temp = TempDir::new()?;
+        let staged = temp.path().join("staged");
+        let final_dir = temp.path().join("bundle");
+        fs::create_dir(&staged)?;
+        fs::write(staged.join("candidate"), "new")?;
+        let guard = acquire_bundle_publish_guard(&final_dir)?;
+        assert!(!guard.parent.exists(&final_dir)?);
+        let error = guard
+            .parent
+            .rename_with(&staged, &final_dir, || fs::create_dir(&final_dir))
+            .expect_err("a destination created after validation must be preserved");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(final_dir.is_dir());
+        assert_eq!(fs::read_to_string(staged.join("candidate"))?, "new");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn publication_cleanup_swap_preserves_outside_tree_and_parked_generation() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new()?;
+        let final_dir = temp.path().join("bundle");
+        let backup = temp.path().join("backup");
+        let parked = temp.path().join("parked");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(backup.join("private"))?;
+        fs::create_dir_all(&outside)?;
+        fs::write(backup.join("private/secret"), "old")?;
+        fs::write(outside.join("sentinel"), "outside")?;
+        let guard = acquire_bundle_publish_guard(&final_dir)?;
+        let expected = super::inspect_bundle_tree(&backup, "backup", &guard.parent)?;
+        let error = super::cleanup_journaled_bundle_tree_after_publish_with(
+            &backup,
+            &final_dir,
+            "prior Pages bundle",
+            &expected,
+            |path| {
+                fs::rename(path, &parked)?;
+                symlink(&outside, path)?;
+                guard
+                    .parent
+                    .remove_tree(path, &expected)
+                    .map_err(std::io::Error::other)
+            },
+            &guard.parent,
+        )
+        .expect_err("a swapped cleanup root must be retained");
+        assert!(format!("{error:#}").contains("private artifacts retained"));
+        assert_eq!(fs::read_to_string(outside.join("sentinel"))?, "outside");
+        assert_eq!(fs::read_to_string(parked.join("private/secret"))?, "old");
+        assert!(fs::symlink_metadata(backup)?.file_type().is_symlink());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn rejected_stage_cleanup_refuses_replaced_parent_and_entry() -> Result<()> {
+        let temp = TempDir::new()?;
+        let parent = temp.path().join("publish");
+        let stage = parent.join("staged");
+        let opened = create_bundle_staging_root(&stage)?;
+        fs::write(stage.join("private"), "owned")?;
+        fs::rename(&parent, temp.path().join("parked-parent"))?;
+        fs::create_dir_all(&stage)?;
+        fs::write(stage.join("sentinel"), "replacement")?;
+        let error = cleanup_rejected_bundle_temp(&stage, &opened)
+            .expect_err("a rejected-stage name is not sufficient cleanup authority");
+        assert!(format!("{error:#}").contains("changed identity"));
+        assert_eq!(fs::read_to_string(stage.join("sentinel"))?, "replacement");
+        assert_eq!(
+            fs::read_to_string(temp.path().join("parked-parent/staged/private"))?,
+            "owned"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn different_bundle_outputs_have_independent_publication_locks() -> Result<()> {
+        let temp = TempDir::new()?;
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        let first_guard = acquire_bundle_publish_guard(&first)?;
+        let second_guard = acquire_bundle_publish_guard(&second)?;
+        require_bundle_publish_guard(&first, &first_guard)?;
+        require_bundle_publish_guard(&second, &second_guard)?;
+        Ok(())
+    }
+
+    #[test]
+    fn publication_refuses_staged_tree_from_another_parent() -> Result<()> {
+        let temp = TempDir::new()?;
+        let final_dir = temp.path().join("publish/bundle");
+        let staged = temp.path().join("staging/bundle");
+        fs::create_dir_all(final_dir.join("site"))?;
+        fs::create_dir_all(staged.join("private"))?;
+        fs::write(staged.join("private/secret"), "new")?;
+        let mut retain = false;
+        let error = replace_dir_from_temp(&staged, &final_dir, &mut retain)
+            .expect_err("publication must stay inside one pinned parent");
+        assert!(format!("{error:#}").contains("same parent directory"));
+        assert_eq!(fs::read_to_string(staged.join("private/secret"))?, "new");
+        assert!(final_dir.join("site").is_dir());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn publication_exchange_moves_symlink_entry_without_following_its_referent() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new()?;
+        let final_dir = temp.path().join("bundle");
+        let staged = temp.path().join("staged");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside)?;
+        fs::create_dir(&staged)?;
+        fs::write(outside.join("sentinel"), "outside")?;
+        fs::write(staged.join("candidate"), "new")?;
+        let guard = acquire_bundle_publish_guard(&final_dir)?;
+        symlink(&outside, &final_dir)?;
+        guard.parent.exchange(&staged, &final_dir)?;
+        assert_eq!(fs::read_to_string(final_dir.join("candidate"))?, "new");
+        assert!(fs::symlink_metadata(&staged)?.file_type().is_symlink());
+        assert_eq!(fs::read_to_string(outside.join("sentinel"))?, "outside");
+        assert!(super::inspect_bundle_tree(&staged, "swapped prior", &guard.parent).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn publication_journal_symlink_is_preserved_without_following_it() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new()?;
+        let final_dir = temp.path().join("bundle");
+        let outside = temp.path().join("outside-journal");
+        fs::write(&outside, "outside")?;
+        let guard = acquire_bundle_publish_guard(&final_dir)?;
+        let journal = bundle_publish_recovery_journal_path(&final_dir);
+        symlink(&outside, &journal)?;
+        assert!(super::recover_interrupted_bundle_publish(&final_dir, &guard.parent).is_err());
+        assert!(fs::symlink_metadata(journal)?.file_type().is_symlink());
+        assert_eq!(fs::read_to_string(outside)?, "outside");
+        assert!(!final_dir.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn publication_restart_cleans_journal_with_only_prior_or_candidate_surviving() -> Result<()> {
+        for candidate_survives in [false, true] {
+            let temp = TempDir::new()?;
+            let final_dir = temp.path().join("bundle");
+            let staged = temp.path().join("staged");
+            fs::create_dir(&final_dir)?;
+            fs::create_dir(&staged)?;
+            fs::write(final_dir.join("generation"), "old")?;
+            fs::write(staged.join("generation"), "new")?;
+            let prior = inspect_bundle_tree(&final_dir, "prior")?;
+            let candidate = inspect_bundle_tree(&staged, "candidate")?;
+            let backup = unpredictable_bundle_publish_backup_path(&final_dir)?;
+            write_bundle_publish_journal(&final_dir, &backup, &prior, &candidate)?;
+            if candidate_survives {
+                fs::rename(&final_dir, temp.path().join("retired-prior"))?;
+                fs::rename(&staged, &final_dir)?;
+            }
+            recover_interrupted_bundle_publish(&final_dir)?;
+            assert_eq!(
+                fs::read_to_string(final_dir.join("generation"))?,
+                if candidate_survives { "new" } else { "old" }
+            );
+            assert!(!bundle_publish_recovery_journal_path(&final_dir).exists());
+            assert!(!backup.exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn publication_restart_recovers_relative_output_spellings() -> Result<()> {
+        const CHILD: &str = "CASS_TEST_RELATIVE_BUNDLE_RECOVERY";
+        if matches!(dotenvy::var(CHILD).as_deref(), Ok("1")) {
+            for (output, stage) in [("bundle", "staged"), ("./dotted-bundle", "./dotted-staged")] {
+                let final_dir = Path::new(output);
+                let staged = Path::new(stage);
+                fs::create_dir(final_dir)?;
+                fs::create_dir(staged)?;
+                fs::write(final_dir.join("generation"), "old")?;
+                fs::write(staged.join("generation"), "new")?;
+                let prior = inspect_bundle_tree(final_dir, "prior")?;
+                let candidate = inspect_bundle_tree(staged, "candidate")?;
+                let backup = unpredictable_bundle_publish_backup_path(final_dir)?;
+                write_bundle_publish_journal(final_dir, &backup, &prior, &candidate)?;
+                fs::rename(final_dir, &backup)?;
+                recover_interrupted_bundle_publish(final_dir)?;
+                assert_eq!(fs::read_to_string(final_dir.join("generation"))?, "old");
+                assert_eq!(fs::read_to_string(staged.join("generation"))?, "new");
+                assert!(!backup.exists());
+                assert!(!bundle_publish_recovery_journal_path(final_dir).exists());
+            }
+            return Ok(());
+        }
+        let temp = TempDir::new()?;
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "pages::bundle::tests::publication_restart_recovers_relative_output_spellings",
+                "--nocapture",
+            ])
+            .current_dir(temp.path())
+            .env(CHILD, "1")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "relative-output restart child failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A zero-test child cannot satisfy the parent: both restored files
+        // must exist in the isolated working directory.
+        for name in ["bundle", "dotted-bundle"] {
+            assert_eq!(
+                fs::read_to_string(temp.path().join(name).join("generation"))?,
+                "old"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn publication_swap_after_durable_staging_retains_named_backup() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        for replace_lock in [true, false] {
+            let temp = TempDir::new()?;
+            let final_dir = temp.path().join("bundle");
+            let staged = temp.path().join("staged");
+            let outside = temp.path().join("outside");
+            fs::create_dir(&final_dir)?;
+            fs::create_dir(&staged)?;
+            fs::create_dir(&outside)?;
+            fs::write(final_dir.join("generation"), "old")?;
+            fs::write(staged.join("generation"), "new")?;
+            fs::write(outside.join("sentinel"), "outside")?;
+            let guard = acquire_bundle_publish_guard(&final_dir)?;
+            let prior = super::inspect_bundle_tree(&final_dir, "prior", &guard.parent)?;
+            let candidate = super::inspect_bundle_tree(&staged, "candidate", &guard.parent)?;
+            let backup = unpredictable_bundle_publish_backup_path(&final_dir)?;
+            let journal = super::write_bundle_publish_journal(
+                &final_dir,
+                &backup,
+                &prior,
+                &candidate,
+                &guard.parent,
+            )?;
+            let mut retain = false;
+            let error = super::try_publish_linux_bundle_via_atomic_exchange(
+                &staged,
+                &final_dir,
+                &backup,
+                &journal,
+                &prior,
+                &candidate,
+                &mut retain,
+                &guard.parent,
+                || {
+                    if replace_lock {
+                        fs::rename(&guard.lock_path, temp.path().join("parked-lock"))
+                            .expect("swap original lock");
+                        fs::write(&guard.lock_path, "replacement")
+                            .expect("install replacement lock");
+                    } else {
+                        fs::rename(&final_dir, temp.path().join("parked-prior"))
+                            .expect("park prior generation");
+                        symlink(&outside, &final_dir).expect("swap live entry to outside symlink");
+                    }
+                },
+            )
+            .expect_err("a post-staging lock or live-entry swap cannot complete publication");
+            let rendered = format!("{error:#}");
+            assert!(retain);
+            assert!(rendered.contains(&backup.display().to_string()));
+            assert!(backup.symlink_metadata().is_ok());
+            assert!(bundle_publish_recovery_journal_path(&final_dir).exists());
+            assert_eq!(fs::read_to_string(outside.join("sentinel"))?, "outside");
+            assert_eq!(
+                fs::read_to_string(final_dir.join("generation"))?,
+                if replace_lock { "old" } else { "new" }
+            );
+            if replace_lock {
+                assert!(rendered.contains(&staged.display().to_string()));
+                assert_eq!(fs::read_to_string(backup.join("generation"))?, "new");
+            } else {
+                assert!(fs::symlink_metadata(&backup)?.file_type().is_symlink());
+                assert_eq!(
+                    fs::read_to_string(temp.path().join("parked-prior/generation"))?,
+                    "old"
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]
