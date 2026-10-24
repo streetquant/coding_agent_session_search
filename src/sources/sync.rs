@@ -30,6 +30,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use fs2::FileExt;
 use thiserror::Error;
 
 use super::{
@@ -718,6 +719,70 @@ impl PathSyncResult {
     }
 }
 
+/// rsync's documented exit code for an error in the SSH transport layer.
+///
+/// A transport failure means the SSH session itself never produced a usable
+/// rsync channel, so any "Permission denied" in the output is an
+/// authentication problem.
+fn rsync_exit_is_transport_failure(exit_code: Option<i32>) -> bool {
+    matches!(exit_code, Some(255))
+}
+
+/// rsync's documented exit codes for a partial transfer.
+///
+/// 23 = some files could not be transferred, 24 = some files vanished at the
+/// source. The remote side ran and moved part of the tree in both cases.
+fn rsync_exit_is_partial_transfer(exit_code: Option<i32>) -> bool {
+    matches!(exit_code, Some(23) | Some(24))
+}
+
+/// Classify a failed rsync run into a truthful failure message.
+///
+/// The exit code separates a transport failure (255) from a transfer-level
+/// failure (1-24). That distinction decides whether "Permission denied" means
+/// "the SSH key was rejected" or "the remote account cannot read that path",
+/// and whether the run moved part of the tree before it failed.
+fn rsync_failure_message(
+    host: &str,
+    expanded_path: &str,
+    stderr: &str,
+    exit_code: Option<i32>,
+    files_transferred: u64,
+) -> String {
+    let trimmed = stderr.trim();
+    if stderr.contains("Connection refused") || stderr.contains("Connection timed out") {
+        return format!("SSH connection failed: {trimmed}");
+    }
+    if is_host_key_verification_failure(stderr) {
+        return host_key_verification_error(host);
+    }
+    if stderr.contains("No such file or directory") && files_transferred == 0 {
+        // Nothing moved and the remote path does not exist: a total failure
+        // with a missing path, not a partial transfer.
+        return format!("Remote path not found: {expanded_path}");
+    }
+    if rsync_exit_is_transport_failure(exit_code) {
+        // The SSH session failed. Keep the historical wording so an
+        // authentication problem keeps its "authentication" reason.
+        if stderr.contains("Permission denied") {
+            return format!("Permission denied: {trimmed}");
+        }
+        return format!("rsync failed: {trimmed}");
+    }
+    if rsync_exit_is_partial_transfer(exit_code) {
+        return format!(
+            "rsync partial transfer (exit {}): {trimmed}",
+            exit_code.unwrap_or_default()
+        );
+    }
+    if stderr.contains("Permission denied") {
+        // The SSH session succeeded and rsync could not read a remote path:
+        // a remote filesystem permission problem, not an auth failure.
+        return format!("Remote path permission denied: {trimmed}");
+    }
+    format!("rsync failed: {trimmed}")
+}
+
 pub fn sync_failure_reason(error: &str) -> &'static str {
     let lower = error.to_ascii_lowercase();
 
@@ -729,6 +794,10 @@ pub fn sync_failure_reason(error: &str) -> &'static str {
         "missing_paths"
     } else if lower.contains("invalid source definition") {
         "invalid_source"
+    } else if lower.contains("remote path permission denied") {
+        "remote_permission_denied"
+    } else if lower.contains("partial transfer") {
+        "partial_transfer"
     } else if lower.contains("permission denied")
         || lower.contains("no valid authentication")
         || lower.contains("authentication failed")
@@ -1321,24 +1390,26 @@ impl SyncEngine {
         }
 
         if !status_success {
-            // Check for specific error types
-            let error_msg = if stderr.contains("Connection refused")
-                || stderr.contains("Connection timed out")
-            {
-                format!("SSH connection failed: {}", stderr.trim())
-            } else if is_host_key_verification_failure(&stderr) {
-                host_key_verification_error(host)
-            } else if stderr.contains("No such file or directory") {
-                format!("Remote path not found: {}", expanded_path)
-            } else if stderr.contains("Permission denied") {
-                format!("Permission denied: {}", stderr.trim())
-            } else {
-                format!("rsync failed: {}", stderr.trim())
-            };
+            // rsync keeps reporting what it moved even when it exits non-zero
+            // (23/24 = partial transfer). Dropping those numbers would report
+            // a partial transfer as "0 files / 0 bytes" and hide the fact that
+            // data already landed in the mirror.
+            let stats = parse_rsync_stats(&stdout);
+            let exit_code = output.status.code();
+            let error_msg = rsync_failure_message(
+                host,
+                &expanded_path,
+                &stderr,
+                exit_code,
+                stats.files_transferred,
+            );
 
             tracing::warn!(
                 host = %host,
                 remote_path = %expanded_path,
+                exit_code = ?exit_code,
+                files = stats.files_transferred,
+                bytes = stats.bytes_transferred,
                 error = %error_msg,
                 "rsync failed"
             );
@@ -1346,6 +1417,8 @@ impl SyncEngine {
             return PathSyncResult {
                 remote_path: remote_path.to_string(),
                 local_path,
+                files_transferred: stats.files_transferred,
+                bytes_transferred: stats.bytes_transferred,
                 success: false,
                 error: Some(error_msg),
                 duration_ms,
@@ -2889,6 +2962,51 @@ impl SourceSyncInfo {
 pub struct SyncStatus {
     /// Sync info per source (keyed by source name).
     pub sources: std::collections::HashMap<String, SourceSyncInfo>,
+    /// Source names this instance loaded from the durable ledger.
+    ///
+    /// A loaded name that is no longer carried was removed by the caller; a
+    /// name that is on disk but was never loaded belongs to a concurrent
+    /// writer and has to survive the merge.
+    #[serde(skip)]
+    loaded_source_names: std::collections::HashSet<String>,
+    /// Source names this instance wrote explicitly.
+    ///
+    /// An explicit write always wins over whatever a concurrent writer left
+    /// on disk for the same source.
+    #[serde(skip)]
+    updated_source_names: std::collections::HashSet<String>,
+}
+
+/// Cross-process lock for the durable sync ledger.
+///
+/// The ledger is a read-modify-write target: a manual `cass sources sync` and
+/// the scheduler's own per-source sync both write it, so the write has to be
+/// serialized and merged instead of replacing the file wholesale.
+struct SyncStatusLock {
+    file: std::fs::File,
+}
+
+impl SyncStatusLock {
+    fn acquire(data_dir: &Path) -> Result<Self, std::io::Error> {
+        let path = data_dir.join("sync_status.lock");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        FileExt::lock_exclusive(&file)?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for SyncStatusLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
 }
 
 impl SyncStatus {
@@ -2896,8 +3014,12 @@ impl SyncStatus {
     pub fn load(data_dir: &Path) -> Result<Self, std::io::Error> {
         let path = Self::status_path(data_dir);
         match std::fs::read_to_string(&path) {
-            Ok(content) => serde_json::from_str(&content)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            Ok(content) => {
+                let mut status: Self = serde_json::from_str(&content)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                status.loaded_source_names = status.sources.keys().cloned().collect();
+                Ok(status)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e),
         }
@@ -2907,14 +3029,57 @@ impl SyncStatus {
     ///
     /// Uses an atomic rename on Unix. On Windows, falls back to remove-then-rename
     /// because replacing an existing destination with `std::fs::rename` fails.
+    ///
+    /// The write is serialized with a cross-process lock and merged with the
+    /// ledger as it is on disk right now. A whole-file replace would let a
+    /// concurrent writer's records disappear: the other source would look
+    /// never-synced again (duplicate work on the next tick) and its failure
+    /// history would be lost.
     pub fn save(&self, data_dir: &Path) -> Result<(), std::io::Error> {
         let path = Self::status_path(data_dir);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let content = serde_json::to_string_pretty(self)?;
+        let _lock = SyncStatusLock::acquire(data_dir)?;
+        let merged = self.merge_with_disk(&path);
+        let content = serde_json::to_string_pretty(&merged)?;
         let tmp_path = write_sync_status_temp_file(&path, content.as_bytes())?;
         replace_file_from_temp(&tmp_path, &path)
+    }
+
+    /// Merge this instance with the durable ledger as it is on disk right now.
+    ///
+    /// The merge keeps every other writer's entries, honours this instance's
+    /// explicit writes, and still applies this instance's removals.
+    fn merge_with_disk(&self, path: &Path) -> Self {
+        let disk = match std::fs::read_to_string(path) {
+            Ok(content) => serde_json::from_str::<Self>(&content).unwrap_or_default(),
+            Err(_) => Self::default(),
+        };
+        let mut merged = disk.clone();
+        for (name, info) in &self.sources {
+            let caller_owns_entry = self.updated_source_names.contains(name)
+                || !self.loaded_source_names.contains(name);
+            let keep_disk = match merged.sources.get(name) {
+                None => false,
+                // The caller's own entry wins; the disk copy is not consulted.
+                Some(_disk_info) if caller_owns_entry => false,
+                // An untouched entry may have been refreshed by a concurrent
+                // writer; the newer sync wins so a stale snapshot cannot
+                // resurrect an older state.
+                Some(disk_info) => disk_info.last_sync > info.last_sync,
+            };
+            if !keep_disk {
+                merged.sources.insert(name.clone(), info.clone());
+            }
+        }
+        // Names this instance loaded and no longer carries were removed by the
+        // caller and must not survive. Names that were never loaded belong to
+        // a concurrent writer and must survive.
+        merged.sources.retain(|name, _| {
+            self.sources.contains_key(name) || !self.loaded_source_names.contains(name)
+        });
+        merged
     }
 
     /// Update status for a source from a sync report.
@@ -2935,6 +3100,7 @@ impl SyncStatus {
     /// Set status for a source from precomputed sync info.
     pub fn set_info(&mut self, source_name: &str, info: SourceSyncInfo) {
         self.sources.insert(source_name.to_string(), info);
+        self.updated_source_names.insert(source_name.to_string());
     }
 
     /// Drop sync status entries for sources that no longer exist.
@@ -3096,6 +3262,13 @@ fn sync_result_auth_failure(result: &SyncResult) -> bool {
         return false;
     };
     let error = error.to_ascii_lowercase();
+    // A remote filesystem permission error is not an SSH authentication
+    // failure: the SSH session succeeded and rsync could not read a remote
+    // path. Treating it as an auth failure defers the source forever, so a
+    // transient remote-side problem silently kills scheduled freshness.
+    if error.contains("remote path permission denied") || error.contains("partial transfer") {
+        return false;
+    }
     error.contains("permission denied")
         || error.contains("authentication")
         || error.contains("host key verification failed")
@@ -4855,6 +5028,128 @@ Total transferred file size: 1,234 bytes
         let path = "/path/with/~tilde/inside";
         let expanded = expand_tilde_local(path);
         assert_eq!(expanded, path);
+    }
+
+    // ------------------------------------------------------------------
+    // coding_agent_session_search-2l1b0.24: a partial transfer must stay
+    // truthful (the files that landed are counted, the failure is named
+    // for what it is) and the durable ledger must not lose another
+    // writer's records.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn rsync_partial_transfer_keeps_the_counts_and_is_not_an_auth_failure() {
+        let stderr = "rsync: [sender] opendir \"/remote/locked\" failed: Permission denied (13)\n\
+                      rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1983)";
+        let message = rsync_failure_message("host", "/remote", stderr, Some(23), 2);
+        assert!(
+            message.contains("partial transfer"),
+            "a partial transfer must be named truthfully: {message}"
+        );
+        assert!(
+            message.contains("Permission denied"),
+            "the remote cause must stay visible: {message}"
+        );
+        assert_eq!(sync_failure_reason(&message), "partial_transfer");
+        assert!(
+            !sync_result_auth_failure(&SyncResult::Failed(message.clone())),
+            "a remote permission error is not an authentication failure"
+        );
+    }
+
+    #[test]
+    fn rsync_transport_failure_keeps_the_authentication_reason() {
+        let stderr = "user@host: Permission denied (publickey).\n\
+                      rsync: connection unexpectedly closed (0 bytes received so far) [Receiver]";
+        let message = rsync_failure_message("host", "/remote", stderr, Some(255), 0);
+        assert!(
+            message.starts_with("Permission denied"),
+            "an SSH authentication failure keeps its wording: {message}"
+        );
+        assert_eq!(sync_failure_reason(&message), "authentication");
+        assert!(sync_result_auth_failure(&SyncResult::Failed(message)));
+    }
+
+    #[test]
+    fn rsync_missing_remote_path_is_not_a_partial_transfer() {
+        let stderr = "rsync: change_dir \"/remote/gone\" failed: No such file or directory (2)\n\
+                      rsync error: some files/attrs were not transferred (see previous errors) (code 23)";
+        let message = rsync_failure_message("host", "/remote/gone", stderr, Some(23), 0);
+        assert_eq!(
+            message, "Remote path not found: /remote/gone",
+            "a missing remote path keeps its own reason: {message}"
+        );
+        assert_eq!(sync_failure_reason(&message), "remote_path_not_found");
+    }
+
+    #[test]
+    fn rsync_remote_permission_denial_has_its_own_reason() {
+        let stderr =
+            "rsync: [sender] send_files failed to open \"/remote/locked\": Permission denied (13)";
+        let message = rsync_failure_message("host", "/remote", stderr, Some(1), 0);
+        assert!(
+            message.starts_with("Remote path permission denied"),
+            "a remote filesystem denial keeps its own wording: {message}"
+        );
+        assert_eq!(sync_failure_reason(&message), "remote_permission_denied");
+        assert!(!sync_result_auth_failure(&SyncResult::Failed(message)));
+    }
+
+    #[test]
+    fn durable_ledger_save_keeps_a_concurrent_writers_record() {
+        // `.keep()` so the fixture never deletes anything it created.
+        let dir = tempfile::tempdir().unwrap().keep();
+        let data_dir = dir.as_path();
+
+        let info = |last_sync: i64| SourceSyncInfo {
+            last_sync: Some(last_sync),
+            last_result: SyncResult::Success,
+            files_synced: 1,
+            bytes_transferred: 8,
+            duration_ms: 3,
+            consecutive_failures: 0,
+        };
+
+        let mut first = SyncStatus::load(data_dir).expect("load empty ledger");
+        first.set_info("alpha", info(1_000));
+        first.save(data_dir).expect("write alpha");
+
+        // Two writers hold the same snapshot.
+        let mut stale = SyncStatus::load(data_dir).expect("load ledger");
+        let mut other = SyncStatus::load(data_dir).expect("load ledger");
+        other.set_info("beta", info(2_000));
+        other.save(data_dir).expect("write beta");
+
+        // The stale writer saves afterwards: "beta" must survive, or that
+        // source looks never-synced again and is synced a second time.
+        stale.set_info("alpha", info(3_000));
+        stale.save(data_dir).expect("write alpha again");
+
+        let merged = SyncStatus::load(data_dir).expect("reload ledger");
+        assert!(
+            merged.get("alpha").is_some(),
+            "the writer's own record survives its own save"
+        );
+        assert!(
+            merged.get("beta").is_some(),
+            "a concurrent writer's record must survive a later save"
+        );
+        assert_eq!(
+            merged.get("beta").and_then(|entry| entry.last_sync),
+            Some(2_000),
+            "the concurrent writer's record is preserved verbatim"
+        );
+
+        // An explicit prune still deletes the entry it names.
+        let mut pruner = SyncStatus::load(data_dir).expect("load ledger");
+        assert!(pruner.retain_sources(["alpha"]));
+        pruner.save(data_dir).expect("write pruned ledger");
+        let pruned = SyncStatus::load(data_dir).expect("reload pruned ledger");
+        assert!(pruned.get("alpha").is_some());
+        assert!(
+            pruned.get("beta").is_none(),
+            "a pruned source does not come back"
+        );
     }
 }
 
