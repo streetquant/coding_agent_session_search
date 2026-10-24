@@ -22,7 +22,8 @@ include = [
 
 [dependencies]
 # Resident-memory supervision reuses the sysinfo version already in Cargo.lock.
-sysinfo = { version = "*", default-features = false, features = ["system"] }
+# Owner directive, 2026-10-24: "Use the three minimum versions".
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 anyhow = "1.0.102"
 thiserror = "2.0.18"
 tracing = "0.1.44"
@@ -111,7 +112,7 @@ rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
 fs2 = "0.4.3"
-libc = "*"
+libc = "0.2.189"
 same-file = "1.0.6"
 lru = "0.18"
 rustc-hash = "2.1.2"  # Fast non-cryptographic hashing for cache keys (P1 Opt 1.3), replaces unmaintained fxhash
@@ -119,7 +120,10 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }  # Fast content hashin
 itoa = "1.0.18"  # Zero-allocation integer-to-string for hot paths (bead w32k6)
 smallvec = "1.15.1"  # Stack-allocated small vectors for hot paths (Opt 4.4)
 regex = "1.12.3"
-portable-pty = "0.9.0"
+# The published 0.9.0 still uses nix 0.28 / cfg_aliases 0.1.1, which emits
+# future-incompatibility warnings on the pinned nightly. This official upstream
+# fix moves to nix 0.29 while preserving the PTY and Windows ConPTY APIs.
+portable-pty = { version = "=0.9.0", git = "https://github.com/wezterm/wezterm", rev = "f78f72f2f18bf459561e3681f016365273d3e281" }
 # FrankenTUI migration foundation (bead 2noh9.2.1), exact-pinned to the
 # crates.io 0.5.0 release for reproducible CI builds.
 ftui = { version = "=0.5.0" }
@@ -270,7 +274,7 @@ once_cell = "1.21.4"
 serial_test = "4.0.1"
 proptest = "1.11.0"
 arbitrary = { version = "1", features = ["derive"] }
-serde_yaml = "0.9.34"
+serde-saphyr = { version = "2.0.0", default-features = false, features = ["deserialize"] }
 rand = "0.10"
 rand_chacha = "0.10"
 # GH513 writes rollouts the way Codex compresses them; production reads them
@@ -278,7 +282,7 @@ rand_chacha = "0.10"
 zstd = { version = "0.13", default-features = false }
 # GH470 measures native model input tokens without padding or silent truncation.
 # Reuse the tokenizer and regex backend already resolved by native MiniLM.
-tokenizers = { version = "*", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 # rusqlite is retained only for C-SQLite interop fixtures in tests; production
 # storage and historical salvage paths use frankensqlite.
 rusqlite = { version = "0.40.2", features = ["bundled", "modern_sqlite"] }
@@ -297,6 +301,11 @@ test = false
 [[bin]]
 name = "cass-pages-perf-bundle"
 path = "src/bin/cass-pages-perf-bundle.rs"
+test = false
+
+[[bin]]
+name = "cass-docs-tables"
+path = "src/bin/cass-docs-tables.rs"
 test = false
 
 [[bin]]

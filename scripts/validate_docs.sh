@@ -387,12 +387,27 @@ key_token_pattern() {
 check_keys() {
     section "README key bindings ↔ TUI key map"
     local readme="${README_PATH:-README.md}" keymap="src/ui/app.rs"
+    # Global dispatch/help/palette now consume this exact declarative registry.
+    # Keep the arm check below for contextual detail controls. The integration
+    # suite independently feeds legacy/Kitty bytes through the real parser and
+    # checks both registry/README drift and expected CassMsg outcomes.
+    local registered_keys
+    registered_keys=$(sed -n '/^pub static .*KEYMAP:/,/^];/p' src/ui/shortcuts.rs | grep -oE '"[^"]+"' | tr -d '"')
     local missing=0 checked=0 token pattern cell
     while IFS= read -r cell; do
         # Split multi-key cells: `F3` / `Alt+G`
         while IFS= read -r token; do
             token="${token#\`}"; token="${token%\`}"
             [[ -z "$token" ]] && continue
+            if printf '%s\n' "$registered_keys" | grep -Fxq -- "$token"; then
+                checked=$((checked + 1))
+                continue
+            fi
+            if [[ ${#token} -eq 1 ]] && grep -Fq 'KeyCode::Char(c)' "$keymap" \
+                && grep -Fq 'CassMsg::QueryChanged(c.to_string())' "$keymap"; then
+                checked=$((checked + 1))
+                continue
+            fi
             pattern=$(key_token_pattern "$token")
             [[ -z "$pattern" ]] && continue
             checked=$((checked + 1))
@@ -403,7 +418,7 @@ check_keys() {
         done < <(printf '%s\n' "$cell" | grep -o -E '`[^`]+`')
     done < <(grep -E '^\| `[^|]+` *\|' "$readme" | sed -E 's/^\| ([^|]*)\|.*/\1/' | grep -E '`(F[0-9]+|Esc|Enter|Tab|Del|Delete|Backspace|Up|Down|Left|Right|Home|End|Page(Up|Down)|Space|Ctrl|Alt|Shift|.)`|\+' )
     if [[ $missing -eq 0 ]]; then
-        log_pass "all $checked README key bindings resolve to a TUI key-map arm"
+        log_pass "all $checked README key bindings resolve to the dispatch registry or a contextual arm"
     fi
 }
 
@@ -605,6 +620,22 @@ check_cargo_docs() {
     fi
 }
 
+check_generated_tables() {
+    section "Generated documentation tables"
+    local output
+    if output=$(cargo run --quiet --bin cass-docs-tables -- --check 2>&1); then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && log_pass "$line"
+        done <<< "$output"
+    else
+        log_fail "README/AGENTS generated tables drifted from the code registries:"
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && log_fail "  $line"
+        done <<< "$output"
+        log_fail "regenerate with: cargo run --bin cass-docs-tables"
+    fi
+}
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -648,6 +679,7 @@ main() {
             check_keys
             check_flags
             check_env
+            check_generated_tables
             ;;
         all|*)
             check_readme
@@ -659,6 +691,7 @@ main() {
             check_keys
             check_flags
             check_env
+            check_generated_tables
             ;;
     esac
 

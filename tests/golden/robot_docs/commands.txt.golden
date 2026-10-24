@@ -3,14 +3,14 @@ commands:
   (global) --verbose/-v  Enable debug logs (overrides auto-quiet)
   Tip: `--robot-docs=<topic>` is normalized to `robot-docs <topic>`; globals can appear before/after subcommands.
   cass search <query> [OPTIONS]
-    --agent A         Filter by agent (e.g. codex, claude_code, gemini, opencode, omp, antigravity; run `cass capabilities --json | jq .connectors` for the full 26-connector inventory)
+    --agent A         Filter by agent (e.g. codex, claude_code, gemini, opencode, omp, antigravity; run `cass capabilities --json | jq .connectors` for the full connector inventory)
     --workspace W     Filter by workspace path
     --limit N         Max results (default: 0 = no limit)
     --offset N        Pagination offset (default: 0)
     --json | --robot  JSON output for automation
     --fields F1,F2    Select specific fields in hits (reduces token usage)
                       Presets: minimal (path,line,agent), summary (+title,score), provenance (source_id,origin_kind,origin_host)
-                      Fields: score,agent,workspace,workspace_original,source_path,snippet,content,title,created_at,line_number,match_type,source_id,origin_kind,origin_host
+                      Fields: score,agent,workspace,workspace_original,source_path,snippet,content,title,created_at,line_number,match_type,source_id,origin_kind,origin_host,conversation_id,message_anchor
     --max-content-length N  Truncate content/snippet/title to N chars (UTF-8 safe, adds '...')
                             Adds *_truncated: true indicator for each truncated field
     --today           Filter to today only
@@ -56,7 +56,7 @@ commands:
   cass status [--json] [--stale-threshold N] [--data-dir DIR]
   cass diag [--json] [--verbose] [--data-dir DIR]
   cass sessions [--workspace DIR] [--current] [--limit N] [--since WHEN] [--json]
-  cass view <path> [-n LINE] [-C CONTEXT] [--json]
+  cass view <path> [--message-index N] [--source ID] [--conversation-id ID] [--message-anchor TOKEN] [-n LINE] [-C CONTEXT] [--json]
   cass index [--full] [--watch] [--json] [--robot-trace-ingest] [--data-dir DIR]
                     In --json mode, NDJSON events stream on stderr:
                       {event:started|phase|progress|completed|error, ...}
@@ -121,7 +121,7 @@ commands:
   cass models check-update [--model NAME] [--json]  Compare an explicit installed revision against its pin.
   cass models backfill             Re-embed conversations against a newly acquired model.
   cass models build-hnsw [--tier fast|quality] [--check] [--force] [--json]  Build/verify the HNSW accelerator for a published semantic artifact (no archive open, no embedding).
-  cass expand <path> --message-index N [--source ID] [--conversation-id ID] [-C CONTEXT] [--json]  Follow search line_number; --line is for raw JSONL.
+  cass expand <path> --message-index N [--source ID] [--conversation-id ID] [--message-anchor TOKEN] [-C CONTEXT] [--json]  Follow search line_number; --line is for raw JSONL.
   cass resume <path> [--shell]     Resolve a session path into its native-harness resume command.
   cass timeline [--since DATE] [--until DATE] [--json]  Activity timeline over a time range.
   cass mirror prune [--older-than 90d] [--max-size 100GB] [--keep-latest 1] [--keep-tag important] [--apply] [--json]  Plan or apply raw-mirror retention with an audit log.
