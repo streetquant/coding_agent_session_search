@@ -66,6 +66,11 @@ fn cass_cmd(home: &Path, data_dir: &Path) -> Command {
         .env("XDG_CACHE_HOME", home.join("xdg-cache"))
         .env("CASS_DATA_DIR", data_dir)
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        // These connectors default to machine-wide mirrors under /warp; pin
+        // them inside the disposable home so a seed indexes the fixture, not
+        // whatever another agent happened to mirror.
+        .env("CASS_CLOUDMCP_DATA_ROOT", home.join(".cloudmcp-empty"))
+        .env("CASS_OPENWEBUI_DATA_ROOT", home.join(".openwebui-empty"))
         .env("CASS_SEMANTIC_EMBEDDER", "hash")
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .env("NO_COLOR", "1")
