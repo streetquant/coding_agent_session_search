@@ -450,6 +450,10 @@ impl TuiSession {
         self.writer.flush().expect("flush PTY");
     }
 
+    fn captured_bytes(&self) -> Vec<u8> {
+        self.captured.lock().expect("capture lock").clone()
+    }
+
     fn captured_len(&self) -> usize {
         self.captured.lock().expect("capture lock").len()
     }
@@ -891,32 +895,12 @@ fn tui_large_archive_first_frame_and_core_journeys() {
         }
         session.resize(terminal_size); // restore the declared terminal shape
 
-        // ---- help overlay -------------------------------------------------
-        let help_base = session.captured_len();
-        let help_start = Instant::now();
-        session.write(b"\x1bOP"); // F1
-        assert!(
-            session.wait_render_since(
-                help_base,
-                Duration::from_millis(HELP_BUDGET_MS),
-                |rendered| rendered.contains(HELP_MARKER),
-            ),
-            "[{label}] help overlay did not open within {HELP_BUDGET_MS}ms; tail: {}",
-            tail(&session.rendered_since(help_base), 2000)
-        );
-        let help_ms = help_start.elapsed().as_millis() as u64;
-        assert!(
-            help_ms <= HELP_BUDGET_MS,
-            "[{label}] help latency {help_ms}ms > {HELP_BUDGET_MS}ms"
-        );
-        let help_close_base = session.captured_len();
-        session.write(b"\x1b");
-        assert!(
-            session.wait_growth(help_close_base, 4, Duration::from_millis(HELP_BUDGET_MS)),
-            "[{label}] help overlay did not close on ESC"
-        );
-
         // ---- broad lexical search on the large result set -----------------
+        save_artifact(
+            &format!("{label}_before_broad.raw"),
+            &trace_id,
+            &session.captured_bytes(),
+        );
         session.write(b"\x0c"); // Ctrl+L clears the query
         thread::sleep(Duration::from_millis(80));
         let broad_base = session.captured_len();
@@ -935,6 +919,38 @@ fn tui_large_archive_first_frame_and_core_journeys() {
         assert!(
             broad_ms <= SEARCH_BUDGET_MS,
             "[{label}] broad key-to-result {broad_ms}ms > {SEARCH_BUDGET_MS}ms"
+        );
+
+        // ---- help overlay -------------------------------------------------
+        let help_base = session.captured_len();
+        let help_start = Instant::now();
+        session.write(b"\x1bOP"); // F1
+        assert!(
+            session.wait_render_since(
+                help_base,
+                Duration::from_millis(HELP_BUDGET_MS),
+                |rendered| rendered.contains(HELP_MARKER),
+            ),
+            "[{label}] help overlay did not open within {HELP_BUDGET_MS}ms; tail: {}",
+            tail(&session.rendered_since(help_base), 2000)
+        );
+        let help_ms = help_start.elapsed().as_millis() as u64;
+        assert!(
+            help_ms <= HELP_BUDGET_MS,
+            "[{label}] help latency {help_ms}ms > {HELP_BUDGET_MS}ms"
+        );
+        // F1 toggles deterministically; ESC would be ambiguous with a following
+        // control byte until the terminal parser's escape timeout elapses.
+        let help_close_base = session.captured_len();
+        session.write(b"\x1bOP"); // F1 closes
+        assert!(
+            session.wait_render_since(
+                help_close_base,
+                Duration::from_millis(HELP_BUDGET_MS),
+                |rendered| rendered.contains(BROAD_RESULT_MARKER),
+            ),
+            "[{label}] help overlay did not close back to the results within {HELP_BUDGET_MS}ms; tail: {}",
+            tail(&session.rendered_since(help_close_base), 2000)
         );
 
         // ---- cancellation while the large archive is still live -----------

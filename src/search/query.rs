@@ -4800,7 +4800,7 @@ impl SearchClient {
     /// instead of once for setup and again for hydration. Returns `Ok(None)`
     /// when this client has no configured archive; the transaction is always
     /// rolled back, and no recovery write is performed by this wrapper.
-    pub(crate) fn with_semantic_read_snapshot<T>(
+    pub fn with_semantic_read_snapshot<T>(
         &self,
         inspect: impl FnOnce(&dyn SemanticReadSnapshot) -> T,
     ) -> Result<Option<T>> {

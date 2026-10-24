@@ -18,7 +18,9 @@ use coding_agent_search::search::external_embedder::ExternalEmbeddingConfig;
 use coding_agent_search::search::fastembed_embedder::FastEmbedder;
 use coding_agent_search::search::hash_embedder::HashEmbedder;
 use coding_agent_search::search::model_manager::{
-    load_hash_semantic_context_strict, load_semantic_context_for_embedder_strict,
+    load_hash_semantic_context_strict, load_hash_semantic_context_with_snapshot,
+    load_semantic_context_for_embedder_strict,
+    load_semantic_context_for_embedder_with_snapshot,
 };
 use coding_agent_search::search::query::{
     FieldMask, SearchClient, SearchClientOptions, SearchFilters, SearchHit, rrf_fuse_hits,
@@ -426,14 +428,42 @@ impl Semantic {
         // or credentials, much less construct a client or send public probes.
         let expected_id = config.embedder.id()?;
         let guard = AssetGuard::capture(&config.data_dir, db, &expected_id)?;
-        let setup = match config.embedder {
-            EmbedderChoice::Hash => load_hash_semantic_context_strict(&config.data_dir, db),
-            _ => load_semantic_context_for_embedder_strict(
-                &config.data_dir,
-                db,
-                config.embedder.name(),
-            ),
-        };
+        // Open the archive once, then admit artifacts and filter metadata
+        // through the same handle semantic hydration will use. A cold service
+        // used to open the archive twice (setup and hydration).
+        let client = SearchClient::open_semantic(
+            db,
+            SearchClientOptions {
+                enable_reload: false,
+                enable_warm: false,
+                strict_read_only: true,
+            },
+        )?
+        .context("canonical semantic archive is missing")?;
+        let setup = client
+            .with_semantic_read_snapshot(|snapshot| match config.embedder {
+                EmbedderChoice::Hash => load_hash_semantic_context_with_snapshot(
+                    &config.data_dir,
+                    db,
+                    snapshot,
+                ),
+                _ => load_semantic_context_for_embedder_with_snapshot(
+                    &config.data_dir,
+                    db,
+                    config.embedder.name(),
+                    snapshot,
+                ),
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| match config.embedder {
+                EmbedderChoice::Hash => load_hash_semantic_context_strict(&config.data_dir, db),
+                _ => load_semantic_context_for_embedder_strict(
+                    &config.data_dir,
+                    db,
+                    config.embedder.name(),
+                ),
+            });
         let context = setup
             .context
             .ok_or_else(|| Refusal::Unavailable(setup.availability.summary()))?;
@@ -456,15 +486,6 @@ impl Semantic {
                 "semantic artifact lacks a pre-admission file witness"
             );
         }
-        let client = SearchClient::open_semantic(
-            db,
-            SearchClientOptions {
-                enable_reload: false,
-                enable_warm: false,
-                strict_read_only: true,
-            },
-        )?
-        .context("canonical semantic archive is missing")?;
         client.set_semantic_artifacts_context(
             context.embedder,
             context.artifacts,

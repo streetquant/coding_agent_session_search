@@ -15,9 +15,11 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::franken_sync::compat::RowExt;
 use crate::indexer::semantic::expected_vector_space_revision;
+use anyhow::anyhow;
 use crate::search::ann_index::hnsw_index_path;
-use crate::search::embedder::Embedder;
+use crate::search::embedder::{CassPassageProducer, Embedder};
 use crate::search::fastembed_embedder::{FastEmbedder, LazyFastEmbedder};
 use crate::search::hash_embedder::HashEmbedder;
 use crate::search::model_download::{
@@ -25,15 +27,28 @@ use crate::search::model_download::{
     classify_model_cache_metadata,
 };
 use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
+use crate::search::semantic_manifest::selection::SemanticSelectionMetadata;
+use crate::search::semantic_manifest::source_snapshot::{
+    SemanticSourceContract, SemanticSourceSnapshot, SemanticSourceSnapshotError,
+    semantic_source_certificate_in_transaction,
+};
 use crate::search::semantic_manifest::{
-    SemanticCurrentPointerV1, SemanticShardManifest, SemanticShardRecord, TierKind,
-    semantic_shard_artifact_path_is_safe,
+    SemanticArtifactRole, SemanticCurrentPointerV1, SemanticGenerationError,
+    SemanticGenerationManifestV1, SemanticGenerationPurpose, SemanticShardManifest,
+    SemanticShardRecord, TierKind, semantic_shard_artifact_path_is_safe,
+};
+use crate::search::semantic_reader::ann::AnnAdmissionBudget;
+use crate::search::semantic_reader::publication::text::hydration::{
+    PassageProjection, SemanticReadSnapshot, snapshot_seal,
+};
+use crate::search::semantic_reader::publication::{
+    SelectedSemanticGeneration, SemanticSelectionBudget, SemanticSelectionError,
 };
 use crate::search::vector_index::{
     ROLE_ASSISTANT, ROLE_USER, SemanticFilterMaps, SemanticIndexArtifact,
     SemanticProgressiveUnavailableReason, VectorIndex, vector_index_path,
 };
-use crate::storage::sqlite::{FrankenStorage, SemanticIdentityTier};
+use crate::storage::sqlite::FrankenStorage;
 
 /// Unified TUI state machine for semantic search availability.
 ///
@@ -311,6 +326,314 @@ pub struct SemanticContext {
     pub roles: Option<HashSet<u8>>,
 }
 
+/// Actual producer owners selected by the caller's explicit retrieval policy.
+/// Missing tiers stay missing; a quality producer is never replaced by hash.
+#[derive(Clone)]
+pub struct RetainedSemanticProducers {
+    pub fast: Option<Arc<CassPassageProducer>>,
+    pub quality: Option<Arc<CassPassageProducer>>,
+    pub primary: TierKind,
+}
+
+impl RetainedSemanticProducers {
+    fn validate_manifest(
+        &self,
+        manifest: &SemanticGenerationManifestV1,
+        contract: SemanticSourceContract,
+    ) -> Result<(), RetainedSemanticLoadError> {
+        let primary = match self.primary {
+            TierKind::Fast => &self.fast,
+            TierKind::Quality => &self.quality,
+        };
+        if primary.is_none() {
+            return Err(RetainedSemanticLoadError::MissingPrimaryProducer);
+        }
+        for (tier, role, producer) in [
+            (TierKind::Fast, SemanticArtifactRole::FastVector, &self.fast),
+            (
+                TierKind::Quality,
+                SemanticArtifactRole::QualityVector,
+                &self.quality,
+            ),
+        ] {
+            let Some(producer) = producer else {
+                continue;
+            };
+            if producer.source_contract() != contract {
+                return Err(RetainedSemanticLoadError::ProducerSourceContract { tier });
+            }
+            let identity = producer
+                .identity()
+                .map_err(|_| RetainedSemanticLoadError::ProducerUnavailable { tier })?;
+            let mut selected = false;
+            for artifact in manifest.artifacts.iter().filter(|item| item.role == role) {
+                selected = true;
+                let expected = &artifact.embedding_identity.identity;
+                expected
+                    .verify_exact_producer_with(identity)
+                    .map_err(|_| RetainedSemanticLoadError::ProducerMismatch { tier })?;
+                if producer.dimension() != expected.space.dimension as usize {
+                    return Err(RetainedSemanticLoadError::ProducerMismatch { tier });
+                }
+            }
+            if !selected {
+                return Err(RetainedSemanticLoadError::UnselectedProducer { tier });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Explicit source projection and admission limits; none are inferred from a
+/// selected vector's name or rewritten to match an available model.
+#[derive(Debug, Clone, Copy)]
+pub struct RetainedSemanticLoadPolicy {
+    pub source_contract: SemanticSourceContract,
+    pub vectors: SemanticSelectionBudget,
+    pub ann: AnnAdmissionBudget,
+}
+
+/// A source-bound empty publication has no embedding or vector identity.
+#[derive(Clone)]
+pub struct RetainedEmptySemanticContext {
+    source: SemanticSourceSnapshot,
+    pointer: SemanticCurrentPointerV1,
+    manifest: SemanticGenerationManifestV1,
+}
+
+impl std::fmt::Debug for RetainedEmptySemanticContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedEmptySemanticContext")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RetainedEmptySemanticContext {
+    pub fn source_snapshot(&self) -> &SemanticSourceSnapshot {
+        &self.source
+    }
+
+    pub fn pointer(&self) -> &SemanticCurrentPointerV1 {
+        &self.pointer
+    }
+
+    pub fn manifest(&self) -> &SemanticGenerationManifestV1 {
+        &self.manifest
+    }
+}
+
+/// Empty and populated publications retain distinct kinds of authority.
+#[derive(Debug, Clone)]
+pub enum RetainedSemanticLoadOutcome {
+    Empty(Arc<RetainedEmptySemanticContext>),
+    Populated(Arc<RetainedSemanticContext>),
+}
+
+impl RetainedSemanticLoadOutcome {
+    pub fn source_snapshot(&self) -> &SemanticSourceSnapshot {
+        match self {
+            Self::Empty(context) => context.source_snapshot(),
+            Self::Populated(context) => context.source_snapshot(),
+        }
+    }
+
+    /// Revalidate the actual query snapshot before model or ANN work. The
+    /// caller must use this same transaction for filtering and hydration.
+    pub fn verify_source_in_transaction<R: SemanticReadSnapshot>(
+        &self,
+        transaction: &R,
+    ) -> Result<(), RetainedSemanticLoadError> {
+        let retained = self.source_snapshot();
+        let current = semantic_source_certificate_in_transaction(transaction, retained.contract())
+            .map_err(RetainedSemanticLoadError::Source)?;
+        if current.identity() != retained.identity() {
+            return Err(RetainedSemanticLoadError::SourceChanged);
+        }
+        Ok(())
+    }
+}
+
+/// An independently certified source, retained publication, and actual models.
+/// This is distinct from the path-based SemanticContext: no dummy legacy
+/// artifact vector can represent an immutable publication.
+#[derive(Clone)]
+pub struct RetainedSemanticContext {
+    selected: SelectedSemanticGeneration,
+    source: SemanticSourceSnapshot,
+    producers: RetainedSemanticProducers,
+    filter_maps: SemanticFilterMaps,
+    roles: Option<HashSet<u8>>,
+    ann_budget: AnnAdmissionBudget,
+}
+
+impl std::fmt::Debug for RetainedSemanticContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedSemanticContext")
+            .field("primary", &self.producers.primary)
+            .field("fast_shards", &self.selected.shard_count(TierKind::Fast))
+            .field(
+                "quality_shards",
+                &self.selected.shard_count(TierKind::Quality),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl RetainedSemanticContext {
+    pub fn selected(&self) -> &SelectedSemanticGeneration {
+        &self.selected
+    }
+
+    pub fn source_snapshot(&self) -> &SemanticSourceSnapshot {
+        &self.source
+    }
+
+    pub fn producers(&self) -> &RetainedSemanticProducers {
+        &self.producers
+    }
+
+    pub fn projection(&self) -> PassageProjection {
+        self.source.contract().projection()
+    }
+
+    pub fn filter_maps(&self) -> &SemanticFilterMaps {
+        &self.filter_maps
+    }
+
+    pub fn roles(&self) -> Option<&HashSet<u8>> {
+        self.roles.as_ref()
+    }
+
+    pub fn ann_budget(&self) -> AnnAdmissionBudget {
+        self.ann_budget
+    }
+}
+
+/// Stable displays contain no model diagnostics, archive text or artifact paths.
+/// The typed underlying publication failure is retained for deliberate diagnosis.
+#[derive(Debug, thiserror::Error)]
+pub enum RetainedSemanticLoadError {
+    #[error("semantic current pointer could not be inspected")]
+    PointerProbe(#[source] std::io::Error),
+    #[error("semantic source certificate admission failed: {0}")]
+    Source(#[source] SemanticSourceSnapshotError),
+    #[error("semantic filter metadata could not be read from the source snapshot")]
+    FilterMaps(#[source] anyhow::Error),
+    #[error("semantic publication metadata admission failed")]
+    Publication(#[source] SemanticGenerationError),
+    #[error("semantic retained owner admission failed")]
+    Selection(#[source] SemanticSelectionError),
+    #[error("semantic primary producer is unavailable")]
+    MissingPrimaryProducer,
+    #[error("semantic {tier:?} producer is unavailable")]
+    ProducerUnavailable { tier: TierKind },
+    #[error("semantic {tier:?} producer differs from the selected identity")]
+    ProducerMismatch { tier: TierKind },
+    #[error("semantic {tier:?} producer differs from the independent source contract")]
+    ProducerSourceContract { tier: TierKind },
+    #[error("semantic {tier:?} producer has no selected vector tier")]
+    UnselectedProducer { tier: TierKind },
+    #[error("semantic publication changed during producer admission")]
+    SelectionChanged,
+    #[error("semantic source differs from the retained query context")]
+    SourceChanged,
+}
+
+impl RetainedSemanticLoadError {
+    pub const fn reason_code(&self) -> &'static str {
+        match self {
+            Self::PointerProbe(_) => "semantic_pointer_probe_failed",
+            Self::Source(source) => source.reason_code(),
+            Self::FilterMaps(_) => "semantic_filter_metadata_rejected",
+            Self::Publication(_) => "semantic_publication_metadata_rejected",
+            Self::Selection(_) => "semantic_retained_owner_rejected",
+            Self::MissingPrimaryProducer => "semantic_primary_producer_missing",
+            Self::ProducerUnavailable { .. } => "semantic_producer_unavailable",
+            Self::ProducerMismatch { .. } => "semantic_producer_mismatch",
+            Self::ProducerSourceContract { .. } => "semantic_producer_source_contract_mismatch",
+            Self::UnselectedProducer { .. } => "semantic_producer_tier_unselected",
+            Self::SelectionChanged => "semantic_selection_changed",
+            Self::SourceChanged => "semantic_source_context_changed",
+        }
+    }
+}
+
+/// Admit CURRENT using an independent certificate from the caller's actual read
+/// snapshot, then load actual producers and retain every selected vector owner.
+///
+/// None means CURRENT is absent. A present but rejected publication is an error;
+/// callers must not fall through to conventional vector filenames in that case.
+/// The factory receives metadata and the explicit source contract, not authority
+/// to copy expected identities onto unbound embeddings. It must return actual
+/// producer owners. Constructing a CassPassageProducer measures its conformance
+/// outputs through actual inference; the caller must admit that factory work.
+/// An explicitly empty publication returns before the factory, retaining its
+/// certified source and selected metadata without fabricated model identities.
+/// The adapter performs no query inference, download, graph load, archive write,
+/// or transaction lifecycle operation.
+pub fn load_retained_semantic_context<R, F>(
+    data_dir: &Path,
+    transaction: &R,
+    policy: RetainedSemanticLoadPolicy,
+    roles: Option<HashSet<u8>>,
+    producer_factory: F,
+) -> Result<Option<RetainedSemanticLoadOutcome>, RetainedSemanticLoadError>
+where
+    R: SemanticReadSnapshot,
+    F: FnOnce(
+        &SemanticGenerationManifestV1,
+        SemanticSourceContract,
+    ) -> Result<RetainedSemanticProducers, RetainedSemanticLoadError>,
+{
+    match std::fs::symlink_metadata(SemanticCurrentPointerV1::path(data_dir)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(RetainedSemanticLoadError::PointerProbe(error)),
+        Ok(_) => {}
+    }
+    let source = semantic_source_certificate_in_transaction(transaction, policy.source_contract)
+        .map_err(RetainedSemanticLoadError::Source)?;
+    let metadata = SemanticSelectionMetadata::read(data_dir, Some(source.identity()))
+        .map_err(RetainedSemanticLoadError::Publication)?;
+    policy
+        .vectors
+        .check(&metadata.manifest)
+        .map_err(RetainedSemanticLoadError::Selection)?;
+    if metadata.manifest.purpose == SemanticGenerationPurpose::EmptyCorpus {
+        return Ok(Some(RetainedSemanticLoadOutcome::Empty(Arc::new(
+            RetainedEmptySemanticContext {
+                source,
+                pointer: metadata.pointer,
+                manifest: metadata.manifest,
+            },
+        ))));
+    }
+    let filter_maps = SemanticFilterMaps::from_read_snapshot(transaction)
+        .map_err(RetainedSemanticLoadError::FilterMaps)?;
+    let producers = producer_factory(&metadata.manifest, source.contract())?;
+    producers.validate_manifest(&metadata.manifest, source.contract())?;
+    let selected =
+        SelectedSemanticGeneration::open_current(data_dir, source.identity(), policy.vectors)
+            .map_err(RetainedSemanticLoadError::Selection)?;
+    if selected.selection().pointer() != &metadata.pointer
+        || selected.selection().manifest() != &metadata.manifest
+    {
+        return Err(RetainedSemanticLoadError::SelectionChanged);
+    }
+    producers.validate_manifest(selected.selection().manifest(), source.contract())?;
+    Ok(Some(RetainedSemanticLoadOutcome::Populated(Arc::new(
+        RetainedSemanticContext {
+            selected,
+            source,
+            producers,
+            filter_maps,
+            roles,
+            ann_budget: policy.ann,
+        },
+    ))))
+}
+
 pub struct SemanticSetup {
     pub availability: SemanticAvailability,
     pub context: Option<SemanticContext>,
@@ -569,6 +892,57 @@ fn complete_shard_generation_candidate_exists(data_dir: &Path, embedder_id: &str
         .any(|(tier, db_fingerprint)| manifest.summary(tier, embedder_id, db_fingerprint).complete)
 }
 
+/// Adapter for legacy callers that already own a `FrankenStorage` handle.
+struct ConnectionReadSnapshot<'a>(&'a crate::franken_sync::Connection);
+
+impl snapshot_seal::Sealed for ConnectionReadSnapshot<'_> {}
+
+impl SemanticReadSnapshot for ConnectionReadSnapshot<'_> {
+    fn query_with_params(
+        &self,
+        sql: &str,
+        params: &[crate::franken_sync::SqliteValue],
+    ) -> Result<Vec<crate::franken_sync::Row>, crate::franken_sync::FrankenError> {
+        self.0.query_with_params(sql, params)
+    }
+}
+
+/// The lexical storage fingerprint, computed on a caller-owned snapshot.
+///
+/// Keep this byte-identical to
+/// `crate::indexer::lexical_storage_fingerprint_for_storage`; a fingerprint
+/// difference would make every semantic artifact look stale.
+fn lexical_fingerprint_from_snapshot(
+    snapshot: &dyn SemanticReadSnapshot,
+) -> anyhow::Result<String> {
+    let count_row = snapshot
+        .query_with_params("SELECT COUNT(*) FROM conversations", &[])
+        .map_err(|error| anyhow!("counting canonical conversations: {error}"))?;
+    let total_conversations: i64 = count_row
+        .first()
+        .ok_or_else(|| anyhow!("conversation count query returned no row"))?
+        .get_typed(0)
+        .map_err(|error| anyhow!("conversation count was not an integer: {error}"))?;
+    let total_conversations = usize::try_from(total_conversations.max(0)).unwrap_or(usize::MAX);
+    let max_conversation_id: i64 = snapshot
+        .query_with_params("SELECT COALESCE(MAX(id), 0) FROM conversations", &[])
+        .map_err(|error| anyhow!("computing conversation fingerprint: {error}"))?
+        .first()
+        .ok_or_else(|| anyhow!("conversation fingerprint query returned no row"))?
+        .get_typed(0)
+        .map_err(|error| anyhow!("conversation fingerprint was not an integer: {error}"))?;
+    let max_message_id: i64 = snapshot
+        .query_with_params("SELECT COALESCE(MAX(id), 0) FROM messages", &[])
+        .map_err(|error| anyhow!("computing message fingerprint: {error}"))?
+        .first()
+        .ok_or_else(|| anyhow!("message fingerprint query returned no row"))?
+        .get_typed(0)
+        .map_err(|error| anyhow!("message fingerprint was not an integer: {error}"))?;
+    Ok(format!(
+        "content-v1:{total_conversations}:{max_conversation_id}:{max_message_id}"
+    ))
+}
+
 fn load_complete_shard_artifacts_for_current_db(
     data_dir: &Path,
     db_path: &Path,
@@ -576,18 +950,19 @@ fn load_complete_shard_artifacts_for_current_db(
     expected_dimension: usize,
     context_label: &'static str,
     strict_read_only: bool,
+    snapshot: Option<&dyn SemanticReadSnapshot>,
 ) -> Option<Vec<SemanticIndexArtifact>> {
     load_complete_shard_artifacts_with_fingerprint(
         data_dir,
         embedder_id,
         expected_dimension,
         context_label,
-        || {
-            if strict_read_only {
+        || match snapshot {
+            Some(snapshot) => lexical_fingerprint_from_snapshot(snapshot),
+            None if strict_read_only => {
                 crate::indexer::lexical_storage_fingerprint_for_db_strict(db_path)
-            } else {
-                crate::indexer::lexical_storage_fingerprint_for_db(db_path)
             }
+            None => crate::indexer::lexical_storage_fingerprint_for_db(db_path),
         },
     )
 }
@@ -650,6 +1025,7 @@ pub fn load_semantic_context_strict(data_dir: &Path, db_path: &Path) -> Semantic
         active_policy_embedder_name(),
         false,
         true,
+        None,
     )
 }
 
@@ -668,6 +1044,7 @@ pub fn load_semantic_context_deferred_strict(data_dir: &Path, db_path: &Path) ->
         active_policy_embedder_name(),
         true,
         true,
+        None,
     )
 }
 
@@ -676,7 +1053,7 @@ pub fn load_semantic_context_for_embedder(
     db_path: &Path,
     embedder_name: &str,
 ) -> SemanticSetup {
-    load_semantic_context_inner(data_dir, db_path, true, embedder_name, false, false)
+    load_semantic_context_inner(data_dir, db_path, true, embedder_name, false, false, None)
 }
 
 pub fn load_semantic_context_for_embedder_strict(
@@ -684,7 +1061,7 @@ pub fn load_semantic_context_for_embedder_strict(
     db_path: &Path,
     embedder_name: &str,
 ) -> SemanticSetup {
-    load_semantic_context_inner(data_dir, db_path, true, embedder_name, false, true)
+    load_semantic_context_inner(data_dir, db_path, true, embedder_name, false, true, None)
 }
 
 /// Load index/filter metadata now while deferring the local model itself.
@@ -697,7 +1074,7 @@ pub fn load_semantic_context_for_embedder_deferred(
     db_path: &Path,
     embedder_name: &str,
 ) -> SemanticSetup {
-    load_semantic_context_inner(data_dir, db_path, true, embedder_name, true, false)
+    load_semantic_context_inner(data_dir, db_path, true, embedder_name, true, false, None)
 }
 
 pub fn load_semantic_context_for_embedder_deferred_strict(
@@ -705,7 +1082,78 @@ pub fn load_semantic_context_for_embedder_deferred_strict(
     db_path: &Path,
     embedder_name: &str,
 ) -> SemanticSetup {
-    load_semantic_context_inner(data_dir, db_path, true, embedder_name, true, true)
+    load_semantic_context_inner(data_dir, db_path, true, embedder_name, true, true, None)
+}
+
+/// Load the policy context from a caller-owned archive snapshot.
+pub fn load_semantic_context_with_snapshot(
+    data_dir: &Path,
+    db_path: &Path,
+    snapshot: &dyn SemanticReadSnapshot,
+) -> SemanticSetup {
+    load_semantic_context_inner(
+        data_dir,
+        db_path,
+        true,
+        active_policy_embedder_name(),
+        false,
+        true,
+        Some(snapshot),
+    )
+}
+
+/// Deferred-model counterpart of [`load_semantic_context_with_snapshot`].
+pub fn load_semantic_context_deferred_with_snapshot(
+    data_dir: &Path,
+    db_path: &Path,
+    snapshot: &dyn SemanticReadSnapshot,
+) -> SemanticSetup {
+    load_semantic_context_inner(
+        data_dir,
+        db_path,
+        true,
+        active_policy_embedder_name(),
+        true,
+        true,
+        Some(snapshot),
+    )
+}
+
+/// Load an explicitly requested embedder from a caller-owned archive snapshot.
+pub fn load_semantic_context_for_embedder_with_snapshot(
+    data_dir: &Path,
+    db_path: &Path,
+    embedder_name: &str,
+    snapshot: &dyn SemanticReadSnapshot,
+) -> SemanticSetup {
+    load_semantic_context_inner(
+        data_dir,
+        db_path,
+        true,
+        embedder_name,
+        false,
+        true,
+        Some(snapshot),
+    )
+}
+
+/// Deferred-model counterpart of
+/// [`load_semantic_context_for_embedder_with_snapshot`].
+pub fn load_semantic_context_for_embedder_deferred_with_snapshot(
+    data_dir: &Path,
+    db_path: &Path,
+    embedder_name: &str,
+    snapshot: &dyn SemanticReadSnapshot,
+) -> SemanticSetup {
+    load_semantic_context_inner(
+        data_dir,
+        db_path,
+        true,
+        embedder_name,
+        true,
+        true,
+        Some(snapshot),
+    )
 }
 
 /// Probe semantic availability without loading the embedder or DB-backed
@@ -803,17 +1251,31 @@ pub(crate) fn probe_hash_semantic_availability(data_dir: &Path) -> SemanticAvail
 
 /// Load hash-based semantic context (no model download required).
 pub fn load_hash_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSetup {
-    load_hash_semantic_context_inner(data_dir, db_path, false)
+    load_hash_semantic_context_inner(data_dir, db_path, false, None)
 }
 
 pub fn load_hash_semantic_context_strict(data_dir: &Path, db_path: &Path) -> SemanticSetup {
-    load_hash_semantic_context_inner(data_dir, db_path, true)
+    load_hash_semantic_context_inner(data_dir, db_path, true, None)
+}
+
+/// Load the hash-vector context from a caller-owned archive snapshot.
+///
+/// The snapshot serves staleness admission, filter maps and the artifact
+/// fingerprint, so the caller's later hydration reuses the same archive
+/// handle instead of opening the database again.
+pub fn load_hash_semantic_context_with_snapshot(
+    data_dir: &Path,
+    db_path: &Path,
+    snapshot: &dyn SemanticReadSnapshot,
+) -> SemanticSetup {
+    load_hash_semantic_context_inner(data_dir, db_path, true, Some(snapshot))
 }
 
 fn load_hash_semantic_context_inner(
     data_dir: &Path,
     db_path: &Path,
     strict_read_only: bool,
+    snapshot: Option<&dyn SemanticReadSnapshot>,
 ) -> SemanticSetup {
     if let Some(availability) = selected_generation_owner_requirement(data_dir) {
         return SemanticSetup {
@@ -839,6 +1301,7 @@ fn load_hash_semantic_context_inner(
         embedder.dimension(),
         "hash semantic",
         strict_read_only,
+        snapshot,
     );
     if !monolithic_present && shard_artifacts.is_none() {
         return SemanticSetup {
@@ -847,26 +1310,35 @@ fn load_hash_semantic_context_inner(
         };
     }
 
-    let storage = match if strict_read_only {
-        FrankenStorage::open_strict_readonly(db_path)
-    } else {
-        FrankenStorage::open_readonly(db_path)
-    } {
-        Ok(storage) => storage,
-        Err(err) => {
-            return SemanticSetup {
-                availability: SemanticAvailability::DatabaseUnavailable {
-                    db_path: db_path.to_path_buf(),
-                    error: err.to_string(),
-                },
-                context: None,
+    let owned_storage;
+    let storage_snapshot;
+    let admission: &dyn SemanticReadSnapshot = match snapshot {
+        Some(snapshot) => snapshot,
+        None => {
+            owned_storage = match if strict_read_only {
+                FrankenStorage::open_strict_readonly(db_path)
+            } else {
+                FrankenStorage::open_readonly(db_path)
+            } {
+                Ok(storage) => storage,
+                Err(err) => {
+                    return SemanticSetup {
+                        availability: SemanticAvailability::DatabaseUnavailable {
+                            db_path: db_path.to_path_buf(),
+                            error: err.to_string(),
+                        },
+                        context: None,
+                    };
+                }
             };
+            storage_snapshot = ConnectionReadSnapshot(owned_storage.raw());
+            &storage_snapshot
         }
     };
 
     if let Some(availability) = refuse_stale_semantic_assets(
         data_dir,
-        &storage,
+        admission,
         embedder.id(),
         &SemanticAvailability::HashFallback,
         crate::search::asset_state::SemanticPreference::HashFallback,
@@ -877,7 +1349,7 @@ fn load_hash_semantic_context_inner(
         };
     }
 
-    let filter_maps = match SemanticFilterMaps::from_storage(&storage) {
+    let filter_maps = match SemanticFilterMaps::from_read_snapshot(admission) {
         Ok(maps) => maps,
         Err(err) => {
             return SemanticSetup {
@@ -937,6 +1409,7 @@ pub fn load_semantic_context_no_version_check(data_dir: &Path, db_path: &Path) -
         active_policy_embedder_name(),
         false,
         false,
+        None,
     )
 }
 
@@ -947,6 +1420,7 @@ fn load_semantic_context_inner(
     embedder_name: &str,
     defer_embedder_load: bool,
     strict_read_only: bool,
+    snapshot: Option<&dyn SemanticReadSnapshot>,
 ) -> SemanticSetup {
     if embedder_name
         .trim()
@@ -1025,6 +1499,7 @@ fn load_semantic_context_inner(
         config.dimension,
         "semantic",
         strict_read_only,
+        snapshot,
     );
     if !monolithic_present && shard_artifacts.is_none() {
         return SemanticSetup {
@@ -1033,26 +1508,35 @@ fn load_semantic_context_inner(
         };
     }
 
-    let storage = match if strict_read_only {
-        FrankenStorage::open_strict_readonly(db_path)
-    } else {
-        FrankenStorage::open_readonly(db_path)
-    } {
-        Ok(storage) => storage,
-        Err(err) => {
-            return SemanticSetup {
-                availability: SemanticAvailability::DatabaseUnavailable {
-                    db_path: db_path.to_path_buf(),
-                    error: err.to_string(),
-                },
-                context: None,
+    let owned_storage;
+    let storage_snapshot;
+    let admission: &dyn SemanticReadSnapshot = match snapshot {
+        Some(snapshot) => snapshot,
+        None => {
+            owned_storage = match if strict_read_only {
+                FrankenStorage::open_strict_readonly(db_path)
+            } else {
+                FrankenStorage::open_readonly(db_path)
+            } {
+                Ok(storage) => storage,
+                Err(err) => {
+                    return SemanticSetup {
+                        availability: SemanticAvailability::DatabaseUnavailable {
+                            db_path: db_path.to_path_buf(),
+                            error: err.to_string(),
+                        },
+                        context: None,
+                    };
+                }
             };
+            storage_snapshot = ConnectionReadSnapshot(owned_storage.raw());
+            &storage_snapshot
         }
     };
 
     if let Some(availability) = refuse_stale_semantic_assets(
         data_dir,
-        &storage,
+        admission,
         &config.embedder_id,
         &SemanticAvailability::Ready {
             embedder_id: config.embedder_id.clone(),
@@ -1065,7 +1549,7 @@ fn load_semantic_context_inner(
         };
     }
 
-    let filter_maps = match SemanticFilterMaps::from_storage(&storage) {
+    let filter_maps = match SemanticFilterMaps::from_read_snapshot(admission) {
         Ok(maps) => maps,
         Err(err) => {
             return SemanticSetup {
@@ -1149,32 +1633,49 @@ fn load_semantic_context_inner(
 /// preserves legacy manifest-less installs).
 fn refuse_stale_semantic_assets(
     data_dir: &Path,
-    storage: &FrankenStorage,
+    snapshot: &dyn SemanticReadSnapshot,
     served_embedder_id: &str,
     availability_if_served: &SemanticAvailability,
     preference: crate::search::asset_state::SemanticPreference,
 ) -> Option<SemanticAvailability> {
-    let semantic_identity_tier = if served_embedder_id == HashEmbedder::default().id() {
-        SemanticIdentityTier::Fast
+    // Schema keys owned by `storage::sqlite::SemanticIdentityTier::meta_key`;
+    // mirrored here because the snapshot reader is intentionally independent
+    // of an open `FrankenStorage`. Keep these strings in lockstep.
+    let identity_meta_key = if served_embedder_id == HashEmbedder::default().id() {
+        "semantic_fast_identity_rebuild_v1"
     } else {
-        SemanticIdentityTier::Quality
+        "semantic_quality_identity_rebuild_v1"
     };
-    match storage.semantic_identity_rebuild_required(semantic_identity_tier) {
-        Ok(true) => {
+    let identity_marker = snapshot
+        .query_with_params(
+            "SELECT value FROM meta WHERE key = ?1",
+            &[crate::franken_sync::SqliteValue::Text(
+                identity_meta_key.into(),
+            )],
+        )
+        .map_err(|error| format!("checking canonical semantic identity invalidation marker: {error}"))
+        .and_then(|rows| {
+            let Some(row) = rows.first() else {
+                return Ok(None);
+            };
+            row.get_typed::<String>(0)
+                .map(Some)
+                .map_err(|error| format!("reading canonical semantic identity marker: {error}"))
+        });
+    match identity_marker {
+        Ok(Some(value)) if value != "complete" => {
             return Some(SemanticAvailability::IndexStale {
                 embedder_id: served_embedder_id.to_string(),
                 reason: "canonical agent/source identity changed; run 'cass index --semantic' to rebuild semantic filter metadata"
                     .to_string(),
             });
         }
-        Ok(false) => {}
+        Ok(_) => {}
         Err(err) => {
-            return Some(SemanticAvailability::LoadFailed {
-                context: format!("checking canonical semantic identity invalidation marker: {err}"),
-            });
+            return Some(SemanticAvailability::LoadFailed { context: err });
         }
     }
-    let db_fingerprint = match crate::indexer::lexical_storage_fingerprint_for_storage(storage) {
+    let db_fingerprint = match lexical_fingerprint_from_snapshot(snapshot) {
         Ok(fingerprint) => fingerprint,
         Err(err) => {
             // The archive answered the open but not the fingerprint queries;
@@ -1395,6 +1896,8 @@ pub fn default_model_manifest() -> ModelManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::franken_sync::compat::TransactionExt;
+    use crate::storage::sqlite::SemanticIdentityTier;
     use tempfile::tempdir;
 
     type AvailabilityTuiCase = (
@@ -1402,6 +1905,220 @@ mod tests {
         &'static str,
         fn(&SemanticAvailability) -> bool,
     );
+
+    #[test]
+    fn retained_loader_absent_pointer_does_not_require_source_or_model() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let connection = crate::franken_sync::Connection::open(":memory:")?;
+        let mut transaction = connection.transaction()?;
+        let context = load_retained_semantic_context(
+            root.path(),
+            &transaction,
+            RetainedSemanticLoadPolicy {
+                source_contract: SemanticSourceContract::new(PassageProjection::RawPassagesV2),
+                vectors: SemanticSelectionBudget::default(),
+                ann: AnnAdmissionBudget::default(),
+            },
+            None,
+            |_, _| panic!("an absent publication must not initialize a model"),
+        )?;
+        assert!(context.is_none());
+        transaction.rollback()?;
+        Ok(())
+    }
+
+    #[test]
+    fn retained_loader_rejects_source_before_publication_or_model() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let pointer = SemanticCurrentPointerV1::path(root.path());
+        std::fs::create_dir_all(pointer.parent().expect("current pointer has a parent"))?;
+        std::fs::write(pointer, b"publication metadata must not be read yet")?;
+        let connection = crate::franken_sync::Connection::open(":memory:")?;
+        let mut transaction = connection.transaction()?;
+        let error = load_retained_semantic_context(
+            root.path(),
+            &transaction,
+            RetainedSemanticLoadPolicy {
+                source_contract: SemanticSourceContract::new(PassageProjection::RawPassagesV2),
+                vectors: SemanticSelectionBudget::default(),
+                ann: AnnAdmissionBudget::default(),
+            },
+            None,
+            |_, _| panic!("an uncertified source must not initialize a model"),
+        )
+        .expect_err("a present publication requires independent source authority");
+        assert!(matches!(error, RetainedSemanticLoadError::Source(_)));
+        transaction.rollback()?;
+        Ok(())
+    }
+
+    #[test]
+    fn retained_loader_rejects_bad_publication_after_actual_source_certificate()
+    -> anyhow::Result<()> {
+        use crate::search::semantic_manifest::source_snapshot::{
+            persist_semantic_source_certificate_in_transaction,
+            semantic_source_snapshot_in_transaction,
+        };
+
+        let root = tempdir()?;
+        let database = root.path().join("retained-loader-source.db");
+        let storage = FrankenStorage::open(&database)?;
+        storage.raw().execute_batch(
+            "INSERT INTO agents(id, slug, name, kind, created_at, updated_at)
+                 VALUES(9101, 'loader', 'loader', 'cli', 1, 1);
+             INSERT INTO conversations(id, agent_id, source_path)
+                 VALUES(9102, 9101, '/loader.jsonl');
+             INSERT INTO messages(id, conversation_id, idx, role, content)
+                 VALUES(9103, 9102, 0, 'user', 'actual loader source certificate');",
+        )?;
+        let contract = SemanticSourceContract::new(PassageProjection::RawPassagesV2);
+        let mut transaction = storage.raw().transaction()?;
+        let source =
+            semantic_source_snapshot_in_transaction(&transaction, contract, Default::default())?;
+        persist_semantic_source_certificate_in_transaction(&transaction, &source)?;
+        transaction.commit()?;
+        drop(transaction);
+        storage.close()?;
+
+        let pointer = SemanticCurrentPointerV1::path(root.path());
+        std::fs::create_dir_all(pointer.parent().expect("current pointer has a parent"))?;
+        std::fs::write(pointer, b"malformed current publication")?;
+        let storage = FrankenStorage::open_strict_readonly(&database)?;
+        let mut transaction = storage.raw().transaction()?;
+        let error = load_retained_semantic_context(
+            root.path(),
+            &transaction,
+            RetainedSemanticLoadPolicy {
+                source_contract: contract,
+                vectors: SemanticSelectionBudget::default(),
+                ann: AnnAdmissionBudget::default(),
+            },
+            None,
+            |_, _| panic!("a malformed publication must not initialize a model"),
+        )
+        .expect_err("a valid source certificate does not authorize malformed publication metadata");
+        assert!(matches!(error, RetainedSemanticLoadError::Publication(_)));
+        assert_eq!(
+            error.reason_code(),
+            "semantic_publication_metadata_rejected"
+        );
+        transaction.rollback()?;
+        drop(transaction);
+        storage.close_without_checkpoint()?;
+        Ok(())
+    }
+
+    #[test]
+    fn retained_loader_empty_publication_skips_factory_and_revalidates_source() -> anyhow::Result<()>
+    {
+        use crate::search::semantic_manifest::source_snapshot::{
+            persist_semantic_source_certificate_in_transaction,
+            semantic_source_snapshot_in_transaction,
+        };
+        use crate::search::semantic_manifest::{
+            SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION, SemanticExpectedCurrentV1,
+            SemanticGenerationStatus, SemanticGenerationTopology, SemanticProducerAttestation,
+        };
+
+        let root = tempdir()?;
+        let storage = FrankenStorage::open(&root.path().join("empty-loader-source.db"))?;
+        let contract = SemanticSourceContract::new(PassageProjection::RawPassagesV2);
+        let mut transaction = storage.raw().transaction()?;
+        let source =
+            semantic_source_snapshot_in_transaction(&transaction, contract, Default::default())?;
+        assert_eq!(source.identity().document_count, 0);
+        persist_semantic_source_certificate_in_transaction(&transaction, &source)?;
+        transaction.commit()?;
+        drop(transaction);
+
+        // Publication provenance is a test declaration, not native producer
+        // proof. Source authority comes from the actual migrated empty archive.
+        let manifest = SemanticGenerationManifestV1 {
+            schema_version: SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION,
+            purpose: SemanticGenerationPurpose::EmptyCorpus,
+            generation_id: "empty-loader-generation".into(),
+            build_id: "empty-loader-build".into(),
+            request_id: None,
+            previous_generation_id: None,
+            created_at_ms: 1,
+            completed_at_ms: 2,
+            sealed_at_ms: 3,
+            requested_topology: SemanticGenerationTopology::QualityOnly,
+            realized_topology: SemanticGenerationTopology::QualityOnly,
+            status: SemanticGenerationStatus::Sealed,
+            corpus: source.identity().clone(),
+            producer: SemanticProducerAttestation {
+                cass_git_commit: "a".repeat(40),
+                frankensearch_git_commit: "b".repeat(40),
+                cargo_lock_sha256: "c".repeat(64),
+                rust_toolchain: "loader-test-toolchain".into(),
+                enabled_features: vec!["semantic".into()],
+                build_profile: "test".into(),
+                binary_elf_sha256: "d".repeat(64),
+            },
+            selected_document_count: 0,
+            total_vector_slot_count_across_tiers: 0,
+            total_live_vector_count_across_tiers: 0,
+            total_tombstone_vector_count_across_tiers: 0,
+            total_wal_entry_count_across_tiers: 0,
+            artifacts: Vec::new(),
+        };
+        manifest.write_immutable(root.path())?;
+        let pointer = SemanticCurrentPointerV1::for_manifest(&manifest, 4, 1)?;
+        pointer.publish_atomic(root.path(), &SemanticExpectedCurrentV1::Absent)?;
+
+        let mut transaction = storage.raw().transaction()?;
+        let outcome = load_retained_semantic_context(
+            root.path(),
+            &transaction,
+            RetainedSemanticLoadPolicy {
+                source_contract: contract,
+                vectors: SemanticSelectionBudget {
+                    max_declared_vector_bytes: 0,
+                },
+                ann: AnnAdmissionBudget {
+                    max_declared_graph_bytes: 0,
+                },
+            },
+            None,
+            |_, _| panic!("an explicit empty publication must not initialize a model"),
+        )?
+        .expect("the selected empty publication exists");
+        let RetainedSemanticLoadOutcome::Empty(context) = &outcome else {
+            panic!("empty source must not acquire vector or producer owners");
+        };
+        assert_eq!(context.pointer(), &pointer);
+        assert_eq!(context.manifest(), &manifest);
+        assert_eq!(context.source_snapshot().identity(), source.identity());
+        assert!(context.manifest().artifacts.is_empty());
+        outcome.verify_source_in_transaction(&transaction)?;
+        transaction.rollback()?;
+        drop(transaction);
+
+        storage.raw().execute_batch(
+            "INSERT INTO agents(id, slug, name, kind, created_at, updated_at)
+                 VALUES(9201, 'empty-loader', 'empty-loader', 'cli', 1, 1);
+             INSERT INTO conversations(id, agent_id, source_path)
+                 VALUES(9202, 9201, '/empty-loader.jsonl');
+             INSERT INTO messages(id, conversation_id, idx, role, content)
+                 VALUES(9203, 9202, 0, 'user', 'new source after empty publication');",
+        )?;
+        let mut transaction = storage.raw().transaction()?;
+        let current =
+            semantic_source_snapshot_in_transaction(&transaction, contract, Default::default())?;
+        persist_semantic_source_certificate_in_transaction(&transaction, &current)?;
+        transaction.commit()?;
+        drop(transaction);
+        let mut transaction = storage.raw().transaction()?;
+        assert!(matches!(
+            outcome.verify_source_in_transaction(&transaction),
+            Err(RetainedSemanticLoadError::SourceChanged)
+        ));
+        transaction.rollback()?;
+        drop(transaction);
+        storage.close()?;
+        Ok(())
+    }
 
     #[test]
     fn test_semantic_availability_ready() {
@@ -2326,5 +3043,30 @@ mod tests {
             .map(|artifact| artifact.index().record_count())
             .sum::<usize>();
         assert_eq!(loaded_records, 2);
+    }
+
+    #[test]
+    fn snapshot_fingerprint_matches_storage_fingerprint() -> anyhow::Result<()> {
+        let tmp = tempdir()?;
+        let db_path = tmp.path().join("snapshot-fingerprint.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        storage.raw().execute_batch(
+            "INSERT INTO agents(id, slug, name, kind, created_at, updated_at)
+                 VALUES(8101, 'snapshot', 'snapshot', 'cli', 1, 1);
+             INSERT INTO conversations(id, agent_id, source_path)
+                 VALUES(8102, 8101, '/snapshot.jsonl');
+             INSERT INTO messages(id, conversation_id, idx, role, content)
+                 VALUES(8103, 8102, 0, 'user', 'first'),
+                       (8104, 8102, 1, 'assistant', 'second');",
+        )?;
+        let snapshot = ConnectionReadSnapshot(storage.raw());
+        // Semantic admission must fingerprint the same archive generation it
+        // will hydrate from, so the snapshot path must agree byte-for-byte
+        // with the storage adapter used by status and other callers.
+        assert_eq!(
+            lexical_fingerprint_from_snapshot(&snapshot)?,
+            crate::indexer::lexical_storage_fingerprint_for_storage(&storage)?
+        );
+        Ok(())
     }
 }
