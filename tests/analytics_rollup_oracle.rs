@@ -994,6 +994,184 @@ fn oracle_ledger_matches_rollups_raw_fallbacks_and_status() {
 }
 
 #[test]
+fn duplicate_and_updated_events_do_not_double_count() {
+    let tmp = TempDir::new().expect("temp dir");
+    let db_path = tmp.path().join("agent_search.db");
+    let storage = FrankenStorage::open(&db_path).expect("open storage");
+    let agent_id = storage
+        .ensure_agent(&Agent {
+            id: None,
+            slug: "claude_code".to_string(),
+            name: "Claude Code".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })
+        .expect("agent");
+    let workspace = Path::new("/srv/duplicate-events");
+    let workspace_id = storage
+        .ensure_workspace(workspace, Some("duplicate-events"))
+        .expect("workspace");
+    let started_at = utc_ms(2026, 3, 1, 12, 0, 0, 0);
+
+    let message = |idx: i64, role: MessageRole, content: &str, extra: Value| Message {
+        id: None,
+        idx,
+        role,
+        author: None,
+        created_at: Some(started_at + idx * 1_000),
+        content: pad_to_quad(content),
+        extra_json: extra,
+        snippets: Vec::new(),
+    };
+    let conversation = |messages: Vec<Message>| Conversation {
+        id: None,
+        agent_slug: "claude_code".to_string(),
+        workspace: Some(workspace.to_path_buf()),
+        external_id: Some("conv-duplicate-events".to_string()),
+        title: Some("duplicate events".to_string()),
+        source_path: PathBuf::from("/fixtures/conv-duplicate-events.jsonl"),
+        started_at: Some(started_at),
+        ended_at: Some(started_at + 86_400_000),
+        approx_tokens: None,
+        metadata_json: json!({}),
+        messages,
+        source_id: "local".to_string(),
+        origin_host: None,
+    };
+
+    let first = conversation(vec![message(
+        0,
+        MessageRole::User,
+        "Count this message exactly once.",
+        json!({}),
+    )]);
+    storage
+        .insert_conversation_tree(agent_id, Some(workspace_id), &first)
+        .expect("first insert");
+    // A provider re-scan can hand the archive the same conversation again.
+    storage
+        .insert_conversation_tree(agent_id, Some(workspace_id), &first)
+        .expect("duplicate insert");
+    storage.rebuild_analytics().expect("rebuild track A");
+    storage
+        .rebuild_token_daily_stats()
+        .expect("rebuild track B");
+
+    let initial =
+        query_tokens_timeseries(&storage.raw(), &AnalyticsFilter::default(), GroupBy::Day)
+            .expect("initial tokens");
+    assert_eq!(initial.totals.message_count, 1, "duplicate insert once");
+    assert_eq!(initial.totals.user_message_count, 1);
+    assert_eq!(initial.totals.assistant_message_count, 0);
+
+    // A later update appends one new assistant turn; the existing user turn
+    // is not duplicated or re-counted.
+    let updated = conversation(vec![
+        message(
+            0,
+            MessageRole::User,
+            "Count this message exactly once.",
+            json!({}),
+        ),
+        message(
+            1,
+            MessageRole::Agent,
+            "Appended after the archive was revisited.",
+            claude_usage("claude-sonnet-4-20250514", 100, 50, 0, 0, 0),
+        ),
+    ]);
+    let outcome = storage
+        .insert_conversation_tree(agent_id, Some(workspace_id), &updated)
+        .expect("updated insert");
+    assert_eq!(outcome.inserted_indices, vec![1]);
+    let conversation_id = outcome.conversation_id;
+    let stored = storage
+        .fetch_messages(conversation_id)
+        .expect("stored messages");
+    assert_eq!(stored.len(), 2, "no duplicate append");
+    let assistant = &stored[1];
+    let assistant_id = assistant.id.expect("stored assistant id");
+    let assistant_at = assistant.created_at.expect("assistant timestamp");
+    let assistant_day = FrankenStorage::day_id_from_millis(assistant_at);
+    let pricing = PricingTable::franken_load(storage.raw()).expect("pricing");
+    let cost = pricing
+        .compute_cost(
+            Some("claude-sonnet-4-20250514"),
+            assistant_day,
+            Some(100),
+            Some(50),
+            Some(0),
+            Some(0),
+        )
+        .expect("priced assistant");
+    // The indexer materializes the appended turn's Track B ledger row.
+    storage
+        .raw()
+        .execute_batch(&format!(
+            "INSERT INTO token_usage (
+                message_id, conversation_id, agent_id, workspace_id, source_id,
+                timestamp_ms, day_id, model_name, model_family, model_tier,
+                service_tier, provider, input_tokens, output_tokens,
+                cache_read_tokens, cache_creation_tokens, thinking_tokens,
+                total_tokens, estimated_cost_usd, role, content_chars,
+                has_tool_calls, tool_call_count, data_source
+             ) VALUES (
+                {assistant_id}, {conversation_id}, {agent_id}, {workspace_id},
+                'local', {assistant_at}, {assistant_day},
+                'claude-sonnet-4-20250514', 'claude', 'sonnet', NULL,
+                'anthropic', 100, 50, 0, 0, 0, 150, {cost:.17},
+                'agent', {}, 0, 0, 'api'
+             );",
+            assistant.content.len()
+        ))
+        .expect("append token ledger");
+    storage.rebuild_analytics().expect("rebuild track A");
+    storage
+        .rebuild_token_daily_stats()
+        .expect("rebuild track B");
+
+    let tokens = query_tokens_timeseries(&storage.raw(), &AnalyticsFilter::default(), GroupBy::Day)
+        .expect("updated tokens");
+    assert_eq!(tokens.totals.message_count, 2);
+    assert_eq!(tokens.totals.user_message_count, 1);
+    assert_eq!(tokens.totals.assistant_message_count, 1);
+    assert_eq!(tokens.totals.api_tokens_total, 150);
+
+    let costs = query_cost_timeseries(&storage.raw(), &AnalyticsFilter::default(), GroupBy::Day)
+        .expect("updated costs");
+    assert_f64_close(
+        costs.totals.estimated_cost_usd,
+        0.001_05,
+        "updated cost total",
+    );
+
+    let status = query_status(&storage.raw(), &AnalyticsFilter::default()).expect("status");
+    assert_eq!(status.coverage.total_messages, 2);
+
+    let agents = query_breakdown(
+        &storage.raw(),
+        &AnalyticsFilter::default(),
+        Dim::Agent,
+        Metric::ApiTotal,
+        10,
+    )
+    .expect("agent breakdown");
+    let claude = agents
+        .rows
+        .iter()
+        .find(|row| row.key == "claude_code")
+        .expect("claude row");
+    assert_eq!(claude.value, 150);
+    assert_eq!(claude.message_count, 2);
+
+    let scatter =
+        query_session_scatter(&storage.raw(), &AnalyticsFilter::default(), 10).expect("scatter");
+    assert_eq!(scatter.len(), 1);
+    assert_eq!(scatter[0].message_count, 2);
+    assert!(scatter[0].api_tokens_total >= 150);
+}
+
+#[test]
 fn timestamp_boundaries_and_timezone_edges_are_exact() {
     let tmp = TempDir::new().expect("temp dir");
     let db_path = tmp.path().join("agent_search.db");
