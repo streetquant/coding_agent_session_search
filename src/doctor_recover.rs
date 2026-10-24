@@ -31,8 +31,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::storage::sqlite::{
-    FrankenStorage, FtsConsistencyRepair, FtsDryRunParity, FtsRebuildProgress, FtsShadowParity,
-    FtsShadowParityStatus, RecoveryConversationRow,
+    FrankenStorage, FtsConsistencyRepair, FtsDryRunParity, FtsShadowParity, FtsShadowParityStatus,
+    RecoveryConversationRow,
 };
 use crate::{CliError, CliResult, RobotFormat, default_data_dir};
 
@@ -578,7 +578,7 @@ fn fts_parity_json(parity: &FtsShadowParity) -> serde_json::Value {
 
 fn planned_fts_repair(status: FtsShadowParityStatus) -> &'static str {
     match status {
-        FtsShadowParityStatus::Absent => "bounded_resumable_recreate",
+        FtsShadowParityStatus::Absent => "failure_atomic_recreate",
         FtsShadowParityStatus::Residue => "drop_residue_and_recreate_from_canonical",
         FtsShadowParityStatus::Healthy => "verify_and_record_generation",
         FtsShadowParityStatus::Partial => "resumable_incremental_catch_up",
@@ -666,56 +666,11 @@ fn fts_rebuild_dry_run_envelope(
     })
 }
 
-/// GH #345: report durable rebuild progress for a human-facing repair.
-///
-/// The reporter fires after every committed batch; throttle to one line per
-/// five seconds so a multi-million-message archive does not flood the
-/// terminal. Structured output must stay a single JSON envelope, so JSON runs
-/// install nothing. Every reported count is already durable, so an interrupted
-/// rebuild resumes from the last printed prefix.
-fn install_fts_rebuild_progress_printer(
-    storage: &FrankenStorage,
-    db_path: &Path,
-    structured_format: Option<RobotFormat>,
-) {
-    if structured_format.is_some() {
-        return;
-    }
-    let last_printed = std::sync::Mutex::new(None::<std::time::Instant>);
-    let db_path = db_path.to_path_buf();
-    storage.set_fts_rebuild_progress(Some(Box::new(move |progress: FtsRebuildProgress| {
-        let now = std::time::Instant::now();
-        let mut last = last_printed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if last.is_some_and(|at| now.duration_since(at) < std::time::Duration::from_secs(5)) {
-            return;
-        }
-        *last = Some(now);
-        if progress.total_rows > 0 {
-            eprintln!(
-                "Canonical FTS5 rebuild: {}/{} rows committed in {} (durable; an interrupted \
-                 rebuild resumes from this prefix)",
-                progress.committed_rows,
-                progress.total_rows,
-                db_path.display()
-            );
-        } else {
-            eprintln!(
-                "Canonical FTS5 rebuild: {} rows committed in {} (durable)",
-                progress.committed_rows,
-                db_path.display()
-            );
-        }
-    })));
-}
-
 /// Verify and safely repair the canonical FTS5 shadow tables in place.
 ///
 /// Queryable partial shadows are retained and caught up in bounded, resumable
-/// batches. Recreated shadows are repopulated in bounded batches, each
-/// committed durably so an interruption leaves a resumable Partial shadow
-/// rather than publishing nothing. Unqueryable or divergent artifacts are
+/// batches. An absent shadow is created in a transaction so interruption
+/// cannot publish a partial table. Unqueryable or divergent artifacts are
 /// preserved for bundle-level recovery rather than destroyed in place. Exact
 /// canonical/indexable/FTS parity is required before success.
 pub fn run_doctor_rebuild_canonical_fts(
@@ -734,7 +689,7 @@ pub fn run_doctor_rebuild_canonical_fts(
             kind: "refused-unsafe",
             message: "`cass doctor --rebuild-canonical-fts` mutates the canonical archive's derived FTS5 shadow and requires `--yes`".to_string(),
             hint: Some(
-                "Inspect first with `--rebuild-canonical-fts --dry-run --json`, then re-run with `--rebuild-canonical-fts --yes` only when the plan is applicable. Queryable partial shadows are caught up in place; absent, corrupt, and divergent shadows are dropped, recreated, and repopulated in bounded batches, each durable so an interrupted rebuild resumes from its committed prefix. Unqueryable artifacts are preserved for bundle-level recovery. Canonical rows are never modified.".to_string(),
+                "Inspect first with `--rebuild-canonical-fts --dry-run --json`, then re-run with `--rebuild-canonical-fts --yes` only when the plan is applicable. Queryable partial shadows are caught up in place and absent shadows are created failure-atomically; unqueryable/divergent artifacts are preserved for bundle-level recovery. Canonical rows are never modified.".to_string(),
             ),
             retryable: false,
         });
@@ -828,7 +783,6 @@ pub fn run_doctor_rebuild_canonical_fts(
                     ),
                 )
             })?;
-            install_fts_rebuild_progress_printer(&deferred, &db_path, structured_format);
             let inserted = deferred
                 .rebuild_fts_shadow_via_drop_recreate()
                 .map_err(|e| {
@@ -874,7 +828,6 @@ pub fn run_doctor_rebuild_canonical_fts(
             ));
         }
     };
-    install_fts_rebuild_progress_printer(&storage, &db_path, structured_format);
     if dry_run {
         let before = storage
             .inspect_search_fallback_fts_parity_dry_run(fts_dry_run_rowid_comparison_cap())
@@ -1038,7 +991,7 @@ pub fn run_doctor_rebuild_canonical_fts(
             ("resumable_incremental_catch_up", inserted_rows)
         }
         FtsConsistencyRepair::Rebuilt { inserted_rows } => {
-            ("bounded_resumable_recreate", inserted_rows)
+            ("failure_atomic_recreate", inserted_rows)
         }
     };
 
@@ -1055,7 +1008,7 @@ pub fn run_doctor_rebuild_canonical_fts(
         "parity_after": fts_parity_json(&after),
         "mutated_asset_class": "canonical_fts5_shadow",
         "canonical_rows_modified": false,
-        "note": "Queryable partial shadows are caught up in place; recreated shadows are repopulated in bounded batches, each committed durably so an interrupted rebuild resumes from its published prefix. Exact parity is verified before success. Canonical rows are never modified.",
+        "note": "Queryable shadows are preserved and caught up resumably; recreation is transactionally published only after exact parity validation. Canonical rows are never modified.",
     });
 
     if structured_format.is_some() {
@@ -2407,7 +2360,7 @@ mod tests {
         let mut fits = oversized(FtsShadowParityStatus::Absent);
         fits.indexable_messages = 1;
         let fits = fts_rebuild_dry_run_envelope(db, &fits, true);
-        assert_eq!(fits["planned_action"], "bounded_resumable_recreate");
+        assert_eq!(fits["planned_action"], "failure_atomic_recreate");
         assert_eq!(fits["would_mutate"], true);
     }
 

@@ -2697,16 +2697,21 @@ mod tests {
         };
         let mut tracker = EngineLivenessTracker::default();
         assert!(!tracker.observe(io_sample(1, 1_000_000)), "baseline");
+        let trickle = 1_000_000 + ENGINE_LIVENESS_MIN_IO_ADVANCE - 1;
         assert!(
-            !tracker.observe(io_sample(1, 1_000_000 + ENGINE_LIVENESS_MIN_IO_ADVANCE - 1)),
+            !tracker.observe(io_sample(1, trickle)),
             "a sub-threshold I/O trickle is not proof of work"
         );
+        // The tracker compares consecutive samples, so the next sample must
+        // itself advance by the threshold from the trickle, not from the
+        // baseline.
+        let advanced = trickle + ENGINE_LIVENESS_MIN_IO_ADVANCE;
         assert!(
-            tracker.observe(io_sample(1, 1_000_000 + ENGINE_LIVENESS_MIN_IO_ADVANCE)),
+            tracker.observe(io_sample(1, advanced)),
             "a 256 KiB storage-I/O advance is work"
         );
         assert!(
-            !tracker.observe(io_sample(1, 1_000_000 + ENGINE_LIVENESS_MIN_IO_ADVANCE)),
+            !tracker.observe(io_sample(1, advanced)),
             "frozen I/O and CPU is a wedge"
         );
     }

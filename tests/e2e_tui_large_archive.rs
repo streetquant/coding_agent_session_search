@@ -678,9 +678,9 @@ fn tui_large_archive_first_frame_and_core_journeys() {
     );
 
     let mut runs = Vec::new();
-    for (label, size) in [("small", SMALL_SIZE), ("large", LARGE_SIZE)] {
+    for (label, terminal_size) in [("small", SMALL_SIZE), ("large", LARGE_SIZE)] {
         let latency_trace = fixture.data_dir.join(format!("latency-{label}.json"));
-        let mut session = TuiSession::spawn(&fixture, size, Some(&latency_trace), None);
+        let mut session = TuiSession::spawn(&fixture, terminal_size, Some(&latency_trace), None);
 
         // ---- first usable frame ------------------------------------------
         assert!(
@@ -859,8 +859,14 @@ fn tui_large_archive_first_frame_and_core_journeys() {
 
         // ---- resize ------------------------------------------------------
         for (resize_label, resize_size) in [
-            ("grow", size(cols(size) + 60, rows(size) + 16)),
-            ("shrink", size(cols(size) - 12, rows(size) - 6)),
+            (
+                "grow",
+                size(cols(terminal_size) + 60, rows(terminal_size) + 16),
+            ),
+            (
+                "shrink",
+                size(cols(terminal_size) - 12, rows(terminal_size) - 6),
+            ),
         ] {
             let base = session.captured_len();
             let started = Instant::now();
@@ -883,7 +889,7 @@ fn tui_large_archive_first_frame_and_core_journeys() {
                 "[{label}] TUI exited after resize"
             );
         }
-        session.resize(size); // restore the declared terminal shape
+        session.resize(terminal_size); // restore the declared terminal shape
 
         // ---- help overlay -------------------------------------------------
         let help_base = session.captured_len();
@@ -1000,7 +1006,7 @@ fn tui_large_archive_first_frame_and_core_journeys() {
 
         save_artifact(&format!("{label}_pty_output.raw"), &trace_id, &raw);
         let run = serde_json::json!({
-            "size": { "cols": cols(size), "rows": rows(size) },
+            "size": { "cols": cols(terminal_size), "rows": rows(terminal_size) },
             "first_frame_ms": first_frame_ms,
             "initial_search_ms": search_ms,
             "trace_input_to_visible_ms": trace_visible_ms,
