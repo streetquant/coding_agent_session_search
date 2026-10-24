@@ -1057,9 +1057,8 @@ fn duplicate_and_updated_events_do_not_double_count() {
         .rebuild_token_daily_stats()
         .expect("rebuild track B");
 
-    let initial =
-        query_tokens_timeseries(storage.raw(), &AnalyticsFilter::default(), GroupBy::Day)
-            .expect("initial tokens");
+    let initial = query_tokens_timeseries(storage.raw(), &AnalyticsFilter::default(), GroupBy::Day)
+        .expect("initial tokens");
     assert_eq!(initial.totals.message_count, 1, "duplicate insert once");
     assert_eq!(initial.totals.user_message_count, 1);
     assert_eq!(initial.totals.assistant_message_count, 0);
