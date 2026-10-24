@@ -1,8 +1,12 @@
+pub mod archive_count;
 mod archive_lease;
 pub mod background_refresh;
-pub mod archive_count;
 #[cfg(test)]
 mod checkpoint_deadline;
+// The GH #379 witness measures Linux resident-set residency (`/proc`), so
+// the module is Linux-only; `crate::daemon` is unix-only too.
+#[cfg(all(test, target_os = "linux"))]
+mod gh379_first_mutation_tests;
 pub(crate) mod lexical_generation;
 mod lexical_publish;
 pub mod lexical_reconcile;
@@ -49,7 +53,7 @@ use crate::franken_sync::compat::{
     Transaction as FrankenTransaction, TransactionExt as FrankenTransactionExt,
 };
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, never, select};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, never};
 use frankensearch::index::VectorIndex as FsVectorIndex;
 use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
 use notify::{RecursiveMode, Watcher, recommended_watcher};
@@ -77,9 +81,7 @@ use crate::model::conversation_packet::{
 };
 use crate::search::asset_state::{SearchMaintenanceJobKind, SearchMaintenanceMode};
 use crate::search::canonicalize::is_hard_message_noise;
-use crate::search::tantivy::{
-    SearchableIndexSummary, TantivyIndex, index_dir, schema_hash_matches,
-};
+use crate::search::tantivy::{TantivyIndex, index_dir, schema_hash_matches};
 use crate::search::vector_index::{
     ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER, vector_index_path,
 };
@@ -92,8 +94,7 @@ use crate::storage::sqlite::incompatible_legacy_fts_shadow_ddl;
 #[cfg(test)]
 use crate::storage::sqlite::{DailyStatsRebuildResult, StatsAggregator, StatsDelta};
 use crate::storage::sqlite::{
-    FrankenStorage, FtsConsistencyRepair, HistoricalSalvageOutcome,
-    LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE, SemanticIdentityTier,
+    FrankenStorage, FtsConsistencyRepair, HistoricalSalvageOutcome, SemanticIdentityTier,
     seed_canonical_from_best_historical_bundle,
 };
 use semantic::{
@@ -1121,9 +1122,18 @@ pub(crate) const INDEX_PHASE_SEMANTIC_HNSW: usize = 7;
 pub(crate) const INDEX_PHASE_SEMANTIC_MANIFEST: usize = 8;
 pub(crate) const INDEX_PHASE_SEMANTIC_FINALIZE: usize = 9;
 pub(crate) const INDEX_PHASE_ANALYTICS_REBUILD: usize = 10;
+/// GH #450: frankensqlite's one-time first-open compatibility repair. It runs
+/// before the first indexing phase proper, so it gets its own top-level phase
+/// with byte progress instead of hiding under `preparing 0/0`.
+pub(crate) const INDEX_PHASE_COMPATIBILITY_REPAIR: usize = 11;
 
 #[derive(Debug, Default)]
 pub struct IndexingProgress {
+    /// GH #450: live view of the pre-index compatibility repair, when one is
+    /// pending. Published into every progress payload as `compatibility_repair`
+    /// while the phase runs; `None` once the phase ends.
+    pub(crate) compatibility_repair:
+        Mutex<Option<crate::storage::compat_repair::CompatRepairReceipt>>,
     pub stop_requested: AtomicBool,
     /// Cancellation of an admitted preparation query is relayed to the
     /// engine's operation context. Its owner still drains the query and
@@ -1331,6 +1341,7 @@ impl IndexingProgress {
             INDEX_PHASE_SEMANTIC_MANIFEST => "semantic_manifest",
             INDEX_PHASE_SEMANTIC_FINALIZE => "semantic_finalize",
             INDEX_PHASE_ANALYTICS_REBUILD => "analytics_rebuild",
+            INDEX_PHASE_COMPATIBILITY_REPAIR => "compatibility_repair",
             _ => "preparing",
         }
     }
@@ -1342,6 +1353,7 @@ impl IndexingProgress {
             INDEX_PHASE_SEMANTIC_EMBEDDING | INDEX_PHASE_ANALYTICS_REBUILD => "messages",
             INDEX_PHASE_SEMANTIC_VECTOR_PUBLISH | INDEX_PHASE_SEMANTIC_HNSW => "vectors",
             INDEX_PHASE_SEMANTIC_MANIFEST | INDEX_PHASE_SEMANTIC_FINALIZE => "steps",
+            INDEX_PHASE_COMPATIBILITY_REPAIR => "bytes",
             _ => "items",
         }
     }
@@ -1359,6 +1371,34 @@ impl IndexingProgress {
     pub(crate) fn update_phase_progress(&self, current: usize, total: usize) {
         self.total.store(total, Ordering::Relaxed);
         self.current.store(current, Ordering::Relaxed);
+    }
+
+    /// GH #450: publish one live compatibility-repair sample. The top-level
+    /// counters carry the byte numerator/denominator so a progress consumer
+    /// that only reads `phase`/`current`/`total` (the exact shape that read
+    /// `preparing 0/0` during the 1,491 s repair) sees real work; the full
+    /// receipt rides in the nested `compatibility_repair` object.
+    pub(crate) fn publish_compat_repair(
+        &self,
+        snapshot: &crate::storage::compat_repair::CompatRepairReceipt,
+    ) {
+        let current = usize::try_from(snapshot.progress_current).unwrap_or(usize::MAX);
+        let total = usize::try_from(snapshot.progress_total).unwrap_or(usize::MAX);
+        self.set_phase_progress(INDEX_PHASE_COMPATIBILITY_REPAIR, current, total);
+        if let Ok(mut slot) = self.compatibility_repair.lock() {
+            *slot = Some(snapshot.clone());
+        }
+    }
+
+    /// Clear the repair phase once its open has returned. Returning to
+    /// `preparing` keeps a later preflight wedge attributed to the step it is
+    /// actually in, not to a repair that already completed.
+    pub(crate) fn clear_compat_repair(&self) {
+        self.set_phase_progress(INDEX_PHASE_PREPARING, 0, 0);
+        self.total_is_final.store(false, Ordering::Relaxed);
+        if let Ok(mut slot) = self.compatibility_repair.lock() {
+            *slot = None;
+        }
     }
 
     /// #332: record one unit of real work (a parsed conversation, a received
@@ -1627,6 +1667,14 @@ impl IndexingProgress {
 
         let total_is_final = self.total_is_final.load(Ordering::Relaxed);
         let activity = self.activity.load(std::sync::atomic::Ordering::Relaxed);
+        // GH #450: the repair phase's own evidence rides with every snapshot,
+        // including bytes read/written, pages, RSS, PSI and the age of the
+        // last observed work. A reader can now tell active-slow from wedged
+        // without inferring it from a frozen top-level counter.
+        let compatibility_repair = self.compatibility_repair.lock().ok().and_then(|slot| {
+            slot.as_ref()
+                .map(crate::storage::compat_repair::CompatRepairReceipt::to_progress_json)
+        });
 
         // Derived rate + ETA for the indexing phase. Guard against divide-by-zero
         // and bogus values when `total` isn't set yet. #332: ETA is only
@@ -1688,6 +1736,7 @@ impl IndexingProgress {
             "quarantined_conversations": quarantined_conversations,
             "lexical_update_deferred": lexical_update_deferred,
             "final_wal_checkpoint": final_wal_checkpoint,
+            "compatibility_repair": compatibility_repair,
             "rebuild_pipeline": {
                 "queue_depth": rebuild_pipeline_queue_depth,
                 "inflight_message_bytes": rebuild_pipeline_inflight_message_bytes,
@@ -5376,1217 +5425,6 @@ fn lexical_rebuild_prepare_prebuilt_doc_refs<'a>(
     prepared_docs
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn build_lexical_rebuild_shard_index(
-    shard_index_path: &Path,
-    batch: &[LexicalRebuildConversationPacket],
-    lexical_rebuild_worker_pool: Option<&ThreadPool>,
-) -> Result<usize> {
-    Ok(
-        build_lexical_rebuild_shard_index_summary_with_writer_parallelism(
-            shard_index_path,
-            batch,
-            lexical_rebuild_worker_pool,
-            None,
-            None,
-        )?
-        .docs,
-    )
-}
-
-fn build_lexical_rebuild_shard_index_summary_with_writer_parallelism(
-    shard_index_path: &Path,
-    batch: &[LexicalRebuildConversationPacket],
-    lexical_rebuild_worker_pool: Option<&ThreadPool>,
-    writer_parallelism: Option<usize>,
-    heartbeat: Option<crate::search::quill_bridge::EngineHeartbeat>,
-) -> Result<SearchableIndexSummary> {
-    let mut shard_index = if let Some(writer_parallelism) = writer_parallelism {
-        TantivyIndex::open_or_create_with_writer_parallelism(shard_index_path, writer_parallelism)
-    } else {
-        TantivyIndex::open_or_create(shard_index_path)
-    }
-    .with_context(|| {
-        format!(
-            "opening lexical rebuild shard index at {}",
-            shard_index_path.display()
-        )
-    })?;
-    // GH #446: a single giant shard build is minutes of silent Quill work
-    // between the pipeline counter changes the watchdog can see.
-    shard_index.set_heartbeat(heartbeat);
-    shard_index.configure_bulk_load_merge_policy();
-    let prepared_docs =
-        lexical_rebuild_prepare_prebuilt_doc_refs(batch, lexical_rebuild_worker_pool);
-    let indexed_docs = shard_index
-        .add_prebuilt_document_refs_slice(prepared_docs.as_slice())
-        .with_context(|| {
-            format!(
-                "adding prebuilt lexical rebuild docs into shard index {}",
-                shard_index_path.display()
-            )
-        })?;
-    shard_index.commit().with_context(|| {
-        format!(
-            "committing lexical rebuild shard index at {}",
-            shard_index_path.display()
-        )
-    })?;
-    Ok(SearchableIndexSummary {
-        docs: indexed_docs,
-        segments: shard_index.segment_count(),
-    })
-}
-
-#[derive(Debug)]
-struct LexicalRebuildShardBuildWork {
-    shard: LexicalShardPlanShard,
-    packets: Vec<LexicalRebuildConversationPacket>,
-    message_bytes: usize,
-    shard_index_path: PathBuf,
-    writer_parallelism: usize,
-}
-
-#[derive(Debug)]
-struct LexicalRebuildShardBuildResult {
-    shard: LexicalShardPlanShard,
-    indexed_docs: usize,
-    segments: usize,
-    shard_index_path: PathBuf,
-    message_bytes: usize,
-    index_size_bytes: u64,
-    build_duration_ms: u64,
-    amplification_milli: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct LexicalRebuildShardBuildTelemetrySnapshot {
-    completed_jobs: usize,
-    last_shard_index: Option<usize>,
-    last_message_bytes: usize,
-    last_index_size_bytes: u64,
-    last_duration_ms: u64,
-    last_amplification_milli: Option<u64>,
-    observed_amplification_milli: Option<u64>,
-}
-
-#[derive(Debug, Default)]
-struct LexicalRebuildShardBuildTelemetry {
-    completed_jobs: AtomicUsize,
-    last_shard_index: AtomicUsize,
-    last_message_bytes: AtomicUsize,
-    last_index_size_bytes: AtomicU64,
-    last_duration_ms: AtomicU64,
-    last_amplification_milli: AtomicU64,
-    observed_amplification_milli: AtomicU64,
-}
-
-impl LexicalRebuildShardBuildTelemetry {
-    fn record(&self, result: &LexicalRebuildShardBuildResult) {
-        self.completed_jobs.fetch_add(1, Ordering::Relaxed);
-        self.last_shard_index
-            .store(result.shard.shard_index, Ordering::Relaxed);
-        self.last_message_bytes
-            .store(result.message_bytes, Ordering::Relaxed);
-        self.last_index_size_bytes
-            .store(result.index_size_bytes, Ordering::Relaxed);
-        self.last_duration_ms
-            .store(result.build_duration_ms, Ordering::Relaxed);
-        self.last_amplification_milli
-            .store(result.amplification_milli.unwrap_or(0), Ordering::Relaxed);
-        if let Some(amplification_milli) = result.amplification_milli {
-            let conservative_amplification = amplification_milli
-                .max(LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_FLOOR_MILLI);
-            let _ = self.observed_amplification_milli.try_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |current| Some(current.max(conservative_amplification)),
-            );
-        }
-    }
-
-    fn snapshot(&self) -> LexicalRebuildShardBuildTelemetrySnapshot {
-        let completed_jobs = self.completed_jobs.load(Ordering::Relaxed);
-        let last_shard_index = self.last_shard_index.load(Ordering::Relaxed);
-        let last_amplification_milli = self.last_amplification_milli.load(Ordering::Relaxed);
-        let observed_amplification_milli =
-            self.observed_amplification_milli.load(Ordering::Relaxed);
-        LexicalRebuildShardBuildTelemetrySnapshot {
-            completed_jobs,
-            last_shard_index: (completed_jobs > 0).then_some(last_shard_index),
-            last_message_bytes: self.last_message_bytes.load(Ordering::Relaxed),
-            last_index_size_bytes: self.last_index_size_bytes.load(Ordering::Relaxed),
-            last_duration_ms: self.last_duration_ms.load(Ordering::Relaxed),
-            last_amplification_milli: (last_amplification_milli > 0)
-                .then_some(last_amplification_milli),
-            observed_amplification_milli: (observed_amplification_milli > 0)
-                .then_some(observed_amplification_milli),
-        }
-    }
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone)]
-struct LexicalRebuildShardMergeWork {
-    output_path: PathBuf,
-    input_paths: Vec<PathBuf>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LexicalRebuildShardMergeArtifact {
-    first_shard_index: usize,
-    last_shard_index: usize,
-    index_path: PathBuf,
-    docs: usize,
-    segments: usize,
-}
-
-#[derive(Debug)]
-struct LexicalRebuildShardMergeResult {
-    output_level: usize,
-    artifact: LexicalRebuildShardMergeArtifact,
-}
-
-#[derive(Debug)]
-struct LexicalRebuildShardMergeJob {
-    output_level: usize,
-    output_path: PathBuf,
-    input_artifacts: Vec<LexicalRebuildShardMergeArtifact>,
-}
-
-#[derive(Debug)]
-enum LexicalRebuildShardMergeMessage {
-    Built(LexicalRebuildShardMergeResult),
-    Error {
-        output_level: usize,
-        first_shard_index: usize,
-        last_shard_index: usize,
-        error: String,
-    },
-}
-
-#[derive(Debug)]
-enum LexicalRebuildShardBuildMessage {
-    Built(LexicalRebuildShardBuildResult),
-    Error { shard_index: usize, error: String },
-}
-
-fn lexical_rebuild_amplification_milli(index_size_bytes: u64, message_bytes: usize) -> Option<u64> {
-    if message_bytes == 0 {
-        return None;
-    }
-    let scaled = u128::from(index_size_bytes).saturating_mul(1_000);
-    u64::try_from(scaled / (message_bytes as u128)).ok()
-}
-
-fn spawn_lexical_rebuild_shard_builder_workers(
-    worker_count: usize,
-    rx: Receiver<LexicalRebuildShardBuildWork>,
-    tx: Sender<LexicalRebuildShardBuildMessage>,
-    flow_limiter: Arc<StreamingByteLimiter>,
-    lexical_rebuild_worker_pool: Option<Arc<ThreadPool>>,
-    heartbeat: Option<crate::search::quill_bridge::EngineHeartbeat>,
-) -> Vec<JoinHandle<()>> {
-    let tracing_dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
-    (0..worker_count.max(1))
-        .map(|worker_idx| {
-            let rx = rx.clone();
-            let tx = tx.clone();
-            let flow_limiter = Arc::clone(&flow_limiter);
-            let lexical_rebuild_worker_pool = lexical_rebuild_worker_pool.clone();
-            let heartbeat = heartbeat.clone();
-            let tracing_dispatch = tracing_dispatch.clone();
-            thread::spawn(move || {
-                tracing::dispatcher::with_default(&tracing_dispatch, || {
-                    while let Ok(work) = rx.recv() {
-                        let flow_reservation_bytes = work
-                            .packets
-                            .iter()
-                            .map(|packet| packet.flow_reservation_bytes)
-                            .sum::<usize>();
-                        let shard_message_bytes = work.message_bytes;
-                        let build_started = Instant::now();
-                        // #282/#288: a panicking shard-build worker (a Tantivy
-                        // assert, an allocator abort, etc.) used to unwind
-                        // silently — sibling workers' `tx` clones kept the
-                        // result channel open, so the staging→publish consumer
-                        // parked forever (all threads on a condvar at the
-                        // handoff: the terminal-wedge signature). Mirror the
-                        // page-prep containment (see ~16456) and convert the
-                        // panic into the same `Error` teardown the consumer
-                        // already handles, so it aborts loudly instead.
-                        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                            || {
-                                #[cfg(test)]
-                                lexical_rebuild_shard_build_injected_panic_hook(
-                                    &work.shard_index_path,
-                                );
-                                build_lexical_rebuild_shard_index_summary_with_writer_parallelism(
-                                    &work.shard_index_path,
-                                    &work.packets,
-                                    lexical_rebuild_worker_pool.as_deref(),
-                                    Some(work.writer_parallelism),
-                                    heartbeat.clone(),
-                                )
-                            },
-                        )) {
-                            Ok(result) => result,
-                            Err(payload) => Err(anyhow::anyhow!(
-                                "lexical rebuild shard-build worker {worker_idx} panicked while building shard {}: {}",
-                                work.shard.shard_index,
-                                panic_payload_message(payload)
-                            )),
-                        };
-                        let build_duration_ms =
-                            u64::try_from(build_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                        let index_size_bytes =
-                            directory_size_bytes_best_effort(&work.shard_index_path);
-                        let amplification_milli = lexical_rebuild_amplification_milli(
-                            index_size_bytes,
-                            shard_message_bytes,
-                        );
-                        // The reservation covers the packet heap, not merely
-                        // the Tantivy build call. Free that heap before waking
-                        // producers; otherwise a newly admitted giant page can
-                        // overlap the completed shard packets in RSS while the
-                        // limiter already reports their bytes as available.
-                        drop(work.packets);
-                        flow_limiter.release(flow_reservation_bytes);
-                        match result {
-                            Ok(summary) => {
-                                tracing::info!(
-                                    worker_idx,
-                                    shard_index = work.shard.shard_index,
-                                    writer_parallelism = work.writer_parallelism,
-                                    indexed_docs = summary.docs,
-                                    shard_conversations = work.shard.conversation_count,
-                                    shard_message_bytes,
-                                    index_size_bytes,
-                                    build_duration_ms,
-                                    amplification_milli,
-                                    "built lexical rebuild shard index"
-                                );
-                                if tx
-                                    .send(LexicalRebuildShardBuildMessage::Built(
-                                        LexicalRebuildShardBuildResult {
-                                            shard: work.shard,
-                                            indexed_docs: summary.docs,
-                                            segments: summary.segments,
-                                            shard_index_path: work.shard_index_path,
-                                            message_bytes: shard_message_bytes,
-                                            index_size_bytes,
-                                            build_duration_ms,
-                                            amplification_milli,
-                                        },
-                                    ))
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            Err(err) => {
-                                let _ = tx.send(LexicalRebuildShardBuildMessage::Error {
-                                    shard_index: work.shard.shard_index,
-                                    error: format!("{err:#}"),
-                                });
-                                return;
-                            }
-                        }
-                    }
-                });
-            })
-        })
-        .collect()
-}
-
-fn spawn_lexical_rebuild_shard_merge_workers(
-    worker_count: usize,
-    rx: Receiver<LexicalRebuildShardMergeJob>,
-    tx: Sender<LexicalRebuildShardMergeMessage>,
-) -> Vec<JoinHandle<()>> {
-    let tracing_dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
-    (0..worker_count.max(1))
-        .map(|worker_idx| {
-            let rx = rx.clone();
-            let tx = tx.clone();
-            let tracing_dispatch = tracing_dispatch.clone();
-            thread::spawn(move || {
-                tracing::dispatcher::with_default(&tracing_dispatch, || {
-                    while let Ok(work) = rx.recv() {
-                        let first_shard_index = work
-                            .input_artifacts
-                            .first()
-                            .map(|artifact| artifact.first_shard_index)
-                            .unwrap_or(usize::MAX);
-                        let last_shard_index = work
-                            .input_artifacts
-                            .last()
-                            .map(|artifact| artifact.last_shard_index)
-                            .unwrap_or(usize::MAX);
-                        let input_paths = work
-                            .input_artifacts
-                            .iter()
-                            .map(|artifact| artifact.index_path.clone())
-                            .collect::<Vec<_>>();
-                        // #282: a panicking shard-merge worker used to unwind
-                        // silently, leaving the result channel open and parking
-                        // the final-frontier reducer forever on
-                        // `merge_result_rx.recv()`. Contain the panic and emit
-                        // the same `Error` teardown the reducer already handles.
-                        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                            || {
-                                #[cfg(test)]
-                                lexical_rebuild_shard_merge_injected_panic_hook(&work.output_path);
-                                crate::search::tantivy::TantivyIndex::merge_compatible_index_directories(
-                                    &work.output_path,
-                                    &input_paths,
-                                )
-                            },
-                        )) {
-                            Ok(result) => result,
-                            Err(payload) => Err(anyhow::anyhow!(
-                                "lexical rebuild shard-merge worker {worker_idx} panicked while merging shards {first_shard_index}..={last_shard_index}: {}",
-                                panic_payload_message(payload)
-                            )),
-                        };
-                        match result {
-                            Ok(merged_index) => {
-                                let docs = work
-                                    .input_artifacts
-                                    .iter()
-                                    .map(|artifact| artifact.docs)
-                                    .sum();
-                                let segments = merged_index.segment_count();
-                                drop(merged_index);
-                                tracing::info!(
-                                    worker_idx,
-                                    output_level = work.output_level,
-                                    first_shard_index,
-                                    last_shard_index,
-                                    input_count = input_paths.len(),
-                                    "merged staged lexical rebuild shard group"
-                                );
-                                if tx
-                                    .send(LexicalRebuildShardMergeMessage::Built(
-                                        LexicalRebuildShardMergeResult {
-                                            output_level: work.output_level,
-                                            artifact: LexicalRebuildShardMergeArtifact {
-                                                first_shard_index,
-                                                last_shard_index,
-                                                index_path: work.output_path,
-                                                docs,
-                                                segments,
-                                            },
-                                        },
-                                    ))
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            Err(err) => {
-                                let _ = tx.send(LexicalRebuildShardMergeMessage::Error {
-                                    output_level: work.output_level,
-                                    first_shard_index,
-                                    last_shard_index,
-                                    error: format!("{err:#}"),
-                                });
-                                return;
-                            }
-                        }
-                    }
-                });
-            })
-        })
-        .collect()
-}
-
-#[derive(Debug)]
-struct LexicalRebuildShardMergeCoordinator {
-    stage_root: PathBuf,
-    ready_levels: Vec<VecDeque<LexicalRebuildShardMergeArtifact>>,
-    next_output_seq_by_level: Vec<usize>,
-    pending_merge_jobs: usize,
-    allowed_pending_merge_jobs: usize,
-}
-
-impl LexicalRebuildShardMergeCoordinator {
-    const EAGER_MERGE_FAN_IN: usize = 8;
-
-    fn new(stage_root: PathBuf) -> Self {
-        Self {
-            stage_root,
-            ready_levels: Vec::new(),
-            next_output_seq_by_level: Vec::new(),
-            pending_merge_jobs: 0,
-            allowed_pending_merge_jobs: 0,
-        }
-    }
-
-    fn pending_merge_jobs(&self) -> usize {
-        self.pending_merge_jobs
-    }
-
-    fn ready_artifact_count(&self) -> usize {
-        self.ready_levels.iter().map(VecDeque::len).sum()
-    }
-
-    fn ready_merge_groups(&self) -> usize {
-        self.ready_levels
-            .iter()
-            .map(|level| level.len() / Self::EAGER_MERGE_FAN_IN)
-            .sum()
-    }
-
-    fn set_allowed_pending_merge_jobs(
-        &mut self,
-        allowed_pending_merge_jobs: usize,
-        merge_work_tx: &Sender<LexicalRebuildShardMergeJob>,
-    ) -> Result<()> {
-        self.allowed_pending_merge_jobs = allowed_pending_merge_jobs;
-        self.schedule_ready_merges(merge_work_tx)
-    }
-
-    fn queue_base_artifact(
-        &mut self,
-        artifact: LexicalRebuildShardMergeArtifact,
-        merge_work_tx: &Sender<LexicalRebuildShardMergeJob>,
-    ) -> Result<()> {
-        self.queue_artifact_at_level(0, artifact, merge_work_tx)
-    }
-
-    fn complete_merge(
-        &mut self,
-        result: LexicalRebuildShardMergeResult,
-        merge_work_tx: &Sender<LexicalRebuildShardMergeJob>,
-    ) -> Result<()> {
-        self.pending_merge_jobs = self.pending_merge_jobs.saturating_sub(1);
-        self.queue_artifact_at_level(result.output_level, result.artifact, merge_work_tx)
-    }
-
-    fn final_merge_input_artifacts(&self) -> Vec<LexicalRebuildShardMergeArtifact> {
-        let mut artifacts = self
-            .ready_levels
-            .iter()
-            .flat_map(|level| level.iter().cloned())
-            .collect::<Vec<_>>();
-        artifacts.sort_by_key(|artifact| (artifact.first_shard_index, artifact.last_shard_index));
-        artifacts
-    }
-
-    fn queue_artifact_at_level(
-        &mut self,
-        level: usize,
-        artifact: LexicalRebuildShardMergeArtifact,
-        merge_work_tx: &Sender<LexicalRebuildShardMergeJob>,
-    ) -> Result<()> {
-        self.ensure_level(level);
-        self.ready_levels[level].push_back(artifact);
-        self.schedule_ready_merges(merge_work_tx)
-    }
-
-    fn schedule_ready_merges(
-        &mut self,
-        merge_work_tx: &Sender<LexicalRebuildShardMergeJob>,
-    ) -> Result<()> {
-        let mut level = 0usize;
-        while level < self.ready_levels.len() {
-            while self.pending_merge_jobs < self.allowed_pending_merge_jobs
-                && self.ready_levels[level].len() >= Self::EAGER_MERGE_FAN_IN
-            {
-                let output_level = level.saturating_add(1);
-                self.ensure_level(output_level);
-                let inputs = (0..Self::EAGER_MERGE_FAN_IN)
-                    .map(|_| {
-                        self.ready_levels[level]
-                            .pop_front()
-                            .expect("merge coordinator should have enough artifacts ready")
-                    })
-                    .collect::<Vec<_>>();
-                let seq = self.next_output_seq_by_level[output_level];
-                self.next_output_seq_by_level[output_level] =
-                    self.next_output_seq_by_level[output_level].saturating_add(1);
-                let round_dir = self.stage_root.join(format!("round-{output_level:05}"));
-                fs::create_dir_all(&round_dir).with_context(|| {
-                    format!(
-                        "creating eager staged lexical merge round directory {}",
-                        round_dir.display()
-                    )
-                })?;
-                let first_shard_index = inputs
-                    .first()
-                    .map(|artifact| artifact.first_shard_index)
-                    .unwrap_or(usize::MAX);
-                let last_shard_index = inputs
-                    .last()
-                    .map(|artifact| artifact.last_shard_index)
-                    .unwrap_or(usize::MAX);
-                let output_path = round_dir.join(format!("merge-{seq:05}"));
-                tracing::info!(
-                    merge_level = output_level,
-                    first_shard_index,
-                    last_shard_index,
-                    input_count = inputs.len(),
-                    "queueing eager staged lexical rebuild merge job"
-                );
-                merge_work_tx
-                    .send(LexicalRebuildShardMergeJob {
-                        output_level,
-                        output_path,
-                        input_artifacts: inputs,
-                    })
-                    .map_err(|_| {
-                        anyhow::anyhow!(
-                            "staged lexical rebuild eager merge worker queue disconnected"
-                        )
-                    })?;
-                self.pending_merge_jobs = self.pending_merge_jobs.saturating_add(1);
-            }
-            level = level.saturating_add(1);
-        }
-        Ok(())
-    }
-
-    fn ensure_level(&mut self, level: usize) {
-        while self.ready_levels.len() <= level {
-            self.ready_levels.push(VecDeque::new());
-        }
-        while self.next_output_seq_by_level.len() <= level {
-            self.next_output_seq_by_level.push(0);
-        }
-    }
-}
-
-// The final publish path can expose a federated shard bundle directly, so the
-// rebuild critical path should not compact every small residual frontier down
-// to one artifact. This is the LSM-style tiered publish threshold: keep query
-// fan-out bounded, but avoid foreground compaction for the common 5-32 shard
-// tail left after eager merging.
-const LEXICAL_REBUILD_FINAL_FRONTIER_FEDERATED_SHARD_LIMIT: usize = 32;
-
-fn should_reduce_staged_lexical_final_frontier(frontier_artifacts: usize) -> bool {
-    frontier_artifacts > LEXICAL_REBUILD_FINAL_FRONTIER_FEDERATED_SHARD_LIMIT
-}
-
-fn reduce_staged_lexical_final_merge_frontier_via_workers(
-    mut frontier: Vec<LexicalRebuildShardMergeArtifact>,
-    stage_root: &Path,
-    max_parallel_jobs: usize,
-    merge_work_tx: &Sender<LexicalRebuildShardMergeJob>,
-    merge_result_rx: &Receiver<LexicalRebuildShardMergeMessage>,
-    // #282: a large final frontier can spend minutes here blocked on
-    // `merge_result_rx.recv()` with no shard/merge boundary in the outer drain
-    // loop, freezing `last_progress_at_ms` and tripping the stall-abort at
-    // 100%. Each completed reduction merge is real forward progress, so bump
-    // the lock-file progress atomic on every `Built` result.
-    progress_bump: Option<&Arc<AtomicI64>>,
-) -> Result<Vec<LexicalRebuildShardMergeArtifact>> {
-    if frontier.len() <= 1 {
-        return Ok(frontier);
-    }
-
-    let worker_limit = max_parallel_jobs.max(1);
-    let reduction_stage_root = stage_root.join("worker-final-frontier");
-    fs::create_dir_all(&reduction_stage_root).with_context(|| {
-        format!(
-            "creating staged lexical final-frontier reduction directory {}",
-            reduction_stage_root.display()
-        )
-    })?;
-    frontier.sort_by_key(|artifact| (artifact.first_shard_index, artifact.last_shard_index));
-    tracing::info!(
-        ready_artifacts = frontier.len(),
-        worker_limit,
-        "draining staged lexical rebuild final merge frontier via merge workers"
-    );
-
-    let mut pending_jobs = 0usize;
-    let mut next_output_seq = 0usize;
-    while frontier.len().saturating_add(pending_jobs) > 1 {
-        while pending_jobs < worker_limit && frontier.len() > 1 {
-            let input_count = frontier
-                .len()
-                .min(LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN);
-            let inputs = frontier.drain(0..input_count).collect::<Vec<_>>();
-            let first_shard_index = inputs
-                .first()
-                .map(|artifact| artifact.first_shard_index)
-                .unwrap_or(usize::MAX);
-            let last_shard_index = inputs
-                .last()
-                .map(|artifact| artifact.last_shard_index)
-                .unwrap_or(usize::MAX);
-            let output_path = reduction_stage_root.join(format!("merge-{next_output_seq:05}"));
-            next_output_seq = next_output_seq.saturating_add(1);
-            tracing::info!(
-                first_shard_index,
-                last_shard_index,
-                input_count = inputs.len(),
-                "queueing staged lexical rebuild final-frontier merge job"
-            );
-            merge_work_tx
-                .send(LexicalRebuildShardMergeJob {
-                    output_level: 0,
-                    output_path,
-                    input_artifacts: inputs,
-                })
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "staged lexical rebuild eager merge worker queue disconnected during final-frontier reduction"
-                    )
-                })?;
-            pending_jobs = pending_jobs.saturating_add(1);
-        }
-
-        let message = merge_result_rx.recv().map_err(|_| {
-            anyhow::anyhow!(
-                "staged lexical rebuild eager merge channel closed during final-frontier reduction"
-            )
-        })?;
-        match message {
-            LexicalRebuildShardMergeMessage::Built(result) => {
-                pending_jobs = pending_jobs.saturating_sub(1);
-                bump_index_run_lock_progress_if_present(progress_bump);
-                frontier.push(result.artifact);
-                frontier.sort_by_key(|artifact| {
-                    (artifact.first_shard_index, artifact.last_shard_index)
-                });
-            }
-            LexicalRebuildShardMergeMessage::Error {
-                output_level,
-                first_shard_index,
-                last_shard_index,
-                error,
-            } => {
-                return Err(anyhow::anyhow!(
-                    "staged lexical final-frontier merge at level {output_level} for shard range {first_shard_index}..={last_shard_index} failed: {error}"
-                ));
-            }
-        }
-    }
-
-    Ok(frontier)
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct LexicalRebuildStagedMergeRuntimeSnapshot {
-    workers_max: usize,
-    allowed_jobs: usize,
-    active_jobs: usize,
-    ready_artifacts: usize,
-    ready_groups: usize,
-    controller_reason: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct LexicalRebuildStagedShardBuildRuntimeSnapshot {
-    workers_max: usize,
-    allowed_jobs: usize,
-    active_jobs: usize,
-    pending_jobs: usize,
-    controller_reason: String,
-}
-
-#[derive(Debug)]
-struct LexicalRebuildStagedMergeController {
-    max_workers: usize,
-    loadavg_high_watermark_1m_milli: Option<u32>,
-}
-
-impl LexicalRebuildStagedMergeController {
-    fn new(max_workers: usize, loadavg_high_watermark_1m_milli: Option<u32>) -> Self {
-        Self {
-            max_workers: max_workers.max(1),
-            loadavg_high_watermark_1m_milli,
-        }
-    }
-
-    fn decide(
-        &self,
-        producer_finished: bool,
-        runtime: &LexicalRebuildPipelineRuntimeSnapshot,
-        merge_coordinator: &LexicalRebuildShardMergeCoordinator,
-    ) -> LexicalRebuildStagedMergeRuntimeSnapshot {
-        let active_jobs = merge_coordinator.pending_merge_jobs();
-        let ready_artifacts = merge_coordinator.ready_artifact_count();
-        let ready_groups = merge_coordinator.ready_merge_groups();
-        let backlog_groups = active_jobs.saturating_add(ready_groups);
-        if backlog_groups == 0 {
-            return LexicalRebuildStagedMergeRuntimeSnapshot {
-                workers_max: self.max_workers,
-                controller_reason: "no_staged_merge_backlog".to_string(),
-                ..LexicalRebuildStagedMergeRuntimeSnapshot::default()
-            };
-        }
-
-        let (allowed_jobs, controller_reason) = if !producer_finished {
-            if let (Some(loadavg_1m_milli), Some(high_watermark_1m_milli)) = (
-                runtime.host_loadavg_1m_milli,
-                self.loadavg_high_watermark_1m_milli,
-            ) && loadavg_1m_milli >= high_watermark_1m_milli
-            {
-                (
-                    0,
-                    format!(
-                        "host_loadavg_1m_{}_reached_high_watermark_{}",
-                        format_lexical_rebuild_loadavg_1m_milli(loadavg_1m_milli),
-                        format_lexical_rebuild_loadavg_1m_milli(high_watermark_1m_milli)
-                    ),
-                )
-            } else if runtime.ordered_buffered_pages > 0 || runtime.queue_depth > 0 {
-                let debt_budget = ready_groups.min(self.max_workers).max(1);
-                let trickle_budget = active_jobs.max(debt_budget).min(self.max_workers);
-                (
-                    trickle_budget,
-                    format!(
-                        "builder_handoff_pressure_scaling_staged_merge_budget_{}_active_jobs_{}_ready_groups_{}_debt_budget_{}_buffered_pages_{}_queue_depth_{}",
-                        trickle_budget,
-                        active_jobs,
-                        ready_groups,
-                        debt_budget,
-                        runtime.ordered_buffered_pages,
-                        runtime.queue_depth
-                    ),
-                )
-            } else if runtime.page_prep_workers > 0
-                && runtime.active_page_prep_jobs >= runtime.page_prep_workers
-            {
-                let saturated_budget = ready_groups
-                    .min(self.max_workers.div_ceil(2))
-                    .max(1)
-                    .max(active_jobs.min(self.max_workers));
-                (
-                    saturated_budget,
-                    if saturated_budget == 1 {
-                        format!(
-                            "page_prep_workers_saturated_{}_of_{}",
-                            runtime.active_page_prep_jobs, runtime.page_prep_workers
-                        )
-                    } else {
-                        format!(
-                            "page_prep_workers_saturated_{}_of_{}_merge_budget_{}_active_jobs_{}_ready_groups_{}",
-                            runtime.active_page_prep_jobs,
-                            runtime.page_prep_workers,
-                            saturated_budget,
-                            active_jobs,
-                            ready_groups
-                        )
-                    },
-                )
-            } else if runtime.active_page_prep_jobs > 0
-                || runtime.pending_batch_conversations > 0
-                || runtime.pending_batch_message_bytes > 0
-            {
-                (
-                    self.max_workers.div_ceil(2).max(1),
-                    format!(
-                        "pipeline_active_page_prep_jobs_{}_pending_batch_conversations_{}_pending_batch_message_bytes_{}",
-                        runtime.active_page_prep_jobs,
-                        runtime.pending_batch_conversations,
-                        runtime.pending_batch_message_bytes
-                    ),
-                )
-            } else {
-                (
-                    self.max_workers,
-                    "producer_idle_allowing_max_staged_merge_parallelism".to_string(),
-                )
-            }
-        } else if ready_artifacts.saturating_add(active_jobs)
-            <= LEXICAL_REBUILD_FINAL_FRONTIER_FEDERATED_SHARD_LIMIT
-        {
-            (
-                active_jobs.min(self.max_workers),
-                format!(
-                    "producer_finished_final_frontier_within_federated_cap_{}_active_jobs_{}_ready_artifacts_{}",
-                    LEXICAL_REBUILD_FINAL_FRONTIER_FEDERATED_SHARD_LIMIT,
-                    active_jobs,
-                    ready_artifacts
-                ),
-            )
-        } else if let (Some(loadavg_1m_milli), Some(high_watermark_1m_milli)) = (
-            runtime.host_loadavg_1m_milli,
-            self.loadavg_high_watermark_1m_milli,
-        ) && loadavg_1m_milli >= high_watermark_1m_milli
-        {
-            (
-                1.min(self.max_workers),
-                format!(
-                    "producer_finished_but_host_loadavg_1m_{}_remains_high",
-                    format_lexical_rebuild_loadavg_1m_milli(loadavg_1m_milli)
-                ),
-            )
-        } else {
-            (
-                self.max_workers,
-                "producer_finished_allowing_max_staged_merge_parallelism".to_string(),
-            )
-        };
-
-        LexicalRebuildStagedMergeRuntimeSnapshot {
-            workers_max: self.max_workers,
-            allowed_jobs: allowed_jobs.min(backlog_groups),
-            active_jobs,
-            ready_artifacts,
-            ready_groups,
-            controller_reason,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct LexicalRebuildStagedShardBuildController {
-    max_workers: usize,
-    loadavg_high_watermark_1m_milli: Option<u32>,
-    memory_reserve_bytes: usize,
-    emergency_memory_reserve_bytes: usize,
-}
-
-impl LexicalRebuildStagedShardBuildController {
-    fn new(max_workers: usize, loadavg_high_watermark_1m_milli: Option<u32>) -> Self {
-        Self::new_with_memory_reserves(
-            max_workers,
-            loadavg_high_watermark_1m_milli,
-            lexical_rebuild_staged_shard_build_memory_reserve_bytes(),
-            lexical_rebuild_staged_shard_build_emergency_memory_reserve_bytes(),
-        )
-    }
-
-    fn new_with_memory_reserves(
-        max_workers: usize,
-        loadavg_high_watermark_1m_milli: Option<u32>,
-        memory_reserve_bytes: usize,
-        emergency_memory_reserve_bytes: usize,
-    ) -> Self {
-        let memory_reserve_bytes = memory_reserve_bytes.max(1);
-        Self {
-            max_workers: max_workers.max(1),
-            loadavg_high_watermark_1m_milli,
-            memory_reserve_bytes,
-            emergency_memory_reserve_bytes: emergency_memory_reserve_bytes
-                .max(1)
-                .min(memory_reserve_bytes),
-        }
-    }
-
-    fn decide(
-        &self,
-        runtime: &LexicalRebuildPipelineRuntimeSnapshot,
-        staged_merge_runtime: &LexicalRebuildStagedMergeRuntimeSnapshot,
-        active_jobs: usize,
-        pending_jobs: usize,
-        next_pending_job_message_bytes: Option<usize>,
-    ) -> LexicalRebuildStagedShardBuildRuntimeSnapshot {
-        let backlog_jobs = active_jobs.saturating_add(pending_jobs);
-        if backlog_jobs == 0 {
-            return LexicalRebuildStagedShardBuildRuntimeSnapshot {
-                workers_max: self.max_workers,
-                allowed_jobs: 0,
-                active_jobs,
-                pending_jobs,
-                controller_reason: "no_staged_shard_build_backlog".to_string(),
-            };
-        }
-
-        let (allowed_jobs, controller_reason) =
-            if let (Some(loadavg_1m_milli), Some(high_watermark_1m_milli)) = (
-                runtime.host_loadavg_1m_milli,
-                self.loadavg_high_watermark_1m_milli,
-            ) && loadavg_1m_milli >= high_watermark_1m_milli
-            {
-                (
-                    1.min(self.max_workers),
-                    format!(
-                        "host_loadavg_1m_{}_reached_high_watermark_{}",
-                        format_lexical_rebuild_loadavg_1m_milli(loadavg_1m_milli),
-                        format_lexical_rebuild_loadavg_1m_milli(high_watermark_1m_milli)
-                    ),
-                )
-            } else {
-                let merge_reserved_slots = staged_merge_runtime.allowed_jobs.min(self.max_workers);
-                let shard_budget = self.max_workers.saturating_sub(merge_reserved_slots).max(1);
-                if merge_reserved_slots > 0 {
-                    (
-                        shard_budget,
-                        format!(
-                            "reserving_{}_slots_for_staged_merge_active_jobs_{}_ready_groups_{}",
-                            merge_reserved_slots,
-                            staged_merge_runtime.active_jobs,
-                            staged_merge_runtime.ready_groups
-                        ),
-                    )
-                } else {
-                    (
-                        self.max_workers,
-                        "staged_merge_idle_lending_full_budget_to_shard_builders".to_string(),
-                    )
-                }
-            };
-
-        let (allowed_jobs, controller_reason) = self.apply_memory_admission(
-            runtime,
-            active_jobs,
-            backlog_jobs,
-            next_pending_job_message_bytes,
-            allowed_jobs,
-            controller_reason,
-        );
-
-        LexicalRebuildStagedShardBuildRuntimeSnapshot {
-            workers_max: self.max_workers,
-            allowed_jobs: allowed_jobs.min(backlog_jobs),
-            active_jobs,
-            pending_jobs,
-            controller_reason,
-        }
-    }
-
-    fn apply_memory_admission(
-        &self,
-        runtime: &LexicalRebuildPipelineRuntimeSnapshot,
-        active_jobs: usize,
-        backlog_jobs: usize,
-        next_pending_job_message_bytes: Option<usize>,
-        allowed_jobs: usize,
-        controller_reason: String,
-    ) -> (usize, String) {
-        let Some(available_memory_bytes) = runtime.host_available_memory_bytes else {
-            return (allowed_jobs, controller_reason);
-        };
-        let available_memory_bytes = usize_from_u64_saturating(available_memory_bytes);
-        let estimated_builder_bytes =
-            self.estimated_builder_memory_bytes(runtime, next_pending_job_message_bytes);
-        if available_memory_bytes <= self.emergency_memory_reserve_bytes {
-            if active_jobs == 0 && backlog_jobs > 0 {
-                let probe_ceiling =
-                    available_memory_bytes.saturating_sub(available_memory_bytes / 4);
-                if estimated_builder_bytes <= probe_ceiling {
-                    return (
-                        1.min(allowed_jobs).min(backlog_jobs),
-                        format!(
-                            "host_available_memory_bytes_{}_below_emergency_reserve_{}_admitting_single_small_staged_shard_build_estimated_builder_bytes_{}",
-                            available_memory_bytes,
-                            self.emergency_memory_reserve_bytes,
-                            estimated_builder_bytes
-                        ),
-                    );
-                }
-            }
-            return (
-                active_jobs.min(backlog_jobs),
-                format!(
-                    "host_available_memory_bytes_{}_below_emergency_reserve_{}_pausing_new_staged_shard_builds",
-                    available_memory_bytes, self.emergency_memory_reserve_bytes
-                ),
-            );
-        }
-        if available_memory_bytes <= self.memory_reserve_bytes {
-            let allowed_under_reserve = if active_jobs == 0 && backlog_jobs > 0 {
-                1
-            } else {
-                active_jobs
-            }
-            .min(allowed_jobs)
-            .min(backlog_jobs);
-            return (
-                allowed_under_reserve,
-                format!(
-                    "host_available_memory_bytes_{}_below_reserve_{}_limiting_staged_shard_builds_to_{}",
-                    available_memory_bytes, self.memory_reserve_bytes, allowed_under_reserve
-                ),
-            );
-        }
-
-        let memory_headroom = available_memory_bytes.saturating_sub(self.memory_reserve_bytes);
-        let active_estimated_bytes = estimated_builder_bytes.saturating_mul(active_jobs);
-        let additional_jobs =
-            memory_headroom.saturating_sub(active_estimated_bytes) / estimated_builder_bytes.max(1);
-        let memory_allowed_jobs = active_jobs
-            .saturating_add(additional_jobs)
-            .min(self.max_workers)
-            .min(backlog_jobs)
-            .max(active_jobs.min(backlog_jobs));
-        if memory_allowed_jobs < allowed_jobs {
-            (
-                memory_allowed_jobs,
-                format!(
-                    "host_available_memory_bytes_{}_reserve_{}_estimated_builder_bytes_{}_limiting_staged_shard_builds_to_{}",
-                    available_memory_bytes,
-                    self.memory_reserve_bytes,
-                    estimated_builder_bytes,
-                    memory_allowed_jobs
-                ),
-            )
-        } else {
-            (allowed_jobs, controller_reason)
-        }
-    }
-
-    fn estimated_builder_memory_bytes(
-        &self,
-        runtime: &LexicalRebuildPipelineRuntimeSnapshot,
-        next_pending_job_message_bytes: Option<usize>,
-    ) -> usize {
-        let amplification_milli = runtime
-            .staged_shard_build_observed_amplification_milli
-            .unwrap_or(LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_FLOOR_MILLI)
-            .max(LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_FLOOR_MILLI)
-            .saturating_mul(LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_HEADROOM_MILLI)
-            / 1_000;
-        let amplified_message_bytes = next_pending_job_message_bytes
-            .map(|message_bytes| {
-                let scaled =
-                    (message_bytes as u128).saturating_mul(u128::from(amplification_milli)) / 1_000;
-                usize::try_from(scaled).unwrap_or(usize::MAX)
-            })
-            .unwrap_or(0);
-        amplified_message_bytes
-            .max(usize_from_u64_saturating(
-                LEXICAL_REBUILD_STAGED_SHARD_BUILD_MIN_ESTIMATED_BYTES,
-            ))
-            .max(1)
-    }
-}
-
-fn should_pause_staged_lexical_pipeline_handoff(
-    pipeline_backlog_paused: bool,
-    active_shard_build_jobs: usize,
-    pending_merge_jobs: usize,
-) -> bool {
-    pipeline_backlog_paused && (active_shard_build_jobs > 0 || pending_merge_jobs > 0)
-}
-
-fn apply_staged_merge_runtime_snapshot(
-    latest_runtime: &mut LexicalRebuildPipelineRuntimeSnapshot,
-    progress: Option<&Arc<IndexingProgress>>,
-    staged_merge_runtime: &LexicalRebuildStagedMergeRuntimeSnapshot,
-) {
-    latest_runtime.staged_merge_workers_max = staged_merge_runtime.workers_max;
-    latest_runtime.staged_merge_allowed_jobs = staged_merge_runtime.allowed_jobs;
-    latest_runtime.staged_merge_active_jobs = staged_merge_runtime.active_jobs;
-    latest_runtime.staged_merge_ready_artifacts = staged_merge_runtime.ready_artifacts;
-    latest_runtime.staged_merge_ready_groups = staged_merge_runtime.ready_groups;
-    latest_runtime.staged_merge_controller_reason = staged_merge_runtime.controller_reason.clone();
-    let Some(progress) = progress else {
-        return;
-    };
-    progress
-        .rebuild_pipeline_staged_merge_workers_max
-        .store(staged_merge_runtime.workers_max, Ordering::Relaxed);
-    progress
-        .rebuild_pipeline_staged_merge_allowed_jobs
-        .store(staged_merge_runtime.allowed_jobs, Ordering::Relaxed);
-    progress
-        .rebuild_pipeline_staged_merge_active_jobs
-        .store(staged_merge_runtime.active_jobs, Ordering::Relaxed);
-    progress
-        .rebuild_pipeline_staged_merge_ready_artifacts
-        .store(staged_merge_runtime.ready_artifacts, Ordering::Relaxed);
-    progress
-        .rebuild_pipeline_staged_merge_ready_groups
-        .store(staged_merge_runtime.ready_groups, Ordering::Relaxed);
-    if let Ok(mut staged_merge_reason) = progress
-        .rebuild_pipeline_staged_merge_controller_reason
-        .lock()
-    {
-        *staged_merge_reason = staged_merge_runtime.controller_reason.clone();
-    }
-}
-
-fn apply_staged_shard_build_runtime_snapshot(
-    latest_runtime: &mut LexicalRebuildPipelineRuntimeSnapshot,
-    progress: Option<&Arc<IndexingProgress>>,
-    staged_shard_build_runtime: &LexicalRebuildStagedShardBuildRuntimeSnapshot,
-) {
-    latest_runtime.staged_shard_build_workers_max = staged_shard_build_runtime.workers_max;
-    latest_runtime.staged_shard_build_allowed_jobs = staged_shard_build_runtime.allowed_jobs;
-    latest_runtime.staged_shard_build_active_jobs = staged_shard_build_runtime.active_jobs;
-    latest_runtime.staged_shard_build_pending_jobs = staged_shard_build_runtime.pending_jobs;
-    latest_runtime.staged_shard_build_controller_reason =
-        staged_shard_build_runtime.controller_reason.clone();
-    let Some(progress) = progress else {
-        return;
-    };
-    progress
-        .rebuild_pipeline_staged_shard_build_workers_max
-        .store(staged_shard_build_runtime.workers_max, Ordering::Relaxed);
-    progress
-        .rebuild_pipeline_staged_shard_build_allowed_jobs
-        .store(staged_shard_build_runtime.allowed_jobs, Ordering::Relaxed);
-    progress
-        .rebuild_pipeline_staged_shard_build_active_jobs
-        .store(staged_shard_build_runtime.active_jobs, Ordering::Relaxed);
-    progress
-        .rebuild_pipeline_staged_shard_build_pending_jobs
-        .store(staged_shard_build_runtime.pending_jobs, Ordering::Relaxed);
-    if let Ok(mut staged_shard_build_reason) = progress
-        .rebuild_pipeline_staged_shard_build_controller_reason
-        .lock()
-    {
-        *staged_shard_build_reason = staged_shard_build_runtime.controller_reason.clone();
-    }
-}
-
-fn apply_staged_shard_build_telemetry_snapshot(
-    latest_runtime: &mut LexicalRebuildPipelineRuntimeSnapshot,
-    progress: Option<&Arc<IndexingProgress>>,
-    memory_reserve_bytes: usize,
-    emergency_memory_reserve_bytes: usize,
-    telemetry: &LexicalRebuildShardBuildTelemetry,
-) {
-    let snapshot = telemetry.snapshot();
-    latest_runtime.staged_shard_build_memory_reserve_bytes = memory_reserve_bytes;
-    latest_runtime.staged_shard_build_emergency_memory_reserve_bytes =
-        emergency_memory_reserve_bytes;
-    latest_runtime.staged_shard_build_completed_jobs = snapshot.completed_jobs;
-    latest_runtime.staged_shard_build_last_shard_index = snapshot.last_shard_index;
-    latest_runtime.staged_shard_build_last_message_bytes = snapshot.last_message_bytes;
-    latest_runtime.staged_shard_build_last_index_size_bytes = snapshot.last_index_size_bytes;
-    latest_runtime.staged_shard_build_last_duration_ms = snapshot.last_duration_ms;
-    latest_runtime.staged_shard_build_last_amplification_milli = snapshot.last_amplification_milli;
-    latest_runtime.staged_shard_build_observed_amplification_milli =
-        snapshot.observed_amplification_milli;
-    let Some(progress) = progress else {
-        return;
-    };
-    progress
-        .rebuild_pipeline_staged_shard_build_memory_reserve_bytes
-        .store(memory_reserve_bytes, Ordering::Relaxed);
-    progress
-        .rebuild_pipeline_staged_shard_build_emergency_memory_reserve_bytes
-        .store(emergency_memory_reserve_bytes, Ordering::Relaxed);
-    progress
-        .rebuild_pipeline_staged_shard_build_completed_jobs
-        .store(snapshot.completed_jobs, Ordering::Relaxed);
-    if let Ok(mut last_shard_index) = progress
-        .rebuild_pipeline_staged_shard_build_last_shard_index
-        .lock()
-    {
-        *last_shard_index = snapshot.last_shard_index;
-    }
-    progress
-        .rebuild_pipeline_staged_shard_build_last_message_bytes
-        .store(snapshot.last_message_bytes, Ordering::Relaxed);
-    progress
-        .rebuild_pipeline_staged_shard_build_last_index_size_bytes
-        .store(snapshot.last_index_size_bytes, Ordering::Relaxed);
-    progress
-        .rebuild_pipeline_staged_shard_build_last_duration_ms
-        .store(snapshot.last_duration_ms, Ordering::Relaxed);
-    if let Ok(mut last_amplification) = progress
-        .rebuild_pipeline_staged_shard_build_last_amplification_milli
-        .lock()
-    {
-        *last_amplification = snapshot.last_amplification_milli;
-    }
-    if let Ok(mut observed_amplification) = progress
-        .rebuild_pipeline_staged_shard_build_observed_amplification_milli
-        .lock()
-    {
-        *observed_amplification = snapshot.observed_amplification_milli;
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn flush_streamed_lexical_rebuild_batch_for_planned_shard_boundary(
     planned_shard_index: Option<usize>,
@@ -6787,28 +5625,6 @@ impl LexicalRebuildPerfProfile {
             Self::millis(self.commit_duration) / commits,
             Self::millis(self.pending_progress_duration) / commits,
             Self::millis(self.heartbeat_progress_duration) / heartbeat_persists,
-        );
-    }
-}
-
-fn log_lexical_rebuild_prep_profile_step(
-    rebuild_started: Option<Instant>,
-    step_started: Instant,
-    step: &str,
-) {
-    if let Some(rebuild_started) = rebuild_started {
-        let step_ms = step_started.elapsed().as_millis() as u64;
-        let total_ms = rebuild_started.elapsed().as_millis() as u64;
-        eprintln!(
-            "CASS_PREP_PROFILE step={step} step_ms={} total_ms={}",
-            step_ms, total_ms
-        );
-        tracing::info!(
-            component = "main",
-            step,
-            step_ms,
-            total_ms,
-            "lexical rebuild prep profile"
         );
     }
 }
@@ -9727,155 +8543,6 @@ fn live_tantivy_doc_count(index_path: &Path) -> Result<Option<usize>> {
     }
 }
 
-fn validate_lexical_rebuild_shard_build_result(
-    result: &LexicalRebuildShardBuildResult,
-) -> Result<LexicalRebuildShardMergeArtifact> {
-    crate::search::tantivy::validate_searchable_index_contract(&result.shard_index_path)
-        .with_context(|| {
-            format!(
-                "validating built lexical rebuild shard {} at {}",
-                result.shard.shard_index,
-                result.shard_index_path.display()
-            )
-        })?;
-    let observed_docs = live_tantivy_doc_count(&result.shard_index_path)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "built lexical rebuild shard {} at {} is not searchable",
-            result.shard.shard_index,
-            result.shard_index_path.display()
-        )
-    })?;
-    // ubs:ignore -- Observed and reported shard document counts verify index completeness.
-    if observed_docs != result.indexed_docs {
-        return Err(anyhow::anyhow!(
-            "built lexical rebuild shard {} reported {} docs but a fresh Tantivy reader sees {}",
-            result.shard.shard_index,
-            result.indexed_docs,
-            observed_docs
-        ));
-    }
-    // [coding_agent_session_search-rx1ex] When known, the shard plan's
-    // `message_count` is a SQLite-side planning estimate from
-    // `list_conversation_footprints_for_lexical_rebuild`, while
-    // `observed_docs` is the post-filter Tantivy doc count. The
-    // lexical sink legitimately drops messages via
-    // `is_hard_message_noise` (empty content, hard-noise roles).
-    // Pre-fix this check fired on any session where ANY message was
-    // filtered — including the trivial 1-conversation/2-message
-    // repro in bead rx1ex. The meaningful invariant is that the
-    // sink can never produce MORE docs than there were source
-    // messages; if it does, something is duplicating documents and
-    // a hard error is correct. If observed_docs <= message_count,
-    // the gap is filter-induced and we log the count for operator
-    // audit instead of failing the rebuild.
-    if lexical_shard_message_count_is_known(result.shard.message_count)
-        && observed_docs > result.shard.message_count
-    {
-        return Err(anyhow::anyhow!(
-            "built lexical rebuild shard {} indexed {} docs which EXCEEDS its shard plan's \
-             {} source messages — the lexical sink should never produce more docs than \
-             rows; investigate fan-out or duplicate-document bugs",
-            result.shard.shard_index,
-            observed_docs,
-            result.shard.message_count
-        ));
-    }
-    if lexical_shard_message_count_is_known(result.shard.message_count) {
-        let filtered = result.shard.message_count.saturating_sub(observed_docs);
-        if filtered > 0 {
-            tracing::debug!(
-                target: "cass::indexer::lexical_rebuild",
-                shard_index = result.shard.shard_index,
-                observed_docs,
-                planned_message_count = result.shard.message_count,
-                filtered_messages = filtered,
-                "lexical rebuild shard indexed fewer docs than the shard plan's message count; \
-                 gap is hard-noise/empty-content filtering applied by cass_document_for_message"
-            );
-        }
-    } else {
-        tracing::debug!(
-            target: "cass::indexer::lexical_rebuild",
-            shard_index = result.shard.shard_index,
-            observed_docs,
-            "lexical rebuild shard used conversation-only planning; source message count validation deferred to exact indexed-doc accounting"
-        );
-    }
-
-    Ok(LexicalRebuildShardMergeArtifact {
-        first_shard_index: result.shard.shard_index,
-        last_shard_index: result.shard.shard_index,
-        index_path: result.shard_index_path.clone(),
-        docs: observed_docs,
-        segments: result.segments,
-    })
-}
-
-fn validate_complete_lexical_rebuild_shard_artifacts(
-    shard_plan: &LexicalShardPlan,
-    artifacts: &[LexicalRebuildShardMergeArtifact],
-) -> Result<()> {
-    if artifacts.len() != shard_plan.shards.len() {
-        return Err(anyhow::anyhow!(
-            "staged lexical rebuild validated {} shard artifacts but planned {} shards",
-            artifacts.len(),
-            shard_plan.shards.len()
-        ));
-    }
-
-    for (expected, artifact) in shard_plan.shards.iter().zip(artifacts.iter()) {
-        // ubs:ignore -- The artifact's first shard ordinal must match its planned shard.
-        if artifact.first_shard_index != expected.shard_index
-            // ubs:ignore -- The artifact's last shard ordinal must match its planned shard.
-            || artifact.last_shard_index != expected.shard_index
-        {
-            return Err(anyhow::anyhow!(
-                "staged lexical rebuild shard artifact order mismatch: expected shard {} but got range {}..={}",
-                expected.shard_index,
-                artifact.first_shard_index,
-                artifact.last_shard_index
-            ));
-        }
-        // These counts were already checked against a fresh reader when each
-        // shard build completed; reusing them avoids a redundant end-of-run
-        // open of every staged shard.
-        let observed_docs = artifact.docs;
-        // [coding_agent_session_search-rx1ex] Mirrors the relaxation in
-        // validate_lexical_rebuild_shard_build_result: tolerate
-        // filter-induced doc < message gaps; only fail on the
-        // impossible case where docs > raw messages. See the comment
-        // there for the full rationale.
-        if lexical_shard_message_count_is_known(expected.message_count)
-            && observed_docs > expected.message_count
-        {
-            return Err(anyhow::anyhow!(
-                "validated lexical rebuild shard {} has {} docs which EXCEEDS its shard plan's \
-                 {} source messages — investigate fan-out or duplicate-document bugs",
-                expected.shard_index,
-                observed_docs,
-                expected.message_count
-            ));
-        }
-        if !lexical_shard_message_count_is_known(expected.message_count) {
-            continue;
-        }
-        let filtered = expected.message_count.saturating_sub(observed_docs);
-        if filtered > 0 {
-            tracing::debug!(
-                target: "cass::indexer::lexical_rebuild",
-                shard_index = expected.shard_index,
-                observed_docs,
-                planned_message_count = expected.message_count,
-                filtered_messages = filtered,
-                "validated lexical rebuild shard has fewer docs than the shard plan's message \
-                 count; gap is hard-noise/empty-content filtering"
-            );
-        }
-    }
-
-    Ok(())
-}
-
 fn pending_commit_landed(
     base_meta_fingerprint: Option<&str>,
     current_meta_fingerprint: Option<&str>,
@@ -10265,61 +8932,6 @@ fn persist_pending_lexical_rebuild_progress(
         runtime,
         index_meta_fingerprint(content_path)?,
     )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn maybe_persist_staged_lexical_rebuild_progress(
-    index_path: &Path,
-    state: &mut LexicalRebuildState,
-    next_conversation_id: Option<i64>,
-    processed_conversations: usize,
-    indexed_docs: usize,
-    runtime: &LexicalRebuildPipelineRuntimeSnapshot,
-    base_meta_fingerprint_override: Option<&str>,
-    force: bool,
-    conversations_since_progress_persist: &mut usize,
-    progress_heartbeat_interval_conversations: usize,
-    last_progress_persist: &mut Instant,
-    progress_heartbeat_interval: Duration,
-    progress_bump: Option<&Arc<AtomicI64>>,
-    mut perf_profile: Option<&mut LexicalRebuildPerfProfile>,
-) -> Result<bool> {
-    // Staged shard-build resume safety is restart-from-zero, so these persists
-    // exist to keep cross-process status visibility fresh without rewriting the
-    // checkpoint on every durable shard completion.
-    if !force
-        && !should_persist_lexical_rebuild_progress(
-            *conversations_since_progress_persist,
-            progress_heartbeat_interval_conversations,
-            last_progress_persist.elapsed(),
-            progress_heartbeat_interval,
-        )
-    {
-        return Ok(false);
-    }
-
-    let heartbeat_progress_started = perf_profile.as_ref().map(|_| Instant::now());
-    let base_meta_fingerprint = match base_meta_fingerprint_override {
-        Some(base_meta_fingerprint) => Some(base_meta_fingerprint.to_string()),
-        None => index_meta_fingerprint(index_path)?,
-    };
-    persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
-        index_path,
-        state,
-        next_conversation_id,
-        processed_conversations,
-        indexed_docs,
-        runtime,
-        base_meta_fingerprint,
-    )?;
-    bump_index_run_lock_progress_if_present(progress_bump);
-    if let (Some(profile), Some(started)) = (perf_profile.as_mut(), heartbeat_progress_started) {
-        profile.heartbeat_persist_count = profile.heartbeat_persist_count.saturating_add(1);
-        profile.heartbeat_progress_duration += started.elapsed();
-    }
-    *conversations_since_progress_persist = 0;
-    *last_progress_persist = Instant::now();
-    Ok(true)
 }
 
 fn lexical_rebuild_content_fingerprint_value(
@@ -12150,32 +10762,12 @@ pub(crate) struct LexicalRebuildCheckpoint {
     pub updated_at_ms: i64,
 }
 
-const LEXICAL_SHARD_PLAN_VERSION: u8 = 1;
-
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct LexicalShardPlannerBudgets {
     pub max_conversations_per_shard: usize,
     pub max_messages_per_shard: usize,
     pub max_message_bytes_per_shard: usize,
-}
-
-impl LexicalShardPlannerBudgets {
-    fn normalized(self) -> Self {
-        Self {
-            max_conversations_per_shard: self.max_conversations_per_shard.max(1),
-            max_messages_per_shard: self.max_messages_per_shard.max(1),
-            max_message_bytes_per_shard: self.max_message_bytes_per_shard.max(1),
-        }
-    }
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct LexicalShardPlannerConversation {
-    pub conversation_id: i64,
-    pub message_count: usize,
-    pub message_bytes: usize,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -12202,516 +10794,6 @@ pub(crate) struct LexicalShardPlan {
     pub total_message_bytes: usize,
     pub oversized_conversation_ids: Vec<i64>,
     pub shards: Vec<LexicalShardPlanShard>,
-}
-
-const LEXICAL_SHARD_UNKNOWN_MESSAGE_COUNT: usize = usize::MAX;
-
-fn lexical_shard_message_count_is_known(message_count: usize) -> bool {
-    // ubs:ignore -- This compares a row count with the unknown-count sentinel.
-    message_count != LEXICAL_SHARD_UNKNOWN_MESSAGE_COUNT
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn plan_lexical_rebuild_shards(
-    conversations: &[LexicalShardPlannerConversation],
-    budgets: LexicalShardPlannerBudgets,
-) -> LexicalShardPlan {
-    let budgets = budgets.normalized();
-    let mut ordered = conversations.to_vec();
-    ordered.sort_by_key(|conversation| conversation.conversation_id);
-
-    let total_conversations = ordered.len();
-    let total_messages = ordered
-        .iter()
-        .map(|conversation| conversation.message_count)
-        .sum();
-    let total_message_bytes = ordered
-        .iter()
-        .map(|conversation| conversation.message_bytes)
-        .sum();
-
-    let mut shards = Vec::new();
-    let mut oversized_conversation_ids = Vec::new();
-
-    let mut first_conversation_id = None;
-    let mut last_conversation_id = None;
-    let mut conversation_count = 0usize;
-    let mut message_count = 0usize;
-    let mut message_bytes = 0usize;
-    let mut conversation_ids = Vec::new();
-
-    let flush_current_shard = |shards: &mut Vec<LexicalShardPlanShard>,
-                               first_conversation_id: &mut Option<i64>,
-                               last_conversation_id: &mut Option<i64>,
-                               conversation_count: &mut usize,
-                               message_count: &mut usize,
-                               message_bytes: &mut usize,
-                               conversation_ids: &mut Vec<i64>,
-                               oversized_single_conversation: bool| {
-        if *conversation_count == 0 {
-            return;
-        }
-        debug_assert_eq!(*conversation_count, conversation_ids.len());
-        shards.push(LexicalShardPlanShard {
-            shard_index: shards.len(),
-            first_conversation_id: (*first_conversation_id)
-                .expect("non-empty shard should have a first conversation id"),
-            last_conversation_id: (*last_conversation_id)
-                .expect("non-empty shard should have a last conversation id"),
-            conversation_count: *conversation_count,
-            message_count: *message_count,
-            message_bytes: *message_bytes,
-            conversation_id_fingerprint: lexical_shard_conversation_ids_fingerprint(
-                conversation_ids,
-            ),
-            oversized_single_conversation,
-        });
-        *first_conversation_id = None;
-        *last_conversation_id = None;
-        *conversation_count = 0;
-        *message_count = 0;
-        *message_bytes = 0;
-        conversation_ids.clear();
-    };
-
-    for conversation in ordered {
-        let exceeds_budget = conversation.message_count > budgets.max_messages_per_shard
-            || conversation.message_bytes > budgets.max_message_bytes_per_shard;
-        let would_overflow_current = conversation_count > 0
-            && (conversation_count.saturating_add(1) > budgets.max_conversations_per_shard
-                || message_count.saturating_add(conversation.message_count)
-                    > budgets.max_messages_per_shard
-                || message_bytes.saturating_add(conversation.message_bytes)
-                    > budgets.max_message_bytes_per_shard);
-
-        if would_overflow_current {
-            flush_current_shard(
-                &mut shards,
-                &mut first_conversation_id,
-                &mut last_conversation_id,
-                &mut conversation_count,
-                &mut message_count,
-                &mut message_bytes,
-                &mut conversation_ids,
-                false,
-            );
-        }
-
-        if exceeds_budget {
-            oversized_conversation_ids.push(conversation.conversation_id);
-            flush_current_shard(
-                &mut shards,
-                &mut first_conversation_id,
-                &mut last_conversation_id,
-                &mut conversation_count,
-                &mut message_count,
-                &mut message_bytes,
-                &mut conversation_ids,
-                false,
-            );
-            first_conversation_id = Some(conversation.conversation_id);
-            last_conversation_id = Some(conversation.conversation_id);
-            conversation_count = 1;
-            message_count = conversation.message_count;
-            message_bytes = conversation.message_bytes;
-            conversation_ids.push(conversation.conversation_id);
-            flush_current_shard(
-                &mut shards,
-                &mut first_conversation_id,
-                &mut last_conversation_id,
-                &mut conversation_count,
-                &mut message_count,
-                &mut message_bytes,
-                &mut conversation_ids,
-                true,
-            );
-            continue;
-        }
-
-        if first_conversation_id.is_none() {
-            first_conversation_id = Some(conversation.conversation_id);
-        }
-        last_conversation_id = Some(conversation.conversation_id);
-        conversation_count = conversation_count.saturating_add(1);
-        message_count = message_count.saturating_add(conversation.message_count);
-        message_bytes = message_bytes.saturating_add(conversation.message_bytes);
-        conversation_ids.push(conversation.conversation_id);
-    }
-
-    flush_current_shard(
-        &mut shards,
-        &mut first_conversation_id,
-        &mut last_conversation_id,
-        &mut conversation_count,
-        &mut message_count,
-        &mut message_bytes,
-        &mut conversation_ids,
-        false,
-    );
-
-    let plan_id = lexical_shard_plan_id(
-        budgets,
-        &shards,
-        total_conversations,
-        total_messages,
-        total_message_bytes,
-        &oversized_conversation_ids,
-    );
-
-    LexicalShardPlan {
-        planner_version: LEXICAL_SHARD_PLAN_VERSION,
-        plan_id,
-        budgets,
-        total_conversations,
-        total_messages,
-        total_message_bytes,
-        oversized_conversation_ids,
-        shards,
-    }
-}
-
-fn lexical_shard_conversation_ids_fingerprint(conversation_ids: &[i64]) -> String {
-    let mut hasher = blake3::Hasher::new();
-    for conversation_id in conversation_ids {
-        hasher.update(&conversation_id.to_le_bytes());
-    }
-    hasher.finalize().to_hex().to_string()
-}
-
-fn lexical_shard_plan_id(
-    budgets: LexicalShardPlannerBudgets,
-    shards: &[LexicalShardPlanShard],
-    total_conversations: usize,
-    total_messages: usize,
-    total_message_bytes: usize,
-    oversized_conversation_ids: &[i64],
-) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&[LEXICAL_SHARD_PLAN_VERSION]);
-    hasher.update(&budgets.max_conversations_per_shard.to_le_bytes());
-    hasher.update(&budgets.max_messages_per_shard.to_le_bytes());
-    hasher.update(&budgets.max_message_bytes_per_shard.to_le_bytes());
-    hasher.update(&total_conversations.to_le_bytes());
-    hasher.update(&total_messages.to_le_bytes());
-    hasher.update(&total_message_bytes.to_le_bytes());
-    for shard in shards {
-        hasher.update(&shard.shard_index.to_le_bytes());
-        hasher.update(&shard.first_conversation_id.to_le_bytes());
-        hasher.update(&shard.last_conversation_id.to_le_bytes());
-        hasher.update(&shard.conversation_count.to_le_bytes());
-        hasher.update(&shard.message_count.to_le_bytes());
-        hasher.update(&shard.message_bytes.to_le_bytes());
-        hasher.update(shard.conversation_id_fingerprint.as_bytes());
-        hasher.update(&[u8::from(shard.oversized_single_conversation)]);
-    }
-    for conversation_id in oversized_conversation_ids {
-        hasher.update(&conversation_id.to_le_bytes());
-    }
-    hasher.finalize().to_hex().to_string()
-}
-
-// Dormant with the Quill backend: staged sharding is a Tantivy-ingest
-// parallelization strategy whose merge step has no FSLX equivalent. Retained
-// (not deleted) because the planner is engine-independent and would be reused
-// if Quill ever grows an N-directory merge.
-#[allow(dead_code)]
-fn lexical_rebuild_target_shard_count(
-    worker_parallelism: usize,
-    tantivy_writer_threads: usize,
-) -> usize {
-    worker_parallelism
-        .max(tantivy_writer_threads)
-        .clamp(1, 64)
-        .saturating_mul(4)
-        .clamp(1, 256)
-}
-
-// Dormant with the Quill backend: staged sharding is a Tantivy-ingest
-// parallelization strategy whose merge step has no FSLX equivalent. Retained
-// (not deleted) because the planner is engine-independent and would be reused
-// if Quill ever grows an N-directory merge.
-#[allow(dead_code)]
-fn lexical_rebuild_default_shard_budget(
-    total: usize,
-    target_shards: usize,
-    min_budget: usize,
-    max_budget: usize,
-) -> usize {
-    let min_budget = min_budget.max(1);
-    let max_budget = max_budget.max(min_budget);
-    total
-        .max(1)
-        .div_ceil(target_shards.max(1))
-        .clamp(min_budget, max_budget)
-}
-
-const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_FLOOR: usize = 16 * 1024 * 1024;
-const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_DEFAULT: usize = 64 * 1024 * 1024;
-const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_CEILING: usize = 128 * 1024 * 1024;
-const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_MEMORY_FRACTION: u64 = 2_048;
-
-fn lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(
-    available_memory_bytes: Option<u64>,
-) -> usize {
-    let Some(available_memory_bytes) = available_memory_bytes else {
-        return LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_DEFAULT;
-    };
-    let scaled =
-        available_memory_bytes / LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_MEMORY_FRACTION;
-    let scaled =
-        usize::try_from(scaled).unwrap_or(LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_CEILING);
-    scaled.clamp(
-        LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_FLOOR,
-        LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_CEILING,
-    )
-}
-
-fn lexical_rebuild_staged_shard_max_message_bytes(
-    settings: &LexicalRebuildPipelineSettingsSnapshot,
-) -> usize {
-    dotenvy::var("CASS_TANTIVY_REBUILD_STAGED_SHARD_MAX_MESSAGE_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| {
-            lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(
-                responsiveness::available_memory_bytes(),
-            )
-        })
-        .min(settings.steady_commit_every_message_bytes.max(1))
-        .max(1)
-}
-
-fn lexical_rebuild_pending_shard_build_max_message_bytes(
-    settings: &LexicalRebuildPipelineSettingsSnapshot,
-) -> usize {
-    dotenvy::var("CASS_TANTIVY_REBUILD_PENDING_SHARD_BUILD_MAX_MESSAGE_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| {
-            settings
-                .pipeline_max_message_bytes_in_flight
-                .max(lexical_rebuild_staged_shard_max_message_bytes(settings))
-        })
-        .max(1)
-}
-
-fn lexical_rebuild_pending_shard_build_max_jobs(
-    settings: &LexicalRebuildPipelineSettingsSnapshot,
-) -> usize {
-    dotenvy::var("CASS_TANTIVY_REBUILD_PENDING_SHARD_BUILD_MAX_JOBS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| settings.staged_shard_builders.max(1).saturating_mul(32))
-        .clamp(1, 256)
-}
-
-// Dormant with the Quill backend: staged sharding is a Tantivy-ingest
-// parallelization strategy whose merge step has no FSLX equivalent. Retained
-// (not deleted) because the planner is engine-independent and would be reused
-// if Quill ever grows an N-directory merge.
-#[allow(dead_code)]
-fn lexical_rebuild_default_shard_planner_budgets_for_totals(
-    settings: &LexicalRebuildPipelineSettingsSnapshot,
-    total_conversations: usize,
-    total_messages: usize,
-    total_message_bytes: usize,
-) -> LexicalShardPlannerBudgets {
-    let target_shards =
-        lexical_rebuild_target_shard_count(settings.workers, settings.tantivy_writer_threads);
-    let max_message_bytes_per_shard = lexical_rebuild_staged_shard_max_message_bytes(settings);
-    let min_message_bytes_per_shard = settings
-        .startup_commit_every_message_bytes
-        .min(max_message_bytes_per_shard)
-        .max(1);
-    LexicalShardPlannerBudgets {
-        max_conversations_per_shard: lexical_rebuild_default_shard_budget(
-            total_conversations,
-            target_shards,
-            settings.startup_batch_fetch_conversations,
-            settings.steady_commit_every_conversations,
-        ),
-        max_messages_per_shard: lexical_rebuild_default_shard_budget(
-            total_messages,
-            target_shards,
-            settings.startup_commit_every_messages,
-            settings.steady_commit_every_messages,
-        ),
-        max_message_bytes_per_shard: lexical_rebuild_default_shard_budget(
-            total_message_bytes,
-            target_shards,
-            min_message_bytes_per_shard,
-            max_message_bytes_per_shard,
-        ),
-    }
-}
-
-// Dormant with the Quill backend: staged sharding is a Tantivy-ingest
-// parallelization strategy whose merge step has no FSLX equivalent. Retained
-// (not deleted) because the planner is engine-independent and would be reused
-// if Quill ever grows an N-directory merge.
-#[allow(dead_code)]
-fn lexical_rebuild_shard_planner_conversations_from_storage(
-    storage: &FrankenStorage,
-) -> Result<Vec<LexicalShardPlannerConversation>> {
-    Ok(storage
-        .list_conversation_footprints_for_lexical_rebuild()
-        .with_context(|| "listing canonical lexical rebuild conversation footprints")?
-        .into_iter()
-        .map(|footprint| LexicalShardPlannerConversation {
-            conversation_id: footprint.conversation_id,
-            message_count: footprint.message_count,
-            message_bytes: footprint.message_bytes,
-        })
-        .collect())
-}
-
-#[allow(dead_code)]
-const LEXICAL_REBUILD_ID_ONLY_MAX_CONVERSATIONS_PER_SHARD: usize = 64;
-
-// Dormant with the Quill backend: staged sharding is a Tantivy-ingest
-// parallelization strategy whose merge step has no FSLX equivalent. Retained
-// (not deleted) because the planner is engine-independent and would be reused
-// if Quill ever grows an N-directory merge.
-#[allow(dead_code)]
-fn plan_lexical_rebuild_shards_from_conversation_ids_with_settings(
-    storage: &FrankenStorage,
-    settings: &LexicalRebuildPipelineSettingsSnapshot,
-    total_conversations: usize,
-    total_messages: usize,
-) -> Result<LexicalShardPlan> {
-    let conversation_ids = storage
-        .list_conversation_ids_for_lexical_rebuild()
-        .with_context(|| "listing canonical conversation ids for id-only lexical shard planning")?;
-    let exact_total_conversations = conversation_ids.len();
-    let average_messages_per_conversation = if exact_total_conversations == 0 {
-        0
-    } else {
-        total_messages.div_ceil(exact_total_conversations).max(1)
-    };
-    let estimated_message_bytes_per_conversation = average_messages_per_conversation
-        .saturating_mul(LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE);
-    let max_message_bytes_per_shard = lexical_rebuild_staged_shard_max_message_bytes(settings);
-    let max_conversations_by_average_bytes = if estimated_message_bytes_per_conversation == 0 {
-        LEXICAL_REBUILD_ID_ONLY_MAX_CONVERSATIONS_PER_SHARD
-    } else {
-        max_message_bytes_per_shard
-            .saturating_div(estimated_message_bytes_per_conversation)
-            .max(1)
-    };
-    let max_conversations_per_shard = settings
-        .steady_commit_every_conversations
-        .clamp(1, LEXICAL_REBUILD_ID_ONLY_MAX_CONVERSATIONS_PER_SHARD)
-        .min(max_conversations_by_average_bytes.max(1))
-        .max(1);
-    let max_messages_per_shard = average_messages_per_conversation
-        .saturating_mul(max_conversations_per_shard)
-        .max(1);
-    let estimated_message_bytes_per_shard = estimated_message_bytes_per_conversation
-        .saturating_mul(max_conversations_per_shard)
-        .max(1)
-        .min(max_message_bytes_per_shard.max(1));
-
-    tracing::info!(
-        total_conversations,
-        exact_total_conversations,
-        total_messages,
-        average_messages_per_conversation,
-        estimated_message_bytes_per_conversation,
-        max_conversations_per_shard,
-        max_messages_per_shard,
-        max_message_bytes_per_shard = estimated_message_bytes_per_shard,
-        "using conservative conversation-id-only lexical shard plan because canonical DB has no tail footprint metadata"
-    );
-
-    let conversations = conversation_ids
-        .into_iter()
-        .map(|conversation_id| LexicalShardPlannerConversation {
-            conversation_id,
-            message_count: average_messages_per_conversation,
-            message_bytes: estimated_message_bytes_per_conversation,
-        })
-        .collect::<Vec<_>>();
-    let budgets = LexicalShardPlannerBudgets {
-        max_conversations_per_shard,
-        max_messages_per_shard,
-        max_message_bytes_per_shard: estimated_message_bytes_per_shard,
-    };
-    let mut plan = plan_lexical_rebuild_shards(&conversations, budgets);
-    for shard in &mut plan.shards {
-        shard.message_count = LEXICAL_SHARD_UNKNOWN_MESSAGE_COUNT;
-    }
-    plan.total_conversations = exact_total_conversations;
-    plan.total_messages = total_messages;
-    plan.total_message_bytes =
-        total_messages.saturating_mul(LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE);
-    plan.plan_id = lexical_shard_plan_id(
-        plan.budgets,
-        &plan.shards,
-        plan.total_conversations,
-        plan.total_messages,
-        plan.total_message_bytes,
-        &plan.oversized_conversation_ids,
-    );
-    Ok(plan)
-}
-
-// Dormant with the Quill backend: staged sharding is a Tantivy-ingest
-// parallelization strategy whose merge step has no FSLX equivalent. Retained
-// (not deleted) because the planner is engine-independent and would be reused
-// if Quill ever grows an N-directory merge.
-#[allow(dead_code)]
-fn plan_lexical_rebuild_shards_from_storage_with_settings(
-    storage: &FrankenStorage,
-    settings: &LexicalRebuildPipelineSettingsSnapshot,
-    total_conversations: usize,
-) -> Result<LexicalShardPlan> {
-    if !storage.lexical_rebuild_has_tail_footprint_metadata()? {
-        let total_messages = count_total_messages_exact(storage)?;
-        return plan_lexical_rebuild_shards_from_conversation_ids_with_settings(
-            storage,
-            settings,
-            total_conversations,
-            total_messages,
-        );
-    }
-
-    let conversations = lexical_rebuild_shard_planner_conversations_from_storage(storage)?;
-    let total_conversations = conversations.len();
-    let total_messages = conversations
-        .iter()
-        .map(|conversation| conversation.message_count)
-        .sum();
-    let total_message_bytes = conversations
-        .iter()
-        .map(|conversation| conversation.message_bytes)
-        .sum();
-    let budgets = lexical_rebuild_default_shard_planner_budgets_for_totals(
-        settings,
-        total_conversations,
-        total_messages,
-        total_message_bytes,
-    );
-    let mut plan = plan_lexical_rebuild_shards(&conversations, budgets);
-    for shard in &mut plan.shards {
-        // Footprints are sizing estimates, not validation contracts: the
-        // lexical sink can legitimately emit more than one Tantivy document
-        // for a source message on snippet-heavy sessions. Keep the byte-aware
-        // boundaries, but leave exact doc-count validation to the completed
-        // rebuild accounting.
-        shard.message_count = LEXICAL_SHARD_UNKNOWN_MESSAGE_COUNT;
-    }
-    plan.plan_id = lexical_shard_plan_id(
-        plan.budgets,
-        &plan.shards,
-        plan.total_conversations,
-        plan.total_messages,
-        plan.total_message_bytes,
-        &plan.oversized_conversation_ids,
-    );
-    Ok(plan)
 }
 
 #[derive(Debug, Clone)]
@@ -12763,12 +10845,6 @@ impl LexicalRebuildPlannedShardCursor {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LexicalRebuildShardBuilderSettings {
-    max_builders: usize,
-    writer_parallelism_budget: usize,
-}
-
 const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_SLOT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_BUDGET_NUMERATOR: u64 = 2;
 const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_BUDGET_DENOMINATOR: u64 = 3;
@@ -12780,9 +10856,6 @@ const LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_RESERVE_FRACTION: u64 = 32;
 const LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_FALLBACK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
 const LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_CEILING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-const LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_FLOOR_MILLI: u64 = 8_000;
-const LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_HEADROOM_MILLI: u64 = 1_500;
-const LEXICAL_REBUILD_STAGED_SHARD_BUILD_MIN_ESTIMATED_BYTES: u64 = 512 * 1024 * 1024;
 
 fn lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
     workers: usize,
@@ -12808,10 +10881,6 @@ fn lexical_rebuild_default_staged_shard_builder_parallelism_for_workers(workers:
         workers,
         responsiveness::available_memory_bytes(),
     )
-}
-
-fn usize_from_u64_saturating(value: u64) -> usize {
-    usize::try_from(value).unwrap_or(usize::MAX)
 }
 
 fn lexical_rebuild_default_staged_shard_build_memory_reserve_bytes_for_total_memory(
@@ -12909,59 +10978,8 @@ fn lexical_rebuild_staged_merge_worker_parallelism_configured() -> usize {
         })
 }
 
-fn lexical_rebuild_staged_shard_builder_settings(
-    settings: &LexicalRebuildPipelineSettingsSnapshot,
-    planned_shard_count: usize,
-) -> LexicalRebuildShardBuilderSettings {
-    let planned_shard_count = planned_shard_count.max(1);
-    let writer_parallelism_budget = settings.tantivy_writer_threads.max(1);
-    let max_builders = planned_shard_count
-        .min(settings.staged_shard_builders.max(1))
-        .min(writer_parallelism_budget)
-        .max(1);
-    LexicalRebuildShardBuilderSettings {
-        max_builders,
-        writer_parallelism_budget,
-    }
-}
-
-fn lexical_rebuild_staged_shard_builder_writer_parallelism_for_dispatch(
-    writer_parallelism_budget: usize,
-    allowed_jobs: usize,
-    dispatch_slot_index: usize,
-) -> usize {
-    let writer_parallelism_budget = writer_parallelism_budget.max(1);
-    let allowed_jobs = allowed_jobs.max(1);
-    if dispatch_slot_index >= allowed_jobs {
-        return 1;
-    }
-    if allowed_jobs >= writer_parallelism_budget {
-        return 1;
-    }
-
-    let base = writer_parallelism_budget / allowed_jobs;
-    let remainder = writer_parallelism_budget % allowed_jobs;
-    base.saturating_add(usize::from(dispatch_slot_index < remainder))
-        .max(1)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LexicalRebuildShardMergeSettings {
-    workers: usize,
-}
-
-fn lexical_rebuild_staged_shard_merge_settings(
-    settings: &LexicalRebuildPipelineSettingsSnapshot,
-    planned_shard_count: usize,
-) -> LexicalRebuildShardMergeSettings {
-    let eager_merge_groups =
-        planned_shard_count / LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN;
-    let workers = if eager_merge_groups == 0 {
-        1
-    } else {
-        settings.staged_merge_workers.min(eager_merge_groups).max(1)
-    };
-    LexicalRebuildShardMergeSettings { workers }
+fn usize_from_u64_saturating(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
 }
 
 pub(crate) fn load_lexical_rebuild_checkpoint(
@@ -14725,12 +12743,74 @@ fn source_file_observation(path: &Path) -> Option<serde_json::Value> {
     crate::connectors::source_dependencies::observation::file_observation(path)
 }
 
+/// Whether a source predates the connector's own incremental cutoff.
+///
+/// A source the connector's last completed scan already covered does not have
+/// to be read again. The connector's scan contract names the one exception: a
+/// compressed Codex rollout keeps the modification time of the plain rollout
+/// it was compressed from, so its content can be newer than the cutoff (GH
+/// #513), and the connector selects that form on its own terms.
+fn source_predates_connector_cutoff(
+    source: &DiscoveredSourceFile,
+    observation: Option<&serde_json::Value>,
+    cutoff: Option<i64>,
+) -> bool {
+    let Some(cutoff) = cutoff else {
+        return false;
+    };
+    if source_carries_cutoff_independent_form(source) {
+        return false;
+    }
+    let Some(mtime_ms) = observation
+        .and_then(|observation| observation.get("mtime_ns"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|mtime_ns| mtime_ns / 1_000_000)
+        .and_then(|mtime_ms| i64::try_from(mtime_ms).ok())
+    else {
+        return false;
+    };
+    // The same millisecond overlap the discovery cutoff uses, so a source
+    // written in the cutoff's own millisecond stays eligible.
+    mtime_ms < cutoff.saturating_sub(1_000)
+}
+
+/// Whether a source carries the source form a connector's scan contract
+/// names, which the connector selects independently of a scan's
+/// modification-time cutoff.
+fn source_carries_cutoff_independent_form(source: &DiscoveredSourceFile) -> bool {
+    // The exemption is the enforcement half of the contract. The connector's
+    // own declaration decides both whether the connector may keep a cutoff
+    // and which source form the cutoff must not skip, so the policy and its
+    // enforcement cannot drift apart.
+    crate::storage::sqlite::connector_scan_contract_source_form_matches(
+        &source.provider_slug,
+        &source.source_path,
+    )
+}
+
+/// Whether a connector's own modification-time cutoff is the complete
+/// eligibility rule for the sources it lists.
+///
+/// A self-contained parser reads only the primary source, so the connector's
+/// own cutoff decides everything the connector would read. A connector that
+/// can read a sidecar or a sibling file has an eligibility rule the
+/// modification time does not capture: a newly created `run-state.json`
+/// beside an unchanged transcript changes the parsed result. The durable
+/// ledger's dependency evidence is that rule, so the cutoff must not preempt
+/// it. The default is closed: an unknown connector is treated as one that can
+/// read a sidecar.
+fn connector_cutoff_is_complete(connector_name: &str) -> bool {
+    !crate::connectors::source_dependencies::source_dependency_policy(connector_name)
+        .observes_parent_directory()
+}
+
 fn source_ledger_matches(observation: &str, source: &DiscoveredSourceFile) -> bool {
     crate::connectors::source_dependencies::observation::ledger_matches(
         observation,
         &source.source_path,
         source_folder_is_dependency(source),
-        env!("CASS_SOURCE_INGEST_CONTRACT"),
+        crate::connectors::ingest_contract::provider_contract(&source.provider_slug),
     )
 }
 
@@ -14789,6 +12869,29 @@ fn source_observations_after_scan(
     Some((primary, dependencies))
 }
 
+/// The durable scan's context and the connector's own cutoff.
+///
+/// The durable ledger decides reuse per source, so the discovery cutoff is
+/// dropped and the connector lists every source it knows. The connector's own
+/// cutoff is captured in the same step, so clearing the discovery cutoff
+/// cannot lose it: a connector whose scan contract names a source form it
+/// selects independently of a cutoff still needs its cutoff applied per
+/// source, or it re-reads its whole corpus on every run.
+struct DurableScanContext {
+    ctx: ScanContext,
+    connector_cutoff: Option<i64>,
+}
+
+fn durable_scan_context(ctx: &ScanContext) -> DurableScanContext {
+    let connector_cutoff = ctx.since_ts;
+    let mut ctx = ctx.clone();
+    ctx.since_ts = None;
+    DurableScanContext {
+        ctx,
+        connector_cutoff,
+    }
+}
+
 /// Keep only the final bounded batch until the connector certifies a source.
 /// Filtering or a changing reconstruction dependency withholds the marker.
 fn scan_with_durable_source_boundaries(
@@ -14806,10 +12909,22 @@ fn scan_with_durable_source_boundaries(
             Ok(())
         });
     }
-    let mut ctx = ctx.clone();
-    ctx.since_ts = None;
+    // The durable ledger decides reuse per source, so the discovery cutoff is
+    // dropped and the connector lists every source it knows. The ledger only
+    // records the sources a previous run completed, so a connector whose
+    // scan contract names a source form it selects independently of a cutoff
+    // still needs its own cutoff applied per source: without it the connector
+    // re-reads its whole corpus on every run.
+    let DurableScanContext {
+        ctx,
+        connector_cutoff,
+    } = durable_scan_context(ctx);
     sender.retain_final = true;
     let sender = std::cell::RefCell::new(sender);
+    // A connector that can read a sidecar keeps the ledger's dependency
+    // evidence as the eligibility rule; the cutoff only applies where the
+    // connector's own modification-time rule is complete.
+    let cutoff_applies = connector_cutoff_is_complete(sender.borrow().connector_name);
     let filtered = std::cell::Cell::new(false);
     let before = std::cell::RefCell::new(None);
     let primary_before = std::cell::RefCell::new(None);
@@ -14840,6 +12955,31 @@ fn scan_with_durable_source_boundaries(
         {
             return false;
         }
+        // The connector's own incremental cutoff, applied per source. A
+        // source its last completed scan already covered does not have to be
+        // read again; the scan contract's source form is the exception. The
+        // observation is sampled before the flush so the completion proof
+        // spans the flush window: a source that changes during the scan is
+        // withheld from the ledger and re-read, never less often than before.
+        let primary_observation = source_file_observation(&source.source_path);
+        // A watermark only proves coverage by the previous parser. It must
+        // not hide a changed parser, an unrecorded source, or a build whose
+        // local dependencies disable completion reuse (GH #426).
+        let ledger_matches = env!("CASS_SOURCE_INGEST_REUSE") == "true"
+            && config
+                .source_ledger
+                .get(&source_ledger_key(source, &ctx))
+                .is_some_and(|saved| source_ledger_matches(saved, source));
+        if cutoff_applies
+            && ledger_matches
+            && source_predates_connector_cutoff(
+                source,
+                primary_observation.as_ref(),
+                connector_cutoff,
+            )
+        {
+            return false;
+        }
         if let Err(error) = sender.borrow_mut().flush() {
             *flush_error.borrow_mut() = Some(error);
             return false;
@@ -14859,13 +12999,8 @@ fn scan_with_durable_source_boundaries(
         // Use the pre-discovery parent, not a later snapshot that could bless
         // an untracked sidecar appearing between discovery and admission.
         *before.borrow_mut() = dependencies_before.parent_for(&source.source_path).cloned();
-        *primary_before.borrow_mut() = source_file_observation(&source.source_path);
-        let skip = env!("CASS_SOURCE_INGEST_REUSE") == "true"
-            && !filtered.get()
-            && config
-                .source_ledger
-                .get(&source_ledger_key(source, &ctx))
-                .is_some_and(|saved| source_ledger_matches(saved, source));
+        *primary_before.borrow_mut() = primary_observation;
+        let skip = !filtered.get() && ledger_matches;
         tracing::debug!(connector=%source.provider_slug, skipped=skip,"source_ingest_observation");
         if skip {
             sender
@@ -14898,7 +13033,8 @@ fn scan_with_durable_source_boundaries(
         let entry = crate::storage::sqlite::SourceIngestLedgerEntry {
             key: source_ledger_key(&completion.source, &ctx),
             observation: serde_json::json!({"primary":primary,"dependencies":dependencies,
-                "producer_contract":env!("CASS_SOURCE_INGEST_CONTRACT")})
+                "producer_contract":crate::connectors::ingest_contract::provider_contract(
+                    &completion.source.provider_slug)})
             .to_string(),
         };
         sender.borrow_mut().complete_source(entry)
@@ -15697,6 +13833,7 @@ where
                             "remote flush failed: {}",
                             error
                         );
+                        // ubs:ignore[rust.perf.string-alloc-in-loop] -- One diagnostic per failed remote flush.
                         let _ = tx.send(IndexMessage::ScanError {
                             connector_name: name,
                             error: format!(
@@ -16625,7 +14762,7 @@ where
         additional_scan_roots: additional_scan_roots.clone(),
         local_connector_roots: local_connector_roots.clone(),
         since_ts,
-        local_since_ts_by_connector: Arc::new(connector_local_scan_since_ts_map(
+        local_since_ts_by_connector: Arc::new(connector_admission_scan_since_ts_map(
             storage,
             since_ts,
             &connector_factories,
@@ -17434,10 +15571,45 @@ fn connector_activity_time_lower_bound(name: &str, since_ts: Option<i64>) -> Opt
     }
 }
 
+/// The batch producer's per-connector cutoff.
+///
+/// The batch producer has no durable source ledger, so it keeps the
+/// scan-contract escalation: a connector whose contract this archive has not
+/// recorded is scanned without a cutoff, so the contract's source form stays
+/// listed. No connector that reaches this lane carries a contract — every
+/// contract-bearing connector supports source boundaries and is scanned by
+/// the streaming producer — so the escalation is inert here and this map
+/// agrees with the streaming map for every connector the lane scans.
 fn connector_local_scan_since_ts_map<F>(
     storage: &FrankenStorage,
     fallback_since_ts: Option<i64>,
     connector_factories: &[(&'static str, F)],
+) -> Result<HashMap<&'static str, Option<i64>>> {
+    connector_scan_since_ts_map(storage, fallback_since_ts, connector_factories, true)
+}
+
+/// The streaming producer's per-connector cutoff.
+///
+/// This is the connector's own watermark without the scan-contract
+/// escalation. A connector whose scan contract names a source form it selects
+/// independently of a cutoff satisfies that contract by construction, so the
+/// sources its last completed scan already covered do not have to be read
+/// again; the contract's source form is exempted per source instead. A
+/// connector whose contract form still rides the cutoff keeps the
+/// escalation, because only an open cutoff keeps that form listed.
+fn connector_admission_scan_since_ts_map<F>(
+    storage: &FrankenStorage,
+    fallback_since_ts: Option<i64>,
+    connector_factories: &[(&'static str, F)],
+) -> Result<HashMap<&'static str, Option<i64>>> {
+    connector_scan_since_ts_map(storage, fallback_since_ts, connector_factories, false)
+}
+
+fn connector_scan_since_ts_map<F>(
+    storage: &FrankenStorage,
+    fallback_since_ts: Option<i64>,
+    connector_factories: &[(&'static str, F)],
+    escalate_pending_contract: bool,
 ) -> Result<HashMap<&'static str, Option<i64>>> {
     let connector_names = connector_factories
         .iter()
@@ -17449,40 +15621,59 @@ fn connector_local_scan_since_ts_map<F>(
         .iter()
         .map(|(name, _)| {
             let state = connector_states.get(*name).copied().unwrap_or_default();
-            // OMP is newly split from the legacy Pi Agent identity. The
-            // archive upgrade can legitimately create `omp` rows before the
-            // dedicated connector has ever completed a scan; do one full OMP
-            // scan until its own watermark exists so older profile/XDG roots
-            // are not skipped by the global Pi-era cutoff.
-            // ubs:ignore -- The provider name selects Devin's scan-watermark policy.
-            let local_since_ts = if *name == "devin" {
-                // Devin stores provider activity at whole-second precision while
-                // CASS scan watermarks are millisecond timestamps. A commit made
-                // after the previous scan can therefore carry an activity value
-                // that sorts before that scan's watermark. The provider can also
-                // commit only to its WAL. Re-read this connector without a time
-                // cutoff and let canonical idempotency discard unchanged rows.
-                None
-            // ubs:ignore -- The provider name selects OMP's first-scan watermark policy.
-            } else if *name == "omp" && state.last_scan_ts.is_none() {
-                None
-            } else if state.scan_contract_pending {
-                // A source form this build reads can predate any cutoff (GH
-                // #513: compressed Codex rollouts keep old modification times).
-                None
-            } else {
-                connector_local_scan_since_ts_from_state(
-                    fallback_since_ts,
-                    state.last_scan_ts,
-                    state.has_conversations,
-                )
-            };
+            let local_since_ts =
+                connector_scan_cutoff(name, &state, fallback_since_ts, escalate_pending_contract);
             Ok((
                 *name,
                 connector_activity_time_lower_bound(name, local_since_ts),
             ))
         })
         .collect()
+}
+
+/// The cutoff one connector's scan runs under.
+///
+/// `escalate_pending_contract` selects the batch producer's cutoff, which
+/// stays open for every connector whose scan contract this archive has not
+/// recorded: a source form this build reads can predate any cutoff (GH #513:
+/// compressed Codex rollouts keep old modification times), so the connector
+/// has to list every source it knows. The streaming producer's cutoff leaves
+/// the contract's source form alone and only bounds which of the listed
+/// sources this run reads: the form is exempted per source instead.
+fn connector_scan_cutoff(
+    name: &str,
+    state: &crate::storage::sqlite::ConnectorScanState,
+    fallback_since_ts: Option<i64>,
+    escalate_pending_contract: bool,
+) -> Option<i64> {
+    // OMP is newly split from the legacy Pi Agent identity. The
+    // archive upgrade can legitimately create `omp` rows before the
+    // dedicated connector has ever completed a scan; do one full OMP
+    // scan until its own watermark exists so older profile/XDG roots
+    // are not skipped by the global Pi-era cutoff.
+    // ubs:ignore -- The provider name selects Devin's scan-watermark policy.
+    if name == "devin" {
+        // Devin stores provider activity at whole-second precision while
+        // CASS scan watermarks are millisecond timestamps. A commit made
+        // after the previous scan can therefore carry an activity value
+        // that sorts before that scan's watermark. The provider can also
+        // commit only to its WAL. Re-read this connector without a time
+        // cutoff and let canonical idempotency discard unchanged rows.
+        None
+    // ubs:ignore -- The provider name selects OMP's first-scan watermark policy.
+    } else if (name == "omp" && state.last_scan_ts.is_none())
+        || (state.scan_contract_pending
+            && (escalate_pending_contract
+                || !crate::storage::sqlite::connector_scan_contract_is_cutoff_independent(name)))
+    {
+        None
+    } else {
+        connector_local_scan_since_ts_from_state(
+            fallback_since_ts,
+            state.last_scan_ts,
+            state.has_conversations,
+        )
+    }
 }
 
 fn connector_explicit_scan_root_since_ts(
@@ -18087,18 +16278,37 @@ fn run_index_with_storage_ownership(
     // a strictly read-only connection before `open_storage_for_index`. That
     // writable open may repair transition/schema objects even on the current
     // schema, so checking immediately afterward would already be too late.
+    //
+    // A malformed/unopenable archive is not indexed in place. When the raw
+    // mirror is checksum-verified it is the recovery authority: rebuild the
+    // canonical archive from it, quarantining (never deleting) the malformed
+    // bundle. Without a verified mirror the archive is preserved and the
+    // operator gets the existing refusal.
+    let mut canonical_archive_mirror_recovery: Option<CanonicalArchiveMirrorRecovery> = None;
     if opts.full
         && let Some(reason) = full_rebuild_existing_archive_integrity_preflight(&opts.db_path)?
     {
-        tracing::error!(
-            db_path = %opts.db_path.display(),
-            reason = %reason,
-            "full rebuild detected an unhealthy current-schema canonical db; refusing to replace the canonical archive"
-        );
-        return Err(canonical_archive_unhealthy_for_index_error(
-            &opts.db_path,
-            &reason,
-        ));
+        match recover_canonical_archive_from_verified_raw_mirror(&opts.data_dir, &opts.db_path)
+            .with_context(|| {
+                format!(
+                    "recovering the unhealthy canonical archive at {} from the checksum-verified raw mirror after preflight reported: {reason}",
+                    opts.db_path.display()
+                )
+            })?
+        {
+            Some(recovery) => canonical_archive_mirror_recovery = Some(recovery),
+            None => {
+                tracing::error!(
+                    db_path = %opts.db_path.display(),
+                    reason = %reason,
+                    "full rebuild detected an unhealthy current-schema canonical db and no checksum-verified raw mirror; refusing to replace the canonical archive"
+                );
+                return Err(canonical_archive_unhealthy_for_index_error(
+                    &opts.db_path,
+                    &reason,
+                ));
+            }
+        }
     }
 
     // GH #450: this writable open is where frankensqlite runs its one-time
@@ -18110,24 +16320,113 @@ fn run_index_with_storage_ownership(
     // (#446): progress is posted only in an interval where the database bundle
     // (including the migration backup being written) grew or the process burned
     // CPU, so a genuinely wedged open still reports `stalled`.
+    // GH #450: admit and name the pre-index compatibility repair BEFORE the
+    // writable open that runs it. `prepare` refuses unaffordable work with a
+    // durable deferred receipt and leaves the engine marker absent, so the
+    // required repair is retried rather than silently skipped. When it admits,
+    // the first sample is published immediately (instead of the first liveness
+    // tick one second later) and the open's heartbeat feeds byte progress.
+    let compat_repair = Arc::new(std::sync::Mutex::new(
+        crate::storage::compat_repair::prepare(&opts.db_path)?,
+    ));
+    if let Some(snapshot) = compat_repair.lock().ok().and_then(|slot| {
+        slot.as_ref()
+            .map(crate::storage::compat_repair::CompatRepairMonitor::snapshot)
+    }) && let Some(progress) = opts.progress.as_ref()
+    {
+        progress.publish_compat_repair(&snapshot);
+    }
     let open_liveness_targets = storage_open_liveness_targets(&opts.db_path);
     let open_liveness_heartbeat: crate::search::quill_bridge::EngineHeartbeat = {
         let progress = opts.progress.clone();
         let progress_bump = Arc::clone(&progress_bump);
+        let compat_repair = Arc::clone(&compat_repair);
         Arc::new(move || {
+            let repair_sample = compat_repair.lock().ok().and_then(|mut slot| {
+                slot.as_mut()
+                    .map(crate::storage::compat_repair::CompatRepairMonitor::observe)
+            });
             if let Some(progress) = progress.as_ref() {
                 progress.tick_activity();
+                if let Some(sample) = repair_sample.as_ref() {
+                    progress.publish_compat_repair(sample);
+                }
             }
             bump_index_run_lock_progress_atomic(&progress_bump);
         })
     };
     let storage_open_started = Instant::now();
-    let (mut storage, canonical_storage_rebuilt, opened_fresh_for_full) =
-        crate::search::quill_bridge::run_with_liveness_ticks(
-            open_liveness_targets,
-            open_liveness_heartbeat,
-            || open_storage_for_index(&opts.db_path, opts.full),
-        )?;
+    let mut storage_open = crate::search::quill_bridge::run_with_liveness_ticks(
+        open_liveness_targets.clone(),
+        Arc::clone(&open_liveness_heartbeat),
+        || open_storage_for_index(&opts.db_path, opts.full),
+    );
+    // The read-only preflight above is size-bounded; a large bundle can defer
+    // its engine probes and only fail at the writable open. Give that same
+    // malformed/unopenable shape the same verified-mirror recovery instead of
+    // indexing on a corrupt file. Contention and newer-schema refusals are not
+    // archive damage and keep their existing behavior.
+    let should_attempt_open_recovery = match &storage_open {
+        Ok(_) => false,
+        Err(err) => {
+            opts.full
+                && canonical_archive_mirror_recovery.is_none()
+                && opts.db_path.is_file()
+                && canonical_archive_open_failure_allows_mirror_recovery(err)
+        }
+    };
+    if should_attempt_open_recovery {
+        if let Some(recovery) =
+            recover_canonical_archive_from_verified_raw_mirror(&opts.data_dir, &opts.db_path)
+                .with_context(|| {
+                    format!(
+                        "recovering the unopenable canonical archive at {} from the checksum-verified raw mirror",
+                        opts.db_path.display()
+                    )
+                })?
+        {
+            canonical_archive_mirror_recovery = Some(recovery);
+            storage_open = crate::search::quill_bridge::run_with_liveness_ticks(
+                open_liveness_targets,
+                open_liveness_heartbeat,
+                || open_storage_for_index(&opts.db_path, opts.full),
+            );
+        }
+    }
+    if let Some(recovery) = canonical_archive_mirror_recovery.as_ref() {
+        tracing::info!(
+            db_path = %opts.db_path.display(),
+            archived_bundle = %recovery.archived_bundle.display(),
+            inserted_conversations = recovery.inserted_conversations,
+            inserted_messages = recovery.inserted_messages,
+            "full rebuild recovered the canonical archive from the checksum-verified raw mirror"
+        );
+    }
+    // GH #450: finish the named repair phase. Completion is claimed only from
+    // the engine marker; an open that returned without writing it leaves the
+    // required repair pending and must surface instead of continuing as if the
+    // archive were compatible.
+    let compat_repair_monitor = compat_repair.lock().ok().and_then(|mut slot| slot.take());
+    let storage_open = match storage_open {
+        Ok(opened) => match compat_repair_monitor {
+            Some(monitor) => monitor.finish().map(|_| opened),
+            None => Ok(opened),
+        },
+        Err(err) => {
+            if let Some(monitor) = compat_repair_monitor {
+                monitor.failed(&err);
+            }
+            Err(err)
+        }
+    };
+    if let Some(progress) = opts.progress.as_ref() {
+        progress.clear_compat_repair();
+    }
+    let (mut storage, canonical_storage_rebuilt, opened_fresh_for_full) = storage_open?;
+    let canonical_storage_rebuilt =
+        canonical_storage_rebuilt || canonical_archive_mirror_recovery.is_some();
+    let opened_fresh_for_full =
+        opened_fresh_for_full || canonical_archive_mirror_recovery.is_some();
     let storage_open_elapsed = storage_open_started.elapsed();
     if storage_open_elapsed >= SLOW_STORAGE_OPEN_WARN_THRESHOLD {
         // GH #450: name the cost. An open this long is a schema migration or
@@ -22605,6 +20904,14 @@ fn open_storage_for_index(
                 ));
             }
             Ok(_) => {}
+            Err(err)
+                if crate::storage::sqlite::conflicting_fts_schema_repair_required_from_error(
+                    &err,
+                )
+                .is_some() =>
+            {
+                return Err(err);
+            }
             Err(err) if anyhow_chain_indicates_retryable_storage_contention(&err) => {
                 return Err(anyhow::anyhow!(
                     "canonical db is busy/locked during index open; refusing to replace it: {err:#}"
@@ -22637,6 +20944,14 @@ fn open_storage_for_index(
     if existing_archive_bytes.is_some() {
         match FrankenStorage::open(db_path) {
             Ok(storage) => Ok((storage, false, false)),
+            Err(err)
+                if crate::storage::sqlite::conflicting_fts_schema_repair_required_from_error(
+                    &err,
+                )
+                .is_some() =>
+            {
+                Err(err)
+            }
             Err(err) if anyhow_chain_indicates_retryable_storage_contention(&err) => {
                 Err(anyhow::anyhow!(
                     "canonical db is busy/locked during index open; refusing to replace it: {err}"
@@ -22765,14 +21080,7 @@ fn background_migration_repair_pending_bytes_with_max_bytes(
     db_path: &Path,
     max_bytes: u64,
 ) -> Option<u64> {
-    if !db_path.is_file() {
-        return None;
-    }
-    let bundle_bytes = database_bundle_size_bytes(db_path);
-    if should_run_engine_backed_archive_integrity_preflight(Some(bundle_bytes), max_bytes) {
-        return None;
-    }
-    (!crate::storage::sqlite::index_engine_migration_is_complete(db_path)).then_some(bundle_bytes)
+    crate::storage::compat_repair::pending_bundle_bytes_with_max(db_path, max_bytes)
 }
 
 fn should_run_engine_backed_archive_integrity_preflight(
@@ -23056,6 +21364,12 @@ fn full_rebuild_existing_archive_integrity_preflight_with_max_bytes(
         Duration::from_secs(10),
     ) {
         Ok(storage) => storage,
+        Err(err)
+            if crate::storage::sqlite::conflicting_fts_schema_repair_required_from_error(&err)
+                .is_some() =>
+        {
+            return Err(err);
+        }
         Err(err) if anyhow_chain_indicates_retryable_storage_contention(&err) => {
             return Err(anyhow::anyhow!(
                 "full rebuild read-only archive preflight hit transient storage contention: {err:#}"
@@ -23092,6 +21406,172 @@ fn full_rebuild_existing_archive_integrity_preflight_with_max_bytes(
         );
     }
     result
+}
+
+/// Result of replacing an unreadable/malformed canonical archive with a
+/// rebuild from the checksum-verified raw mirror.
+#[derive(Debug, Clone)]
+struct CanonicalArchiveMirrorRecovery {
+    archived_bundle: PathBuf,
+    inserted_conversations: usize,
+    inserted_messages: usize,
+}
+
+/// Rebuild the canonical archive from the checksum-verified raw mirror when
+/// the existing file is malformed or unopenable (GH #374 Defect 1).
+///
+/// Returns `Ok(None)` when the raw mirror is not a checksum-verified recovery
+/// authority, leaving both the existing archive and the caller's refusal path
+/// untouched. On success the malformed bundle (db + `-wal` + `-shm` + WAL-cert
+/// sidecars) is renamed to a sibling `*.corrupt.<timestamp>` path before the
+/// rebuilt bundle is promoted, so no canonical bytes are deleted. The staged
+/// rebuild must pass the same strict read-only integrity preflight that gates
+/// an existing archive before any canonical name changes, and a failed
+/// promotion restores the quarantined bundle.
+fn recover_canonical_archive_from_verified_raw_mirror(
+    data_dir: &Path,
+    db_path: &Path,
+) -> Result<Option<CanonicalArchiveMirrorRecovery>> {
+    if !db_path.is_file() {
+        return Ok(None);
+    }
+    let raw_mirror = crate::collect_doctor_raw_mirror_report(data_dir);
+    if !crate::doctor_raw_mirror_is_verified_recovery_authority(&raw_mirror) {
+        tracing::info!(
+            db_path = %db_path.display(),
+            manifests = raw_mirror.summary.manifest_count,
+            verified_blobs = raw_mirror.summary.verified_blob_count,
+            missing_blobs = raw_mirror.summary.missing_blob_count,
+            checksum_mismatches = raw_mirror.summary.checksum_mismatch_count,
+            manifest_checksum_mismatches = raw_mirror.summary.manifest_checksum_mismatch_count,
+            "raw mirror is not a checksum-verified recovery authority; preserving the canonical archive"
+        );
+        return Ok(None);
+    }
+
+    let parent = db_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "creating canonical archive directory before raw-mirror rebuild: {}",
+            parent.display()
+        )
+    })?;
+    let staging = TempDirBuilder::new()
+        .prefix(".cass-mirror-recovery-")
+        .tempdir_in(parent)
+        .with_context(|| {
+            format!(
+                "creating staging directory for raw-mirror canonical rebuild next to {}",
+                db_path.display()
+            )
+        })?;
+    let staged_db_path = staging.path().join("rebuilt.db");
+    let mut skipped_records = Vec::new();
+    let mut parse_errors = Vec::new();
+    let (inserted_conversations, inserted_messages, evidence_sources, _manifest_indices) =
+        crate::reconstruct_archive_from_verified_raw_mirror(
+            data_dir,
+            &staged_db_path,
+            &raw_mirror,
+            &mut skipped_records,
+            &mut parse_errors,
+        )
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "rebuilding the canonical archive at {} from the checksum-verified raw mirror failed: {err}",
+                db_path.display()
+            )
+        })?;
+    for evidence in &evidence_sources {
+        tracing::debug!(evidence = %evidence, "raw-mirror canonical rebuild evidence");
+    }
+
+    if let Some(problem) = full_rebuild_existing_archive_integrity_preflight(&staged_db_path)
+        .with_context(|| {
+            format!(
+                "verifying the raw-mirror rebuilt archive {} before promotion",
+                staged_db_path.display()
+            )
+        })?
+    {
+        return Err(anyhow::anyhow!(
+            "raw-mirror rebuild produced an archive that fails the full-rebuild integrity preflight: {problem}"
+        ));
+    }
+
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    let mut archived_bundle = db_path.with_extension(format!("corrupt.{timestamp}"));
+    for suffix in 1..100 {
+        if !archived_bundle.exists() {
+            break;
+        }
+        archived_bundle = db_path.with_extension(format!("corrupt.{timestamp}.{suffix}"));
+    }
+    let moved = crate::storage::sqlite::move_database_bundle(db_path, &archived_bundle)
+        .with_context(|| {
+            format!(
+                "quarantining the malformed canonical archive {} before the raw-mirror rebuild",
+                db_path.display()
+            )
+        })?;
+
+    if let Err(err) = crate::storage::sqlite::move_database_bundle(&staged_db_path, db_path) {
+        if moved.moved_any() {
+            let _ = crate::storage::sqlite::move_database_bundle(&archived_bundle, db_path);
+        }
+        return Err(err).with_context(|| {
+            format!(
+                "promoting the raw-mirror rebuilt archive into the canonical path {}",
+                db_path.display()
+            )
+        });
+    }
+
+    // fsqlite records namespace identity for the replaced file in sidecars that
+    // deliberately do not travel with a bundle move. Rebind a writable open to
+    // the promoted bytes, exactly as the historical-seed promotion does, so the
+    // normal read-only index open sees a coherent namespace. On failure restore
+    // both sides.
+    if let Err(err) = crate::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())
+    {
+        let _ = crate::storage::sqlite::move_database_bundle(db_path, &staged_db_path);
+        if moved.moved_any() {
+            let _ = crate::storage::sqlite::move_database_bundle(&archived_bundle, db_path);
+        }
+        return Err(anyhow::Error::new(err)).with_context(|| {
+            format!(
+                "rebinding the database namespace after the raw-mirror rebuild at {}",
+                db_path.display()
+            )
+        });
+    }
+
+    tracing::warn!(
+        db_path = %db_path.display(),
+        archived_bundle = %archived_bundle.display(),
+        inserted_conversations,
+        inserted_messages,
+        "full rebuild rebuilt the canonical archive from the checksum-verified raw mirror and quarantined the malformed bundle"
+    );
+    Ok(Some(CanonicalArchiveMirrorRecovery {
+        archived_bundle,
+        inserted_conversations,
+        inserted_messages,
+    }))
+}
+
+/// Whether an `open_storage_for_index` failure describes a malformed/unopenable
+/// archive that a verified raw mirror may replace. Contention and a
+/// newer-than-supported schema are not archive damage: the first is transient
+/// and the second must not be silently downgraded.
+fn canonical_archive_open_failure_allows_mirror_recovery(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}");
+    !anyhow_chain_indicates_retryable_storage_contention(err)
+        && !message.contains("newer than supported version")
+        && !message.contains("busy/locked")
 }
 
 fn targeted_watch_once_fts_parity_problem(
@@ -23777,6 +22257,7 @@ fn quarantine_failed_seed_bundle(db_path: &Path) -> Result<Option<PathBuf>> {
             backup_root.clone()
         } else {
             backup_root.with_file_name(format!(
+                // ubs:ignore[rust.perf.string-alloc-in-loop] -- Only the DB and its two SQLite sidecars.
                 "{}{}",
                 backup_root
                     .file_name()
@@ -24259,30 +22740,6 @@ fn lexical_rebuild_page_prep_injected_panic_hook(db_path: &Path) {
     LEXICAL_REBUILD_PAGE_PREP_INJECTED_PANIC.fire_if_armed_for(
         db_path,
         "injected lexical rebuild page-prep panic for the #288 regression test",
-    );
-}
-
-#[cfg(test)]
-static LEXICAL_REBUILD_SHARD_BUILD_INJECTED_PANIC: ScopedPanicInjection =
-    ScopedPanicInjection::new();
-
-#[cfg(test)]
-fn lexical_rebuild_shard_build_injected_panic_hook(shard_index_path: &Path) {
-    LEXICAL_REBUILD_SHARD_BUILD_INJECTED_PANIC.fire_if_armed_for(
-        shard_index_path,
-        "injected lexical rebuild shard-build panic for the #282 regression test",
-    );
-}
-
-#[cfg(test)]
-static LEXICAL_REBUILD_SHARD_MERGE_INJECTED_PANIC: ScopedPanicInjection =
-    ScopedPanicInjection::new();
-
-#[cfg(test)]
-fn lexical_rebuild_shard_merge_injected_panic_hook(output_path: &Path) {
-    LEXICAL_REBUILD_SHARD_MERGE_INJECTED_PANIC.fire_if_armed_for(
-        output_path,
-        "injected lexical rebuild shard-merge panic for the #282 regression test",
     );
 }
 
@@ -26270,1402 +24727,6 @@ pub(crate) fn linux_atomic_exchange_is_unsupported(error: &anyhow::Error) -> boo
     })
 }
 
-struct LexicalRebuildFinalMergeArtifact {
-    publish_path: PathBuf,
-    docs: usize,
-    // Kept for test assertions + future diagnostics; production code only
-    // consumes the path + doc count, but regression tests still read this to
-    // prove the segment frontier is not silently remerged.
-    #[allow(dead_code)]
-    segments: usize,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn finalize_staged_lexical_rebuild_publish_artifact(
-    output_path: &Path,
-    input_paths: &[PathBuf],
-    stage_root: &Path,
-    max_parallel_jobs: usize,
-) -> Result<LexicalRebuildFinalMergeArtifact> {
-    let mut input_artifacts = Vec::with_capacity(input_paths.len());
-    for (idx, input_path) in input_paths.iter().enumerate() {
-        let summary =
-            crate::search::tantivy::searchable_index_summary(input_path)?.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "staged lexical rebuild artifact is not searchable: {}",
-                    input_path.display()
-                )
-            })?;
-        input_artifacts.push(LexicalRebuildShardMergeArtifact {
-            first_shard_index: idx,
-            last_shard_index: idx,
-            index_path: input_path.clone(),
-            docs: summary.docs,
-            segments: summary.segments,
-        });
-    }
-    finalize_staged_lexical_rebuild_publish_artifact_from_artifacts(
-        output_path,
-        &input_artifacts,
-        stage_root,
-        max_parallel_jobs,
-    )
-}
-
-fn finalize_staged_lexical_rebuild_publish_artifact_from_artifacts(
-    output_path: &Path,
-    input_artifacts: &[LexicalRebuildShardMergeArtifact],
-    stage_root: &Path,
-    max_parallel_jobs: usize,
-) -> Result<LexicalRebuildFinalMergeArtifact> {
-    if input_artifacts.is_empty() {
-        return Err(anyhow::anyhow!(
-            "cannot finalize staged lexical rebuild without at least one merged artifact"
-        ));
-    }
-
-    if input_artifacts.len() == 1 {
-        let artifact = &input_artifacts[0];
-        let publish_path = artifact.index_path.clone();
-        tracing::info!(
-            publish_path = %publish_path.display(),
-            "reusing already-final staged lexical rebuild artifact without redundant final merge"
-        );
-        crate::search::tantivy::validate_searchable_index_contract(&publish_path).with_context(
-            || {
-                format!(
-                    "single-input staged lexical rebuild artifact is not searchable: {}",
-                    publish_path.display()
-                )
-            },
-        )?;
-        return Ok(LexicalRebuildFinalMergeArtifact {
-            publish_path,
-            docs: artifact.docs,
-            segments: artifact.segments,
-        });
-    }
-
-    tracing::info!(
-        publish_path = %output_path.display(),
-        staged_artifacts = input_artifacts.len(),
-        "publishing staged lexical rebuild as federated lexical shard set without final assembly collapse"
-    );
-    let _ = stage_root;
-    let _ = max_parallel_jobs;
-    let publish_inputs = input_artifacts
-        .iter()
-        .map(|artifact| {
-            (
-                artifact.index_path.clone(),
-                SearchableIndexSummary {
-                    docs: artifact.docs,
-                    segments: artifact.segments,
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    let summary =
-        crate::search::tantivy::publish_federated_searchable_index_directories_with_summaries(
-            output_path,
-            &publish_inputs,
-        )?;
-    Ok(LexicalRebuildFinalMergeArtifact {
-        publish_path: output_path.to_path_buf(),
-        docs: summary.docs,
-        segments: summary.segments,
-    })
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn merge_lexical_rebuild_shard_index_tree(
-    output_path: &Path,
-    input_paths: &[PathBuf],
-    stage_root: &Path,
-    max_parallel_jobs: usize,
-) -> Result<crate::search::tantivy::TantivyIndex> {
-    const MERGE_FAN_IN: usize = 4;
-
-    if input_paths.is_empty() {
-        return Err(anyhow::anyhow!(
-            "cannot merge staged lexical rebuild shards without at least one shard index"
-        ));
-    }
-
-    if input_paths.len() <= MERGE_FAN_IN {
-        return crate::search::tantivy::TantivyIndex::merge_compatible_index_directories(
-            output_path,
-            input_paths,
-        );
-    }
-
-    let mut current_round_paths = input_paths.to_vec();
-    let mut round = 0usize;
-    let merge_pool = if max_parallel_jobs > 1 {
-        Some(
-            ThreadPoolBuilder::new()
-                .num_threads(max_parallel_jobs)
-                .thread_name(|idx| format!("cass-lexical-merge-{idx}"))
-                .build()
-                .context("building staged lexical merge thread pool")?,
-        )
-    } else {
-        None
-    };
-    while current_round_paths.len() > 1 {
-        let round_dir = stage_root.join(format!("round-{round:05}"));
-        fs::create_dir_all(&round_dir).with_context(|| {
-            format!(
-                "creating staged lexical merge round directory {}",
-                round_dir.display()
-            )
-        })?;
-        let final_round = current_round_paths.len() <= MERGE_FAN_IN;
-        let merge_jobs = current_round_paths
-            .chunks(MERGE_FAN_IN)
-            .enumerate()
-            .map(|(group_idx, group_inputs)| LexicalRebuildShardMergeWork {
-                output_path: if final_round {
-                    output_path.to_path_buf()
-                } else {
-                    round_dir.join(format!("merge-{group_idx:05}"))
-                },
-                input_paths: group_inputs.to_vec(),
-            })
-            .collect::<Vec<_>>();
-
-        tracing::info!(
-            merge_round = round,
-            merge_jobs = merge_jobs.len(),
-            merge_inputs = current_round_paths.len(),
-            merge_fan_in = MERGE_FAN_IN,
-            merge_workers = max_parallel_jobs.max(1),
-            "running staged lexical rebuild merge round"
-        );
-
-        let merge_job = |job: LexicalRebuildShardMergeWork| {
-            crate::search::tantivy::TantivyIndex::merge_compatible_index_directories(
-                &job.output_path,
-                &job.input_paths,
-            )
-            .with_context(|| {
-                format!(
-                    "merging {} staged lexical shard indices into {}",
-                    job.input_paths.len(),
-                    job.output_path.display()
-                )
-            })?;
-            Ok::<PathBuf, anyhow::Error>(job.output_path)
-        };
-        let merge_jobs_parallel = merge_jobs.clone();
-        let run_merge_jobs_parallel = move || {
-            merge_jobs_parallel
-                .into_par_iter()
-                .map(merge_job)
-                .collect::<Result<Vec<_>>>()
-        };
-        let run_merge_jobs_sequential = move || {
-            merge_jobs
-                .into_iter()
-                .map(merge_job)
-                .collect::<Result<Vec<_>>>()
-        };
-
-        current_round_paths = match &merge_pool {
-            Some(pool) => pool.install(run_merge_jobs_parallel)?,
-            None => run_merge_jobs_sequential()?,
-        };
-        round = round.saturating_add(1);
-    }
-
-    crate::search::tantivy::TantivyIndex::open_or_create(output_path)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn rebuild_tantivy_from_db_via_staged_shards(
-    db_path: &Path,
-    index_path: &Path,
-    total_conversations: usize,
-    progress: Option<Arc<IndexingProgress>>,
-    options: LexicalRebuildStartupOptions,
-    prep_profile_started: Option<Instant>,
-    storage: FrankenStorage,
-    mut rebuild_state: LexicalRebuildState,
-    shard_plan: LexicalShardPlan,
-    pipeline_settings: LexicalRebuildPipelineSettingsSnapshot,
-    progress_heartbeat_interval_conversations: usize,
-    progress_heartbeat_interval: Duration,
-    mut latest_pipeline_runtime: LexicalRebuildPipelineRuntimeSnapshot,
-    mut responsiveness_controller: LexicalRebuildResponsivenessController,
-    pipeline_budget_controller: Arc<LexicalRebuildPipelineBudgetController>,
-    mut current_batch_conversation_limit: usize,
-    lexical_rebuild_flow_limiter: Arc<StreamingByteLimiter>,
-    producer_telemetry: Arc<LexicalRebuildProducerTelemetry>,
-    lexical_rebuild_worker_pool: Option<Arc<ThreadPool>>,
-    pipeline_rx: Receiver<LexicalRebuildPipelineMessage>,
-    producer_handle: JoinHandle<()>,
-    mut perf_profile: Option<LexicalRebuildPerfProfile>,
-    rebuild_profile_started: Option<Instant>,
-    progress_bump: Option<Arc<AtomicI64>>,
-) -> Result<LexicalRebuildOutcome> {
-    let persist_initial_checkpoint_started = Instant::now();
-    persist_lexical_rebuild_state_for_active_run_start(index_path, &rebuild_state)?;
-    bump_index_run_lock_progress_if_present(progress_bump.as_ref());
-    log_lexical_rebuild_prep_profile_step(
-        prep_profile_started,
-        persist_initial_checkpoint_started,
-        "persist_initial_checkpoint",
-    );
-
-    if let Some(p) = &progress {
-        p.phase.store(2, Ordering::Relaxed);
-        p.is_rebuilding.store(true, Ordering::Relaxed);
-        p.total.store(total_conversations, Ordering::Relaxed);
-        p.current
-            .store(rebuild_state.processed_conversations, Ordering::Relaxed);
-        // Count-free restart receives only the interrupted checkpoint's hint.
-        // The exact denominator is known after authoritative enumeration.
-        p.total_is_final.store(
-            !options.defer_initial_content_fingerprint,
-            Ordering::Relaxed,
-        );
-        p.discovered_agents.store(0, Ordering::Relaxed);
-    }
-    let lexical_rebuild_started = Instant::now();
-
-    let stage_parent = index_path.parent().unwrap_or(index_path);
-    let shard_stage_root = TempDirBuilder::new()
-        .prefix("cass-lexical-shards.")
-        .tempdir_in(stage_parent)
-        .with_context(|| {
-            format!(
-                "creating staged lexical shard-build root under {}",
-                stage_parent.display()
-            )
-        })?;
-    let merge_stage_root = TempDirBuilder::new()
-        .prefix("cass-lexical-merge.")
-        .tempdir_in(stage_parent)
-        .with_context(|| {
-            format!(
-                "creating staged lexical merge root under {}",
-                stage_parent.display()
-            )
-        })?;
-    let eager_merge_stage_root = merge_stage_root.path().join("eager");
-    let final_merge_stage_root = merge_stage_root.path().join("final");
-    let staged_merged_index_path = merge_stage_root.path().join("index");
-    let staged_publish_base_meta_fingerprint = index_meta_fingerprint(index_path)?;
-    let shard_builder_settings =
-        lexical_rebuild_staged_shard_builder_settings(&pipeline_settings, shard_plan.shards.len());
-    let shard_merge_settings =
-        lexical_rebuild_staged_shard_merge_settings(&pipeline_settings, shard_plan.shards.len());
-    tracing::info!(
-        db_path = %db_path.display(),
-        planned_shards = shard_plan.shards.len(),
-        plan_id = %shard_plan.plan_id,
-        shard_builders_max = shard_builder_settings.max_builders,
-        shard_builder_writer_parallelism_budget =
-            shard_builder_settings.writer_parallelism_budget,
-        eager_merge_workers = shard_merge_settings.workers,
-        "running fresh authoritative lexical rebuild via staged shard-build path"
-    );
-
-    let (shard_work_tx, shard_work_rx) =
-        bounded::<LexicalRebuildShardBuildWork>(shard_builder_settings.max_builders.max(1));
-    let (shard_result_tx, shard_result_rx) = bounded::<LexicalRebuildShardBuildMessage>(
-        shard_plan
-            .shards
-            .len()
-            .max(shard_builder_settings.max_builders)
-            .max(1),
-    );
-    let shard_builder_handles = spawn_lexical_rebuild_shard_builder_workers(
-        shard_builder_settings.max_builders,
-        shard_work_rx,
-        shard_result_tx,
-        Arc::clone(&lexical_rebuild_flow_limiter),
-        lexical_rebuild_worker_pool.clone(),
-        lexical_index_heartbeat(progress.as_ref()),
-    );
-    let shard_work_dispatch_tx = shard_work_tx.clone();
-    let (merge_work_tx, merge_work_rx) =
-        bounded::<LexicalRebuildShardMergeJob>(shard_merge_settings.workers.max(1));
-    let (merge_result_tx, merge_result_rx) =
-        bounded::<LexicalRebuildShardMergeMessage>(shard_plan.shards.len().max(1));
-    let merge_worker_handles = spawn_lexical_rebuild_shard_merge_workers(
-        shard_merge_settings.workers,
-        merge_work_rx,
-        merge_result_tx,
-    );
-
-    let mut indexed_docs = rebuild_state.indexed_docs;
-    let mut observed_messages = rebuild_state.indexed_docs;
-    let mut processed_conversations = rebuild_state.processed_conversations;
-    let mut last_processed_conversation_id = rebuild_state.committed_conversation_id;
-    let mut conversations_since_progress_persist = 0usize;
-    let mut last_progress_persist = Instant::now();
-    let mut current_shard_packets = Vec::new();
-    let mut current_shard_index = None;
-    let mut current_shard_message_bytes = 0usize;
-    let mut enqueued_shards = 0usize;
-    let mut received_shard_results = 0usize;
-    let mut active_shard_build_jobs = 0usize;
-    let mut next_shard_to_commit = 0usize;
-    let mut pending_completed_shards = BTreeMap::new();
-    let mut completed_shard_artifacts = Vec::with_capacity(shard_plan.shards.len());
-    let mut scheduled_completed_shard_artifacts = 0usize;
-    let mut pending_shard_build_jobs: VecDeque<LexicalRebuildShardBuildWork> = VecDeque::new();
-    let mut pending_shard_build_message_bytes = 0usize;
-    let pending_shard_build_max_message_bytes =
-        lexical_rebuild_pending_shard_build_max_message_bytes(&pipeline_settings);
-    let pending_shard_build_max_jobs =
-        lexical_rebuild_pending_shard_build_max_jobs(&pipeline_settings);
-    let mut merge_coordinator = LexicalRebuildShardMergeCoordinator::new(eager_merge_stage_root);
-    let staged_merge_controller = LexicalRebuildStagedMergeController::new(
-        shard_merge_settings.workers,
-        pipeline_settings.controller_loadavg_high_watermark_1m_milli,
-    );
-    let staged_shard_build_controller = LexicalRebuildStagedShardBuildController::new(
-        shard_builder_settings.max_builders,
-        pipeline_settings.controller_loadavg_high_watermark_1m_milli,
-    );
-    let shard_build_telemetry = LexicalRebuildShardBuildTelemetry::default();
-    let mut max_conversation_id = 0i64;
-    let mut max_message_id = 0i64;
-    let mut final_merge_input_artifacts: Option<Vec<LexicalRebuildShardMergeArtifact>> = None;
-    let mut equivalence_accumulator = LexicalRebuildEquivalenceAccumulator::new();
-
-    let refresh_runtime =
-        |latest_pipeline_runtime: &mut LexicalRebuildPipelineRuntimeSnapshot,
-         responsiveness_controller: &mut LexicalRebuildResponsivenessController,
-         current_batch_conversation_limit: &mut usize,
-         pending_batch_conversations: usize,
-         pending_batch_message_bytes: usize| {
-            refresh_and_maybe_apply_lexical_rebuild_pipeline_runtime(
-                latest_pipeline_runtime,
-                progress.as_ref(),
-                lexical_rebuild_flow_limiter.as_ref(),
-                Some(producer_telemetry.as_ref()),
-                responsiveness_controller,
-                pipeline_budget_controller.as_ref(),
-                current_batch_conversation_limit,
-                None,
-                LexicalRebuildPipelineSinkRuntimeSnapshot::new(
-                    pipeline_rx.len(),
-                    pending_batch_conversations,
-                    pending_batch_message_bytes,
-                ),
-            );
-        };
-
-    let refresh_staged_parallelism_and_dispatch =
-        |latest_pipeline_runtime: &mut LexicalRebuildPipelineRuntimeSnapshot,
-         merge_coordinator: &mut LexicalRebuildShardMergeCoordinator,
-         pending_shard_build_jobs: &mut VecDeque<LexicalRebuildShardBuildWork>,
-         pending_shard_build_message_bytes: &mut usize,
-         active_shard_build_jobs: &mut usize,
-         enqueued_shards: &mut usize,
-         producer_finished: bool|
-         -> Result<()> {
-            let staged_merge_runtime = staged_merge_controller.decide(
-                producer_finished,
-                latest_pipeline_runtime,
-                merge_coordinator,
-            );
-            merge_coordinator.set_allowed_pending_merge_jobs(
-                staged_merge_runtime.allowed_jobs,
-                &merge_work_tx,
-            )?;
-            let applied_runtime = staged_merge_controller.decide(
-                producer_finished,
-                latest_pipeline_runtime,
-                merge_coordinator,
-            );
-            apply_staged_merge_runtime_snapshot(
-                latest_pipeline_runtime,
-                progress.as_ref(),
-                &applied_runtime,
-            );
-            apply_staged_shard_build_telemetry_snapshot(
-                latest_pipeline_runtime,
-                progress.as_ref(),
-                staged_shard_build_controller.memory_reserve_bytes,
-                staged_shard_build_controller.emergency_memory_reserve_bytes,
-                &shard_build_telemetry,
-            );
-            let staged_shard_build_runtime = staged_shard_build_controller.decide(
-                latest_pipeline_runtime,
-                &applied_runtime,
-                *active_shard_build_jobs,
-                pending_shard_build_jobs.len(),
-                pending_shard_build_jobs
-                    .front()
-                    .map(|work| work.shard.message_bytes),
-            );
-            while *active_shard_build_jobs < staged_shard_build_runtime.allowed_jobs {
-                let Some(mut work) = pending_shard_build_jobs.pop_front() else {
-                    break;
-                };
-                *pending_shard_build_message_bytes =
-                    pending_shard_build_message_bytes.saturating_sub(work.message_bytes);
-                let dispatch_slot_index = *active_shard_build_jobs;
-                work.writer_parallelism =
-                    lexical_rebuild_staged_shard_builder_writer_parallelism_for_dispatch(
-                        shard_builder_settings.writer_parallelism_budget,
-                        staged_shard_build_runtime.allowed_jobs,
-                        dispatch_slot_index,
-                    );
-                shard_work_dispatch_tx.send(work).map_err(|_| {
-                    anyhow::anyhow!(
-                        "staged lexical rebuild shard builder queue disconnected before shard enqueue"
-                    )
-                })?;
-                *active_shard_build_jobs = active_shard_build_jobs.saturating_add(1);
-                *enqueued_shards = enqueued_shards.saturating_add(1);
-            }
-            let applied_shard_build_runtime = staged_shard_build_controller.decide(
-                latest_pipeline_runtime,
-                &applied_runtime,
-                *active_shard_build_jobs,
-                pending_shard_build_jobs.len(),
-                pending_shard_build_jobs
-                    .front()
-                    .map(|work| work.shard.message_bytes),
-            );
-            apply_staged_shard_build_runtime_snapshot(
-                latest_pipeline_runtime,
-                progress.as_ref(),
-                &applied_shard_build_runtime,
-            );
-            apply_staged_shard_build_telemetry_snapshot(
-                latest_pipeline_runtime,
-                progress.as_ref(),
-                staged_shard_build_controller.memory_reserve_bytes,
-                staged_shard_build_controller.emergency_memory_reserve_bytes,
-                &shard_build_telemetry,
-            );
-            Ok(())
-        };
-
-    let initial_staged_merge_runtime =
-        staged_merge_controller.decide(false, &latest_pipeline_runtime, &merge_coordinator);
-    apply_staged_merge_runtime_snapshot(
-        &mut latest_pipeline_runtime,
-        progress.as_ref(),
-        &initial_staged_merge_runtime,
-    );
-    let initial_staged_shard_build_runtime = staged_shard_build_controller.decide(
-        &latest_pipeline_runtime,
-        &initial_staged_merge_runtime,
-        active_shard_build_jobs,
-        pending_shard_build_jobs.len(),
-        pending_shard_build_jobs
-            .front()
-            .map(|work| work.shard.message_bytes),
-    );
-    apply_staged_shard_build_runtime_snapshot(
-        &mut latest_pipeline_runtime,
-        progress.as_ref(),
-        &initial_staged_shard_build_runtime,
-    );
-    apply_staged_shard_build_telemetry_snapshot(
-        &mut latest_pipeline_runtime,
-        progress.as_ref(),
-        staged_shard_build_controller.memory_reserve_bytes,
-        staged_shard_build_controller.emergency_memory_reserve_bytes,
-        &shard_build_telemetry,
-    );
-
-    let advance_completed_shards =
-        |pending_completed_shards: &mut BTreeMap<usize, LexicalRebuildShardBuildResult>,
-         next_shard_to_commit: &mut usize,
-         completed_shard_artifacts: &mut Vec<LexicalRebuildShardMergeArtifact>,
-         processed_conversations: &mut usize,
-         indexed_docs: &mut usize,
-         observed_messages: &mut usize,
-         last_processed_conversation_id: &mut Option<i64>,
-         conversations_since_progress_persist: &mut usize,
-         responsiveness_controller: &mut LexicalRebuildResponsivenessController,
-         current_batch_conversation_limit: &mut usize|
-         -> Result<bool> {
-            let mut force_progress_persist = false;
-            while let Some(result) = pending_completed_shards.remove(next_shard_to_commit) {
-                let validated_artifact = validate_lexical_rebuild_shard_build_result(&result)?;
-                *processed_conversations =
-                    processed_conversations.saturating_add(result.shard.conversation_count);
-                *indexed_docs = indexed_docs.saturating_add(result.indexed_docs);
-                let shard_observed_messages =
-                    if lexical_shard_message_count_is_known(result.shard.message_count) {
-                        result.shard.message_count
-                    } else {
-                        result.indexed_docs
-                    };
-                *observed_messages = observed_messages.saturating_add(shard_observed_messages);
-                *last_processed_conversation_id = Some(result.shard.last_conversation_id);
-                completed_shard_artifacts.push(validated_artifact);
-                *conversations_since_progress_persist = conversations_since_progress_persist
-                    .saturating_add(result.shard.conversation_count);
-                if let Some(p) = &progress {
-                    p.current.store(*processed_conversations, Ordering::Relaxed);
-                    if options.defer_initial_content_fingerprint {
-                        p.total
-                            .fetch_max(*processed_conversations, Ordering::Relaxed);
-                    }
-                }
-                bump_index_run_lock_progress_if_present(progress_bump.as_ref());
-                if let Some(transition) = responsiveness_controller.record_first_durable_commit() {
-                    apply_lexical_rebuild_budget_transition(
-                        transition,
-                        lexical_rebuild_flow_limiter.as_ref(),
-                        pipeline_budget_controller.as_ref(),
-                        current_batch_conversation_limit,
-                        None,
-                    );
-                    force_progress_persist = true;
-                }
-                *next_shard_to_commit = next_shard_to_commit.saturating_add(1);
-            }
-            Ok(force_progress_persist)
-        };
-
-    let queue_newly_completed_shard_artifacts =
-        |merge_coordinator: &mut LexicalRebuildShardMergeCoordinator,
-         completed_shard_artifacts: &[LexicalRebuildShardMergeArtifact],
-         scheduled_completed_shard_artifacts: &mut usize|
-         -> Result<()> {
-            while *scheduled_completed_shard_artifacts < completed_shard_artifacts.len() {
-                merge_coordinator.queue_base_artifact(
-                    completed_shard_artifacts[*scheduled_completed_shard_artifacts].clone(),
-                    &merge_work_tx,
-                )?;
-                *scheduled_completed_shard_artifacts =
-                    (*scheduled_completed_shard_artifacts).saturating_add(1);
-            }
-            Ok(())
-        };
-
-    let main_result: Result<()> = (|| {
-        let never_shard_result_rx = never::<LexicalRebuildShardBuildMessage>();
-        let never_merge_result_rx = never::<LexicalRebuildShardMergeMessage>();
-        let never_pipeline_rx = never::<LexicalRebuildPipelineMessage>();
-        let mut shard_result_channel_open = true;
-        let mut merge_result_channel_open = true;
-        let mut producer_finished = false;
-        let mut pipeline_backlog_pause_logged = false;
-        while !producer_finished {
-            let active_shard_result_rx = if shard_result_channel_open {
-                &shard_result_rx
-            } else {
-                &never_shard_result_rx
-            };
-            let active_merge_result_rx = if merge_result_channel_open {
-                &merge_result_rx
-            } else {
-                &never_merge_result_rx
-            };
-            let pipeline_backlog_paused = pending_shard_build_message_bytes
-                >= pending_shard_build_max_message_bytes
-                || pending_shard_build_jobs.len() >= pending_shard_build_max_jobs;
-            let pending_merge_jobs = merge_coordinator.pending_merge_jobs();
-            let pause_pipeline_handoff = should_pause_staged_lexical_pipeline_handoff(
-                pipeline_backlog_paused,
-                active_shard_build_jobs,
-                pending_merge_jobs,
-            );
-            if pause_pipeline_handoff && !pipeline_backlog_pause_logged {
-                tracing::info!(
-                    pending_shard_build_jobs = pending_shard_build_jobs.len(),
-                    pending_shard_build_max_jobs,
-                    pending_shard_build_message_bytes,
-                    pending_shard_build_max_message_bytes,
-                    active_shard_build_jobs,
-                    pending_merge_jobs,
-                    "pausing lexical rebuild producer handoff while staged shard-build backlog drains"
-                );
-                pipeline_backlog_pause_logged = true;
-            } else if !pause_pipeline_handoff && pipeline_backlog_pause_logged {
-                tracing::info!(
-                    pending_shard_build_jobs = pending_shard_build_jobs.len(),
-                    pending_shard_build_max_jobs,
-                    pending_shard_build_message_bytes,
-                    pending_shard_build_max_message_bytes,
-                    active_shard_build_jobs,
-                    pending_merge_jobs,
-                    "resuming lexical rebuild producer handoff after staged backlog drained or lost its async wake source"
-                );
-                pipeline_backlog_pause_logged = false;
-            }
-            if pipeline_backlog_paused && !pause_pipeline_handoff {
-                tracing::debug!(
-                    pending_shard_build_jobs = pending_shard_build_jobs.len(),
-                    pending_shard_build_max_jobs,
-                    pending_shard_build_message_bytes,
-                    pending_shard_build_max_message_bytes,
-                    active_shard_build_jobs,
-                    pending_merge_jobs,
-                    "continuing to drain lexical rebuild producer handoff because no staged shard or merge job can wake the sink"
-                );
-            }
-            let active_pipeline_rx = if pause_pipeline_handoff {
-                &never_pipeline_rx
-            } else {
-                &pipeline_rx
-            };
-            select! {
-                recv(active_shard_result_rx) -> message => {
-                    match message {
-                        Ok(LexicalRebuildShardBuildMessage::Built(result)) => {
-                            active_shard_build_jobs = active_shard_build_jobs.saturating_sub(1);
-                            received_shard_results = received_shard_results.saturating_add(1);
-                            shard_build_telemetry.record(&result);
-                            pending_completed_shards.insert(result.shard.shard_index, result);
-                        }
-                        Ok(LexicalRebuildShardBuildMessage::Error { shard_index, error }) => {
-                            active_shard_build_jobs = active_shard_build_jobs.saturating_sub(1);
-                            return Err(anyhow::anyhow!(
-                                "building lexical rebuild shard {shard_index} failed: {error}"
-                            ));
-                        }
-                        Err(_) => {
-                            if received_shard_results < enqueued_shards {
-                                return Err(anyhow::anyhow!(
-                                    "staged lexical rebuild shard builder channel closed before all enqueued shards completed"
-                                ));
-                            }
-                            shard_result_channel_open = false;
-                            continue;
-                        }
-                    }
-
-                    let force_progress_persist = advance_completed_shards(
-                        &mut pending_completed_shards,
-                        &mut next_shard_to_commit,
-                        &mut completed_shard_artifacts,
-                        &mut processed_conversations,
-                        &mut indexed_docs,
-                        &mut observed_messages,
-                        &mut last_processed_conversation_id,
-                        &mut conversations_since_progress_persist,
-                        &mut responsiveness_controller,
-                        &mut current_batch_conversation_limit,
-                    )?;
-                    queue_newly_completed_shard_artifacts(
-                        &mut merge_coordinator,
-                        &completed_shard_artifacts,
-                        &mut scheduled_completed_shard_artifacts,
-                    )?;
-
-                    refresh_runtime(
-                        &mut latest_pipeline_runtime,
-                        &mut responsiveness_controller,
-                        &mut current_batch_conversation_limit,
-                        current_shard_packets.len(),
-                        current_shard_message_bytes,
-                    );
-                    refresh_staged_parallelism_and_dispatch(
-                        &mut latest_pipeline_runtime,
-                        &mut merge_coordinator,
-                        &mut pending_shard_build_jobs,
-                        &mut pending_shard_build_message_bytes,
-                        &mut active_shard_build_jobs,
-                        &mut enqueued_shards,
-                        producer_finished,
-                    )?;
-                    maybe_persist_staged_lexical_rebuild_progress(
-                        index_path,
-                        &mut rebuild_state,
-                        last_processed_conversation_id,
-                        processed_conversations,
-                        indexed_docs,
-                        &latest_pipeline_runtime,
-                        staged_publish_base_meta_fingerprint.as_deref(),
-                        force_progress_persist,
-                        &mut conversations_since_progress_persist,
-                        progress_heartbeat_interval_conversations,
-                        &mut last_progress_persist,
-                        progress_heartbeat_interval,
-                        progress_bump.as_ref(),
-                        perf_profile.as_mut(),
-                    )?;
-                }
-                recv(active_merge_result_rx) -> message => {
-                    match message {
-                        Ok(LexicalRebuildShardMergeMessage::Built(result)) => {
-                            merge_coordinator.complete_merge(result, &merge_work_tx)?;
-                            bump_index_run_lock_progress_if_present(progress_bump.as_ref());
-                        }
-                        Ok(LexicalRebuildShardMergeMessage::Error {
-                            output_level,
-                            first_shard_index,
-                            last_shard_index,
-                            error,
-                        }) => {
-                            return Err(anyhow::anyhow!(
-                                "eager staged lexical merge at level {output_level} for shard range {first_shard_index}..={last_shard_index} failed: {error}"
-                            ));
-                        }
-                        Err(_) => {
-                            if merge_coordinator.pending_merge_jobs() > 0 {
-                                return Err(anyhow::anyhow!(
-                                    "staged lexical rebuild eager merge channel closed before all queued merges completed"
-                                ));
-                            }
-                            merge_result_channel_open = false;
-                            continue;
-                        }
-                    }
-                    refresh_runtime(
-                        &mut latest_pipeline_runtime,
-                        &mut responsiveness_controller,
-                        &mut current_batch_conversation_limit,
-                        current_shard_packets.len(),
-                        current_shard_message_bytes,
-                    );
-                    refresh_staged_parallelism_and_dispatch(
-                        &mut latest_pipeline_runtime,
-                        &mut merge_coordinator,
-                        &mut pending_shard_build_jobs,
-                        &mut pending_shard_build_message_bytes,
-                        &mut active_shard_build_jobs,
-                        &mut enqueued_shards,
-                        producer_finished,
-                    )?;
-                    maybe_persist_staged_lexical_rebuild_progress(
-                        index_path,
-                        &mut rebuild_state,
-                        last_processed_conversation_id,
-                        processed_conversations,
-                        indexed_docs,
-                        &latest_pipeline_runtime,
-                        staged_publish_base_meta_fingerprint.as_deref(),
-                        false,
-                        &mut conversations_since_progress_persist,
-                        progress_heartbeat_interval_conversations,
-                        &mut last_progress_persist,
-                        progress_heartbeat_interval,
-                        progress_bump.as_ref(),
-                        perf_profile.as_mut(),
-                    )?;
-                }
-                recv(active_pipeline_rx) -> message => {
-                    match message {
-                        Ok(LexicalRebuildPipelineMessage::Batch(prepared_page)) => {
-                            let mut page_reservation = StreamingByteReservation::new(
-                                lexical_rebuild_flow_limiter.as_ref(),
-                                lexical_rebuild_prepared_page_reserved_bytes(&prepared_page),
-                            );
-                            if let Some(profile) = perf_profile.as_mut() {
-                                profile.conversation_list_duration +=
-                                    prepared_page.conversation_list_duration;
-                                profile.message_stream_duration += prepared_page.message_fetch_duration;
-                                profile.finish_conversation_duration +=
-                                    prepared_page.packet_prepare_duration;
-                            }
-
-                            if options.defer_initial_content_fingerprint {
-                                max_conversation_id =
-                                    max_conversation_id.max(prepared_page.page_last_conversation_id);
-                            }
-
-                            let LexicalRebuildPreparedPage {
-                                packets,
-                                page_last_conversation_id: _page_last_conversation_id,
-                                planned_shard_index,
-                                finishes_planned_shard,
-                                conversation_list_duration: _conversation_list_duration,
-                                message_fetch_duration: _message_fetch_duration,
-                                packet_prepare_duration: _packet_prepare_duration,
-                            } = prepared_page;
-
-                            let planned_shard_index = planned_shard_index.ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "staged lexical rebuild received a prepared page without planned shard metadata"
-                                )
-                            })?;
-                            if current_shard_index.is_none() {
-                                current_shard_index = Some(planned_shard_index);
-                            }
-                            // ubs:ignore -- Planned shard ordinals prevent mixing pages across shard builds.
-                            if current_shard_index != Some(planned_shard_index) {
-                                return Err(anyhow::anyhow!(
-                                    "staged lexical rebuild crossed from shard {} into shard {} before closing the prior shard",
-                                    current_shard_index.unwrap_or(usize::MAX),
-                                    planned_shard_index
-                                ));
-                            }
-
-                            for mut packet in packets {
-                                if options.defer_initial_content_fingerprint
-                                    && let Some(last_message_id) = packet.last_message_id
-                                {
-                                    max_message_id = max_message_id.max(last_message_id);
-                                }
-                                equivalence_accumulator.absorb_packet(&packet);
-                                current_shard_message_bytes =
-                                    current_shard_message_bytes.saturating_add(packet.message_bytes);
-                                packet.flow_reservation_bytes = 0;
-                                current_shard_packets.push(packet);
-                            }
-                            bump_index_run_lock_progress_if_present(progress_bump.as_ref());
-                            // The byte limiter covers producer-prepared pages
-                            // waiting for this consumer. After packets enter
-                            // the staged shard buffers, the pending-shard
-                            // backlog cap accounts for their heap footprint.
-                            page_reservation.release_now();
-
-                            refresh_runtime(
-                                &mut latest_pipeline_runtime,
-                                &mut responsiveness_controller,
-                                &mut current_batch_conversation_limit,
-                                current_shard_packets.len(),
-                                current_shard_message_bytes,
-                            );
-                            refresh_staged_parallelism_and_dispatch(
-                                &mut latest_pipeline_runtime,
-                                &mut merge_coordinator,
-                                &mut pending_shard_build_jobs,
-                                &mut pending_shard_build_message_bytes,
-                                &mut active_shard_build_jobs,
-                                &mut enqueued_shards,
-                                producer_finished,
-                            )?;
-
-                            if finishes_planned_shard {
-                                let shard = shard_plan
-                                    .shards
-                                    .get(planned_shard_index)
-                                    .cloned()
-                                    .ok_or_else(|| {
-                                        anyhow::anyhow!(
-                                            "missing staged lexical rebuild shard metadata for shard {}",
-                                            planned_shard_index
-                                        )
-                                    })?;
-                                let shard_message_bytes = current_shard_message_bytes;
-                                let shard_packets = std::mem::take(&mut current_shard_packets);
-                                current_shard_message_bytes = 0;
-                                current_shard_index = None;
-                                pending_shard_build_message_bytes =
-                                    pending_shard_build_message_bytes
-                                        .saturating_add(shard_message_bytes);
-                                pending_shard_build_jobs.push_back(LexicalRebuildShardBuildWork {
-                                    shard,
-                                    packets: shard_packets,
-                                    message_bytes: shard_message_bytes,
-                                    shard_index_path: shard_stage_root
-                                        .path()
-                                        .join(format!("shard-{planned_shard_index:05}")),
-                                    writer_parallelism: 1,
-                                });
-                                refresh_staged_parallelism_and_dispatch(
-                                    &mut latest_pipeline_runtime,
-                                    &mut merge_coordinator,
-                                    &mut pending_shard_build_jobs,
-                                    &mut pending_shard_build_message_bytes,
-                                    &mut active_shard_build_jobs,
-                                    &mut enqueued_shards,
-                                    producer_finished,
-                                )?;
-                            }
-
-                            maybe_persist_staged_lexical_rebuild_progress(
-                                index_path,
-                                &mut rebuild_state,
-                                last_processed_conversation_id,
-                                processed_conversations,
-                                indexed_docs,
-                                &latest_pipeline_runtime,
-                                staged_publish_base_meta_fingerprint.as_deref(),
-                                false,
-                                &mut conversations_since_progress_persist,
-                                progress_heartbeat_interval_conversations,
-                                &mut last_progress_persist,
-                                progress_heartbeat_interval,
-                                progress_bump.as_ref(),
-                                perf_profile.as_mut(),
-                            )?;
-                        }
-                        Ok(LexicalRebuildPipelineMessage::Error(error)) => {
-                            return Err(error);
-                        }
-                        Ok(LexicalRebuildPipelineMessage::Done) => {
-                            producer_finished = true;
-                            refresh_runtime(
-                                &mut latest_pipeline_runtime,
-                                &mut responsiveness_controller,
-                                &mut current_batch_conversation_limit,
-                                current_shard_packets.len(),
-                                current_shard_message_bytes,
-                            );
-                            refresh_staged_parallelism_and_dispatch(
-                                &mut latest_pipeline_runtime,
-                                &mut merge_coordinator,
-                                &mut pending_shard_build_jobs,
-                                &mut pending_shard_build_message_bytes,
-                                &mut active_shard_build_jobs,
-                                &mut enqueued_shards,
-                                producer_finished,
-                            )?;
-                            maybe_persist_staged_lexical_rebuild_progress(
-                                index_path,
-                                &mut rebuild_state,
-                                last_processed_conversation_id,
-                                processed_conversations,
-                                indexed_docs,
-                                &latest_pipeline_runtime,
-                                staged_publish_base_meta_fingerprint.as_deref(),
-                                false,
-                                &mut conversations_since_progress_persist,
-                                progress_heartbeat_interval_conversations,
-                                &mut last_progress_persist,
-                                progress_heartbeat_interval,
-                                progress_bump.as_ref(),
-                                perf_profile.as_mut(),
-                            )?;
-                        }
-                        Err(_) => {
-                            return Err(anyhow::anyhow!(
-                                "lexical rebuild pipeline channel closed before producer completion"
-                            ));
-                        }
-                    }
-                }
-                default(Duration::from_millis(250)) => {
-                    refresh_runtime(
-                        &mut latest_pipeline_runtime,
-                        &mut responsiveness_controller,
-                        &mut current_batch_conversation_limit,
-                        current_shard_packets.len(),
-                        current_shard_message_bytes,
-                    );
-                    refresh_staged_parallelism_and_dispatch(
-                        &mut latest_pipeline_runtime,
-                        &mut merge_coordinator,
-                        &mut pending_shard_build_jobs,
-                        &mut pending_shard_build_message_bytes,
-                        &mut active_shard_build_jobs,
-                        &mut enqueued_shards,
-                        producer_finished,
-                    )?;
-                }
-            }
-        }
-
-        if !current_shard_packets.is_empty() || current_shard_index.is_some() {
-            return Err(anyhow::anyhow!(
-                "staged lexical rebuild finished with an unterminated shard packet buffer"
-            ));
-        }
-
-        while !pending_shard_build_jobs.is_empty()
-            || received_shard_results < enqueued_shards
-            || merge_coordinator.pending_merge_jobs() > 0
-        {
-            let active_shard_result_rx = if shard_result_channel_open {
-                &shard_result_rx
-            } else {
-                &never_shard_result_rx
-            };
-            let active_merge_result_rx = if merge_result_channel_open {
-                &merge_result_rx
-            } else {
-                &never_merge_result_rx
-            };
-            select! {
-                recv(active_shard_result_rx) -> message => {
-                    match message {
-                        Ok(LexicalRebuildShardBuildMessage::Built(result)) => {
-                            active_shard_build_jobs = active_shard_build_jobs.saturating_sub(1);
-                            received_shard_results = received_shard_results.saturating_add(1);
-                            shard_build_telemetry.record(&result);
-                            pending_completed_shards.insert(result.shard.shard_index, result);
-                        }
-                        Ok(LexicalRebuildShardBuildMessage::Error { shard_index, error }) => {
-                            active_shard_build_jobs = active_shard_build_jobs.saturating_sub(1);
-                            return Err(anyhow::anyhow!(
-                                "building lexical rebuild shard {shard_index} failed: {error}"
-                            ));
-                        }
-                        Err(_) => {
-                            if received_shard_results < enqueued_shards {
-                                return Err(anyhow::anyhow!(
-                                    "staged lexical rebuild shard builder channel closed before all shards completed"
-                                ));
-                            }
-                            shard_result_channel_open = false;
-                            continue;
-                        }
-                    }
-                    let force_progress_persist = advance_completed_shards(
-                        &mut pending_completed_shards,
-                        &mut next_shard_to_commit,
-                        &mut completed_shard_artifacts,
-                        &mut processed_conversations,
-                        &mut indexed_docs,
-                        &mut observed_messages,
-                        &mut last_processed_conversation_id,
-                        &mut conversations_since_progress_persist,
-                        &mut responsiveness_controller,
-                        &mut current_batch_conversation_limit,
-                    )?;
-                    queue_newly_completed_shard_artifacts(
-                        &mut merge_coordinator,
-                        &completed_shard_artifacts,
-                        &mut scheduled_completed_shard_artifacts,
-                    )?;
-                    refresh_runtime(
-                        &mut latest_pipeline_runtime,
-                        &mut responsiveness_controller,
-                        &mut current_batch_conversation_limit,
-                        current_shard_packets.len(),
-                        current_shard_message_bytes,
-                    );
-                    refresh_staged_parallelism_and_dispatch(
-                        &mut latest_pipeline_runtime,
-                        &mut merge_coordinator,
-                        &mut pending_shard_build_jobs,
-                        &mut pending_shard_build_message_bytes,
-                        &mut active_shard_build_jobs,
-                        &mut enqueued_shards,
-                        true,
-                    )?;
-                    maybe_persist_staged_lexical_rebuild_progress(
-                        index_path,
-                        &mut rebuild_state,
-                        last_processed_conversation_id,
-                        processed_conversations,
-                        indexed_docs,
-                        &latest_pipeline_runtime,
-                        staged_publish_base_meta_fingerprint.as_deref(),
-                        force_progress_persist,
-                        &mut conversations_since_progress_persist,
-                        progress_heartbeat_interval_conversations,
-                        &mut last_progress_persist,
-                        progress_heartbeat_interval,
-                        progress_bump.as_ref(),
-                        perf_profile.as_mut(),
-                    )?;
-                }
-                recv(active_merge_result_rx) -> message => {
-                    match message {
-                        Ok(LexicalRebuildShardMergeMessage::Built(result)) => {
-                            merge_coordinator.complete_merge(result, &merge_work_tx)?;
-                            bump_index_run_lock_progress_if_present(progress_bump.as_ref());
-                        }
-                        Ok(LexicalRebuildShardMergeMessage::Error {
-                            output_level,
-                            first_shard_index,
-                            last_shard_index,
-                            error,
-                        }) => {
-                            return Err(anyhow::anyhow!(
-                                "eager staged lexical merge at level {output_level} for shard range {first_shard_index}..={last_shard_index} failed: {error}"
-                            ));
-                        }
-                        Err(_) => {
-                            if merge_coordinator.pending_merge_jobs() > 0 {
-                                return Err(anyhow::anyhow!(
-                                    "staged lexical rebuild eager merge channel closed before all queued merges completed"
-                                ));
-                            }
-                            merge_result_channel_open = false;
-                            continue;
-                        }
-                    }
-                    refresh_runtime(
-                        &mut latest_pipeline_runtime,
-                        &mut responsiveness_controller,
-                        &mut current_batch_conversation_limit,
-                        current_shard_packets.len(),
-                        current_shard_message_bytes,
-                    );
-                    refresh_staged_parallelism_and_dispatch(
-                        &mut latest_pipeline_runtime,
-                        &mut merge_coordinator,
-                        &mut pending_shard_build_jobs,
-                        &mut pending_shard_build_message_bytes,
-                        &mut active_shard_build_jobs,
-                        &mut enqueued_shards,
-                        true,
-                    )?;
-                    maybe_persist_staged_lexical_rebuild_progress(
-                        index_path,
-                        &mut rebuild_state,
-                        last_processed_conversation_id,
-                        processed_conversations,
-                        indexed_docs,
-                        &latest_pipeline_runtime,
-                        staged_publish_base_meta_fingerprint.as_deref(),
-                        false,
-                        &mut conversations_since_progress_persist,
-                        progress_heartbeat_interval_conversations,
-                        &mut last_progress_persist,
-                        progress_heartbeat_interval,
-                        progress_bump.as_ref(),
-                        perf_profile.as_mut(),
-                    )?;
-                }
-                default(Duration::from_millis(250)) => {
-                    refresh_runtime(
-                        &mut latest_pipeline_runtime,
-                        &mut responsiveness_controller,
-                        &mut current_batch_conversation_limit,
-                        current_shard_packets.len(),
-                        current_shard_message_bytes,
-                    );
-                    refresh_staged_parallelism_and_dispatch(
-                        &mut latest_pipeline_runtime,
-                        &mut merge_coordinator,
-                        &mut pending_shard_build_jobs,
-                        &mut pending_shard_build_message_bytes,
-                        &mut active_shard_build_jobs,
-                        &mut enqueued_shards,
-                        true,
-                    )?;
-                    // #282: the staging→publish handoff wedged the stall
-                    // watchdog at 100% because a long final-merge / frontier
-                    // reduction crosses NO shard-or-merge result boundary for
-                    // minutes, so `last_progress_at_ms` froze and the abort
-                    // fired even though the merge workers were busy. Bump the
-                    // progress atomic on this busy-poll tick ONLY when work is
-                    // genuinely in flight (active shard builds or pending
-                    // merges) — never on a true zero-work deadlock, so the
-                    // watchdog still catches real wedges.
-                    if active_shard_build_jobs > 0 || merge_coordinator.pending_merge_jobs() > 0 {
-                        bump_index_run_lock_progress_if_present(progress_bump.as_ref());
-                    }
-                }
-            }
-        }
-        if next_shard_to_commit != shard_plan.shards.len() {
-            return Err(anyhow::anyhow!(
-                "staged lexical rebuild only committed {} of {} planned shards",
-                next_shard_to_commit,
-                shard_plan.shards.len()
-            ));
-        }
-        validate_complete_lexical_rebuild_shard_artifacts(&shard_plan, &completed_shard_artifacts)?;
-        let mut reduced_final_merge_artifacts = merge_coordinator.final_merge_input_artifacts();
-        if should_reduce_staged_lexical_final_frontier(reduced_final_merge_artifacts.len()) {
-            reduced_final_merge_artifacts = reduce_staged_lexical_final_merge_frontier_via_workers(
-                reduced_final_merge_artifacts,
-                final_merge_stage_root.as_path(),
-                shard_merge_settings.workers,
-                &merge_work_tx,
-                &merge_result_rx,
-                progress_bump.as_ref(),
-            )?;
-        }
-        final_merge_input_artifacts = Some(reduced_final_merge_artifacts);
-        Ok(())
-    })();
-
-    if main_result.is_err() {
-        lexical_rebuild_flow_limiter.close();
-    }
-    drop(pipeline_rx);
-    // Disconnect both shard-work senders on every exit before joining the
-    // builders.  Previously the original sender was dropped only on the happy
-    // path inside `main_result`; an early error left it alive, so idle builders
-    // remained blocked in `recv()` and this join never returned.
-    drop(shard_work_dispatch_tx);
-    drop(shard_work_tx);
-    drop(merge_work_tx);
-    match producer_handle.join() {
-        Ok(()) => {}
-        Err(payload) => {
-            let panic_message = panic_payload_message(payload);
-            if main_result.is_ok() {
-                return Err(anyhow::anyhow!(
-                    "lexical rebuild packet producer panicked: {}",
-                    panic_message
-                ));
-            }
-            tracing::warn!(
-                error = %panic_message,
-                "lexical rebuild packet producer panicked while the staged shard consumer was already failing"
-            );
-        }
-    }
-
-    for handle in shard_builder_handles {
-        if let Err(payload) = handle.join() {
-            let panic_message = panic_payload_message(payload);
-            if main_result.is_ok() {
-                return Err(anyhow::anyhow!(
-                    "staged lexical rebuild shard builder panicked: {}",
-                    panic_message
-                ));
-            }
-            tracing::warn!(
-                error = %panic_message,
-                "staged lexical rebuild shard builder panicked while the consumer was already failing"
-            );
-        }
-    }
-    for handle in merge_worker_handles {
-        if let Err(payload) = handle.join() {
-            let panic_message = panic_payload_message(payload);
-            if main_result.is_ok() {
-                return Err(anyhow::anyhow!(
-                    "staged lexical rebuild eager merge worker panicked: {}",
-                    panic_message
-                ));
-            }
-            tracing::warn!(
-                error = %panic_message,
-                "staged lexical rebuild eager merge worker panicked while the consumer was already failing"
-            );
-        }
-    }
-    main_result?;
-
-    refresh_and_maybe_apply_lexical_rebuild_pipeline_runtime(
-        &mut latest_pipeline_runtime,
-        progress.as_ref(),
-        lexical_rebuild_flow_limiter.as_ref(),
-        Some(producer_telemetry.as_ref()),
-        &mut responsiveness_controller,
-        pipeline_budget_controller.as_ref(),
-        &mut current_batch_conversation_limit,
-        None,
-        LexicalRebuildPipelineSinkRuntimeSnapshot::new(0, 0, 0),
-    );
-    maybe_persist_staged_lexical_rebuild_progress(
-        index_path,
-        &mut rebuild_state,
-        last_processed_conversation_id,
-        processed_conversations,
-        indexed_docs,
-        &latest_pipeline_runtime,
-        staged_publish_base_meta_fingerprint.as_deref(),
-        true,
-        &mut conversations_since_progress_persist,
-        progress_heartbeat_interval_conversations,
-        &mut last_progress_persist,
-        progress_heartbeat_interval,
-        progress_bump.as_ref(),
-        perf_profile.as_mut(),
-    )?;
-
-    let final_merge_inputs = final_merge_input_artifacts
-        .unwrap_or_else(|| merge_coordinator.final_merge_input_artifacts());
-    let final_merge_artifact = finalize_staged_lexical_rebuild_publish_artifact_from_artifacts(
-        &staged_merged_index_path,
-        &final_merge_inputs,
-        &final_merge_stage_root,
-        shard_merge_settings.workers,
-    )?;
-    let merged_docs = final_merge_artifact.docs;
-    // ubs:ignore -- Merged and durably built document counts verify index completeness.
-    if merged_docs != indexed_docs {
-        return Err(anyhow::anyhow!(
-            "staged lexical rebuild merged {} docs but durable shard builds produced {} docs",
-            merged_docs,
-            indexed_docs
-        ));
-    }
-    let final_total_conversations = if options.defer_initial_content_fingerprint {
-        processed_conversations
-    } else {
-        total_conversations
-    };
-    let final_storage_fingerprint = if options.defer_initial_content_fingerprint {
-        lexical_rebuild_content_fingerprint_value(
-            final_total_conversations,
-            max_conversation_id,
-            max_message_id,
-        )
-    } else {
-        rebuild_state.db.storage_fingerprint.clone()
-    };
-    let final_observed_messages = observed_messages.max(indexed_docs);
-    let lexical_rebuild_duration = lexical_rebuild_started.elapsed();
-    let publish_started = Instant::now();
-    // #282: entering the finalize→publish stretch (manifest persistence,
-    // fingerprinting, atomic swap) is a real forward-progress boundary after
-    // the merge drain loop exited. Bump the progress atomic so a slow publish
-    // on a large index does not freeze `last_progress_at_ms` and trip the
-    // stall-abort right at the staging→publish handoff.
-    bump_index_run_lock_progress_if_present(progress_bump.as_ref());
-    let equivalence_evidence = equivalence_accumulator.finalize();
-    let generation_manifest = persist_lexical_rebuild_generation_artifacts(
-        &final_merge_artifact.publish_path,
-        &final_storage_fingerprint,
-        processed_conversations,
-        final_total_conversations,
-        final_observed_messages,
-        indexed_docs,
-        &equivalence_evidence,
-    )?;
-    let staged_published_meta_fingerprint =
-        index_meta_fingerprint(&final_merge_artifact.publish_path)?;
-    publish_staged_lexical_index(&final_merge_artifact.publish_path, index_path)?;
-    log_lexical_generation_manifest_published(&generation_manifest, &equivalence_evidence);
-
-    crate::search::tantivy::validate_searchable_index_contract(index_path).with_context(|| {
-        format!(
-            "validating staged lexical rebuild after publish: {}",
-            index_path.display()
-        )
-    })?;
-    verify_published_lexical_doc_count(index_path, indexed_docs, "staged")?;
-    let refresh_ledger =
-        build_authoritative_lexical_refresh_ledger(AuthoritativeLexicalRefreshLedgerInput {
-            publish_mode: "atomic_staged_swap",
-            lexical_duration: lexical_rebuild_duration,
-            publish_duration: publish_started.elapsed(),
-            processed_conversations,
-            total_conversations: final_total_conversations,
-            final_observed_messages,
-            indexed_docs,
-            equivalence_evidence: &equivalence_evidence,
-        });
-    persist_lexical_refresh_ledger(index_path, &refresh_ledger)?;
-    log_lexical_refresh_ledger_published(&refresh_ledger);
-
-    storage.close_without_checkpoint().with_context(|| {
-        format!(
-            "closing readonly database after staged Tantivy rebuild without checkpoint: {}",
-            db_path.display()
-        )
-    })?;
-    rebuild_state.db.storage_fingerprint = final_storage_fingerprint;
-    rebuild_state.db.total_conversations = final_total_conversations;
-    rebuild_state.db.total_messages = final_observed_messages;
-    rebuild_state.committed_offset = i64::try_from(final_total_conversations).unwrap_or(i64::MAX);
-    rebuild_state.committed_conversation_id = last_processed_conversation_id;
-    rebuild_state.processed_conversations = processed_conversations;
-    rebuild_state.indexed_docs = indexed_docs;
-    rebuild_state.mark_completed(staged_published_meta_fingerprint);
-    persist_lexical_rebuild_state(index_path, &rebuild_state)?;
-
-    if let Some(p) = &progress {
-        p.current
-            .store(final_total_conversations, Ordering::Relaxed);
-        p.total.store(final_total_conversations, Ordering::Relaxed);
-        p.total_is_final.store(true, Ordering::Relaxed);
-        p.phase.store(0, Ordering::Relaxed);
-        p.is_rebuilding.store(false, Ordering::Relaxed);
-    }
-
-    if let Some(profile) = perf_profile.as_mut() {
-        if let Some(started) = rebuild_profile_started {
-            profile.total_duration = started.elapsed();
-        }
-        profile.log_summary();
-    }
-
-    Ok(LexicalRebuildOutcome {
-        observed_conversations: final_total_conversations,
-        indexed_docs,
-        observed_messages: Some(final_observed_messages),
-        exact_checkpoint_persisted: true,
-        equivalence: Some(equivalence_evidence),
-    })
-}
-
 fn rebuild_tantivy_from_db_with_options(
     db_path: &Path,
     data_dir: &Path,
@@ -27882,9 +24943,7 @@ fn rebuild_tantivy_from_db_once(
     let mut restart_from_zero =
         rebuild_state.processed_conversations == 0 && rebuild_state.pending.is_none();
 
-    // Plan staged shards BEFORE deciding whether to pre-wipe the live index.
-    // Bead 9ct8r: when the rebuild will go through
-    // `rebuild_tantivy_from_db_via_staged_shards`, the build happens in a
+    // Bead 9ct8r: when the rebuild restarts from zero, the build happens in a
     // scratch tmpdir and `publish_staged_lexical_index` atomically swaps it
     // into the live path at commit time. Pre-wiping the live index in that
     // case is both redundant AND actively harmful — it exposes a multi-
@@ -27905,17 +24964,8 @@ fn rebuild_tantivy_from_db_once(
     // 442k-message corpus streams into ONE index in minutes. The single-index
     // path below is the same code that already runs whenever no shard plan is
     // produced, so this is a strategy choice, not a new code path.
-    let staged_shard_plan: Option<LexicalShardPlan> = None;
-    let _ = (restart_from_zero, total_conversations, &pipeline_settings);
-    if staged_shard_plan.is_some() {
-        log_prep_step("plan_lexical_shards", &mut prep_step_started);
-    }
-    // Any fresh non-empty shard plan can rebuild off-live and publish
-    // atomically, even when the plan collapses to a single shard. The
-    // final staged artifact already supports the single-input fast-path,
-    // and forcing single-shard fresh rebuilds through that path closes
-    // bead 9ct8r's remaining 0-doc crash window for concurrent readers.
-    let will_use_atomic_staged_publish = staged_shard_plan.is_some();
+    // Staged sharding is disabled for the Quill backend, so every rebuild
+    // takes the single-index path below.
 
     // Atomic publish is INDEPENDENT of sharding. Bead 9ct8r's invariant is that a
     // concurrent reader never observes an intermediate doc count during a
@@ -27931,7 +24981,7 @@ fn rebuild_tantivy_from_db_once(
     // the state into the scratch dir would make every interrupted from-zero
     // rebuild restart from zero — the exact failure #380 reports.
     let scratch_path = staged_lexical_rebuild_scratch_path(&index_path);
-    let mut staged_build_path = if restart_from_zero && !will_use_atomic_staged_publish {
+    let mut staged_build_path = if restart_from_zero {
         // Fresh staged build: discard any scratch left by an abandoned run.
         if let Err(err) = fs::remove_dir_all(&scratch_path)
             // ubs:ignore -- This compares the filesystem error enum after scratch cleanup.
@@ -27952,8 +25002,7 @@ fn rebuild_tantivy_from_db_once(
         })?;
         rebuild_state = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
         Some(scratch_path.clone())
-    } else if !will_use_atomic_staged_publish
-        && rebuild_state.is_incomplete()
+    } else if rebuild_state.is_incomplete()
         && lexical_rebuild_resume_content_path(&index_path, &rebuild_state)? != index_path
     {
         // Resuming a staged build that was interrupted mid-flight: the partial
@@ -27978,26 +25027,13 @@ fn rebuild_tantivy_from_db_once(
     let mut build_path = staged_build_path
         .clone()
         .unwrap_or_else(|| index_path.clone());
-    if restart_from_zero && will_use_atomic_staged_publish {
-        // Staged-shards path will atomically swap the new index into
-        // `index_path` via `publish_staged_lexical_index`. The live
-        // index stays intact for concurrent readers until the swap —
-        // that's the whole point. We still need to reset the in-memory
-        // rebuild_state so the rebuild starts from pristine accounting;
-        // the staged-shards delegation writes a fresh state file to
-        // the old live path (which gets moved to retained-backups on
-        // publish) and a completed state file to the new live path
-        // after publish succeeds.
-        rebuild_state = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
-    }
-
     // GH #494: a saved cursor is only usable while its committed prefix still
     // exists. Check BEFORE open_or_create: a missing MANIFEST creates an empty
     // writer, and a schema mismatch can wipe the candidate. Neither may keep
     // the old counters/cursor. Do this before constructing producer/controller
     // state so a restart uses one coherent zero-based pipeline, not a new
     // checkpoint with the previous run's accounting still captured in locals.
-    if !restart_from_zero && !will_use_atomic_staged_publish {
+    if !restart_from_zero {
         let resume_check = (|| -> Result<()> {
             // GH #530: pending commit reconciliation above accounts for an
             // exactly landed commit before this check. Any remaining count gap
@@ -28201,7 +25237,7 @@ fn rebuild_tantivy_from_db_once(
         producer_handle = Some(spawn_lexical_rebuild_packet_producer(
             db_path.to_path_buf(),
             rebuild_state.committed_conversation_id,
-            staged_shard_plan.clone(),
+            None,
             page_size,
             pipeline_channel_size,
             first_budget_promotion_wait,
@@ -28214,42 +25250,6 @@ fn rebuild_tantivy_from_db_once(
             producer_telemetry.clone(),
         ));
         log_prep_step("start_packet_producer", &mut prep_step_started);
-    }
-
-    if let Some(ref shard_plan) = staged_shard_plan {
-        rebuild_state.set_execution_mode(LexicalRebuildExecutionMode::StagedShardBuild);
-        let pipeline_rx = pipeline_rx
-            .take()
-            .expect("staged lexical rebuild pipeline receiver missing before consume loop");
-        let producer_handle = producer_handle
-            .take()
-            .expect("staged lexical rebuild packet producer handle missing before consume loop");
-        return rebuild_tantivy_from_db_via_staged_shards(
-            db_path,
-            &index_path,
-            total_conversations,
-            progress,
-            options,
-            prep_profile.then_some(prep_started),
-            storage,
-            rebuild_state,
-            shard_plan.clone(),
-            pipeline_settings,
-            progress_heartbeat_interval_conversations,
-            progress_heartbeat_interval,
-            latest_pipeline_runtime,
-            responsiveness_controller,
-            pipeline_budget_controller,
-            current_batch_conversation_limit,
-            lexical_rebuild_flow_limiter,
-            producer_telemetry,
-            lexical_rebuild_worker_pool,
-            pipeline_rx,
-            producer_handle,
-            perf_profile,
-            rebuild_profile_started,
-            progress_bump,
-        );
     }
 
     let mut t_index = match (|| -> Result<TantivyIndex> {
@@ -28341,7 +25341,7 @@ fn rebuild_tantivy_from_db_once(
         producer_handle = Some(spawn_lexical_rebuild_packet_producer(
             db_path.to_path_buf(),
             rebuild_state.committed_conversation_id,
-            staged_shard_plan.clone(),
+            None,
             page_size,
             pipeline_channel_size,
             first_budget_promotion_wait,
@@ -31311,10 +28311,34 @@ pub fn conversation_ingest_quarantine_summary(
     }
 }
 
-/// Build the set of quarantined conversation ids whose recorded source log is
-/// gone (so a retry could never succeed). The poison JSONL records carry the
-/// `source_path`; if a record has a path that no longer exists, that
-/// conversation is source-missing.
+/// Recover the bounded parser root from a recorded conversation source identity.
+fn quarantine_retry_scan_path(kind: ConnectorKind, source_path: &Path) -> PathBuf {
+    // Database connectors identify a session as <store.db>/<encoded-id>.
+    // Reparse the physical store, retaining the recorded session path for the
+    // exact candidate and quarantine-identity checks below.
+    if matches!(
+        kind,
+        ConnectorKind::Devin | ConnectorKind::Goose | ConnectorKind::Hermes
+    ) && let Some(store) = source_path.parent().filter(|parent| parent.is_file())
+    {
+        return store.to_path_buf();
+    }
+    // OpenHands exposes its first event as the representative source, but its
+    // parser reconstructs the conversation from the events directory and its
+    // base_state.json sibling. Keep the scan scoped to that conversation.
+    if kind == ConnectorKind::OpenHands
+        && source_path.is_file()
+        && let Some(events) = source_path
+            .parent()
+            .filter(|parent| parent.file_name().is_some_and(|name| name == "events"))
+        && let Some(conversation) = events.parent()
+    {
+        return conversation.to_path_buf();
+    }
+    source_path.to_path_buf()
+}
+
+/// Build the set of quarantine ids whose physical source store is gone.
 pub(crate) fn quarantine_source_missing_ids(data_dir: &Path) -> BTreeSet<String> {
     let quarantine_dir = data_dir.join("quarantine");
     let mut missing = BTreeSet::new();
@@ -31338,9 +28362,19 @@ pub(crate) fn quarantine_source_missing_ids(data_dir: &Path) -> BTreeSet<String>
                 continue;
             };
             if let Some(source_path) = value.get("source_path").and_then(serde_json::Value::as_str)
-                && !Path::new(source_path).exists()
             {
-                missing.insert(conversation_id.to_string());
+                let source_path = Path::new(source_path);
+                let provider = value
+                    .get("agent_slug")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| conversation_id.split('|').next());
+                let scan_path = provider
+                    .and_then(ConnectorKind::from_slug)
+                    .map(|kind| quarantine_retry_scan_path(kind, source_path))
+                    .unwrap_or_else(|| source_path.to_path_buf());
+                if !scan_path.exists() {
+                    missing.insert(conversation_id.to_string());
+                }
             }
         }
     }
@@ -31442,25 +28476,22 @@ fn targeted_quarantine_retry_inner(
     source: Option<&QuarantineRetrySource>,
 ) -> Result<quarantine_retry::AttemptResult> {
     let source = source.context("quarantine retry source metadata is missing")?;
-    if !source.source_path.is_file() {
-        anyhow::bail!(
-            "quarantine retry source is not a readable file: {}",
-            source.source_path.display()
-        );
-    }
     let kind = ConnectorKind::from_slug(&source.provider).with_context(|| {
         format!(
             "quarantine retry does not recognize connector provider {}",
             source.provider
         )
     })?;
-    let connector = kind.create_connector(Some(data_dir));
-    let root = ScanRoot::local(source.source_path.clone());
-    let context = crate::connectors::ScanContext::with_roots(
-        source.source_path.clone(),
-        vec![root.clone()],
-        None,
+    let scan_path = quarantine_retry_scan_path(kind, &source.source_path);
+    anyhow::ensure!(
+        scan_path.is_file()
+            || (kind == ConnectorKind::OpenHands && scan_path.join("events").is_dir()),
+        "quarantine retry source is not a readable store: {}",
+        source.source_path.display()
     );
+    let connector = kind.create_connector(Some(data_dir));
+    let root = ScanRoot::local(scan_path.clone());
+    let context = crate::connectors::ScanContext::with_roots(scan_path, vec![root.clone()], None);
     let conversations = connector.scan(&context).with_context(|| {
         format!(
             "targeted quarantine retry could not parse {}",
@@ -32377,20 +29408,32 @@ fn next_watch_loop_event(
 
 fn is_database_watch_root(kind: ConnectorKind, root: &ScanRoot) -> bool {
     (kind == ConnectorKind::Shelley
-        || (kind == ConnectorKind::Devin
-            && root
-                .path
-                .extension()
-                .is_some_and(|extension| extension == "db")))
+        || (matches!(
+            kind,
+            ConnectorKind::Devin
+                | ConnectorKind::Goose
+                | ConnectorKind::Crush
+                | ConnectorKind::Hermes
+        ) && root
+            .path
+            .extension()
+            .is_some_and(|extension| extension == "db")))
         && root.path.is_file()
 }
 
-/// Shelley and Devin take an explicit file root as their database and fail the
-/// whole scan on anything else. So `--watch-once <file>` under a directory root
-/// hands them the file only when it is a SQLite database. An unhinted Codex
-/// rollout under a shared configured source used to fail the run (GH #524).
+/// Database providers accept an explicit file root only when it is a SQLite
+/// database. An unhinted Codex rollout under a shared configured source used
+/// to fail the run when handed to Shelley or Devin (GH #524).
 fn explicit_watch_once_file_may_be_database(kind: ConnectorKind, path: &Path) -> bool {
-    if !matches!(kind, ConnectorKind::Shelley | ConnectorKind::Devin) || !path.is_file() {
+    if !matches!(
+        kind,
+        ConnectorKind::Shelley
+            | ConnectorKind::Devin
+            | ConnectorKind::Goose
+            | ConnectorKind::Crush
+            | ConnectorKind::Hermes
+    ) || !path.is_file()
+    {
         return true;
     }
     let mut header = [0_u8; 16];
@@ -32465,7 +29508,14 @@ fn watch_scan_lower_bound(kind: ConnectorKind, since_ts: Option<i64>) -> Option<
         // a private sentinel so deletion clears authority without disabling
         // ordinary Cursor incremental scans.
         None
-    } else if matches!(kind, ConnectorKind::Devin | ConnectorKind::Shelley) {
+    } else if matches!(
+        kind,
+        ConnectorKind::Devin
+            | ConnectorKind::Shelley
+            | ConnectorKind::Goose
+            | ConnectorKind::Crush
+            | ConnectorKind::Hermes
+    ) {
         // Database providers filter by activity time, which can precede
         // the WAL commit that triggered this scan. Filesystem event times cannot
         // bound it, even after rounding to seconds. Re-read the changed store and
@@ -38111,8 +35161,9 @@ pub mod persist {
         enum Part<'a> {
             Whole(&'a [NormalizedConversation]),
             Slice {
-                slice: Box<NormalizedConversation>,
-                finishes: Option<&'a NormalizedConversation>,
+                conversation: &'a NormalizedConversation,
+                range: std::ops::Range<usize>,
+                is_final: bool,
             },
         }
         let mut parts = Vec::new();
@@ -38129,8 +35180,9 @@ pub mod persist {
             for (slice, range) in ranges.into_iter().enumerate() {
                 let is_final = slice == last;
                 parts.push(Part::Slice {
-                    slice: Box::new(persist_conversation_slice(conv, range, is_final)),
-                    finishes: is_final.then_some(conv),
+                    conversation: conv,
+                    range,
+                    is_final,
                 });
             }
             run_start = pos + 1;
@@ -38151,8 +35203,14 @@ pub mod persist {
             // whole conversation. A part replays only its own conversations,
             // so runs of ordinary conversations, and a final slice that is not
             // the batch's last part, keep the inline rebuild.
-            let part_strategy = if matches!(part, Part::Slice { finishes: None, .. })
-                && lexical_strategy == LexicalPopulationStrategy::InlineRebuildFromScan
+            let part_strategy = if matches!(
+                part,
+                Part::Slice {
+                    is_final: false,
+                    ..
+                }
+            ) && lexical_strategy
+                == LexicalPopulationStrategy::InlineRebuildFromScan
             {
                 LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild
             } else {
@@ -38172,21 +35230,32 @@ pub mod persist {
                     heartbeat,
                     completion,
                 ),
-                Part::Slice { slice, .. } => persist_conversations_batched_whole(
-                    storage,
-                    t_index.as_deref_mut(),
-                    std::slice::from_ref(slice.as_ref()),
-                    part_strategy,
-                    defer_checkpoints,
-                    capture_semantic_delta,
-                    raw_mirror_data_dir,
-                    false,
-                    heartbeat,
-                    completion,
-                ),
+                Part::Slice {
+                    conversation,
+                    range,
+                    is_final,
+                } => {
+                    // Materialize only the slice being persisted. Building all
+                    // slices up front duplicated an entire giant conversation.
+                    let slice =
+                        persist_conversation_slice(conversation, range.start..range.end, *is_final);
+                    persist_conversations_batched_whole(
+                        storage,
+                        t_index.as_deref_mut(),
+                        std::slice::from_ref(&slice),
+                        part_strategy,
+                        defer_checkpoints,
+                        capture_semantic_delta,
+                        raw_mirror_data_dir,
+                        false,
+                        heartbeat,
+                        completion,
+                    )
+                }
             }?;
             if let Part::Slice {
-                finishes: Some(conv),
+                conversation: conv,
+                is_final: true,
                 ..
             } = &part
                 && let Some(&conversation_id) = part_outcome.canonical_conversation_ids.first()
@@ -48075,1466 +45144,6 @@ mod tests {
     }
 
     #[test]
-    // Asserts the staged-shard rebuild strategy, which builds N independent
-    // index directories and merges them. That merge is Tantivy-only (Quill's
-    // concat_merge joins segments WITHIN one manifest), so the strategy is
-    // disabled for the Quill backend — see the `staged_shard_plan` binding.
-    // Ignored rather than deleted: these are exactly the tests that must pass
-    // if an N-directory merge is ever built, and weakening them would hide
-    // that the strategy no longer runs.
-    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
-    fn lexical_rebuild_shard_indices_can_be_built_and_merged_from_packet_batches() {
-        let tmp = TempDir::new().unwrap();
-        let shard_a_path = tmp.path().join("shard-a");
-        let shard_b_path = tmp.path().join("shard-b");
-        let merged_path = tmp.path().join("merged");
-        let make_packet =
-            |conversation_id: i64, external_id: &str, message_a: &str, message_b: &str| {
-                LexicalRebuildConversationPacket::from_canonical_replay(
-                    crate::storage::sqlite::LexicalRebuildConversationRow {
-                        id: Some(conversation_id),
-                        agent_slug: "codex".into(),
-                        workspace: Some(PathBuf::from("/tmp/workspace")),
-                        external_id: Some(external_id.into()),
-                        title: Some(format!("Shard {external_id}")),
-                        source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
-                        started_at: Some(1_700_000_900_000 + conversation_id),
-                        ended_at: Some(1_700_000_900_100 + conversation_id),
-                        source_id: LOCAL_SOURCE_ID.into(),
-                        origin_host: None,
-                    },
-                    vec![
-                        crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                            idx: 0,
-                            is_tool_role: false,
-                            created_at: Some(1_700_000_900_010 + conversation_id),
-                            content: message_a.into(),
-                        },
-                        crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                            idx: 1,
-                            is_tool_role: false,
-                            created_at: Some(1_700_000_900_020 + conversation_id),
-                            content: message_b.into(),
-                        },
-                    ]
-                    .into_iter()
-                    .collect::<crate::storage::sqlite::LexicalRebuildGroupedMessageRows>(),
-                    Some(conversation_id * 10),
-                    &HashMap::new(),
-                )
-            };
-
-        let shard_a = vec![
-            make_packet(1, "segment-a1", "alpha-1", "alpha-2"),
-            make_packet(2, "segment-a2", "alpha-3", "alpha-4"),
-        ];
-        let shard_b = vec![
-            make_packet(3, "segment-b1", "beta-1", "beta-2"),
-            make_packet(4, "segment-b2", "beta-3", "beta-4"),
-        ];
-
-        assert_eq!(
-            build_lexical_rebuild_shard_index(&shard_a_path, &shard_a, None).unwrap(),
-            4
-        );
-        assert_eq!(
-            build_lexical_rebuild_shard_index(&shard_b_path, &shard_b, None).unwrap(),
-            4
-        );
-
-        let merged_index =
-            crate::search::tantivy::TantivyIndex::merge_compatible_index_directories(
-                &merged_path,
-                &[&shard_a_path, &shard_b_path],
-            )
-            .unwrap();
-        let reader = merged_index.reader().unwrap();
-        crate::search::quill_bridge::refresh_reader(&reader).unwrap();
-        assert_eq!(reader.doc_count().expect("doc count"), 8);
-        assert_eq!(
-            merged_index.segment_count(),
-            1,
-            "merged shard indices should collapse into a single final segment"
-        );
-    }
-
-    #[test]
-    fn lexical_rebuild_validates_built_shard_before_merge_frontier() {
-        let tmp = TempDir::new().unwrap();
-        let shard_path = tmp.path().join("validated-shard");
-        let packet = LexicalRebuildConversationPacket::from_canonical_replay(
-            crate::storage::sqlite::LexicalRebuildConversationRow {
-                id: Some(7),
-                agent_slug: "codex".into(),
-                workspace: Some(PathBuf::from("/tmp/workspace")),
-                external_id: Some("validated-shard".into()),
-                title: Some("Validated shard".into()),
-                source_path: PathBuf::from("/tmp/validated-shard.jsonl"),
-                started_at: Some(1_700_000_935_000),
-                ended_at: Some(1_700_000_935_100),
-                source_id: LOCAL_SOURCE_ID.into(),
-                origin_host: None,
-            },
-            vec![
-                crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                    idx: 0,
-                    is_tool_role: false,
-                    created_at: Some(1_700_000_935_010),
-                    content: "validated alpha".into(),
-                },
-                crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                    idx: 1,
-                    is_tool_role: false,
-                    created_at: Some(1_700_000_935_020),
-                    content: "validated beta".into(),
-                },
-            ]
-            .into_iter()
-            .collect::<crate::storage::sqlite::LexicalRebuildGroupedMessageRows>(),
-            Some(70),
-            &HashMap::new(),
-        );
-        let indexed_docs = build_lexical_rebuild_shard_index(&shard_path, &[packet], None).unwrap();
-        let shard = LexicalShardPlanShard {
-            shard_index: 0,
-            first_conversation_id: 7,
-            last_conversation_id: 7,
-            conversation_count: 1,
-            message_count: 2,
-            message_bytes: "validated alpha".len() + "validated beta".len(),
-            conversation_id_fingerprint: lexical_shard_conversation_ids_fingerprint(&[7]),
-            oversized_single_conversation: false,
-        };
-        let result = LexicalRebuildShardBuildResult {
-            shard: shard.clone(),
-            indexed_docs,
-            segments: 1,
-            shard_index_path: shard_path.clone(),
-            message_bytes: shard.message_bytes,
-            index_size_bytes: 0,
-            build_duration_ms: 0,
-            amplification_milli: None,
-        };
-
-        let artifact = validate_lexical_rebuild_shard_build_result(&result).unwrap();
-
-        assert_eq!(artifact.first_shard_index, 0);
-        assert_eq!(artifact.last_shard_index, 0);
-        assert_eq!(artifact.index_path, shard_path);
-        validate_complete_lexical_rebuild_shard_artifacts(
-            &LexicalShardPlan {
-                planner_version: LEXICAL_SHARD_PLAN_VERSION,
-                plan_id: "validated-plan".into(),
-                budgets: LexicalShardPlannerBudgets {
-                    max_conversations_per_shard: 1,
-                    max_messages_per_shard: 2,
-                    max_message_bytes_per_shard: 10_000,
-                },
-                total_conversations: 1,
-                total_messages: 2,
-                total_message_bytes: "validated alpha".len() + "validated beta".len(),
-                oversized_conversation_ids: Vec::new(),
-                shards: vec![shard],
-            },
-            &[artifact],
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn lexical_rebuild_rejects_shard_doc_count_mismatch_before_merge_frontier() {
-        let tmp = TempDir::new().unwrap();
-        let shard_path = tmp.path().join("mismatched-shard");
-        let packet = LexicalRebuildConversationPacket::from_canonical_replay(
-            crate::storage::sqlite::LexicalRebuildConversationRow {
-                id: Some(8),
-                agent_slug: "codex".into(),
-                workspace: Some(PathBuf::from("/tmp/workspace")),
-                external_id: Some("mismatched-shard".into()),
-                title: Some("Mismatched shard".into()),
-                source_path: PathBuf::from("/tmp/mismatched-shard.jsonl"),
-                started_at: Some(1_700_000_936_000),
-                ended_at: Some(1_700_000_936_100),
-                source_id: LOCAL_SOURCE_ID.into(),
-                origin_host: None,
-            },
-            vec![
-                crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                    idx: 0,
-                    is_tool_role: false,
-                    created_at: Some(1_700_000_936_010),
-                    content: "mismatch alpha".into(),
-                },
-                crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                    idx: 1,
-                    is_tool_role: false,
-                    created_at: Some(1_700_000_936_020),
-                    content: "mismatch beta".into(),
-                },
-            ]
-            .into_iter()
-            .collect::<crate::storage::sqlite::LexicalRebuildGroupedMessageRows>(),
-            Some(80),
-            &HashMap::new(),
-        );
-        assert_eq!(
-            build_lexical_rebuild_shard_index(&shard_path, &[packet], None).unwrap(),
-            2
-        );
-        let result = LexicalRebuildShardBuildResult {
-            shard: LexicalShardPlanShard {
-                shard_index: 0,
-                first_conversation_id: 8,
-                last_conversation_id: 8,
-                conversation_count: 1,
-                message_count: 2,
-                message_bytes: "mismatch alpha".len() + "mismatch beta".len(),
-                conversation_id_fingerprint: lexical_shard_conversation_ids_fingerprint(&[8]),
-                oversized_single_conversation: false,
-            },
-            indexed_docs: 1,
-            segments: 1,
-            shard_index_path: shard_path,
-            message_bytes: "mismatch alpha".len() + "mismatch beta".len(),
-            index_size_bytes: 0,
-            build_duration_ms: 0,
-            amplification_milli: None,
-        };
-
-        let err = validate_lexical_rebuild_shard_build_result(&result)
-            .unwrap_err()
-            .to_string();
-
-        assert!(
-            err.contains("reported 1 docs but a fresh Tantivy reader sees 2"),
-            "expected doc-count mismatch error, got {err}"
-        );
-    }
-
-    /// `coding_agent_session_search-rx1ex`: pre-fix,
-    /// `validate_lexical_rebuild_shard_build_result` failed any
-    /// rebuild where the post-filter Tantivy doc count was less
-    /// than the shard plan's raw `message_count`. The reproducer
-    /// in the bead (1 conversation × 2 messages) reliably tripped
-    /// this even though the lexical sink legitimately drops messages
-    /// via `is_hard_message_noise`. Post-fix, the validator tolerates
-    /// the filter-induced gap (only fails on the impossible
-    /// `observed_docs > message_count` "fan-out" case) and emits a
-    /// structured debug log naming the filtered count.
-    #[test]
-    fn shard_validate_tolerates_filter_induced_doc_lt_message_count_gap() {
-        let tmp = TempDir::new().unwrap();
-        let shard_path = tmp.path().join("filter-tolerance-shard");
-        // Build a single packet with 2 messages, both with content
-        // so the lexical sink emits 2 docs. We then construct a
-        // shard plan whose message_count claims 3 (simulating a
-        // filter that dropped 1 message after the planner was sized).
-        let packet = LexicalRebuildConversationPacket::from_canonical_replay(
-            crate::storage::sqlite::LexicalRebuildConversationRow {
-                id: Some(80),
-                agent_slug: "codex".into(),
-                workspace: None,
-                external_id: Some("filter-gap".into()),
-                title: Some("filter gap".into()),
-                source_path: PathBuf::from("/tmp/filter-gap.jsonl"),
-                started_at: Some(1_700_000_940_000),
-                ended_at: Some(1_700_000_940_100),
-                source_id: LOCAL_SOURCE_ID.into(),
-                origin_host: None,
-            },
-            vec![
-                crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                    idx: 0,
-                    is_tool_role: false,
-                    created_at: Some(1_700_000_940_010),
-                    content: "filter alpha".into(),
-                },
-                crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                    idx: 1,
-                    is_tool_role: false,
-                    created_at: Some(1_700_000_940_020),
-                    content: "filter beta".into(),
-                },
-            ]
-            .into_iter()
-            .collect::<crate::storage::sqlite::LexicalRebuildGroupedMessageRows>(),
-            Some(80),
-            &HashMap::new(),
-        );
-        let indexed_docs = build_lexical_rebuild_shard_index(&shard_path, &[packet], None).unwrap();
-        assert_eq!(
-            indexed_docs, 2,
-            "fixture must build exactly 2 docs (precondition)"
-        );
-
-        let shard = LexicalShardPlanShard {
-            shard_index: 0,
-            first_conversation_id: 80,
-            last_conversation_id: 80,
-            conversation_count: 1,
-            // Plan claims 3 messages — simulates the filter case
-            // where one source message was dropped via
-            // is_hard_message_noise but the planner sized for the
-            // raw row count from list_conversation_footprints_*.
-            message_count: 3,
-            message_bytes: "filter alpha".len() + "filter beta".len() + "dropped".len(),
-            conversation_id_fingerprint: lexical_shard_conversation_ids_fingerprint(&[80]),
-            oversized_single_conversation: false,
-        };
-        let result = LexicalRebuildShardBuildResult {
-            shard: shard.clone(),
-            indexed_docs,
-            segments: 1,
-            shard_index_path: shard_path.clone(),
-            message_bytes: shard.message_bytes,
-            index_size_bytes: 0,
-            build_duration_ms: 0,
-            amplification_milli: None,
-        };
-
-        // Pre-fix this would have errored with "indexed 2 docs but
-        // its shard plan expected 3 messages"; post-fix it
-        // succeeds because the gap is filter-attributable.
-        let artifact = validate_lexical_rebuild_shard_build_result(&result)
-            .expect("filter-induced doc<message gap must NOT fail validation");
-        assert_eq!(artifact.first_shard_index, 0);
-        assert_eq!(artifact.last_shard_index, 0);
-        assert_eq!(artifact.index_path, shard_path);
-
-        // Same tolerance must also apply to
-        // validate_complete_lexical_rebuild_shard_artifacts so the
-        // plan-level validation matches the per-shard-build path.
-        validate_complete_lexical_rebuild_shard_artifacts(
-            &LexicalShardPlan {
-                planner_version: LEXICAL_SHARD_PLAN_VERSION,
-                plan_id: "filter-tolerance".into(),
-                budgets: LexicalShardPlannerBudgets {
-                    max_conversations_per_shard: 1,
-                    max_messages_per_shard: 3,
-                    max_message_bytes_per_shard: 10_000,
-                },
-                total_conversations: 1,
-                total_messages: 3,
-                total_message_bytes: shard.message_bytes,
-                oversized_conversation_ids: Vec::new(),
-                shards: vec![shard],
-            },
-            &[artifact],
-        )
-        .expect("plan-level validator must tolerate filter-induced gaps too");
-    }
-
-    /// Companion test for the inflation case: if the lexical sink
-    /// somehow emits MORE docs than the shard plan's raw message
-    /// count, that's the "fan-out / duplicate document" bug class
-    /// and validation MUST hard-error. Post-fix, the second check
-    /// continues to catch this.
-    #[test]
-    fn shard_validate_rejects_doc_count_exceeding_shard_plan_message_count() {
-        let tmp = TempDir::new().unwrap();
-        let shard_path = tmp.path().join("inflation-shard");
-        let packet = LexicalRebuildConversationPacket::from_canonical_replay(
-            crate::storage::sqlite::LexicalRebuildConversationRow {
-                id: Some(81),
-                agent_slug: "codex".into(),
-                workspace: None,
-                external_id: Some("inflation".into()),
-                title: Some("inflation".into()),
-                source_path: PathBuf::from("/tmp/inflation.jsonl"),
-                started_at: Some(1_700_000_950_000),
-                ended_at: Some(1_700_000_950_100),
-                source_id: LOCAL_SOURCE_ID.into(),
-                origin_host: None,
-            },
-            vec![
-                crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                    idx: 0,
-                    is_tool_role: false,
-                    created_at: Some(1_700_000_950_010),
-                    content: "inflation alpha".into(),
-                },
-                crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                    idx: 1,
-                    is_tool_role: false,
-                    created_at: Some(1_700_000_950_020),
-                    content: "inflation beta".into(),
-                },
-            ]
-            .into_iter()
-            .collect::<crate::storage::sqlite::LexicalRebuildGroupedMessageRows>(),
-            Some(81),
-            &HashMap::new(),
-        );
-        let indexed_docs = build_lexical_rebuild_shard_index(&shard_path, &[packet], None).unwrap();
-        assert_eq!(indexed_docs, 2);
-
-        // Construct a deliberately-undersized shard plan: claims
-        // only 1 message but actually 2 docs were emitted.
-        let shard = LexicalShardPlanShard {
-            shard_index: 0,
-            first_conversation_id: 81,
-            last_conversation_id: 81,
-            conversation_count: 1,
-            message_count: 1,
-            message_bytes: "inflation alpha".len(),
-            conversation_id_fingerprint: lexical_shard_conversation_ids_fingerprint(&[81]),
-            oversized_single_conversation: false,
-        };
-        let result = LexicalRebuildShardBuildResult {
-            shard: shard.clone(),
-            indexed_docs,
-            segments: 1,
-            shard_index_path: shard_path.clone(),
-            message_bytes: shard.message_bytes,
-            index_size_bytes: 0,
-            build_duration_ms: 0,
-            amplification_milli: None,
-        };
-
-        let err = validate_lexical_rebuild_shard_build_result(&result)
-            .unwrap_err()
-            .to_string();
-        // Pin the exact "EXCEEDS" phrasing so a regression that
-        // softens this hard-error trips the test.
-        assert!(
-            err.contains("EXCEEDS"),
-            "expected inflation hard-error to use the explicit EXCEEDS phrasing; got: {err}"
-        );
-        assert!(
-            err.contains("2 docs") && err.contains("1 source messages"),
-            "error must name observed (2) and planned (1) counts; got: {err}"
-        );
-    }
-
-    #[test]
-    // Asserts the staged-shard rebuild strategy, which builds N independent
-    // index directories and merges them. That merge is Tantivy-only (Quill's
-    // concat_merge joins segments WITHIN one manifest), so the strategy is
-    // disabled for the Quill backend — see the `staged_shard_plan` binding.
-    // Ignored rather than deleted: these are exactly the tests that must pass
-    // if an N-directory merge is ever built, and weakening them would hide
-    // that the strategy no longer runs.
-    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
-    fn lexical_rebuild_shard_index_tree_merges_multiple_rounds() {
-        let tmp = TempDir::new().unwrap();
-        let merge_stage_root = tmp.path().join("merge-stage");
-        let merged_path = tmp.path().join("merged");
-        let make_packet =
-            |conversation_id: i64, external_id: &str, message_a: &str, message_b: &str| {
-                LexicalRebuildConversationPacket::from_canonical_replay(
-                    crate::storage::sqlite::LexicalRebuildConversationRow {
-                        id: Some(conversation_id),
-                        agent_slug: "codex".into(),
-                        workspace: Some(PathBuf::from("/tmp/workspace")),
-                        external_id: Some(external_id.into()),
-                        title: Some(format!("Shard {external_id}")),
-                        source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
-                        started_at: Some(1_700_000_910_000 + conversation_id),
-                        ended_at: Some(1_700_000_910_100 + conversation_id),
-                        source_id: LOCAL_SOURCE_ID.into(),
-                        origin_host: None,
-                    },
-                    vec![
-                        crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                            idx: 0,
-                            is_tool_role: false,
-                            created_at: Some(1_700_000_910_010 + conversation_id),
-                            content: message_a.into(),
-                        },
-                        crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                            idx: 1,
-                            is_tool_role: false,
-                            created_at: Some(1_700_000_910_020 + conversation_id),
-                            content: message_b.into(),
-                        },
-                    ]
-                    .into_iter()
-                    .collect::<crate::storage::sqlite::LexicalRebuildGroupedMessageRows>(),
-                    Some(conversation_id * 10),
-                    &HashMap::new(),
-                )
-            };
-
-        let shard_paths = (0..5)
-            .map(|idx| {
-                let shard_path = tmp.path().join(format!("tree-shard-{idx}"));
-                let packet = make_packet(
-                    i64::from(idx + 1),
-                    &format!("tree-segment-{idx}"),
-                    &format!("alpha-{idx}"),
-                    &format!("beta-{idx}"),
-                );
-                assert_eq!(
-                    build_lexical_rebuild_shard_index(&shard_path, &[packet], None).unwrap(),
-                    2
-                );
-                shard_path
-            })
-            .collect::<Vec<_>>();
-
-        let merged_index = merge_lexical_rebuild_shard_index_tree(
-            &merged_path,
-            &shard_paths,
-            &merge_stage_root,
-            2,
-        )
-        .unwrap();
-        let reader = merged_index.reader().unwrap();
-        crate::search::quill_bridge::refresh_reader(&reader).unwrap();
-        assert_eq!(reader.doc_count().expect("doc count"), 10);
-        assert_eq!(
-            merged_index.segment_count(),
-            1,
-            "tree-merged shard indices should collapse into a single final segment"
-        );
-    }
-
-    #[test]
-    fn finalize_staged_lexical_rebuild_publish_artifact_reuses_single_input_without_remerge() {
-        let tmp = TempDir::new().unwrap();
-        let merge_stage_root = tmp.path().join("merge-stage");
-        let merged_path = tmp.path().join("merged");
-        let shard_path = tmp.path().join("single-shard");
-        let packet = LexicalRebuildConversationPacket::from_canonical_replay(
-            crate::storage::sqlite::LexicalRebuildConversationRow {
-                id: Some(1),
-                agent_slug: "codex".into(),
-                workspace: Some(PathBuf::from("/tmp/workspace")),
-                external_id: Some("single-segment".into()),
-                title: Some("Single shard".into()),
-                source_path: PathBuf::from("/tmp/single-segment.jsonl"),
-                started_at: Some(1_700_000_915_000),
-                ended_at: Some(1_700_000_915_100),
-                source_id: LOCAL_SOURCE_ID.into(),
-                origin_host: None,
-            },
-            vec![
-                crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                    idx: 0,
-                    is_tool_role: false,
-                    created_at: Some(1_700_000_915_010),
-                    content: "alpha".into(),
-                },
-                crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                    idx: 1,
-                    is_tool_role: false,
-                    created_at: Some(1_700_000_915_020),
-                    content: "beta".into(),
-                },
-            ]
-            .into_iter()
-            .collect::<crate::storage::sqlite::LexicalRebuildGroupedMessageRows>(),
-            Some(10),
-            &HashMap::new(),
-        );
-
-        assert_eq!(
-            build_lexical_rebuild_shard_index(&shard_path, &[packet], None).unwrap(),
-            2
-        );
-
-        let final_artifact = finalize_staged_lexical_rebuild_publish_artifact(
-            &merged_path,
-            std::slice::from_ref(&shard_path),
-            &merge_stage_root,
-            2,
-        )
-        .unwrap();
-        assert_eq!(final_artifact.docs, 2);
-        assert_eq!(
-            final_artifact.publish_path, shard_path,
-            "single-input finalization should reuse the existing shard artifact directly"
-        );
-        assert!(
-            !merged_path.exists(),
-            "single-input finalization should skip materializing a redundant merged directory"
-        );
-    }
-
-    #[test]
-    // Asserts the staged-shard rebuild strategy, which builds N independent
-    // index directories and merges them. That merge is Tantivy-only (Quill's
-    // concat_merge joins segments WITHIN one manifest), so the strategy is
-    // disabled for the Quill backend — see the `staged_shard_plan` binding.
-    // Ignored rather than deleted: these are exactly the tests that must pass
-    // if an N-directory merge is ever built, and weakening them would hide
-    // that the strategy no longer runs.
-    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
-    fn finalize_staged_lexical_rebuild_publish_artifact_publishes_federated_multi_input_frontier_without_doc_remerge()
-     {
-        let tmp = TempDir::new().unwrap();
-        let merge_stage_root = tmp.path().join("merge-stage");
-        let merged_path = tmp.path().join("merged");
-        let make_packet =
-            |conversation_id: i64, external_id: &str, message_a: &str, message_b: &str| {
-                LexicalRebuildConversationPacket::from_canonical_replay(
-                    crate::storage::sqlite::LexicalRebuildConversationRow {
-                        id: Some(conversation_id),
-                        agent_slug: "codex".into(),
-                        workspace: Some(PathBuf::from("/tmp/workspace")),
-                        external_id: Some(external_id.into()),
-                        title: Some(format!("Shard {external_id}")),
-                        source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
-                        started_at: Some(1_700_000_916_000 + conversation_id),
-                        ended_at: Some(1_700_000_916_100 + conversation_id),
-                        source_id: LOCAL_SOURCE_ID.into(),
-                        origin_host: None,
-                    },
-                    vec![
-                        crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                            idx: 0,
-                            is_tool_role: false,
-                            created_at: Some(1_700_000_916_010 + conversation_id),
-                            content: message_a.into(),
-                        },
-                        crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                            idx: 1,
-                            is_tool_role: false,
-                            created_at: Some(1_700_000_916_020 + conversation_id),
-                            content: message_b.into(),
-                        },
-                    ]
-                    .into_iter()
-                    .collect::<crate::storage::sqlite::LexicalRebuildGroupedMessageRows>(),
-                    Some(conversation_id * 10),
-                    &HashMap::new(),
-                )
-            };
-
-        let shard_paths = (0..3)
-            .map(|idx| {
-                let shard_path = tmp.path().join(format!("finalize-shard-{idx}"));
-                let packet = make_packet(
-                    i64::from(idx + 1),
-                    &format!("finalize-{idx}"),
-                    &format!("alpha-{idx}"),
-                    &format!("beta-{idx}"),
-                );
-                assert_eq!(
-                    build_lexical_rebuild_shard_index(&shard_path, &[packet], None).unwrap(),
-                    2
-                );
-                shard_path
-            })
-            .collect::<Vec<_>>();
-
-        let final_artifact = finalize_staged_lexical_rebuild_publish_artifact(
-            &merged_path,
-            &shard_paths,
-            &merge_stage_root,
-            3,
-        )
-        .unwrap();
-        assert_eq!(final_artifact.docs, 6);
-        assert_eq!(
-            final_artifact.segments, 3,
-            "multi-input finalization should preserve the final shard frontier without remerging docs"
-        );
-        assert_eq!(
-            final_artifact.publish_path, merged_path,
-            "multi-input finalization should materialize the federated publish bundle at the requested output path"
-        );
-        assert_eq!(
-            crate::search::tantivy::open_federated_search_readers(&merged_path)
-                .unwrap()
-                .expect("federated readers")
-                .len(),
-            3,
-            "multi-input finalization should publish the three final shard artifacts as a federated lexical bundle"
-        );
-        assert!(
-            !merge_stage_root.join("round-00000").exists(),
-            "multi-input finalization should not materialize a fallback merge-tree round"
-        );
-    }
-
-    #[test]
-    // Asserts the staged-shard rebuild strategy, which builds N independent
-    // index directories and merges them. That merge is Tantivy-only (Quill's
-    // concat_merge joins segments WITHIN one manifest), so the strategy is
-    // disabled for the Quill backend — see the `staged_shard_plan` binding.
-    // Ignored rather than deleted: these are exactly the tests that must pass
-    // if an N-directory merge is ever built, and weakening them would hide
-    // that the strategy no longer runs.
-    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
-    fn merge_lexical_rebuild_shard_index_tree_merges_small_frontier_without_round_directory() {
-        let tmp = TempDir::new().unwrap();
-        let merge_stage_root = tmp.path().join("merge-stage");
-        let merged_path = tmp.path().join("merged");
-        let make_packet =
-            |conversation_id: i64, external_id: &str, message_a: &str, message_b: &str| {
-                LexicalRebuildConversationPacket::from_canonical_replay(
-                    crate::storage::sqlite::LexicalRebuildConversationRow {
-                        id: Some(conversation_id),
-                        agent_slug: "codex".into(),
-                        workspace: Some(PathBuf::from("/tmp/workspace")),
-                        external_id: Some(external_id.into()),
-                        title: Some(format!("Shard {external_id}")),
-                        source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
-                        started_at: Some(1_700_000_918_000 + conversation_id),
-                        ended_at: Some(1_700_000_918_100 + conversation_id),
-                        source_id: LOCAL_SOURCE_ID.into(),
-                        origin_host: None,
-                    },
-                    vec![
-                        crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                            idx: 0,
-                            is_tool_role: false,
-                            created_at: Some(1_700_000_918_010 + conversation_id),
-                            content: message_a.into(),
-                        },
-                        crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                            idx: 1,
-                            is_tool_role: false,
-                            created_at: Some(1_700_000_918_020 + conversation_id),
-                            content: message_b.into(),
-                        },
-                    ]
-                    .into_iter()
-                    .collect::<crate::storage::sqlite::LexicalRebuildGroupedMessageRows>(),
-                    Some(conversation_id * 10),
-                    &HashMap::new(),
-                )
-            };
-
-        let shard_paths = (0..3)
-            .map(|idx| {
-                let shard_path = tmp.path().join(format!("small-frontier-shard-{idx}"));
-                let packet = make_packet(
-                    i64::from(idx + 1),
-                    &format!("small-frontier-{idx}"),
-                    &format!("alpha-{idx}"),
-                    &format!("beta-{idx}"),
-                );
-                assert_eq!(
-                    build_lexical_rebuild_shard_index(&shard_path, &[packet], None).unwrap(),
-                    2
-                );
-                shard_path
-            })
-            .collect::<Vec<_>>();
-
-        let merged_index = merge_lexical_rebuild_shard_index_tree(
-            &merged_path,
-            &shard_paths,
-            &merge_stage_root,
-            3,
-        )
-        .unwrap();
-        let reader = merged_index.reader().unwrap();
-        crate::search::quill_bridge::refresh_reader(&reader).unwrap();
-        assert_eq!(reader.doc_count().expect("doc count"), 6);
-        assert!(
-            !merge_stage_root.join("round-00000").exists(),
-            "small final frontiers should merge directly without materializing a merge-tree round directory"
-        );
-    }
-
-    #[test]
-    // Asserts the staged-shard rebuild strategy, which builds N independent
-    // index directories and merges them. That merge is Tantivy-only (Quill's
-    // concat_merge joins segments WITHIN one manifest), so the strategy is
-    // disabled for the Quill backend — see the `staged_shard_plan` binding.
-    // Ignored rather than deleted: these are exactly the tests that must pass
-    // if an N-directory merge is ever built, and weakening them would hide
-    // that the strategy no longer runs.
-    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
-    fn reduce_staged_lexical_final_merge_frontier_via_workers_reduces_large_frontier_to_single_artifact()
-     {
-        let tmp = TempDir::new().unwrap();
-        let stage_root = tmp.path().join("final-frontier-stage");
-        let (merge_work_tx, merge_work_rx) = bounded::<LexicalRebuildShardMergeJob>(2);
-        let (merge_result_tx, merge_result_rx) = bounded::<LexicalRebuildShardMergeMessage>(8);
-        let merge_worker_handles =
-            spawn_lexical_rebuild_shard_merge_workers(2, merge_work_rx, merge_result_tx);
-        let make_packet =
-            |conversation_id: i64, external_id: &str, message_a: &str, message_b: &str| {
-                LexicalRebuildConversationPacket::from_canonical_replay(
-                    crate::storage::sqlite::LexicalRebuildConversationRow {
-                        id: Some(conversation_id),
-                        agent_slug: "codex".into(),
-                        workspace: Some(PathBuf::from("/tmp/workspace")),
-                        external_id: Some(external_id.into()),
-                        title: Some(format!("Shard {external_id}")),
-                        source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
-                        started_at: Some(1_700_000_930_000 + conversation_id),
-                        ended_at: Some(1_700_000_930_100 + conversation_id),
-                        source_id: LOCAL_SOURCE_ID.into(),
-                        origin_host: None,
-                    },
-                    vec![
-                        crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                            idx: 0,
-                            is_tool_role: false,
-                            created_at: Some(1_700_000_930_010 + conversation_id),
-                            content: message_a.into(),
-                        },
-                        crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                            idx: 1,
-                            is_tool_role: false,
-                            created_at: Some(1_700_000_930_020 + conversation_id),
-                            content: message_b.into(),
-                        },
-                    ]
-                    .into_iter()
-                    .collect::<crate::storage::sqlite::LexicalRebuildGroupedMessageRows>(),
-                    Some(conversation_id * 10),
-                    &HashMap::new(),
-                )
-            };
-
-        let frontier_ranges = [
-            (0usize, 3usize),
-            (4, 7),
-            (8, 11),
-            (12, 12),
-            (13, 13),
-            (14, 14),
-        ];
-        let frontier = frontier_ranges
-            .iter()
-            .enumerate()
-            .map(|(idx, (first_shard_index, last_shard_index))| {
-                let shard_path = tmp.path().join(format!("frontier-artifact-{idx}"));
-                let packet = make_packet(
-                    i64::try_from(idx + 1).unwrap(),
-                    &format!("frontier-{idx}"),
-                    &format!("alpha-{idx}"),
-                    &format!("beta-{idx}"),
-                );
-                assert_eq!(
-                    build_lexical_rebuild_shard_index(&shard_path, &[packet], None).unwrap(),
-                    2
-                );
-                LexicalRebuildShardMergeArtifact {
-                    first_shard_index: *first_shard_index,
-                    last_shard_index: *last_shard_index,
-                    index_path: shard_path,
-                    docs: 2,
-                    segments: 1,
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let reduced = reduce_staged_lexical_final_merge_frontier_via_workers(
-            frontier,
-            &stage_root,
-            2,
-            &merge_work_tx,
-            &merge_result_rx,
-            None,
-        )
-        .unwrap();
-        assert_eq!(reduced.len(), 1);
-        assert_eq!(reduced[0].first_shard_index, 0);
-        assert_eq!(reduced[0].last_shard_index, 14);
-
-        let merged_index =
-            crate::search::tantivy::TantivyIndex::open_or_create(&reduced[0].index_path).unwrap();
-        let reader = merged_index.reader().unwrap();
-        crate::search::quill_bridge::refresh_reader(&reader).unwrap();
-        assert_eq!(reader.doc_count().expect("doc count"), 12);
-
-        drop(merge_work_tx);
-        for handle in merge_worker_handles {
-            handle.join().unwrap();
-        }
-    }
-
-    #[test]
-    // Asserts the staged-shard rebuild strategy, which builds N independent
-    // index directories and merges them. That merge is Tantivy-only (Quill's
-    // concat_merge joins segments WITHIN one manifest), so the strategy is
-    // disabled for the Quill backend — see the `staged_shard_plan` binding.
-    // Ignored rather than deleted: these are exactly the tests that must pass
-    // if an N-directory merge is ever built, and weakening them would hide
-    // that the strategy no longer runs.
-    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
-    fn lexical_rebuild_eager_merge_coordinator_reduces_full_groups_before_final_merge() {
-        let tmp = TempDir::new().unwrap();
-        let eager_merge_stage_root = tmp.path().join("eager-merge-stage");
-        let final_merge_stage_root = tmp.path().join("final-merge-stage");
-        let merged_path = tmp.path().join("merged");
-        let (merge_work_tx, merge_work_rx) = bounded::<LexicalRebuildShardMergeJob>(1);
-        let (merge_result_tx, merge_result_rx) = bounded::<LexicalRebuildShardMergeMessage>(8);
-        let merge_worker_handles =
-            spawn_lexical_rebuild_shard_merge_workers(1, merge_work_rx, merge_result_tx);
-        let make_packet =
-            |conversation_id: i64, external_id: &str, message_a: &str, message_b: &str| {
-                LexicalRebuildConversationPacket::from_canonical_replay(
-                    crate::storage::sqlite::LexicalRebuildConversationRow {
-                        id: Some(conversation_id),
-                        agent_slug: "codex".into(),
-                        workspace: Some(PathBuf::from("/tmp/workspace")),
-                        external_id: Some(external_id.into()),
-                        title: Some(format!("Shard {external_id}")),
-                        source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
-                        started_at: Some(1_700_000_920_000 + conversation_id),
-                        ended_at: Some(1_700_000_920_100 + conversation_id),
-                        source_id: LOCAL_SOURCE_ID.into(),
-                        origin_host: None,
-                    },
-                    vec![
-                        crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                            idx: 0,
-                            is_tool_role: false,
-                            created_at: Some(1_700_000_920_010 + conversation_id),
-                            content: message_a.into(),
-                        },
-                        crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                            idx: 1,
-                            is_tool_role: false,
-                            created_at: Some(1_700_000_920_020 + conversation_id),
-                            content: message_b.into(),
-                        },
-                    ]
-                    .into_iter()
-                    .collect::<crate::storage::sqlite::LexicalRebuildGroupedMessageRows>(),
-                    Some(conversation_id * 10),
-                    &HashMap::new(),
-                )
-            };
-
-        let shard_count = LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN + 1;
-        let shard_paths = (0..shard_count)
-            .map(|idx| {
-                let shard_path = tmp.path().join(format!("eager-shard-{idx}"));
-                let packet = make_packet(
-                    i64::try_from(idx + 1).unwrap(),
-                    &format!("eager-segment-{idx}"),
-                    &format!("alpha-{idx}"),
-                    &format!("beta-{idx}"),
-                );
-                assert_eq!(
-                    build_lexical_rebuild_shard_index(&shard_path, &[packet], None).unwrap(),
-                    2
-                );
-                shard_path
-            })
-            .collect::<Vec<_>>();
-
-        let mut merge_coordinator =
-            LexicalRebuildShardMergeCoordinator::new(eager_merge_stage_root);
-        // The coordinator's eager-merge gate defaults to
-        // allowed_pending_merge_jobs=0 so that production callers always
-        // opt in to the concurrency they want. Grant the test enough budget
-        // for at least one in-flight eager merge; without this, the gate
-        // at schedule_ready_merges swallows every ready group and the
-        // 4-way merge never fires (previously this was silently elided,
-        // which is the regression that made this test red).
-        merge_coordinator
-            .set_allowed_pending_merge_jobs(8, &merge_work_tx)
-            .unwrap();
-        for (idx, shard_path) in shard_paths.iter().enumerate() {
-            merge_coordinator
-                .queue_base_artifact(
-                    LexicalRebuildShardMergeArtifact {
-                        first_shard_index: idx,
-                        last_shard_index: idx,
-                        index_path: shard_path.clone(),
-                        docs: 2,
-                        segments: 1,
-                    },
-                    &merge_work_tx,
-                )
-                .unwrap();
-        }
-
-        assert_eq!(
-            merge_coordinator.pending_merge_jobs(),
-            1,
-            "one more than the eager fan-in should trigger one eager merge with one shard left unmerged"
-        );
-        let eager_merge_result = match merge_result_rx
-            .recv_timeout(Duration::from_secs(30))
-            .unwrap()
-        {
-            LexicalRebuildShardMergeMessage::Built(result) => result,
-            LexicalRebuildShardMergeMessage::Error {
-                output_level,
-                first_shard_index,
-                last_shard_index,
-                error,
-            } => {
-                #[rustfmt::skip]
-                panic!( // ubs:ignore -- Fail the eager-merge test on an unexpected error.
-                    "unexpected eager merge failure at level {output_level} for {first_shard_index}..={last_shard_index}: {error}" // ubs:ignore -- Retained test failure diagnostic.
-                ); // ubs:ignore -- End of the reviewed test-only failure expression.
-            }
-        };
-        merge_coordinator
-            .complete_merge(eager_merge_result, &merge_work_tx)
-            .unwrap();
-        assert_eq!(merge_coordinator.pending_merge_jobs(), 0);
-
-        let final_merge_inputs = merge_coordinator
-            .final_merge_input_artifacts()
-            .into_iter()
-            .map(|artifact| artifact.index_path)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            final_merge_inputs.len(),
-            2,
-            "eager reduction should shrink one fan-in group down to one merged artifact plus one tail shard"
-        );
-
-        drop(merge_work_tx);
-        for handle in merge_worker_handles {
-            handle.join().unwrap();
-        }
-
-        let merged_index = merge_lexical_rebuild_shard_index_tree(
-            &merged_path,
-            &final_merge_inputs,
-            &final_merge_stage_root,
-            1,
-        )
-        .unwrap();
-        let reader = merged_index.reader().unwrap();
-        crate::search::quill_bridge::refresh_reader(&reader).unwrap();
-        assert_eq!(
-            reader.doc_count().expect("doc count"),
-            u64::try_from(shard_count * 2).unwrap()
-        );
-    }
-
-    #[test]
-    fn lexical_rebuild_staged_merge_controller_trickles_under_builder_pressure() {
-        let controller = LexicalRebuildStagedMergeController::new(3, Some(7_000));
-        let fan_in = LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN;
-        let merge_coordinator = LexicalRebuildShardMergeCoordinator {
-            stage_root: PathBuf::from("/tmp/eager-merge"),
-            ready_levels: vec![
-                (0..fan_in)
-                    .map(|idx| LexicalRebuildShardMergeArtifact {
-                        first_shard_index: idx,
-                        last_shard_index: idx,
-                        index_path: PathBuf::from(format!("/tmp/shard-{idx}")),
-                        docs: 0,
-                        segments: 0,
-                    })
-                    .collect(),
-            ],
-            next_output_seq_by_level: vec![0, 0],
-            pending_merge_jobs: 0,
-            allowed_pending_merge_jobs: 0,
-        };
-        let pressured_runtime = LexicalRebuildPipelineRuntimeSnapshot {
-            queue_depth: 2,
-            pending_batch_conversations: 4,
-            pending_batch_message_bytes: 32_768,
-            page_prep_workers: 6,
-            active_page_prep_jobs: 6,
-            ordered_buffered_pages: 1,
-            producer_handoff_wait_count: 1,
-            ..LexicalRebuildPipelineRuntimeSnapshot::default()
-        };
-
-        let decision = controller.decide(false, &pressured_runtime, &merge_coordinator);
-
-        assert_eq!(decision.workers_max, 3);
-        assert_eq!(decision.allowed_jobs, 1);
-        assert_eq!(decision.ready_artifacts, fan_in);
-        assert_eq!(decision.ready_groups, 1);
-        assert_eq!(
-            decision.controller_reason,
-            "builder_handoff_pressure_scaling_staged_merge_budget_1_active_jobs_0_ready_groups_1_debt_budget_1_buffered_pages_1_queue_depth_2"
-        );
-    }
-
-    #[test]
-    fn lexical_rebuild_staged_merge_controller_spends_debt_budget_under_page_prep_saturation() {
-        let controller = LexicalRebuildStagedMergeController::new(8, Some(7_000));
-        let merge_coordinator = LexicalRebuildShardMergeCoordinator {
-            stage_root: PathBuf::from("/tmp/eager-merge"),
-            ready_levels: vec![
-                (0..LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN * 3)
-                    .map(|idx| LexicalRebuildShardMergeArtifact {
-                        first_shard_index: idx,
-                        last_shard_index: idx,
-                        index_path: PathBuf::from(format!("/tmp/shard-{idx}")),
-                        docs: 0,
-                        segments: 0,
-                    })
-                    .collect(),
-            ],
-            next_output_seq_by_level: vec![0, 0],
-            pending_merge_jobs: 0,
-            allowed_pending_merge_jobs: 0,
-        };
-        let saturated_runtime = LexicalRebuildPipelineRuntimeSnapshot {
-            page_prep_workers: 6,
-            active_page_prep_jobs: 6,
-            ..LexicalRebuildPipelineRuntimeSnapshot::default()
-        };
-
-        let decision = controller.decide(false, &saturated_runtime, &merge_coordinator);
-
-        assert_eq!(decision.workers_max, 8);
-        assert_eq!(decision.allowed_jobs, 3);
-        assert_eq!(
-            decision.ready_artifacts,
-            LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN * 3
-        );
-        assert_eq!(decision.ready_groups, 3);
-        assert_eq!(
-            decision.controller_reason,
-            "page_prep_workers_saturated_6_of_6_merge_budget_3_active_jobs_0_ready_groups_3"
-        );
-    }
-
-    #[test]
-    fn lexical_rebuild_staged_merge_controller_scales_under_large_merge_debt() {
-        let controller = LexicalRebuildStagedMergeController::new(4, Some(7_000));
-        let fan_in = LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN;
-        let ready_groups = 16;
-        let merge_coordinator = LexicalRebuildShardMergeCoordinator {
-            stage_root: PathBuf::from("/tmp/eager-merge"),
-            ready_levels: vec![
-                (0..fan_in * ready_groups)
-                    .map(|idx| LexicalRebuildShardMergeArtifact {
-                        first_shard_index: idx,
-                        last_shard_index: idx,
-                        index_path: PathBuf::from(format!("/tmp/shard-{idx}")),
-                        docs: 0,
-                        segments: 0,
-                    })
-                    .collect(),
-            ],
-            next_output_seq_by_level: vec![0, 0],
-            pending_merge_jobs: 1,
-            allowed_pending_merge_jobs: 1,
-        };
-        let pressured_runtime = LexicalRebuildPipelineRuntimeSnapshot {
-            ordered_buffered_pages: 150,
-            ..LexicalRebuildPipelineRuntimeSnapshot::default()
-        };
-
-        let decision = controller.decide(false, &pressured_runtime, &merge_coordinator);
-
-        assert_eq!(decision.workers_max, 4);
-        assert_eq!(decision.allowed_jobs, 4);
-        assert_eq!(decision.active_jobs, 1);
-        assert_eq!(decision.ready_artifacts, fan_in * ready_groups);
-        assert_eq!(decision.ready_groups, ready_groups);
-        assert_eq!(
-            decision.controller_reason,
-            format!(
-                "builder_handoff_pressure_scaling_staged_merge_budget_4_active_jobs_1_ready_groups_{ready_groups}_debt_budget_4_buffered_pages_150_queue_depth_0"
-            )
-        );
-    }
-
-    #[test]
-    fn lexical_rebuild_staged_merge_controller_keeps_debt_budget_monotonic_with_more_workers() {
-        let controller = LexicalRebuildStagedMergeController::new(8, Some(7_000));
-        let fan_in = LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN;
-        let ready_groups = 12;
-        let merge_coordinator = LexicalRebuildShardMergeCoordinator {
-            stage_root: PathBuf::from("/tmp/eager-merge"),
-            ready_levels: vec![
-                (0..fan_in * ready_groups)
-                    .map(|idx| LexicalRebuildShardMergeArtifact {
-                        first_shard_index: idx,
-                        last_shard_index: idx,
-                        index_path: PathBuf::from(format!("/tmp/shard-{idx}")),
-                        docs: 0,
-                        segments: 0,
-                    })
-                    .collect(),
-            ],
-            next_output_seq_by_level: vec![0, 0],
-            pending_merge_jobs: 1,
-            allowed_pending_merge_jobs: 1,
-        };
-        let pressured_runtime = LexicalRebuildPipelineRuntimeSnapshot {
-            ordered_buffered_pages: 120,
-            ..LexicalRebuildPipelineRuntimeSnapshot::default()
-        };
-
-        let decision = controller.decide(false, &pressured_runtime, &merge_coordinator);
-
-        assert_eq!(decision.workers_max, 8);
-        assert_eq!(decision.allowed_jobs, 8);
-        assert_eq!(decision.active_jobs, 1);
-        assert_eq!(decision.ready_artifacts, fan_in * ready_groups);
-        assert_eq!(decision.ready_groups, ready_groups);
-        assert_eq!(
-            decision.controller_reason,
-            format!(
-                "builder_handoff_pressure_scaling_staged_merge_budget_8_active_jobs_1_ready_groups_{ready_groups}_debt_budget_8_buffered_pages_120_queue_depth_0"
-            )
-        );
-    }
-
-    #[test]
-    fn lexical_rebuild_staged_merge_controller_restores_parallelism_after_producer_finishes() {
-        let controller = LexicalRebuildStagedMergeController::new(3, Some(7_000));
-        let fan_in = LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN;
-        let ready_groups = (LEXICAL_REBUILD_FINAL_FRONTIER_FEDERATED_SHARD_LIMIT / fan_in) + 1;
-        let merge_coordinator = LexicalRebuildShardMergeCoordinator {
-            stage_root: PathBuf::from("/tmp/eager-merge"),
-            ready_levels: vec![
-                (0..fan_in * ready_groups)
-                    .map(|idx| LexicalRebuildShardMergeArtifact {
-                        first_shard_index: idx,
-                        last_shard_index: idx,
-                        index_path: PathBuf::from(format!("/tmp/shard-{idx}")),
-                        docs: 0,
-                        segments: 0,
-                    })
-                    .collect(),
-            ],
-            next_output_seq_by_level: vec![0, 0],
-            pending_merge_jobs: 1,
-            allowed_pending_merge_jobs: 1,
-        };
-        let clear_runtime = LexicalRebuildPipelineRuntimeSnapshot {
-            page_prep_workers: 6,
-            host_loadavg_1m_milli: Some(4_500),
-            ..LexicalRebuildPipelineRuntimeSnapshot::default()
-        };
-
-        let decision = controller.decide(true, &clear_runtime, &merge_coordinator);
-
-        assert_eq!(decision.allowed_jobs, 3);
-        assert_eq!(decision.active_jobs, 1);
-        assert_eq!(decision.ready_artifacts, fan_in * ready_groups);
-        assert_eq!(decision.ready_groups, ready_groups);
-        assert_eq!(
-            decision.controller_reason,
-            "producer_finished_allowing_max_staged_merge_parallelism"
-        );
-    }
-
-    #[test]
-    fn lexical_rebuild_staged_shard_build_controller_borrows_idle_merge_budget() {
-        let controller = LexicalRebuildStagedShardBuildController::new(6, Some(7_000));
-        let runtime = LexicalRebuildPipelineRuntimeSnapshot::default();
-        let staged_merge_runtime = LexicalRebuildStagedMergeRuntimeSnapshot {
-            workers_max: 3,
-            allowed_jobs: 0,
-            active_jobs: 0,
-            ready_artifacts: 0,
-            ready_groups: 0,
-            controller_reason: "no_staged_merge_backlog".to_string(),
-        };
-
-        let decision = controller.decide(&runtime, &staged_merge_runtime, 2, 3, None);
-
-        assert_eq!(decision.workers_max, 6);
-        assert_eq!(decision.allowed_jobs, 5);
-        assert_eq!(decision.active_jobs, 2);
-        assert_eq!(decision.pending_jobs, 3);
-        assert_eq!(
-            decision.controller_reason,
-            "staged_merge_idle_lending_full_budget_to_shard_builders"
-        );
-    }
-
-    #[test]
-    fn lexical_rebuild_staged_shard_build_controller_reserves_slots_for_merge_backlog() {
-        let controller = LexicalRebuildStagedShardBuildController::new(6, Some(7_000));
-        let runtime = LexicalRebuildPipelineRuntimeSnapshot::default();
-        let staged_merge_runtime = LexicalRebuildStagedMergeRuntimeSnapshot {
-            workers_max: 3,
-            allowed_jobs: 2,
-            active_jobs: 1,
-            ready_artifacts: 5,
-            ready_groups: 1,
-            controller_reason: "pipeline_active".to_string(),
-        };
-
-        let decision = controller.decide(&runtime, &staged_merge_runtime, 3, 3, None);
-
-        assert_eq!(decision.workers_max, 6);
-        assert_eq!(decision.allowed_jobs, 4);
-        assert_eq!(decision.active_jobs, 3);
-        assert_eq!(decision.pending_jobs, 3);
-        assert_eq!(
-            decision.controller_reason,
-            "reserving_2_slots_for_staged_merge_active_jobs_1_ready_groups_1"
-        );
-    }
-
-    #[test]
-    fn lexical_rebuild_staged_shard_build_controller_pauses_new_jobs_at_emergency_memory_reserve() {
-        const GIB: usize = 1024 * 1024 * 1024;
-        let controller = LexicalRebuildStagedShardBuildController::new_with_memory_reserves(
-            6,
-            None,
-            16 * GIB,
-            4 * GIB,
-        );
-        let runtime = LexicalRebuildPipelineRuntimeSnapshot {
-            host_available_memory_bytes: Some(2 * GIB as u64),
-            ..LexicalRebuildPipelineRuntimeSnapshot::default()
-        };
-        let staged_merge_runtime = LexicalRebuildStagedMergeRuntimeSnapshot::default();
-
-        let decision = controller.decide(&runtime, &staged_merge_runtime, 2, 4, Some(64 << 20));
-
-        assert_eq!(decision.allowed_jobs, 2);
-        assert_eq!(decision.active_jobs, 2);
-        assert_eq!(decision.pending_jobs, 4);
-        assert_eq!(
-            decision.controller_reason,
-            format!(
-                "host_available_memory_bytes_{}_below_emergency_reserve_{}_pausing_new_staged_shard_builds",
-                2 * GIB,
-                4 * GIB
-            )
-        );
-    }
-
-    #[test]
-    fn lexical_rebuild_staged_shard_build_controller_allows_one_idle_job_below_memory_reserve() {
-        const GIB: usize = 1024 * 1024 * 1024;
-        let controller = LexicalRebuildStagedShardBuildController::new_with_memory_reserves(
-            6,
-            None,
-            16 * GIB,
-            4 * GIB,
-        );
-        let runtime = LexicalRebuildPipelineRuntimeSnapshot {
-            host_available_memory_bytes: Some(8 * GIB as u64),
-            ..LexicalRebuildPipelineRuntimeSnapshot::default()
-        };
-        let staged_merge_runtime = LexicalRebuildStagedMergeRuntimeSnapshot::default();
-
-        let decision = controller.decide(&runtime, &staged_merge_runtime, 0, 4, Some(64 << 20));
-
-        assert_eq!(decision.allowed_jobs, 1);
-        assert_eq!(
-            decision.controller_reason,
-            format!(
-                "host_available_memory_bytes_{}_below_reserve_{}_limiting_staged_shard_builds_to_1",
-                8 * GIB,
-                16 * GIB
-            )
-        );
-    }
-
-    #[test]
-    fn lexical_rebuild_staged_shard_build_controller_allows_small_idle_probe_below_emergency() {
-        const GIB: usize = 1024 * 1024 * 1024;
-        const MIB: usize = 1024 * 1024;
-        let controller = LexicalRebuildStagedShardBuildController::new_with_memory_reserves(
-            6,
-            None,
-            4 * GIB,
-            GIB,
-        );
-        let runtime = LexicalRebuildPipelineRuntimeSnapshot {
-            host_available_memory_bytes: Some(768 * MIB as u64),
-            ..LexicalRebuildPipelineRuntimeSnapshot::default()
-        };
-        let staged_merge_runtime = LexicalRebuildStagedMergeRuntimeSnapshot::default();
-
-        let decision = controller.decide(&runtime, &staged_merge_runtime, 0, 4, Some(MIB));
-
-        assert_eq!(decision.allowed_jobs, 1);
-        assert_eq!(
-            decision.controller_reason,
-            format!(
-                "host_available_memory_bytes_{}_below_emergency_reserve_{}_admitting_single_small_staged_shard_build_estimated_builder_bytes_{}",
-                768 * MIB,
-                GIB,
-                512 * MIB
-            )
-        );
-    }
-
-    #[test]
-    fn staged_lexical_pipeline_handoff_pause_requires_async_wake_source() {
-        assert!(
-            !should_pause_staged_lexical_pipeline_handoff(false, 0, 0),
-            "no backlog means the producer handoff should stay open"
-        );
-        assert!(
-            !should_pause_staged_lexical_pipeline_handoff(true, 0, 0),
-            "a saturated backlog with no active shard or merge job must keep draining pipeline_rx"
-        );
-        assert!(
-            should_pause_staged_lexical_pipeline_handoff(true, 1, 0),
-            "active shard builders can wake the sink, so backlog pause is safe"
-        );
-        assert!(
-            should_pause_staged_lexical_pipeline_handoff(true, 0, 1),
-            "active merge jobs can wake the sink, so backlog pause is safe"
-        );
-    }
-
-    #[test]
-    fn lexical_rebuild_staged_shard_build_controller_caps_override_fanout_by_memory_headroom() {
-        const GIB: usize = 1024 * 1024 * 1024;
-        let controller = LexicalRebuildStagedShardBuildController::new_with_memory_reserves(
-            8,
-            None,
-            4 * GIB,
-            GIB,
-        );
-        let runtime = LexicalRebuildPipelineRuntimeSnapshot {
-            host_available_memory_bytes: Some(8 * GIB as u64),
-            staged_shard_build_observed_amplification_milli: Some(24_000),
-            ..LexicalRebuildPipelineRuntimeSnapshot::default()
-        };
-        let staged_merge_runtime = LexicalRebuildStagedMergeRuntimeSnapshot::default();
-
-        let decision = controller.decide(&runtime, &staged_merge_runtime, 0, 8, Some(64 << 20));
-
-        assert_eq!(decision.allowed_jobs, 1);
-        assert_eq!(
-            decision.controller_reason,
-            format!(
-                "host_available_memory_bytes_{}_reserve_{}_estimated_builder_bytes_{}_limiting_staged_shard_builds_to_1",
-                8 * GIB,
-                4 * GIB,
-                36usize * (64usize << 20)
-            )
-        );
-    }
-
-    #[test]
-    fn lexical_rebuild_shard_build_telemetry_records_conservative_amplification() {
-        let telemetry = LexicalRebuildShardBuildTelemetry::default();
-        let result = LexicalRebuildShardBuildResult {
-            shard: LexicalShardPlanShard {
-                shard_index: 7,
-                first_conversation_id: 10,
-                last_conversation_id: 11,
-                conversation_count: 2,
-                message_count: 4,
-                message_bytes: 1_000,
-                conversation_id_fingerprint: "fingerprint".to_string(),
-                oversized_single_conversation: false,
-            },
-            indexed_docs: 4,
-            segments: 1,
-            shard_index_path: PathBuf::from("/tmp/shard-7"),
-            message_bytes: 1_000,
-            index_size_bytes: 2_500,
-            build_duration_ms: 123,
-            amplification_milli: lexical_rebuild_amplification_milli(2_500, 1_000),
-        };
-
-        telemetry.record(&result);
-        let snapshot = telemetry.snapshot();
-
-        assert_eq!(snapshot.completed_jobs, 1);
-        assert_eq!(snapshot.last_shard_index, Some(7));
-        assert_eq!(snapshot.last_message_bytes, 1_000);
-        assert_eq!(snapshot.last_index_size_bytes, 2_500);
-        assert_eq!(snapshot.last_duration_ms, 123);
-        assert_eq!(snapshot.last_amplification_milli, Some(2_500));
-        assert_eq!(
-            snapshot.observed_amplification_milli,
-            Some(LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_FLOOR_MILLI),
-            "admission should use a conservative floor until observed amplification exceeds it"
-        );
-    }
-
-    #[test]
     #[serial]
     fn lexical_rebuild_pipeline_settings_snapshot_honors_env_overrides() {
         let _responsiveness = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
@@ -49887,63 +45496,6 @@ mod tests {
     }
 
     #[test]
-    fn lexical_rebuild_final_frontier_reduction_only_runs_above_federated_publish_cap() {
-        assert!(!should_reduce_staged_lexical_final_frontier(0));
-        assert!(!should_reduce_staged_lexical_final_frontier(
-            LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN + 1
-        ));
-        assert!(!should_reduce_staged_lexical_final_frontier(
-            LEXICAL_REBUILD_FINAL_FRONTIER_FEDERATED_SHARD_LIMIT
-        ));
-        assert!(should_reduce_staged_lexical_final_frontier(
-            LEXICAL_REBUILD_FINAL_FRONTIER_FEDERATED_SHARD_LIMIT + 1
-        ));
-    }
-
-    #[test]
-    fn staged_merge_controller_skips_finished_tail_merges_within_federated_publish_cap() {
-        let tmp = TempDir::new().unwrap();
-        let (merge_work_tx, _merge_work_rx) = bounded::<LexicalRebuildShardMergeJob>(1);
-        let mut merge_coordinator =
-            LexicalRebuildShardMergeCoordinator::new(tmp.path().join("eager-merge-stage"));
-        for shard_index in 0..LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN {
-            merge_coordinator
-                .queue_base_artifact(
-                    LexicalRebuildShardMergeArtifact {
-                        first_shard_index: shard_index,
-                        last_shard_index: shard_index,
-                        index_path: tmp.path().join(format!("shard-{shard_index:05}")),
-                        docs: 1,
-                        segments: 1,
-                    },
-                    &merge_work_tx,
-                )
-                .unwrap();
-        }
-
-        let controller = LexicalRebuildStagedMergeController::new(8, None);
-        let decision = controller.decide(
-            true,
-            &LexicalRebuildPipelineRuntimeSnapshot::default(),
-            &merge_coordinator,
-        );
-
-        assert_eq!(decision.ready_artifacts, 8);
-        assert_eq!(decision.ready_groups, 1);
-        assert_eq!(
-            decision.allowed_jobs, 0,
-            "a bounded final frontier should publish federated instead of paying another eager merge"
-        );
-        assert!(
-            decision
-                .controller_reason
-                .contains("final_frontier_within_federated_cap"),
-            "unexpected controller reason: {}",
-            decision.controller_reason
-        );
-    }
-
-    #[test]
     fn lexical_rebuild_default_staged_shard_builder_parallelism_uses_bounded_builder_farm() {
         const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -49973,881 +45525,6 @@ mod tests {
                 Some(512 * GIB),
             ),
             8
-        );
-    }
-
-    #[test]
-    fn lexical_rebuild_default_staged_shard_max_message_bytes_scales_with_available_memory() {
-        const GIB: u64 = 1024 * 1024 * 1024;
-
-        assert_eq!(
-            lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(None),
-            64 * 1024 * 1024
-        );
-        assert_eq!(
-            lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(Some(
-                32 * GIB
-            )),
-            16 * 1024 * 1024
-        );
-        assert_eq!(
-            lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(Some(
-                128 * GIB
-            )),
-            64 * 1024 * 1024
-        );
-        assert_eq!(
-            lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(Some(
-                512 * GIB
-            )),
-            128 * 1024 * 1024
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn lexical_rebuild_shard_planner_respects_staged_shard_byte_cap() {
-        let _cap = set_env(
-            "CASS_TANTIVY_REBUILD_STAGED_SHARD_MAX_MESSAGE_BYTES",
-            "65536",
-        );
-        let settings = LexicalRebuildPipelineSettingsSnapshot {
-            workers: 12,
-            available_parallelism: 12,
-            reserved_cores: 2,
-            tantivy_writer_threads: 8,
-            staged_shard_builders: 8,
-            staged_merge_workers: 3,
-            controller_mode: "steady".into(),
-            controller_restore_clear_samples: 3,
-            controller_restore_hold_ms: 0,
-            controller_loadavg_high_watermark_1m_milli: None,
-            controller_loadavg_low_watermark_1m_milli: None,
-            page_size: LEXICAL_REBUILD_PAGE_SIZE,
-            steady_batch_fetch_conversations: 1024,
-            startup_batch_fetch_conversations: 256,
-            steady_commit_every_conversations: 1024,
-            startup_commit_every_conversations: 256,
-            steady_commit_every_messages: 2048,
-            startup_commit_every_messages: 512,
-            steady_commit_every_message_bytes: 512 * 1024 * 1024,
-            startup_commit_every_message_bytes: 128 * 1024 * 1024,
-            pipeline_channel_size: 2,
-            page_prep_workers: 6,
-            pipeline_max_message_bytes_in_flight: 4 * 1024 * 1024,
-        };
-
-        let budgets = lexical_rebuild_default_shard_planner_budgets_for_totals(
-            &settings,
-            10_000,
-            1_000_000,
-            4usize * 1024 * 1024 * 1024,
-        );
-
-        assert_eq!(budgets.max_message_bytes_per_shard, 65_536);
-    }
-
-    #[test]
-    #[serial]
-    fn lexical_rebuild_pending_shard_build_job_cap_scales_with_builders_and_env() {
-        let _invalid_override = set_env("CASS_TANTIVY_REBUILD_PENDING_SHARD_BUILD_MAX_JOBS", "0");
-        let mut settings = LexicalRebuildPipelineSettingsSnapshot {
-            workers: 8,
-            available_parallelism: 8,
-            reserved_cores: 2,
-            tantivy_writer_threads: 8,
-            staged_shard_builders: 2,
-            staged_merge_workers: 1,
-            controller_mode: "steady".into(),
-            controller_restore_clear_samples: 3,
-            controller_restore_hold_ms: 0,
-            controller_loadavg_high_watermark_1m_milli: None,
-            controller_loadavg_low_watermark_1m_milli: None,
-            page_size: LEXICAL_REBUILD_PAGE_SIZE,
-            steady_batch_fetch_conversations: 1024,
-            startup_batch_fetch_conversations: 256,
-            steady_commit_every_conversations: 1024,
-            startup_commit_every_conversations: 256,
-            steady_commit_every_messages: 2048,
-            startup_commit_every_messages: 512,
-            steady_commit_every_message_bytes: 512 * 1024 * 1024,
-            startup_commit_every_message_bytes: 128 * 1024 * 1024,
-            pipeline_channel_size: 2,
-            page_prep_workers: 6,
-            pipeline_max_message_bytes_in_flight: 4 * 1024 * 1024,
-        };
-
-        assert_eq!(lexical_rebuild_pending_shard_build_max_jobs(&settings), 64);
-        settings.staged_shard_builders = 16;
-        assert_eq!(lexical_rebuild_pending_shard_build_max_jobs(&settings), 256);
-        drop(_invalid_override);
-
-        let _explicit_override = set_env("CASS_TANTIVY_REBUILD_PENDING_SHARD_BUILD_MAX_JOBS", "17");
-        assert_eq!(lexical_rebuild_pending_shard_build_max_jobs(&settings), 17);
-    }
-
-    #[test]
-    #[serial]
-    fn lexical_rebuild_large_corpus_planner_keeps_5m_message_shards_byte_bounded() {
-        const CONVERSATIONS: usize = 56_512;
-        const MESSAGES: usize = 5_347_311;
-        const MESSAGE_BYTES: usize = 8 * 1024 * 1024 * 1024;
-        const SHARD_CAP: usize = 64 * 1024 * 1024;
-        let _cap = set_env(
-            "CASS_TANTIVY_REBUILD_STAGED_SHARD_MAX_MESSAGE_BYTES",
-            &SHARD_CAP.to_string(),
-        );
-        let settings = LexicalRebuildPipelineSettingsSnapshot {
-            workers: 16,
-            available_parallelism: 16,
-            reserved_cores: 2,
-            tantivy_writer_threads: 8,
-            staged_shard_builders: 2,
-            staged_merge_workers: 2,
-            controller_mode: "steady".into(),
-            controller_restore_clear_samples: 3,
-            controller_restore_hold_ms: 0,
-            controller_loadavg_high_watermark_1m_milli: None,
-            controller_loadavg_low_watermark_1m_milli: None,
-            page_size: LEXICAL_REBUILD_PAGE_SIZE,
-            steady_batch_fetch_conversations: 1024,
-            startup_batch_fetch_conversations: 256,
-            steady_commit_every_conversations: 10_000,
-            startup_commit_every_conversations: 2_048,
-            steady_commit_every_messages: 800_000,
-            startup_commit_every_messages: 800_000,
-            steady_commit_every_message_bytes: 512 * 1024 * 1024,
-            startup_commit_every_message_bytes: 128 * 1024 * 1024,
-            pipeline_channel_size: 4,
-            page_prep_workers: 8,
-            pipeline_max_message_bytes_in_flight: 512 * 1024 * 1024,
-        };
-        let budgets = lexical_rebuild_default_shard_planner_budgets_for_totals(
-            &settings,
-            CONVERSATIONS,
-            MESSAGES,
-            MESSAGE_BYTES,
-        );
-        let mut conversations = Vec::with_capacity(CONVERSATIONS);
-        for idx in 0..CONVERSATIONS {
-            let message_count =
-                MESSAGES / CONVERSATIONS + usize::from(idx < MESSAGES % CONVERSATIONS);
-            let message_bytes =
-                MESSAGE_BYTES / CONVERSATIONS + usize::from(idx < MESSAGE_BYTES % CONVERSATIONS);
-            conversations.push(LexicalShardPlannerConversation {
-                conversation_id: i64::try_from(idx + 1).unwrap(),
-                message_count,
-                message_bytes,
-            });
-        }
-
-        let plan = plan_lexical_rebuild_shards(&conversations, budgets);
-
-        assert_eq!(budgets.max_message_bytes_per_shard, SHARD_CAP);
-        assert!(
-            plan.shards.len() >= MESSAGE_BYTES.div_ceil(SHARD_CAP),
-            "large corpus should be split into enough shards to keep Tantivy builder heaps bounded"
-        );
-        assert!(
-            plan.shards
-                .iter()
-                .all(|shard| shard.message_bytes <= SHARD_CAP),
-            "no synthetic 5M-message shard should exceed the staged shard byte cap"
-        );
-    }
-
-    #[test]
-    fn lexical_rebuild_staged_shard_builder_settings_preserve_total_writer_budget() {
-        let settings = LexicalRebuildPipelineSettingsSnapshot {
-            workers: 12,
-            available_parallelism: 12,
-            reserved_cores: 2,
-            tantivy_writer_threads: 8,
-            staged_shard_builders: 8,
-            staged_merge_workers: 3,
-            controller_mode: "steady".into(),
-            controller_restore_clear_samples: 3,
-            controller_restore_hold_ms: 0,
-            controller_loadavg_high_watermark_1m_milli: None,
-            controller_loadavg_low_watermark_1m_milli: None,
-            page_size: LEXICAL_REBUILD_PAGE_SIZE,
-            steady_batch_fetch_conversations: 1024,
-            startup_batch_fetch_conversations: 256,
-            steady_commit_every_conversations: 1024,
-            startup_commit_every_conversations: 256,
-            steady_commit_every_messages: 2048,
-            startup_commit_every_messages: 512,
-            steady_commit_every_message_bytes: 1_000_000,
-            startup_commit_every_message_bytes: 250_000,
-            pipeline_channel_size: 2,
-            page_prep_workers: 6,
-            pipeline_max_message_bytes_in_flight: 4 * 1024 * 1024,
-        };
-
-        assert_eq!(
-            lexical_rebuild_staged_shard_builder_settings(&settings, 3),
-            LexicalRebuildShardBuilderSettings {
-                max_builders: 3,
-                writer_parallelism_budget: 8,
-            }
-        );
-        assert_eq!(
-            lexical_rebuild_staged_shard_builder_settings(&settings, 32),
-            LexicalRebuildShardBuilderSettings {
-                max_builders: 8,
-                writer_parallelism_budget: 8,
-            }
-        );
-
-        let constrained_writer_budget = LexicalRebuildPipelineSettingsSnapshot {
-            tantivy_writer_threads: 4,
-            ..settings
-        };
-        assert_eq!(
-            lexical_rebuild_staged_shard_builder_settings(&constrained_writer_budget, 32),
-            LexicalRebuildShardBuilderSettings {
-                max_builders: 4,
-                writer_parallelism_budget: 4,
-            }
-        );
-    }
-
-    #[test]
-    fn lexical_rebuild_staged_shard_builder_dispatch_writer_parallelism_rebalances_budget() {
-        let balanced = (0..6)
-            .map(|slot| {
-                lexical_rebuild_staged_shard_builder_writer_parallelism_for_dispatch(8, 6, slot)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(balanced, vec![2, 2, 1, 1, 1, 1]);
-        assert_eq!(balanced.iter().sum::<usize>(), 8);
-
-        let widened = (0..2)
-            .map(|slot| {
-                lexical_rebuild_staged_shard_builder_writer_parallelism_for_dispatch(8, 2, slot)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(widened, vec![4, 4]);
-    }
-
-    #[test]
-    fn lexical_shard_plan_is_deterministic_across_input_order() {
-        let budgets = LexicalShardPlannerBudgets {
-            max_conversations_per_shard: 2,
-            max_messages_per_shard: 20,
-            max_message_bytes_per_shard: 2_000,
-        };
-        let ordered = vec![
-            LexicalShardPlannerConversation {
-                conversation_id: 10,
-                message_count: 4,
-                message_bytes: 400,
-            },
-            LexicalShardPlannerConversation {
-                conversation_id: 20,
-                message_count: 5,
-                message_bytes: 500,
-            },
-            LexicalShardPlannerConversation {
-                conversation_id: 30,
-                message_count: 6,
-                message_bytes: 600,
-            },
-        ];
-        let permuted = vec![ordered[2], ordered[0], ordered[1]];
-
-        let ordered_plan = plan_lexical_rebuild_shards(&ordered, budgets);
-        let permuted_plan = plan_lexical_rebuild_shards(&permuted, budgets);
-
-        assert_eq!(ordered_plan, permuted_plan);
-        assert_eq!(ordered_plan.shards.len(), 2);
-        assert_eq!(ordered_plan.shards[0].first_conversation_id, 10);
-        assert_eq!(ordered_plan.shards[0].last_conversation_id, 20);
-        assert_eq!(ordered_plan.shards[1].first_conversation_id, 30);
-        assert_eq!(ordered_plan.shards[1].last_conversation_id, 30);
-    }
-
-    #[test]
-    fn lexical_shard_plan_id_changes_when_sparse_assignments_change() {
-        let budgets = LexicalShardPlannerBudgets {
-            max_conversations_per_shard: 3,
-            max_messages_per_shard: 20,
-            max_message_bytes_per_shard: 2_000,
-        };
-        let plan_a = plan_lexical_rebuild_shards(
-            &[
-                LexicalShardPlannerConversation {
-                    conversation_id: 1,
-                    message_count: 2,
-                    message_bytes: 200,
-                },
-                LexicalShardPlannerConversation {
-                    conversation_id: 2,
-                    message_count: 2,
-                    message_bytes: 200,
-                },
-                LexicalShardPlannerConversation {
-                    conversation_id: 4,
-                    message_count: 2,
-                    message_bytes: 200,
-                },
-            ],
-            budgets,
-        );
-        let plan_b = plan_lexical_rebuild_shards(
-            &[
-                LexicalShardPlannerConversation {
-                    conversation_id: 1,
-                    message_count: 2,
-                    message_bytes: 200,
-                },
-                LexicalShardPlannerConversation {
-                    conversation_id: 3,
-                    message_count: 2,
-                    message_bytes: 200,
-                },
-                LexicalShardPlannerConversation {
-                    conversation_id: 4,
-                    message_count: 2,
-                    message_bytes: 200,
-                },
-            ],
-            budgets,
-        );
-
-        assert_eq!(plan_a.shards.len(), 1);
-        assert_eq!(plan_b.shards.len(), 1);
-        assert_eq!(plan_a.shards[0].first_conversation_id, 1);
-        assert_eq!(plan_b.shards[0].first_conversation_id, 1);
-        assert_eq!(plan_a.shards[0].last_conversation_id, 4);
-        assert_eq!(plan_b.shards[0].last_conversation_id, 4);
-        assert_eq!(plan_a.shards[0].conversation_count, 3);
-        assert_eq!(plan_b.shards[0].conversation_count, 3);
-        assert_ne!(
-            plan_a.shards[0].conversation_id_fingerprint,
-            plan_b.shards[0].conversation_id_fingerprint,
-            "sparse shard assignments with the same range and totals need distinct shard evidence"
-        );
-        assert_ne!(
-            plan_a.plan_id, plan_b.plan_id,
-            "plan identity must include interior conversation IDs, not only shard ranges"
-        );
-    }
-
-    #[test]
-    fn lexical_shard_plan_isolates_oversized_single_conversation() {
-        let budgets = LexicalShardPlannerBudgets {
-            max_conversations_per_shard: 3,
-            max_messages_per_shard: 10,
-            max_message_bytes_per_shard: 1_000,
-        };
-        let plan = plan_lexical_rebuild_shards(
-            &[
-                LexicalShardPlannerConversation {
-                    conversation_id: 1,
-                    message_count: 3,
-                    message_bytes: 300,
-                },
-                LexicalShardPlannerConversation {
-                    conversation_id: 2,
-                    message_count: 50,
-                    message_bytes: 5_000,
-                },
-                LexicalShardPlannerConversation {
-                    conversation_id: 3,
-                    message_count: 2,
-                    message_bytes: 200,
-                },
-            ],
-            budgets,
-        );
-
-        assert_eq!(plan.oversized_conversation_ids, vec![2]);
-        assert_eq!(plan.shards.len(), 3);
-        assert!(!plan.shards[0].oversized_single_conversation);
-        assert!(plan.shards[1].oversized_single_conversation);
-        assert_eq!(plan.shards[1].first_conversation_id, 2);
-        assert_eq!(plan.shards[1].last_conversation_id, 2);
-        assert_eq!(plan.shards[2].first_conversation_id, 3);
-        assert_eq!(plan.shards[2].last_conversation_id, 3);
-    }
-
-    #[test]
-    fn lexical_rebuild_target_shard_count_scales_with_parallelism() {
-        assert_eq!(lexical_rebuild_target_shard_count(1, 1), 4);
-        assert_eq!(lexical_rebuild_target_shard_count(8, 4), 32);
-        assert_eq!(lexical_rebuild_target_shard_count(4, 12), 48);
-        assert_eq!(lexical_rebuild_target_shard_count(128, 64), 256);
-    }
-
-    #[test]
-    fn lexical_rebuild_default_shard_budget_respects_parallel_targets_and_caps() {
-        assert_eq!(
-            lexical_rebuild_default_shard_budget(48_000, 48, 512, 10_000),
-            1_000
-        );
-        assert_eq!(
-            lexical_rebuild_default_shard_budget(4_000, 48, 512, 10_000),
-            512
-        );
-        assert_eq!(
-            lexical_rebuild_default_shard_budget(5_000_000, 16, 32_000, 250_000),
-            250_000
-        );
-    }
-
-    #[test]
-    fn lexical_rebuild_shard_planner_conversations_from_storage_uses_estimated_byte_footprints() {
-        let temp = TempDir::new().unwrap();
-        let db_path = temp.path().join("db.sqlite");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-
-        let agent = Agent {
-            id: None,
-            slug: "codex".into(),
-            name: "Codex".into(),
-            version: Some("0.2.3".into()),
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-
-        let insert = |external_id: &str, base_ts: i64, messages: Vec<Message>| {
-            storage
-                .insert_conversation_tree(
-                    agent_id,
-                    None,
-                    &Conversation {
-                        id: None,
-                        agent_slug: "codex".into(),
-                        workspace: Some(PathBuf::from("/tmp/workspace")),
-                        external_id: Some(external_id.to_string()),
-                        title: Some(external_id.to_string()),
-                        source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
-                        started_at: Some(base_ts),
-                        ended_at: Some(base_ts + 100),
-                        approx_tokens: Some(64),
-                        metadata_json: serde_json::Value::Null,
-                        messages,
-                        source_id: LOCAL_SOURCE_ID.into(),
-                        origin_host: None,
-                    },
-                )
-                .unwrap()
-                .conversation_id
-        };
-
-        let ascii_id = insert(
-            "planner-ascii",
-            1_700_000_000_000,
-            vec![
-                Message {
-                    id: None,
-                    idx: 0,
-                    role: MessageRole::User,
-                    author: None,
-                    created_at: Some(1_700_000_000_010),
-                    content: "abc".into(),
-                    extra_json: serde_json::Value::Null,
-                    snippets: Vec::new(),
-                },
-                Message {
-                    id: None,
-                    idx: 1,
-                    role: MessageRole::Agent,
-                    author: None,
-                    created_at: Some(1_700_000_000_020),
-                    content: "defg".into(),
-                    extra_json: serde_json::Value::Null,
-                    snippets: Vec::new(),
-                },
-            ],
-        );
-        let empty_id = insert("planner-empty", 1_700_000_001_000, Vec::new());
-        let utf8_id = insert(
-            "planner-utf8",
-            1_700_000_002_000,
-            vec![Message {
-                id: None,
-                idx: 0,
-                role: MessageRole::Tool,
-                author: None,
-                created_at: Some(1_700_000_002_010),
-                content: "hé🙂".into(),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            }],
-        );
-
-        let conversations =
-            lexical_rebuild_shard_planner_conversations_from_storage(&storage).unwrap();
-        assert_eq!(
-            conversations,
-            vec![
-                LexicalShardPlannerConversation {
-                    conversation_id: ascii_id,
-                    message_count: 2,
-                    message_bytes: 2
-                        * crate::storage::sqlite::LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
-                },
-                LexicalShardPlannerConversation {
-                    conversation_id: empty_id,
-                    message_count: 0,
-                    message_bytes: 0,
-                },
-                LexicalShardPlannerConversation {
-                    conversation_id: utf8_id,
-                    message_count: 1,
-                    message_bytes:
-                        crate::storage::sqlite::LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn lexical_rebuild_shard_plan_from_storage_uses_message_footprints() {
-        let temp = TempDir::new().unwrap();
-        let db_path = temp.path().join("db.sqlite");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-
-        let agent = Agent {
-            id: None,
-            slug: "codex".into(),
-            name: "Codex".into(),
-            version: Some("0.2.3".into()),
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-
-        for conversation_idx in 0..3 {
-            let external_id = format!("footprint-plan-{conversation_idx}");
-            let messages = (0..4)
-                .map(|message_idx| Message {
-                    id: None,
-                    idx: message_idx,
-                    role: MessageRole::User,
-                    author: None,
-                    created_at: Some(1_700_000_000_000 + message_idx),
-                    content: format!("{external_id}-{message_idx}"),
-                    extra_json: serde_json::Value::Null,
-                    snippets: Vec::new(),
-                })
-                .collect::<Vec<_>>();
-            storage
-                .insert_conversation_tree(
-                    agent_id,
-                    None,
-                    &Conversation {
-                        id: None,
-                        agent_slug: "codex".into(),
-                        workspace: Some(PathBuf::from("/tmp/workspace")),
-                        external_id: Some(external_id.clone()),
-                        title: Some(external_id.clone()),
-                        source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
-                        started_at: Some(1_700_000_000_000),
-                        ended_at: Some(1_700_000_000_100),
-                        approx_tokens: Some(64),
-                        metadata_json: serde_json::Value::Null,
-                        messages,
-                        source_id: LOCAL_SOURCE_ID.into(),
-                        origin_host: None,
-                    },
-                )
-                .unwrap();
-        }
-
-        let settings = LexicalRebuildPipelineSettingsSnapshot {
-            workers: 1,
-            available_parallelism: 1,
-            reserved_cores: 0,
-            tantivy_writer_threads: 1,
-            staged_shard_builders: 1,
-            staged_merge_workers: 1,
-            controller_mode: "steady".into(),
-            controller_restore_clear_samples: 1,
-            controller_restore_hold_ms: 0,
-            controller_loadavg_high_watermark_1m_milli: None,
-            controller_loadavg_low_watermark_1m_milli: None,
-            page_size: LEXICAL_REBUILD_PAGE_SIZE,
-            steady_batch_fetch_conversations: 10,
-            startup_batch_fetch_conversations: 10,
-            steady_commit_every_conversations: 10,
-            startup_commit_every_conversations: 10,
-            steady_commit_every_messages: 5,
-            startup_commit_every_messages: 5,
-            steady_commit_every_message_bytes: 1024 * 1024,
-            startup_commit_every_message_bytes: 1024 * 1024,
-            pipeline_channel_size: 2,
-            page_prep_workers: 1,
-            pipeline_max_message_bytes_in_flight: 2 * 1024 * 1024,
-        };
-
-        let plan =
-            plan_lexical_rebuild_shards_from_storage_with_settings(&storage, &settings, 3).unwrap();
-
-        assert_eq!(plan.total_conversations, 3);
-        assert_eq!(plan.total_messages, 12);
-        assert_eq!(plan.shards.len(), 3);
-        assert_eq!(
-            plan.shards
-                .iter()
-                .map(|shard| shard.message_count)
-                .collect::<Vec<_>>(),
-            vec![
-                LEXICAL_SHARD_UNKNOWN_MESSAGE_COUNT,
-                LEXICAL_SHARD_UNKNOWN_MESSAGE_COUNT,
-                LEXICAL_SHARD_UNKNOWN_MESSAGE_COUNT
-            ]
-        );
-        assert_eq!(
-            plan.shards
-                .iter()
-                .map(|shard| shard.conversation_count)
-                .collect::<Vec<_>>(),
-            vec![1, 1, 1]
-        );
-    }
-
-    #[test]
-    fn lexical_rebuild_shard_plan_without_tail_metadata_uses_conservative_id_only_plan() {
-        let temp = TempDir::new().unwrap();
-        let db_path = temp.path().join("legacy-canonical.db");
-        let db_path_str = db_path.to_string_lossy().into_owned();
-        let conn = crate::franken_sync::Connection::open(db_path_str).unwrap();
-        conn.execute_compat(
-            "CREATE TABLE conversations (id INTEGER PRIMARY KEY, source_path TEXT NOT NULL)",
-            &[] as &[ParamValue],
-        )
-        .unwrap();
-        conn.execute_compat(
-            "CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER NOT NULL,
-                role TEXT NOT NULL,
-                author TEXT,
-                created_at INTEGER,
-                content TEXT NOT NULL,
-                UNIQUE(conversation_id, idx)
-            )",
-            &[] as &[ParamValue],
-        )
-        .unwrap();
-        conn.execute_compat(
-            "CREATE INDEX idx_messages_conv_idx ON messages(conversation_id, idx)",
-            &[] as &[ParamValue],
-        )
-        .unwrap();
-        for conversation_id in 1..=130 {
-            conn.execute_compat(
-                "INSERT INTO conversations(id, source_path) VALUES (?1, ?2)",
-                &[
-                    ParamValue::from(i64::from(conversation_id)),
-                    ParamValue::from(format!("/tmp/legacy-{conversation_id}.jsonl")),
-                ],
-            )
-            .unwrap();
-            conn.execute_compat(
-                "INSERT INTO messages(conversation_id, idx, role, content)
-                 VALUES (?1, 0, 'user', ?2)",
-                &[
-                    ParamValue::from(i64::from(conversation_id)),
-                    ParamValue::from(format!("message {conversation_id}")),
-                ],
-            )
-            .unwrap();
-        }
-        drop(conn);
-
-        let storage = FrankenStorage::open_readonly(&db_path).unwrap();
-        assert!(
-            !storage
-                .lexical_rebuild_has_tail_footprint_metadata()
-                .unwrap(),
-            "legacy canonical DB fixture intentionally has no tail metadata"
-        );
-        let settings = LexicalRebuildPipelineSettingsSnapshot {
-            workers: 8,
-            available_parallelism: 8,
-            reserved_cores: 0,
-            tantivy_writer_threads: 8,
-            staged_shard_builders: 2,
-            staged_merge_workers: 1,
-            controller_mode: "steady".into(),
-            controller_restore_clear_samples: 1,
-            controller_restore_hold_ms: 0,
-            controller_loadavg_high_watermark_1m_milli: None,
-            controller_loadavg_low_watermark_1m_milli: None,
-            page_size: LEXICAL_REBUILD_PAGE_SIZE,
-            steady_batch_fetch_conversations: 512,
-            startup_batch_fetch_conversations: 512,
-            steady_commit_every_conversations: 512,
-            startup_commit_every_conversations: 512,
-            steady_commit_every_messages: 10_000,
-            startup_commit_every_messages: 10_000,
-            steady_commit_every_message_bytes: 64 * 1024 * 1024,
-            startup_commit_every_message_bytes: 64 * 1024 * 1024,
-            pipeline_channel_size: 2,
-            page_prep_workers: 1,
-            pipeline_max_message_bytes_in_flight: 256 * 1024,
-        };
-
-        let plan = plan_lexical_rebuild_shards_from_storage_with_settings(&storage, &settings, 130)
-            .unwrap();
-
-        assert_eq!(plan.total_conversations, 130);
-        assert_eq!(plan.total_messages, 130);
-        assert_eq!(
-            plan.shards
-                .iter()
-                .map(|shard| shard.conversation_count)
-                .collect::<Vec<_>>(),
-            vec![64, 64, 2]
-        );
-        assert!(
-            plan.shards
-                .iter()
-                // ubs:ignore -- The fixture checks the unknown message-count sentinel in an ID-only shard plan.
-                .all(|shard| shard.message_count == LEXICAL_SHARD_UNKNOWN_MESSAGE_COUNT),
-            "id-only plans must leave doc-count validation to observed rebuild accounting"
-        );
-    }
-
-    #[test]
-    fn lexical_rebuild_shard_plan_with_sparse_tail_metadata_uses_conservative_id_only_plan() {
-        let temp = TempDir::new().unwrap();
-        let db_path = temp.path().join("sparse-tail-canonical.db");
-        let db_path_str = db_path.to_string_lossy().into_owned();
-        let conn = crate::franken_sync::Connection::open(db_path_str).unwrap();
-        conn.execute_compat(
-            "CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                source_path TEXT NOT NULL,
-                last_message_idx INTEGER
-            )",
-            &[] as &[ParamValue],
-        )
-        .unwrap();
-        conn.execute_compat(
-            "CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER NOT NULL,
-                role TEXT NOT NULL,
-                author TEXT,
-                created_at INTEGER,
-                content TEXT NOT NULL,
-                UNIQUE(conversation_id, idx)
-            )",
-            &[] as &[ParamValue],
-        )
-        .unwrap();
-        conn.execute_compat(
-            "CREATE INDEX idx_messages_conv_idx ON messages(conversation_id, idx)",
-            &[] as &[ParamValue],
-        )
-        .unwrap();
-        conn.execute_compat(
-            "CREATE TABLE conversation_tail_state (
-                conversation_id INTEGER PRIMARY KEY,
-                ended_at INTEGER,
-                last_message_idx INTEGER,
-                last_message_created_at INTEGER
-            )",
-            &[] as &[ParamValue],
-        )
-        .unwrap();
-        for conversation_id in 1..=130 {
-            if conversation_id == 1 {
-                conn.execute_compat(
-                    "INSERT INTO conversations(id, source_path, last_message_idx)
-                     VALUES (?1, ?2, 0)",
-                    &[
-                        ParamValue::from(i64::from(conversation_id)),
-                        ParamValue::from(format!("/tmp/sparse-tail-{conversation_id}.jsonl")),
-                    ],
-                )
-                .unwrap();
-            } else {
-                conn.execute_compat(
-                    "INSERT INTO conversations(id, source_path, last_message_idx)
-                     VALUES (?1, ?2, NULL)",
-                    &[
-                        ParamValue::from(i64::from(conversation_id)),
-                        ParamValue::from(format!("/tmp/sparse-tail-{conversation_id}.jsonl")),
-                    ],
-                )
-                .unwrap();
-            }
-            conn.execute_compat(
-                "INSERT INTO messages(conversation_id, idx, role, content)
-                 VALUES (?1, 0, 'user', ?2)",
-                &[
-                    ParamValue::from(i64::from(conversation_id)),
-                    ParamValue::from(format!("message {conversation_id}")),
-                ],
-            )
-            .unwrap();
-            conn.execute_compat(
-                "INSERT INTO conversation_tail_state(conversation_id, last_message_idx)
-                 VALUES (?1, 0)",
-                &[ParamValue::from(i64::from(conversation_id + 1_000))],
-            )
-            .unwrap();
-        }
-        drop(conn);
-
-        let storage = FrankenStorage::open_readonly(&db_path).unwrap();
-        assert!(
-            !storage
-                .lexical_rebuild_has_tail_footprint_metadata()
-                .unwrap(),
-            "one populated conversation tail plus stale tail-state rows must not send a large legacy DB through full footprint aggregation"
-        );
-        let settings = LexicalRebuildPipelineSettingsSnapshot {
-            workers: 8,
-            available_parallelism: 8,
-            reserved_cores: 0,
-            tantivy_writer_threads: 8,
-            staged_shard_builders: 2,
-            staged_merge_workers: 1,
-            controller_mode: "steady".into(),
-            controller_restore_clear_samples: 1,
-            controller_restore_hold_ms: 0,
-            controller_loadavg_high_watermark_1m_milli: None,
-            controller_loadavg_low_watermark_1m_milli: None,
-            page_size: LEXICAL_REBUILD_PAGE_SIZE,
-            steady_batch_fetch_conversations: 512,
-            startup_batch_fetch_conversations: 512,
-            steady_commit_every_conversations: 512,
-            startup_commit_every_conversations: 512,
-            steady_commit_every_messages: 10_000,
-            startup_commit_every_messages: 10_000,
-            steady_commit_every_message_bytes: 64 * 1024 * 1024,
-            startup_commit_every_message_bytes: 64 * 1024 * 1024,
-            pipeline_channel_size: 2,
-            page_prep_workers: 1,
-            pipeline_max_message_bytes_in_flight: 256 * 1024,
-        };
-
-        let plan = plan_lexical_rebuild_shards_from_storage_with_settings(&storage, &settings, 130)
-            .unwrap();
-
-        assert_eq!(
-            plan.shards
-                .iter()
-                .map(|shard| shard.conversation_count)
-                .collect::<Vec<_>>(),
-            vec![64, 64, 2]
-        );
-        assert!(
-            plan.shards
-                .iter()
-                // ubs:ignore -- The fixture checks the unknown message-count sentinel with sparse tail metadata.
-                .all(|shard| shard.message_count == LEXICAL_SHARD_UNKNOWN_MESSAGE_COUNT),
-            "sparse tail metadata should use the same validation-safe id-only plan as absent metadata"
         );
     }
 
@@ -50942,58 +45619,6 @@ mod tests {
             responsiveness::effective_inflight_byte_limit(uncapped_message_bytes_in_flight).max(1)
         );
         assert!(snapshot.pipeline_max_message_bytes_in_flight <= uncapped_message_bytes_in_flight);
-    }
-
-    #[test]
-    fn lexical_rebuild_staged_shard_merge_settings_scales_with_eager_group_count() {
-        let settings = LexicalRebuildPipelineSettingsSnapshot {
-            workers: 12,
-            available_parallelism: 12,
-            reserved_cores: 2,
-            tantivy_writer_threads: 8,
-            staged_shard_builders: 8,
-            staged_merge_workers: 3,
-            controller_mode: "steady".into(),
-            controller_restore_clear_samples: 3,
-            controller_restore_hold_ms: 0,
-            controller_loadavg_high_watermark_1m_milli: None,
-            controller_loadavg_low_watermark_1m_milli: None,
-            page_size: LEXICAL_REBUILD_PAGE_SIZE,
-            steady_batch_fetch_conversations: 1024,
-            startup_batch_fetch_conversations: 256,
-            steady_commit_every_conversations: 1024,
-            startup_commit_every_conversations: 256,
-            steady_commit_every_messages: 2048,
-            startup_commit_every_messages: 512,
-            steady_commit_every_message_bytes: 1_000_000,
-            startup_commit_every_message_bytes: 250_000,
-            pipeline_channel_size: 2,
-            page_prep_workers: 6,
-            pipeline_max_message_bytes_in_flight: 4 * 1024 * 1024,
-        };
-
-        assert_eq!(
-            lexical_rebuild_staged_shard_merge_settings(&settings, 3),
-            LexicalRebuildShardMergeSettings { workers: 1 }
-        );
-        assert_eq!(
-            lexical_rebuild_staged_shard_merge_settings(&settings, 5),
-            LexicalRebuildShardMergeSettings { workers: 1 }
-        );
-        assert_eq!(
-            lexical_rebuild_staged_shard_merge_settings(
-                &settings,
-                LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN * 3,
-            ),
-            LexicalRebuildShardMergeSettings { workers: 3 }
-        );
-        assert_eq!(
-            lexical_rebuild_staged_shard_merge_settings(
-                &settings,
-                LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN * 8,
-            ),
-            LexicalRebuildShardMergeSettings { workers: 3 }
-        );
     }
 
     #[test]
@@ -52364,195 +46989,6 @@ mod tests {
             0,
             "consumer-owned releases should drain all reserved bytes after the burst completes"
         );
-    }
-
-    #[test]
-    fn lexical_rebuild_packet_producer_respects_planned_shard_boundaries() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("producer-planned-shards.db");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        seed_lexical_rebuild_fixture(&storage);
-        let agent_id = storage
-            .ensure_agent(&Agent {
-                id: None,
-                slug: "codex".into(),
-                name: "Codex".into(),
-                version: Some("0.2.3".into()),
-                kind: AgentKind::Cli,
-            })
-            .unwrap();
-        for suffix in 3..=6 {
-            let external_id = format!("lexical-fixture-{suffix}");
-            let base_ts = 1_700_000_000_000_i64 + i64::from(suffix) * 1_000;
-            storage
-                .insert_conversation_tree(
-                    agent_id,
-                    None,
-                    &Conversation {
-                        id: None,
-                        agent_slug: "codex".into(),
-                        workspace: Some(PathBuf::from("/tmp/workspace")),
-                        external_id: Some(external_id.clone()),
-                        title: Some("Lexical rebuild fixture".into()),
-                        source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
-                        started_at: Some(base_ts),
-                        ended_at: Some(base_ts + 100),
-                        approx_tokens: Some(64),
-                        metadata_json: serde_json::Value::Null,
-                        messages: vec![
-                            Message {
-                                id: None,
-                                idx: 0,
-                                role: MessageRole::User,
-                                author: Some("user".into()),
-                                created_at: Some(base_ts + 10),
-                                content: format!("{external_id}-first"),
-                                extra_json: serde_json::json!({"opaque": true}),
-                                snippets: Vec::new(),
-                            },
-                            Message {
-                                id: None,
-                                idx: 1,
-                                role: MessageRole::Agent,
-                                author: Some("assistant".into()),
-                                created_at: Some(base_ts + 20),
-                                content: format!("{external_id}-second"),
-                                extra_json: serde_json::json!({"opaque": true}),
-                                snippets: Vec::new(),
-                            },
-                        ],
-                        source_id: LOCAL_SOURCE_ID.into(),
-                        origin_host: None,
-                    },
-                )
-                .unwrap();
-        }
-        drop(storage);
-
-        let planned_settings = LexicalRebuildPipelineSettingsSnapshot {
-            workers: 1,
-            available_parallelism: 1,
-            reserved_cores: 0,
-            tantivy_writer_threads: 1,
-            staged_shard_builders: 1,
-            staged_merge_workers: 1,
-            controller_mode: "steady".into(),
-            controller_restore_clear_samples: 1,
-            controller_restore_hold_ms: 0,
-            controller_loadavg_high_watermark_1m_milli: None,
-            controller_loadavg_low_watermark_1m_milli: None,
-            page_size: LEXICAL_REBUILD_PAGE_SIZE,
-            steady_batch_fetch_conversations: 3,
-            startup_batch_fetch_conversations: 3,
-            steady_commit_every_conversations: 3,
-            startup_commit_every_conversations: 3,
-            steady_commit_every_messages: 6,
-            startup_commit_every_messages: 6,
-            steady_commit_every_message_bytes: 65_536,
-            startup_commit_every_message_bytes: 65_536,
-            pipeline_channel_size: 2,
-            page_prep_workers: 1,
-            pipeline_max_message_bytes_in_flight: 256 * 1024,
-        };
-        let storage = FrankenStorage::open_readonly(&db_path).unwrap();
-        let planned_shard_plan =
-            plan_lexical_rebuild_shards_from_storage_with_settings(&storage, &planned_settings, 6)
-                .unwrap();
-        assert_eq!(
-            planned_shard_plan
-                .shards
-                .iter()
-                .map(|shard| shard.conversation_count)
-                .collect::<Vec<_>>(),
-            vec![3, 3]
-        );
-        storage.close_without_checkpoint().unwrap();
-
-        let (tx, rx) = bounded::<LexicalRebuildPipelineMessage>(2);
-        // This test exercises exact shard boundaries, so inject a fixed
-        // budget. The runtime helper applies live machine pressure and can
-        // reduce the requested three-conversation page to a smaller page.
-        let pipeline_budget = LexicalRebuildPipelineBudgetSnapshot::new(
-            64,
-            256,
-            3 * 8 * 1024 * 1024,
-            9 * 8 * 1024 * 1024,
-            64,
-            256,
-            3 * 8 * 1024 * 1024,
-        );
-        let flow_limiter = Arc::new(StreamingByteLimiter::new(
-            pipeline_budget.max_message_bytes_in_flight,
-        ));
-        let handle = spawn_lexical_rebuild_packet_producer(
-            db_path,
-            None,
-            Some(planned_shard_plan),
-            LEXICAL_REBUILD_PAGE_SIZE,
-            2,
-            None,
-            Arc::new(LexicalRebuildPipelineBudgetController::new(pipeline_budget)),
-            tx,
-            flow_limiter.clone(),
-            None,
-            Arc::new(LexicalRebuildProducerTelemetry::default()),
-        );
-
-        let mut observed_pages = Vec::new();
-        loop {
-            match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-                LexicalRebuildPipelineMessage::Batch(batch) => {
-                    assert_eq!(
-                        batch.planned_shard_index,
-                        Some(observed_pages.len()),
-                        "each emitted page should stay tagged with its deterministic shard index"
-                    );
-                    assert!(
-                        batch.finishes_planned_shard,
-                        "each page in this fixture should close exactly one planned shard"
-                    );
-                    observed_pages.push(
-                        batch
-                            .packets
-                            .iter()
-                            .map(|packet| {
-                                packet
-                                    .identity
-                                    .external_id
-                                    .clone()
-                                    .expect("fixture conversation has external id")
-                            })
-                            .collect::<Vec<_>>(),
-                    );
-                    release_lexical_rebuild_prepared_page_reservation(
-                        &batch,
-                        flow_limiter.as_ref(),
-                    );
-                }
-                LexicalRebuildPipelineMessage::Done => break,
-                LexicalRebuildPipelineMessage::Error(error) => {
-                    panic!("producer returned error: {error}") // ubs:ignore -- Shard-boundary test fails on an unexpected producer error.
-                }
-            }
-        }
-        handle.join().unwrap();
-
-        assert_eq!(
-            observed_pages,
-            vec![
-                vec![
-                    "lexical-fixture-1".to_string(),
-                    "lexical-fixture-2".to_string(),
-                    "lexical-fixture-3".to_string(),
-                ],
-                vec![
-                    "lexical-fixture-4".to_string(),
-                    "lexical-fixture-5".to_string(),
-                    "lexical-fixture-6".to_string(),
-                ],
-            ]
-        );
-        assert_eq!(flow_limiter.bytes_in_flight(), 0);
     }
 
     #[test]
@@ -53971,123 +48407,6 @@ mod tests {
         }
     }
 
-    /// #282 regression: a panic inside a shard-build worker must surface as a
-    /// `LexicalRebuildShardBuildMessage::Error`. Before the catch_unwind
-    /// containment, the panicking worker unwound silently while sibling
-    /// workers kept the result channel open, so the staging→publish consumer
-    /// parked forever at the handoff (the terminal-wedge signature: all
-    /// threads on a condvar, governor spinning one core).
-    #[test]
-    #[serial]
-    fn shard_build_worker_panic_surfaces_as_error_result_instead_of_parking_consumer() {
-        let worker_count = 1usize;
-        let (work_tx, work_rx) = bounded::<LexicalRebuildShardBuildWork>(worker_count);
-        let (msg_tx, msg_rx) = bounded::<LexicalRebuildShardBuildMessage>(worker_count);
-        let flow_limiter = Arc::new(StreamingByteLimiter::new(1024));
-        let handles = spawn_lexical_rebuild_shard_builder_workers(
-            worker_count,
-            work_rx,
-            msg_tx,
-            Arc::clone(&flow_limiter),
-            None,
-            None,
-        );
-
-        let tmp = TempDir::new().unwrap();
-        LEXICAL_REBUILD_SHARD_BUILD_INJECTED_PANIC.arm(tmp.path());
-        work_tx
-            .send(LexicalRebuildShardBuildWork {
-                shard: LexicalShardPlanShard {
-                    shard_index: 7,
-                    first_conversation_id: 0,
-                    last_conversation_id: 0,
-                    conversation_count: 0,
-                    message_count: 0,
-                    message_bytes: 0,
-                    conversation_id_fingerprint: String::new(),
-                    oversized_single_conversation: false,
-                },
-                packets: Vec::new(),
-                message_bytes: 0,
-                shard_index_path: tmp.path().join("shard-7"),
-                writer_parallelism: 1,
-            })
-            .unwrap();
-
-        let message = msg_rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("a panicking shard-build worker must still emit an Error result (#282)");
-        match message {
-            LexicalRebuildShardBuildMessage::Error { shard_index, error } => {
-                assert_eq!(shard_index, 7);
-                assert!(
-                    error.contains("panicked"),
-                    "error must identify the panic: {error}"
-                );
-                assert!(
-                    error.contains("injected lexical rebuild shard-build panic"),
-                    "error must preserve the panic payload text: {error}"
-                );
-            }
-            other => panic!("expected a shard-build Error result, got {other:?}"), // ubs:ignore -- Fault-injection test requires a contained shard-build error.
-        }
-
-        drop(work_tx);
-        for handle in handles {
-            let _ = handle.join();
-        }
-    }
-
-    /// #282 regression: a panic inside a shard-merge worker must surface as a
-    /// `LexicalRebuildShardMergeMessage::Error`. Before the catch_unwind
-    /// containment, the panicking worker left the result channel open and the
-    /// final-frontier reducer parked forever on `merge_result_rx.recv()`.
-    #[test]
-    #[serial]
-    fn shard_merge_worker_panic_surfaces_as_error_result_instead_of_parking_reducer() {
-        let worker_count = 1usize;
-        let (job_tx, job_rx) = bounded::<LexicalRebuildShardMergeJob>(worker_count);
-        let (msg_tx, msg_rx) = bounded::<LexicalRebuildShardMergeMessage>(worker_count);
-        let handles = spawn_lexical_rebuild_shard_merge_workers(worker_count, job_rx, msg_tx);
-
-        let tmp = TempDir::new().unwrap();
-        LEXICAL_REBUILD_SHARD_MERGE_INJECTED_PANIC.arm(tmp.path());
-        job_tx
-            .send(LexicalRebuildShardMergeJob {
-                output_level: 3,
-                output_path: tmp.path().join("merge-out"),
-                input_artifacts: Vec::new(),
-            })
-            .unwrap();
-
-        let message = msg_rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("a panicking shard-merge worker must still emit an Error result (#282)");
-        match message {
-            LexicalRebuildShardMergeMessage::Error {
-                output_level,
-                error,
-                ..
-            } => {
-                assert_eq!(output_level, 3);
-                assert!(
-                    error.contains("panicked"),
-                    "error must identify the panic: {error}"
-                );
-                assert!(
-                    error.contains("injected lexical rebuild shard-merge panic"),
-                    "error must preserve the panic payload text: {error}"
-                );
-            }
-            other => panic!("expected a shard-merge Error result, got {other:?}"), // ubs:ignore -- Fault-injection test requires a contained shard-merge error.
-        }
-
-        drop(job_tx);
-        for handle in handles {
-            let _ = handle.join();
-        }
-    }
-
     /// `coding_agent_session_search-wxsy8`: stress-pin the
     /// capacity-shrink-then-grow lost-wakeup race that the fix
     /// closed. Pre-fix, `update_max_bytes_in_flight` stored the new
@@ -55434,6 +49753,386 @@ mod tests {
         Ok(())
     }
 
+    fn cooow_route_fixture(base: &Path, kind: ConnectorKind) -> Result<PathBuf> {
+        let root = match kind {
+            ConnectorKind::PrimeAgent => base.join(".prime/agent/sessions"),
+            ConnectorKind::Kiro => base.join(".kiro/sessions/cli"),
+            ConnectorKind::OpenHands => base.join(".openhands/conversations"),
+            ConnectorKind::Devin => base.join("devin/sessions.db"),
+            ConnectorKind::Goose => base.join("goose/sessions.db"),
+            ConnectorKind::Crush => base.join("crush/crush.db"),
+            ConnectorKind::Hermes => base.join("hermes/state.db"),
+            _ => anyhow::bail!("unsupported cooow fixture provider"),
+        };
+        fs::create_dir_all(root.parent().context("fixture parent")?)?;
+        if matches!(
+            kind,
+            ConnectorKind::PrimeAgent | ConnectorKind::Kiro | ConnectorKind::OpenHands
+        ) {
+            fs::create_dir_all(&root)?;
+            for id in ["route-one", "route-two"] {
+                match kind {
+                    ConnectorKind::PrimeAgent => fs::write(
+                        root.join(format!("{id}.jsonl")),
+                        format!(
+                            "{}\n{}\n",
+                            serde_json::json!({
+                                "type":"session", "version":3, "id":id, "cwd":"/work/cooow"
+                            }),
+                            serde_json::json!({
+                                "type":"message", "id":"first", "parentId":null,
+                                "message":{"role":"user", "content":id}
+                            })
+                        ),
+                    )?,
+                    ConnectorKind::Kiro => fs::write(
+                        root.join(format!("{id}.jsonl")),
+                        format!(
+                            "{}\n",
+                            serde_json::json!({
+                                "version":"v1", "kind":"Prompt", "data":{
+                                    "message_id":"first", "content":[{"kind":"text", "data":id}],
+                                    "meta":{"timestamp":1700000000}
+                                }
+                            })
+                        ),
+                    )?,
+                    ConnectorKind::OpenHands => {
+                        let events = root.join(id).join("events");
+                        fs::create_dir_all(&events)?;
+                        fs::write(
+                            events.join("event-00001.json"),
+                            serde_json::to_vec(&serde_json::json!({
+                                "kind":"MessageEvent", "source":"user", "timestamp":"2023-11-14T22:13:20Z",
+                                "llm_message":{"role":"user", "content":[{"type":"text", "text":id}]}
+                            }))?,
+                        )?;
+                    }
+                    _ => unreachable!(), // ubs:ignore -- The outer branch restricts these three file providers.
+                }
+            }
+        } else {
+            let conn = crate::franken_sync::Connection::open(root.to_string_lossy().as_ref())?;
+            conn.execute("PRAGMA journal_mode=WAL")?;
+            let schema = match kind {
+                ConnectorKind::Devin => r#"CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, working_directory TEXT, model TEXT, agent_mode TEXT, created_at INTEGER, last_activity_at INTEGER, main_chain_id INTEGER, hidden INTEGER NOT NULL DEFAULT 0);
+                    CREATE TABLE message_nodes (node_id INTEGER PRIMARY KEY, session_id TEXT, parent_node_id INTEGER, chat_message TEXT, created_at INTEGER);
+                    INSERT INTO sessions VALUES ('route-one', 'One', '/work/cooow', NULL, NULL, 1700000000, 1700000000, 1, 0), ('route-two', 'Two', '/work/cooow', NULL, NULL, 1700000000, 1700000000, 2, 0);
+                    INSERT INTO message_nodes VALUES (1, 'route-one', NULL, '{"role":"user","content":"route-one"}', 1700000000), (2, 'route-two', NULL, '{"role":"user","content":"route-two"}', 1700000000);"#,
+                ConnectorKind::Goose => r#"CREATE TABLE sessions (id TEXT PRIMARY KEY, description TEXT, working_dir TEXT, created_at INTEGER, updated_at INTEGER, provider_name TEXT, model_config_json TEXT, session_type TEXT);
+                    CREATE TABLE messages (session_id TEXT, role TEXT, content_json TEXT, created_timestamp INTEGER, tokens INTEGER, metadata_json TEXT, message_id TEXT PRIMARY KEY);
+                    INSERT INTO sessions VALUES ('route-one', 'One', '/work/cooow', 1700000000, 1700000000, NULL, NULL, NULL), ('route-two', 'Two', '/work/cooow', 1700000000, 1700000000, NULL, NULL, NULL);
+                    INSERT INTO messages VALUES ('route-one', 'user', '[{"type":"text","text":"route-one"}]', 1700000000, NULL, NULL, 'one'), ('route-two', 'user', '[{"type":"text","text":"route-two"}]', 1700000000, NULL, NULL, 'two');"#,
+                ConnectorKind::Crush => r#"CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, prompt_tokens INTEGER, completion_tokens INTEGER, cost REAL);
+                    CREATE TABLE messages (session_id TEXT, role TEXT, parts TEXT, created_at INTEGER, model TEXT, provider TEXT);
+                    INSERT INTO sessions VALUES ('route-one', 'One', 0, 0, 0), ('route-two', 'Two', 0, 0, 0);
+                    INSERT INTO messages VALUES ('route-one', 'user', '[{"type":"text","text":"route-one"}]', 1700000000000, NULL, NULL), ('route-two', 'user', '[{"type":"text","text":"route-two"}]', 1700000000000, NULL, NULL);"#,
+                ConnectorKind::Hermes => "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, model TEXT, title TEXT, parent_session_id TEXT, started_at REAL, ended_at REAL, end_reason TEXT, message_count INTEGER, tool_call_count INTEGER, input_tokens INTEGER, output_tokens INTEGER);
+                    CREATE TABLE messages (session_id TEXT, role TEXT, content TEXT, tool_calls TEXT, tool_name TEXT, tool_call_id TEXT, reasoning TEXT, timestamp REAL);
+                    INSERT INTO sessions VALUES ('route-one', 'cli', NULL, 'One', NULL, 1700000000, 1700000000, NULL, 1, 0, 0, 0), ('route-two', 'cli', NULL, 'Two', NULL, 1700000000, 1700000000, NULL, 1, 0, 0, 0);
+                    INSERT INTO messages VALUES ('route-one', 'user', 'route-one', NULL, NULL, NULL, NULL, 1700000000), ('route-two', 'user', 'route-two', NULL, NULL, NULL, NULL, 1700000000);",
+                _ => unreachable!(), // ubs:ignore -- The file-provider branch already handled all other fixture variants.
+            };
+            conn.execute_batch(schema)?;
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        }
+        Ok(root)
+    }
+
+    fn cooow_watch_route(kind: ConnectorKind) -> Result<()> {
+        let _recent_guard = set_env_var("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+        let temp = TempDir::new()?;
+        let root = cooow_route_fixture(temp.path(), kind)?;
+        let data_dir = temp.path().join("archive");
+        fs::create_dir_all(&data_dir)?;
+        let opts = IndexOptions {
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+        let context =
+            ScanContext::with_roots(root.clone(), vec![ScanRoot::local(root.clone())], None);
+        let parsed = kind.create_connector(None).scan(&context)?;
+        assert_eq!(
+            parsed.len(),
+            2,
+            "{} fixture must parse both sessions",
+            kind.slug()
+        );
+        let mut roots = build_watch_roots(vec![ScanRoot::local(root.clone())]);
+        roots.retain(|(candidate, scan)| *candidate == kind && scan.path == root);
+        assert_eq!(
+            roots.len(),
+            1,
+            "{} must receive its operational watch root",
+            kind.slug()
+        );
+        let index_path = index_dir(&data_dir)?;
+        let storage = Mutex::new(FrankenStorage::open(&opts.db_path)?);
+        let lexical = Mutex::new(Some(TantivyIndex::open_or_create(&index_path)?));
+        let state = Mutex::new(HashMap::new());
+        let triggers = if root.is_file() {
+            vec![root.clone()]
+        } else {
+            parsed
+                .iter()
+                .map(|conversation| conversation.source_path.clone())
+                .collect()
+        };
+        let indexed = reindex_paths(
+            &opts,
+            triggers.clone(),
+            &roots,
+            &state,
+            &storage,
+            &lexical,
+            &index_path,
+            false,
+        )?;
+        assert_eq!(
+            indexed,
+            2,
+            "{} watch must ingest sessions despite old provider timestamps",
+            kind.slug()
+        );
+        reindex_paths(
+            &opts,
+            triggers,
+            &roots,
+            &state,
+            &storage,
+            &lexical,
+            &index_path,
+            false,
+        )?;
+        let count: i64 = storage.lock().unwrap().raw().query_row_map(
+            "SELECT COUNT(*) FROM conversations",
+            &[],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(
+            count,
+            2,
+            "{} watch replay must preserve identities",
+            kind.slug()
+        );
+        assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 2);
+        if root.is_file() {
+            let conn = crate::franken_sync::Connection::open(root.to_string_lossy().as_ref())?;
+            conn.execute("PRAGMA journal_mode=WAL")?;
+            conn.execute("PRAGMA wal_autocheckpoint=0")?;
+            let main_before = fs::read(&root)?;
+            // The archive retains the first canonical variant of an existing
+            // message index. Exercise the provider's native append operation,
+            // with activity timestamps still older than the watch watermark.
+            let append = match kind {
+                ConnectorKind::Devin => {
+                    r#"INSERT INTO message_nodes VALUES (3, 'route-one', 1, '{"role":"user","content":"walrouteupdate"}', 1700000001);
+                    UPDATE sessions SET main_chain_id=3, last_activity_at=1700000001 WHERE id='route-one';"#
+                }
+                ConnectorKind::Goose => {
+                    r#"INSERT INTO messages VALUES ('route-one', 'user', '[{"type":"text","text":"walrouteupdate"}]', 1700000001, NULL, NULL, 'wal-one');"#
+                }
+                ConnectorKind::Crush => {
+                    r#"INSERT INTO messages VALUES ('route-one', 'user', '[{"type":"text","text":"walrouteupdate"}]', 1700000001000, NULL, NULL);"#
+                }
+                ConnectorKind::Hermes => {
+                    "INSERT INTO messages VALUES ('route-one', 'user', 'walrouteupdate', NULL, NULL, NULL, NULL, 1700000001);"
+                }
+                _ => anyhow::bail!("unexpected database fixture"),
+            };
+            conn.execute_batch(append)?;
+            assert_eq!(
+                fs::read(&root)?,
+                main_before,
+                "fixture update must remain WAL-only"
+            );
+            let wal = PathBuf::from(format!("{}-wal", root.display()));
+            assert!(wal.is_file());
+            reindex_paths(
+                &opts,
+                vec![wal],
+                &roots,
+                &state,
+                &storage,
+                &lexical,
+                &index_path,
+                false,
+            )?;
+            let updated: i64 = storage.lock().unwrap().raw().query_row_map(
+                "SELECT COUNT(*) FROM messages WHERE content='walrouteupdate'",
+                &[],
+                |row| row.get_typed(0),
+            )?;
+            assert_eq!(
+                updated,
+                1,
+                "{} watch must observe a delayed WAL-only update",
+                kind.slug()
+            );
+            assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 3);
+            let neighbor = root.with_file_name("unrelated.db-wal");
+            fs::write(&neighbor, b"unrelated")?;
+            assert!(classify_paths(vec![neighbor], &roots, false).is_empty());
+        }
+        assert!(load_watch_state(&data_dir).contains_key(&kind));
+        Ok(())
+    }
+
+    fn cooow_retry_route(kind: ConnectorKind) -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = cooow_route_fixture(temp.path(), kind)?;
+        let data_dir = temp.path().join("archive");
+        fs::create_dir_all(&data_dir)?;
+        let source_bytes = root.is_file().then(|| fs::read(&root)).transpose()?;
+        let context =
+            ScanContext::with_roots(root.clone(), vec![ScanRoot::local(root.clone())], None);
+        let conversations = kind.create_connector(None).scan(&context)?;
+        assert_eq!(conversations.len(), 2);
+        let conversation = conversations
+            .iter()
+            .find(|conversation| {
+                conversation
+                    .external_id
+                    .as_deref()
+                    .is_some_and(|id| id.contains("route-one"))
+            })
+            .context("first fixture session")?;
+        let source = QuarantineRetrySource {
+            provider: kind.slug().to_string(),
+            source_path: conversation.source_path.clone(),
+            external_id: conversation.external_id.clone(),
+            workspace: conversation.workspace.clone(),
+            started_at: conversation.started_at,
+            ended_at: conversation.ended_at,
+            message_count: Some(conversation.messages.len()),
+        };
+        let key = QuarantineKey::new(
+            poison_conversation_id(conversation),
+            u32::try_from(crate::storage::sqlite::CURRENT_SCHEMA_VERSION)?,
+        );
+        let mut wrong_source = source.clone();
+        wrong_source.message_count = Some(999);
+        assert!(
+            matches!(
+                targeted_quarantine_retry(&data_dir, &key, Some(&wrong_source)),
+                quarantine_retry::AttemptResult::Failed(_)
+            ),
+            "{} must reject the wrong session shape",
+            kind.slug()
+        );
+        let mut state = QuarantineState::default();
+        state.record_attempt(
+            &key,
+            "index-ingest-out-of-memory: out of memory",
+            chrono::Utc::now(),
+        );
+        for record in state.entries.values_mut() {
+            record.cass_version_at_quarantine = Some("0.0.1-old".to_string());
+        }
+        state.save(&data_dir)?;
+        fs::create_dir_all(data_dir.join("quarantine"))?;
+        fs::write(
+            data_dir.join("quarantine").join(INDEX_INGEST_POISON_FILE),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "conversation_id":key.conversation_id,
+                    "schema_version_at_quarantine":key.schema_version,
+                    "cass_version_at_quarantine":"0.0.1-old",
+                    "reason":"index-ingest-out-of-memory",
+                    "agent_slug":source.provider,
+                    "source_path":source.source_path,
+                    "external_id":source.external_id,
+                    "workspace":source.workspace,
+                    "started_at":source.started_at,
+                    "ended_at":source.ended_at,
+                    "message_count":source.message_count,
+                })
+            ),
+        )?;
+        let config = quarantine_retry::RetryConfig::default();
+        let plan = plan_quarantine_retry(&data_dir, &config)?;
+        assert_eq!(
+            plan.planned_attempts,
+            1,
+            "{} source must remain retryable",
+            kind.slug()
+        );
+        assert_eq!(
+            QuarantineState::load(&data_dir).len(),
+            1,
+            "planning must preserve quarantine"
+        );
+        let report = run_quarantine_retry(&data_dir, &config, true)?;
+        assert_eq!(
+            report.cleared,
+            1,
+            "{} bounded retry: {report:?}",
+            kind.slug()
+        );
+        assert!(QuarantineState::load(&data_dir).is_empty());
+        let result = targeted_quarantine_retry(&data_dir, &key, Some(&source));
+        assert!(
+            matches!(result, quarantine_retry::AttemptResult::Reindexed),
+            "{} replay: {result:?}",
+            kind.slug()
+        );
+        let storage = FrankenStorage::open(&data_dir.join("agent_search.db"))?;
+        let rows = storage
+            .raw()
+            .query("SELECT external_id FROM conversations")?;
+        assert_eq!(
+            rows.len(),
+            1,
+            "{} retry must exclude its neighbor and remain idempotent",
+            kind.slug()
+        );
+        assert_eq!(
+            rows[0].get_typed::<String>(0)?,
+            source.external_id.context("fixture identity")?
+        );
+        assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 1);
+        if let Some(before) = source_bytes {
+            assert_eq!(
+                fs::read(&root)?,
+                before,
+                "retry must preserve the source database"
+            );
+        }
+        Ok(())
+    }
+
+    macro_rules! cooow_provider_routes {
+        ($kind:ident, $watch:ident, $retry:ident) => {
+            #[test]
+            #[serial]
+            fn $watch() -> Result<()> {
+                cooow_watch_route(ConnectorKind::$kind)
+            }
+            #[test]
+            #[serial]
+            fn $retry() -> Result<()> {
+                cooow_retry_route(ConnectorKind::$kind)
+            }
+        };
+    }
+    cooow_provider_routes!(PrimeAgent, cooow_watch_prime_agent, cooow_retry_prime_agent);
+    cooow_provider_routes!(Kiro, cooow_watch_kiro, cooow_retry_kiro);
+    cooow_provider_routes!(Devin, cooow_watch_devin, cooow_retry_devin);
+    cooow_provider_routes!(OpenHands, cooow_watch_openhands, cooow_retry_openhands);
+    cooow_provider_routes!(Goose, cooow_watch_goose, cooow_retry_goose);
+    cooow_provider_routes!(Crush, cooow_watch_crush, cooow_retry_crush);
+    cooow_provider_routes!(Hermes, cooow_watch_hermes, cooow_retry_hermes);
+
     /// xaztn: dry-run classifies without mutation; apply reparses exactly the
     /// keyed source conversation and persists it before clearing quarantine.
     #[test]
@@ -56728,6 +51427,95 @@ mod tests {
     }
 
     #[test]
+    fn lqz28_codex_scan_contract_separates_the_discovery_cutoff_from_the_admission_cutoff() {
+        let pending = crate::storage::sqlite::ConnectorScanState {
+            last_scan_ts: Some(1_700_000_000_000),
+            has_conversations: true,
+            scan_contract_pending: true,
+        };
+        assert_eq!(
+            connector_scan_cutoff("codex", &pending, Some(1_600_000_000_000), true),
+            None,
+            "a pending scan contract keeps the connector's discovery cutoff open, so the contract's source form stays listed"
+        );
+        assert_eq!(
+            connector_scan_cutoff("codex", &pending, Some(1_600_000_000_000), false),
+            Some(1_699_999_999_999),
+            "a connector that selects its contract's source form independently of a cutoff reads only the sources its last completed scan did not cover"
+        );
+        assert_eq!(
+            connector_scan_cutoff("future_connector", &pending, Some(1_600_000_000_000), false),
+            None,
+            "a contract whose source form still rides the cutoff keeps the escalation on both cutoffs"
+        );
+        let recorded = crate::storage::sqlite::ConnectorScanState {
+            scan_contract_pending: false,
+            ..pending
+        };
+        assert_eq!(
+            connector_scan_cutoff("codex", &recorded, Some(1_600_000_000_000), true),
+            Some(1_699_999_999_999),
+            "a recorded contract lets the discovery cutoff follow the connector's own watermark"
+        );
+    }
+
+    /// The durable scan captures the connector's own cutoff in the same step
+    /// that drops the discovery cutoff. Capturing it after the clear would
+    /// lose it, and the wedge would return with every predicate test still
+    /// green.
+    #[test]
+    fn lqz28_durable_scan_context_keeps_the_connector_cutoff() {
+        let ctx = ScanContext {
+            data_dir: std::path::PathBuf::from("/tmp/lqz28-durable-scan-context"),
+            scan_roots: Vec::new(),
+            since_ts: Some(4_242),
+            progress_tick: None,
+        };
+        let durable = durable_scan_context(&ctx);
+        assert_eq!(
+            durable.connector_cutoff,
+            Some(4_242),
+            "the connector's own cutoff survives the drop of the discovery cutoff"
+        );
+        assert_eq!(
+            durable.ctx.since_ts, None,
+            "the durable scan still lists every source the connector knows"
+        );
+    }
+
+    /// The streaming producer reads its sources under the admission cutoff.
+    /// A swapped call site restores the wedge, and no predicate test can see
+    /// a call site, so the wiring is pinned here.
+    #[test]
+    fn lqz28_streaming_producer_uses_the_admission_cutoff() {
+        fn top_level_fn<'a>(source: &'a str, name: &str) -> &'a str {
+            let marker = format!("\nfn {name}");
+            let start = source
+                .find(&marker)
+                .unwrap_or_else(|| panic!("top-level function {name} is missing"));
+            let rest = &source[start + 1..];
+            let end = rest.find("\nfn ").unwrap_or(rest.len());
+            &rest[..end]
+        }
+
+        let source = include_str!("mod.rs");
+        let streaming = top_level_fn(source, "run_streaming_index_with_connector_factories");
+        assert!(
+            streaming.contains("connector_admission_scan_since_ts_map"),
+            "the streaming producer must read its sources under the admission cutoff"
+        );
+        assert!(
+            !streaming.contains("connector_local_scan_since_ts_map"),
+            "the streaming producer must not fall back to the batch producer's cutoff"
+        );
+        let batch = top_level_fn(source, "run_batch_index_with_connector_factories");
+        assert!(
+            batch.contains("connector_local_scan_since_ts_map"),
+            "the batch producer keeps the escalation: it has no durable source ledger"
+        );
+    }
+
+    #[test]
     fn cursor_configured_roots_retain_incremental_watermarks() -> Result<()> {
         let temp = TempDir::new()?;
         let storage = FrankenStorage::open(&temp.path().join("cass.db"))?;
@@ -57615,7 +52403,8 @@ mod tests {
         .with_fs_metadata();
         let before = source_file_observation(&path).unwrap();
         let saved=serde_json::json!({"primary":before,"dependencies":[source_file_observation(temp.path()).unwrap()],
-            "producer_contract":env!("CASS_SOURCE_INGEST_CONTRACT")}).to_string();
+            "producer_contract":crate::connectors::ingest_contract::provider_contract(
+                &source.provider_slug)}).to_string();
         std::thread::sleep(Duration::from_millis(2));
         std::fs::write(&path, b"after!").unwrap();
         std::fs::OpenOptions::new()
@@ -57649,7 +52438,8 @@ mod tests {
         .with_fs_metadata();
         let snapshot = || {
             serde_json::json!({"primary":source_file_observation(&path).unwrap(),
-            "producer_contract":env!("CASS_SOURCE_INGEST_CONTRACT"),
+            "producer_contract":crate::connectors::ingest_contract::provider_contract(
+                &source.provider_slug),
             "dependencies":[source_file_observation(temp.path()).unwrap(),source_file_observation(&sidecar).unwrap()]}).to_string()
         };
         let saved = snapshot();
@@ -59306,6 +54096,58 @@ mod tests {
         .unwrap();
         assert_eq!(pending(4096), None, "a completed migration never defers");
         assert_eq!(fs::metadata(&db_path).unwrap().len(), 8192);
+    }
+
+    /// GH #450: the repair is a named phase whose top-level counters carry
+    /// bytes, and whose evidence (archive bytes, pages, RSS, PSI, last
+    /// activity) rides in the snapshot under `compatibility_repair`. The
+    /// historic failure was `phase:"preparing", current:0, total:0` while
+    /// 1,491 s of repair work was in flight.
+    #[test]
+    fn compatibility_repair_publishes_byte_progress_before_any_indexing_phase() {
+        let progress = IndexingProgress::default();
+        let snapshot: crate::storage::compat_repair::CompatRepairReceipt =
+            serde_json::from_value(serde_json::json!({
+                "state": "running",
+                "archive_path": "/tmp/agent_search.db",
+                "archive_bytes": 8192,
+                "pages_total": 2,
+                "page_size": 4096,
+                "progress_current": 4096,
+                "progress_total": 8192,
+                "started_at_unix": 1_700_000_000,
+                "updated_at_unix": 1_700_000_001,
+                "rss_bytes": 1024,
+                "psi_io_some_avg10": 73.32,
+            }))
+            .expect("valid receipt");
+
+        progress.publish_compat_repair(&snapshot);
+        let payload = progress.snapshot_json(1_000);
+        assert_eq!(payload["phase"], "compatibility_repair");
+        assert_eq!(
+            payload["phase_code"],
+            serde_json::json!(INDEX_PHASE_COMPATIBILITY_REPAIR)
+        );
+        assert_eq!(payload["unit"], "bytes");
+        assert_eq!(payload["current"], 4096);
+        assert_eq!(payload["total"], 8192);
+        assert_eq!(payload["compatibility_repair"]["state"], "running");
+        assert_eq!(payload["compatibility_repair"]["archive_bytes"], 8192);
+        assert_eq!(payload["compatibility_repair"]["pages_total"], 2);
+        assert_eq!(payload["compatibility_repair"]["rss_bytes"], 1024);
+        assert_eq!(payload["compatibility_repair"]["psi_io_some_avg10"], 73.32);
+        assert!(
+            payload["compatibility_repair"]["last_activity_age_ms"]
+                .as_u64()
+                .is_some(),
+            "the snapshot must age the last observed work"
+        );
+
+        progress.clear_compat_repair();
+        let idle = progress.snapshot_json(2_000);
+        assert_eq!(idle["phase"], "preparing");
+        assert!(idle["compatibility_repair"].is_null());
     }
 
     #[test]
@@ -61618,6 +56460,179 @@ c.close()
         );
     }
 
+    fn capture_verified_raw_mirror_session(
+        data_dir: &Path,
+        source_path: &Path,
+    ) -> crate::raw_mirror::RawMirrorCaptureRecord {
+        std::fs::write(
+            source_path,
+            "{\"role\":\"user\",\"content\":\"alpha\"}\n{\"role\":\"assistant\",\"content\":\"beta\"}\n",
+        )
+        .unwrap();
+        crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
+            data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path,
+            db_links: &[crate::raw_mirror::RawMirrorDbLink {
+                conversation_id: Some(1),
+                message_count: Some(2),
+                source_path: Some(source_path.display().to_string()),
+                started_at_ms: Some(1_733_000_000_000),
+            }],
+        })
+        .expect("capture source into the raw mirror")
+    }
+
+    #[test]
+    fn full_rebuild_recovers_malformed_archive_from_verified_raw_mirror() {
+        // GH #374 Defect 1: a checksum-verified raw mirror is the recovery
+        // authority for a malformed/unopenable canonical archive. The malformed
+        // bundle is quarantined (never deleted), and the promoted rebuild is a
+        // real canonical archive holding the mirror-captured conversation.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+        let source_path = tmp.path().join("session.jsonl");
+        let capture = capture_verified_raw_mirror_session(&data_dir, &source_path);
+
+        let report = crate::collect_doctor_raw_mirror_report(&data_dir);
+        assert!(
+            crate::doctor_raw_mirror_is_verified_recovery_authority(&report),
+            "fixture mirror must be a verified recovery authority: {report:#?}"
+        );
+
+        let malformed = b"not a sqlite database";
+        std::fs::write(&db_path, malformed).unwrap();
+        let wal_path = crate::storage::sqlite::database_sidecar_path(&db_path, "-wal");
+        let shm_path = crate::storage::sqlite::database_sidecar_path(&db_path, "-shm");
+        std::fs::write(&wal_path, b"stale-wal").unwrap();
+        std::fs::write(&shm_path, b"stale-shm").unwrap();
+
+        let recovery = recover_canonical_archive_from_verified_raw_mirror(&data_dir, &db_path)
+            .expect("raw-mirror recovery should run")
+            .expect("verified mirror must authorize recovery");
+        assert_eq!(recovery.inserted_conversations, 1);
+        assert_eq!(recovery.inserted_messages, 2);
+
+        // No source-of-truth bytes may disappear: the malformed bundle and its
+        // sidecars are preserved under the quarantine name.
+        assert!(recovery.archived_bundle.exists());
+        assert_eq!(std::fs::read(&recovery.archived_bundle).unwrap(), malformed);
+        assert_eq!(
+            std::fs::read(crate::storage::sqlite::database_sidecar_path(
+                &recovery.archived_bundle,
+                "-wal"
+            ))
+            .unwrap(),
+            b"stale-wal"
+        );
+        assert_eq!(
+            std::fs::read(crate::storage::sqlite::database_sidecar_path(
+                &recovery.archived_bundle,
+                "-shm"
+            ))
+            .unwrap(),
+            b"stale-shm"
+        );
+        assert!(
+            !wal_path.exists() && !shm_path.exists(),
+            "stale sidecars must move with the quarantined bundle, not leak into the rebuilt archive"
+        );
+
+        // The promoted archive is readable and contains the mirror session.
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(count_total_conversations_exact(&storage).unwrap(), 1);
+        let message_count = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM messages",
+                &[] as &[ParamValue],
+                |row| row.get_typed::<i64>(0),
+            )
+            .unwrap();
+        assert_eq!(message_count, 2);
+        let source_evidence: String = storage
+            .raw()
+            .query_row_map(
+                "SELECT content FROM messages ORDER BY id LIMIT 1",
+                &[] as &[ParamValue],
+                |row| row.get_typed::<String>(0),
+            )
+            .unwrap();
+        assert_eq!(source_evidence, "alpha");
+        storage.close().unwrap();
+
+        // The capture record still points at the untouched mirror blob.
+        let mirror_blob = data_dir
+            .join("raw-mirror")
+            .join("v1")
+            .join(&capture.blob_relative_path);
+        assert!(mirror_blob.is_file());
+    }
+
+    #[test]
+    fn full_rebuild_preserves_malformed_archive_when_raw_mirror_is_unverified() {
+        // Without a checksum-verified authority the existing safe refusal must
+        // hold: the malformed canonical bytes stay exactly where they are and
+        // no quarantine/rebuild artifact appears.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+        let source_path = tmp.path().join("session.jsonl");
+        let capture = capture_verified_raw_mirror_session(&data_dir, &source_path);
+
+        let blob_path = data_dir
+            .join("raw-mirror")
+            .join("v1")
+            .join(&capture.blob_relative_path);
+        let mut blob = std::fs::read(&blob_path).unwrap();
+        blob[0] ^= 0xff;
+        std::fs::write(&blob_path, blob).unwrap();
+
+        let report = crate::collect_doctor_raw_mirror_report(&data_dir);
+        assert!(
+            report.summary.checksum_mismatch_count > 0,
+            "fixture must invalidate the mirror checksum: {report:#?}"
+        );
+        assert!(
+            !crate::doctor_raw_mirror_is_verified_recovery_authority(&report),
+            "a checksum-mismatched mirror must not be a recovery authority"
+        );
+
+        let malformed = b"not a sqlite database";
+        std::fs::write(&db_path, malformed).unwrap();
+        assert!(
+            recover_canonical_archive_from_verified_raw_mirror(&data_dir, &db_path)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            malformed,
+            "unverified-mirror recovery must not touch the canonical archive"
+        );
+        let quarantine_artifacts = std::fs::read_dir(&data_dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .map(|name| name.contains(".corrupt."))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            quarantine_artifacts, 0,
+            "a refused recovery must not quarantine the archive"
+        );
+    }
+
     #[test]
     fn persist_append_only_adds_new_messages_to_index() {
         let tmp = TempDir::new().unwrap();
@@ -61647,90 +56662,6 @@ c.close()
         let reader = index.reader().unwrap();
         crate::search::quill_bridge::refresh_reader(&reader).unwrap();
         assert_eq!(reader.doc_count().expect("doc count"), 3);
-    }
-
-    #[test]
-    #[serial]
-    // Asserts the staged-shard rebuild strategy, which builds N independent
-    // index directories and merges them. That merge is Tantivy-only (Quill's
-    // concat_merge joins segments WITHIN one manifest), so the strategy is
-    // disabled for the Quill backend — see the `staged_shard_plan` binding.
-    // Ignored rather than deleted: these are exactly the tests that must pass
-    // if an N-directory merge is ever built, and weakening them would hide
-    // that the strategy no longer runs.
-    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
-    fn rebuild_tantivy_from_db_emits_phase_exact_prep_profile_logs() {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-
-        let db_path = data_dir.join("db.sqlite");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        seed_lexical_rebuild_fixture(&storage);
-
-        let _prep_profile = set_env("CASS_PREP_PROFILE", "1");
-        let _conversation_limit = set_env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "2");
-
-        let logs = capture_logs(|| {
-            let rebuild = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
-            assert_eq!(rebuild.indexed_docs, 4);
-        });
-
-        // Bead 9752r: commit 9e6c0ef7 (9ct8r) routes restart_from_zero
-        // rebuilds with total_conversations > 0 through
-        // `rebuild_tantivy_from_db_via_staged_shards`, which builds in
-        // a scratch tmpdir and publishes atomically via
-        // `publish_staged_lexical_index`. That path never opens a
-        // Tantivy writer against the live index, so the in-place-only
-        // steps `open_tantivy` and `ready_to_index` are no longer
-        // emitted for this scenario. The staged path's analogue is
-        // `persist_initial_checkpoint` (which already appears below).
-        for needle in [
-            "lexical rebuild prep profile",
-            r#"component="main""#,
-            r#"step="open_readonly""#,
-            r#"step="compute_db_state_fingerprint""#,
-            r#"step="load_checkpoint_state""#,
-            r#"step="start_packet_producer""#,
-            r#"step="plan_lexical_shards""#,
-            r#"step="persist_initial_checkpoint""#,
-            r#"component="producer""#,
-            r#"step="load_sources""#,
-            r#"step="build_lookups""#,
-            r#"step="load_resume_cursor""#,
-            r#"step="first_batch_handoff""#,
-        ] {
-            assert!(
-                logs.contains(needle),
-                "expected prep-profile log fragment `{needle}`, got:
-{logs}"
-            );
-        }
-
-        // Ordering invariant: deterministic shard planning must
-        // complete before the producer starts up, and the producer
-        // startup must complete before the initial checkpoint is
-        // persisted (the staged-path analogue of the old
-        // "producer-before-open_tantivy" overlap contract).
-        let start_packet_producer = logs
-            .find(r#"step="start_packet_producer""#)
-            .expect("start_packet_producer log position");
-        let plan_lexical_shards = logs
-            .find(r#"step="plan_lexical_shards""#)
-            .expect("plan_lexical_shards log position");
-        let persist_initial_checkpoint = logs
-            .find(r#"step="persist_initial_checkpoint""#)
-            .expect("persist_initial_checkpoint log position");
-        assert!(
-            plan_lexical_shards < start_packet_producer,
-            "fresh rebuild should finish deterministic shard planning before producer startup overlap: {logs}"
-        );
-        assert!(
-            start_packet_producer < persist_initial_checkpoint,
-            "fresh staged rebuild should start the packet producer before \
-             persisting the initial checkpoint (producer-handoff overlap): {logs}"
-        );
     }
 
     #[test]
@@ -61783,81 +56714,6 @@ c.close()
             !index_path.join("meta.json").exists(),
             "completed checkpoint fast-path should not create Tantivy metadata"
         );
-    }
-
-    #[test]
-    #[serial]
-    // Asserts the staged-shard rebuild strategy, which builds N independent
-    // index directories and merges them. That merge is Tantivy-only (Quill's
-    // concat_merge joins segments WITHIN one manifest), so the strategy is
-    // disabled for the Quill backend — see the `staged_shard_plan` binding.
-    // Ignored rather than deleted: these are exactly the tests that must pass
-    // if an N-directory merge is ever built, and weakening them would hide
-    // that the strategy no longer runs.
-    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
-    fn rebuild_tantivy_from_db_logs_streamed_batch_stats() {
-        // Bead 9752r: after 9e6c0ef7 (9ct8r) routes restart_from_zero
-        // rebuilds with total_conversations > 0 through the
-        // staged-shards path, the in-place streaming `flushed a
-        // streamed conversation batch` + `chunk_*` logs no longer
-        // fire for this scenario. The staged path's equivalent
-        // page-level diagnostic is `lexical rebuild prepared bounded
-        // page` (already emitted) plus `built lexical rebuild shard
-        // index` as the commit-phase analogue. The bounded-page
-        // budget fields and the overall indexed_docs assertion below
-        // are preserved because they're path-agnostic contracts.
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-
-        let db_path = data_dir.join("db.sqlite");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        seed_lexical_rebuild_fixture(&storage);
-
-        let _conversation_limit = set_env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "2");
-
-        let logs = capture_logs(|| {
-            let rebuild = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
-            assert_eq!(rebuild.indexed_docs, 4);
-            assert_eq!(rebuild.observed_messages, Some(4));
-        });
-
-        assert!(
-            logs.contains(
-                "running fresh authoritative lexical rebuild via staged shard-build path"
-            ),
-            "expected staged-shards rebuild banner after 9ct8r routing, got:
-{logs}"
-        );
-        assert!(
-            logs.contains("lexical rebuild prepared bounded page"),
-            "expected page-level bounded-prep diagnostics, got:
-{logs}"
-        );
-        assert!(
-            logs.contains("budget_shrink_decision=")
-                && logs.contains("batch_fetch_message_bytes_limit=")
-                && logs.contains("max_message_bytes_in_flight="),
-            "expected bounded page budget diagnostics, got:
-{logs}"
-        );
-        assert!(
-            logs.contains("page_messages=4") && logs.contains("page_conversations=2"),
-            "expected per-page conversation + message counts matching the fixture (2 convs / 4 msgs), got:
-{logs}"
-        );
-        assert!(
-            logs.contains("built lexical rebuild shard index"),
-            "expected staged-shards commit-phase diagnostic, got:
-{logs}"
-        );
-        assert!(
-            logs.contains("indexed_docs=4") && logs.contains("shard_conversations=2"),
-            "expected shard-build completion counts (4 docs / 2 convs) in staged output, got:
-{logs}"
-        );
-        assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 4);
     }
 
     #[test]
@@ -62030,83 +56886,6 @@ c.close()
             logs.contains("generation_id=") && logs.contains("attempt_id="),
             "expected generation_id + attempt_id fields in publish log, got:
 {logs}"
-        );
-    }
-
-    #[test]
-    #[serial]
-    // Asserts the staged-shard rebuild strategy, which builds N independent
-    // index directories and merges them. That merge is Tantivy-only (Quill's
-    // concat_merge joins segments WITHIN one manifest), so the strategy is
-    // disabled for the Quill backend — see the `staged_shard_plan` binding.
-    // Ignored rather than deleted: these are exactly the tests that must pass
-    // if an N-directory merge is ever built, and weakening them would hide
-    // that the strategy no longer runs.
-    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
-    fn rebuild_tantivy_from_db_persists_packet_refresh_ledger() {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-
-        let db_path = data_dir.join("db.sqlite");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        seed_lexical_rebuild_fixture(&storage);
-
-        let logs = capture_logs(|| {
-            let rebuild = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
-            let evidence = rebuild
-                .equivalence
-                .as_ref()
-                .expect("authoritative rebuild must emit equivalence evidence");
-
-            let index_path = index_dir(&data_dir).unwrap();
-            let raw = std::fs::read_to_string(lexical_refresh_ledger_path(&index_path))
-                .expect("refresh ledger should be persisted for the packet-driven rebuild");
-            let ledger: refresh_ledger::RefreshLedger =
-                serde_json::from_str(&raw).expect("refresh ledger must be valid JSON");
-            let milestones = ledger.readiness_milestones();
-
-            assert_eq!(
-                milestones.search_readiness_state,
-                refresh_ledger::RefreshSearchReadinessState::Published
-            );
-            assert!(
-                milestones.time_to_lexical_ready_ms.is_some(),
-                "packet rebuild should record a lexical-ready milestone"
-            );
-            assert!(
-                milestones.time_to_search_ready_ms.is_some(),
-                "packet rebuild should record a search-ready milestone"
-            );
-            assert_eq!(
-                ledger.tags.get("dataflow").map(String::as_str),
-                Some("conversation_packet")
-            );
-            assert_eq!(
-                ledger.tags.get("publish_mode").map(String::as_str),
-                Some("atomic_staged_swap")
-            );
-            assert!(
-                ledger.full_rebuild,
-                "authoritative canonical packet replay is a full lexical rebuild"
-            );
-            assert_eq!(
-                ledger
-                    .phase(refresh_ledger::RefreshPhase::LexicalRebuild)
-                    .and_then(|phase| phase.counters.get("indexed_docs"))
-                    .copied(),
-                Some(u64::try_from(rebuild.indexed_docs).unwrap_or(u64::MAX))
-            );
-            assert_eq!(
-                ledger.equivalence.search_hit_digest.as_deref(),
-                Some(evidence.golden_query_digest.as_str())
-            );
-        });
-
-        assert!(
-            logs.contains("lexical refresh ledger published"),
-            "expected refresh ledger publish log, got:\n{logs}"
         );
     }
 
@@ -62968,337 +57747,6 @@ c.close()
 
     #[test]
     #[serial]
-    // Asserts the staged-shard rebuild strategy, which builds N independent
-    // index directories and merges them. That merge is Tantivy-only (Quill's
-    // concat_merge joins segments WITHIN one manifest), so the strategy is
-    // disabled for the Quill backend — see the `staged_shard_plan` binding.
-    // Ignored rather than deleted: these are exactly the tests that must pass
-    // if an N-directory merge is ever built, and weakening them would hide
-    // that the strategy no longer runs.
-    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
-    fn rebuild_tantivy_from_db_fresh_run_uses_staged_shard_build_path() {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-
-        let db_path = data_dir.join("db.sqlite");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        seed_lexical_rebuild_fixture(&storage);
-
-        let _workers = set_env("CASS_TANTIVY_REBUILD_WORKERS", "6");
-        let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "2");
-        let _fetch_conversations = set_env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "1");
-        let _startup_fetch_conversations = set_env(
-            "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
-            "1",
-        );
-        let _first_budget_promotion_wait = set_env(
-            "CASS_TANTIVY_REBUILD_FIRST_BUDGET_PROMOTION_WAIT_MS",
-            "5000",
-        );
-        let _commit_conversations = set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS", "1");
-        let _startup_commit_conversations = set_env(
-            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS",
-            "1",
-        );
-
-        let logs = capture_logs(|| {
-            let rebuild = rebuild_tantivy_from_db_with_options(
-                &db_path,
-                &data_dir,
-                2,
-                None,
-                LexicalRebuildStartupOptions {
-                    defer_initial_content_fingerprint: true,
-                },
-                None,
-            )
-            .unwrap();
-            assert_eq!(rebuild.indexed_docs, 4);
-            assert_eq!(rebuild.observed_messages, Some(4));
-            assert!(rebuild.exact_checkpoint_persisted);
-        });
-
-        assert!(
-            logs.contains("staged shard-build path"),
-            "expected staged shard-build log, got:\n{logs}"
-        );
-        assert!(
-            !logs.contains("timed out waiting for first durable budget promotion"),
-            "staged shard-build path should advance the first durable shard without a producer timeout: {logs}"
-        );
-        let index_path = index_dir(&data_dir).unwrap();
-        let state = load_lexical_rebuild_state(&index_path)
-            .unwrap()
-            .expect("completed lexical rebuild state after staged shard build");
-        assert!(state.completed);
-        assert_eq!(
-            state.execution_mode,
-            Some(LexicalRebuildExecutionMode::SharedWriter)
-        );
-        assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 4);
-    }
-
-    #[test]
-    #[serial]
-    // Asserts the staged-shard rebuild strategy, which builds N independent
-    // index directories and merges them. That merge is Tantivy-only (Quill's
-    // concat_merge joins segments WITHIN one manifest), so the strategy is
-    // disabled for the Quill backend — see the `staged_shard_plan` binding.
-    // Ignored rather than deleted: these are exactly the tests that must pass
-    // if an N-directory merge is ever built, and weakening them would hide
-    // that the strategy no longer runs.
-    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
-    fn rebuild_tantivy_from_db_bounded_final_frontier_publishes_federated_without_remerge() {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-
-        let db_path = data_dir.join("db.sqlite");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        seed_lexical_rebuild_fixture(&storage);
-        let agent = Agent {
-            id: None,
-            slug: "codex".into(),
-            name: "Codex".into(),
-            version: Some("0.2.3".into()),
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-        for (suffix, base_ts) in [("3", 1_700_000_002_000_i64), ("4", 1_700_000_003_000_i64)] {
-            let external_id = format!("lexical-fixture-{suffix}");
-            storage
-                .insert_conversation_tree(
-                    agent_id,
-                    None,
-                    &Conversation {
-                        id: None,
-                        agent_slug: "codex".into(),
-                        workspace: Some(PathBuf::from("/tmp/workspace")),
-                        external_id: Some(external_id.clone()),
-                        title: Some("Lexical rebuild fixture".into()),
-                        source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
-                        started_at: Some(base_ts),
-                        ended_at: Some(base_ts + 100),
-                        approx_tokens: Some(64),
-                        metadata_json: serde_json::Value::Null,
-                        messages: vec![
-                            Message {
-                                id: None,
-                                idx: 0,
-                                role: MessageRole::User,
-                                author: Some("user".into()),
-                                created_at: Some(base_ts + 10),
-                                content: format!("{external_id}-first"),
-                                extra_json: serde_json::json!({"opaque": true}),
-                                snippets: Vec::new(),
-                            },
-                            Message {
-                                id: None,
-                                idx: 1,
-                                role: MessageRole::Agent,
-                                author: Some("assistant".into()),
-                                created_at: Some(base_ts + 20),
-                                content: format!("{external_id}-second"),
-                                extra_json: serde_json::json!({"opaque": true}),
-                                snippets: Vec::new(),
-                            },
-                        ],
-                        source_id: LOCAL_SOURCE_ID.into(),
-                        origin_host: None,
-                    },
-                )
-                .unwrap();
-        }
-
-        let _workers = set_env("CASS_TANTIVY_REBUILD_WORKERS", "6");
-        let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "2");
-        let _fetch_conversations = set_env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "1");
-        let _startup_fetch_conversations = set_env(
-            "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
-            "1",
-        );
-        let _commit_conversations = set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS", "1");
-        let _startup_commit_conversations = set_env(
-            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS",
-            "1",
-        );
-
-        let logs = capture_logs(|| {
-            let rebuild = rebuild_tantivy_from_db_with_options(
-                &db_path,
-                &data_dir,
-                2,
-                None,
-                LexicalRebuildStartupOptions {
-                    defer_initial_content_fingerprint: true,
-                },
-                None,
-            )
-            .unwrap();
-            assert_eq!(rebuild.indexed_docs, 8);
-            assert_eq!(rebuild.observed_messages, Some(8));
-            assert!(rebuild.exact_checkpoint_persisted);
-        });
-
-        assert!(
-            logs.contains("staged shard-build path"),
-            "expected staged shard-build log, got:\n{logs}"
-        );
-        assert!(
-            logs.contains(
-                "publishing staged lexical rebuild as federated lexical shard set without final assembly collapse"
-            ),
-            "expected bounded final-frontier federated publish log, got:\n{logs}"
-        );
-        assert!(
-            !logs.contains("running staged lexical rebuild merge round"),
-            "a bounded final frontier should not trigger a redundant final merge round: {logs}"
-        );
-        assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 8);
-    }
-
-    #[test]
-    #[serial]
-    // Asserts the staged-shard rebuild strategy, which builds N independent
-    // index directories and merges them. That merge is Tantivy-only (Quill's
-    // concat_merge joins segments WITHIN one manifest), so the strategy is
-    // disabled for the Quill backend — see the `staged_shard_plan` binding.
-    // Ignored rather than deleted: these are exactly the tests that must pass
-    // if an N-directory merge is ever built, and weakening them would hide
-    // that the strategy no longer runs.
-    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
-    fn rebuild_tantivy_from_db_multi_artifact_final_frontier_assembles_publish_generation_without_doc_remerge()
-     {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-
-        let db_path = data_dir.join("db.sqlite");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        seed_lexical_rebuild_fixture(&storage);
-        let agent = Agent {
-            id: None,
-            slug: "codex".into(),
-            name: "Codex".into(),
-            version: Some("0.2.3".into()),
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-        let base_ts = 1_700_000_100_000_i64;
-        let external_id = "lexical-fixture-3";
-        storage
-            .insert_conversation_tree(
-                agent_id,
-                None,
-                &Conversation {
-                    id: None,
-                    agent_slug: "codex".into(),
-                    workspace: Some(PathBuf::from("/tmp/workspace")),
-                    external_id: Some(external_id.into()),
-                    title: Some("Lexical rebuild fixture".into()),
-                    source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
-                    started_at: Some(base_ts),
-                    ended_at: Some(base_ts + 100),
-                    approx_tokens: Some(64),
-                    metadata_json: serde_json::Value::Null,
-                    messages: vec![
-                        Message {
-                            id: None,
-                            idx: 0,
-                            role: MessageRole::User,
-                            author: Some("user".into()),
-                            created_at: Some(base_ts + 10),
-                            content: format!("{external_id}-first"),
-                            extra_json: serde_json::json!({"opaque": true}),
-                            snippets: Vec::new(),
-                        },
-                        Message {
-                            id: None,
-                            idx: 1,
-                            role: MessageRole::Agent,
-                            author: Some("assistant".into()),
-                            created_at: Some(base_ts + 20),
-                            content: format!("{external_id}-second"),
-                            extra_json: serde_json::json!({"opaque": true}),
-                            snippets: Vec::new(),
-                        },
-                    ],
-                    source_id: LOCAL_SOURCE_ID.into(),
-                    origin_host: None,
-                },
-            )
-            .unwrap();
-
-        let _workers = set_env("CASS_TANTIVY_REBUILD_WORKERS", "6");
-        let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "2");
-        let _fetch_conversations = set_env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "1");
-        let _startup_fetch_conversations = set_env(
-            "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
-            "1",
-        );
-        let _commit_conversations = set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS", "1");
-        let _startup_commit_conversations = set_env(
-            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS",
-            "1",
-        );
-
-        let logs = capture_logs(|| {
-            let rebuild = rebuild_tantivy_from_db_with_options(
-                &db_path,
-                &data_dir,
-                2,
-                None,
-                LexicalRebuildStartupOptions {
-                    defer_initial_content_fingerprint: true,
-                },
-                None,
-            )
-            .unwrap();
-            assert_eq!(rebuild.indexed_docs, 6);
-            assert_eq!(rebuild.observed_messages, Some(6));
-            assert!(rebuild.exact_checkpoint_persisted);
-        });
-
-        assert!(
-            logs.contains("staged shard-build path"),
-            "expected staged shard-build log, got:\n{logs}"
-        );
-        assert!(
-            logs.contains(
-                "publishing staged lexical rebuild as federated lexical shard set without final assembly collapse"
-            ),
-            "expected federated final publish log, got:\n{logs}"
-        );
-        assert!(
-            !logs.contains("running staged lexical rebuild merge round"),
-            "federated multi-artifact publish should avoid the fallback merge-tree tail: {logs}"
-        );
-        let index_path = index_dir(&data_dir).unwrap();
-        assert_eq!(
-            crate::search::tantivy::open_federated_search_readers(&index_path)
-                .unwrap()
-                .expect("published federated readers")
-                .len(),
-            3,
-            "published staged rebuild should preserve the three final shard artifacts as a federated lexical bundle"
-        );
-        assert_eq!(
-            crate::search::tantivy::searchable_index_summary(&index_path)
-                .unwrap()
-                .expect("searchable summary")
-                .segments,
-            3,
-            "published staged rebuild should report the three preserved final shard segments"
-        );
-        assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 6);
-    }
-
-    #[test]
-    #[serial]
     fn publish_staged_lexical_index_replaces_live_index_and_retains_prior_backup() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -63374,111 +57822,6 @@ c.close()
                 .docs,
             1,
             "the retained backup should preserve the previously published live index"
-        );
-    }
-
-    /// Regression for GH #333: an authoritative rebuild must not move the
-    /// currently searchable generation out of the live path before its staged
-    /// replacement is ready. The injected publication failure models a killed
-    /// or failed post-lexical/semantic run: the command must fail while the
-    /// exact prior live document surface remains searchable.
-    #[test]
-    #[serial]
-    // Asserts the staged-shard rebuild strategy, which builds N independent
-    // index directories and merges them. That merge is Tantivy-only (Quill's
-    // concat_merge joins segments WITHIN one manifest), so the strategy is
-    // disabled for the Quill backend — see the `staged_shard_plan` binding.
-    // Ignored rather than deleted: these are exactly the tests that must pass
-    // if an N-directory merge is ever built, and weakening them would hide
-    // that the strategy no longer runs.
-    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
-    fn run_index_authoritative_rebuild_failure_preserves_prior_live_generation() {
-        const ENOSPC_RAW_OS_ERROR: i32 = 28;
-
-        let tmp = TempDir::new().unwrap();
-        let home = tmp.path().join("home");
-        let data_dir = home.join("cass-data");
-        fs::create_dir_all(&data_dir).unwrap();
-        let db_path = data_dir.join("db.sqlite");
-        let mut storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        seed_lexical_rebuild_fixture(&storage);
-        storage.close_best_effort_in_place();
-
-        let index_path = index_dir(&data_dir).unwrap();
-        let prior_conv = norm_conv(
-            Some("gh333-prior-live"),
-            vec![norm_msg(0, 1_700_013_000_000)],
-        );
-        let mut prior_live = TantivyIndex::open_or_create(&index_path).unwrap();
-        prior_live
-            .add_messages_with_conversation_id(&prior_conv, &prior_conv.messages, Some(1_300))
-            .unwrap();
-        prior_live.commit().unwrap();
-        drop(prior_live);
-        assert_eq!(
-            crate::search::tantivy::searchable_index_summary(&index_path)
-                .unwrap()
-                .unwrap()
-                .docs,
-            1
-        );
-
-        // Force the normal run_index preflight down the authoritative rebuild
-        // path without using --force-rebuild's readonly fast path.
-        fs::write(
-            index_path.join("schema_hash.json"),
-            br#"{"schema_hash":"gh333-stale-schema"}"#,
-        )
-        .unwrap();
-
-        let _home = set_env("HOME", &home.to_string_lossy());
-        let _codex_home = set_env("CODEX_HOME", &home.join(".codex-empty").to_string_lossy());
-        let _ignore_sources = ignore_sources_config();
-        let progress = Arc::new(IndexingProgress::default());
-        let opts = IndexOptions {
-            full: false,
-            force_rebuild: false,
-            watch: false,
-            watch_once_paths: None,
-            db_path,
-            data_dir: data_dir.clone(),
-            semantic: false,
-            build_hnsw: false,
-            embedder: "hash".to_string(),
-            progress: Some(progress),
-            watch_interval_secs: 30,
-        };
-
-        #[cfg(target_os = "linux")]
-        let _fault = inject_lexical_publish_rename_failure_once(
-            LexicalPublishRenameSite::LinuxParkPriorLiveToCanonicalSidecar,
-            ENOSPC_RAW_OS_ERROR,
-        );
-        #[cfg(not(target_os = "linux"))]
-        let _fault = inject_lexical_publish_rename_failure_once(
-            LexicalPublishRenameSite::NonLinuxPublishStagedLive,
-            ENOSPC_RAW_OS_ERROR,
-        );
-
-        let error = run_index(opts, None)
-            .expect_err("injected staged publication failure must fail the index command");
-        assert!(
-            format!("{error:#}").contains("rolled back")
-                || format!("{error:#}").contains("publishing staged lexical index"),
-            "failure should retain staged-publication context: {error:#}"
-        );
-        assert_eq!(
-            crate::search::tantivy::searchable_index_summary(&index_path)
-                .unwrap()
-                .unwrap()
-                .docs,
-            1,
-            "failed authoritative publication must preserve the prior searchable generation"
-        );
-        assert!(
-            !index_path.with_extension("bak").exists(),
-            "run_index must not strand the published generation in the obsolete eager .bak path"
         );
     }
 
@@ -65033,485 +59376,6 @@ c.close()
                 None => std::env::remove_var("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION"),
             }
         }
-    }
-
-    /// On Unix, unlinking a retained backup while a reader still has
-    /// that old index open must not corrupt the reader. This pins the
-    /// common GC case where bounded retention prunes older backup
-    /// generations after a successful publish, while some concurrent
-    /// diagnostic or stale reader still has the old directory mapped.
-    #[test]
-    #[serial]
-    #[cfg(unix)]
-    // Asserts staged-publish backup retention, which only runs under the
-    // staged-shard rebuild strategy — Tantivy-only and disabled for the Quill
-    // backend (see the `staged_shard_plan` binding). Ignored rather than
-    // weakened so it still guards the behavior if that strategy returns.
-    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
-    fn publish_staged_lexical_index_prunes_retained_backup_without_breaking_open_reader() {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        fs::create_dir_all(&data_dir).unwrap();
-        let index_path = index_dir(&data_dir).unwrap();
-
-        let build_generation =
-            |path: &Path, label: &str, doc_count: usize, conversation_id: i64, base_ts: i64| {
-                let messages = (0..doc_count)
-                    .map(|idx| norm_msg(idx as i64, base_ts + (idx as i64 * 100)))
-                    .collect::<Vec<_>>();
-                let conv = norm_conv(Some(label), messages);
-                let mut index = TantivyIndex::open_or_create(path).unwrap();
-                index
-                    .add_messages_with_conversation_id(&conv, &conv.messages, Some(conversation_id))
-                    .unwrap();
-                index.commit().unwrap();
-                drop(index);
-            };
-
-        build_generation(
-            &index_path,
-            "retained-reader-seed",
-            1,
-            1_100,
-            1_700_011_000_000,
-        );
-
-        let (oldest_backup_path, oldest_backup_reader) = {
-            let _retention_two = set_env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "2");
-
-            for (iteration, doc_count, conversation_id) in
-                [(1_usize, 2_usize, 1_101_i64), (2_usize, 3_usize, 1_102_i64)]
-            {
-                let stage_root = TempDirBuilder::new()
-                    .prefix(&format!("cass-test-open-reader-retention-{iteration}."))
-                    .tempdir_in(data_dir.parent().unwrap())
-                    .unwrap();
-                let staged_index_path = stage_root.path().join("staged");
-                build_generation(
-                    &staged_index_path,
-                    &format!("retained-reader-stage-{iteration}"),
-                    doc_count,
-                    conversation_id,
-                    1_700_011_100_000 + iteration as i64 * 1_000,
-                );
-                publish_staged_lexical_index(&staged_index_path, &index_path).unwrap();
-            }
-
-            let backups_dir = lexical_publish_backups_dir(&index_path);
-            let mut retained_with_docs: Vec<(usize, PathBuf)> = fs::read_dir(&backups_dir)
-                .unwrap()
-                .map(|entry| {
-                    let path = entry.unwrap().path();
-                    let docs = crate::search::tantivy::searchable_index_summary(&path)
-                        .unwrap()
-                        .unwrap()
-                        .docs;
-                    (docs, path)
-                })
-                .collect();
-            retained_with_docs.sort_by_key(|(docs, _path)| *docs);
-            assert_eq!(
-                retained_with_docs
-                    .iter()
-                    .map(|(docs, _)| *docs)
-                    .collect::<Vec<_>>(),
-                vec![1, 2],
-                "retention=2 should retain the oldest two prior-live generations before pruning is tightened"
-            );
-
-            let oldest_backup_path = retained_with_docs[0].1.clone();
-            let oldest_backup_index = TantivyIndex::open_or_create(&oldest_backup_path).unwrap();
-            let oldest_backup_reader = oldest_backup_index.reader().unwrap();
-            crate::search::quill_bridge::refresh_reader(&oldest_backup_reader).unwrap();
-            assert_eq!(
-                oldest_backup_reader.doc_count().expect("doc count"),
-                1,
-                "precondition: the pinned reader must observe the oldest retained backup generation"
-            );
-            drop(oldest_backup_index);
-
-            (oldest_backup_path, oldest_backup_reader)
-        };
-
-        let _retention_one = set_env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "1");
-        let stage_root = TempDirBuilder::new()
-            .prefix("cass-test-open-reader-retention-prune.")
-            .tempdir_in(data_dir.parent().unwrap())
-            .unwrap();
-        let staged_index_path = stage_root.path().join("staged");
-        build_generation(
-            &staged_index_path,
-            "retained-reader-stage-prune",
-            4,
-            1_103,
-            1_700_011_200_000,
-        );
-        publish_staged_lexical_index(&staged_index_path, &index_path).unwrap();
-
-        assert!(
-            !oldest_backup_path.exists(),
-            "bounded retention should prune the oldest retained backup path once the cap drops to 1"
-        );
-        assert_eq!(
-            oldest_backup_reader.doc_count().expect("doc count"),
-            1,
-            "an open reader pinned to a pruned retained backup must keep serving the prior doc surface"
-        );
-        assert_eq!(
-            crate::search::tantivy::searchable_index_summary(&index_path)
-                .unwrap()
-                .unwrap()
-                .docs,
-            4,
-            "live index must advance to the newly published generation while stale-reader GC runs"
-        );
-
-        let backups_dir = lexical_publish_backups_dir(&index_path);
-        let retained_doc_counts: Vec<usize> = fs::read_dir(&backups_dir)
-            .unwrap()
-            .map(|entry| {
-                let path = entry.unwrap().path();
-                crate::search::tantivy::searchable_index_summary(&path)
-                    .unwrap()
-                    .unwrap()
-                    .docs
-            })
-            .collect();
-        assert_eq!(
-            retained_doc_counts,
-            vec![3],
-            "retention=1 should leave exactly the immediately prior live generation after pruning"
-        );
-    }
-
-    #[test]
-    #[serial]
-    // Asserts the staged-shard rebuild strategy, which builds N independent
-    // index directories and merges them. That merge is Tantivy-only (Quill's
-    // concat_merge joins segments WITHIN one manifest), so the strategy is
-    // disabled for the Quill backend — see the `staged_shard_plan` binding.
-    // Ignored rather than deleted: these are exactly the tests that must pass
-    // if an N-directory merge is ever built, and weakening them would hide
-    // that the strategy no longer runs.
-    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
-    fn rebuild_tantivy_from_db_publishes_bounded_final_frontier_without_reduction() {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-
-        let db_path = data_dir.join("db.sqlite");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        seed_lexical_rebuild_fixture(&storage);
-        let agent = Agent {
-            id: None,
-            slug: "codex".into(),
-            name: "Codex".into(),
-            version: Some("0.2.3".into()),
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-        for suffix in 3..=15 {
-            let base_ts = 1_700_000_000_000_i64 + (i64::from(suffix) * 1_000_i64);
-            let external_id = format!("lexical-fixture-{suffix}");
-            storage
-                .insert_conversation_tree(
-                    agent_id,
-                    None,
-                    &Conversation {
-                        id: None,
-                        agent_slug: "codex".into(),
-                        workspace: Some(PathBuf::from("/tmp/workspace")),
-                        external_id: Some(external_id.clone()),
-                        title: Some("Lexical rebuild fixture".into()),
-                        source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
-                        started_at: Some(base_ts),
-                        ended_at: Some(base_ts + 100),
-                        approx_tokens: Some(64),
-                        metadata_json: serde_json::Value::Null,
-                        messages: vec![
-                            Message {
-                                id: None,
-                                idx: 0,
-                                role: MessageRole::User,
-                                author: Some("user".into()),
-                                created_at: Some(base_ts + 10),
-                                content: format!("{external_id}-first"),
-                                extra_json: serde_json::json!({"opaque": true}),
-                                snippets: Vec::new(),
-                            },
-                            Message {
-                                id: None,
-                                idx: 1,
-                                role: MessageRole::Agent,
-                                author: Some("assistant".into()),
-                                created_at: Some(base_ts + 20),
-                                content: format!("{external_id}-second"),
-                                extra_json: serde_json::json!({"opaque": true}),
-                                snippets: Vec::new(),
-                            },
-                        ],
-                        source_id: LOCAL_SOURCE_ID.into(),
-                        origin_host: None,
-                    },
-                )
-                .unwrap();
-        }
-
-        let _workers = set_env("CASS_TANTIVY_REBUILD_WORKERS", "6");
-        let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "2");
-        let _fetch_conversations = set_env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "1");
-        let _startup_fetch_conversations = set_env(
-            "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
-            "1",
-        );
-        let _commit_conversations = set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS", "1");
-        let _startup_commit_conversations = set_env(
-            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS",
-            "1",
-        );
-
-        let mut rebuild_equivalence: Option<super::LexicalRebuildEquivalenceEvidence> = None;
-        let logs = capture_logs(|| {
-            let rebuild = rebuild_tantivy_from_db_with_options(
-                &db_path,
-                &data_dir,
-                2,
-                None,
-                LexicalRebuildStartupOptions {
-                    defer_initial_content_fingerprint: true,
-                },
-                None,
-            )
-            .unwrap();
-            assert_eq!(rebuild.indexed_docs, 30);
-            assert_eq!(rebuild.observed_messages, Some(30));
-            assert!(rebuild.exact_checkpoint_persisted);
-            rebuild_equivalence = rebuild.equivalence.clone();
-        });
-        let evidence = rebuild_equivalence
-            .expect("staged shard rebuild must emit equivalence evidence like the normal path");
-
-        assert!(
-            logs.contains("staged shard-build path"),
-            "expected staged shard-build log, got:\n{logs}"
-        );
-        assert!(
-            logs.contains(
-                "publishing staged lexical rebuild as federated lexical shard set without final assembly collapse"
-            ),
-            "expected bounded final frontier to publish as a federated bundle, got:\n{logs}"
-        );
-        assert!(
-            !logs
-                .contains("draining staged lexical rebuild final merge frontier via merge workers"),
-            "bounded final frontier should not pay foreground reduction cost: {logs}"
-        );
-        assert!(
-            !logs.contains("running staged lexical rebuild merge round"),
-            "bounded final frontier should avoid the fallback merge-tree tail: {logs}"
-        );
-        let index_path = index_dir(&data_dir).unwrap();
-        let state = load_lexical_rebuild_state(&index_path)
-            .unwrap()
-            .expect("completed lexical rebuild state after bounded final-frontier publish");
-        assert_eq!(
-            state.committed_meta_fingerprint.as_deref(),
-            index_meta_fingerprint(&index_path).unwrap().as_deref(),
-            "completed staged rebuild state should retain the live published meta fingerprint"
-        );
-        let evidence_path = lexical_rebuild_equivalence_evidence_path(&index_path);
-        let persisted_evidence: super::LexicalRebuildEquivalenceEvidence =
-            serde_json::from_slice(&std::fs::read(&evidence_path).unwrap()).unwrap();
-        assert_eq!(
-            persisted_evidence, evidence,
-            "staged shard rebuild must persist the same equivalence evidence it returns"
-        );
-        let manifest = lexical_generation::load_manifest(&index_path)
-            .unwrap()
-            .expect("staged shard rebuild must persist a published generation manifest");
-        assert_eq!(
-            manifest.build_state,
-            lexical_generation::LexicalGenerationBuildState::Validated
-        );
-        assert_eq!(
-            manifest.publish_state,
-            lexical_generation::LexicalGenerationPublishState::Published
-        );
-        assert_eq!(
-            manifest.equivalence_manifest_fingerprint.as_deref(),
-            Some(evidence.manifest_fingerprint.as_str()),
-            "staged shard generation manifest must point at the persisted equivalence evidence"
-        );
-        assert!(
-            logs.contains("lexical generation manifest published"),
-            "expected staged shard path to log generation manifest publish, got:\n{logs}"
-        );
-        assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 30);
-    }
-
-    #[test]
-    #[serial]
-    // Asserts the staged-shard rebuild strategy, which builds N independent
-    // index directories and merges them. That merge is Tantivy-only (Quill's
-    // concat_merge joins segments WITHIN one manifest), so the strategy is
-    // disabled for the Quill backend — see the `staged_shard_plan` binding.
-    // Ignored rather than deleted: these are exactly the tests that must pass
-    // if an N-directory merge is ever built, and weakening them would hide
-    // that the strategy no longer runs.
-    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
-    fn rebuild_tantivy_from_db_discards_incomplete_staged_shard_checkpoint_and_restarts() {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-
-        let db_path = data_dir.join("db.sqlite");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        seed_lexical_rebuild_fixture(&storage);
-
-        let index_path = index_dir(&data_dir).unwrap();
-        std::fs::create_dir_all(&index_path).unwrap();
-        let fingerprint = lexical_storage_fingerprint_for_db(&db_path).unwrap();
-        std::fs::write(
-            lexical_rebuild_state_path(&index_path),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "version": LEXICAL_REBUILD_STATE_VERSION,
-                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
-                "db": {
-                    "db_path": db_path.display().to_string(),
-                    "total_conversations": 2,
-                    "total_messages": 0,
-                    "storage_fingerprint": fingerprint,
-                },
-                "page_size": LEXICAL_REBUILD_PAGE_SIZE,
-                "committed_offset": 0,
-                "committed_conversation_id": null,
-                "processed_conversations": 1,
-                "indexed_docs": 2,
-                "committed_meta_fingerprint": null,
-                "pending": {
-                    "next_offset": 1,
-                    "next_conversation_id": 1,
-                    "processed_conversations": 1,
-                    "indexed_docs": 2,
-                    "base_meta_fingerprint": null,
-                },
-                "completed": false,
-                "updated_at_ms": FrankenStorage::now_millis(),
-                "execution_mode": "staged_shard_build",
-                "runtime": {
-                    "queue_depth": 1,
-                    "inflight_message_bytes": 128,
-                    "pending_batch_conversations": 1,
-                    "pending_batch_message_bytes": 128,
-                    "page_prep_workers": 1,
-                    "active_page_prep_jobs": 1,
-                    "ordered_buffered_pages": 0,
-                    "budget_generation": 0,
-                    "host_loadavg_1m_milli": null,
-                    "controller_mode": "",
-                    "controller_reason": "",
-                    "updated_at_ms": FrankenStorage::now_millis(),
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let _prep_profile = set_env("CASS_PREP_PROFILE", "1");
-        let _workers = set_env("CASS_TANTIVY_REBUILD_WORKERS", "6");
-        let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "2");
-        let _fetch_conversations = set_env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "1");
-        let _startup_fetch_conversations = set_env(
-            "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
-            "1",
-        );
-        let _commit_conversations = set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS", "1");
-        let _startup_commit_conversations = set_env(
-            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS",
-            "1",
-        );
-
-        let logs = capture_logs(|| {
-            let rebuild = rebuild_tantivy_from_db_with_options(
-                &db_path,
-                &data_dir,
-                2,
-                None,
-                LexicalRebuildStartupOptions::default(),
-                None,
-            )
-            .unwrap();
-            assert_eq!(rebuild.indexed_docs, 4);
-            assert_eq!(rebuild.observed_messages, Some(4));
-        });
-
-        assert!(
-            logs.contains("discarding non-resumable staged lexical rebuild checkpoint"),
-            "expected staged checkpoint reset log, got:\n{logs}"
-        );
-        for needle in [
-            r#"step="restart_from_zero_reset""#,
-            r#"step="plan_lexical_shards""#,
-            r#"step="start_packet_producer""#,
-            r#"step="persist_initial_checkpoint""#,
-            r#"step="first_batch_handoff""#,
-        ] {
-            assert!(
-                logs.contains(needle),
-                "expected staged restart prep-profile log fragment `{needle}`, got:\n{logs}"
-            );
-        }
-        let restart_from_zero_reset = logs
-            .find(r#"step="restart_from_zero_reset""#)
-            .expect("restart_from_zero_reset log position");
-        let plan_lexical_shards = logs
-            .find(r#"step="plan_lexical_shards""#)
-            .expect("plan_lexical_shards log position");
-        let start_packet_producer = logs
-            .find(r#"step="start_packet_producer""#)
-            .expect("start_packet_producer log position");
-        let persist_initial_checkpoint = logs
-            .find(r#"step="persist_initial_checkpoint""#)
-            .expect("persist_initial_checkpoint log position");
-        let first_batch_handoff = logs
-            .find(r#"step="first_batch_handoff""#)
-            .expect("first_batch_handoff log position");
-        // Bead 9752r: commit 9e6c0ef7 (9ct8r) moved shard planning
-        // BEFORE the restart-from-zero reset — the reset now needs to
-        // know whether a staged shard plan exists so it can skip the
-        // live-index pre-wipe when the staged-shards path will
-        // atomically publish instead. Planning still completes before
-        // producer startup and initial-checkpoint persistence. The
-        // producer can hand off its first page before the main thread
-        // logs checkpoint persistence on a fast scheduler, so the
-        // checkpoint's final durable contents below are the safety
-        // proof rather than that intra-startup log order.
-        assert!(
-            plan_lexical_shards < restart_from_zero_reset,
-            "9ct8r: staged shard planning must run BEFORE the restart-from-zero \
-             reset so the reset can decide whether to skip the pre-wipe: {logs}"
-        );
-        assert!(
-            plan_lexical_shards < start_packet_producer,
-            "restart-from-zero rebuild should finish shard planning before producer startup overlap: {logs}"
-        );
-        assert!(
-            start_packet_producer < persist_initial_checkpoint,
-            "restart-from-zero staged rebuild should overlap producer startup before persisting the fresh startup checkpoint: {logs}"
-        );
-        assert!(
-            start_packet_producer < first_batch_handoff,
-            "restart-from-zero rebuild must start the producer before it hands off its first batch: {logs}"
-        );
-        let checkpoint = load_lexical_rebuild_checkpoint(&index_path)
-            .unwrap()
-            .expect("completed checkpoint after staged checkpoint reset");
-        assert!(checkpoint.completed);
-        assert_eq!(checkpoint.processed_conversations, 2);
-        assert_eq!(checkpoint.indexed_docs, 4);
-        assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 4);
     }
 
     #[test]
@@ -72772,308 +66636,6 @@ c.close()
                 .as_ref()
                 .and_then(|pending| pending.base_meta_fingerprint.as_deref()),
             index_meta_fingerprint(&index_path).unwrap().as_deref()
-        );
-    }
-
-    #[test]
-    // Asserts the staged-shard rebuild strategy, which builds N independent
-    // index directories and merges them. That merge is Tantivy-only (Quill's
-    // concat_merge joins segments WITHIN one manifest), so the strategy is
-    // disabled for the Quill backend — see the `staged_shard_plan` binding.
-    // Ignored rather than deleted: these are exactly the tests that must pass
-    // if an N-directory merge is ever built, and weakening them would hide
-    // that the strategy no longer runs.
-    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
-    fn commit_lexical_rebuild_progress_without_finalized_checkpoint_persist_leaves_recoverable_pending_state()
-     {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        fs::create_dir_all(&data_dir).unwrap();
-        let index_path = index_dir(&data_dir).unwrap();
-        let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
-        let conversation = norm_conv(Some("final-commit"), vec![norm_msg(0, 1_700_000_000_000)]);
-        index
-            .add_messages_with_conversation_id(&conversation, &conversation.messages, Some(1))
-            .unwrap();
-
-        let mut state = LexicalRebuildState::new(
-            LexicalRebuildDbState {
-                db_path: "/tmp/agent_search.db".to_string(),
-                total_conversations: 1,
-                total_messages: 1,
-                storage_fingerprint: "seed:1".to_string(),
-            },
-            LEXICAL_REBUILD_PAGE_SIZE,
-        );
-        let runtime = LexicalRebuildPipelineRuntimeSnapshot {
-            queue_depth: 0,
-            inflight_message_bytes: 0,
-            max_message_bytes_in_flight: 4_096,
-            pending_batch_conversations: 1,
-            pending_batch_message_bytes: 128,
-            page_prep_workers: 1,
-            active_page_prep_jobs: 0,
-            ordered_buffered_pages: 0,
-            budget_generation: 1,
-            producer_budget_wait_count: 0,
-            producer_budget_wait_ms: 0,
-            producer_handoff_wait_count: 1,
-            producer_handoff_wait_ms: 4,
-            host_loadavg_1m_milli: None,
-            controller_mode: "steady".to_string(),
-            controller_reason: "final-commit".to_string(),
-            staged_merge_workers_max: 0,
-            staged_merge_allowed_jobs: 0,
-            staged_merge_active_jobs: 0,
-            staged_merge_ready_artifacts: 0,
-            staged_merge_ready_groups: 0,
-            staged_merge_controller_reason: String::new(),
-            staged_shard_build_workers_max: 0,
-            staged_shard_build_allowed_jobs: 0,
-            staged_shard_build_active_jobs: 0,
-            staged_shard_build_pending_jobs: 0,
-            staged_shard_build_controller_reason: String::new(),
-            updated_at_ms: 1_733_000_555_000_i64,
-            ..LexicalRebuildPipelineRuntimeSnapshot::default()
-        };
-
-        commit_lexical_rebuild_progress(
-            &index_path,
-            &index_path,
-            &mut state,
-            Some(1),
-            1,
-            1,
-            &runtime,
-            &mut index,
-            false,
-            None,
-        )
-        .unwrap();
-
-        assert!(state.pending.is_none());
-        assert_eq!(state.committed_offset, 1);
-        assert_eq!(state.committed_conversation_id, Some(1));
-        assert_eq!(state.processed_conversations, 1);
-        assert_eq!(state.indexed_docs, 1);
-        assert_eq!(
-            state.committed_meta_fingerprint.as_deref(),
-            index_meta_fingerprint(&index_path).unwrap().as_deref()
-        );
-
-        let persisted = load_lexical_rebuild_state(&index_path)
-            .unwrap()
-            .expect("pending checkpoint should remain on disk until completion");
-        assert!(persisted.pending.is_some());
-        assert_eq!(persisted.committed_meta_fingerprint, None);
-        assert_eq!(persisted.runtime, runtime);
-
-        let reconciled = reconcile_pending_lexical_commit(&index_path, persisted).unwrap();
-        assert!(reconciled.pending.is_none());
-        assert_eq!(reconciled.committed_offset, 1);
-        assert_eq!(reconciled.committed_conversation_id, Some(1));
-        assert_eq!(reconciled.processed_conversations, 1);
-        assert_eq!(reconciled.indexed_docs, 1);
-        assert_eq!(
-            reconciled.committed_meta_fingerprint.as_deref(),
-            index_meta_fingerprint(&index_path).unwrap().as_deref()
-        );
-    }
-
-    #[test]
-    fn maybe_persist_staged_lexical_rebuild_progress_skips_write_until_heartbeat_is_due() {
-        let tmp = TempDir::new().unwrap();
-        let index_path = tmp.path().join("index");
-        fs::create_dir_all(&index_path).unwrap();
-        fs::write(index_path.join("meta.json"), b"stable-meta").unwrap();
-
-        let mut state = LexicalRebuildState::new(
-            LexicalRebuildDbState {
-                db_path: "/tmp/agent_search.db".to_string(),
-                total_conversations: 12,
-                total_messages: 24,
-                storage_fingerprint: "seed:12".to_string(),
-            },
-            LEXICAL_REBUILD_PAGE_SIZE,
-        );
-        let runtime = LexicalRebuildPipelineRuntimeSnapshot {
-            queue_depth: 1,
-            inflight_message_bytes: 1_024,
-            max_message_bytes_in_flight: 4_096,
-            pending_batch_conversations: 1,
-            pending_batch_message_bytes: 2_048,
-            page_prep_workers: 2,
-            active_page_prep_jobs: 1,
-            ordered_buffered_pages: 0,
-            budget_generation: 1,
-            producer_budget_wait_count: 1,
-            producer_budget_wait_ms: 3,
-            producer_handoff_wait_count: 0,
-            producer_handoff_wait_ms: 0,
-            host_loadavg_1m_milli: None,
-            controller_mode: "startup".to_string(),
-            controller_reason: "staged-heartbeat".to_string(),
-            staged_merge_workers_max: 1,
-            staged_merge_allowed_jobs: 0,
-            staged_merge_active_jobs: 0,
-            staged_merge_ready_artifacts: 0,
-            staged_merge_ready_groups: 0,
-            staged_merge_controller_reason: "warming".to_string(),
-            staged_shard_build_workers_max: 4,
-            staged_shard_build_allowed_jobs: 2,
-            staged_shard_build_active_jobs: 2,
-            staged_shard_build_pending_jobs: 3,
-            staged_shard_build_controller_reason: "backlog".to_string(),
-            updated_at_ms: 1_733_000_444_000_i64,
-            ..LexicalRebuildPipelineRuntimeSnapshot::default()
-        };
-        let base_meta_fingerprint = index_meta_fingerprint(&index_path).unwrap();
-        let mut conversations_since_progress_persist = 1usize;
-        let mut last_progress_persist = Instant::now();
-
-        let persisted = maybe_persist_staged_lexical_rebuild_progress(
-            &index_path,
-            &mut state,
-            Some(1),
-            1,
-            2,
-            &runtime,
-            base_meta_fingerprint.as_deref(),
-            false,
-            &mut conversations_since_progress_persist,
-            8,
-            &mut last_progress_persist,
-            Duration::from_secs(60),
-            None,
-            None,
-        )
-        .unwrap();
-
-        assert!(!persisted);
-        assert_eq!(conversations_since_progress_persist, 1);
-        assert!(
-            load_lexical_rebuild_state(&index_path).unwrap().is_none(),
-            "staged progress should not rewrite the state file before the heartbeat is due"
-        );
-    }
-
-    #[test]
-    fn maybe_persist_staged_lexical_rebuild_progress_force_refreshes_runtime_without_new_progress()
-    {
-        let tmp = TempDir::new().unwrap();
-        let index_path = tmp.path().join("index");
-        fs::create_dir_all(&index_path).unwrap();
-        fs::write(index_path.join("meta.json"), b"stable-meta").unwrap();
-
-        let mut state = LexicalRebuildState::new(
-            LexicalRebuildDbState {
-                db_path: "/tmp/agent_search.db".to_string(),
-                total_conversations: 12,
-                total_messages: 24,
-                storage_fingerprint: "seed:12".to_string(),
-            },
-            LEXICAL_REBUILD_PAGE_SIZE,
-        );
-        let base_meta_fingerprint = index_meta_fingerprint(&index_path).unwrap();
-        state.record_pending_commit(Some(6), 6, 12, base_meta_fingerprint.clone());
-        state.set_runtime(&LexicalRebuildPipelineRuntimeSnapshot {
-            queue_depth: 1,
-            inflight_message_bytes: 1_024,
-            max_message_bytes_in_flight: 4_096,
-            pending_batch_conversations: 1,
-            pending_batch_message_bytes: 2_048,
-            page_prep_workers: 2,
-            active_page_prep_jobs: 1,
-            ordered_buffered_pages: 0,
-            budget_generation: 1,
-            producer_budget_wait_count: 1,
-            producer_budget_wait_ms: 3,
-            producer_handoff_wait_count: 0,
-            producer_handoff_wait_ms: 0,
-            host_loadavg_1m_milli: None,
-            controller_mode: "startup".to_string(),
-            controller_reason: "seeded-runtime".to_string(),
-            staged_merge_workers_max: 1,
-            staged_merge_allowed_jobs: 0,
-            staged_merge_active_jobs: 0,
-            staged_merge_ready_artifacts: 0,
-            staged_merge_ready_groups: 0,
-            staged_merge_controller_reason: "warming".to_string(),
-            staged_shard_build_workers_max: 4,
-            staged_shard_build_allowed_jobs: 2,
-            staged_shard_build_active_jobs: 2,
-            staged_shard_build_pending_jobs: 3,
-            staged_shard_build_controller_reason: "backlog".to_string(),
-            updated_at_ms: 1_733_000_555_000_i64,
-            ..LexicalRebuildPipelineRuntimeSnapshot::default()
-        });
-        persist_lexical_rebuild_state(&index_path, &state).unwrap();
-
-        let refreshed_runtime = LexicalRebuildPipelineRuntimeSnapshot {
-            queue_depth: 0,
-            inflight_message_bytes: 0,
-            max_message_bytes_in_flight: 4_096,
-            pending_batch_conversations: 0,
-            pending_batch_message_bytes: 0,
-            page_prep_workers: 2,
-            active_page_prep_jobs: 0,
-            ordered_buffered_pages: 0,
-            budget_generation: 2,
-            producer_budget_wait_count: 1,
-            producer_budget_wait_ms: 3,
-            producer_handoff_wait_count: 1,
-            producer_handoff_wait_ms: 5,
-            host_loadavg_1m_milli: Some(4_250),
-            controller_mode: "merge_tail".to_string(),
-            controller_reason: "draining_eager_merges".to_string(),
-            staged_merge_workers_max: 2,
-            staged_merge_allowed_jobs: 2,
-            staged_merge_active_jobs: 1,
-            staged_merge_ready_artifacts: 3,
-            staged_merge_ready_groups: 1,
-            staged_merge_controller_reason: "merge_backlog".to_string(),
-            staged_shard_build_workers_max: 4,
-            staged_shard_build_allowed_jobs: 0,
-            staged_shard_build_active_jobs: 0,
-            staged_shard_build_pending_jobs: 0,
-            staged_shard_build_controller_reason: "builders_idle".to_string(),
-            updated_at_ms: 1_733_000_666_000_i64,
-            ..LexicalRebuildPipelineRuntimeSnapshot::default()
-        };
-        let mut conversations_since_progress_persist = 0usize;
-        let mut last_progress_persist = Instant::now();
-
-        let persisted = maybe_persist_staged_lexical_rebuild_progress(
-            &index_path,
-            &mut state,
-            Some(6),
-            6,
-            12,
-            &refreshed_runtime,
-            base_meta_fingerprint.as_deref(),
-            true,
-            &mut conversations_since_progress_persist,
-            64,
-            &mut last_progress_persist,
-            Duration::from_secs(60),
-            None,
-            None,
-        )
-        .unwrap();
-
-        assert!(persisted);
-        assert_eq!(state.runtime, refreshed_runtime);
-        let persisted_state = load_lexical_rebuild_state(&index_path)
-            .unwrap()
-            .expect("forced staged heartbeat should persist");
-        assert_eq!(persisted_state.runtime, refreshed_runtime);
-        assert_eq!(
-            persisted_state
-                .pending
-                .as_ref()
-                .map(|pending| pending.next_conversation_id),
-            Some(Some(6)),
-            "forced staged heartbeat should keep the existing pending progress visible"
         );
     }
 

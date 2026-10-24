@@ -1325,19 +1325,19 @@ struct SearchLoopStats {
 
 #[test]
 #[serial]
-fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
+fn duplicate_fts_schema_rows_require_doctor_before_cli_writes_resume() {
     let sqlite3_available = std::process::Command::new("sqlite3")
         .arg("-version")
         .output()
         .is_ok_and(|output| output.status.success());
     if !sqlite3_available {
         eprintln!(
-            "skipping duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes: \
+            "skipping duplicate_fts_schema_rows_require_doctor_before_cli_writes_resume: \
              duplicate sqlite_master repair requires the sqlite3 CLI"
         );
         return;
     }
-    let tracker = tracker_for("duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes");
+    let tracker = tracker_for("duplicate_fts_schema_rows_require_doctor_before_cli_writes_resume");
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.to_path_buf();
@@ -1349,11 +1349,17 @@ fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
         .with_codex_home(&codex_home);
 
     let ts = 1_732_118_400_000u64;
+    // Complete content exceeds the stored lexical preview. Requesting an
+    // anchor with full content must therefore open the canonical archive.
+    let initial_content = format!(
+        "fts_repair_initial_token {}canonical_hydration_tail",
+        "canonical hydration padding ".repeat(256)
+    );
     make_codex_session(
         &codex_home,
         "2024/11/20",
         "rollout-fts-repair.jsonl",
-        "fts_repair_initial_token",
+        &initial_content,
         ts,
     );
     let session_file = codex_home.join("sessions/2024/11/20/rollout-fts-repair.jsonl");
@@ -1423,6 +1429,203 @@ fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
         "the injected duplicate schema row should reproduce the unreadable pre-fix SQLite state"
     );
 
+    let before_refusal = fs::read(&db_path).expect("capture the conflicting archive");
+    let metadata_search = tracker.phase(
+        "derived_metadata_search",
+        "The published lexical generation can serve metadata without opening the archive",
+        || {
+            command_env
+                .cass_assert_command()
+                .args([
+                    "search",
+                    "fts_repair_initial_token",
+                    "--robot",
+                    "--mode",
+                    "lexical",
+                    "--no-maintenance",
+                    "--fields",
+                    "minimal",
+                    "--timeout",
+                    "0",
+                    "--data-dir",
+                ])
+                .arg(&data_dir)
+                .current_dir(home)
+                .output()
+                .expect("search the published lexical metadata")
+        },
+    );
+    assert!(metadata_search.status.success(), "{metadata_search:?}");
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&metadata_search.stdout).expect("parse metadata-only search");
+    assert_eq!(metadata["hits"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        fs::read(&db_path).expect("read the archive after metadata search"),
+        before_refusal,
+        "serving the derived generation must not repair the archive"
+    );
+
+    let strict_hydration_command = || {
+        let mut command = command_env.cass_assert_command();
+        command
+            .args([
+                "search",
+                "fts_repair_initial_token",
+                "--robot",
+                "--mode",
+                "lexical",
+                "--no-maintenance",
+                "--fields",
+                "content,message_anchor",
+                "--timeout",
+                "0",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .current_dir(home);
+        command
+    };
+    // `stats` opens the canonical archive on both 71759163 and current code;
+    // its behavior cannot be satisfied by a derived lexical generation or a
+    // newer search flag that the historical CLI does not recognize.
+    let mut stats_command = command_env.cass_assert_command();
+    stats_command
+        .args(["stats", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .current_dir(home);
+    for (step, mut command) in [
+        ("ordinary_archive_read_requires_repair", stats_command),
+        (
+            "strict_hydration_requires_repair",
+            strict_hydration_command(),
+        ),
+    ] {
+        let refused_read = tracker.phase(
+            step,
+            "Canonical reads refuse the conflicting archive without repairing it",
+            || command.output().expect("read the conflicting archive"),
+        );
+        assert_eq!(
+            refused_read.status.code(),
+            Some(7),
+            "{step}: {refused_read:?}"
+        );
+        let read_refusal: serde_json::Value = String::from_utf8_lossy(&refused_read.stderr)
+            .lines()
+            .rev()
+            .find_map(|line| serde_json::from_str(line).ok())
+            .expect("canonical reads must emit a structured repair-required error");
+        assert_eq!(read_refusal["error"]["kind"], "schema-repair-required");
+        assert_eq!(read_refusal["error"]["code"], 7);
+        assert_eq!(read_refusal["error"]["retryable"], false);
+        assert!(
+            read_refusal["error"]["hint"]
+                .as_str()
+                .expect("canonical read repair hint")
+                .contains("cass doctor --fix")
+        );
+        assert_eq!(
+            fs::read(&db_path).expect("read the refused archive"),
+            before_refusal,
+            "{step} must not repair or rewrite the archive"
+        );
+    }
+
+    let refused_index = tracker.phase(
+        "index_requires_explicit_repair",
+        "Ordinary indexing refuses the conflicting catalog without changing archive bytes",
+        || {
+            command_env
+                .cass_assert_command()
+                .args(["index", "--json", "--no-progress-events", "--data-dir"])
+                .arg(&data_dir)
+                .current_dir(home)
+                .output()
+                .expect("run index against the conflicting catalog")
+        },
+    );
+    assert_eq!(refused_index.status.code(), Some(7));
+    let refusal: serde_json::Value = serde_json::from_slice(&refused_index.stdout)
+        .expect("index must emit a structured repair-required error");
+    assert_eq!(refusal["success"], false);
+    assert_eq!(refusal["kind"], "schema-repair-required");
+    assert_eq!(refusal["code"], 7);
+    assert_eq!(refusal["retryable"], false);
+    assert!(
+        refusal["hint"]
+            .as_str()
+            .expect("actionable repair hint")
+            .contains("cass doctor --fix")
+    );
+    assert_eq!(
+        fs::read(&db_path).expect("read the refused archive"),
+        before_refusal,
+        "ordinary indexing must not repair or rewrite the conflicting archive"
+    );
+
+    let doctor = tracker.phase(
+        "doctor_repairs_conflicting_catalog",
+        "Explicit doctor repair restores the catalog before reads and writes resume",
+        || {
+            command_env
+                .cass_assert_command()
+                .args(["doctor", "--fix", "--json", "--data-dir"])
+                .arg(&data_dir)
+                .current_dir(home)
+                .output()
+                .expect("repair the conflicting catalog through doctor")
+        },
+    );
+    let doctor_json: serde_json::Value =
+        serde_json::from_slice(&doctor.stdout).expect("parse the doctor repair report");
+    let repair = doctor_json["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["name"] == "conflicting_fts_schema_rows")
+        .expect("doctor must report the conflicting catalog repair");
+    assert_eq!(repair["status"], "pass", "{doctor_json}");
+    assert_eq!(repair["fix_applied"], true, "{doctor_json}");
+    assert_eq!(
+        count_messages(&db_path),
+        baseline_messages,
+        "doctor must preserve every canonical message"
+    );
+
+    let repaired_bytes = fs::read(&db_path).expect("capture the repaired archive");
+    let hydrated = tracker.phase(
+        "strict_hydration_after_doctor",
+        "The identical strict request returns complete content and anchors after doctor repair",
+        || {
+            strict_hydration_command()
+                .output()
+                .expect("hydrate canonical content after doctor repair")
+        },
+    );
+    assert!(hydrated.status.success(), "{hydrated:?}");
+    let hydrated_json: serde_json::Value =
+        serde_json::from_slice(&hydrated.stdout).expect("parse hydrated search");
+    let hydrated_hits = hydrated_json["hits"].as_array().expect("hydrated hits");
+    assert_eq!(hydrated_hits.len(), 2);
+    for hit in hydrated_hits {
+        let content = hit["content"].as_str().expect("complete canonical content");
+        assert!(
+            content == initial_content || content == format!("{initial_content}_response"),
+            "the complete original message must survive catalog repair"
+        );
+        assert!(
+            hit["message_anchor"]
+                .as_str()
+                .expect("anchor requires complete canonical authority")
+                .starts_with("v1:")
+        );
+    }
+    assert_eq!(
+        fs::read(&db_path).expect("read the hydrated archive"),
+        repaired_bytes,
+        "successful strict hydration must leave archive bytes unchanged"
+    );
+
     let existing_search = command_env
         .cass_assert_command()
         .args([
@@ -1439,7 +1642,7 @@ fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
         .expect("search for existing content after duplicate schema injection");
     assert!(
         existing_search.status.success(),
-        "search should continue to succeed even when the fallback SQLite FTS table is malformed\nstdout:\n{}\nstderr:\n{}",
+        "search should succeed after the explicit doctor repair\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&existing_search.stdout),
         String::from_utf8_lossy(&existing_search.stderr)
     );
@@ -1451,7 +1654,7 @@ fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
         .unwrap_or(0);
     assert!(
         existing_hits >= 1,
-        "the Tantivy index should remain authoritative for search results"
+        "the lexical index must retain the original searchable content"
     );
 
     let incremental_index = command_env
@@ -1465,7 +1668,7 @@ fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
         .expect("run index after duplicate schema injection");
     assert!(
         incremental_index.status.success(),
-        "incremental index should succeed even when the fallback SQLite FTS table is malformed\nstdout:\n{}\nstderr:\n{}",
+        "incremental index should succeed after the explicit doctor repair\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&incremental_index.stdout),
         String::from_utf8_lossy(&incremental_index.stderr)
     );
@@ -1530,7 +1733,7 @@ fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
         .expect("search for appended content after repair");
     assert!(
         appended.status.success(),
-        "search should succeed after incremental write even with malformed fallback FTS\nstdout:\n{}\nstderr:\n{}",
+        "search should succeed after the repaired archive accepts an incremental write\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&appended.stdout),
         String::from_utf8_lossy(&appended.stderr)
     );
@@ -2220,912 +2423,6 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
             .with_custom("max_search_duration_ms", search_stats.max_duration_ms)
             .with_custom("stable_doc_count", before_docs as u64)
             .with_custom("stable_total_matches", baseline_total_matches),
-    );
-    tracker.complete();
-}
-
-#[test]
-#[serial]
-// Exercises the FEDERATED atomic-publish path, which is the Tantivy-only
-// staged-shard machinery disabled for the Quill backend. The single-index
-// atomic swap that actually runs is covered by
-// tests/atomic_swap_publish_crash_window.rs. Ignored, not weakened.
-#[ignore = "federated staged-shard publish is Tantivy-only; disabled on the Quill backend"]
-fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_atomic_publish() {
-    let tracker = tracker_for(
-        "force_rebuild_preserves_search_results_and_reader_surface_during_federated_atomic_publish",
-    );
-    let tmp = tempfile::TempDir::new().unwrap();
-    let home = tmp.path().to_path_buf();
-    let codex_home = home.to_path_buf();
-    let data_dir = home.join("cass_data");
-    fs::create_dir_all(&data_dir).unwrap();
-    let command_env = tracker
-        .command_environment()
-        .with_home(&home)
-        .with_codex_home(&codex_home);
-
-    const QUERY: &str = "federatedatomicswapsearchanchor";
-    for (filename, content, ts) in [
-        (
-            "rollout-fed-atomic-1.jsonl",
-            format!("{QUERY} session_alpha"),
-            1_732_310_000_000_u64,
-        ),
-        (
-            "rollout-fed-atomic-2.jsonl",
-            format!("{QUERY} session_beta"),
-            1_732_310_100_000_u64,
-        ),
-        (
-            "rollout-fed-atomic-3.jsonl",
-            format!("{QUERY} session_gamma"),
-            1_732_310_200_000_u64,
-        ),
-    ] {
-        make_codex_session(&codex_home, "2024/11/23", filename, &content, ts);
-    }
-
-    tracker.phase(
-        "seed_and_index_federated_fixture",
-        "Create three sessions and force a federated lexical publish bundle",
-        || {
-            let mut initial_index = command_env.cass_assert_command();
-            force_federated_publish_env(&mut initial_index);
-            initial_index
-                .args(["index", "--full", "--json", "--data-dir"])
-                .arg(&data_dir)
-                .current_dir(&home)
-                .env("CODEX_HOME", &codex_home)
-                .env("HOME", &home)
-                .timeout(Duration::from_secs(30))
-                .assert()
-                .success();
-        },
-    );
-
-    let live_index_path = index_dir(&data_dir).expect("resolve live Tantivy index path");
-    let before_summary = searchable_index_summary(&live_index_path)
-        .expect("read baseline federated searchable index summary")
-        .expect("baseline federated index should exist");
-    let before_docs = before_summary.docs;
-    assert!(
-        before_docs >= 3,
-        "baseline federated index should contain multiple docs"
-    );
-    let before_federated_readers = open_federated_search_readers(&live_index_path)
-        .expect("load federated readers before rebuild")
-        .expect("baseline federated manifest should exist");
-    assert!(
-        before_federated_readers.len() > 1,
-        "forced shard planner settings should produce a federated live index"
-    );
-
-    let mut baseline_command = command_env.cass_assert_command();
-    baseline_command
-        .args([
-            "search",
-            QUERY,
-            "--json",
-            "--mode",
-            "lexical",
-            "--fields",
-            "minimal",
-            "--limit",
-            "10",
-            "--data-dir",
-        ])
-        .arg(&data_dir)
-        .current_dir(&home)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", &home)
-        .timeout(Duration::from_secs(20));
-    let baseline_search = baseline_command
-        .output()
-        .expect("run baseline federated lexical search");
-    assert!(
-        baseline_search.status.success(),
-        "baseline federated lexical search should succeed before force rebuild\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&baseline_search.stdout),
-        String::from_utf8_lossy(&baseline_search.stderr)
-    );
-    let baseline_total_matches = total_matches_from_search_output(&baseline_search.stdout);
-    assert!(
-        baseline_total_matches > 0,
-        "baseline federated lexical search should return at least one hit before rebuild"
-    );
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let rebuild_running = Arc::new(AtomicBool::new(false));
-    let search_in_flight = Arc::new(AtomicBool::new(false));
-    let reader_attempts_during_rebuild = Arc::new(AtomicUsize::new(0));
-    let search_attempts_during_rebuild = Arc::new(AtomicUsize::new(0));
-    let (ready_tx, ready_rx) = mpsc::channel();
-
-    let reader_ready_tx = ready_tx.clone();
-    let reader_stop = Arc::clone(&stop);
-    let reader_rebuild_running = Arc::clone(&rebuild_running);
-    let reader_overlap = Arc::clone(&reader_attempts_during_rebuild);
-    let reader_index_path = live_index_path.clone();
-    let reader_deadline = Instant::now() + Duration::from_secs(20);
-    let reader_handle = std::thread::spawn(move || {
-        let _ = reader_ready_tx.send("reader");
-        let mut observations: Vec<Result<Option<SearchableIndexSummary>, String>> = Vec::new();
-        while !reader_stop.load(Ordering::Relaxed) && Instant::now() < reader_deadline {
-            if reader_rebuild_running.load(Ordering::Relaxed) {
-                reader_overlap.fetch_add(1, Ordering::Relaxed);
-            }
-            let obs = searchable_index_summary(&reader_index_path).map_err(|e| format!("{e:#}"));
-            observations.push(obs);
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        observations
-    });
-
-    let search_ready_tx = ready_tx.clone();
-    let search_stop = Arc::clone(&stop);
-    let search_rebuild_running = Arc::clone(&rebuild_running);
-    let search_in_flight_thread = Arc::clone(&search_in_flight);
-    let search_overlap = Arc::clone(&search_attempts_during_rebuild);
-    let search_home = home.clone();
-    let search_codex_home = codex_home.clone();
-    let search_data_dir = data_dir.clone();
-    let search_command_env = command_env.clone();
-    let search_handle = std::thread::spawn(move || {
-        let _ = search_ready_tx.send("search");
-        let mut stats = SearchLoopStats::default();
-        while !search_stop.load(Ordering::Relaxed) {
-            let search_started = Instant::now();
-            search_in_flight_thread.store(true, Ordering::Relaxed);
-            let started_during_rebuild = search_rebuild_running.load(Ordering::Relaxed);
-            let output = search_command_env
-                .cass_assert_command()
-                .args([
-                    "search",
-                    QUERY,
-                    "--json",
-                    "--mode",
-                    "lexical",
-                    "--fields",
-                    "minimal",
-                    "--limit",
-                    "10",
-                    "--data-dir",
-                ])
-                .arg(&search_data_dir)
-                .current_dir(&search_home)
-                .env("CODEX_HOME", &search_codex_home)
-                .env("HOME", &search_home)
-                .timeout(Duration::from_secs(20))
-                .output()
-                .expect("run concurrent federated cass search");
-            search_in_flight_thread.store(false, Ordering::Relaxed);
-            let search_finished = Instant::now();
-            if started_during_rebuild || search_rebuild_running.load(Ordering::Relaxed) {
-                search_overlap.fetch_add(1, Ordering::Relaxed);
-            }
-            let elapsed_ms = search_finished.duration_since(search_started).as_millis() as u64;
-            stats.attempts += 1;
-            stats.max_duration_ms = stats.max_duration_ms.max(elapsed_ms);
-
-            if output.status.success() {
-                let hit_count = total_matches_from_search_output(&output.stdout);
-                if hit_count != baseline_total_matches {
-                    stats.failures.push(format!(
-                        "concurrent federated lexical search returned {hit_count} hits; expected stable total_matches={baseline_total_matches}\nstdout:\n{}",
-                        String::from_utf8_lossy(&output.stdout)
-                    ));
-                } else {
-                    stats.successes += 1;
-                }
-            } else {
-                stats.failures.push(format!(
-                    "concurrent federated lexical search failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
-                    output.status.code(),
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-            }
-
-            std::thread::sleep(Duration::from_millis(40));
-        }
-
-        stats
-    });
-    drop(ready_tx);
-
-    for _ in 0..2 {
-        ready_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("reader and search concurrency helpers should start promptly");
-    }
-
-    let rebuild_start = tracker.start(
-        "force_federated_rebuild_under_concurrent_reader_and_search",
-        Some("Run cass index --full --force-rebuild with forced multi-shard planning while a direct reader and cass search poll the same live index"),
-    );
-    rebuild_running.store(true, Ordering::Relaxed);
-    if search_in_flight.load(Ordering::Relaxed) {
-        search_attempts_during_rebuild.fetch_add(1, Ordering::Relaxed);
-    }
-    let mut rebuild = command_env.cass_assert_command();
-    force_federated_publish_env(&mut rebuild);
-    let publish_pause_sentinel = home.join("federated-atomic-publish-overlap-sentinel.json");
-    let rebuild_output = rebuild
-        .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
-        .arg(&data_dir)
-        .current_dir(&home)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", &home)
-        .env(
-            "CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SENTINEL",
-            &publish_pause_sentinel,
-        )
-        .env("CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SLEEP_MS", "2000")
-        .timeout(Duration::from_secs(60))
-        .output()
-        .expect("run federated force rebuild under concurrent read/search load");
-    rebuild_running.store(false, Ordering::Relaxed);
-    let rebuild_duration_ms = rebuild_start.elapsed().as_millis() as u64;
-    tracker.end(
-        "force_federated_rebuild_under_concurrent_reader_and_search",
-        Some("Run cass index --full --force-rebuild with forced multi-shard planning while a direct reader and cass search poll the same live index"),
-        rebuild_start,
-    );
-
-    stop.store(true, Ordering::Relaxed);
-    let reader_observations = reader_handle.join().expect("join federated reader thread");
-    let search_stats = search_handle.join().expect("join federated search thread");
-
-    assert!(
-        rebuild_output.status.success(),
-        "federated force rebuild should succeed under concurrent reader/search load\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&rebuild_output.stdout),
-        String::from_utf8_lossy(&rebuild_output.stderr)
-    );
-    let rebuild_json: serde_json::Value =
-        serde_json::from_slice(&rebuild_output.stdout).expect("parse federated force rebuild json");
-    assert_eq!(
-        rebuild_json
-            .get("success")
-            .and_then(|value| value.as_bool()),
-        Some(true),
-        "federated force rebuild should report success in --json output"
-    );
-
-    assert!(
-        !reader_observations.is_empty(),
-        "reader should collect at least one observation during the federated force rebuild window"
-    );
-    assert!(
-        reader_attempts_during_rebuild.load(Ordering::Relaxed) > 0,
-        "expected direct reader overlap while federated force rebuild was running"
-    );
-    for (idx, observation) in reader_observations.iter().enumerate() {
-        if let Ok(Some(summary)) = observation {
-            assert_eq!(
-                summary.docs, before_docs,
-                "federated reader observation #{idx} returned docs={} instead of the stable count {before_docs}; \
-                 this indicates a half-torn federated lexical index surface during atomic publish",
-                summary.docs
-            );
-        }
-    }
-
-    assert!(
-        search_attempts_during_rebuild.load(Ordering::Relaxed) > 0,
-        "expected cass search overlap while federated force rebuild was running"
-    );
-    assert!(
-        search_stats.failures.is_empty(),
-        "concurrent cass search should stay logically stable during federated force rebuild:\n{}",
-        search_stats.failures.join("\n---\n")
-    );
-    assert!(
-        search_stats.successes > 0,
-        "expected at least one successful concurrent federated cass search attempt"
-    );
-
-    let after_summary = searchable_index_summary(&live_index_path)
-        .expect("read searchable summary after federated rebuild")
-        .expect("live index should still exist after federated rebuild");
-    assert_eq!(
-        after_summary.docs, before_docs,
-        "federated force rebuild on unchanged content should preserve the live doc count"
-    );
-    let after_federated_readers = open_federated_search_readers(&live_index_path)
-        .expect("load federated readers after rebuild")
-        .expect("federated manifest should still exist after rebuild");
-    assert!(
-        after_federated_readers.len() > 1,
-        "post-rebuild live surface should remain a federated lexical bundle"
-    );
-
-    let after_search = command_env
-        .cass_assert_command()
-        .args([
-            "search",
-            QUERY,
-            "--json",
-            "--mode",
-            "lexical",
-            "--fields",
-            "minimal",
-            "--limit",
-            "10",
-            "--data-dir",
-        ])
-        .arg(&data_dir)
-        .current_dir(&home)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", &home)
-        .timeout(Duration::from_secs(20))
-        .output()
-        .expect("run post-rebuild federated lexical search");
-    assert!(
-        after_search.status.success(),
-        "post-rebuild federated lexical search should succeed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&after_search.stdout),
-        String::from_utf8_lossy(&after_search.stderr)
-    );
-    let after_total_matches = total_matches_from_search_output(&after_search.stdout);
-    assert_eq!(
-        after_total_matches, baseline_total_matches,
-        "federated force rebuild on unchanged content should preserve the logical search result count"
-    );
-
-    tracker.metrics(
-        "force_federated_rebuild_concurrency_surface",
-        &E2ePerformanceMetrics::new()
-            .with_duration(rebuild_duration_ms)
-            .with_custom(
-                "reader_attempts_during_rebuild",
-                reader_attempts_during_rebuild.load(Ordering::Relaxed) as u64,
-            )
-            .with_custom(
-                "search_attempts_during_rebuild",
-                search_attempts_during_rebuild.load(Ordering::Relaxed) as u64,
-            )
-            .with_custom("search_attempts_total", search_stats.attempts as u64)
-            .with_custom("search_successes_total", search_stats.successes as u64)
-            .with_custom("max_search_duration_ms", search_stats.max_duration_ms)
-            .with_custom("stable_doc_count", before_docs as u64)
-            .with_custom("stable_total_matches", baseline_total_matches)
-            .with_custom(
-                "federated_shard_count",
-                after_federated_readers.len() as u64,
-            ),
-    );
-    tracker.complete();
-}
-
-#[test]
-#[serial]
-// Exercises the FEDERATED atomic-publish path, which is the Tantivy-only
-// staged-shard machinery disabled for the Quill backend. The single-index
-// atomic swap that actually runs is covered by
-// tests/atomic_swap_publish_crash_window.rs. Ignored, not weakened.
-#[ignore = "federated staged-shard publish is Tantivy-only; disabled on the Quill backend"]
-fn repeated_force_rebuild_preserves_federated_reader_and_search_stability() {
-    let tracker =
-        tracker_for("repeated_force_rebuild_preserves_federated_reader_and_search_stability");
-    let tmp = tempfile::TempDir::new().unwrap();
-    let home = tmp.path().to_path_buf();
-    let codex_home = home.to_path_buf();
-    let data_dir = home.join("cass_data");
-    fs::create_dir_all(&data_dir).unwrap();
-    let command_env = tracker
-        .command_environment()
-        .with_home(&home)
-        .with_codex_home(&codex_home);
-
-    const QUERY: &str = "federatedrebuildstabilityanchor";
-    const REBUILD_CYCLES: usize = 20;
-    for (filename, content, ts) in [
-        (
-            "rollout-fed-stability-1.jsonl",
-            format!("{QUERY} stability_alpha"),
-            1_732_311_000_000_u64,
-        ),
-        (
-            "rollout-fed-stability-2.jsonl",
-            format!("{QUERY} stability_beta"),
-            1_732_311_100_000_u64,
-        ),
-        (
-            "rollout-fed-stability-3.jsonl",
-            format!("{QUERY} stability_gamma"),
-            1_732_311_200_000_u64,
-        ),
-    ] {
-        make_codex_session(&codex_home, "2024/11/24", filename, &content, ts);
-    }
-
-    tracker.phase(
-        "seed_and_index_repeated_federated_fixture",
-        "Create three sessions and force an initial federated lexical publish bundle",
-        || {
-            let mut initial_index = command_env.cass_assert_command();
-            force_federated_publish_env(&mut initial_index);
-            initial_index
-                .args(["index", "--full", "--json", "--data-dir"])
-                .arg(&data_dir)
-                .current_dir(&home)
-                .env("CODEX_HOME", &codex_home)
-                .env("HOME", &home)
-                .timeout(Duration::from_secs(30))
-                .assert()
-                .success();
-        },
-    );
-
-    let live_index_path = index_dir(&data_dir).expect("resolve live Tantivy index path");
-    let before_summary = searchable_index_summary(&live_index_path)
-        .expect("read baseline federated searchable index summary")
-        .expect("baseline federated index should exist");
-    let before_docs = before_summary.docs;
-    assert!(
-        before_docs >= 3,
-        "baseline federated index should contain multiple docs"
-    );
-    let before_federated_readers = open_federated_search_readers(&live_index_path)
-        .expect("load federated readers before repeated rebuilds")
-        .expect("baseline federated manifest should exist");
-    let baseline_federated_reader_count = before_federated_readers.len();
-    assert!(
-        baseline_federated_reader_count > 1,
-        "forced shard planner settings should produce a federated live index"
-    );
-
-    let baseline_search = command_env
-        .cass_assert_command()
-        .args([
-            "search",
-            QUERY,
-            "--json",
-            "--mode",
-            "lexical",
-            "--fields",
-            "minimal",
-            "--limit",
-            "10",
-            "--data-dir",
-        ])
-        .arg(&data_dir)
-        .current_dir(&home)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", &home)
-        .timeout(Duration::from_secs(20))
-        .output()
-        .expect("run baseline repeated federated lexical search");
-    assert!(
-        baseline_search.status.success(),
-        "baseline repeated federated lexical search should succeed before force rebuild loop\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&baseline_search.stdout),
-        String::from_utf8_lossy(&baseline_search.stderr)
-    );
-    let baseline_total_matches = total_matches_from_search_output(&baseline_search.stdout);
-    assert!(
-        baseline_total_matches > 0,
-        "baseline repeated federated lexical search should return at least one hit before rebuild loop"
-    );
-
-    let repeated_rebuild_started = tracker.start(
-        "repeat_federated_force_rebuilds_and_validate_stability",
-        Some("Run repeated cass index --full --force-rebuild cycles with forced multi-shard planning and verify reader/search stability after every publish"),
-    );
-    let mut max_rebuild_duration_ms = 0_u64;
-    for cycle in 0..REBUILD_CYCLES {
-        let rebuild_started = Instant::now();
-        let mut rebuild = command_env.cass_assert_command();
-        force_federated_publish_env(&mut rebuild);
-        let rebuild_output = rebuild
-            .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
-            .arg(&data_dir)
-            .current_dir(&home)
-            .env("CODEX_HOME", &codex_home)
-            .env("HOME", &home)
-            .timeout(Duration::from_secs(60))
-            .output()
-            .expect("run repeated federated force rebuild");
-        let rebuild_duration_ms = rebuild_started.elapsed().as_millis() as u64;
-        max_rebuild_duration_ms = max_rebuild_duration_ms.max(rebuild_duration_ms);
-
-        assert!(
-            rebuild_output.status.success(),
-            "repeated federated force rebuild cycle {cycle} should succeed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&rebuild_output.stdout),
-            String::from_utf8_lossy(&rebuild_output.stderr)
-        );
-        let rebuild_json: serde_json::Value = serde_json::from_slice(&rebuild_output.stdout)
-            .expect("parse repeated federated force rebuild json");
-        assert_eq!(
-            rebuild_json
-                .get("success")
-                .and_then(|value| value.as_bool()),
-            Some(true),
-            "repeated federated force rebuild cycle {cycle} should report success in --json output"
-        );
-
-        let cycle_summary = searchable_index_summary(&live_index_path)
-            .expect("read searchable summary after repeated federated rebuild cycle")
-            .expect("live index should exist after repeated federated rebuild cycle");
-        assert_eq!(
-            cycle_summary.docs, before_docs,
-            "repeated federated force rebuild cycle {cycle} changed the live doc count from {before_docs} to {}; \
-             the publish path should remain stable for unchanged content",
-            cycle_summary.docs
-        );
-
-        let cycle_federated_readers = open_federated_search_readers(&live_index_path)
-            .expect("load federated readers after repeated rebuild cycle")
-            .expect("federated manifest should exist after repeated rebuild cycle");
-        assert_eq!(
-            cycle_federated_readers.len(),
-            baseline_federated_reader_count,
-            "repeated federated force rebuild cycle {cycle} changed the shard bundle width from {baseline_federated_reader_count} to {}; \
-             forced federated publish should remain structurally stable",
-            cycle_federated_readers.len()
-        );
-
-        let cycle_search = command_env
-            .cass_assert_command()
-            .args([
-                "search",
-                QUERY,
-                "--json",
-                "--mode",
-                "lexical",
-                "--fields",
-                "minimal",
-                "--limit",
-                "10",
-                "--data-dir",
-            ])
-            .arg(&data_dir)
-            .current_dir(&home)
-            .env("CODEX_HOME", &codex_home)
-            .env("HOME", &home)
-            .timeout(Duration::from_secs(20))
-            .output()
-            .expect("run repeated post-rebuild federated lexical search");
-        assert!(
-            cycle_search.status.success(),
-            "repeated federated lexical search after cycle {cycle} should succeed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&cycle_search.stdout),
-            String::from_utf8_lossy(&cycle_search.stderr)
-        );
-        let cycle_total_matches = total_matches_from_search_output(&cycle_search.stdout);
-        assert_eq!(
-            cycle_total_matches, baseline_total_matches,
-            "repeated federated force rebuild cycle {cycle} changed the logical lexical hit count from {baseline_total_matches} to {cycle_total_matches}"
-        );
-    }
-    tracker.end(
-        "repeat_federated_force_rebuilds_and_validate_stability",
-        Some("Run repeated cass index --full --force-rebuild cycles with forced multi-shard planning and verify reader/search stability after every publish"),
-        repeated_rebuild_started,
-    );
-
-    tracker.metrics(
-        "repeated_federated_rebuild_stability_surface",
-        &E2ePerformanceMetrics::new()
-            .with_duration(repeated_rebuild_started.elapsed().as_millis() as u64)
-            .with_custom("rebuild_cycles", REBUILD_CYCLES as u64)
-            .with_custom("max_rebuild_duration_ms", max_rebuild_duration_ms)
-            .with_custom("stable_doc_count", before_docs as u64)
-            .with_custom("stable_total_matches", baseline_total_matches)
-            .with_custom(
-                "federated_shard_count",
-                baseline_federated_reader_count as u64,
-            ),
-    );
-    tracker.complete();
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-#[serial]
-// Exercises the FEDERATED atomic-publish path, which is the Tantivy-only
-// staged-shard machinery disabled for the Quill backend. The single-index
-// atomic swap that actually runs is covered by
-// tests/atomic_swap_publish_crash_window.rs. Ignored, not weakened.
-#[ignore = "federated staged-shard publish is Tantivy-only; disabled on the Quill backend"]
-fn force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain() {
-    let tracker =
-        tracker_for("force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain");
-    let tmp = tempfile::TempDir::new().unwrap();
-    let home = tmp.path().to_path_buf();
-    let codex_home = home.to_path_buf();
-    let data_dir = home.join("cass_data");
-    fs::create_dir_all(&data_dir).unwrap();
-    let command_env = tracker
-        .command_environment()
-        .with_home(&home)
-        .with_codex_home(&codex_home);
-
-    const QUERY: &str = "killrelaunchpublishanchor";
-
-    tracker.phase(
-        "seed_and_index_single_shard_fixture",
-        "Create a minimal fixture and build the baseline lexical index",
-        || {
-            make_codex_session(
-                &codex_home,
-                "2024/11/24",
-                "rollout-kill-relaunch.jsonl",
-                QUERY,
-                1_732_320_000_000,
-            );
-
-            command_env
-                .cass_assert_command()
-                .args(["index", "--full", "--json", "--data-dir"])
-                .arg(&data_dir)
-                .current_dir(&home)
-                .env("CODEX_HOME", &codex_home)
-                .env("HOME", &home)
-                .timeout(Duration::from_secs(30))
-                .assert()
-                .success();
-        },
-    );
-
-    let live_index_path = index_dir(&data_dir).expect("resolve live Tantivy index path");
-    let canonical_sidecar = lexical_publish_in_progress_backup_path(&live_index_path);
-    let backups_dir = lexical_publish_backups_dir(&live_index_path);
-    let before_summary = searchable_index_summary(&live_index_path)
-        .expect("read baseline searchable index summary")
-        .expect("baseline index should exist");
-    let before_docs = before_summary.docs;
-    assert!(
-        before_docs > 0,
-        "baseline index should contain at least one doc"
-    );
-
-    let baseline_search = command_env
-        .cass_assert_command()
-        .args([
-            "search",
-            QUERY,
-            "--json",
-            "--mode",
-            "lexical",
-            "--fields",
-            "minimal",
-            "--limit",
-            "5",
-            "--data-dir",
-        ])
-        .arg(&data_dir)
-        .current_dir(&home)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", &home)
-        .timeout(Duration::from_secs(20))
-        .output()
-        .expect("run baseline lexical search");
-    assert!(
-        baseline_search.status.success(),
-        "baseline lexical search should succeed before kill/relaunch test\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&baseline_search.stdout),
-        String::from_utf8_lossy(&baseline_search.stderr)
-    );
-    let baseline_total_matches = total_matches_from_search_output(&baseline_search.stdout);
-    assert!(
-        baseline_total_matches > 0,
-        "baseline lexical search should return at least one hit before kill/relaunch"
-    );
-
-    let sentinel_path = home.join("publish-kill-relaunch-sentinel.json");
-    let rebuild_start = tracker.start(
-        "sigkill_force_rebuild_in_linux_publish_window",
-        Some(
-            "Spawn cass index --full --force-rebuild, pause after NEW is live and OLD is parked, then SIGKILL the process",
-        ),
-    );
-    let mut child = cass_std_cmd(&command_env, &home);
-    child.env(
-        "CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SENTINEL",
-        &sentinel_path,
-    );
-    child.env("CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SLEEP_MS", "30000");
-    child.args(["index", "--full", "--force-rebuild", "--json", "--data-dir"]);
-    child.arg(&data_dir);
-    let mut child = child.spawn().expect("spawn force rebuild child process");
-
-    let sentinel = wait_for_publish_kill_relaunch_sentinel(&sentinel_path, Duration::from_secs(20));
-    assert_eq!(
-        sentinel.get("stage").and_then(|value| value.as_str()),
-        Some("linux_swap_committed_prior_live_parked"),
-        "sentinel must prove the child paused after NEW went live and OLD was parked"
-    );
-    assert_eq!(
-        sentinel
-            .get("live_index_path")
-            .and_then(|value| value.as_str()),
-        Some(live_index_path.to_string_lossy().as_ref()),
-        "sentinel should describe the live index path under test"
-    );
-    assert_eq!(
-        sentinel
-            .get("canonical_sidecar_path")
-            .and_then(|value| value.as_str()),
-        Some(canonical_sidecar.to_string_lossy().as_ref()),
-        "sentinel should describe the canonical sidecar path under test"
-    );
-
-    assert!(
-        live_index_path.exists(),
-        "live lexical index must still exist while the child is paused in the publish window"
-    );
-    assert!(
-        canonical_sidecar.exists(),
-        "prior live generation must be parked at the canonical sidecar before SIGKILL"
-    );
-    let paused_summary = searchable_index_summary(&live_index_path)
-        .expect("read live summary while child is paused")
-        .expect("live index should remain readable while paused");
-    assert_eq!(
-        paused_summary.docs, before_docs,
-        "paused publish window must still expose the stable live doc count"
-    );
-
-    let paused_search = command_env
-        .cass_assert_command()
-        .args([
-            "search",
-            QUERY,
-            "--json",
-            "--mode",
-            "lexical",
-            "--fields",
-            "minimal",
-            "--limit",
-            "5",
-            "--data-dir",
-        ])
-        .arg(&data_dir)
-        .current_dir(&home)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", &home)
-        .timeout(Duration::from_secs(20))
-        .output()
-        .expect("run lexical search while child is paused");
-    assert!(
-        paused_search.status.success(),
-        "lexical search should still succeed while the child is paused in the publish window\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&paused_search.stdout),
-        String::from_utf8_lossy(&paused_search.stderr)
-    );
-    assert_eq!(
-        total_matches_from_search_output(&paused_search.stdout),
-        baseline_total_matches,
-        "paused publish window must preserve stable search results"
-    );
-
-    child.kill().expect("send SIGKILL to paused rebuild child");
-    let child_status = child.wait().expect("wait for killed rebuild child");
-    tracker.end(
-        "sigkill_force_rebuild_in_linux_publish_window",
-        Some(
-            "Spawn cass index --full --force-rebuild, pause after NEW is live and OLD is parked, then SIGKILL the process",
-        ),
-        rebuild_start,
-    );
-    assert!(
-        !child_status.success(),
-        "SIGKILLed rebuild child must not report success"
-    );
-    assert!(
-        live_index_path.exists(),
-        "live lexical index must still exist immediately after SIGKILL"
-    );
-    assert!(
-        canonical_sidecar.exists(),
-        "SIGKILL should strand the canonical sidecar for restart recovery"
-    );
-
-    let relaunch_start = tracker.start(
-        "relaunch_force_rebuild_and_recover_sidecar",
-        Some(
-            "Relaunch cass index --full --force-rebuild and prove recovery finalizes the stranded sidecar cleanly",
-        ),
-    );
-    let relaunch_output = command_env
-        .cass_assert_command()
-        .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
-        .arg(&data_dir)
-        .current_dir(&home)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", &home)
-        .timeout(Duration::from_secs(60))
-        .output()
-        .expect("relaunch force rebuild after SIGKILL");
-    tracker.end(
-        "relaunch_force_rebuild_and_recover_sidecar",
-        Some(
-            "Relaunch cass index --full --force-rebuild and prove recovery finalizes the stranded sidecar cleanly",
-        ),
-        relaunch_start,
-    );
-    assert!(
-        relaunch_output.status.success(),
-        "relaunch after SIGKILL should succeed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&relaunch_output.stdout),
-        String::from_utf8_lossy(&relaunch_output.stderr)
-    );
-    let relaunch_json: serde_json::Value =
-        serde_json::from_slice(&relaunch_output.stdout).expect("parse relaunch index json");
-    assert_eq!(
-        relaunch_json
-            .get("success")
-            .and_then(|value| value.as_bool()),
-        Some(true),
-        "relaunch force rebuild should report success in --json output"
-    );
-
-    assert!(
-        !canonical_sidecar.exists(),
-        "relaunch recovery must consume the stranded canonical sidecar"
-    );
-    let retained_backup_count = fs::read_dir(&backups_dir)
-        .map(|entries| entries.filter_map(Result::ok).count())
-        .unwrap_or(0);
-    assert!(
-        retained_backup_count >= 1,
-        "relaunch recovery should retain at least one prior-live artifact after cleaning the stranded sidecar"
-    );
-
-    let after_summary = searchable_index_summary(&live_index_path)
-        .expect("read live summary after relaunch recovery")
-        .expect("live index should remain readable after relaunch recovery");
-    assert_eq!(
-        after_summary.docs, before_docs,
-        "relaunch recovery must preserve the stable live doc count"
-    );
-
-    let after_search = command_env
-        .cass_assert_command()
-        .args([
-            "search",
-            QUERY,
-            "--json",
-            "--mode",
-            "lexical",
-            "--fields",
-            "minimal",
-            "--limit",
-            "5",
-            "--data-dir",
-        ])
-        .arg(&data_dir)
-        .current_dir(&home)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", &home)
-        .timeout(Duration::from_secs(20))
-        .output()
-        .expect("run lexical search after relaunch recovery");
-    assert!(
-        after_search.status.success(),
-        "lexical search should succeed after relaunch recovery\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&after_search.stdout),
-        String::from_utf8_lossy(&after_search.stderr)
-    );
-    assert_eq!(
-        total_matches_from_search_output(&after_search.stdout),
-        baseline_total_matches,
-        "relaunch recovery must preserve stable lexical search results"
-    );
-
-    tracker.metrics(
-        "kill_relaunch_publish_recovery",
-        &E2ePerformanceMetrics::new()
-            .with_custom("stable_doc_count", before_docs as u64)
-            .with_custom("stable_total_matches", baseline_total_matches)
-            .with_custom(
-                "retained_backup_count_after_relaunch",
-                retained_backup_count as u64,
-            ),
     );
     tracker.complete();
 }

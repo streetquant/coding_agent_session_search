@@ -52,6 +52,9 @@ use crate::franken_sync::compat::OptionalExtension;
 use crate::franken_sync::compat::{ParamValue, RowExt, param_slice_to_values};
 #[cfg(test)]
 use crate::franken_sync::params;
+use crate::search::semantic_reader::publication::text::hydration::{
+    SemanticReadSnapshot, snapshot_seal,
+};
 
 /// Row-mapping conveniences for the dedicated-owner search connection.
 ///
@@ -226,6 +229,18 @@ impl Drop for SearchReadTransaction<'_> {
                 "failed to roll back search hydration read transaction"
             );
         }
+    }
+}
+
+impl snapshot_seal::Sealed for SearchReadTransaction<'_> {}
+
+impl SemanticReadSnapshot for SearchReadTransaction<'_> {
+    fn query_with_params(
+        &self,
+        sql: &str,
+        params: &[crate::franken_sync::SqliteValue],
+    ) -> Result<Vec<crate::franken_sync::Row>, crate::franken_sync::FrankenError> {
+        self.conn.query_with_params_sync(sql, params)
     }
 }
 
@@ -2025,6 +2040,10 @@ pub struct SearchHit {
     /// Keep this with source_id, source_path and line_number for exact follow-ups.
     /// Null means no canonical conversation identity is available; never invent one.
     pub conversation_id: Option<i64>,
+    /// Immutable full-content anchor for view/expand --message-anchor.
+    /// Absent when this hit has only a preview or no canonical identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_anchor: Option<String>,
     pub score: f32,
     pub source_path: String,
     pub agent: String,
@@ -2049,6 +2068,40 @@ pub struct SearchHit {
     /// Origin host label for remote sources
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin_host: Option<String>,
+}
+
+/// Bind complete archived text to its exact source and canonical coordinates.
+/// Length framing prevents untrusted paths and source labels from changing
+/// tuple boundaries. Preview text must never be passed as complete content.
+pub fn message_anchor_for_content(
+    source_id: &str,
+    source_path: &str,
+    conversation_id: Option<i64>,
+    message_index: Option<usize>,
+    content: &str,
+) -> Option<String> {
+    let conversation_id = conversation_id.filter(|id| *id > 0)?;
+    let message_index = message_index.filter(|index| *index > 0)?;
+    if source_id.is_empty() || source_path.is_empty() {
+        return None;
+    }
+    let conversation_id = conversation_id.to_string();
+    let message_index = message_index.to_string();
+    let mut digest = blake3::Hasher::new_derive_key("cass.message.anchor.v1");
+    for field in [
+        source_id,
+        source_path,
+        &conversation_id,
+        &message_index,
+        content,
+    ] {
+        digest.update(&u64::try_from(field.len()).ok()?.to_le_bytes());
+        digest.update(field.as_bytes());
+    }
+    let mut anchor = String::with_capacity(67);
+    anchor.push_str("v1:");
+    anchor.push_str(digest.finalize().to_hex().as_str());
+    Some(anchor)
 }
 
 /// One engine-ranked message admitted to the CASS lexical Layer-B hydrator.
@@ -2702,6 +2755,19 @@ fn top_k_fused(mut hits: Vec<FusedHit>, k: usize) -> Vec<FusedHit> {
     hits
 }
 
+fn retain_incoming_message_anchor(retained: &mut SearchHit, incoming: &SearchHit) {
+    if retained.message_anchor.is_none()
+        && incoming.message_anchor.is_some()
+        && retained.conversation_id == incoming.conversation_id
+        && retained.line_number == incoming.line_number
+        && retained.source_path == incoming.source_path
+        && normalized_search_hit_source_id(retained) == normalized_search_hit_source_id(incoming)
+    {
+        // ubs:ignore[rust.collections.clone-in-loop] -- The merged hit must own this borrowed anchor; the None guard permits only one copy per retained hit.
+        retained.message_anchor = incoming.message_anchor.clone();
+    }
+}
+
 /// Fuse lexical + semantic hits using Reciprocal Rank Fusion (RRF).
 /// Applies deterministic tie-breaking and returns the requested page slice.
 pub fn rrf_fuse_hits(
@@ -2745,6 +2811,7 @@ pub fn rrf_fuse_hits(
         let doc_id = search_hit_doc_id(hit);
         hit_by_doc_id
             .entry(doc_id.clone())
+            .and_modify(|retained| retain_incoming_message_anchor(retained, hit))
             .or_insert_with(|| hit.clone());
         semantic_scored.push(FsVectorHit {
             index: u32::try_from(idx).unwrap_or(u32::MAX),
@@ -2877,7 +2944,9 @@ pub fn rrf_fuse_hits(
             })
         });
 
-        if let Some(existing_idx) = merged_idx {
+        if let Some(existing_idx) = merged_idx
+            && let Some(existing) = unique_hits.get_mut(existing_idx)
+        {
             exact_seen.insert(exact_key, existing_idx);
             let slot = fallback_seen.entry(fallback_key).or_insert(CompatSlot {
                 index: existing_idx,
@@ -2885,26 +2954,27 @@ pub fn rrf_fuse_hits(
                 ambiguous: false,
             });
             update_slot(slot, hit.conversation_id);
-            if unique_hits[existing_idx].conversation_id.is_none() && hit.conversation_id.is_some()
-            {
-                unique_hits[existing_idx].conversation_id = hit.conversation_id;
+            if existing.conversation_id.is_none() && hit.conversation_id.is_some() {
+                existing.conversation_id = hit.conversation_id;
             }
-            unique_hits[existing_idx].score += fused_hit.rrf_score as f32;
+            retain_incoming_message_anchor(existing, &hit);
+            existing.score += fused_hit.rrf_score as f32;
             continue;
         }
 
         hit.score = fused_hit.rrf_score as f32;
         let index = unique_hits.len();
+        let conversation_id = hit.conversation_id;
         unique_hits.push(hit);
         exact_seen.insert(exact_key, index);
         match fallback_seen.get_mut(&fallback_key) {
-            Some(slot) => update_slot(slot, unique_hits[index].conversation_id),
+            Some(slot) => update_slot(slot, conversation_id),
             None => {
                 fallback_seen.insert(
                     fallback_key,
                     CompatSlot {
                         index,
-                        conversation_id: unique_hits[index].conversation_id,
+                        conversation_id,
                         ambiguous: false,
                     },
                 );
@@ -3279,6 +3349,7 @@ struct ProgressiveLexicalHit {
     content: String,
     content_hash: u64,
     conversation_id: Option<i64>,
+    message_anchor: Option<String>,
     source_path: String,
     agent: String,
     workspace: String,
@@ -3311,6 +3382,7 @@ impl ProgressiveLexicalHit {
             },
             content_hash: hit.content_hash,
             conversation_id: hit.conversation_id,
+            message_anchor: hit.message_anchor.clone(),
             source_path: hit.source_path.clone(),
             agent: hit.agent.clone(),
             workspace: hit.workspace.clone(),
@@ -3331,6 +3403,7 @@ impl ProgressiveLexicalHit {
             content: self.content.clone(),
             content_hash: self.content_hash,
             conversation_id: self.conversation_id,
+            message_anchor: self.message_anchor.clone(),
             score,
             source_path: self.source_path.clone(),
             agent: self.agent.clone(),
@@ -3341,6 +3414,7 @@ impl ProgressiveLexicalHit {
             match_type: self.match_type,
             source_id: self.source_id.clone(),
             origin_kind: self.origin_kind.clone(),
+            // ubs:ignore[rust.collections.clone-in-loop] -- The emitted hit outlives this borrowed progressive cache entry and must own its optional host name.
             origin_host: self.origin_host.clone(),
         }
     }
@@ -3749,6 +3823,11 @@ impl CachedHit {
                 .map_or(0, std::string::String::len)
             + self.hit.source_id.len()
             + self.hit.origin_kind.len()
+            + self
+                .hit
+                .message_anchor
+                .as_ref()
+                .map_or(0, std::string::String::len)
             + self
                 .hit
                 .origin_host
@@ -4711,6 +4790,31 @@ impl SearchClient {
         }
 
         Ok(guard)
+    }
+
+    /// Run `inspect` against one read transaction on this client's archive.
+    ///
+    /// Semantic setup and later hydration must observe the same archive
+    /// generation. Reusing this client's owner handle also means a cold
+    /// command pays the archive's open (including WAL-index recovery) once
+    /// instead of once for setup and again for hydration. Returns `Ok(None)`
+    /// when this client has no configured archive; the transaction is always
+    /// rolled back, and no recovery write is performed by this wrapper.
+    pub(crate) fn with_semantic_read_snapshot<T>(
+        &self,
+        inspect: impl FnOnce(&dyn SemanticReadSnapshot) -> T,
+    ) -> Result<Option<T>> {
+        let guard = self.sqlite_guard()?;
+        let Some(conn) = guard.as_ref() else {
+            return Ok(None);
+        };
+        let mut transaction = SearchReadTransaction::begin(conn)
+            .map_err(|error| anyhow!("starting semantic setup read transaction: {error}"))?;
+        let value = inspect(&transaction);
+        transaction
+            .rollback()
+            .map_err(|error| anyhow!("ending semantic setup read transaction: {error}"))?;
+        Ok(Some(value))
     }
 
     pub fn search(
@@ -6550,6 +6654,13 @@ impl SearchClient {
                     content,
                     content_hash,
                     conversation_id: Some(message.conversation_id),
+                    message_anchor: message_anchor_for_content(
+                        &source_id,
+                        &conversation.source_path,
+                        Some(message.conversation_id),
+                        line_number,
+                        &message.full_content,
+                    ),
                     score: 0.0,
                     source_path: conversation.source_path.clone(),
                     agent: conversation.agent.clone(),
@@ -8384,6 +8495,11 @@ impl SearchClient {
                     || (field_mask.needs_content()
                         && field_mask.preview_content_limit().is_none()
                         && stored_preview_is_complete_content(&pending.stored_preview)));
+            let complete_content = !pending.stored_content.is_empty()
+                || (field_mask.needs_content()
+                    && field_mask.preview_content_limit().is_none()
+                    && (stored_preview_is_complete_content(&pending.stored_preview)
+                        || hydrated_content.is_some()));
             let effective_content = if !pending.stored_content.is_empty() {
                 pending.stored_content.clone()
             } else if preview_satisfies_effective_content {
@@ -8447,6 +8563,17 @@ impl SearchClient {
                 content,
                 content_hash,
                 conversation_id: pending.conversation_id,
+                message_anchor: complete_content
+                    .then(|| {
+                        message_anchor_for_content(
+                            &pending.source_id,
+                            &pending.source_path,
+                            pending.conversation_id,
+                            pending.line_number,
+                            &effective_content,
+                        )
+                    })
+                    .flatten(),
                 score: pending.score,
                 source_path: pending.source_path,
                 agent: pending.agent,
@@ -9047,6 +9174,19 @@ impl SearchClient {
         } else {
             String::new()
         };
+        let message_anchor = request
+            .field_mask
+            .needs_content()
+            .then(|| {
+                message_anchor_for_content(
+                    &source_id,
+                    &source_path,
+                    conversation_id,
+                    line_number,
+                    &raw_content,
+                )
+            })
+            .flatten();
         let content = if request.field_mask.needs_content() {
             raw_content
         } else {
@@ -9064,6 +9204,7 @@ impl SearchClient {
             content,
             content_hash,
             conversation_id,
+            message_anchor,
             score,
             source_path,
             agent,
@@ -9494,11 +9635,10 @@ impl SearchClient {
                         } else {
                             metadata_title
                         },
-                        if metadata_content.is_empty() {
-                            fts_content.unwrap_or_default()
-                        } else {
-                            metadata_content
-                        },
+                        // An existing canonical row is authoritative even
+                        // after its content becomes empty. A derived FTS row
+                        // must not resurrect its prior text under that key.
+                        metadata_content,
                         if metadata_agent.is_empty() {
                             fts_agent.unwrap_or_default()
                         } else {
@@ -9507,11 +9647,9 @@ impl SearchClient {
                         // Canonical NULL is authoritative too: a legacy
                         // content-bearing FTS row can retain an old attribution.
                         metadata_workspace,
-                        if metadata_source_path.is_empty() {
-                            fts_source_path.unwrap_or_default()
-                        } else {
-                            metadata_source_path
-                        },
+                        // Missing canonical coordinates cannot be supplied by
+                        // an obsolete derived shadow under the same row key.
+                        metadata_source_path,
                         metadata_created_at.or(fts_created_at),
                         metadata_idx,
                         metadata_conversation_id,
@@ -9551,6 +9689,18 @@ impl SearchClient {
                 } else {
                     String::new()
                 };
+                let message_anchor = field_mask
+                    .needs_content()
+                    .then(|| {
+                        message_anchor_for_content(
+                            &source_id,
+                            &source_path,
+                            conversation_id,
+                            line_number,
+                            &raw_content,
+                        )
+                    })
+                    .flatten();
                 let content = if field_mask.needs_content() {
                     raw_content
                 } else {
@@ -9568,6 +9718,7 @@ impl SearchClient {
                     content,
                     content_hash,
                     conversation_id,
+                    message_anchor,
                     score: (-bm25_score) as f32,
                     source_path,
                     agent,
@@ -9862,6 +10013,13 @@ impl SearchClient {
                 content,
                 content_hash,
                 conversation_id: Some(candidate.conversation_id),
+                message_anchor: message_anchor_for_content(
+                    &candidate.source_id,
+                    &candidate.source_path,
+                    Some(candidate.conversation_id),
+                    line_number,
+                    &raw_content,
+                ),
                 score: 0.0,
                 source_path: candidate.source_path,
                 agent: candidate.agent,
@@ -11281,6 +11439,7 @@ mod tests {
     /// the bd-q6xf9 regression tests below.
     fn projected_minimal_fields_search_hit(title: &str, source_path: &str) -> SearchHit {
         SearchHit {
+            message_anchor: None,
             title: title.to_string(),
             snippet: String::new(),
             content: String::new(),
@@ -12551,6 +12710,7 @@ mod tests {
                 semantic_score: None,
             },
             hit: SearchHit {
+                message_anchor: None,
                 title: id.into(),
                 snippet: "".into(),
                 content: "".into(),
@@ -12573,6 +12733,7 @@ mod tests {
 
     fn make_federated_merge_hit(id: &str, agent: &str) -> SearchHit {
         SearchHit {
+            message_anchor: None,
             title: id.into(),
             snippet: String::new(),
             content: id.into(),
@@ -13226,6 +13387,7 @@ mod tests {
         };
 
         let hits = vec![SearchHit {
+            message_anchor: None,
             title: "こんにちは".into(),
             snippet: String::new(),
             content: "こんにちは 世界".into(),
@@ -13362,6 +13524,7 @@ mod tests {
     #[test]
     fn progressive_lexical_hit_omits_unused_content() {
         let hit = SearchHit {
+            message_anchor: None,
             title: "hello world".into(),
             snippet: "hello **world**".into(),
             content: "hello world from a much larger conversation body".into(),
@@ -13422,6 +13585,7 @@ mod tests {
         };
         let field_mask = FieldMask::new(false, true, true, true);
         let lexical_hit = SearchHit {
+            message_anchor: None,
             title: "lexical title".into(),
             snippet: "lexical snippet".into(),
             content: "full lexical body".into(),
@@ -15619,6 +15783,140 @@ mod tests {
         assert_sqlite_null_workspace_overrides_shadow(false)
     }
 
+    #[test]
+    fn gh493_sqlite_empty_content_overrides_legacy_content_bearing_shadow() -> Result<()> {
+        let conn = SearchSqliteFixture::in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+             CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER,
+                idx INTEGER,
+                content TEXT,
+                created_at INTEGER
+             );
+             CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at UNINDEXED,
+                tokenize='porter'
+             );
+             INSERT INTO sources(id, kind) VALUES('local', 'local');
+             INSERT INTO agents(id, slug) VALUES(1, 'codex');
+             INSERT INTO conversations(id, agent_id, source_id, title, source_path)
+             VALUES(1, 1, 'local', 'empty canonical session', '/tmp/empty-canonical.jsonl');
+             INSERT INTO messages(id, conversation_id, idx, content, created_at)
+             VALUES(1, 1, 0, 'anchordrift original canonical body', 42);
+             INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+             VALUES(1, 'anchordrift original canonical body', 'empty canonical session',
+                    'codex', '', '/tmp/empty-canonical.jsonl', 42);
+             UPDATE messages SET content = '' WHERE id = 1;",
+        )?;
+        let shadow_content: String = conn.connection().query_row_map(
+            "SELECT content FROM fts_messages WHERE rowid = 1",
+            &[],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(shadow_content, "anchordrift original canonical body");
+
+        let client = SearchClient {
+            reader: LexicalReaderSlot::default(),
+            sqlite: Mutex::new(Some(conn.into_connection())),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            strict_read_only: false,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
+        };
+
+        // Only the stale FTS body contains this term. A source-table scan
+        // cannot satisfy this assertion or hide an unexercised FTS hydrator.
+        let hits = client.search(
+            "anchordrift",
+            SearchFilters::default(),
+            5,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(hits.len(), 1, "the stale FTS row must reach hydration");
+        let hit = &hits[0];
+        assert!(
+            hit.content.is_empty(),
+            "canonical empty content is authoritative"
+        );
+        assert!(
+            hit.snippet.is_empty(),
+            "the shadow body must not become a snippet"
+        );
+        assert_eq!(hit.conversation_id, Some(1));
+        assert_eq!(hit.line_number, Some(1));
+        let empty_anchor =
+            message_anchor_for_content("local", "/tmp/empty-canonical.jsonl", Some(1), Some(1), "");
+        assert!(
+            empty_anchor.is_some(),
+            "empty complete content still has an anchor"
+        );
+        assert_eq!(hit.message_anchor, empty_anchor);
+        assert_ne!(
+            hit.message_anchor,
+            message_anchor_for_content(
+                "local",
+                "/tmp/empty-canonical.jsonl",
+                Some(1),
+                Some(1),
+                &shadow_content,
+            ),
+            "the new hit must not anchor the shadow's obsolete body",
+        );
+
+        client
+            .sqlite
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute_sync("UPDATE conversations SET source_path = '' WHERE id = 1")?;
+        let missing_path_hits = client.search(
+            "anchordrift original",
+            SearchFilters::default(),
+            5,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(missing_path_hits.len(), 1);
+        assert!(missing_path_hits[0].source_path.is_empty());
+        assert!(
+            missing_path_hits[0].message_anchor.is_none(),
+            "a missing canonical path must not be replaced by obsolete FTS coordinates"
+        );
+
+        Ok(())
+    }
+
     fn assert_sqlite_null_workspace_overrides_shadow(contentless: bool) -> Result<()> {
         let conn = SearchSqliteFixture::in_memory()?;
         let content_option = if contentless { "content=''," } else { "" };
@@ -17370,6 +17668,7 @@ mod tests {
         };
 
         let first_hit = SearchHit {
+            message_anchor: None,
             title: "Shared Session".into(),
             snippet: String::new(),
             content: String::new(),
@@ -17393,6 +17692,7 @@ mod tests {
             conversation_id: None,
         };
         let second_hit = SearchHit {
+            message_anchor: None,
             title: "Shared Session".into(),
             snippet: String::new(),
             content: String::new(),
@@ -17577,6 +17877,7 @@ mod tests {
         };
 
         let first_hit = SearchHit {
+            message_anchor: None,
             title: "Shared Session".into(),
             snippet: String::new(),
             content: String::new(),
@@ -17672,6 +17973,7 @@ mod tests {
         };
 
         let hit = SearchHit {
+            message_anchor: None,
             title: "Legacy Local".into(),
             snippet: String::new(),
             content: String::new(),
@@ -17757,6 +18059,7 @@ mod tests {
         };
 
         let hit = SearchHit {
+            message_anchor: None,
             title: "Trimmed Local".into(),
             snippet: String::new(),
             content: String::new(),
@@ -17842,6 +18145,7 @@ mod tests {
         };
 
         let hit = SearchHit {
+            message_anchor: None,
             title: "Blank Local".into(),
             snippet: String::new(),
             content: String::new(),
@@ -17928,6 +18232,7 @@ mod tests {
         };
 
         let hit = SearchHit {
+            message_anchor: None,
             title: "Legacy Remote".into(),
             snippet: String::new(),
             content: String::new(),
@@ -18186,6 +18491,7 @@ mod tests {
         };
 
         let hit = SearchHit {
+            message_anchor: None,
             title: "hello world".into(),
             snippet: "hello".into(),
             content: "hello world".into(),
@@ -18256,6 +18562,7 @@ mod tests {
         };
 
         let hit = SearchHit {
+            message_anchor: None,
             title: "a".into(),
             snippet: "a".into(),
             content: "a".into(),
@@ -18478,6 +18785,7 @@ mod tests {
         };
 
         let hit = SearchHit {
+            message_anchor: None,
             title: "test".into(),
             snippet: "snippet".into(),
             content: "content".into(),
@@ -18594,6 +18902,7 @@ mod tests {
     fn s3_fifo_admission_rejects_one_off_byte_heavy_entries_then_admits_ghost_replay() {
         let content = "large".repeat(1_000);
         let hit = SearchHit {
+            message_anchor: None,
             title: "large".into(),
             snippet: "large".into(),
             content: content.clone(),
@@ -18645,6 +18954,7 @@ mod tests {
     fn lru_policy_keeps_admitting_large_entries_under_existing_caps() {
         let content = "large".repeat(1_000);
         let hit = SearchHit {
+            message_anchor: None,
             title: "large".into(),
             snippet: "large".into(),
             content: content.clone(),
@@ -18700,6 +19010,7 @@ mod tests {
         // Large content to exceed byte cap quickly
         let content = "c".repeat(100);
         let hit = SearchHit {
+            message_anchor: None,
             title: "a".repeat(50),
             snippet: "b".repeat(50),
             content: content.clone(), // 200+ bytes per hit
@@ -18753,6 +19064,7 @@ mod tests {
     #[test]
     fn cache_byte_pressure_evicts_byte_heavy_shard_before_small_entries() {
         let small_hit = SearchHit {
+            message_anchor: None,
             title: "small".into(),
             snippet: "small".into(),
             content: "small".into(),
@@ -18772,6 +19084,7 @@ mod tests {
         };
         let large_content = "large".repeat(2_000);
         let large_hit = SearchHit {
+            message_anchor: None,
             title: "large".into(),
             snippet: "large".into(),
             content: large_content.clone(),
@@ -19069,6 +19382,7 @@ mod tests {
     fn deduplicate_hits_removes_exact_dupes() {
         let hits = vec![
             SearchHit {
+                message_anchor: None,
                 title: "title1".into(),
                 snippet: "snip1".into(),
                 content: "hello world".into(),
@@ -19087,6 +19401,7 @@ mod tests {
                 conversation_id: None,
             },
             SearchHit {
+                message_anchor: None,
                 title: "title1".into(),
                 snippet: "snip2".into(),
                 content: "hello world".into(), // same content
@@ -19116,6 +19431,7 @@ mod tests {
     fn deduplicate_hits_keeps_higher_score() {
         let hits = vec![
             SearchHit {
+                message_anchor: None,
                 title: "title1".into(),
                 snippet: "snip1".into(),
                 content: "hello world".into(),
@@ -19134,6 +19450,7 @@ mod tests {
                 conversation_id: None,
             },
             SearchHit {
+                message_anchor: None,
                 title: "title1".into(),
                 snippet: "snip2".into(),
                 content: "hello world".into(),
@@ -19162,6 +19479,7 @@ mod tests {
     #[test]
     fn deduplicate_hits_keeps_repeated_same_content_at_different_lines() {
         let first = SearchHit {
+            message_anchor: None,
             title: "Shared Session".into(),
             snippet: String::new(),
             content: "repeat me".into(),
@@ -19229,6 +19547,7 @@ mod tests {
     fn deduplicate_hits_keeps_distinct_titles_with_same_source_path_and_content() {
         let hits = vec![
             SearchHit {
+                message_anchor: None,
                 title: "Morning Session".into(),
                 snippet: "snip1".into(),
                 content: "hello world".into(),
@@ -19247,6 +19566,7 @@ mod tests {
                 conversation_id: None,
             },
             SearchHit {
+                message_anchor: None,
                 title: "Evening Session".into(),
                 snippet: "snip2".into(),
                 content: "hello world".into(),
@@ -19276,6 +19596,7 @@ mod tests {
     fn deduplicate_hits_normalizes_whitespace() {
         let hits = vec![
             SearchHit {
+                message_anchor: None,
                 title: "title1".into(),
                 snippet: "snip1".into(),
                 content: "hello    world".into(), // extra spaces
@@ -19294,6 +19615,7 @@ mod tests {
                 conversation_id: None,
             },
             SearchHit {
+                message_anchor: None,
                 title: "title1".into(),
                 snippet: "snip2".into(),
                 content: "hello world".into(), // normal spacing
@@ -19321,6 +19643,7 @@ mod tests {
     fn deduplicate_hits_normalizes_blank_local_source_id() {
         let hits = vec![
             SearchHit {
+                message_anchor: None,
                 title: "title1".into(),
                 snippet: "snip1".into(),
                 content: "hello world".into(),
@@ -19339,6 +19662,7 @@ mod tests {
                 conversation_id: None,
             },
             SearchHit {
+                message_anchor: None,
                 title: "title1".into(),
                 snippet: "snip2".into(),
                 content: "hello world".into(),
@@ -19367,6 +19691,7 @@ mod tests {
     fn deduplicate_hits_filters_tool_noise() {
         let hits = vec![
             SearchHit {
+                message_anchor: None,
                 title: "title1".into(),
                 snippet: "snip1".into(),
                 content: "[Tool:]".into(), // noise (empty tool name)
@@ -19385,6 +19710,7 @@ mod tests {
                 conversation_id: None,
             },
             SearchHit {
+                message_anchor: None,
                 title: "title2".into(),
                 snippet: "snip2".into(),
                 content: "This is real content about testing".into(),
@@ -19413,6 +19739,7 @@ mod tests {
     fn deduplicate_hits_filters_acknowledgement_noise() {
         let hits = vec![
             SearchHit {
+                message_anchor: None,
                 title: "ack".into(),
                 snippet: "ack".into(),
                 content: "Acknowledged.".into(),
@@ -19431,6 +19758,7 @@ mod tests {
                 conversation_id: None,
             },
             SearchHit {
+                message_anchor: None,
                 title: "real".into(),
                 snippet: "real".into(),
                 content: "Authentication refresh logic changed".into(),
@@ -19458,6 +19786,7 @@ mod tests {
     #[test]
     fn deduplicate_hits_hides_system_prompts_unless_query_requests_them() {
         let prompt_hit = SearchHit {
+            message_anchor: None,
             title: "prompt".into(),
             snippet: "prompt".into(),
             content:
@@ -19493,6 +19822,7 @@ mod tests {
     fn deduplicate_hits_preserves_unique_content() {
         let hits = vec![
             SearchHit {
+                message_anchor: None,
                 title: "title1".into(),
                 snippet: "snip1".into(),
                 content: "first message".into(),
@@ -19511,6 +19841,7 @@ mod tests {
                 conversation_id: None,
             },
             SearchHit {
+                message_anchor: None,
                 title: "title2".into(),
                 snippet: "snip2".into(),
                 content: "second message".into(),
@@ -19529,6 +19860,7 @@ mod tests {
                 conversation_id: None,
             },
             SearchHit {
+                message_anchor: None,
                 title: "title3".into(),
                 snippet: "snip3".into(),
                 content: "third message".into(),
@@ -19558,6 +19890,7 @@ mod tests {
     fn deduplicate_hits_respects_source_boundaries() {
         let hits = vec![
             SearchHit {
+                message_anchor: None,
                 title: "local title".into(),
                 snippet: "snip".into(),
                 content: "hello world".into(),
@@ -19576,6 +19909,7 @@ mod tests {
                 conversation_id: None,
             },
             SearchHit {
+                message_anchor: None,
                 title: "remote title".into(),
                 snippet: "snip".into(),
                 content: "hello world".into(), // same content
@@ -23592,140 +23926,6 @@ mod tests {
     }
 
     #[test]
-    // Builds its corpus by publishing separate shard directories into a
-    // federated bundle, which is the Tantivy-only staged-shard machinery
-    // disabled for the Quill backend (see the `staged_shard_plan` binding in
-    // indexer/mod.rs). The federated READ path itself is ported and covered by
-    // `open_federated_search_readers`; what is unreachable here is the shard
-    // *construction* this fixture depends on.
-    #[ignore = "Tantivy-only shard publishing; unreachable on the Quill backend"]
-    fn search_client_reads_federated_lexical_bundle_as_one_corpus() -> Result<()> {
-        let root = TempDir::new()?;
-        let shard_a = root.path().join("shard-a");
-        let shard_b = root.path().join("shard-b");
-        let published = root.path().join("published");
-
-        let mut shard_a_index = TantivyIndex::open_or_create(&shard_a)?;
-        let mut shard_b_index = TantivyIndex::open_or_create(&shard_b)?;
-
-        let make_conv =
-            |external_id: &str, title: &str, source_path: &str, tag: &str| NormalizedConversation {
-                agent_slug: "codex".into(),
-                external_id: Some(external_id.into()),
-                title: Some(title.into()),
-                workspace: Some(std::path::PathBuf::from("/ws")),
-                source_path: std::path::PathBuf::from(source_path),
-                started_at: Some(1_700_000_100_000),
-                ended_at: Some(1_700_000_100_100),
-                metadata: json!({}),
-                messages: vec![
-                    NormalizedMessage {
-                        idx: 0,
-                        role: "user".into(),
-                        author: None,
-                        created_at: Some(1_700_000_100_010),
-                        content: format!("shared federated needle {tag} user"),
-                        extra: json!({}),
-                        snippets: vec![],
-                        invocations: Vec::new(),
-                    },
-                    NormalizedMessage {
-                        idx: 1,
-                        role: "assistant".into(),
-                        author: None,
-                        created_at: Some(1_700_000_100_020),
-                        content: format!("shared federated needle {tag} assistant"),
-                        extra: json!({}),
-                        snippets: vec![],
-                        invocations: Vec::new(),
-                    },
-                ],
-            };
-
-        let conv_a = make_conv(
-            "fed-query-a",
-            "Fed Query A",
-            "/tmp/fed-query-a.jsonl",
-            "alpha",
-        );
-        let conv_b = make_conv(
-            "fed-query-b",
-            "Fed Query B",
-            "/tmp/fed-query-b.jsonl",
-            "beta",
-        );
-
-        shard_a_index.add_conversation(&conv_a)?;
-        shard_b_index.add_conversation(&conv_b)?;
-        shard_a_index.commit()?;
-        shard_b_index.commit()?;
-        drop(shard_a_index);
-        drop(shard_b_index);
-
-        crate::search::tantivy::publish_federated_searchable_index_directories(
-            &published,
-            &[&shard_a, &shard_b],
-        )?;
-
-        let client = SearchClient::open(&published, None)?.expect("federated index present");
-        assert!(client.has_tantivy());
-        assert_eq!(client.total_docs(), 4);
-
-        let hits = client.search(
-            "shared federated needle",
-            SearchFilters::default(),
-            10,
-            0,
-            FieldMask::FULL,
-        )?;
-        assert_eq!(hits.len(), 4);
-        let observed_order = hits
-            .iter()
-            .map(|hit| {
-                (
-                    hit.source_path.clone(),
-                    hit.line_number,
-                    hit.content.clone(),
-                    hit.score.to_bits(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let hit_paths = hits
-            .iter()
-            .map(|hit| hit.source_path.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        assert!(hit_paths.contains("/tmp/fed-query-a.jsonl"));
-        assert!(hit_paths.contains("/tmp/fed-query-b.jsonl"));
-
-        for attempt in 0..3 {
-            let repeated = client.search(
-                "shared federated needle",
-                SearchFilters::default(),
-                10,
-                0,
-                FieldMask::FULL,
-            )?;
-            let repeated_order = repeated
-                .iter()
-                .map(|hit| {
-                    (
-                        hit.source_path.clone(),
-                        hit.line_number,
-                        hit.content.clone(),
-                        hit.score.to_bits(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                repeated_order, observed_order,
-                "federated lexical query order drifted on repeated attempt {attempt}"
-            );
-        }
-
-        Ok(())
-    }
-
-    #[test]
     fn gh452_semantic_no_limit_uses_vector_count_without_a_lexical_reader() -> Result<()> {
         for sharded in [false, true] {
             let fixture =
@@ -24840,6 +25040,7 @@ mod tests {
 
     fn make_test_hit(id: &str, score: f32) -> SearchHit {
         SearchHit {
+            message_anchor: None,
             title: id.to_string(),
             snippet: String::new(),
             content: id.to_string(),
@@ -25060,10 +25261,20 @@ mod tests {
         let mut semantic = lexical.clone();
         semantic.conversation_id = Some(42);
         semantic.score = 0.9;
+        semantic.message_anchor = message_anchor_for_content(
+            &semantic.source_id,
+            &semantic.source_path,
+            semantic.conversation_id,
+            semantic.line_number,
+            &semantic.content,
+        );
+        let expected_anchor = semantic.message_anchor.clone();
+        assert!(expected_anchor.is_some());
 
         let fused = rrf_fuse_hits(&[lexical], &[semantic], "", 10, 0);
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].conversation_id, Some(42));
+        assert_eq!(fused[0].message_anchor, expected_anchor);
     }
 
     #[test]
@@ -25121,10 +25332,20 @@ mod tests {
         let mut semantic = lexical.clone();
         semantic.title = "Evening Session".into();
         semantic.score = 0.9;
+        semantic.message_anchor = message_anchor_for_content(
+            &semantic.source_id,
+            &semantic.source_path,
+            semantic.conversation_id,
+            semantic.line_number,
+            &semantic.content,
+        );
+        let expected_anchor = semantic.message_anchor.clone();
+        assert!(expected_anchor.is_some());
 
         let fused = rrf_fuse_hits(&[lexical], &[semantic], "", 10, 0);
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].conversation_id, Some(9));
+        assert_eq!(fused[0].message_anchor, expected_anchor);
     }
 
     #[test]
@@ -27096,6 +27317,7 @@ mod tests {
     #[test]
     fn hit_is_noise_returns_false_when_content_and_snippet_both_empty() {
         let hit = SearchHit {
+            message_anchor: None,
             title: String::new(),
             snippet: String::new(),
             content: String::new(),
@@ -27134,6 +27356,7 @@ mod tests {
     #[test]
     fn hit_is_noise_still_drops_tool_acknowledgement_when_content_present() {
         let hit = SearchHit {
+            message_anchor: None,
             title: String::new(),
             snippet: String::new(),
             content: "ok".to_string(),

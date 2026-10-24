@@ -320,13 +320,12 @@ pub fn subsystem_coverage_matrix() -> Vec<SubsystemCoverage> {
             proof_artifacts: &[
                 "tests/indexer_tantivy.rs",
                 "tests/atomic_swap_publish_crash_window.rs",
-                "src/search/regression_corpus.rs",
             ],
             optional_diagnostics: &["live publish/backup retention tail"],
             fixture_provenance: "synthetic index trees + crash-window fixtures; SQLite is source of truth",
-            log_expectation: "proof-log over publish/atomic-swap runs; deterministic regression-corpus replay",
+            log_expectation: "proof-log over publish/atomic-swap runs; deterministic indexer replay",
             redaction: RedactionExpectation::NoUserContent,
-            closure_evidence: "cargo test --lib search::regression_corpus + atomic_swap_publish_crash_window",
+            closure_evidence: "cargo test --test indexer_tantivy + atomic_swap_publish_crash_window",
         },
         SubsystemCoverage {
             subsystem: "models",
@@ -379,15 +378,14 @@ pub fn subsystem_coverage_matrix() -> Vec<SubsystemCoverage> {
                 ProofLevel::Golden,
             ],
             proof_artifacts: &[
-                "src/search/regression_corpus.rs",
                 "tests/search_pipeline.rs",
                 "tests/spec_search_determinism.rs",
             ],
             optional_diagnostics: &["live semantic refinement tail"],
             fixture_provenance: "synthetic corpus; query/results stay local",
-            log_expectation: "deterministic regression-corpus + determinism spec result lines",
+            log_expectation: "deterministic determinism-spec result lines",
             redaction: RedactionExpectation::LocalOnly,
-            closure_evidence: "cargo test --lib search::regression_corpus + spec_search_determinism",
+            closure_evidence: "cargo test --test spec_search_determinism",
         },
         SubsystemCoverage {
             subsystem: "sources",
