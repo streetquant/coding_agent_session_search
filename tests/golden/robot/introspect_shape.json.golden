@@ -52850,6 +52850,14 @@
                             }
                           }
                         },
+                        "open_retryable": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "counts_skipped": {
                           "type": "object",
                           "properties": {

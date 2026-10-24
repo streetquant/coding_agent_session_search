@@ -167,6 +167,9 @@
         "open_error": {
           "type": "null"
         },
+        "open_retryable": {
+          "type": "boolean"
+        },
         "counts_skipped": {
           "type": "boolean"
         },

@@ -823,6 +823,109 @@ fn sources_agents_include_removes_existing_exclusion() {
     tracker.complete();
 }
 
+/// The connector-coverage commands mutate the shared connector config. Each
+/// mutation must leave the automatic backup of the config it replaced beside
+/// the config, so the inverse can be restored from a real pre-image instead
+/// of a hand-made one.
+#[test]
+fn sources_agents_include_and_exclude_write_automatic_config_backups() {
+    let tracker = tracker_for("sources_agents_include_and_exclude_write_automatic_config_backups");
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&data_dir).unwrap();
+    let pre_image = "disabled_agents = [\"openclaw\"]\n";
+    create_sources_config(&config_dir, pre_image);
+
+    let config_file = config_dir.join("cass").join("sources.toml");
+    let config_parent = config_file.parent().unwrap().to_path_buf();
+    let backups = |dir: &Path| -> Vec<std::path::PathBuf> {
+        let mut found: Vec<std::path::PathBuf> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.starts_with("sources.toml.backup."))
+                    .unwrap_or(false)
+            })
+            .collect();
+        found.sort();
+        found
+    };
+
+    let mut command = tracker.cass_assert_command();
+    let output = command
+        .args(["sources", "agents", "include", "openclaw"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("CASS_DATA_DIR", &data_dir)
+        .output()
+        .expect("sources agents include command");
+    assert!(
+        output.status.success(),
+        "include failed: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let after_include = backups(&config_parent);
+    assert_eq!(
+        after_include.len(),
+        1,
+        "include must leave exactly one automatic backup, found: {after_include:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&after_include[0]).unwrap(),
+        pre_image,
+        "the automatic backup must hold the config that was replaced"
+    );
+
+    let post_image = fs::read_to_string(&config_file).unwrap();
+    assert!(
+        !post_image.contains("openclaw"),
+        "include must remove the exclusion from the config: {post_image}"
+    );
+
+    let mut command = tracker.cass_assert_command();
+    let output = command
+        .args([
+            "sources",
+            "agents",
+            "exclude",
+            "openclaw",
+            "--keep-indexed-data",
+        ])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("CASS_DATA_DIR", &data_dir)
+        .output()
+        .expect("sources agents exclude command");
+    assert!(
+        output.status.success(),
+        "exclude failed: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let after_exclude = backups(&config_parent);
+    assert_eq!(
+        after_exclude.len(),
+        2,
+        "exclude must leave its own automatic backup, found: {after_exclude:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(after_exclude.last().unwrap()).unwrap(),
+        post_image,
+        "the inverse's automatic backup must hold the config it replaced"
+    );
+
+    tracker.complete();
+}
+
 #[test]
 fn sources_agents_exclude_purges_local_archive_data_by_default() {
     let tracker = tracker_for("sources_agents_exclude_purges_local_archive_data_by_default");

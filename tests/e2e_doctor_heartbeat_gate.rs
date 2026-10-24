@@ -21,6 +21,7 @@ use util::timeout::spawn_with_timeout_or_diag;
 
 const HEARTBEAT_MARKER: &str = "[cass doctor --check] still running";
 const STATUS_MARKER: &str = "[cass status] still running";
+const HEALTH_MARKER: &str = "[cass health] still running";
 const TIMEOUT: Duration = Duration::from_secs(180);
 
 struct Fixture {
@@ -163,6 +164,84 @@ fn check() -> Result<(), String> {
     );
     if String::from_utf8_lossy(&status_silent.stderr).contains(STATUS_MARKER) {
         return Err("CASS_DOCTOR_HEARTBEAT_SECS=0 still emitted a status heartbeat".to_string());
+    }
+
+    // k2k20 health half: the watermark probe opens the canonical archive and
+    // used to be silent (and unbounded on the status ceiling). It now emits
+    // the same stderr liveness line, names its open phase, and gives up at
+    // the short health deadline with a RETRYABLE open error rather than an
+    // assumed-good or hard-fault answer.
+    let started = Instant::now();
+    let health = run(
+        &fixture,
+        "health_heartbeat_bounded_open",
+        &["health", "--json"],
+        &[
+            ("CASS_DOCTOR_HEARTBEAT_SECS", "1"),
+            ("CASS_TEST_STATE_PROBE_SLOW_MS", "8000"),
+        ],
+    );
+    let wall = started.elapsed();
+    let health_out = String::from_utf8_lossy(&health.stdout).into_owned();
+    let health_err = String::from_utf8_lossy(&health.stderr).into_owned();
+    let health_json: Value = serde_json::from_str(health_out.trim())
+        .map_err(|e| format!("health --json stdout not JSON: {e}"))?;
+    if health_out.contains(HEALTH_MARKER) {
+        return Err("health heartbeat leaked onto stdout".to_string());
+    }
+    if !health_err.contains(HEALTH_MARKER) {
+        return Err(format!(
+            "health ran {:.1}s and must emit a liveness line on stderr; stderr: {health_err}",
+            wall.as_secs_f64()
+        ));
+    }
+    if !health_err.contains("phase: state_probe_open") {
+        return Err(format!(
+            "health heartbeat must name the blocking open phase; stderr: {health_err}"
+        ));
+    }
+    if wall >= Duration::from_secs(15) {
+        return Err(format!(
+            "health ignored the 3s watermark deadline (ran {:.1}s)",
+            wall.as_secs_f64()
+        ));
+    }
+    if health_json["healthy"] != Value::Bool(false) || health_json["status"] != "degraded" {
+        return Err(format!(
+            "a timed-out health probe must not claim readiness: {health_json}"
+        ));
+    }
+    if health_json["db"]["opened"] != Value::Bool(false)
+        || health_json["db"]["open_skipped"] != Value::Bool(false)
+    {
+        return Err(format!(
+            "a timed-out health probe must report an attempted, unopened archive: {health_json}"
+        ));
+    }
+    let open_error = health_json["db"]["open_error"].as_str().unwrap_or("");
+    if !open_error.contains("exceeded 3s") || !open_error.contains("last phase:") {
+        return Err(format!(
+            "health must name the deadline and the last phase: {health_json}"
+        ));
+    }
+    if health_json["state"]["database"]["open_retryable"] != Value::Bool(true) {
+        return Err(format!(
+            "health must report the bounded probe as retryable: {health_json}"
+        ));
+    }
+
+    // Disabled cadence stays silent even when the probe is slow.
+    let health_silent = run(
+        &fixture,
+        "health_heartbeat_off",
+        &["health", "--json"],
+        &[
+            ("CASS_DOCTOR_HEARTBEAT_SECS", "0"),
+            ("CASS_TEST_STATE_PROBE_SLOW_MS", "1500"),
+        ],
+    );
+    if String::from_utf8_lossy(&health_silent.stderr).contains(HEALTH_MARKER) {
+        return Err("CASS_DOCTOR_HEARTBEAT_SECS=0 still emitted a health heartbeat".to_string());
     }
     Ok(())
 }

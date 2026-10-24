@@ -896,7 +896,17 @@ fn apply_semantic_identity_invalidation(
         SemanticPreference::HashFallback => SemanticIdentityTier::Fast,
         SemanticPreference::DefaultModel => SemanticIdentityTier::Quality,
     };
-    let storage = match FrankenStorage::open_readonly(db_path) {
+    // k2k20: this marker check runs inside `cass status`/`cass health`. The
+    // ordinary readonly opener may run dirty-WAL/schema recovery and hydrate a
+    // multi-GB archive (observed as an 84 s silent health check); neither is
+    // acceptable on an observation surface. Use the strict, mutation-free
+    // opener under a short bound. An unconfirmed marker degrades semantic
+    // availability truthfully (`LoadFailed`) instead of blocking the surface.
+    const SEMANTIC_IDENTITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+    let storage = match FrankenStorage::open_strict_readonly_with_timeout(
+        db_path,
+        SEMANTIC_IDENTITY_PROBE_TIMEOUT,
+    ) {
         Ok(storage) => storage,
         Err(err) => {
             // `db_available` is a point-in-time observation, not proof that
@@ -2648,6 +2658,48 @@ mod tests {
             SemanticPreference::HashFallback,
         );
         assert!(ready.is_hash_fallback());
+    }
+
+    /// k2k20: this marker read runs on `cass status`/`cass health`, so it must
+    /// use the strict mutation-free opener. A dirty WAL left by an unclean
+    /// shutdown must stay byte-identical (the ordinary opener would checkpoint
+    /// it, turning a readiness observation into multi-GB recovery work).
+    #[test]
+    fn semantic_identity_probe_reads_marker_without_recovering_a_dirty_wal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("create cass db");
+        storage
+            .mark_semantic_identity_rebuild_required(SemanticIdentityTier::Fast)
+            .expect("mark fast semantic identity stale");
+        storage
+            .close_without_checkpoint()
+            .expect("close without checkpoint");
+        let wal_path = crate::storage::sqlite::database_sidecar_path(&db_path, "-wal");
+        let before = std::fs::metadata(&wal_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        assert!(
+            before > 0,
+            "precondition: an uncheckpointed close must leave WAL frames"
+        );
+
+        let state = apply_semantic_identity_invalidation(
+            &db_path,
+            SemanticAvailability::HashFallback,
+            SemanticPreference::HashFallback,
+        );
+        assert!(
+            state.is_index_stale(),
+            "the strict probe must still read the invalidation marker: {state:?}"
+        );
+        let after = std::fs::metadata(&wal_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        assert_eq!(
+            before, after,
+            "an observation must not checkpoint the archive (WAL {before} -> {after})"
+        );
     }
 
     #[cfg(windows)]
