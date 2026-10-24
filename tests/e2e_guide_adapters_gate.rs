@@ -420,27 +420,36 @@ fn a_concurrent_index_run_makes_the_guide_refuse_to_mutate() -> TestResult {
         .open(&lock_path)?;
     owner.try_lock_exclusive()?;
 
-    let payload = run_guide(
-        &home,
-        &data_dir,
-        &[
-            "onboard-source",
-            "--apply",
-            "--confirm-step",
-            "3",
-            "--confirm-fact",
-            "sources_config_writable",
-            "--accept-privacy-tier",
-            "redacted",
-            "--accept-cost-risk",
-            "medium",
-            "--allow-rch",
-            "--confirm-stop-conditions-clear",
-        ],
-    )?;
+    // The operator inspects the plan first; approval is bound to exactly the
+    // identity of the operation they reviewed.
+    let inspect_args = [
+        "onboard-source",
+        "--confirm-step",
+        "3",
+        "--confirm-fact",
+        "sources_config_writable",
+        "--accept-privacy-tier",
+        "redacted",
+        "--accept-cost-risk",
+        "medium",
+        "--allow-rch",
+        "--confirm-stop-conditions-clear",
+    ];
+    let plan = run_guide(&home, &data_dir, &inspect_args)?;
+    let readiness_blocked = gate_result(&plan, "readiness") == Some("blocked");
+    let expectation = mutation_step(&plan)
+        .and_then(|step| step.pointer("/preview/identity/value"))
+        .and_then(Value::as_str)
+        .map(|identity| format!("3={identity}"));
+    let mut apply_args: Vec<&str> = inspect_args.to_vec();
+    apply_args.insert(1, "--apply");
+    if let Some(expectation) = expectation.as_deref() {
+        apply_args.extend(["--expect-plan-identity", expectation]);
+    }
+
+    let payload = run_guide(&home, &data_dir, &apply_args)?;
 
     let step = mutation_step(&payload).ok_or("no mutating step in the plan")?;
-    let readiness_blocked = gate_result(&payload, "readiness") == Some("blocked");
     if readiness_blocked {
         ensure(
             counter(&payload, "attempted_mutation_count") == Some(0)
