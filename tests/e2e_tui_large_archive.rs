@@ -87,7 +87,7 @@ fn cass_bin() -> &'static str {
 /// A large Codex corpus. The data dir lives outside the OS temp dir because
 /// the TUI deliberately skips background indexing for scratch temp dirs.
 struct Fixture {
-    root: tempfile::TempDir,
+    _root: tempfile::TempDir,
     home: PathBuf,
     xdg_data: PathBuf,
     xdg_config: PathBuf,
@@ -144,7 +144,7 @@ impl Fixture {
         .expect("seed TUI state");
         write_codex_corpus(&codex_home, sessions, messages_per_session);
         Self {
-            root,
+            _root: root,
             home,
             xdg_data,
             xdg_config,
@@ -424,6 +424,14 @@ impl TuiSession {
             cmd
         };
         fixture.apply_pty_env(&mut cmd);
+        if memory_limit_kib.is_some() {
+            // `.cargo/config.toml` exports RUST_MIN_STACK=128 MiB to tests.
+            // Under RLIMIT_AS=2 GiB every TUI worker thread would reserve that
+            // much address space and thread creation can fail with EAGAIN;
+            // remove the test-harness override so the constrained process uses
+            // the Rust default stacks a normal launch would.
+            cmd.env_remove("RUST_MIN_STACK");
+        }
         if let Some(trace) = latency_trace {
             cmd.env(
                 "CASS_TUI_LATENCY_TRACE_FILE",
@@ -896,11 +904,6 @@ fn tui_large_archive_first_frame_and_core_journeys() {
         session.resize(terminal_size); // restore the declared terminal shape
 
         // ---- broad lexical search on the large result set -----------------
-        save_artifact(
-            &format!("{label}_before_broad.raw"),
-            &trace_id,
-            &session.captured_bytes(),
-        );
         session.write(b"\x0c"); // Ctrl+L clears the query
         thread::sleep(Duration::from_millis(80));
         let broad_base = session.captured_len();
@@ -1178,7 +1181,7 @@ fn tui_large_archive_missing_index_does_not_block_first_frame() {
     );
     let help_ms = help_start.elapsed().as_millis() as u64;
     let help_close_base = session.captured_len();
-    session.write(b"\x1b");
+    session.write(b"\x1bOP"); // F1 toggles without ESC-sequence ambiguity
     assert!(
         session.wait_growth(help_close_base, 4, Duration::from_millis(HELP_BUDGET_MS)),
         "help did not close while the background index ran"
