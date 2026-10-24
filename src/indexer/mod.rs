@@ -24952,18 +24952,15 @@ fn rebuild_tantivy_from_db_once(
     // carve-out's bead-0k0sk follow-up is this fix).
     let page_size = LEXICAL_REBUILD_PAGE_SIZE;
     let pipeline_settings = lexical_rebuild_pipeline_settings_snapshot();
-    // CASS->Quill flip: staged sharding exists ONLY to parallelize Tantivy
-    // ingest — it builds N independent index directories and merges them with
-    // `merge_compatible_index_directories`, which opens Tantivy directories and
-    // merges Tantivy segments. Quill has no N-directory merge (its
-    // `concat_merge` joins segments WITHIN one manifest), and building one would
-    // mean remapping Q1 global docid spaces and rebuilding IDMAP across
-    // independent indexes.
+    // CASS->Quill flip: staged sharding existed ONLY to parallelize Tantivy
+    // ingest — it built N independent index directories and merged their
+    // segments. Quill has no N-directory merge (its `concat_merge` joins
+    // segments WITHIN one manifest), and building one would mean remapping Q1
+    // global docid spaces and rebuilding IDMAP across independent indexes.
     //
     // It is not needed: measured Quill CASS ingest is ~9.8k docs/s, so a
     // 442k-message corpus streams into ONE index in minutes. The single-index
-    // path below is the same code that already runs whenever no shard plan is
-    // produced, so this is a strategy choice, not a new code path.
+    // path below is a strategy choice, not a new code path.
     // Staged sharding is disabled for the Quill backend, so every rebuild
     // takes the single-index path below.
 

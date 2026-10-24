@@ -502,10 +502,6 @@ fn write_root_schema_hash_file(index_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn manifest_relative_shard_path(shard_idx: usize) -> String {
-    format!("shards/shard-{shard_idx:05}")
-}
-
 fn meta_fingerprint_for_existing_index_dir(index_path: &Path) -> Result<String> {
     let meta_path = index_path.join("meta.json");
     let bytes = fs::read(&meta_path)
@@ -1314,121 +1310,6 @@ fn ensure_replaceable_federated_materialization_root(index_path: &Path) -> Resul
     }
 }
 
-pub fn publish_federated_searchable_index_directories<P: AsRef<Path>>(
-    output_path: &Path,
-    input_paths: &[P],
-) -> Result<SearchableIndexSummary> {
-    if input_paths.is_empty() {
-        return Err(anyhow::anyhow!(
-            "cannot publish federated lexical bundle without at least one input shard"
-        ));
-    }
-    let mut input_summaries = Vec::with_capacity(input_paths.len());
-    for input_path in input_paths {
-        let input_path = input_path.as_ref();
-        let summary = searchable_index_summary(input_path)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "federated lexical publish input is not a searchable index: {}",
-                input_path.display()
-            )
-        })?;
-        input_summaries.push((input_path.to_path_buf(), summary));
-    }
-    publish_federated_searchable_index_directories_with_summaries(output_path, &input_summaries)
-}
-
-pub fn publish_federated_searchable_index_directories_with_summaries(
-    output_path: &Path,
-    input_shards: &[(PathBuf, SearchableIndexSummary)],
-) -> Result<SearchableIndexSummary> {
-    if input_shards.is_empty() {
-        return Err(anyhow::anyhow!(
-            "cannot publish federated lexical bundle without at least one input shard"
-        ));
-    }
-    ensure_empty_merge_output_directory(output_path)?;
-
-    let shard_root = output_path.join("shards");
-    fs::create_dir_all(&shard_root).with_context(|| {
-        format!(
-            "creating federated lexical shard root {}",
-            shard_root.display()
-        )
-    })?;
-
-    let mut manifest = FederatedSearchManifest {
-        version: FEDERATED_SEARCH_MANIFEST_VERSION,
-        kind: FEDERATED_SEARCH_MANIFEST_KIND.to_string(),
-        schema_hash: CASS_SCHEMA_HASH.to_string(),
-        shards: Vec::with_capacity(input_shards.len()),
-    };
-    let mut total_docs = 0usize;
-    let mut total_segments = 0usize;
-
-    for (shard_idx, (input_path, summary)) in input_shards.iter().enumerate() {
-        if !searchable_index_exists(input_path) {
-            return Err(anyhow::anyhow!(
-                "federated lexical publish input is not a searchable index: {}",
-                input_path.display()
-            ));
-        }
-        let meta_fingerprint = meta_fingerprint_for_existing_index_dir(input_path)?;
-        let relative_path = manifest_relative_shard_path(shard_idx);
-        let destination_path = output_path.join(&relative_path);
-        if let Some(parent) = destination_path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "creating parent directory for federated lexical shard {}",
-                    destination_path.display()
-                )
-            })?;
-        }
-        fs::rename(input_path, &destination_path).with_context(|| {
-            format!(
-                "moving staged lexical shard {} into federated publish bundle {}",
-                input_path.display(),
-                destination_path.display()
-            )
-        })?;
-
-        total_docs = total_docs.checked_add(summary.docs).with_context(|| {
-            format!(
-                "federated lexical publish doc count overflows platform usize for {}",
-                output_path.display()
-            )
-        })?;
-        total_segments = total_segments
-            .checked_add(summary.segments)
-            .with_context(|| {
-                format!(
-                    "federated lexical publish segment count overflows platform usize for {}",
-                    output_path.display()
-                )
-            })?;
-        manifest.shards.push(FederatedSearchShardManifest {
-            relative_path,
-            docs: summary.docs,
-            segments: summary.segments,
-            meta_fingerprint,
-        });
-    }
-
-    let manifest_bytes =
-        serde_json::to_vec_pretty(&manifest).context("serializing federated search manifest")?;
-    fs::write(federated_search_manifest_path(output_path), &manifest_bytes).with_context(|| {
-        format!(
-            "writing federated search manifest {}",
-            federated_search_manifest_path(output_path).display()
-        )
-    })?;
-    write_root_schema_hash_file(output_path)?;
-
-    Ok(SearchableIndexSummary {
-        docs: total_docs,
-        segments: total_segments,
-    })
-}
-
 /// Discard an index whose recorded schema hash is not the current one.
 ///
 /// This is the mismatch-triggered rebuild. The Tantivy backend performed it
@@ -1634,69 +1515,6 @@ impl TantivyIndex {
     /// Use sparingly - blocks until merge finishes.
     pub fn force_merge(&mut self) -> Result<()> {
         self.inner.force_merge()
-    }
-
-    pub fn merge_compatible_index_directories<P: AsRef<Path>>(
-        output_path: &Path,
-        input_paths: &[P],
-    ) -> Result<Self> {
-        if input_paths.is_empty() {
-            return Err(anyhow::anyhow!(
-                "cannot merge Tantivy index directories without at least one input"
-            ));
-        }
-        ensure_empty_merge_output_directory(output_path)?;
-
-        let indices = input_paths
-            .iter()
-            .map(|input_path| {
-                let input_path = input_path.as_ref();
-                let mut index = Index::open_in_dir(input_path).with_context(|| {
-                    format!(
-                        "opening compatible Tantivy index directory for merge: {}",
-                        input_path.display()
-                    )
-                })?;
-                ensure_tokenizer(&mut index);
-                Ok(index)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let output_directory = tantivy_crate::directory::MmapDirectory::open(output_path)
-            .with_context(|| {
-                format!(
-                    "opening Tantivy output directory for merged index: {}",
-                    output_path.display()
-                )
-            })?;
-        let mut merged = tantivy_crate::indexer::merge_indices(&indices, output_directory)
-            .with_context(|| {
-                format!(
-                    "merging {} compatible Tantivy index directories into {}",
-                    indices.len(),
-                    output_path.display()
-                )
-            })?;
-        ensure_tokenizer(&mut merged);
-        fs::write(
-            output_path.join("schema_hash.json"),
-            format!("{{\"schema_hash\":\"{CASS_SCHEMA_HASH}\"}}"),
-        )
-        .with_context(|| {
-            format!(
-                "writing cass schema hash metadata for merged Tantivy index {}",
-                output_path.display()
-            )
-        })?;
-        drop(merged);
-        Self::open_or_create(output_path)
-    }
-
-    pub fn assemble_compatible_index_directories<P: AsRef<Path>>(
-        output_path: &Path,
-        input_paths: &[P],
-    ) -> Result<Self> {
-        Self::assemble_compatible_index_directory_files(output_path, input_paths)?;
-        Self::open_or_create(output_path)
     }
 
     fn assemble_compatible_index_directory_files<P: AsRef<Path>>(
