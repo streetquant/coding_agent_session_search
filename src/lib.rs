@@ -32047,6 +32047,12 @@ where
     let (sender, receiver) = sync_channel(1);
     std::thread::Builder::new()
         .name("cass-bounded-read-only".to_string())
+        // The GH #503 read path may open a pre-#434 archive through the
+        // engine's deferred-FTS5 state machine, whose debug-build future
+        // frame does not fit the default 2 MiB thread stack (observed as a
+        // SIGSEGV/stack overflow on the first `search` against such an
+        // archive). Other CLI work already runs on this same 16 MiB stack.
+        .stack_size(16 * 1024 * 1024)
         .spawn(move || {
             let _ = sender.send(work());
         })
@@ -75464,6 +75470,49 @@ mod doctor_asset_taxonomy_tests {
         assert!(marker_path.exists(), "marker must be preserved");
         let lock_len = std::fs::metadata(&lock_path).expect("lock metadata").len();
         assert!(lock_len > 0, "held lock metadata must not be truncated");
+    }
+
+    /// A process killed during DB open leaves lock metadata naming a dead pid
+    /// with a still-fresh heartbeat. The kernel released its flock, so the
+    /// next `doctor --fix` must acquire the lock immediately and rewrite the
+    /// metadata instead of waiting for the 24h self-heal bound.
+    #[test]
+    fn doctor_acquire_mutation_lock_reclaims_dead_owner_metadata_with_fresh_heartbeat() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("db");
+        let fresh_heartbeat = doctor_now_ms();
+        let lock_path = write_stale_doctor_lock_metadata(data_dir, fresh_heartbeat);
+
+        let (guard, observation) = doctor_acquire_mutation_lock(data_dir, &db_path)
+            .expect("dead owner's released flock must be acquirable");
+        let DoctorMutationLockObservation::Acquired { metadata, .. } = observation else {
+            panic!("dead-owner lock should be acquired, got {observation:?}");
+        };
+        let current_pid = std::process::id().to_string();
+        assert_eq!(
+            metadata.get("pid"),
+            Some(&current_pid),
+            "lock metadata must name the new owner"
+        );
+        let raw = std::fs::read_to_string(&lock_path).expect("read lock metadata");
+        assert!(
+            raw.contains(&format!("pid={current_pid}\n")),
+            "on-disk lock metadata must be rewritten: {raw}"
+        );
+
+        let second = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock second handle");
+        assert!(
+            fs2::FileExt::try_lock_exclusive(&second).is_err(),
+            "the new owner must hold the flock"
+        );
+        drop(guard);
+        fs2::FileExt::try_lock_exclusive(&second).expect("flock must release with the guard");
     }
 
     #[test]
