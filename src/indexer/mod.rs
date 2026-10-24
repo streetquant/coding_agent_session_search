@@ -56538,10 +56538,22 @@ c.close()
             .unwrap(),
             b"stale-shm"
         );
-        assert!(
-            !wal_path.exists() && !shm_path.exists(),
-            "stale sidecars must move with the quarantined bundle, not leak into the rebuilt archive"
-        );
+        // The rebind open may create fresh sidecars for the promoted archive;
+        // what matters is that the *stale* bytes travelled with the quarantine
+        // instead of leaking into the rebuilt bundle.
+        for (live_sidecar, stale) in [
+            (&wal_path, b"stale-wal".as_slice()),
+            (&shm_path, b"stale-shm".as_slice()),
+        ] {
+            if let Ok(bytes) = std::fs::read(live_sidecar) {
+                assert_ne!(
+                    bytes,
+                    stale,
+                    "stale {} bytes must move with the quarantined bundle, not leak into the rebuilt archive",
+                    live_sidecar.display()
+                );
+            }
+        }
 
         // The promoted archive is readable and contains the mirror session.
         let storage = FrankenStorage::open(&db_path).unwrap();
