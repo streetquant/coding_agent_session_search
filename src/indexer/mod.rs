@@ -1,5 +1,6 @@
 mod archive_lease;
 pub mod background_refresh;
+pub mod archive_count;
 #[cfg(test)]
 mod checkpoint_deadline;
 pub(crate) mod lexical_generation;
@@ -18986,56 +18987,90 @@ fn run_index_with_storage_ownership(
             && !preflight_skip("watch_startup:count_total_messages")
         {
             preflight_phase!("watch_startup:count_total_messages");
-            let canonical_messages = count_total_messages_exact(&storage)?;
-            // cass#317: the true sparseness threshold is the noise-adjusted
-            // expected doc count (reachable messages the sink actually indexes),
-            // not the raw `canonical_messages`. Only pay for that per-conversation
-            // content scan when the index looks sparse against the cheap raw upper
-            // bound — if `observed >= canonical_messages` it certainly covers the
-            // smaller noise-adjusted expectation, so no repair and no scan needed.
-            // Computed under the same `count_total_messages` preflight phase so
-            // the scan stays watchdog-covered without a new taxonomy sub-phase.
-            let expected_lexical_docs =
-                if observed_tantivy_docs.is_some_and(|docs| docs < canonical_messages) {
-                    expected_live_lexical_doc_count_cached(
-                        &storage,
-                        &index_path,
-                        &opts.db_path.to_string_lossy(),
-                        canonical_messages,
-                        opts.progress.as_deref(),
-                    )?
-                } else {
-                    canonical_messages
-                };
-            complete_preflight_phase!();
-            // #248 (coding_agent_session_search-raoug): only pay for the
-            // published-index validation (a read-only DB open + fingerprint COUNT
-            // scans) when the live index actually looks sparse — i.e. below the
-            // noise-adjusted expectation, when it would otherwise trigger a
-            // from-scratch rebuild. A genuinely missing/invalid index rebuilds
-            // regardless (handled in
-            // choose_incremental_canonical_lexical_repair_plan via
-            // tantivy_requires_rebuild), so skip the check then.
-            let published_index_validated_for_current_data = !tantivy_requires_rebuild
-                && observed_tantivy_docs.is_some_and(|docs| docs < expected_lexical_docs)
-                && !preflight_skip("watch_startup:published_index_validate")
-                && {
-                    preflight_phase!("watch_startup:published_index_validate");
-                    let validated = published_lexical_index_validated_for_current_data(
-                        &index_path,
-                        &opts.db_path,
-                    );
+            // GH #381 (coding_agent_session_search-2l1b0.5): the canonical
+            // message count is a heuristic input — it only decides whether the
+            // live lexical index looks sparse — so it is bounded. The bounded
+            // count stops at its wall-clock budget and reports the count as
+            // *unknown* instead of hanging the preflight (the reported
+            // 468k-message shape) or fabricating a zero.
+            let counted = archive_count::measure_archive_count(
+                &storage,
+                &opts.db_path,
+                &index_path,
+                archive_count::archive_count_budget(),
+            )?;
+            match counted.outcome.exact_count() {
+                Some(canonical_messages) => {
+                    // cass#317: the true sparseness threshold is the noise-adjusted
+                    // expected doc count (reachable messages the sink actually indexes),
+                    // not the raw `canonical_messages`. Only pay for that per-conversation
+                    // content scan when the index looks sparse against the cheap raw upper
+                    // bound — if `observed >= canonical_messages` it certainly covers the
+                    // smaller noise-adjusted expectation, so no repair and no scan needed.
+                    // Computed under the same `count_total_messages` preflight phase so
+                    // the scan stays watchdog-covered without a new taxonomy sub-phase.
+                    let expected_lexical_docs =
+                        if observed_tantivy_docs.is_some_and(|docs| docs < canonical_messages) {
+                            expected_live_lexical_doc_count_cached(
+                                &storage,
+                                &index_path,
+                                &opts.db_path.to_string_lossy(),
+                                canonical_messages,
+                                opts.progress.as_deref(),
+                            )?
+                        } else {
+                            canonical_messages
+                        };
                     complete_preflight_phase!();
-                    validated
-                };
-            choose_incremental_canonical_lexical_repair_plan(
-                IncrementalCanonicalLexicalRepairContext {
-                    canonical_messages,
-                    expected_lexical_docs,
-                    published_index_validated_for_current_data,
-                    ..repair_context
-                },
-            )
+                    // #248 (coding_agent_session_search-raoug): only pay for the
+                    // published-index validation (a read-only DB open + fingerprint COUNT
+                    // scans) when the live index actually looks sparse — i.e. below the
+                    // noise-adjusted expectation, when it would otherwise trigger a
+                    // from-scratch rebuild. A genuinely missing/invalid index rebuilds
+                    // regardless (handled in
+                    // choose_incremental_canonical_lexical_repair_plan via
+                    // tantivy_requires_rebuild), so skip the check then.
+                    let published_index_validated_for_current_data = !tantivy_requires_rebuild
+                        && observed_tantivy_docs.is_some_and(|docs| docs < expected_lexical_docs)
+                        && !preflight_skip("watch_startup:published_index_validate")
+                        && {
+                            preflight_phase!("watch_startup:published_index_validate");
+                            let validated = published_lexical_index_validated_for_current_data(
+                                &index_path,
+                                &opts.db_path,
+                            );
+                            complete_preflight_phase!();
+                            validated
+                        };
+                    choose_incremental_canonical_lexical_repair_plan(
+                        IncrementalCanonicalLexicalRepairContext {
+                            canonical_messages,
+                            expected_lexical_docs,
+                            published_index_validated_for_current_data,
+                            ..repair_context
+                        },
+                    )
+                }
+                None => {
+                    complete_preflight_phase!();
+                    // The count is unknown, so the sparseness comparison cannot
+                    // be made. Skipping the repair branch is the same safe
+                    // degradation the operator gets from
+                    // `CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES=1`: the run
+                    // falls through to the normal scan loop instead of the
+                    // lexical-repair shortcut. No zero is fabricated.
+                    tracing::warn!(
+                        db_path = %opts.db_path.display(),
+                        outcome = ?counted.outcome,
+                        wall_ms = counted.wall_ms,
+                        rss_bytes_after = counted.rss_bytes_after,
+                        io_bytes_after = counted.io_bytes_after,
+                        "canonical message count unavailable within its budget; \
+                         skipping the sparse-index repair branch (no count is fabricated)"
+                    );
+                    None
+                }
+            }
         } else {
             None
         };
@@ -26087,7 +26122,9 @@ fn remove_lexical_index_dir_placeholder(index_path: &Path) {
     // cache the archive fingerprint there. Both are rewritten with the published
     // generation, so a directory holding only them is still a placeholder;
     // retaining it gave a fresh install a "prior-live" publish backup with no
-    // index in it. Only those two sidecars are removed. `fs::remove_dir` only
+    // index in it. The bounded-archive-count memo (GH #381) is a cache of the
+    // same kind and is recomputed on demand, so it belongs to the allowlist
+    // too. Only those sidecars are removed. `fs::remove_dir` only
     // succeeds when the directory has zero entries (failing with ENOTEMPTY if
     // any other file or subdirectory exists), so calling it here turns the
     // placeholder back into `!index_path.exists()` without touching a populated
@@ -26101,6 +26138,7 @@ fn remove_lexical_index_dir_placeholder(index_path: &Path) {
     let placeholder_sidecars = [
         lexical_rebuild_state_path(index_path),
         index_path.join(ARCHIVE_FINGERPRINT_CACHE_FILE),
+        index_path.join(archive_count::ARCHIVE_COUNT_CACHE_FILE),
     ];
     let mut sidecars = Vec::new();
     for entry in entries {
@@ -63814,6 +63852,37 @@ c.close()
                 "a checkpoint-only placeholder is not a prior-live generation; got {entries:?}"
             );
         }
+    }
+
+    #[test]
+    fn remove_lexical_index_dir_placeholder_tolerates_the_archive_count_memo() {
+        // GH #381: the bounded-archive-count memo is a cache of the same kind
+        // as the archive fingerprint cache, and it is recomputed on demand. A
+        // first publish must still treat an index dir that holds only the
+        // rebuild checkpoint and those caches as a placeholder, otherwise a
+        // fresh install retains an empty "prior-live" publish backup.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let index_path = index_dir(&data_dir).unwrap();
+        fs::write(
+            lexical_rebuild_state_path(&index_path),
+            b"{\"completed\":false}",
+        )
+        .unwrap();
+        fs::write(index_path.join(ARCHIVE_FINGERPRINT_CACHE_FILE), b"{}").unwrap();
+        fs::write(
+            index_path.join(archive_count::ARCHIVE_COUNT_CACHE_FILE),
+            b"{}",
+        )
+        .unwrap();
+
+        remove_lexical_index_dir_placeholder(&index_path);
+
+        assert!(
+            !index_path.exists(),
+            "the archive count memo must not keep a placeholder index dir alive"
+        );
     }
 
     #[test]

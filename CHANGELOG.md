@@ -109,6 +109,22 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **The canonical-archive message count is bounded and honest about not
+  knowing (#381).** The preflight count of canonical messages ran as one
+  unbounded `SELECT COUNT(*) FROM messages`; on the reported
+  468,216-message / 10,252-conversation archive that read could wedge the
+  whole index run, and the only escape was
+  `CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES=1`, which skipped the whole
+  branch. The count now runs in bounded windows inside a wall-clock budget
+  (`CASS_ARCHIVE_COUNT_BUDGET_MS`, default 30 s), measures the count stage
+  separately from the total wall time (with resident-set and block-IO
+  deltas), and memoizes the exact count next to the lexical index
+  (`.archive-count-cache.json`, keyed by the archive's physical identity) so
+  repeated first access does not pay for the scan again. When the budget
+  expires the count is reported as *unknown* — never as a fabricated zero —
+  and the run degrades to the same safe behavior the skip variable
+  selects: the sparse-index repair branch is skipped and the normal scan
+  loop continues.
 - **`cass swarm status` reads Beads with br 0.7.x (#529).** The live Beads
   reader accepted only br 0.6.x, so with the current br it reported the
   provider unavailable and left the ready, in-progress and blocked counts
