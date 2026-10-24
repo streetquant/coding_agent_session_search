@@ -3228,51 +3228,6 @@ mod tests {
         .expect("write manifest");
     }
 
-    fn publish_test_federated_bundle(root: &Path) -> PathBuf {
-        let shard_a = root.join("shard-a");
-        let shard_b = root.join("shard-b");
-        let published = root.join("published");
-
-        let mut shard_a_index = TantivyIndex::open_or_create(&shard_a).expect("create shard a");
-        let mut shard_b_index = TantivyIndex::open_or_create(&shard_b).expect("create shard b");
-
-        let make_conv = |external_id: &str, content: &str| NormalizedConversation {
-            agent_slug: "codex".to_string(),
-            external_id: Some(external_id.to_string()),
-            title: Some(format!("Bundle {external_id}")),
-            workspace: Some(PathBuf::from("/tmp/workspace")),
-            source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
-            started_at: Some(1_700_000_002_000),
-            ended_at: Some(1_700_000_002_100),
-            metadata: Value::Null,
-            messages: vec![NormalizedMessage {
-                idx: 0,
-                role: "assistant".to_string(),
-                author: None,
-                created_at: Some(1_700_000_002_010),
-                content: content.to_string(),
-                extra: Value::Null,
-                snippets: Vec::new(),
-                invocations: Vec::new(),
-            }],
-        };
-
-        shard_a_index
-            .add_conversation_with_id(&make_conv("bundle-a", "alpha"), Some(10))
-            .expect("index shard a");
-        shard_b_index
-            .add_conversation_with_id(&make_conv("bundle-b", "beta"), Some(20))
-            .expect("index shard b");
-        shard_a_index.commit().expect("commit shard a");
-        shard_b_index.commit().expect("commit shard b");
-        drop(shard_a_index);
-        drop(shard_b_index);
-
-        publish_federated_searchable_index_directories(&published, &[&shard_a, &shard_b])
-            .expect("publish federated bundle");
-        published
-    }
-
     #[test]
     fn federated_manifest_validation_rejects_unsupported_remote_contracts() {
         let root = TempDir::new().expect("temp dir");
