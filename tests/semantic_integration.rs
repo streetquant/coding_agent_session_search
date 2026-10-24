@@ -2428,3 +2428,177 @@ mod gh470_native_long_messages {
         Ok(())
     }
 }
+
+mod gothf8_tokenizer_contract {
+    use coding_agent_search::search::fastembed_reranker::FastEmbedReranker;
+    use coding_agent_search::search::reranker::RerankerError;
+    use sha2::{Digest, Sha256};
+    use tokenizers::{NormalizedString, Normalizer, Tokenizer, TruncationParams};
+
+    // The complete, pinned MS MARCO tokenizer, rather than the 249-byte loader
+    // fixture. Freeze this contract on the incumbent before changing its source.
+    const TOKENIZER: &[u8] =
+        include_bytes!("fixtures/models/xenova-ms-marco-minilm-l6-v2-int8/tokenizer.json");
+
+    fn tokenizer() -> Tokenizer {
+        assert_eq!(
+            hex::encode(Sha256::digest(TOKENIZER)),
+            "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66"
+        );
+        Tokenizer::from_bytes(TOKENIZER).expect("pinned complete tokenizer")
+    }
+
+    #[test]
+    fn gothf8_wordpiece_ids_offsets_and_normalization_are_frozen() {
+        let tokenizer = tokenizer();
+        type FrozenTokenCase = (&'static str, &'static [u32], &'static [(usize, usize)]);
+        let cases: &[FrozenTokenCase] = &[
+            ("", &[101, 102], &[(0, 0), (0, 0)]),
+            (
+                "Hello, WORLD!",
+                &[101, 7592, 1010, 2088, 999, 102],
+                &[(0, 0), (0, 5), (5, 6), (7, 12), (12, 13), (0, 0)],
+            ),
+            ("Café", &[101, 7668, 102], &[(0, 0), (0, 5), (0, 0)]),
+            ("Cafe\u{301}", &[101, 7668, 102], &[(0, 0), (0, 4), (0, 0)]),
+            (
+                "中文",
+                &[101, 1746, 1861, 102],
+                &[(0, 0), (0, 3), (3, 6), (0, 0)],
+            ),
+            (
+                "he\0llo\tworld\n",
+                &[101, 7592, 2088, 102],
+                &[(0, 0), (0, 6), (7, 12), (0, 0)],
+            ),
+            ("🦀", &[101, 100, 102], &[(0, 0), (0, 4), (0, 0)]),
+        ];
+        for &(text, ids, offsets) in cases {
+            let encoded = tokenizer.encode(text, true).expect("encode frozen case");
+            assert_eq!(encoded.get_ids(), ids, "ids for {text:?}");
+            assert_eq!(encoded.get_offsets(), offsets, "offsets for {text:?}");
+            assert_eq!(encoded.get_type_ids(), vec![0; ids.len()]);
+            assert_eq!(encoded.get_attention_mask(), vec![1; ids.len()]);
+            let mut special = vec![0; ids.len()];
+            special[0] = 1;
+            special[ids.len() - 1] = 1;
+            assert_eq!(encoded.get_special_tokens_mask(), special);
+        }
+
+        let encoded = tokenizer
+            .encode("[CLS] hello [SEP]", true)
+            .expect("literal special tokens");
+        assert_eq!(encoded.get_ids(), &[101, 101, 7592, 102, 102]);
+        assert_eq!(
+            encoded.get_offsets(),
+            &[(0, 0), (0, 5), (6, 11), (12, 17), (0, 0)]
+        );
+        assert_eq!(encoded.get_special_tokens_mask(), &[1, 0, 0, 0, 1]);
+        assert_eq!(
+            encoded.get_tokens(),
+            &["[CLS]", "[CLS]", "hello", "[SEP]", "[SEP]"]
+        );
+
+        for (original, expected) in [
+            ("Café", "cafe"),
+            ("Cafe\u{301}", "cafe"),
+            ("中文", " 中  文 "),
+            ("he\0llo\tWORLD\n", "hello world "),
+        ] {
+            let mut normalized = NormalizedString::from(original);
+            tokenizer
+                .get_normalizer()
+                .expect("BERT normalizer")
+                .normalize(&mut normalized)
+                .expect("normalize frozen case");
+            assert_eq!(normalized.get(), expected, "normalization for {original:?}");
+        }
+    }
+
+    #[test]
+    fn gothf8_pair_and_long_token_truncation_are_frozen() {
+        let mut tokenizer = tokenizer();
+        let at_limit = tokenizer
+            .encode("a".repeat(100), true)
+            .expect("maximum WordPiece word length");
+        assert!(!at_limit.get_ids().contains(&100));
+        let over_limit = tokenizer
+            .encode("a".repeat(101), true)
+            .expect("overlong WordPiece word");
+        assert_eq!(over_limit.get_ids(), &[101, 100, 102]);
+        assert_eq!(over_limit.get_offsets(), &[(0, 0), (0, 101), (0, 0)]);
+
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: 8,
+                ..Default::default()
+            }))
+            .expect("pair truncation");
+        let pair = tokenizer
+            .encode(
+                ("hello world", "the quick brown fox jumps over the lazy dog"),
+                true,
+            )
+            .expect("encode pair");
+        assert_eq!(
+            pair.get_ids(),
+            &[101, 7592, 2088, 102, 1996, 4248, 2829, 102]
+        );
+        assert_eq!(pair.get_type_ids(), &[0, 0, 0, 0, 1, 1, 1, 1]);
+        assert_eq!(pair.get_special_tokens_mask(), &[1, 0, 0, 1, 0, 0, 0, 1]);
+        assert_eq!(
+            pair.get_offsets(),
+            &[
+                (0, 0),
+                (0, 5),
+                (6, 11),
+                (0, 0),
+                (0, 3),
+                (4, 9),
+                (10, 15),
+                (0, 0)
+            ]
+        );
+
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: 512,
+                ..Default::default()
+            }))
+            .expect("native reranker truncation");
+        let long = tokenizer
+            .encode("hello ".repeat(600), true)
+            .expect("long repeated prose");
+        let mut expected = vec![101];
+        expected.extend([7592; 510]);
+        expected.push(102);
+        assert_eq!(long.get_ids(), expected);
+        assert_eq!(long.get_offsets()[510], (3054, 3059));
+        assert_eq!(long.get_overflowing().len(), 1);
+        assert_eq!(long.get_overflowing()[0].get_ids().len(), 92);
+    }
+
+    #[test]
+    fn gothf8_invalid_tokenizer_and_weights_keep_typed_load_errors() {
+        let model_dir = tempfile::tempdir().expect("invalid model directory");
+        let tokenizer_path = model_dir.path().join("tokenizer.json");
+        std::fs::write(&tokenizer_path, b"{invalid tokenizer").expect("malformed tokenizer");
+        let error = FastEmbedReranker::load_from_dir(model_dir.path())
+            .err()
+            .expect("invalid tokenizer must fail");
+        assert!(matches!(error, RerankerError::RerankFailed { .. }));
+        assert!(error.to_string().contains("tokenizer"), "{error}");
+
+        std::fs::write(tokenizer_path, TOKENIZER).expect("complete pinned tokenizer");
+        std::fs::write(
+            model_dir.path().join("model.safetensors"),
+            b"invalid weights",
+        )
+        .expect("malformed model weights");
+        let error = FastEmbedReranker::load_from_dir(model_dir.path())
+            .err()
+            .expect("invalid weights must fail");
+        assert!(matches!(error, RerankerError::RerankFailed { .. }));
+        assert!(error.to_string().contains("safetensors"), "{error}");
+    }
+}

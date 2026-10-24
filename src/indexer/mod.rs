@@ -16375,8 +16375,8 @@ fn run_index_with_storage_ownership(
                 && canonical_archive_open_failure_allows_mirror_recovery(err)
         }
     };
-    if should_attempt_open_recovery {
-        if let Some(recovery) =
+    if should_attempt_open_recovery
+        && let Some(recovery) =
             recover_canonical_archive_from_verified_raw_mirror(&opts.data_dir, &opts.db_path)
                 .with_context(|| {
                     format!(
@@ -16384,14 +16384,13 @@ fn run_index_with_storage_ownership(
                         opts.db_path.display()
                     )
                 })?
-        {
-            canonical_archive_mirror_recovery = Some(recovery);
-            storage_open = crate::search::quill_bridge::run_with_liveness_ticks(
-                open_liveness_targets,
-                open_liveness_heartbeat,
-                || open_storage_for_index(&opts.db_path, opts.full),
-            );
-        }
+    {
+        canonical_archive_mirror_recovery = Some(recovery);
+        storage_open = crate::search::quill_bridge::run_with_liveness_ticks(
+            open_liveness_targets,
+            open_liveness_heartbeat,
+            || open_storage_for_index(&opts.db_path, opts.full),
+        );
     }
     if let Some(recovery) = canonical_archive_mirror_recovery.as_ref() {
         tracing::info!(

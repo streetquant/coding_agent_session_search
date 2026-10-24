@@ -1240,6 +1240,7 @@ fn raw_lexical_reader_matches(
         .unwrap_or(0)
 }
 
+#[allow(dead_code)]
 fn force_federated_publish_env(cmd: &mut assert_cmd::Command) {
     cmd.env("CASS_TANTIVY_REBUILD_WORKERS", "6");
     cmd.env("CASS_TANTIVY_MAX_WRITER_THREADS", "2");
@@ -1263,6 +1264,7 @@ fn force_federated_publish_env(cmd: &mut assert_cmd::Command) {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 fn cass_std_cmd(command_env: &E2eCommandEnvironment, home: &Path) -> StdCommand {
     let mut cmd = command_env.cass_std_command();
     cmd.current_dir(home);
@@ -1272,6 +1274,7 @@ fn cass_std_cmd(command_env: &E2eCommandEnvironment, home: &Path) -> StdCommand 
 }
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 fn lexical_publish_in_progress_backup_path(index_path: &Path) -> std::path::PathBuf {
     let file_name = index_path
         .file_name()
@@ -1281,6 +1284,7 @@ fn lexical_publish_in_progress_backup_path(index_path: &Path) -> std::path::Path
 }
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 fn lexical_publish_backups_dir(index_path: &Path) -> std::path::PathBuf {
     index_path
         .parent()
@@ -1289,6 +1293,7 @@ fn lexical_publish_backups_dir(index_path: &Path) -> std::path::PathBuf {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 fn wait_for_publish_kill_relaunch_sentinel(path: &Path, timeout: Duration) -> serde_json::Value {
     let deadline = Instant::now() + timeout;
     loop {

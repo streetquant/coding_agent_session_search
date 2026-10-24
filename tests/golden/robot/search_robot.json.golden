@@ -16,6 +16,7 @@
       "created_at": 1764619673394,
       "conversation_id": 1,
       "line_number": 2,
+      "message_anchor": "[MESSAGE_ANCHOR]",
       "match_type": "exact",
       "source_id": "local",
       "origin_kind": "local"

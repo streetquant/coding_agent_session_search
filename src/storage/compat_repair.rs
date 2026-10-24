@@ -251,7 +251,7 @@ impl CompatRepairLimits {
         resources: &CompatRepairResources,
     ) -> CompatRepairAdmission {
         let estimated_secs = self.estimated_secs(bundle_bytes);
-        let admission = CompatRepairAdmission {
+        CompatRepairAdmission {
             free_bytes: resources.free_bytes,
             required_free_bytes: self.required_free_bytes,
             available_memory_bytes: resources.available_memory_bytes,
@@ -260,8 +260,7 @@ impl CompatRepairLimits {
             max_psi_io_some_avg10: self.max_psi_io_some_avg10,
             estimated_secs,
             max_secs: self.max_secs,
-        };
-        admission
+        }
     }
 
     fn refusal(
@@ -785,11 +784,9 @@ impl CompatRepairMonitor {
         self.snapshot.storage_read_bytes = storage_read_bytes;
         self.snapshot.storage_write_bytes = storage_write_bytes;
         self.snapshot.backup_bytes = backup_bytes;
-        self.snapshot.pages_copied = if self.snapshot.page_size > 0 {
-            backup_bytes / self.snapshot.page_size
-        } else {
-            0
-        };
+        self.snapshot.pages_copied = backup_bytes
+            .checked_div(self.snapshot.page_size)
+            .unwrap_or(0);
         self.snapshot.progress_current = current;
         self.snapshot.elapsed_ms =
             u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);

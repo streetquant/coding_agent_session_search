@@ -21270,8 +21270,7 @@ fn state_db_strict_open_error_message(
         );
     }
     let rendered = format!("{err:#}");
-    if rendered.contains("conflicting virtual-table entries")
-        && rendered.contains("`fts_messages")
+    if rendered.contains("conflicting virtual-table entries") && rendered.contains("`fts_messages")
     {
         return format!(
             "{base}; sqlite_master carries duplicate fts_messages virtual-table entries, so the derived catalog needs the explicit duplicate-row repair, not a read. This read-only probe leaves the archive unchanged; run 'cass doctor --fix --json' (or 'cass doctor --fix --yes --json') to repair it"

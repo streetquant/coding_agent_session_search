@@ -47,7 +47,7 @@ fn day_label(day_id: i64) -> String {
 
 fn pad_to_quad(content: &str) -> String {
     let mut out = content.to_string();
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(' ');
     }
     out
@@ -583,7 +583,7 @@ impl LedgerFixture {
                     agent: spec.agent,
                     workspace_id: *workspace_id,
                     conversation_id: outcome.conversation_id,
-                    source_path: stored_path(&spec.external_id),
+                    source_path: stored_path(spec.external_id),
                     role: role.to_string(),
                     timestamp_ms,
                     day_id,
@@ -1058,7 +1058,7 @@ fn duplicate_and_updated_events_do_not_double_count() {
         .expect("rebuild track B");
 
     let initial =
-        query_tokens_timeseries(&storage.raw(), &AnalyticsFilter::default(), GroupBy::Day)
+        query_tokens_timeseries(storage.raw(), &AnalyticsFilter::default(), GroupBy::Day)
             .expect("initial tokens");
     assert_eq!(initial.totals.message_count, 1, "duplicate insert once");
     assert_eq!(initial.totals.user_message_count, 1);
@@ -1130,14 +1130,14 @@ fn duplicate_and_updated_events_do_not_double_count() {
         .rebuild_token_daily_stats()
         .expect("rebuild track B");
 
-    let tokens = query_tokens_timeseries(&storage.raw(), &AnalyticsFilter::default(), GroupBy::Day)
+    let tokens = query_tokens_timeseries(storage.raw(), &AnalyticsFilter::default(), GroupBy::Day)
         .expect("updated tokens");
     assert_eq!(tokens.totals.message_count, 2);
     assert_eq!(tokens.totals.user_message_count, 1);
     assert_eq!(tokens.totals.assistant_message_count, 1);
     assert_eq!(tokens.totals.api_tokens_total, 150);
 
-    let costs = query_cost_timeseries(&storage.raw(), &AnalyticsFilter::default(), GroupBy::Day)
+    let costs = query_cost_timeseries(storage.raw(), &AnalyticsFilter::default(), GroupBy::Day)
         .expect("updated costs");
     assert_f64_close(
         costs.totals.estimated_cost_usd,
@@ -1145,11 +1145,11 @@ fn duplicate_and_updated_events_do_not_double_count() {
         "updated cost total",
     );
 
-    let status = query_status(&storage.raw(), &AnalyticsFilter::default()).expect("status");
+    let status = query_status(storage.raw(), &AnalyticsFilter::default()).expect("status");
     assert_eq!(status.coverage.total_messages, 2);
 
     let agents = query_breakdown(
-        &storage.raw(),
+        storage.raw(),
         &AnalyticsFilter::default(),
         Dim::Agent,
         Metric::ApiTotal,
@@ -1165,7 +1165,7 @@ fn duplicate_and_updated_events_do_not_double_count() {
     assert_eq!(claude.message_count, 2);
 
     let scatter =
-        query_session_scatter(&storage.raw(), &AnalyticsFilter::default(), 10).expect("scatter");
+        query_session_scatter(storage.raw(), &AnalyticsFilter::default(), 10).expect("scatter");
     assert_eq!(scatter.len(), 1);
     assert_eq!(scatter[0].message_count, 2);
     assert!(scatter[0].api_tokens_total >= 150);
@@ -1427,7 +1427,7 @@ fn missing_rollups_and_ledgers_are_truthful_and_read_only() {
         .query_map_collect(
             "SELECT (SELECT COUNT(*) FROM messages), (SELECT COUNT(*) FROM conversations)",
             &[],
-            |row| Ok(row.get_typed::<i64>(0)?),
+            |row| row.get_typed::<i64>(0),
         )
         .expect("counts");
     let db = FrankenStorage::open_readonly(&db_path).expect("readonly");
@@ -1493,7 +1493,7 @@ fn missing_rollups_and_ledgers_are_truthful_and_read_only() {
         .query_map_collect(
             "SELECT (SELECT COUNT(*) FROM messages), (SELECT COUNT(*) FROM conversations)",
             &[],
-            |row| Ok(row.get_typed::<i64>(0)?),
+            |row| row.get_typed::<i64>(0),
         )
         .expect("counts");
     assert_eq!(before, after);
@@ -1502,7 +1502,7 @@ fn missing_rollups_and_ledgers_are_truthful_and_read_only() {
         .query_map_collect(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='usage_daily'",
             &[],
-            |row| Ok(row.get_typed::<i64>(0)?),
+            |row| row.get_typed::<i64>(0),
         )
         .expect("sqlite_master")
         .into_iter()
@@ -1836,7 +1836,7 @@ fn scaled_skewed_ledger_queries_are_bounded_and_correct() {
             } else {
                 (conv * 7 + idx) % DAYS
             };
-            let ts = start + day_offset * 86_400_000 + i64::from(idx) * 60_000 + 1_000;
+            let ts = start + day_offset * 86_400_000 + idx * 60_000 + 1_000;
             let role = if idx % 5 == 0 { "user" } else { "agent" };
             let model = if agent_index == 0 {
                 "claude-sonnet-4-20250514"

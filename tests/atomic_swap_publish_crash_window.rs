@@ -28,9 +28,7 @@
 //! the publish is in flight.
 
 use assert_cmd::Command;
-use coding_agent_search::search::tantivy::{
-    SearchableIndexSummary, open_federated_search_readers, searchable_index_summary,
-};
+use coding_agent_search::search::tantivy::{SearchableIndexSummary, searchable_index_summary};
 use serde_json::json;
 use std::fs;
 use std::sync::Arc;
@@ -103,6 +101,7 @@ fn seed_codex_session(
     fs::write(sessions.join(actual_filename), body).unwrap();
 }
 
+#[allow(dead_code)]
 fn force_federated_publish_env(cmd: &mut Command) {
     cmd.env("CASS_TANTIVY_REBUILD_WORKERS", "6");
     cmd.env("CASS_TANTIVY_MAX_WRITER_THREADS", "2");

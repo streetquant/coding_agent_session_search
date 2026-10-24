@@ -1527,6 +1527,12 @@
             "type": "unknown"
           }
         },
+        "inventory_complete": {
+          "type": "boolean"
+        },
+        "inventory_scanned_entries": {
+          "type": "integer"
+        },
         "recommended_action": {
           "type": "string"
         },
@@ -3516,6 +3522,80 @@
           "type": "boolean"
         }
       }
+    },
+    "surface": {
+      "type": "string"
+    },
+    "mode": {
+      "type": "string"
+    },
+    "outcome_kind": {
+      "type": "string"
+    },
+    "asset_class": {
+      "type": "string"
+    },
+    "authority_status": {
+      "type": "string"
+    },
+    "coverage_delta": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string"
+        },
+        "archive_conversation_count": {
+          "type": "integer"
+        },
+        "visible_source_conversation_count": {
+          "type": "null"
+        },
+        "raw_mirror_manifest_count": {
+          "type": "integer"
+        },
+        "db_projection_only_count": {
+          "type": "integer"
+        },
+        "missing_current_source_count": {
+          "type": "integer"
+        },
+        "conversation_delta": {
+          "type": "null"
+        },
+        "message_delta": {
+          "type": "null"
+        },
+        "semantic_vector_delta": {
+          "type": "null"
+        },
+        "derived_asset_delta": {
+          "type": "null"
+        }
+      }
+    },
+    "blocked_reasons": {
+      "type": "array",
+      "items": {
+        "type": "unknown"
+      }
+    },
+    "plan_fingerprint": {
+      "type": "null"
+    },
+    "receipt_path": {
+      "type": "null"
+    },
+    "event_log_path": {
+      "type": "null"
+    },
+    "artifact_manifest_path": {
+      "type": "null"
+    },
+    "redaction_status": {
+      "type": "string"
+    },
+    "contract_provenance": {
+      "type": "string"
     }
   }
 }

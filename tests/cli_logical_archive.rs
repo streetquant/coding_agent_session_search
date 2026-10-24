@@ -1181,6 +1181,14 @@ fn restored_remote_sessions_are_readable_without_the_original_archive_or_sources
     assert_eq!(imported["content_sha256"], exported["content_sha256"]);
     let database_bytes = fs::read(&restored).unwrap();
     for (source_id, cid, target) in identities {
+        let anchor = coding_agent_search::search::query::message_anchor_for_content(
+            source_id,
+            stale_path.to_str().unwrap(),
+            Some(cid),
+            Some(1025),
+            target,
+        )
+        .expect("complete restored canonical identity");
         for operation in ["view", "expand"] {
             let payload = receipt(
                 command(root.path())
@@ -1195,6 +1203,8 @@ fn restored_remote_sessions_are_readable_without_the_original_archive_or_sources
                         &cid.to_string(),
                         "--message-index",
                         "1025",
+                        "--message-anchor",
+                        &anchor,
                         "-C",
                         "0",
                         "--json",
@@ -1213,6 +1223,8 @@ fn restored_remote_sessions_are_readable_without_the_original_archive_or_sources
             assert_eq!(rows[0]["source_id"], source_id);
             assert_eq!(rows[0]["conversation_id"], cid);
             assert_eq!(rows[0]["message_index"], 1025);
+            assert_eq!(rows[0]["message_anchor"], anchor);
+            assert_eq!(rows[0]["is_target"], true);
             assert_eq!(rows[0]["content_source"], "archive");
         }
     }
@@ -1721,6 +1733,10 @@ fn indexed_import_completes_the_source_less_search_to_canonical_evidence_journey
                     &conversation.to_string(),
                     "--message-index",
                     &ordinal.to_string(),
+                    "--message-anchor",
+                    hit["message_anchor"]
+                        .as_str()
+                        .expect("recovered search anchor"),
                     "-C",
                     "0",
                     "--json",
@@ -1731,6 +1747,8 @@ fn indexed_import_completes_the_source_less_search_to_canonical_evidence_journey
         assert_eq!(viewed["lines"][0]["source_id"], source_id);
         assert_eq!(viewed["lines"][0]["conversation_id"], conversation);
         assert_eq!(viewed["lines"][0]["message_index"], ordinal);
+        assert_eq!(viewed["lines"][0]["message_anchor"], hit["message_anchor"]);
+        assert_eq!(viewed["lines"][0]["is_target"], true);
         assert_eq!(
             viewed["lines"][0]["content"],
             format!(

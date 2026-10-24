@@ -17,7 +17,6 @@ use std::collections::HashSet;
 use tempfile::TempDir;
 
 mod util;
-use util::e2e_log::PhaseTracker;
 
 // =============================================================================
 // ZERO TANTIVY IMPORTS AUDIT

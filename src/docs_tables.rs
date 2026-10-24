@@ -310,7 +310,7 @@ fn dependency_pins_table() -> String {
                     .is_some_and(|version| version.starts_with('='))
         })
         .collect();
-    pinned.sort_by(|(left, _), (right, _)| left.cmp(right));
+    pinned.sort_by_key(|(left, _)| *left);
 
     let mut out = format!(
         "{} exact or git-pinned direct dependencies (generated from `[dependencies]` in \

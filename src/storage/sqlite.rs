@@ -5635,6 +5635,9 @@ pub(crate) fn close_franken_in_place_with_busy_retry(
     unreachable!("close retry loop returns on the final attempt") // ubs:ignore -- Attempt 12 cannot retry; every success and final error returns above.
 }
 
+/// Progress reporter for a bounded `--rebuild-canonical-fts` rebuild.
+type FtsRebuildProgressReporter = Box<dyn Fn(FtsRebuildProgress) + Send + Sync>;
+
 /// Thread-affine storage owning the primary raw connection and any cached raw
 /// ephemeral writer. Moving it to another OS thread must remain a compile-time
 /// error; use [`FrankenOwnerConnection`] for cross-thread reads instead.
@@ -5677,7 +5680,7 @@ pub struct FrankenStorage {
     /// GH #345: truthful, per-committed-batch progress for a bounded
     /// `--rebuild-canonical-fts` rebuild. `None` outside an explicit repair
     /// (the index tail keeps its own progress counters).
-    fts_rebuild_progress: parking_lot::Mutex<Option<Box<dyn Fn(FtsRebuildProgress) + Send + Sync>>>,
+    fts_rebuild_progress: parking_lot::Mutex<Option<FtsRebuildProgressReporter>>,
     /// GH #413 follow-up (iify0): the run's view of the derived fts5 shadow,
     /// shared with every pool writer this connection spawns (see
     /// [`FtsShadowRunState`]).
@@ -16975,9 +16978,8 @@ impl FrankenStorage {
                 }
 
                 if !entries.is_empty() {
-                    batch_inserted = batch_inserted.saturating_add(
-                        franken_batch_insert_fts_on_connection(&writer, &entries)?,
-                    );
+                    batch_inserted = batch_inserted
+                        .saturating_add(franken_batch_insert_fts_on_connection(&writer, &entries)?);
                     entries.clear();
                     pending_chars = 0;
                 }

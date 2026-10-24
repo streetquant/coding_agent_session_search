@@ -458,6 +458,7 @@ impl TuiSession {
         self.writer.flush().expect("flush PTY");
     }
 
+    #[allow(dead_code)]
     fn captured_bytes(&self) -> Vec<u8> {
         self.captured.lock().expect("capture lock").clone()
     }

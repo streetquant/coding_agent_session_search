@@ -143,12 +143,89 @@ fn remote_spec_for_rsync(host: &str, remote_path: &str) -> String {
     format!("{host}:{remote_path}")
 }
 
+fn antigravity_store_name(path: &Path) -> Option<&str> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| matches!(*name, "antigravity" | "antigravity-cli"))
+}
+
+/// Keep the connector's durable trees together under the original store root.
+/// The summaries database supplies workspace provenance, including live WAL data.
+fn antigravity_sync_filters(remote_path: &str) -> &'static [&'static str] {
+    let Some(name) = antigravity_store_name(Path::new(remote_path)) else {
+        return &[];
+    };
+    let copies_contents = remote_path.ends_with('/') || remote_path.ends_with("/.");
+    match (name, copies_contents) {
+        (_, true) => &[
+            "--include=/",
+            "--include=/brain/***",
+            "--include=/conversations/***",
+            "--include=/conversation_summaries.db",
+            "--include=/conversation_summaries.db-wal",
+            "--include=/conversation_summaries.db-shm",
+            "--include=/conversation_summaries.db-journal",
+            "--exclude=*",
+        ],
+        ("antigravity", false) => &[
+            "--include=/antigravity/",
+            "--include=/antigravity/brain/***",
+            "--include=/antigravity/conversations/***",
+            "--include=/antigravity/conversation_summaries.db",
+            "--include=/antigravity/conversation_summaries.db-wal",
+            "--include=/antigravity/conversation_summaries.db-shm",
+            "--include=/antigravity/conversation_summaries.db-journal",
+            "--exclude=*",
+        ],
+        ("antigravity-cli", false) => &[
+            "--include=/antigravity-cli/",
+            "--include=/antigravity-cli/brain/***",
+            "--include=/antigravity-cli/conversations/***",
+            "--include=/antigravity-cli/conversation_summaries.db",
+            "--include=/antigravity-cli/conversation_summaries.db-wal",
+            "--include=/antigravity-cli/conversation_summaries.db-shm",
+            "--include=/antigravity-cli/conversation_summaries.db-journal",
+            "--exclude=*",
+        ],
+        _ => &[],
+    }
+}
+
+/// SCP and SFTP use the same selection as rsync. Their local path is already
+/// confined to the configured mirror container; its first component is the
+/// configured source's basename. Explicit narrower source paths stay unfiltered.
+fn sync_selection_allows(local_root: &Path, local_path: &Path) -> bool {
+    let Ok(relative) = local_path.strip_prefix(local_root) else {
+        return false;
+    };
+    let mut components = relative.components();
+    let Some(store) = components.next() else {
+        return true;
+    };
+    if antigravity_store_name(Path::new(store.as_os_str())).is_none() {
+        return true;
+    }
+    let Some(entry) = components.next().and_then(|part| part.as_os_str().to_str()) else {
+        return true;
+    };
+    matches!(entry, "brain" | "conversations")
+        || (components.next().is_none()
+            && matches!(
+                entry,
+                "conversation_summaries.db"
+                    | "conversation_summaries.db-wal"
+                    | "conversation_summaries.db-shm"
+                    | "conversation_summaries.db-journal"
+            ))
+}
+
 fn run_rsync_command(
     timeout_str: &str,
     ssh_opts: &str,
     remote_spec: &str,
     local_path_str: &str,
     arg_protection: RsyncArgProtection,
+    filters: &[&str],
 ) -> std::io::Result<std::process::Output> {
     let mut cmd = Command::new("rsync");
     // Keep each negotiated attempt authoritative: inherited RSYNC_PROTECT_ARGS
@@ -160,6 +237,7 @@ fn run_rsync_command(
     if let Some(flag) = arg_protection.flag() {
         cmd.arg(flag);
     }
+    cmd.args(filters);
     cmd.args([
         "--timeout",
         timeout_str,
@@ -1323,12 +1401,14 @@ impl SyncEngine {
         );
 
         let timeout_str = self.transfer_timeout.to_string();
+        let filters = antigravity_sync_filters(remote_path);
         let output = match run_rsync_command(
             &timeout_str,
             &ssh_opts,
             &remote_spec,
             local_path_str,
             arg_protection,
+            filters,
         ) {
             Ok(o) => o,
             Err(e) => {
@@ -1366,6 +1446,7 @@ impl SyncEngine {
                 &fallback_remote_spec,
                 local_path_str,
                 RsyncArgProtection::None,
+                filters,
             ) {
                 Ok(o) => o,
                 Err(e) => {
@@ -1422,7 +1503,6 @@ impl SyncEngine {
                 success: false,
                 error: Some(error_msg),
                 duration_ms,
-                ..Default::default()
             };
         }
 
@@ -1526,6 +1606,7 @@ impl SyncEngine {
         ]);
         // WSL rsync is the real rsync (not openrsync), so --protect-args is safe.
         cmd.arg("--protect-args");
+        cmd.args(antigravity_sync_filters(remote_path));
         cmd.args([
             "--timeout",
             &timeout_str,
@@ -1771,6 +1852,10 @@ impl SyncEngine {
                 );
                 continue;
             };
+
+            if !sync_selection_allows(&local_path, &local_file) {
+                continue;
+            }
 
             if let Err(e) = reject_local_symlink_below_root(&local_path, &local_file) {
                 return PathSyncResult {
@@ -2300,6 +2385,9 @@ impl SyncEngine {
         files_transferred: &mut u64,
         bytes_transferred: &mut u64,
     ) -> Result<(), String> {
+        if !sync_selection_allows(local_root, local_path) {
+            return Ok(());
+        }
         // Use lstat so a remote symlink is classified as a symlink rather than
         // followed to a file or directory outside the configured source root.
         let stat = sftp
@@ -2330,6 +2418,10 @@ impl SyncEngine {
                 let Some(file_name) = sftp_entry_file_name(&entry_path, remote_path) else {
                     continue;
                 };
+                let local_entry = local_path.join(file_name);
+                if !sync_selection_allows(local_root, &local_entry) {
+                    continue;
+                }
 
                 let entry_stat = sftp
                     .lstat(&entry_path)
@@ -2341,8 +2433,6 @@ impl SyncEngine {
                     );
                     continue;
                 }
-
-                let local_entry = local_path.join(file_name);
 
                 if entry_stat.is_dir() {
                     // Recurse into subdirectory
@@ -3437,6 +3527,51 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn antigravity_fallback_selection_keeps_durable_siblings() {
+        let root = Path::new("/mirror/container");
+        for store in ["antigravity", "antigravity-cli"] {
+            for retained in [
+                "",
+                "brain/id/.system_generated/logs/transcript.jsonl",
+                "conversations/id.db",
+                "conversations/id.db-wal",
+                "conversation_summaries.db",
+                "conversation_summaries.db-wal",
+                "conversation_summaries.db-shm",
+                "conversation_summaries.db-journal",
+            ] {
+                assert!(sync_selection_allows(
+                    root,
+                    &root.join(store).join(retained)
+                ));
+            }
+            for excluded in [
+                "skills/prompt.md",
+                "cache/blob",
+                "settings.json",
+                "other.db",
+            ] {
+                assert!(!sync_selection_allows(
+                    root,
+                    &root.join(store).join(excluded)
+                ));
+            }
+        }
+        assert!(sync_selection_allows(
+            root,
+            &root.join("sessions/settings.json")
+        ));
+        assert!(!sync_selection_allows(
+            root,
+            Path::new("/outside/antigravity/brain/id")
+        ));
+        assert!(antigravity_sync_filters("~/.gemini/tmp").is_empty());
+        assert_eq!(
+            antigravity_sync_filters("~/.gemini/antigravity/."),
+            antigravity_sync_filters("~/.gemini/antigravity/")
+        );
+    }
     #[test]
     fn test_path_to_safe_dirname() {
         let res = path_to_safe_dirname("~/.claude/projects");
