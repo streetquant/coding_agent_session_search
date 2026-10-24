@@ -4,7 +4,7 @@ use super::{
     sqlite_content_artifact_paths, sqlite_fixed_artifact_paths, sqlite_runtime_artifact_paths,
 };
 use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt, Transaction, TransactionExt};
-use crate::franken_sync::{Connection, Row as FrankenRow, params};
+use crate::franken_sync::{Connection, Row as FrankenRow, SqliteValue, params};
 use crate::pages::profiles::ShareProfile;
 use crate::pages::redact::RedactionEngine;
 use crate::pages::summary::ExclusionSet;
@@ -74,6 +74,128 @@ type SnippetExportRow = (
     Option<String>,
     String,
 );
+
+/// Rows per FTS `INSERT` statement.
+///
+/// frankensqlite persists every FTS5 `INSERT` statement as a fresh segment
+/// and consumes a fresh 16-bit segid for it. The export used to insert one
+/// message per statement, so the 50,000-message preset consumed ~66,000 of
+/// the 65,536 encodable segids and aborted with `fts5: corrupt %_data
+/// record: segment leaf segid exceeds 16-bit limit`. At 4,096 rows a batch
+/// also keeps each batch's term doclists small enough for one 64 KiB segment
+/// leaf (`lorem` appears in every perf message). frankensqlite's own
+/// automerge combines four segments and, once a term's combined doclist
+/// exceeds a leaf, silently drops that term; stock SQLite then reports
+/// `fts5: checksum mismatch for table "messages_fts"` and the term stops
+/// matching. [`keep_fts_segments_unmerged`] therefore keeps at most two
+/// segments per level after every batch, so the four-segment merge is never
+/// reached and every 4,096-row segment stays stock-readable.
+const FTS_INSERT_BATCH_ROWS: usize = 4096;
+
+/// Insert one batch of `(rowid, content)` rows into `table` with a single
+/// statement, then keep that table's persisted structure merge-free.
+fn flush_fts_inserts(
+    tx: &Transaction<'_>,
+    table: &str,
+    rows: &mut Vec<(i64, String)>,
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    // The rowid is a trusted i64 from the source database; only the content
+    // is bound, one parameter per row (4,096, far below fsqlite's 32,766).
+    let mut sql = format!("INSERT INTO {table}(rowid, content) VALUES ");
+    let mut values = Vec::with_capacity(rows.len());
+    for (index, (rowid, content)) in rows.drain(..).enumerate() {
+        if index > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({rowid},?{})", index + 1));
+        values.push(SqliteValue::from(content));
+    }
+    tx.execute_with_params_skip_statement_savepoint(&sql, &values)
+        .with_context(|| format!("Failed to insert {} rows into {table}", values.len()))?;
+    keep_fts_segments_unmerged(tx, table)
+}
+
+/// Rewrite the persisted FTS structure so no level holds four segments.
+///
+/// Even unmerged, a segment is limited to one 64 KiB leaf per term; the
+/// readers merge across segments, so distributing the same segments over
+/// more levels is invisible to queries. Two segments per level leaves room
+/// for the next append to bring level 0 to three, one below the four-segment
+/// automerge threshold.
+fn keep_fts_segments_unmerged(tx: &Transaction<'_>, table: &str) -> Result<()> {
+    let segments: Vec<(i64, i64, i64)> = tx.query_map_collect(
+        &format!(
+            "SELECT id >> 37, MIN(id & 2147483647), MAX(id & 2147483647)
+             FROM {table}_data
+             WHERE id > 10
+             GROUP BY id >> 37
+             ORDER BY id >> 37"
+        ),
+        params![],
+        |row| {
+            Ok((
+                row.get_typed::<i64>(0)?,
+                row.get_typed::<i64>(1)?,
+                row.get_typed::<i64>(2)?,
+            ))
+        },
+    )?;
+    if segments.is_empty() {
+        return Ok(());
+    }
+
+    // Legacy (non-origin-tracking) structure record shared by stock SQLite
+    // and frankensqlite: cookie, level count, segment count, write counter,
+    // then each level's merge-input count, segment count and segment ranges.
+    let mut block = Vec::with_capacity(4 + segments.len() * 8 + 8);
+    block.extend_from_slice(&0u32.to_be_bytes());
+    push_sqlite_varint(&mut block, u64::try_from(segments.len().div_ceil(2))?);
+    push_sqlite_varint(&mut block, u64::try_from(segments.len())?);
+    push_sqlite_varint(&mut block, u64::try_from(segments.len())?);
+    for level in segments.chunks(2) {
+        push_sqlite_varint(&mut block, 0);
+        push_sqlite_varint(&mut block, u64::try_from(level.len())?);
+        for &(segid, pgno_first, pgno_last) in level {
+            push_sqlite_varint(&mut block, u64::try_from(segid)?);
+            push_sqlite_varint(&mut block, u64::try_from(pgno_first)?);
+            push_sqlite_varint(&mut block, u64::try_from(pgno_last)?);
+        }
+    }
+    tx.execute_with_params_skip_statement_savepoint(
+        &format!("INSERT OR REPLACE INTO {table}_data (id, block) VALUES (10, ?1)"),
+        &[SqliteValue::Blob(block.into())],
+    )
+    .with_context(|| format!("Failed to rewrite {table} segment structure"))?;
+    Ok(())
+}
+
+/// Append a SQLite varint (big-endian 7-bit groups, high bit = continuation).
+fn push_sqlite_varint(out: &mut Vec<u8>, value: u64) {
+    let length = if value <= 0x7f {
+        1
+    } else if value <= 0x3fff {
+        2
+    } else if value <= 0x1f_ffff {
+        3
+    } else if value <= 0x0fff_ffff {
+        4
+    } else if value <= 0x07_ffff_ffff {
+        5
+    } else if value <= 0x03ff_ffff_ffff {
+        6
+    } else if value <= 0x01ff_ffff_ffff {
+        7
+    } else {
+        8
+    };
+    for shift in (0..length).rev() {
+        let byte = ((value >> (shift * 7)) & 0x7f) as u8;
+        out.push(if shift == 0 { byte } else { byte | 0x80 });
+    }
+}
 
 impl ExportEngine {
     pub fn new(source_db_path: &Path, output_path: &Path, filter: ExportFilter) -> Self {
@@ -461,6 +583,9 @@ impl ExportEngine {
                 let mut processed = 0;
                 let mut msg_processed = 0;
                 let mut redactions = RedactionCounts::new();
+                let mut pending_fts: Vec<(i64, String)> = Vec::with_capacity(FTS_INSERT_BATCH_ROWS);
+                let mut pending_code_fts: Vec<(i64, String)> =
+                    Vec::with_capacity(FTS_INSERT_BATCH_ROWS);
 
                 for (
                     id,
@@ -577,16 +702,6 @@ impl ExportEngine {
                             ],
                         )?;
 
-                        // Populate FTS
-                        tx.execute_compat(
-                            "INSERT INTO messages_fts (rowid, content) VALUES (?1, ?2)",
-                            params![*source_message_id, &*content],
-                        )?;
-                        tx.execute_compat(
-                            "INSERT INTO messages_code_fts (rowid, content) VALUES (?1, ?2)",
-                            params![*source_message_id, &*content],
-                        )?;
-
                         // 5. Migrate Snippets for this message (bd-4x92)
                         let snip_rows: Vec<SnippetExportRow> = if has_snippets_table {
                             src_tx.query_map_collect(
@@ -623,12 +738,22 @@ impl ExportEngine {
                             )?;
                         }
 
+                        pending_fts.push((*source_message_id, content.to_string()));
+                        pending_code_fts.push((*source_message_id, content.into_owned()));
+                        if pending_fts.len() == FTS_INSERT_BATCH_ROWS {
+                            flush_fts_inserts(&tx, "messages_fts", &mut pending_fts)?;
+                            flush_fts_inserts(&tx, "messages_code_fts", &mut pending_code_fts)?;
+                        }
+
                         msg_processed += 1;
                     }
 
                     processed += 1;
                     progress(processed, total_convs);
                 }
+
+                flush_fts_inserts(&tx, "messages_fts", &mut pending_fts)?;
+                flush_fts_inserts(&tx, "messages_code_fts", &mut pending_code_fts)?;
 
                 // Metadata
                 tx.execute("INSERT INTO export_meta (key, value) VALUES ('schema_version', '1')")?;
@@ -4390,6 +4515,102 @@ mod tests {
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// A 70,000-row Pages index (more than the failing 50,000 preset) must be
+    /// complete and stock-readable without automerging.
+    ///
+    /// frankensqlite's persisted FTS writer skips any term whose doclist
+    /// does not fit one 64 KiB segment leaf, and automerge combines four
+    /// batches into one segment where a common term (`lorem` here, as in the
+    /// perf corpus) exceeds that leaf. [`flush_fts_inserts`] keeps every
+    /// 4,096-row batch separate and [`keep_fts_segments_unmerged`] spreads
+    /// the segments over levels of two, so no merge runs. The test asserts
+    /// one segment per batch, then checks both stock SQLite (the Pages
+    /// viewer) and frankensqlite (the export verifier) find every match.
+    #[test]
+    fn batched_fts_build_avoids_merge_and_stays_stock_readable() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("fts-merge-free.db");
+        let conn = Connection::open(db_path.to_string_lossy().as_ref())?;
+        conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, content TEXT NOT NULL)")?;
+
+        let mut tx = conn.transaction()?;
+        tx.execute(
+            "CREATE VIRTUAL TABLE messages_fts USING fts5(
+                content,
+                tokenize='porter unicode61 remove_diacritics 2'
+            )",
+        )?;
+        let total_rows = 70_000_i64;
+        let mut first = 1_i64;
+        let mut pending = Vec::with_capacity(FTS_INSERT_BATCH_ROWS);
+        while first <= total_rows {
+            let last = (first + 4095).min(total_rows);
+            let mut values = Vec::with_capacity(usize::try_from(last - first + 1)? * 2);
+            let mut placeholders = String::new();
+            for (offset, rowid) in (first..=last).enumerate() {
+                if !placeholders.is_empty() {
+                    placeholders.push(',');
+                }
+                placeholders.push_str(&format!("(?{},?{})", offset * 2 + 1, offset * 2 + 2));
+                let content = format!(
+                    "segidterm{rowid:05} {}",
+                    "lorem ipsum dolor sit amet ".repeat(9)
+                );
+                values.push(SqliteValue::from(rowid));
+                values.push(SqliteValue::from(content.clone()));
+                pending.push((rowid, content));
+            }
+            tx.execute_with_params_skip_statement_savepoint(
+                &format!("INSERT INTO messages (id, content) VALUES {placeholders}"),
+                &values,
+            )?;
+            if pending.len() == FTS_INSERT_BATCH_ROWS {
+                flush_fts_inserts(&tx, "messages_fts", &mut pending)?;
+            }
+            first = last + 1;
+        }
+        flush_fts_inserts(&tx, "messages_fts", &mut pending)?;
+        tx.commit()?;
+        drop(tx);
+
+        // 70,000 / 4,096 = 18 batches; one segment each proves automerge
+        // never ran (a merge would leave fewer segments *and* lose `lorem`
+        // from the merged segment).
+        let segments: i64 = conn.query_row_map(
+            "SELECT COUNT(DISTINCT id >> 37) FROM messages_fts_data WHERE id > 10",
+            params![],
+            |row| row.get_typed::<i64>(0),
+        )?;
+        assert_eq!(segments, 18);
+        let matches = |needle: &str| {
+            conn.query_row_map(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?1",
+                params![needle],
+                |row| row.get_typed::<i64>(0),
+            )
+        };
+        assert_eq!(matches("lorem")?, total_rows);
+        assert_eq!(matches("segidterm00001")?, 1);
+        assert_eq!(matches(&format!("segidterm{total_rows:05}"))?, 1);
+        assert_eq!(matches("absentterm")?, 0);
+        conn.close()?;
+
+        // The viewer searches the bundle with stock SQLite.
+        let stock = rusqlite::Connection::open(&db_path)?;
+        let verdict: String = stock.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        assert_eq!(verdict, "ok");
+        let stock_matches: i64 = stock.query_row(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'lorem'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(stock_matches, total_rows);
+        let stock_rows: i64 =
+            stock.query_row("SELECT COUNT(*) FROM messages_fts", [], |row| row.get(0))?;
+        assert_eq!(stock_rows, total_rows);
         Ok(())
     }
 
