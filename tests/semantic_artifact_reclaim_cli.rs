@@ -77,6 +77,30 @@ fn cli_preview_apply_preserves_live_index_and_never_opens_database() -> Result<(
     assert_eq!(plan["status"], "ready");
     assert_eq!(plan["plan"]["reclaimable_bytes"], 10);
     assert!(staging.is_file() && reuse.is_dir());
+    // The human operator listing states why each entry is scratch and which
+    // lifecycle owns it, from the same classifier the automatic sweep uses.
+    let listing = Command::new(env!("CARGO_BIN_EXE_cass-semantic-reclaim"))
+        .arg("--data-dir")
+        .arg(&data)
+        .output()?;
+    assert!(listing.status.success());
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    assert!(
+        listing.contains("reason: unreferenced staging index"),
+        "{listing}"
+    );
+    assert!(
+        listing.contains("ownership: semantic backfill artifact lease"),
+        "{listing}"
+    );
+    assert!(
+        listing.contains("reason: abandoned reuse scratch"),
+        "{listing}"
+    );
+    assert!(
+        listing.contains("ownership: semantic rebuild scratch lease"),
+        "{listing}"
+    );
     let fingerprint = plan["plan"]["plan_fingerprint"].as_str().unwrap();
     let explicit = command(&data, &["--dry-run"])?;
     assert!(explicit.status.success());

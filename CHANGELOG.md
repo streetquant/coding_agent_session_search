@@ -98,6 +98,15 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   `raw_mirror_size` finding recommends `--keep-latest 1` instead of
   `--older-than 90d`.
 
+- **`cass semantic-reclaim` states why each entry is reclaimable (#490).**
+  The operator preview now lists, for every candidate, its size, the reason
+  it is scratch and the lifecycle that owns it (`semantic backfill artifact
+  lease` or `semantic rebuild scratch lease`). The reason comes from the same
+  ownership classifier the automatic sweep uses, so an operator no longer has
+  to infer ownership from a file name. The approval fingerprint still binds
+  every candidate identity: a changed, replaced or newly owned candidate
+  invalidates the approval, and nothing is removed.
+
 ### Fixed
 
 - **`cass swarm status` reads Beads with br 0.7.x (#529).** The live Beads

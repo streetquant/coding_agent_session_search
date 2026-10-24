@@ -1,6 +1,6 @@
 //! Reclaim only backfill-owned scratch, never inferred obsolete serving assets.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
@@ -28,6 +28,8 @@ mod checkpoint_tests_live;
 #[cfg(test)]
 mod lease_tests;
 #[cfg(test)]
+mod retirement_journey_tests;
+#[cfg(test)]
 mod storage_tests;
 
 pub use inspection::{
@@ -47,6 +49,52 @@ pub struct BackfillArtifactReclaimReport {
     pub reclaimed_bytes: u64,
     pub failed_paths: Vec<PathBuf>,
     pub checkpoint_missing: bool,
+}
+
+/// Why one entry is eligible for reclamation, in the operator's own terms.
+///
+/// The automatic sweep, the operator preview and the operator apply share this
+/// single ownership decision, so the reason travels with the candidate: an
+/// operator never has to infer ownership from a file name, and the preview can
+/// state the size, the reason and the owning lifecycle for every entry it
+/// lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReclaimReason {
+    /// A staging index file that no manifest, shard manifest or selected
+    /// generation references.
+    UnreferencedStagingIndex,
+    /// The write-ahead-log sidecar of an unreferenced staging index.
+    UnreferencedStagingWal,
+    /// A reuse scratch directory left behind by an interrupted rebuild.
+    AbandonedReuseScratch,
+}
+
+impl ReclaimReason {
+    /// Why this entry may be removed.
+    pub(super) fn reason(self) -> &'static str {
+        match self {
+            Self::UnreferencedStagingIndex => {
+                "unreferenced staging index: no manifest, shard manifest or selected generation owns it"
+            }
+            Self::UnreferencedStagingWal => {
+                "unreferenced staging write-ahead log: its staging index has no live owner"
+            }
+            Self::AbandonedReuseScratch => {
+                "abandoned reuse scratch directory: no live owner references it"
+            }
+        }
+    }
+
+    /// Which lifecycle produced the entry. Ownership is proven by the
+    /// classifier, never by the entry's name.
+    pub(super) fn ownership(self) -> &'static str {
+        match self {
+            Self::UnreferencedStagingIndex | Self::UnreferencedStagingWal => {
+                "semantic backfill artifact lease"
+            }
+            Self::AbandonedReuseScratch => "semantic rebuild scratch lease",
+        }
+    }
 }
 
 /// Explicit recovery for maintenance callers. Lock ordering matches a normal
@@ -275,7 +323,7 @@ impl BackfillArtifacts {
                 let path = checkpoint_path(&self.data_dir, checkpoint);
                 if !inspect_checkpoint(&path, durable)? {
                     return Ok(Discovery {
-                        candidates: BTreeSet::new(),
+                        candidates: BTreeMap::new(),
                         protected,
                         metadata_fingerprint: metadata.fingerprint(),
                         checkpoint_missing: true,
@@ -308,7 +356,7 @@ impl BackfillArtifacts {
 
         // Plan the complete sweep before the first removal. Never traverse
         // generations/, shards/, quarantine/backup directories, or foreign data.
-        let mut candidates = BTreeSet::new();
+        let mut candidates: BTreeMap<PathBuf, ReclaimReason> = BTreeMap::new();
         for entry in fs::read_dir(&root)? {
             let entry = entry?;
             let kind = entry.file_type()?;
@@ -331,11 +379,18 @@ impl BackfillArtifacts {
                     }
                     let wal = wal_path_for(&base);
                     if !protected.contains(&base) && !protected.contains(&wal) {
-                        candidates.insert(path);
+                        // The sidecar is named after its index; the index
+                        // itself is the reclaimable unit.
+                        let reason = if base == path {
+                            ReclaimReason::UnreferencedStagingIndex
+                        } else {
+                            ReclaimReason::UnreferencedStagingWal
+                        };
+                        candidates.insert(path, reason);
                     }
                 }
             } else if kind.is_dir() && reuse_name(name) && !protected.contains(&path) {
-                candidates.insert(path);
+                candidates.insert(path, ReclaimReason::AbandonedReuseScratch);
             }
             // Symlinks are never candidates, including dangling ones.
         }
@@ -378,11 +433,11 @@ impl BackfillArtifacts {
 
     fn remove_candidates(
         &self,
-        candidates: BTreeSet<PathBuf>,
+        candidates: BTreeMap<PathBuf, ReclaimReason>,
     ) -> Result<BackfillArtifactReclaimReport> {
         let root = self.data_dir.join(VECTOR_INDEX_DIR);
         let mut report = BackfillArtifactReclaimReport::default();
-        for path in candidates {
+        for (path, _reason) in candidates {
             let removed = (|| -> Result<(bool, u64)> {
                 let metadata = fs::symlink_metadata(&path)?;
                 let directory = metadata.is_dir();
@@ -438,7 +493,7 @@ impl BackfillArtifacts {
 }
 
 struct Discovery {
-    candidates: BTreeSet<PathBuf>,
+    candidates: BTreeMap<PathBuf, ReclaimReason>,
     protected: ProtectedPaths,
     metadata_fingerprint: String,
     checkpoint_missing: bool,
