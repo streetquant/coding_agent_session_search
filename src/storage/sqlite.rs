@@ -779,6 +779,12 @@ fn open_index_schema_connection_with_timeout(
     timeout: Duration,
 ) -> Result<FrankenConnection> {
     if !index_engine_migration_is_complete(path) {
+        #[cfg(debug_assertions)]
+        index_storage_open_rendezvous_for_test(
+            path,
+            "CASS_TEST_INDEX_ENGINE_OPEN_READY",
+            "CASS_TEST_INDEX_ENGINE_OPEN_RELEASE",
+        )?;
         let repairing = open_franken_raw_connection_with_timeout(path, timeout)?;
         if !index_engine_migration_is_complete(path) {
             return Ok(repairing);
@@ -1083,6 +1089,18 @@ pub(crate) fn open_franken_async_readonly_connection_with_timeout(
                 );
                 return Err(conflicting_fts_schema_repair_required(path));
             }
+            // GH #402/#503: async search hydration has no deferred-FTS5
+            // constructor. Report the same typed repair the sync tolerant
+            // lane admits, instead of a generic DB-open failure.
+            Err(err) if is_legacy_fts5_shadow_autoindex_open_error(&err) => {
+                tracing::warn!(
+                    db = %path.display(),
+                    error = %err,
+                    "dedicated-owner readonly open found the pre-#434 fts_messages shadow \
+                     catalog; reporting the derived-shadow repair without mutating the archive"
+                );
+                return Err(legacy_fts5_shadow_catalog_repair_required(path));
+            }
             Err(err)
                 if !wal_recovery_attempted && attempt_dirty_wal_recovery_checkpoint(path, &err) =>
             {
@@ -1148,6 +1166,19 @@ pub(crate) fn open_franken_async_strict_readonly_connection_with_timeout(
             Err(err) if is_conflicting_virtual_table_entries_error(&err) => {
                 return Err(conflicting_fts_schema_repair_required(path));
             }
+            // GH #402/#503: the pre-#434 FTS shadow catalog has a sync
+            // tolerant lane but no async equivalent; classify it as the
+            // derived-shadow repair rather than a generic open failure.
+            Err(err) if is_legacy_fts5_shadow_autoindex_open_error(&err) => {
+                tracing::warn!(
+                    db = %path.display(),
+                    error = %err,
+                    "strict dedicated-owner readonly open found the pre-#434 fts_messages \
+                     shadow catalog; reporting the derived-shadow repair without mutating \
+                     the archive"
+                );
+                return Err(legacy_fts5_shadow_catalog_repair_required(path));
+            }
             Err(err) => {
                 return Err(context_franken_open_error(
                     err,
@@ -1178,6 +1209,47 @@ pub(crate) fn open_franken_owner_strict_readonly_connection_with_timeout(
 ) -> Result<FrankenOwnerConnection> {
     open_franken_async_strict_readonly_connection_with_timeout(path, timeout)
         .map(FrankenOwnerConnection)
+}
+
+/// GH #503: does this open failure refuse the pre-#434 derived-FTS catalog?
+///
+/// The engine reports `sqlite_master is missing implicit autoindex slot N for
+/// table \`fts_messages_config\`` when a derived FTS5 shadow table declares a
+/// primary key whose implicit autoindex has no `sqlite_master` row. Older cass
+/// wrote that catalog. Canonical (`conversations`/`messages`) autoindex
+/// failures must keep failing closed, so the table name is part of the match.
+pub(crate) fn is_legacy_fts5_shadow_autoindex_open_error(err: &anyhow::Error) -> bool {
+    let rendered = format!("{err:#}");
+    rendered.contains("missing implicit autoindex slot") && rendered.contains("`fts_messages")
+}
+
+/// Open the pinned engine's only legacy-tolerant lane for a read-only caller:
+/// the deferred-FTS5 repair open.
+///
+/// fsqlite binds a missing FTS5-shadow implicit autoindex only when
+/// `defer_fts5_hydration` is set, which is true only for the writable
+/// `open_existing_schema_only_deferred_fts5` constructor (GH #503). This
+/// helper applies `query_only` before returning, so every SQL write on the
+/// handle is refused; opening the existing-only lane leaves the archive bytes
+/// unchanged. FTS5 queries see an empty index until the derived shadow is
+/// rebuilt by an explicit writable repair.
+fn open_legacy_fts5_shadow_catalog_reader(path: &Path) -> Result<FrankenConnection> {
+    let path_str = path.to_string_lossy().to_string();
+    let conn = FrankenConnection::open_existing_schema_only_deferred_fts5(&path_str)
+        .map_err(anyhow::Error::new)
+        .with_context(|| {
+            format!(
+                "opening the legacy-tolerant deferred-FTS5 lane read-only at {}",
+                path.display()
+            )
+        })?;
+    conn.execute("PRAGMA query_only = 1;").with_context(|| {
+        format!(
+            "setting query_only on the legacy-tolerant reader at {}",
+            path.display()
+        )
+    })?;
+    Ok(conn)
 }
 
 pub(crate) fn retryable_franken_error(err: &crate::franken_sync::FrankenError) -> bool {
@@ -1880,21 +1952,108 @@ pub fn is_user_data_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// A connector's scan contract: the source form whose content can predate a
+/// scan's modification-time cutoff.
+///
+/// The contract is one declaration. The form it names, the identity a
+/// completed scan is recorded under, the policy that decides whether the
+/// connector may keep a cutoff while its contract is pending, and the rule
+/// that exempts the form from that cutoff all come from the same variant, so
+/// the policy and its enforcement cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectorScanContract {
+    /// A Codex rollout compressed to `.jsonl.zst` (GH #513).
+    ///
+    /// The compressed form keeps the modification time of the plain rollout it
+    /// was compressed from, so it can hold content newer than a
+    /// modification-time cutoff. The connector selects the compressed form on
+    /// its own terms, so the contract is satisfied by construction: the
+    /// connector keeps an ordinary incremental cutoff, and the compressed form
+    /// is exempt from it per source.
+    CompressedCodexRollout,
+}
+
+impl ConnectorScanContract {
+    /// The source form the contract names.
+    pub fn source_form(self) -> &'static str {
+        match self {
+            Self::CompressedCodexRollout => "rollout-jsonl-zst",
+        }
+    }
+
+    /// The identity a completed scan under this contract is recorded under.
+    ///
+    /// The identity carries the contract's cutoff-independence property, so a
+    /// contract whose property changes re-arms the pending bootstrap instead
+    /// of keeping a recorded identity that no longer describes the contract.
+    pub fn identity(self) -> &'static str {
+        match self {
+            Self::CompressedCodexRollout => "rollout-jsonl-zst+cutoff-independent",
+        }
+    }
+
+    /// Whether the connector selects the contract's source form independently
+    /// of a scan's modification-time cutoff.
+    ///
+    /// A connector that selects the form on its own terms satisfies the
+    /// contract by construction, so it keeps an ordinary incremental cutoff. A
+    /// connector whose form still rides the cutoff must be scanned without one
+    /// until a scan under the contract completes.
+    pub fn cutoff_independent_form(self) -> bool {
+        match self {
+            Self::CompressedCodexRollout => true,
+        }
+    }
+
+    /// Whether a path carries the contract's source form.
+    pub fn source_form_matches(self, path: &Path) -> bool {
+        match self {
+            Self::CompressedCodexRollout => {
+                franken_agent_detection::connectors::codex::is_compressed_rollout(path)
+            }
+        }
+    }
+}
+
 /// Connectors whose reader learned a source form that can already be on disk
-/// with an old modification time, which an incremental scan skips. Until a
-/// scan of the connector under its current contract succeeds, the connector
-/// is scanned without a cutoff; durable source reuse still skips unchanged
-/// files. codex: a rollout Codex compresses to `.jsonl.zst` keeps the plain
-/// rollout's modification time (GH #513).
-const CONNECTOR_SCAN_CONTRACTS: &[(&str, &str)] = &[("codex", "rollout-jsonl-zst")];
+/// with an old modification time, which an incremental scan skips.
+///
+/// A connector whose contract names a form it selects independently of a
+/// cutoff keeps that cutoff, and the form is exempt from it per source: the
+/// connector lists the form and reads it on its own terms. A connector whose
+/// form still rides the cutoff is scanned without a cutoff until a scan under
+/// the contract completes; durable source reuse still skips unchanged files.
+/// codex: a rollout Codex compresses to `.jsonl.zst` keeps the plain rollout's
+/// modification time (GH #513).
+const CONNECTOR_SCAN_CONTRACTS: &[(&str, ConnectorScanContract)] =
+    &[("codex", ConnectorScanContract::CompressedCodexRollout)];
 
 /// The scan contract a connector's watermark must be recorded under.
-pub fn connector_scan_contract(connector_name: &str) -> Option<&'static str> {
+pub fn connector_scan_contract(connector_name: &str) -> Option<ConnectorScanContract> {
     let name = connector_name.trim();
     CONNECTOR_SCAN_CONTRACTS
         .iter()
         .find(|(connector, _)| connector.eq_ignore_ascii_case(name))
         .map(|(_, contract)| *contract)
+}
+
+/// Whether the connector selects its scan contract's source form independently
+/// of a scan's modification-time cutoff.
+pub fn connector_scan_contract_is_cutoff_independent(connector_name: &str) -> bool {
+    connector_scan_contract(connector_name)
+        .is_some_and(|contract| contract.cutoff_independent_form())
+}
+
+/// Whether a source carries the source form its connector's scan contract
+/// names.
+///
+/// This is the enforcement half of the contract: the same declaration that
+/// lets a connector keep a cutoff exempts the form that the cutoff would
+/// otherwise skip.
+pub fn connector_scan_contract_source_form_matches(connector_name: &str, path: &Path) -> bool {
+    connector_scan_contract(connector_name).is_some_and(|contract| {
+        contract.cutoff_independent_form() && contract.source_form_matches(path)
+    })
 }
 
 /// What the indexer needs to choose a connector's incremental cutoff.
@@ -2200,29 +2359,62 @@ pub(crate) fn validate_fts_messages_integrity_for_async_connection(
 /// `schema-repair-required` kind pointing at `cass doctor --fix` (2l1b0.65).
 /// The repair itself lives in
 /// [`repair_conflicting_fts_schema_rows_via_sqlite3`] and is doctor-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConflictingFtsSchemaRepairKind {
+    /// The catalog carries more than one `fts_messages` virtual-table row.
+    DuplicateRows,
+    /// The pre-#434 derived-FTS catalog declares an implicit autoindex that
+    /// `sqlite_master` does not carry. Canonical rows are readable through
+    /// the legacy-tolerant deferred-FTS5 lane; only the derived shadow needs
+    /// `doctor --rebuild-canonical-fts`.
+    LegacyFts5ShadowCatalog,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ConflictingFtsSchemaRepairRequired {
     pub(crate) db_path: PathBuf,
+    pub(crate) kind: ConflictingFtsSchemaRepairKind,
 }
 
 impl std::fmt::Display for ConflictingFtsSchemaRepairRequired {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the archive at {} carries duplicate `fts_messages` virtual-table rows in \
-             sqlite_master, which frankensqlite refuses to open; run 'cass doctor --fix' \
-             to repair it",
-            self.db_path.display()
-        )
+        match self.kind {
+            ConflictingFtsSchemaRepairKind::DuplicateRows => write!(
+                f,
+                "the archive at {} carries duplicate `fts_messages` virtual-table rows in \
+                 sqlite_master, which frankensqlite refuses to open; run 'cass doctor --fix' \
+                 to repair it",
+                self.db_path.display()
+            ),
+            ConflictingFtsSchemaRepairKind::LegacyFts5ShadowCatalog => write!(
+                f,
+                "the archive at {} carries the pre-#434 `fts_messages_config` catalog \
+                 (sqlite_master is missing its implicit autoindex), which the strict \
+                 frankensqlite read path refuses to open; canonical rows remain readable, \
+                 but the derived FTS shadow needs 'cass doctor --rebuild-canonical-fts'",
+                self.db_path.display()
+            ),
+        }
     }
 }
 
 impl std::error::Error for ConflictingFtsSchemaRepairRequired {}
 
-/// Build the typed repair-required error for `db_path`.
+/// Build the typed duplicate-catalog repair-required error for `db_path`.
 pub(crate) fn conflicting_fts_schema_repair_required(db_path: &Path) -> anyhow::Error {
     anyhow::Error::new(ConflictingFtsSchemaRepairRequired {
         db_path: db_path.to_path_buf(),
+        kind: ConflictingFtsSchemaRepairKind::DuplicateRows,
+    })
+}
+
+/// Build the typed repair-required error for the pre-#434 derived-FTS
+/// catalog. Async search hydration cannot use the sync tolerant lane, so it
+/// reports this same condition rather than a generic open failure.
+pub(crate) fn legacy_fts5_shadow_catalog_repair_required(db_path: &Path) -> anyhow::Error {
+    anyhow::Error::new(ConflictingFtsSchemaRepairRequired {
+        db_path: db_path.to_path_buf(),
+        kind: ConflictingFtsSchemaRepairKind::LegacyFts5ShadowCatalog,
     })
 }
 
@@ -2838,6 +3030,17 @@ pub(crate) enum FtsConsistencyRepair {
     Rebuilt {
         inserted_rows: usize,
     },
+}
+
+/// GH #345: durable progress of a bounded canonical-FTS rebuild.
+///
+/// `committed_rows` counts rows already published through committed batches
+/// (a re-run resumes after them); `total_rows` is the indexable canonical
+/// count, or `0` when the rebuild could not compute it up front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FtsRebuildProgress {
+    pub committed_rows: usize,
+    pub total_rows: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4285,7 +4488,7 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 22;
+pub const CURRENT_SCHEMA_VERSION: i64 = 23;
 pub(crate) const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
 const LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v2";
 const PREVIOUS_LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v1";
@@ -5014,6 +5217,135 @@ CREATE TABLE IF NOT EXISTS forgotten_sources (
 );
 ";
 
+/// Persistent source authority is initialized once during writable migration.
+/// Every canonical change advances its clock in the SAME SQLite transaction,
+/// including direct SQL. Read-only semantic admission never runs this DDL.
+const MIGRATION_V23: &str = r"
+CREATE TABLE IF NOT EXISTS semantic_source_identity_v1 (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    database_uuid TEXT NOT NULL,
+    change_sequence INTEGER NOT NULL CHECK(typeof(change_sequence) = 'integer' AND change_sequence >= 0)
+);
+INSERT OR IGNORE INTO semantic_source_identity_v1(singleton, database_uuid, change_sequence)
+VALUES (1, lower(hex(randomblob(16))), 0);
+
+CREATE TABLE IF NOT EXISTS semantic_source_certificates_v1 (
+    contract_sha256 TEXT PRIMARY KEY,
+    snapshot_json TEXT NOT NULL,
+    snapshot_sha256 TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS cass_semantic_source_authority_insert
+BEFORE INSERT ON semantic_source_identity_v1
+WHEN EXISTS(SELECT 1 FROM semantic_source_identity_v1 WHERE singleton = 1)
+BEGIN
+    SELECT RAISE(ABORT, 'semantic source authority already exists and cannot be replaced');
+END;
+CREATE TRIGGER IF NOT EXISTS cass_semantic_source_authority_update
+BEFORE UPDATE ON semantic_source_identity_v1
+WHEN NEW.singleton != OLD.singleton OR NEW.database_uuid != OLD.database_uuid
+     OR typeof(NEW.change_sequence) != 'integer' OR NEW.change_sequence < OLD.change_sequence
+BEGIN
+    SELECT RAISE(ABORT, 'semantic source identity is immutable and its clock cannot wrap or reverse');
+END;
+CREATE TRIGGER IF NOT EXISTS cass_semantic_source_authority_delete
+BEFORE DELETE ON semantic_source_identity_v1
+BEGIN
+    SELECT RAISE(ABORT, 'semantic source authority cannot be removed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS cass_semantic_source_agents_insert AFTER INSERT ON agents
+BEGIN
+    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS cass_semantic_source_agents_update AFTER UPDATE ON agents
+BEGIN
+    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS cass_semantic_source_agents_delete AFTER DELETE ON agents
+BEGIN
+    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS cass_semantic_source_workspaces_insert AFTER INSERT ON workspaces
+BEGIN
+    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS cass_semantic_source_workspaces_update AFTER UPDATE ON workspaces
+BEGIN
+    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS cass_semantic_source_workspaces_delete AFTER DELETE ON workspaces
+BEGIN
+    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS cass_semantic_source_sources_insert AFTER INSERT ON sources
+BEGIN
+    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS cass_semantic_source_sources_update AFTER UPDATE ON sources
+BEGIN
+    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS cass_semantic_source_sources_delete AFTER DELETE ON sources
+BEGIN
+    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS cass_semantic_source_conversations_insert AFTER INSERT ON conversations
+BEGIN
+    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS cass_semantic_source_conversations_update AFTER UPDATE ON conversations
+BEGIN
+    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS cass_semantic_source_conversations_delete AFTER DELETE ON conversations
+BEGIN
+    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS cass_semantic_source_messages_insert AFTER INSERT ON messages
+BEGIN
+    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS cass_semantic_source_messages_update AFTER UPDATE ON messages
+BEGIN
+    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS cass_semantic_source_messages_delete AFTER DELETE ON messages
+BEGIN
+    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
+END;
+";
+
+/// Exact clock definitions admitted by the readonly certificate boundary.
+/// A matching trigger name alone cannot certify a monotonic source clock.
+/// Behavioral tests independently exercise these transitions through SQL.
+pub(crate) fn semantic_source_clock_trigger_contracts() -> Vec<(String, String)> {
+    let mut contracts = Vec::with_capacity(18);
+    for table in [
+        "agents",
+        "workspaces",
+        "sources",
+        "conversations",
+        "messages",
+    ] {
+        for event in ["insert", "update", "delete"] {
+            let name = format!("cass_semantic_source_{table}_{event}");
+            let sql = format!(
+                "CREATE TRIGGER {name} AFTER {} ON {table} BEGIN UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1; END",
+                event.to_ascii_uppercase()
+            );
+            contracts.push((name, sql));
+        }
+    }
+    contracts.push(("cass_semantic_source_authority_insert".into(),
+        "CREATE TRIGGER cass_semantic_source_authority_insert BEFORE INSERT ON semantic_source_identity_v1 WHEN EXISTS(SELECT 1 FROM semantic_source_identity_v1 WHERE singleton = 1) BEGIN SELECT RAISE(ABORT, 'semantic source authority already exists and cannot be replaced'); END".into()));
+    contracts.push(("cass_semantic_source_authority_update".into(),
+        "CREATE TRIGGER cass_semantic_source_authority_update BEFORE UPDATE ON semantic_source_identity_v1 WHEN NEW.singleton != OLD.singleton OR NEW.database_uuid != OLD.database_uuid OR typeof(NEW.change_sequence) != 'integer' OR NEW.change_sequence < OLD.change_sequence BEGIN SELECT RAISE(ABORT, 'semantic source identity is immutable and its clock cannot wrap or reverse'); END".into()));
+    contracts.push(("cass_semantic_source_authority_delete".into(),
+        "CREATE TRIGGER cass_semantic_source_authority_delete BEFORE DELETE ON semantic_source_identity_v1 BEGIN SELECT RAISE(ABORT, 'semantic source authority cannot be removed'); END".into()));
+    contracts
+}
+
 /// Row from the embedding_jobs table.
 #[derive(Debug, Clone)]
 pub struct EmbeddingJobRow {
@@ -5300,10 +5632,23 @@ pub struct FrankenStorage {
     /// stall watchdog reads a healthy multi-minute shadow rebuild as a wedge
     /// and exits 70 after the base abort threshold.
     fts_maintenance_heartbeat: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// GH #345: truthful, per-committed-batch progress for a bounded
+    /// `--rebuild-canonical-fts` rebuild. `None` outside an explicit repair
+    /// (the index tail keeps its own progress counters).
+    fts_rebuild_progress: parking_lot::Mutex<Option<Box<dyn Fn(FtsRebuildProgress) + Send + Sync>>>,
     /// GH #413 follow-up (iify0): the run's view of the derived fts5 shadow,
     /// shared with every pool writer this connection spawns (see
     /// [`FtsShadowRunState`]).
     fts_shadow_run: Arc<FtsShadowRunState>,
+    /// GH #503: set when this read-only handle was admitted through the
+    /// pinned engine's legacy-tolerant deferred-FTS5 open because an
+    /// `fts_messages*` shadow table carries the pre-#434 catalog (a declared
+    /// primary key with no `sqlite_master` implicit autoindex row). Holds the
+    /// ordinary open's refusal for the repair hint. The canonical rows are
+    /// readable; FTS5 queries on this handle see an empty index until the
+    /// derived shadow is rebuilt by an explicit writable repair
+    /// (`cass doctor --rebuild-canonical-fts --yes`).
+    legacy_fts5_shadow_repair: Option<String>,
 }
 
 /// GH #413 follow-up (iify0): per-process state of the derived `fts_messages`
@@ -5492,14 +5837,16 @@ pub(crate) fn error_message_indicates_populated_fts_shadow_without_rowid_reload(
     mentions_populated_without_rowid_shadow && lower.contains("not yet supported")
 }
 
-/// Test-only rendezvous separating uncancellable engine bootstrap from SQL
-/// issued on an admitted connection. Baseline and candidate use the same hook.
+/// Test-only rendezvous for engine admission and SQL on an admitted connection.
 #[cfg(debug_assertions)]
-fn index_storage_open_rendezvous_for_test(path: &Path) -> Result<()> {
-    let (Some(ready), Some(release)) = (
-        dotenvy::var("CASS_TEST_INDEX_STORAGE_OPEN_READY").ok(),
-        dotenvy::var("CASS_TEST_INDEX_STORAGE_OPEN_RELEASE").ok(),
-    ) else {
+fn index_storage_open_rendezvous_for_test(
+    path: &Path,
+    ready_env: &str,
+    release_env: &str,
+) -> Result<()> {
+    let (Some(ready), Some(release)) =
+        (dotenvy::var(ready_env).ok(), dotenvy::var(release_env).ok())
+    else {
         return Ok(());
     };
     let ready = PathBuf::from(ready);
@@ -5560,12 +5907,23 @@ impl FrankenStorage {
             ensured_daily_stats_keys,
             fts_messages_present_cache: AtomicI8::new(FTS_MESSAGES_PRESENT_UNKNOWN),
             fts_maintenance_heartbeat: parking_lot::Mutex::new(None),
+            fts_rebuild_progress: parking_lot::Mutex::new(None),
             fts_shadow_run,
+            legacy_fts5_shadow_repair: None,
         }
     }
 
     fn apply_open_stage_busy_timeout(&self) {
-        if let Err(err) = self.conn.execute("PRAGMA busy_timeout = 5000;") {
+        // fsqlite's native POSIX lock wait does not poll the operation Cx.
+        // Under index cancellation, return to CASS's retry loops promptly so
+        // they can observe the stop. Their five-second contention budgets
+        // remain intact; ordinary unsupervised opens retain the native wait.
+        let pragma = if crate::franken_sync::cancellation_scope_active() {
+            "PRAGMA busy_timeout = 100;"
+        } else {
+            "PRAGMA busy_timeout = 5000;"
+        };
+        if let Err(err) = self.conn.execute(pragma) {
             tracing::debug!(
                 error = %err,
                 "failed to apply open-stage busy_timeout before migrations"
@@ -5636,7 +5994,11 @@ impl FrankenStorage {
                 .with_context(|| format!("creating frankensqlite db at {}", path.display()))?
         };
         #[cfg(debug_assertions)]
-        index_storage_open_rendezvous_for_test(path)?;
+        index_storage_open_rendezvous_for_test(
+            path,
+            "CASS_TEST_INDEX_STORAGE_OPEN_READY",
+            "CASS_TEST_INDEX_STORAGE_OPEN_RELEASE",
+        )?;
         let storage = Self::new(conn, path.to_path_buf());
         storage.apply_open_stage_busy_timeout();
         retry_transient_storage_op("run_migrations", || storage.run_migrations())?;
@@ -6001,6 +6363,7 @@ impl FrankenStorage {
         // class upstream retries in prepare's prologue since 55d7f2c5). The
         // lexical-rebuild page-prep workers open readonly right next to the
         // active writer, so a bounded retry here is load-bearing.
+        let mut legacy_fts5_shadow_repair = None;
         let conn = match retry_transient_storage_op("open_readonly", || {
             FrankenConnection::open_schema_only_with_wal_index_recovery(&path_str)
                 .map_err(anyhow::Error::new)
@@ -6019,6 +6382,22 @@ impl FrankenStorage {
                      without mutating the archive"
                 );
                 return Err(conflicting_fts_schema_repair_required(path));
+            }
+            // GH #503: the pre-#434 derived-FTS catalog refused the ordinary
+            // read-only schema reload. Open the engine's legacy-tolerant
+            // deferred-FTS5 lane (query_only is applied inside) so the
+            // canonical rows are readable; the derived shadow still needs an
+            // explicit writable repair.
+            Err(err) if is_legacy_fts5_shadow_autoindex_open_error(&err) => {
+                tracing::warn!(
+                    db = %path.display(),
+                    error = %err,
+                    "readonly open found the pre-#434 fts_messages shadow catalog; \
+                     admitting the archive through the legacy-tolerant lane \
+                     without a writable repair"
+                );
+                legacy_fts5_shadow_repair = Some(format!("{err:#}"));
+                open_legacy_fts5_shadow_catalog_reader(path)?
             }
             // gh #389: a hard (non-busy) readonly failure with a non-empty
             // `-wal` present is the unclean-shutdown dirty-WAL shape — the
@@ -6042,7 +6421,8 @@ impl FrankenStorage {
                 });
             }
         };
-        let storage = Self::new(conn, path.to_path_buf());
+        let mut storage = Self::new(conn, path.to_path_buf());
+        storage.legacy_fts5_shadow_repair = legacy_fts5_shadow_repair;
         storage.apply_readonly_config()?;
         Ok(storage)
     }
@@ -6071,11 +6451,28 @@ impl FrankenStorage {
         let deadline = Instant::now() + timeout;
         let _doctor_guard = acquire_existing_doctor_mutation_db_open_guard(path, timeout)?;
         let mut backoff = Duration::from_millis(4);
+        let mut legacy_fts5_shadow_repair = None;
         let conn = loop {
             match open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
                 .map_err(anyhow::Error::new)
             {
                 Ok(conn) => break conn,
+                // GH #503: the pre-#434 derived-FTS catalog refuses the
+                // ordinary read-only schema reload. Admit the archive through
+                // the engine's legacy-tolerant deferred-FTS5 lane (query_only
+                // applied inside); canonical rows are readable and the
+                // derived shadow still needs an explicit writable repair.
+                Err(err) if is_legacy_fts5_shadow_autoindex_open_error(&err) => {
+                    tracing::warn!(
+                        db = %path.display(),
+                        error = %err,
+                        "strict readonly open found the pre-#434 fts_messages shadow \
+                         catalog; admitting the archive through the legacy-tolerant \
+                         lane without a writable repair"
+                    );
+                    legacy_fts5_shadow_repair = Some(format!("{err:#}"));
+                    break open_legacy_fts5_shadow_catalog_reader(path)?;
+                }
                 Err(err) if retryable_franken_anyhow(&err) => {
                     let now = Instant::now();
                     if now >= deadline {
@@ -6103,7 +6500,8 @@ impl FrankenStorage {
                 }
             }
         };
-        let storage = Self::new(conn, path.to_path_buf());
+        let mut storage = Self::new(conn, path.to_path_buf());
+        storage.legacy_fts5_shadow_repair = legacy_fts5_shadow_repair;
         storage.apply_readonly_config()?;
         Ok(storage)
     }
@@ -6136,6 +6534,15 @@ impl FrankenStorage {
     /// Access the raw frankensqlite connection.
     pub fn raw(&self) -> &FrankenConnection {
         &self.conn
+    }
+
+    /// GH #503: the ordinary open's refusal when this read-only handle was
+    /// admitted through the engine's legacy-tolerant deferred-FTS5 lane.
+    /// `None` for every ordinary open. Callers surface it as a
+    /// `schema-repair-required` hint for the derived shadow; the canonical
+    /// rows are readable on this handle.
+    pub(crate) fn legacy_fts5_shadow_repair_detail(&self) -> Option<&str> {
+        self.legacy_fts5_shadow_repair.as_deref()
     }
 
     /// Consume the storage wrapper and return the underlying frankensqlite
@@ -6262,7 +6669,7 @@ impl FrankenStorage {
     /// V13 or newer already; additive post-V13 migrations are applied normally.
     pub fn run_migrations(&self) -> Result<()> {
         transition_from_meta_version(&self.conn)?;
-        self.refuse_unbounded_legacy_fts_teardown()?;
+        self.drop_legacy_fts_messages_bounded()?;
 
         let (mut applied, was_fresh) =
             run_attributed_migration_steps(&self.conn, BASE_MIGRATION_STEPS)?;
@@ -6292,54 +6699,58 @@ impl FrankenStorage {
         Ok(())
     }
 
-    /// GH #349: bounded pre-flight for the V14 `fts_contentless` migration.
+    /// GH #349: run the V14 legacy `fts_messages` teardown in autocommit.
     ///
-    /// When the archive still carries a legacy `fts_messages` FTS5 shadow,
-    /// the migration must DROP it, and that teardown is unbounded inside
-    /// frankensqlite — on multi-GB archives it aborts with `out of memory`
-    /// after minutes at multi-GiB RSS. Above the configured byte budget this
-    /// refuses up front with a typed, actionable error instead of attempting
-    /// the drop, leaving the archive untouched. Small archives migrate
-    /// exactly as before, and `CASS_MIGRATION_LEGACY_FTS_DROP_BUDGET_BYTES`
-    /// (see [`LEGACY_FTS_TEARDOWN_BUDGET_ENV`]) tunes or disables the gate.
+    /// `MigrationRunner` applies each migration inside `BEGIN IMMEDIATE` /
+    /// `COMMIT`. FrankenSQLite frees a dropped b-tree in bounded page batches
+    /// (2048 pages per batch), but only autocommit lets each batch commit on
+    /// its own; inside an explicit transaction every batch joins that one
+    /// transaction, so tearing down a multi-GB internal-content FTS5 shadow
+    /// accumulates unbounded freed-page state and aborts with `out of memory`.
     ///
-    /// Every probe here is bounded: one indexed sqlite_master row read, one
-    /// `_schema_migrations` point query, and file metadata for the archive
-    /// family. Probes that themselves fail fail open — the migration then
-    /// runs and any real failure surfaces attributed per step.
-    fn refuse_unbounded_legacy_fts_teardown(&self) -> Result<()> {
-        let carries_fts_messages = self
+    /// This runs before the attributed migration steps and targets only the
+    /// derived `fts_messages` virtual table, and only while V14 is pending;
+    /// canonical tables are never touched. V14's own
+    /// `DROP TABLE IF EXISTS fts_messages` then commits as a no-op, so the
+    /// migration ledger still records `fts_contentless` exactly as before.
+    /// A crash after the drop but before V14's ledger row is resumable: the
+    /// next open finds no `fts_messages`, runs the no-op, and records V14.
+    ///
+    /// Returns whether the legacy table was dropped.
+    fn drop_legacy_fts_messages_bounded(&self) -> Result<bool> {
+        if schema_migration_is_applied(&self.conn, 14).unwrap_or(false) {
+            return Ok(false);
+        }
+        let present = self
             .conn
             .query(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' \
-                 AND name = 'fts_messages' LIMIT 1;",
+                 AND name = 'fts_messages' COLLATE NOCASE LIMIT 1;",
             )
             .map(|rows| !rows.is_empty())
             .unwrap_or(false);
-        if !carries_fts_messages {
-            return Ok(());
+        if !present {
+            return Ok(false);
         }
-        let Some(budget_bytes) = legacy_fts_teardown_budget_bytes() else {
-            return Ok(());
-        };
-        let v14_pending = !schema_migration_is_applied(&self.conn, 14).unwrap_or(true);
-        if !v14_pending {
-            return Ok(());
-        }
-        let archive_bytes = archive_family_bytes(&self.db_path);
-        if archive_bytes <= budget_bytes {
-            return Ok(());
-        }
-        tracing::warn!(
-            archive_bytes,
-            budget_bytes,
-            env = LEGACY_FTS_TEARDOWN_BUDGET_ENV,
-            "refusing unbounded legacy fts_messages teardown during schema migration"
+        // Boundedness is a property of the autocommit lane: if a caller wrapped
+        // run_migrations in a transaction, every page-free batch would join it.
+        let in_autocommit = !self.conn.as_async().in_transaction();
+        #[cfg(test)]
+        LEGACY_FTS_TEARDOWN_RAN_IN_AUTOCOMMIT.with(|probe| probe.set(in_autocommit));
+        anyhow::ensure!(
+            in_autocommit,
+            "legacy fts_messages teardown must run outside an explicit transaction"
         );
-        Err(anyhow::Error::new(LegacyFtsTeardownRefusal {
-            archive_bytes,
-            budget_bytes,
-        }))
+        self.conn
+            .execute("DROP TABLE IF EXISTS fts_messages")
+            .with_context(
+                || "running schema migration v14 (fts_contentless): dropping legacy fts_messages in bounded autocommit mode",
+            )?;
+        info!(
+            db = %self.db_path.display(),
+            "dropped legacy fts_messages in autocommit before migration v14"
+        );
+        Ok(true)
     }
 
     /// Some historical canonical rebuild paths produced databases whose
@@ -6685,6 +7096,7 @@ const POST_TAIL_CACHE_MIGRATION_STEPS: &[(i64, &str, &str)] = &[
     (20, "conversation_external_tail_lookup", MIGRATION_V20),
     (21, "conversation_context_index", MIGRATION_V21),
     (22, "forgotten_sources", MIGRATION_V22),
+    (23, "semantic_source_identity", MIGRATION_V23),
 ];
 
 /// Migration versions that ordinary storage open may apply when their ledger
@@ -6725,75 +7137,13 @@ fn run_attributed_migration_steps(
     Ok((applied, was_fresh))
 }
 
-/// Environment override for the GH #349 legacy-FTS teardown refusal budget,
-/// in bytes of on-disk archive family (main db + sidecars). `0` disables the
-/// refusal entirely and forces the unbounded teardown attempt.
-const LEGACY_FTS_TEARDOWN_BUDGET_ENV: &str = "CASS_MIGRATION_LEGACY_FTS_DROP_BUDGET_BYTES";
-
-/// Default refusal budget: archives above this size never attempt the V14
-/// legacy `fts_messages` teardown automatically.
-const DEFAULT_LEGACY_FTS_TEARDOWN_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
-
-/// Typed refusal of the V14 `fts_contentless` teardown of a large legacy
-/// `fts_messages` FTS5 shadow (GH #349).
-///
-/// The drop is unbounded inside frankensqlite (WITHOUT-ROWID shadow teardown)
-/// and aborts with `out of memory` after minutes and multi-GiB RSS on
-/// multi-GB archives. Refusing up front keeps the archive untouched, names
-/// the failing migration, and carries the safe next actions.
-#[derive(Debug, Error)]
-#[error(
-    "migration v14 (fts_contentless) refused: this archive still carries a legacy fts_messages \
-     FTS5 shadow whose teardown is unbounded in frankensqlite (GH #345/#349: the drop aborts \
-     with 'out of memory' after minutes on multi-GB archives); archive family is \
-     {archive_bytes} bytes, above the {budget_bytes}-byte refusal budget. The archive was not \
-     modified. Next actions: run 'cass doctor check --json' for a bounded read-only diagnosis; \
-     upgrade to a cass build carrying the frankensqlite bounded WITHOUT-ROWID teardown fix and \
-     retry 'cass index --full'; or back up the archive and rebuild a fresh one from provider \
-     session logs. To force the unbounded attempt anyway, set \
-     CASS_MIGRATION_LEGACY_FTS_DROP_BUDGET_BYTES to a byte value above the archive size \
-     (0 disables the refusal entirely)."
-)]
-pub(crate) struct LegacyFtsTeardownRefusal {
-    pub(crate) archive_bytes: u64,
-    pub(crate) budget_bytes: u64,
-}
-
-/// Total on-disk size of the archive family: the main db plus its WAL, SHM,
-/// and journal sidecars. Missing members contribute zero.
-fn archive_family_bytes(db_path: &Path) -> u64 {
-    ["", "-wal", "-shm", "-journal"]
-        .into_iter()
-        .filter_map(|suffix| {
-            std::fs::symlink_metadata(database_sidecar_path(db_path, suffix))
-                .ok()
-                .filter(|meta| meta.is_file())
-                .map(|meta| meta.len())
-        })
-        .sum()
-}
-
-/// Resolve the legacy-FTS teardown refusal budget. `None` means the operator
-/// explicitly disabled the refusal via a `0` budget; an unparsable value
-/// falls back to the default with a warning rather than silently disabling
-/// the gate.
-fn legacy_fts_teardown_budget_bytes() -> Option<u64> {
-    match std::env::var(LEGACY_FTS_TEARDOWN_BUDGET_ENV) {
-        Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(0) => None,
-            Ok(bytes) => Some(bytes),
-            Err(_) => {
-                tracing::warn!(
-                    value = %raw,
-                    env = LEGACY_FTS_TEARDOWN_BUDGET_ENV,
-                    default = DEFAULT_LEGACY_FTS_TEARDOWN_BUDGET_BYTES,
-                    "unparsable refusal budget; using the default"
-                );
-                Some(DEFAULT_LEGACY_FTS_TEARDOWN_BUDGET_BYTES)
-            }
-        },
-        Err(_) => Some(DEFAULT_LEGACY_FTS_TEARDOWN_BUDGET_BYTES),
-    }
+#[cfg(test)]
+thread_local! {
+    /// Test-only evidence that the GH #349 legacy `fts_messages` pre-drop ran
+    /// on the autocommit lane (the lane where each bounded page-free batch
+    /// commits). Thread-local because `run_migrations` runs on the caller.
+    static LEGACY_FTS_TEARDOWN_RAN_IN_AUTOCOMMIT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 fn schema_migration_is_applied(conn: &FrankenConnection, version: i64) -> Result<bool> {
@@ -7647,7 +7997,7 @@ fn current_schema_repair_batches_for_missing_tables(
 }
 
 /// Migration name lookup for backfilling `_schema_migrations` during transition.
-const MIGRATION_NAMES: [(i64, &str); 22] = [
+const MIGRATION_NAMES: [(i64, &str); 23] = [
     (1, "core_tables"),
     (2, "fts_messages"),
     (3, "fts_messages_rebuild"),
@@ -7670,6 +8020,7 @@ const MIGRATION_NAMES: [(i64, &str); 22] = [
     (20, "conversation_external_tail_lookup"),
     (21, "conversation_context_index"),
     (22, "forgotten_sources"),
+    (23, "semantic_source_identity"),
 ];
 
 /// Transitions an existing database from `meta` table schema versioning to the
@@ -10554,7 +10905,7 @@ impl FrankenStorage {
                         key.as_str(),
                         ts.to_string(),
                         contract_key.as_str(),
-                        contract
+                        contract.identity()
                     ],
                 )?;
             }
@@ -10584,7 +10935,7 @@ impl FrankenStorage {
             let key = Self::connector_scan_contract_meta_key(connector_name);
             self.conn.execute_compat(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
-                fparams![key.as_str(), contract],
+                fparams![key.as_str(), contract.identity()],
             )?;
         }
         Ok(())
@@ -10672,7 +11023,8 @@ impl FrankenStorage {
             } else if let Some(connector_name) = key.strip_prefix("scan_contract:connector:")
                 && let Some(state) =
                     states.get_mut(connector_name.trim().to_ascii_lowercase().as_str())
-                && connector_scan_contract(connector_name) == Some(value.as_str())
+                && connector_scan_contract(connector_name).map(|contract| contract.identity())
+                    == Some(value.as_str())
             {
                 state.scan_contract_pending = false;
             }
@@ -15061,12 +15413,13 @@ impl FrankenStorage {
         })
     }
 
-    /// Rebuild the FTS5 index from scratch in one failure-atomic transaction.
+    /// Rebuild the FTS5 index from scratch in bounded, durable batches.
     ///
-    /// Row materialization remains chunked to bound memory, but the old
-    /// queryable shadow is not published away until the replacement has exact
-    /// canonical parity and the transaction commits. A process interruption
-    /// rolls the create-or-clear operation and every insert back together.
+    /// Row materialization is chunked and every page commits on its own
+    /// short-lived writer connection (GH #345), so peak memory does not grow
+    /// with the corpus. A process interruption leaves the pages committed so
+    /// far in a queryable Partial shadow, and the next repair resumes them;
+    /// canonical rows are never modified.
     pub fn rebuild_fts(&self) -> Result<()> {
         self.rebuild_fts_via_frankensqlite().map(|_| ())
     }
@@ -15335,6 +15688,23 @@ impl FrankenStorage {
     fn tick_fts_maintenance_heartbeat(&self) {
         if let Some(heartbeat) = self.fts_maintenance_heartbeat.lock().as_ref() {
             heartbeat();
+        }
+    }
+
+    /// GH #345: install (or, with `None`, clear) the reporter a bounded
+    /// canonical-FTS rebuild invokes after every committed batch. Progress is
+    /// published only after `COMMIT`, so a reported count is durable and a
+    /// re-run resumes from it.
+    pub(crate) fn set_fts_rebuild_progress(
+        &self,
+        progress: Option<Box<dyn Fn(FtsRebuildProgress) + Send + Sync>>,
+    ) {
+        *self.fts_rebuild_progress.lock() = progress;
+    }
+
+    fn report_fts_rebuild_progress(&self, progress: FtsRebuildProgress) {
+        if let Some(reporter) = self.fts_rebuild_progress.lock().as_ref() {
+            reporter(progress);
         }
     }
 
@@ -15812,7 +16182,7 @@ impl FrankenStorage {
                 })?;
         let indexable_messages = self.count_fts_indexable_messages()?;
         let fts_schema_rows = self.conn.query_row_map(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+            FTS_MESSAGES_REGISTRATION_ROW_COUNT_SQL,
             fparams![],
             |row| row.get_typed::<i64>(0),
         )?;
@@ -15973,7 +16343,7 @@ impl FrankenStorage {
                     row.get_typed::<i64>(0)
                 })?;
         let fts_schema_rows = self.conn.query_row_map(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+            FTS_MESSAGES_REGISTRATION_ROW_COUNT_SQL,
             fparams![],
             |row| row.get_typed::<i64>(0),
         )?;
@@ -16080,50 +16450,10 @@ impl FrankenStorage {
     /// Identify catalog shapes for which `_docsize` is not the complete
     /// engine rowid domain (GH #495).
     fn fts_shadow_residue_detail(&self, fts_schema_rows: i64) -> Result<Option<String>> {
-        if fts_schema_rows == 0 {
-            let names = self.conn.query_map_collect(
-                "SELECT name FROM sqlite_master
-                 WHERE type = 'table' AND name IN (
-                   'fts_messages_config','fts_messages_content','fts_messages_data',
-                   'fts_messages_docsize','fts_messages_idx'
-                 ) ORDER BY name",
-                fparams![],
-                |row| row.get_typed::<String>(0),
-            )?;
-            if !names.is_empty() {
-                return Ok(Some(format!(
-                    "fts_messages registration is absent but derived shadow residue remains: {}",
-                    names.join(", ")
-                )));
-            }
-            return Ok(None);
-        }
-        if fts_schema_rows == 1 && !self.fts_messages_schema_is_canonical_contentless()? {
-            return Ok(Some(
-                "fts_messages uses legacy/noncanonical DDL; _docsize parity cannot prove the engine rowid domain and the derived shadow must be recreated"
-                    .to_string(),
-            ));
-        }
-        if fts_schema_rows == 1 {
-            // GH #374: a canonical registration over legacy rowid shadow
-            // tables. Row counts can match exactly, so without this the full
-            // index refused the archive and pointed at a repair that found
-            // nothing to do.
-            let shadow_ddl = self.conn.query_map_collect(
-                "SELECT name, sql FROM sqlite_master
-                 WHERE type = 'table' AND name IN ('fts_messages_config', 'fts_messages_idx')
-                 ORDER BY name",
-                fparams![],
-                |row| Ok((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?)),
-            )?;
-            if let Some(problem) = shadow_ddl
-                .iter()
-                .find_map(|(table, ddl)| incompatible_legacy_fts_shadow_ddl(table, ddl))
-            {
-                return Ok(Some(problem));
-            }
-        }
-        Ok(None)
+        // GH #495: the residue rules live in one shared classifier so the
+        // doctor's read-only probe and this mutating repair path cannot
+        // drift apart on the same archive.
+        fts_shadow_residue_detail_with_query(fts_schema_rows, |sql| self.conn.query(sql))
     }
 
     fn drop_fts_shadow_residue(&self) -> Result<()> {
@@ -16174,9 +16504,50 @@ impl FrankenStorage {
                 })
             }
             FtsShadowParityStatus::Partial => {
-                let inserted_rows = self
-                    .stream_fts_rows_via_frankensqlite(true)
-                    .with_context(|| "resuming missing FTS rows via frankensqlite")?;
+                let inserted_rows = match self.stream_fts_rows_via_frankensqlite(true) {
+                    Ok(inserted_rows) => inserted_rows,
+                    Err(err) if fts_insert_error_is_rowid_collision(&err) => {
+                        // GH #495: the catch-up insert collided with a rowid the
+                        // derived shadow already holds — the reporter's
+                        // "PRIMARY KEY constraint failed". The shadow's rowid
+                        // domain disagrees with `_docsize`, so retrying the
+                        // same insert can never succeed. Route the repair
+                        // through the reviewed drop+recreate route instead of
+                        // repeating the insert on every later run. Canonical
+                        // rows are never touched: only the derived shadow is
+                        // dropped, and it is recreated from those rows. An
+                        // unrelated storage error keeps its own failure.
+                        //
+                        // GH #345 / GH #329: the recreate primitive
+                        // materializes every canonical row in the engine's
+                        // memory (~32 KiB per message), so an over-bound
+                        // corpus must not enter it. The same admission check
+                        // the other rebuild routes use applies here: over the
+                        // bound the shadow is retired and the repair reports
+                        // the not-viable detail instead of hydrating the
+                        // engine.
+                        if let Some(detail) = self.fts_shadow_recreate_refused()? {
+                            // GH #497: a settled retirement must not be
+                            // rewritten — drop the shadow only when the
+                            // recorded retirement does not already describe
+                            // this corpus and bound.
+                            if !self.fts_shadow_retirement_matches(&detail)? {
+                                self.drop_fts_shadow_as_not_viable(&detail)?;
+                            }
+                            anyhow::bail!("{detail}");
+                        }
+                        self.drop_fts_shadow_residue().with_context(
+                            || "dropping the colliding FTS shadow before recreating it",
+                        )?;
+                        self.rebuild_fts_via_frankensqlite().with_context(
+                            || "recreating the canonical FTS shadow after a rowid collision",
+                        )?
+                    }
+                    Err(err) => {
+                        return Err(err)
+                            .with_context(|| "resuming missing FTS rows via frankensqlite");
+                    }
+                };
                 let after = self.require_healthy_fts_parity("resumable FTS catch-up")?;
                 self.record_fts_franken_rebuild_generation()?;
                 self.set_fts_messages_present_cache(true);
@@ -16247,57 +16618,46 @@ impl FrankenStorage {
     /// in-place DELETE path cannot. The FTS5 vtab's destructor is a no-op that never reads
     /// `%_data`, and its backing shadow tables are plain, so `DROP TABLE`
     /// removes the corrupt structure without decoding it. Canonical rows are
-    /// never modified. NOT fully failure-atomic: the drop+recreate runs in
-    /// autocommit (frankensqlite cannot recreate a virtual table in the same
-    /// transaction as its DROP), so only the repopulate is transactional — a
-    /// failed repopulate leaves an EMPTY (not corrupt) shadow, and re-running
-    /// the repair is safe because the shadow is fully derived from canonical.
+    /// never modified. The drop+CREATE runs in autocommit (frankensqlite
+    /// cannot recreate a virtual table in the same transaction as its DROP);
+    /// the repopulate streams bounded pages and commits each on its own
+    /// short-lived writer connection, so a failure leaves a queryable Partial
+    /// shadow and re-running the repair resumes it — the shadow is fully
+    /// derived from canonical rows.
     pub(crate) fn rebuild_fts_shadow_via_drop_recreate(&self) -> Result<usize> {
         self.invalidate_fts_messages_present_cache();
 
         // Drop + recreate the shadow in autocommit: frankensqlite does not
         // support recreating a virtual table in the SAME transaction as its
-        // DROP. The corrupt shadow is replaced by a fresh empty one here; the
-        // repopulate below is transactional. Full failure-atomicity (preserving
-        // the ORIGINAL) has no value in this path because the original shadow is
-        // corrupt — if the repopulate fails, the shadow is empty (not corrupt)
-        // and re-running the repair is safe, since it is fully derived from
-        // canonical rows.
+        // DROP. The replacement starts empty; the repopulate below streams
+        // bounded pages, each committed on its own short-lived writer
+        // connection (GH #345). Every committed page is durable, so an
+        // interrupted rebuild leaves a queryable Partial shadow that the next
+        // run resumes through the ordinary catch-up path instead of publishing
+        // nothing. Canonical rows are never touched, and the shadow is fully
+        // derived, so a re-run is always safe.
         self.conn
             .execute("DROP TABLE IF EXISTS fts_messages")
-            .with_context(|| "dropping the corrupt FTS5 shadow before recreate")?;
+            .with_context(|| "dropping the FTS5 shadow before recreate")?;
+        self.set_fts_messages_present_cache(false);
         self.conn
             .execute_compat(FTS5_REGISTER_SQL, fparams![])
-            .with_context(|| "recreating a fresh FTS5 shadow after dropping the corrupt one")?;
+            .with_context(|| "recreating a fresh FTS5 shadow")?;
         self.set_fts_messages_present_cache(true);
+        #[cfg(test)]
+        injected_fts_rebuild_interruption(1)?;
 
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE TRANSACTION;")
-            .with_context(|| "starting the corrupt-FTS shadow repopulate transaction")?;
-        let repopulate = (|| -> Result<usize> {
-            let inserted_rows = self.stream_fts_rows_via_frankensqlite(false)?;
-            self.require_healthy_fts_parity("corrupt-FTS drop+recreate rebuild")?;
-            self.record_fts_franken_rebuild_generation()?;
-            self.conn
-                .execute_batch("COMMIT;")
-                .with_context(|| "publishing the corrupt-FTS shadow repopulate")?;
-            Ok(inserted_rows)
-        })();
-
-        match repopulate {
-            Ok(inserted_rows) => {
-                self.set_fts_messages_present_cache(true);
-                Ok(inserted_rows)
-            }
-            Err(err) => {
-                self.invalidate_fts_messages_present_cache();
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(err.context(
-                    "corrupt-FTS shadow repopulate rolled back after the shadow was dropped and \
-                     recreated empty; re-run 'cass doctor --rebuild-canonical-fts --yes' to retry",
-                ))
-            }
-        }
+        let inserted_rows = self
+            .stream_fts_rows_via_frankensqlite(false)
+            .with_context(|| {
+                "repopulating the recreated FTS5 shadow in bounded, durable batches; every \
+                 committed batch survives, so re-run 'cass doctor --rebuild-canonical-fts --yes' \
+                 to resume"
+            })?;
+        self.require_healthy_fts_parity("FTS5 drop+recreate rebuild")?;
+        self.record_fts_franken_rebuild_generation()?;
+        self.set_fts_messages_present_cache(true);
+        Ok(inserted_rows)
     }
 
     /// True when every `sqlite_master` row named `fts_messages` declares the
@@ -16318,32 +16678,16 @@ impl FrankenStorage {
     /// state, and rows written through one connection's view are invisible
     /// to the next open (content lands in `%_data`/`%_docsize` while the
     /// reader hydrates from the empty `%_content`).
+    ///
+    /// GH #345: rebuilds no longer branch on this method (every status goes
+    /// through drop+recreate), so it is retained as the unit-test oracle for
+    /// the shared classifier.
+    #[cfg(test)]
     fn fts_messages_schema_is_canonical_contentless(&self) -> Result<bool> {
-        let mut saw_row = false;
-        let mut all_contentless = true;
-        self.conn
-            .query_with_params_for_each(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages'",
-                &[] as &[SqliteValue],
-                |row| {
-                    saw_row = true;
-                    let sql: Option<String> = row.get_typed(0)?;
-                    let normalized: String = sql
-                        .unwrap_or_default()
-                        .to_ascii_lowercase()
-                        .split_whitespace()
-                        .collect();
-                    let has_empty_content =
-                        normalized.contains("content=''") || normalized.contains("content=\"\"");
-                    let has_contentless_delete = normalized.contains("contentless_delete=1");
-                    if !(has_empty_content && has_contentless_delete) {
-                        all_contentless = false;
-                    }
-                    Ok(())
-                },
-            )
-            .with_context(|| "reading the fts_messages CREATE sql for rebuild routing")?;
-        Ok(saw_row && all_contentless)
+        // GH #495: the same rule the doctor's read-only probe applies, read
+        // through the shared classifier so the two cannot drift apart.
+        fts_messages_schema_is_canonical_contentless_with_query(&|sql| self.conn.query(sql))
+            .with_context(|| "reading the fts_messages CREATE sql for rebuild routing")
     }
 
     pub(crate) fn rebuild_fts_via_frankensqlite(&self) -> Result<usize> {
@@ -16380,99 +16724,32 @@ impl FrankenStorage {
                 before.status.as_str()
             );
         }
-        // Route queryable shadows whose surviving CREATE is NOT cass's
-        // canonical contentless registration through DROP+recreate instead of
-        // DELETE_ALL. cass only ever creates `content='', contentless_delete=1`
-        // shadows, so a non-contentless CREATE is a legacy or stale-duplicate
-        // catalog row (see `fts_messages_schema_is_canonical_contentless`);
-        // rebuilding "in place" through that row splits writes and reads
-        // across different shadow tables and silently loses the rebuilt
-        // content on the next open. DROP TABLE removes every catalog row of
-        // that name plus the module shadow-table cascade, leaving one clean
-        // canonical schema, and the repopulate is fully derived from
-        // canonical messages so nothing user-authored is at stake. The
-        // `content=''`-without-`contentless_delete` legacy family is
-        // non-canonical too (GH #497); with a single catalog row it is
-        // classified as residue above. Unqueryable still bails in the match
-        // below.
-        if matches!(
-            before.status,
-            FtsShadowParityStatus::Healthy
-                | FtsShadowParityStatus::Partial
-                | FtsShadowParityStatus::Excess
-                | FtsShadowParityStatus::Divergent
-        ) && !self.fts_messages_schema_is_canonical_contentless()?
-        {
-            return self.rebuild_fts_shadow_via_drop_recreate();
-        }
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE TRANSACTION;")
-            .with_context(|| "starting failure-atomic FTS rebuild transaction")?;
-
-        let rebuild_result = (|| -> Result<usize> {
-            match before.status {
-                FtsShadowParityStatus::Absent => {
-                    self.conn
-                        .execute_compat(FTS5_REGISTER_SQL, fparams![])
-                        .with_context(|| "creating fts_messages inside atomic rebuild")?;
-                }
-                FtsShadowParityStatus::Residue => {
-                    anyhow::bail!("FTS residue must be removed before entering the atomic rebuild")
-                }
-                FtsShadowParityStatus::Healthy
-                | FtsShadowParityStatus::Partial
-                | FtsShadowParityStatus::Excess
-                | FtsShadowParityStatus::Divergent => {
-                    self.conn.execute(FTS5_DELETE_ALL_SQL).with_context(|| {
-                        "clearing the queryable FTS shadow transactionally; a legacy shadow \
-                         without contentless_delete=1 is preserved and requires resumable \
-                         repair instead"
-                    })?;
-                }
-                FtsShadowParityStatus::Unqueryable => anyhow::bail!(
-                    "refusing to replace an unqueryable FTS shadow in place because its \
-                     prior artifact cannot be proven restorable; preserve the complete \
-                     database bundle for staged recovery"
-                ),
+        // Every rebuild replaces the shadow: DROP + CREATE in autocommit,
+        // then bounded pages committed on short-lived writer connections
+        // (GH #345). An in-place `DELETE FROM fts_messages` forced the engine
+        // to hydrate the whole shadow on the primary connection and kept the
+        // rebuild inside one giant transaction, which both retained the corpus
+        // in memory (18 GiB at ~2M messages) and published nothing when
+        // interrupted. The replaced shadow is fully derived from canonical
+        // messages, so nothing user-authored is at stake. This also replaces
+        // non-canonical (legacy or stale-duplicate) shadow CREATEs, which
+        // would otherwise split writes and reads across different shadow
+        // tables. `Unqueryable` still bails because its prior artifact cannot
+        // be proven restorable.
+        match before.status {
+            FtsShadowParityStatus::Absent
+            | FtsShadowParityStatus::Healthy
+            | FtsShadowParityStatus::Partial
+            | FtsShadowParityStatus::Excess
+            | FtsShadowParityStatus::Divergent => self.rebuild_fts_shadow_via_drop_recreate(),
+            FtsShadowParityStatus::Residue => {
+                anyhow::bail!("FTS residue must be removed before the drop+recreate rebuild")
             }
-            self.set_fts_messages_present_cache(true);
-            #[cfg(test)]
-            injected_fts_rebuild_interruption(1)?;
-
-            let inserted_rows = self.stream_fts_rows_via_frankensqlite(false)?;
-            self.require_healthy_fts_parity("transactional FTS rebuild")?;
-            self.record_fts_franken_rebuild_generation()?;
-            self.conn
-                .execute_batch("COMMIT;")
-                .with_context(|| "publishing failure-atomic FTS rebuild transaction")?;
-            Ok(inserted_rows)
-        })();
-
-        match rebuild_result {
-            Ok(inserted_rows) => {
-                self.set_fts_messages_present_cache(true);
-                Ok(inserted_rows)
-            }
-            Err(err) => {
-                self.invalidate_fts_messages_present_cache();
-                match self.conn.execute_batch("ROLLBACK;") {
-                    Ok(()) => Err(err.context(
-                        "failure-atomic FTS rebuild rolled back without publishing a partial shadow",
-                    )),
-                    Err(rollback_err) => {
-                        tracing::error!(
-                            error = %err,
-                            rollback_error = %rollback_err,
-                            "FTS rebuild failed and explicit rollback could not be confirmed"
-                        );
-                        Err(err.context(format!(
-                            "FTS rebuild failed and rollback could not be confirmed: \
-                             {rollback_err}. Preserve the complete database bundle and inspect \
-                             exact FTS parity before any retry"
-                        )))
-                    }
-                }
-            }
+            FtsShadowParityStatus::Unqueryable => anyhow::bail!(
+                "refusing to replace an unqueryable FTS shadow because its prior artifact \
+                 cannot be proven restorable; preserve the complete database bundle for \
+                 staged recovery"
+            ),
         }
     }
 
@@ -16514,6 +16791,24 @@ impl FrankenStorage {
         let workspace_path_by_id = self.load_fts_workspace_path_map()?;
         let mut entries = Vec::new();
         let mut pending_chars = 0usize;
+        // GH #345: truthful total for the progress reporter. A failure to
+        // count only degrades the displayed denominator; it must not fail a
+        // repairable shadow.
+        let total_rows = match self.count_fts_indexable_messages() {
+            Ok(count) => usize::try_from(count).unwrap_or(usize::MAX),
+            Err(err) => {
+                tracing::debug!(
+                    target: "cass::fts_rebuild",
+                    error = %err,
+                    "could not count canonical rows for FTS rebuild progress"
+                );
+                0
+            }
+        };
+        self.report_fts_rebuild_progress(FtsRebuildProgress {
+            committed_rows: 0,
+            total_rows,
+        });
 
         // Test hooks for the #439 liveness contract (tests/cli_index.rs). A
         // PARK sleeps once before the first page WITHOUT a heartbeat — the
@@ -16548,12 +16843,35 @@ impl FrankenStorage {
             if fetched_count == 0 && page.exhausted {
                 break;
             }
+            // GH #345: every page commits through its own short-lived writer
+            // connection. A fresh connection binds the persisted FTS5 shadow
+            // lazily; the engine's in-memory inverted index therefore lives
+            // only as long as this page (the long-lived storage connection
+            // previously retained the whole corpus, 18 GiB on a 2M-message
+            // archive), and an interrupted rebuild keeps every committed page
+            // instead of publishing nothing.
+            let mut writer = open_archive_writer_connection(&self.db_path)
+                .with_context(|| "opening the bounded per-page FTS rebuild writer")?;
+            if let Err(err) = writer.execute_batch("BEGIN IMMEDIATE TRANSACTION;") {
+                let _ = writer.close_without_checkpoint_in_place();
+                return Err(err).with_context(|| "starting the bounded per-page FTS rebuild batch");
+            }
+
             // Keep resumable repair bounded by the canonical page size. The
             // previous implementation loaded every existing FTS rowid into a
             // process-wide HashSet, which scaled with a multi-million-message
-            // archive before the first repair batch could make progress.
+            // archive before the first repair batch could make progress. Probe
+            // through the writer so the committed prefix, including the pages
+            // this rebuild just published, is visible.
             let existing_fts_rowids = if missing_only {
-                Some(self.load_fts_message_rowid_set_for_batch(&page.rows)?)
+                match self.load_fts_message_rowid_set_for_batch_on(&writer, &page.rows) {
+                    Ok(rowids) => Some(rowids),
+                    Err(err) => {
+                        let _ = writer.execute_batch("ROLLBACK;");
+                        let _ = writer.close_without_checkpoint_in_place();
+                        return Err(err);
+                    }
+                }
             } else {
                 None
             };
@@ -16562,57 +16880,89 @@ impl FrankenStorage {
             let skipped_before_batch = total_skipped_orphans;
             let existing_before_batch = total_skipped_existing;
 
-            for row in page.rows {
-                if existing_fts_rowids
-                    .as_ref()
-                    .is_some_and(|rowids| rowids.contains(&row.message_id))
-                {
-                    total_skipped_existing = total_skipped_existing.saturating_add(1);
-                    continue;
+            let batch_result = (|| -> Result<usize> {
+                let mut batch_inserted = 0usize;
+                for row in page.rows {
+                    if existing_fts_rowids
+                        .as_ref()
+                        .is_some_and(|rowids| rowids.contains(&row.message_id))
+                    {
+                        total_skipped_existing = total_skipped_existing.saturating_add(1);
+                        continue;
+                    }
+                    let Some(conversation) = conversation_by_id.get(&row.conversation_id) else {
+                        total_skipped_orphans = total_skipped_orphans.saturating_add(1);
+                        continue;
+                    };
+                    let agent = conversation
+                        .agent_id
+                        .and_then(|agent_id| agent_slug_by_id.get(&agent_id))
+                        .filter(|slug| !slug.is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let workspace = conversation
+                        .workspace_id
+                        .and_then(|workspace_id| workspace_path_by_id.get(&workspace_id))
+                        .cloned()
+                        .unwrap_or_default();
+                    pending_chars = pending_chars.saturating_add(row.content.len());
+                    entries.push(FtsEntry {
+                        content: row.content,
+                        title: conversation.title.clone(),
+                        agent,
+                        workspace,
+                        source_path: conversation.source_path.clone(),
+                        created_at: row.created_at,
+                        message_id: row.message_id,
+                    });
+                    if entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                        || pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                    {
+                        batch_inserted = batch_inserted.saturating_add(
+                            franken_batch_insert_fts_on_connection(&writer, &entries)?,
+                        );
+                        entries.clear();
+                        pending_chars = 0;
+                    }
                 }
-                let Some(conversation) = conversation_by_id.get(&row.conversation_id) else {
-                    total_skipped_orphans = total_skipped_orphans.saturating_add(1);
-                    continue;
-                };
-                let agent = conversation
-                    .agent_id
-                    .and_then(|agent_id| agent_slug_by_id.get(&agent_id))
-                    .filter(|slug| !slug.is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string());
-                let workspace = conversation
-                    .workspace_id
-                    .and_then(|workspace_id| workspace_path_by_id.get(&workspace_id))
-                    .cloned()
-                    .unwrap_or_default();
-                pending_chars = pending_chars.saturating_add(row.content.len());
-                entries.push(FtsEntry {
-                    content: row.content,
-                    title: conversation.title.clone(),
-                    agent,
-                    workspace,
-                    source_path: conversation.source_path.clone(),
-                    created_at: row.created_at,
-                    message_id: row.message_id,
-                });
-                if entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                    || pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                {
-                    total_inserted = total_inserted.saturating_add(
-                        franken_batch_insert_fts_on_connection(&self.conn, &entries)?,
+
+                if !entries.is_empty() {
+                    batch_inserted = batch_inserted.saturating_add(
+                        franken_batch_insert_fts_on_connection(&writer, &entries)?,
                     );
                     entries.clear();
                     pending_chars = 0;
                 }
-            }
+                Ok(batch_inserted)
+            })();
 
-            if !entries.is_empty() {
-                total_inserted = total_inserted.saturating_add(
-                    franken_batch_insert_fts_on_connection(&self.conn, &entries)?,
-                );
-                entries.clear();
-                pending_chars = 0;
+            let batch_inserted = match batch_result {
+                Ok(inserted) => inserted,
+                Err(err) => {
+                    let _ = writer.execute_batch("ROLLBACK;");
+                    let _ = writer.close_without_checkpoint_in_place();
+                    return Err(err);
+                }
+            };
+            if let Err(err) = writer.execute_batch("COMMIT;") {
+                let _ = writer.execute_batch("ROLLBACK;");
+                let _ = writer.close_without_checkpoint_in_place();
+                return Err(err)
+                    .with_context(|| "publishing the bounded per-page FTS rebuild batch");
             }
+            total_inserted = total_inserted.saturating_add(batch_inserted);
+            if let Err(err) = writer.close_without_checkpoint_in_place() {
+                tracing::debug!(
+                    target: "cass::fts_rebuild",
+                    error = %err,
+                    "per-page FTS rebuild writer close failed; committed frames remain durable"
+                );
+            }
+            // Published only after COMMIT, so a re-run resumes from here.
+            self.report_fts_rebuild_progress(FtsRebuildProgress {
+                committed_rows: total_inserted.saturating_add(total_skipped_existing),
+                total_rows,
+            });
 
             // GH #413 follow-up: a page that takes longer than the budget is
             // the engine's O(table)-per-statement wall; stop truthfully here
@@ -16820,8 +17170,17 @@ impl FrankenStorage {
         })
     }
 
+    #[cfg(test)]
     fn load_fts_message_rowid_set_for_batch(
         &self,
+        rows: &[FtsRebuildMessageRow],
+    ) -> Result<HashSet<i64>> {
+        self.load_fts_message_rowid_set_for_batch_on(&self.conn, rows)
+    }
+
+    fn load_fts_message_rowid_set_for_batch_on(
+        &self,
+        conn: &FrankenConnection,
         rows: &[FtsRebuildMessageRow],
     ) -> Result<HashSet<i64>> {
         if rows.is_empty() {
@@ -16845,8 +17204,7 @@ impl FrankenStorage {
         for chunk in rows.chunks(FTS_EXACT_ROWID_PROBE_CHUNK_SIZE) {
             let ids: Vec<i64> = chunk.iter().map(|row| row.message_id).collect();
             let sql = fts_exact_rowid_probe_select_sql(&ids);
-            let matched = self
-                .conn
+            let matched = conn
                 .query(&sql)
                 .with_context(|| "probing bounded exact FTS docsize rowids")?;
             for matched_row in matched {
@@ -18546,6 +18904,272 @@ pub(crate) fn incompatible_legacy_fts_shadow_ddl(table: &str, ddl: &str) -> Opti
     })
 }
 
+/// The derived FTS shadow's catalog shape, classified from `sqlite_master`
+/// alone (GH #495).
+///
+/// The doctor's read-only probe and the mutating repair route must reach the
+/// same verdict about the same archive, and `_docsize` cardinality cannot
+/// carry that verdict: an intact legacy `_docsize` makes a shadow cass no
+/// longer writes look healthy, and derived tables that survived without their
+/// registration look merely absent. Both are residue, and only the
+/// drop+recreate repair route converges them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FtsShadowCatalogVerdict {
+    /// No `fts_messages` registration row and no surviving derived shadow
+    /// table: there is no shadow to repair.
+    Absent,
+    /// Exactly one registration row carrying cass's canonical contentless DDL.
+    Canonical,
+    /// Derived residue: the shadow must be dropped and recreated from
+    /// canonical rows before it can serve lexical search again.
+    Residue { detail: String },
+    /// More than one `fts_messages` registration row: the catalog is
+    /// ambiguous and no in-place repair is safe.
+    Ambiguous { detail: String },
+}
+
+/// The number of `sqlite_master` rows named `fts_messages`.
+///
+/// The doctor's read-only probe and the mutating repair route count the
+/// catalog's registrations with this statement, so they classify an archive
+/// identically (GH #495).
+///
+/// The count deliberately carries **no** `type = 'table'` filter, because the
+/// repair path's own "is this catalog usable" decision counts every catalog
+/// row with that name: a count other than one means an ambiguous catalog the
+/// repair refuses to touch. Both surfaces must read the same statement, so
+/// the filter stays out of both. A stray trigger named `fts_messages` (a
+/// separate SQLite namespace) therefore makes the count two: the repair path
+/// calls the catalog unqueryable, and the doctor keeps its previous verdict
+/// rather than claiming a residue it cannot prove.
+pub(crate) const FTS_MESSAGES_REGISTRATION_ROW_COUNT_SQL: &str =
+    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'";
+
+/// The operator-facing command that rebuilds the derived FTS shadow from
+/// canonical rows.
+///
+/// A residue verdict is only actionable if it names the remedy, so every
+/// residue detail carries this command (GH #495). It is the same command the
+/// doctor's own check surface prints.
+pub(crate) const FTS_SHADOW_REBUILD_COMMAND: &str = "cass doctor --rebuild-canonical-fts --yes";
+
+/// The residue detail of the derived FTS shadow for a catalog that carries
+/// `fts_schema_rows` `fts_messages` registration rows, decided from
+/// `sqlite_master` alone.
+///
+/// `query` reads the catalog; it is a closure so the read-only doctor probe
+/// and the mutating repair path share these rules verbatim instead of
+/// re-deriving them (GH #495).
+pub(crate) fn fts_shadow_residue_detail_with_query(
+    fts_schema_rows: i64,
+    query: impl Fn(&str) -> std::result::Result<Vec<FrankenRow>, crate::franken_sync::FrankenError>,
+) -> Result<Option<String>> {
+    if fts_schema_rows == 0 {
+        let names = fts_residue_shadow_table_names_with_query(&query)?;
+        if !names.is_empty() {
+            return Ok(Some(format!(
+                "fts_messages registration is absent but derived shadow residue remains: {}; run '{}' to rebuild the derived shadow from canonical rows (canonical rows are never modified)",
+                names.join(", "),
+                FTS_SHADOW_REBUILD_COMMAND
+            )));
+        }
+        return Ok(None);
+    }
+    if fts_schema_rows == 1 && !fts_messages_schema_is_canonical_contentless_with_query(&query)? {
+        return Ok(Some(format!(
+            "fts_messages uses legacy/noncanonical DDL; _docsize parity cannot prove the engine rowid domain and the derived shadow must be recreated: run '{}' to rebuild it from canonical rows (canonical rows are never modified)",
+            FTS_SHADOW_REBUILD_COMMAND
+        )));
+    }
+    if fts_schema_rows == 1 {
+        // GH #374: a canonical registration over legacy rowid shadow tables.
+        // Row counts can match exactly, so without this the full index
+        // refused the archive and pointed at a repair that found nothing to
+        // do.
+        if let Some(problem) = fts_legacy_shadow_table_ddl_problem_with_query(&query)? {
+            return Ok(Some(problem));
+        }
+    }
+    Ok(None)
+}
+
+/// The catalog shape of the derived FTS shadow, decided from `sqlite_master`
+/// alone (GH #495).
+///
+/// This is the one classifier the doctor's read-only probe and the mutating
+/// repair route share, so the two surfaces cannot disagree about the same
+/// archive: `Residue` here means exactly what the repair route's `Residue`
+/// status means — the derived shadow must be dropped and recreated from
+/// canonical rows.
+pub(crate) fn fts_shadow_catalog_verdict_with_query(
+    query: impl Fn(&str) -> std::result::Result<Vec<FrankenRow>, crate::franken_sync::FrankenError>,
+) -> Result<FtsShadowCatalogVerdict> {
+    let registration_rows = fts_registration_row_count_with_query(&query)?;
+    let residue = fts_shadow_residue_detail_with_query(registration_rows, &query)?;
+    Ok(match registration_rows {
+        0 => match residue {
+            Some(detail) => FtsShadowCatalogVerdict::Residue { detail },
+            None => FtsShadowCatalogVerdict::Absent,
+        },
+        1 => match residue {
+            Some(detail) => FtsShadowCatalogVerdict::Residue { detail },
+            None => FtsShadowCatalogVerdict::Canonical,
+        },
+        other => FtsShadowCatalogVerdict::Ambiguous {
+            detail: format!(
+                "sqlite_master contains {other} fts_messages rows; expected exactly one"
+            ),
+        },
+    })
+}
+
+fn fts_registration_row_count_with_query(
+    query: &impl Fn(&str) -> std::result::Result<Vec<FrankenRow>, crate::franken_sync::FrankenError>,
+) -> Result<i64> {
+    let rows = query(FTS_MESSAGES_REGISTRATION_ROW_COUNT_SQL)?;
+    match rows.first() {
+        Some(row) => Ok(row.get_typed::<i64>(0)?),
+        None => Ok(0),
+    }
+}
+
+fn fts_residue_shadow_table_names_with_query(
+    query: &impl Fn(&str) -> std::result::Result<Vec<FrankenRow>, crate::franken_sync::FrankenError>,
+) -> Result<Vec<String>> {
+    let rows = query(
+        "SELECT name FROM sqlite_master
+         WHERE type = 'table' AND name IN (
+           'fts_messages_config','fts_messages_content','fts_messages_data',
+           'fts_messages_docsize','fts_messages_idx'
+         ) ORDER BY name",
+    )?;
+    let mut names = Vec::with_capacity(rows.len());
+    for row in &rows {
+        names.push(row.get_typed::<String>(0)?);
+    }
+    Ok(names)
+}
+
+fn fts_messages_schema_is_canonical_contentless_with_query(
+    query: &impl Fn(&str) -> std::result::Result<Vec<FrankenRow>, crate::franken_sync::FrankenError>,
+) -> Result<bool> {
+    let rows =
+        query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages'")?;
+    let mut saw_row = false;
+    let mut all_contentless = true;
+    for row in &rows {
+        saw_row = true;
+        let sql: Option<String> = row.get_typed(0)?;
+        let normalized: String = sql
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .split_whitespace()
+            .collect();
+        let has_empty_content =
+            normalized.contains("content=''") || normalized.contains("content=\"\"");
+        let has_contentless_delete = normalized.contains("contentless_delete=1");
+        if !(has_empty_content && has_contentless_delete) {
+            all_contentless = false;
+        }
+    }
+    Ok(saw_row && all_contentless)
+}
+
+fn fts_legacy_shadow_table_ddl_problem_with_query(
+    query: &impl Fn(&str) -> std::result::Result<Vec<FrankenRow>, crate::franken_sync::FrankenError>,
+) -> Result<Option<String>> {
+    let rows = query(
+        "SELECT name, sql FROM sqlite_master
+         WHERE type = 'table' AND name IN ('fts_messages_config', 'fts_messages_idx')
+         ORDER BY name",
+    )?;
+    let mut shadow_ddl = Vec::with_capacity(rows.len());
+    for row in &rows {
+        shadow_ddl.push((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?));
+    }
+    Ok(shadow_ddl
+        .iter()
+        .find_map(|(table, ddl)| incompatible_legacy_fts_shadow_ddl(table, ddl)))
+}
+
+/// Whether an FTS shadow insert failed because the derived shadow already
+/// holds that rowid (GH #495).
+///
+/// The engine reports this as a primary-key violation: the row is present in
+/// the shadow but missing from the `_docsize` bookkeeping the catch-up probe
+/// consulted, so the shadow's rowid domain disagrees with the probe. The
+/// same insert can never succeed, so the repair must move to the reviewed
+/// drop+recreate route instead of retrying the same insert forever — that is
+/// the reporter's "PRIMARY KEY constraint failed" on a legacy archive.
+///
+/// An unrelated storage error (I/O, corruption, a busy database) is not a
+/// collision and keeps its own truthful failure: dropping a repairable
+/// shadow because of a disk error would destroy a good artifact.
+pub(crate) fn fts_insert_error_is_rowid_collision(error: &anyhow::Error) -> bool {
+    // The classification must be pinned to the FTS shadow insert: a primary
+    // key violation raised by any other statement in the same operation must
+    // not take the destructive drop+recreate route. The insert's own context
+    // names the shadow it wrote, so require both signals.
+    let mut collision = false;
+    let mut fts_shadow_insert = false;
+    for cause in error.chain() {
+        if matches!(
+            cause.downcast_ref::<crate::franken_sync::FrankenError>(),
+            Some(crate::franken_sync::FrankenError::PrimaryKeyViolation)
+        ) {
+            collision = true;
+        }
+        if cause.to_string().contains("into fts_messages") {
+            fts_shadow_insert = true;
+        }
+    }
+    collision && fts_shadow_insert
+}
+
+#[cfg(test)]
+mod fts_collision_classification_tests {
+    use super::fts_insert_error_is_rowid_collision;
+
+    /// GH #495: a rowid collision and an unrelated storage error must be
+    /// distinguishable, because only the collision may be routed to the
+    /// destructive drop+recreate repair.
+    #[test]
+    fn fts_rowid_collision_is_distinguished_from_unrelated_storage_errors() {
+        let collision: anyhow::Error =
+            anyhow::Error::new(crate::franken_sync::FrankenError::PrimaryKeyViolation)
+                .context("inserting 3 rows into fts_messages during streaming FTS maintenance");
+        assert!(
+            fts_insert_error_is_rowid_collision(&collision),
+            "a primary-key violation from the FTS insert is a rowid collision"
+        );
+
+        let unrelated: anyhow::Error =
+            anyhow::Error::new(crate::franken_sync::FrankenError::DatabaseFull)
+                .context("inserting 3 rows into fts_messages during streaming FTS maintenance");
+        assert!(
+            !fts_insert_error_is_rowid_collision(&unrelated),
+            "an unrelated storage error must not be treated as a rowid collision"
+        );
+
+        let not_an_error = anyhow::anyhow!("the shadow was never reachable");
+        assert!(
+            !fts_insert_error_is_rowid_collision(&not_an_error),
+            "a plain error carries no collision"
+        );
+
+        // The classification is pinned to the FTS shadow insert: a primary
+        // key violation from another statement must not take the destructive
+        // drop+recreate route.
+        let foreign_collision: anyhow::Error =
+            anyhow::Error::new(crate::franken_sync::FrankenError::PrimaryKeyViolation)
+                .context("inserting 3 rows into messages during a canonical import");
+        assert!(
+            !fts_insert_error_is_rowid_collision(&foreign_collision),
+            "a primary-key violation outside the FTS shadow insert is not a shadow collision"
+        );
+    }
+}
+
 pub(crate) fn fts_shadow_not_viable_detail(corpus_messages: u64, bound_messages: u64) -> String {
     // GH #497 follow-up: the settled-state statement comes first because the
     // persisted markers keep only the first 400 characters of this text.
@@ -19682,16 +20306,21 @@ struct ExistingMessageLookup {
     replay: HashSet<MessageReplayFingerprint>,
 }
 
-fn existing_message_lookup_from_rows(
-    rows: Vec<FrankenRow>,
+fn existing_message_lookup_from_query(
+    tx: &FrankenTransaction<'_>,
+    sql: &str,
+    params: &[ParamValue],
     min_idx: i64,
     max_idx: i64,
     created_bounds: Option<(i64, i64)>,
     replay_full_scan: bool,
-) -> Result<ExistingMessageLookup> {
-    let mut by_idx = HashMap::with_capacity(rows.len());
-    let mut replay = HashSet::with_capacity(rows.len());
-    for row in rows {
+) -> Result<(ExistingMessageLookup, usize)> {
+    let mut by_idx = HashMap::new();
+    let mut replay = HashSet::new();
+    let mut scanned_rows = 0;
+    // The transaction mapper streams rows. Its unit-valued result retains
+    // no text payloads, even when a timestamp range covers a giant history.
+    let _: Vec<()> = tx.query_map_collect(sql, params, |row| {
         let idx: i64 = row.get_typed(0)?;
         let role: String = row.get_typed(1)?;
         let author: Option<String> = row.get_typed(2)?;
@@ -19728,8 +20357,10 @@ fn existing_message_lookup_from_rows(
                 content_hash,
             });
         }
-    }
-    Ok(ExistingMessageLookup { by_idx, replay })
+        scanned_rows += 1;
+        Ok(())
+    })?;
+    Ok((ExistingMessageLookup { by_idx, replay }, scanned_rows))
 }
 
 fn franken_existing_message_lookup(
@@ -19806,19 +20437,23 @@ fn franken_existing_message_lookup(
 
     let mut replay = HashSet::new();
     if requires_full_scan {
-        let rows = tx.query_params(
+        let (content_lookup, scanned_rows) = existing_message_lookup_from_query(
+            tx,
             "SELECT idx, role, author, created_at, content
              FROM messages INDEXED BY sqlite_autoindex_messages_1
              WHERE conversation_id = ?1",
             fparams![conversation_id],
+            min_idx,
+            max_idx,
+            created_bounds,
+            true,
         )?;
-        record_message_lookup_full_scan_query(rows.len());
-        let content_lookup =
-            existing_message_lookup_from_rows(rows, min_idx, max_idx, created_bounds, true)?;
+        record_message_lookup_full_scan_query(scanned_rows);
         by_idx.extend(content_lookup.by_idx);
         replay.extend(content_lookup.replay);
     } else if let Some((min_created_at, max_created_at)) = created_bounds {
-        let rows = tx.query_params(
+        let (created_lookup, scanned_rows) = existing_message_lookup_from_query(
+            tx,
             "SELECT idx, role, author, created_at, content
              FROM messages INDEXED BY sqlite_autoindex_messages_1
              WHERE conversation_id = ?1
@@ -19826,10 +20461,12 @@ fn franken_existing_message_lookup(
                AND created_at >= ?2
                AND created_at <= ?3",
             fparams![conversation_id, min_created_at, max_created_at],
+            min_idx,
+            max_idx,
+            created_bounds,
+            false,
         )?;
-        record_message_lookup_bounded_queries(1, rows.len());
-        let created_lookup =
-            existing_message_lookup_from_rows(rows, min_idx, max_idx, created_bounds, false)?;
+        record_message_lookup_bounded_queries(1, scanned_rows);
         by_idx.extend(created_lookup.by_idx);
         replay.extend(created_lookup.replay);
     }
@@ -24456,6 +25093,189 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
+    fn semantic_source_authority(storage: &FrankenStorage) -> Result<(String, i64)> {
+        storage.raw().query_row_map(
+            "SELECT database_uuid, change_sequence FROM semantic_source_identity_v1 WHERE singleton = 1",
+            &[] as &[ParamValue],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        ).map_err(Into::into)
+    }
+
+    #[test]
+    fn semantic_source_clock_tracks_direct_sql_for_every_canonical_table() -> Result<()> {
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("source-clock.db"))?;
+        let (uuid, mut sequence) = semantic_source_authority(&storage)?;
+        assert_eq!(uuid.len(), 32);
+        for sql in [
+            "INSERT INTO agents(id, slug, name, kind, created_at, updated_at) VALUES(9001, 'clock', 'clock', 'cli', 1, 1)",
+            "UPDATE agents SET slug = 'clock-changed' WHERE id = 9001",
+            "INSERT INTO workspaces(id, path) VALUES(9002, '/source-clock')",
+            "UPDATE workspaces SET path = '/source-clock-changed' WHERE id = 9002",
+            "INSERT INTO sources(id, kind, created_at, updated_at) VALUES('source-clock', 'ssh', 1, 1)",
+            "UPDATE sources SET host_label = 'changed' WHERE id = 'source-clock'",
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_path, source_id) VALUES(9003, 9001, 9002, '/clock.jsonl', 'local')",
+            "UPDATE conversations SET source_id = 'source-clock' WHERE id = 9003",
+            "INSERT INTO messages(id, conversation_id, idx, role, content) VALUES(9004, 9003, 0, 'user', 'canonical clock source')",
+            "UPDATE messages SET content = 'edited canonical clock source' WHERE id = 9004",
+            "DELETE FROM messages WHERE id = 9004",
+            "DELETE FROM conversations WHERE id = 9003",
+            "DELETE FROM sources WHERE id = 'source-clock'",
+            "DELETE FROM workspaces WHERE id = 9002",
+            "DELETE FROM agents WHERE id = 9001",
+        ] {
+            storage.raw().execute(sql)?;
+            sequence = sequence.checked_add(1).context("fixture clock overflow")?;
+            let current = semantic_source_authority(&storage)?;
+            assert_eq!(
+                current,
+                (uuid.clone(), sequence),
+                "direct canonical SQL did not advance exactly once: {sql}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_source_clock_rolls_back_with_its_canonical_changes() -> Result<()> {
+        use crate::franken_sync::compat::TransactionExt;
+
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("source-clock-rollback.db"))?;
+        let before = semantic_source_authority(&storage)?;
+        let mut transaction = storage.raw().transaction()?;
+        transaction.execute("INSERT INTO workspaces(path) VALUES('/rolled-back-source')")?;
+        let during: i64 = transaction.query_row_map(
+            "SELECT change_sequence FROM semantic_source_identity_v1 WHERE singleton = 1",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(during, before.1 + 1);
+        transaction.rollback()?;
+        assert_eq!(semantic_source_authority(&storage)?, before);
+        let count: i64 = storage.raw().query_row_map(
+            "SELECT COUNT(*) FROM workspaces WHERE path = '/rolled-back-source'",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(count, 0);
+        let mut committed = storage.raw().transaction()?;
+        committed.execute("INSERT INTO workspaces(path) VALUES('/committed-source')")?;
+        committed.commit()?;
+        assert_eq!(
+            semantic_source_authority(&storage)?,
+            (before.0, before.1 + 1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_source_clock_overflow_refuses_the_write_without_wrapping() -> Result<()> {
+        use crate::franken_sync::compat::TransactionExt;
+
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("source-clock-overflow.db"))?;
+        storage.raw().execute("UPDATE semantic_source_identity_v1 SET change_sequence = 9223372036854775806 WHERE singleton = 1")?;
+        let before = semantic_source_authority(&storage)?;
+        let mut transaction = storage.raw().transaction()?;
+        transaction.execute("INSERT INTO workspaces(path) VALUES('/last-source-sequence')")?;
+        assert!(
+            transaction
+                .execute("INSERT INTO workspaces(path) VALUES('/overflow-source-sequence')")
+                .is_err()
+        );
+        let failed_count: i64 = transaction.query_row_map(
+            "SELECT COUNT(*) FROM workspaces WHERE path = '/overflow-source-sequence'",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(
+            failed_count, 0,
+            "overflow must not acknowledge the canonical statement"
+        );
+        transaction.rollback()?;
+        assert_eq!(semantic_source_authority(&storage)?, before);
+        assert!(
+            storage
+                .raw()
+                .execute(
+                    "UPDATE semantic_source_identity_v1 SET change_sequence = 0 WHERE singleton = 1"
+                )
+                .is_err()
+        );
+        assert!(storage.raw().execute("UPDATE semantic_source_identity_v1 SET database_uuid = 'ffffffffffffffffffffffffffffffff' WHERE singleton = 1").is_err());
+        assert!(
+            storage
+                .raw()
+                .execute("DELETE FROM semantic_source_identity_v1 WHERE singleton = 1")
+                .is_err()
+        );
+        assert_eq!(semantic_source_authority(&storage)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_source_clock_refuses_replace_without_recursive_delete_triggers() -> Result<()> {
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("source-clock-replace.db"))?;
+        storage.raw().execute("PRAGMA recursive_triggers = OFF")?;
+        storage
+            .raw()
+            .execute("INSERT INTO workspaces(path) VALUES('/before-replacement')")?;
+        let before = semantic_source_authority(&storage)?;
+        for statement in [
+            "INSERT OR REPLACE INTO semantic_source_identity_v1(singleton, database_uuid, change_sequence) VALUES(1, ?1, ?2)",
+            "REPLACE INTO semantic_source_identity_v1(singleton, database_uuid, change_sequence) VALUES(1, ?1, ?2)",
+            "INSERT OR IGNORE INTO semantic_source_identity_v1(singleton, database_uuid, change_sequence) VALUES(1, ?1, ?2)",
+        ] {
+            for uuid in [before.0.as_str(), "ffffffffffffffffffffffffffffffff"] {
+                assert!(
+                    storage
+                        .raw()
+                        .execute_with_params(
+                            statement,
+                            &[SqliteValue::Text(uuid.into()), SqliteValue::Integer(0)],
+                        )
+                        .is_err(),
+                    "an existing source authority cannot be replaced or rewound"
+                );
+                assert_eq!(semantic_source_authority(&storage)?, before);
+            }
+        }
+        storage
+            .raw()
+            .execute("INSERT INTO workspaces(path) VALUES('/after-replacement-refusal')")?;
+        assert_eq!(
+            semantic_source_authority(&storage)?,
+            (before.0, before.1 + 1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_source_identity_survives_reopen_and_strict_readonly_queries() -> Result<()> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("source-clock-reopen.db");
+        let storage = FrankenStorage::open(&path)?;
+        storage
+            .raw()
+            .execute("INSERT INTO workspaces(path) VALUES('/persistent-source')")?;
+        let expected = semantic_source_authority(&storage)?;
+        storage.close()?;
+        let readonly = FrankenStorage::open_strict_readonly(&path)?;
+        assert_eq!(semantic_source_authority(&readonly)?, expected);
+        assert!(
+            readonly
+                .raw()
+                .execute("INSERT INTO workspaces(path) VALUES('/must-remain-readonly')")
+                .is_err()
+        );
+        readonly.close_without_checkpoint()?;
+        let reopened = FrankenStorage::open(&path)?;
+        assert_eq!(semantic_source_authority(&reopened)?, expected);
+        Ok(())
+    }
+
     #[test]
     fn message_insert_batch_sql_rejects_out_of_range_sizes() -> Result<()> {
         let max_batch_size = MESSAGE_INSERT_BATCH_SIZE.max(APPEND_MESSAGE_INSERT_BATCH_SIZE);
@@ -25186,15 +26006,18 @@ mod tests {
         );
     }
 
+    /// GH #345: a bounded rebuild publishes each page durably instead of
+    /// holding the whole repopulate in one transaction. Phase 1 dies after the
+    /// registration (empty, resumable Partial shadow); phase 2 dies after the
+    /// first committed page (that page's rows survive). Both re-runs converge
+    /// on exact parity without touching canonical rows.
     #[test]
-    fn transactional_fts_rebuild_interruptions_preserve_the_published_shadow() {
+    fn bounded_fts_rebuild_interruptions_leave_durable_progress() {
         let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("fts-atomic-interruption.db");
+        let db_path = dir.path().join("fts-bounded-interruption.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
         seed_atomic_fts_rebuild_fixture(&storage);
 
-        // Change canonical content without touching the already-published FTS
-        // row so rollback can be distinguished from a leaked replacement.
         storage
             .raw()
             .execute("UPDATE messages SET content = 'replacement canonical content' WHERE idx = 0")
@@ -25212,33 +26035,69 @@ mod tests {
         assert_eq!(search_count("survives"), 1);
         assert_eq!(search_count("replacement"), 0);
 
-        for phase in [1, 2] {
-            arm_fts_rebuild_interruption(phase);
-            let error = storage
-                .rebuild_fts()
-                .expect_err("injected rebuild interruption must fail");
-            let error_chain = format!("{error:#}");
-            assert!(
-                error_chain.contains("rolled back"),
-                "rebuild failure must state rollback semantics: {error:#}"
-            );
-            assert!(
-                error_chain.contains(&format!(
-                    "injected FTS rebuild interruption at test phase {phase}"
-                )),
-                "phase {phase} must reach the intended interruption point: {error:#}"
-            );
-            assert_eq!(
-                search_count("survives"),
-                1,
-                "phase {phase} must preserve the previously published FTS content"
-            );
-            assert_eq!(
-                search_count("replacement"),
-                0,
-                "phase {phase} must not leak the uncommitted replacement shadow"
-            );
-        }
+        // Phase 1: the drop+CREATE registration is durable, no page committed.
+        arm_fts_rebuild_interruption(1);
+        let error = storage
+            .rebuild_fts()
+            .expect_err("injected rebuild interruption must fail");
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains("injected FTS rebuild interruption at test phase 1"),
+            "phase 1 must reach the intended interruption point: {error:#}"
+        );
+        assert_eq!(
+            search_count("survives"),
+            0,
+            "the dropped shadow must not answer the old content"
+        );
+        assert_eq!(search_count("replacement"), 0, "no page was committed yet");
+        let interrupted = storage.inspect_search_fallback_fts_parity().unwrap();
+        assert_eq!(
+            interrupted.status,
+            FtsShadowParityStatus::Partial,
+            "interrupted rebuild must leave a queryable, resumable shadow: {interrupted:?}"
+        );
+        assert_eq!(interrupted.indexed_messages, Some(0));
+
+        // The durable Partial shadow is caught up in place by the same path
+        // `cass doctor --rebuild-canonical-fts --yes` uses.
+        assert_eq!(
+            storage.ensure_search_fallback_fts_consistency().unwrap(),
+            FtsConsistencyRepair::IncrementalCatchUp {
+                inserted_rows: 1,
+                total_rows: 1,
+            }
+        );
+        assert_eq!(
+            storage.inspect_search_fallback_fts_parity().unwrap().status,
+            FtsShadowParityStatus::Healthy
+        );
+        assert_eq!(search_count("replacement"), 1);
+
+        // Phase 2: the first page is committed before the abort, so it must
+        // survive; a re-run still converges on exact parity.
+        arm_fts_rebuild_interruption(2);
+        let error = storage
+            .rebuild_fts()
+            .expect_err("injected rebuild interruption must fail");
+        assert!(
+            format!("{error:#}").contains("injected FTS rebuild interruption at test phase 2"),
+            "phase 2 must reach the intended interruption point: {error:#}"
+        );
+        assert_eq!(
+            search_count("replacement"),
+            1,
+            "the committed page must remain published"
+        );
+        storage
+            .rebuild_fts()
+            .expect("re-run after an interrupted publish must converge");
+        assert_eq!(
+            storage.inspect_search_fallback_fts_parity().unwrap().status,
+            FtsShadowParityStatus::Healthy
+        );
+        assert_eq!(search_count("replacement"), 1);
+        assert_eq!(search_count("survives"), 0);
     }
 
     /// GH #369 (bead cb0gl): a rebuild batch whose distinct terms and doclists
@@ -25466,6 +26325,137 @@ mod tests {
             storage
                 .fts_messages_schema_is_canonical_contentless()
                 .unwrap()
+        );
+        assert!(matches!(
+            storage.ensure_search_fallback_fts_consistency().unwrap(),
+            FtsConsistencyRepair::AlreadyHealthy { rows: 1 }
+        ));
+    }
+
+    /// GH #495 Archive B: the reporter's three legacy internal-content rows
+    /// where a rowid is missing from `_docsize` but present in `_content`.
+    /// A canonical registration over that leftover `_content` row passes the
+    /// catalog classifier (the DDL is canonical), so parity says Partial and
+    /// the catch-up insert collides with the row the engine already holds —
+    /// the reporter's `PRIMARY KEY constraint failed`. The repair must move
+    /// to the reviewed drop+recreate route and converge, not retry forever.
+    #[test]
+    fn gh495_legacy_content_row_under_canonical_registration_converges() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("fts-canonical-legacy-content.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        seed_atomic_fts_rebuild_fixture(&storage);
+        let message_id: i64 = storage
+            .raw()
+            .query_row_map("SELECT id FROM messages LIMIT 1", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+
+        // Leave the legacy internal-content row behind while the canonical
+        // contentless registration survives; `_docsize` no longer knows it.
+        // fsqlite's canonical contentless shadow does not materialize a
+        // `_content` table, so the leftover shape needs the table first.
+        storage
+            .raw()
+            .execute(
+                "CREATE TABLE IF NOT EXISTS fts_messages_content(
+                    id INTEGER PRIMARY KEY, c0, c1, c2, c3, c4, c5
+                 )",
+            )
+            .unwrap();
+        storage
+            .raw()
+            .execute_compat(
+                "INSERT INTO fts_messages_content(id, c0, c1, c2, c3, c4, c5)
+                 VALUES(?1, 'legacy hidden text', 'legacy', 'codex', '/tmp', '/tmp/legacy', 0)",
+                fparams![message_id],
+            )
+            .unwrap();
+        // Re-hydrate the live vtab instance from the still-intact `_docsize`
+        // (creating the leftover `_content` table above may have invalidated
+        // it) so the catch-up insert sees the rowid the shadow already holds.
+        let _: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT rowid FROM fts_messages ORDER BY rowid LIMIT 1",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        storage
+            .raw()
+            .execute_compat(
+                "DELETE FROM fts_messages_docsize WHERE id = ?1",
+                fparams![message_id],
+            )
+            .unwrap();
+
+        assert!(
+            storage
+                .fts_messages_schema_is_canonical_contentless()
+                .unwrap(),
+            "the fixture must keep the canonical registration"
+        );
+        assert_eq!(
+            storage.inspect_search_fallback_fts_parity().unwrap().status,
+            FtsShadowParityStatus::Partial,
+            "an intact canonical registration over leftover `_content` rows is Partial, not Residue"
+        );
+
+        let canonical_rows = || {
+            storage
+                .raw()
+                .query("SELECT id, conversation_id, idx, content FROM messages ORDER BY id")
+                .unwrap()
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>()
+        };
+        let before_rows = canonical_rows();
+        assert!(matches!(
+            storage.ensure_search_fallback_fts_consistency().unwrap(),
+            FtsConsistencyRepair::IncrementalCatchUp {
+                inserted_rows: 1,
+                ..
+            }
+        ));
+        assert_eq!(
+            storage.inspect_search_fallback_fts_parity().unwrap().status,
+            FtsShadowParityStatus::Healthy,
+            "the collision route must converge to exact parity"
+        );
+        assert_eq!(canonical_rows(), before_rows, "canonical rows changed");
+        assert!(
+            storage
+                .fts_messages_schema_is_canonical_contentless()
+                .unwrap(),
+            "the repair must republish one canonical registration"
+        );
+        let content_table_exists: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'fts_messages_content'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let leftover_content_rows: i64 = if content_table_exists == 0 {
+            0
+        } else {
+            storage
+                .raw()
+                .query_row_map(
+                    "SELECT COUNT(*) FROM fts_messages_content",
+                    fparams![],
+                    |row| row.get_typed(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            leftover_content_rows, 0,
+            "the collision must route through drop+recreate, clearing the legacy `_content` row"
         );
         assert!(matches!(
             storage.ensure_search_fallback_fts_consistency().unwrap(),
@@ -33968,6 +34958,66 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             )
             .unwrap();
         assert_eq!(stored_indices, vec![0, 1, 12]);
+    }
+
+    #[test]
+    fn message_replay_lookup_preserves_tied_and_missing_timestamps() {
+        for created_at in [None, Some(1_700_000_000_000)] {
+            let dir = TempDir::new().unwrap();
+            let storage = SqliteStorage::open(&dir.path().join("replay.db")).unwrap();
+            let agent_id = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "codex".into(),
+                    name: "Codex".into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
+            let mut conversation =
+                frontier_test_conversation(&[(0, created_at), (1, created_at), (2, created_at)]);
+            for message in &mut conversation.messages {
+                message
+                    .content
+                    .push_str(&"large replay payload ".repeat(4096));
+                message.author = Some(format!("author-{}", message.idx));
+            }
+            let stored = storage
+                .insert_conversation_tree(agent_id, None, &conversation)
+                .unwrap();
+            let mut incoming = conversation.messages.clone();
+            for message in &mut incoming {
+                message.idx += 10;
+            }
+            let tx = storage.conn.transaction().unwrap();
+            let lookup =
+                franken_existing_message_lookup(&tx, stored.conversation_id, &incoming).unwrap();
+            assert!(lookup.by_idx.is_empty());
+            assert_eq!(lookup.replay.len(), incoming.len());
+            for message in &incoming {
+                assert!(lookup.replay.contains(&message_replay_fingerprint(message)));
+            }
+            incoming[0].content.push_str(" genuinely new content");
+            assert!(
+                !lookup
+                    .replay
+                    .contains(&message_replay_fingerprint(&incoming[0]))
+            );
+            let empty = franken_existing_message_lookup(&tx, stored.conversation_id, &[]).unwrap();
+            assert!(empty.by_idx.is_empty() && empty.replay.is_empty());
+            assert!(
+                existing_message_lookup_from_query(
+                    &tx,
+                    "SELECT missing_replay_column FROM messages",
+                    fparams![],
+                    0,
+                    2,
+                    None,
+                    true,
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -43952,10 +45002,6 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     }
 
-    /// The V13-era internal-content `fts_messages` CREATE injected by the
-    /// legacy-teardown fixtures (mirrors the catalog row MIGRATION_V14 drops).
-    const LEGACY_V13_FTS_MESSAGES_SQL: &str = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, content='', tokenize='porter')";
-
     #[test]
     fn attributed_migration_steps_report_applied_versions_freshness_and_failing_step() {
         // Virgin connection: exercise the helper directly, without the
@@ -43987,125 +45033,262 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
 
     #[test]
     #[serial]
-    fn legacy_fts_teardown_refusal_names_migration_and_leaves_archive_untouched() {
-        let _budget = set_env_var(LEGACY_FTS_TEARDOWN_BUDGET_ENV, "1");
+    fn legacy_internal_content_fts_migrates_bounded_and_preserves_canonical_messages() {
         let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("canonical.db");
+        let db_path = dir.path().join("legacy-internal-content.db");
 
-        // Seed a fully-migrated archive. No conversation is written, so the
-        // V14 drop leaves no fts_messages catalog row behind.
-        drop(FrankenStorage::open(&db_path).unwrap());
+        // Seed one canonical conversation/message through the storage API so the
+        // fixture has something the derived-FTS teardown could plausibly lose.
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            let agent_id = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "codex".into(),
+                    name: "Codex".into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
+            let conversation = Conversation {
+                id: None,
+                agent_slug: "codex".into(),
+                workspace: Some(PathBuf::from("/legacy/workspace")),
+                external_id: Some("legacy-internal-content".into()),
+                title: Some("Legacy internal-content FTS".into()),
+                source_path: PathBuf::from("/legacy/session.jsonl"),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_000_100),
+                approx_tokens: Some(64),
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(1_700_000_000_050),
+                    content: "canonical message must survive the derived-fts teardown".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            };
+            storage
+                .insert_conversation_tree(agent_id, None, &conversation)
+                .unwrap();
+        }
 
-        // Downgrade to a V14-pending legacy state and inject the legacy
-        // internal-content fts_messages catalog row (rootpage 0; the refusal
-        // only reads the catalog, so absent shadow tables are fine here).
+        // Rewind to the 0.2.0 bookkeeping shape: no migration ledger, meta
+        // version 13, and a populated STOCK internal-content FTS5 table (the
+        // `_content`/`_docsize`/`_data`/`_idx` shadows frankensqlite must tear
+        // down). `_schema_migrations` is dropped entirely so the real
+        // transition path backfills 1..=13 and leaves v14 pending.
         {
             let fixture = rusqlite_test_fixture_conn(&db_path);
             fixture
                 .execute_batch(
-                    "PRAGMA writable_schema = ON;
-                     UPDATE meta SET value = '13' WHERE key = 'schema_version';
-                     DELETE FROM _schema_migrations WHERE version = 14;
-                     DELETE FROM sqlite_master WHERE name = 'fts_messages';",
+                    "DROP TABLE IF EXISTS fts_messages;
+                     DROP TABLE IF EXISTS _schema_migrations;
+                     -- A 0.2.0 archive predates V23. Its re-seed is not
+                     -- idempotent while the authority row exists, because the
+                     -- BEFORE INSERT guard aborts even under OR IGNORE.
+                     DROP TABLE IF EXISTS semantic_source_identity_v1;
+                     DROP TABLE IF EXISTS semantic_source_certificates_v1;
+                     INSERT OR REPLACE INTO meta(key, value)
+                     VALUES ('schema_version', '13');
+                     CREATE VIRTUAL TABLE fts_messages USING fts5(
+                         content, title, agent, workspace, source_path,
+                         created_at UNINDEXED, message_id UNINDEXED,
+                         tokenize='porter');
+                     INSERT INTO fts_messages(
+                         rowid, content, title, agent, workspace, source_path,
+                         created_at, message_id)
+                     SELECT id, content, 'legacy', 'codex', '/legacy/workspace',
+                            '/legacy/session.jsonl', created_at, id
+                       FROM messages;",
                 )
                 .unwrap();
-            fixture
-                .execute(
-                    "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-                     VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-                    [LEGACY_V13_FTS_MESSAGES_SQL],
-                )
-                .unwrap();
-            fixture
-                .execute_batch("PRAGMA writable_schema = OFF;")
-                .unwrap();
-        }
-
-        let err = match FrankenStorage::open(&db_path) {
-            Ok(_) => panic!("open must refuse the unbounded V14 teardown above the budget"), // ubs:ignore -- Negative test rejects an over-budget teardown being admitted.
-            Err(err) => err,
-        };
-        let rendered = format!("{err:#}");
-        assert!(
-            rendered.contains("v14") && rendered.contains("fts_contentless"),
-            "refusal should name the failing migration: {rendered}"
-        );
-        assert!(
-            rendered.contains(LEGACY_FTS_TEARDOWN_BUDGET_ENV),
-            "refusal should name the budget override: {rendered}"
-        );
-        assert!(
-            rendered.contains("cass doctor check --json"),
-            "refusal should carry the bounded-diagnosis next action: {rendered}"
-        );
-
-        // The archive is untouched: still V14-pending, still meta version 13.
-        let check = rusqlite_test_fixture_conn(&db_path);
-        let v14_rows: i64 = check
-            .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 14",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(v14_rows, 0, "refusal must not record the migration");
-        let meta_version: String = check
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'schema_version'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(meta_version, "13", "refusal must not modify the archive");
-    }
-
-    #[test]
-    #[serial]
-    fn legacy_fts_teardown_zero_budget_disables_the_refusal() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("canonical.db");
-        drop(FrankenStorage::open(&db_path).unwrap());
-
-        {
-            let fixture = rusqlite_test_fixture_conn(&db_path);
+            // Grow the internal-content shadows well past a single page-buffer
+            // batch so the teardown is structurally large, not a toy table.
             fixture
                 .execute_batch(
-                    "PRAGMA writable_schema = ON;
-                     UPDATE meta SET value = '13' WHERE key = 'schema_version';
-                     DELETE FROM _schema_migrations WHERE version = 14;
-                     DELETE FROM sqlite_master WHERE name = 'fts_messages';",
+                    "BEGIN;
+                     WITH RECURSIVE seq(n) AS (
+                         SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 8192
+                     )
+                     INSERT INTO fts_messages(
+                         content, title, agent, workspace, source_path,
+                         created_at, message_id)
+                     SELECT printf('legacy-fts-bulk-%06d ', n) || hex(randomblob(1024)),
+                            'legacy', 'codex', '/legacy/workspace',
+                            '/legacy/session.jsonl', 1700000000000, 100000 + n
+                       FROM seq;
+                     COMMIT;",
                 )
-                .unwrap();
-            fixture
-                .execute(
-                    "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-                     VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-                    [LEGACY_V13_FTS_MESSAGES_SQL],
-                )
-                .unwrap();
-            fixture
-                .execute_batch("PRAGMA writable_schema = OFF;")
                 .unwrap();
         }
 
-        let _budget = set_env_var(LEGACY_FTS_TEARDOWN_BUDGET_ENV, "0");
+        // The fixture must be genuinely structural before the migration claim
+        // means anything: real internal-content shadows, populated.
+        {
+            let check = rusqlite_test_fixture_conn(&db_path);
+            let catalog_rows: i64 = check
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(catalog_rows, 1, "fixture needs the legacy fts_messages row");
+            let content_rows: i64 = check
+                .query_row("SELECT COUNT(*) FROM fts_messages_content", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                content_rows, 8193,
+                "fixture needs a populated internal `_content` shadow"
+            );
+            let content_bytes: i64 = check
+                .query_row(
+                    "SELECT COALESCE(SUM(LENGTH(c0)), 0) FROM fts_messages_content",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                content_bytes > 8 * 1024 * 1024,
+                "fixture corpus must span multiple bounded teardown batches, got \
+                 {content_bytes} bytes"
+            );
+            let docsize_rows: i64 = check
+                .query_row("SELECT COUNT(*) FROM fts_messages_docsize", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(docsize_rows, 8193, "fixture needs real `_docsize` rows");
+            let data_blocks: i64 = check
+                .query_row("SELECT COUNT(*) FROM fts_messages_data", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert!(data_blocks > 1, "fixture needs persisted `_data` segments");
+            let ledger_present: i64 = check
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = '_schema_migrations'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(ledger_present, 0, "fixture must take the transition path");
+        }
+
+        // GH #349: this must complete the V14 teardown through the bounded
+        // autocommit lane instead of OOMing inside MigrationRunner's
+        // transaction. The probe below pins the lane: frankensqlite commits
+        // each page-free batch only in autocommit.
+        LEGACY_FTS_TEARDOWN_RAN_IN_AUTOCOMMIT.with(|probe| probe.set(false));
         let storage = FrankenStorage::open(&db_path)
-            .expect("zero budget must disable the refusal and allow the migration");
+            .expect("populated legacy internal-content archive must migrate");
+        assert!(
+            LEGACY_FTS_TEARDOWN_RAN_IN_AUTOCOMMIT.with(|probe| probe.get()),
+            "the legacy fts_messages drop must run on the autocommit lane"
+        );
         assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+
+        // Canonical data is untouched.
+        let canonical: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM messages \
+                 WHERE content = 'canonical message must survive the derived-fts teardown'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            canonical, 1,
+            "the derived-FTS teardown must preserve messages"
+        );
+
+        // The migration ledger covers the full history, exactly once each.
+        let versions: Vec<i64> = storage
+            .raw()
+            .query("SELECT version FROM _schema_migrations ORDER BY version;")
+            .unwrap()
+            .iter()
+            .map(|row| row.get_typed(0).unwrap())
+            .collect();
+        assert_eq!(
+            versions,
+            (1..=CURRENT_SCHEMA_VERSION).collect::<Vec<i64>>(),
+            "transition plus attributed steps must record the full ledger"
+        );
+
+        // V14 is recorded, the legacy virtual table and every shadow are gone,
+        // and open leaves the derived FTS absent for lazy recreation.
+        let residual: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE name = 'fts_messages' OR name LIKE 'fts_messages!_%' ESCAPE '!';",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(residual, 0, "bounded teardown must remove the whole shadow");
+
+        drop(storage);
+        let reopened = FrankenStorage::open(&db_path).expect("migrated archive must reopen");
+        assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        let canonical_after_reopen: i64 = reopened
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM messages \
+                 WHERE content = 'canonical message must survive the derived-fts teardown'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(canonical_after_reopen, 1);
     }
 
     #[test]
-    #[serial]
-    fn legacy_fts_teardown_refusal_skips_current_archives_entirely() {
-        let _budget = set_env_var(LEGACY_FTS_TEARDOWN_BUDGET_ENV, "1");
+    fn legacy_fts_teardown_skips_current_archives_with_a_live_shadow() {
         let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("canonical.db");
+        let db_path = dir.path().join("current-contentless.db");
 
-        drop(FrankenStorage::open(&db_path).unwrap());
-        // Reopen: V14 is already applied, so even an absurdly small budget
-        // must never fire the refusal on a current archive.
-        let again = FrankenStorage::open(&db_path).unwrap();
-        assert_eq!(again.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        storage
+            .ensure_search_fallback_fts_consistency()
+            .expect("materialize the current contentless fts_messages shadow");
+        let before: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(before, 1, "fixture needs a live current FTS shadow");
+        drop(storage);
+
+        // V14 is already in the ledger: the pre-drop must not touch a current
+        // contentless shadow, even though `fts_messages` exists.
+        let reopened = FrankenStorage::open(&db_path).unwrap();
+        let after: i64 = reopened
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after, 1,
+            "current archives keep their contentless fts_messages shadow"
+        );
     }
 
     #[test]
@@ -47030,12 +48213,166 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             1,
             "paged cleanup should aggregate report entries by table: {report:?}"
         );
-        let metrics_after: i64 = storage
+    }
+
+    fn gh503_fixture_copy(name: &str, dir: &TempDir) -> std::path::PathBuf {
+        let dest = dir.path().join("agent_search.db");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/gh503")
+                .join(name),
+            &dest,
+        )
+        .unwrap();
+        dest
+    }
+
+    fn gh503_needle_rowids(storage: &FrankenStorage, needle: &str) -> Vec<i64> {
+        storage
             .raw()
-            .query_row_map("SELECT COUNT(*) FROM message_metrics", fparams![], |row| {
+            .query_map_collect(
+                "SELECT rowid FROM fts_messages WHERE fts_messages MATCH ?1 ORDER BY rowid",
+                &[ParamValue::from(needle)],
+                |row| row.get_typed(0),
+            )
+            .unwrap()
+    }
+
+    /// GH #503: the pre-#434 derived-FTS catalog could not be opened by the
+    /// strict read-only lane at all, so a readable 0.6.24-era archive
+    /// reported `database.opened=false`. It must now be admitted through the
+    /// pinned engine's legacy-tolerant lane, with canonical rows readable and
+    /// the archive bytes unchanged; the derived shadow repair remains
+    /// explicit and is reported separately.
+    #[test]
+    fn gh503_legacy_fts_shadow_catalog_opens_read_only_without_mutating() {
+        let dir = TempDir::new().unwrap();
+        let db_path = gh503_fixture_copy("legacy_fts_config_shadow.db", &dir);
+        let bytes_before = std::fs::read(&db_path).unwrap();
+
+        let readonly = FrankenStorage::open_readonly(&db_path)
+            .expect("the legacy shadow catalog must open for a read-only probe");
+        let detail = readonly
+            .legacy_fts5_shadow_repair_detail()
+            .expect("the tolerant open must record the ordinary open's refusal");
+        assert!(
+            detail.contains("missing implicit autoindex slot 1 for table `fts_messages_config`"),
+            "the recorded refusal must name the #503 shape: {detail}"
+        );
+        let conversations: i64 = readonly
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |row| {
                 row.get_typed(0)
             })
             .unwrap();
-        assert_eq!(metrics_after, 0);
+        assert_eq!(conversations, 1);
+        let messages: i64 = readonly
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(messages, 2);
+        let contents: Vec<String> = readonly
+            .raw()
+            .query_map_collect(
+                "SELECT content FROM messages ORDER BY idx",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            contents,
+            [
+                "legacyshadowneedle how do I rebuild",
+                "canonicalreplyneedle run the repair"
+            ]
+        );
+        readonly.close_without_checkpoint().unwrap();
+        assert_eq!(
+            bytes_before,
+            std::fs::read(&db_path).unwrap(),
+            "a read-only admission must leave the archive bytes unchanged"
+        );
+
+        let strict = FrankenStorage::open_strict_readonly(&db_path)
+            .expect("the strict read-only lane must tolerate the same catalog");
+        assert!(
+            strict.legacy_fts5_shadow_repair_detail().is_some(),
+            "the strict read-only lane must report the pending shadow repair"
+        );
+        strict.close_without_checkpoint().unwrap();
+        assert_eq!(
+            bytes_before,
+            std::fs::read(&db_path).unwrap(),
+            "the strict read-only admission must leave the archive bytes unchanged"
+        );
+    }
+
+    /// GH #503: the explicit writable repair drops and recreates the derived
+    /// shadow from canonical rows; afterwards the ordinary AND strict
+    /// read-only lanes open with no pending repair and FTS5 answers.
+    #[test]
+    fn gh503_explicit_shadow_repair_makes_the_archive_open_clean_and_searchable() {
+        let dir = TempDir::new().unwrap();
+        let db_path = gh503_fixture_copy("legacy_fts_config_shadow.db", &dir);
+
+        let repair = FrankenStorage::open_deferred_fts5_for_repair(&db_path).unwrap();
+        let inserted = repair.rebuild_fts_shadow_via_drop_recreate().unwrap();
+        assert_eq!(inserted, 2, "both canonical messages must be reindexed");
+        repair.close_without_checkpoint().unwrap();
+
+        let bytes_repaired = std::fs::read(&db_path).unwrap();
+        let readonly = FrankenStorage::open_readonly(&db_path)
+            .expect("the repaired archive must open in the ordinary read-only lane");
+        assert_eq!(readonly.legacy_fts5_shadow_repair_detail(), None);
+        assert_eq!(gh503_needle_rowids(&readonly, "legacyshadowneedle"), [1, 2]);
+        assert_eq!(gh503_needle_rowids(&readonly, "canonicalreplyneedle"), [2]);
+        readonly.close_without_checkpoint().unwrap();
+        assert_eq!(
+            bytes_repaired,
+            std::fs::read(&db_path).unwrap(),
+            "a read-only open of the repaired archive must not mutate it"
+        );
+
+        let strict = FrankenStorage::open_strict_readonly(&db_path)
+            .expect("the repaired archive must open in the strict read-only lane");
+        assert_eq!(strict.legacy_fts5_shadow_repair_detail(), None);
+        assert_eq!(gh503_needle_rowids(&strict, "canonicalreplyneedle"), [2]);
+        strict.close_without_checkpoint().unwrap();
+    }
+
+    /// GH #503 negative: the same catalog defect on a canonical USER table is
+    /// not the repairable derived-shadow shape; both the ordinary and the
+    /// engine's deferred-FTS5 repair open must keep failing closed.
+    #[test]
+    fn gh503_user_table_missing_autoindex_still_fails_closed() {
+        let dir = TempDir::new().unwrap();
+        let db_path = gh503_fixture_copy("legacy_user_table_autoindex.db", &dir);
+        let bytes_before = std::fs::read(&db_path).unwrap();
+
+        let err = FrankenStorage::open_readonly(&db_path)
+            .err()
+            .expect("a user table missing its unique index must not be tolerated");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("missing implicit autoindex slot")
+                && rendered.contains("legacy_meta"),
+            "the refusal must name the user table: {rendered}"
+        );
+        assert!(
+            !is_legacy_fts5_shadow_autoindex_open_error(&err),
+            "a user table must not be classified as the FTS5 shadow shape: {rendered}"
+        );
+
+        assert!(
+            FrankenStorage::open_deferred_fts5_for_repair(&db_path).is_err(),
+            "the engine must not tolerate a missing unique index on a user table"
+        );
+        assert_eq!(
+            bytes_before,
+            std::fs::read(&db_path).unwrap(),
+            "refused read-only probes must leave the archive unchanged"
+        );
     }
 }

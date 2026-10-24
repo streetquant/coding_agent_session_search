@@ -34,6 +34,16 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Added
 
+- **Registry-generated README/AGENTS tables.** Exit codes, the `err.kind`
+  taxonomy, environment variables, connectors and dependency pins are rendered
+  from their runtime registries by `cass-docs-tables`; both documents embed the
+  output between `BEGIN/END GENERATED` markers. `cass-docs-tables --check` and
+  `tests/docs_tables_match_registries.rs` fail on any hand edit, and
+  `scripts/validate_docs.sh --truth` runs the check. The env-var registry now
+  covers the 133 documented variables (including the previously missing
+  rebuild, cache, responsiveness and connector knobs), and the generated
+  connector inventory reports all 37 runtime registrations rather than a
+  hand-counted 34.
 - **Semantic generation leases expose validated rows.** The row source borrows
   vectors, document IDs, tombstone flags and complete frozen identity bytes from
   the lease's retained immutable FSVI owner, so replacing its old pathname cannot
@@ -109,6 +119,38 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **`status`/`health` observation surfaces no longer pay unbounded recovery
+  on a multi-GB archive (k2k20).** `cass health` emitted nothing for minutes
+  while its semantic identity check used the ordinary readonly opener, which
+  may checkpoint a dirty WAL and hydrate the archive; the semantic marker and
+  the health watermark probe now use the strict, mutation-free opener under
+  short bounded deadlines (3 s for health watermarks, 5 s for the semantic
+  marker). The health lane starts the same stderr liveness heartbeat as
+  `status`/`doctor` (first line after ~1 s, naming the phase and archive
+  bytes), and a probe that runs out of time reports a `degraded`, retryable
+  answer with the last phase instead of `healthy=true` or a silent hang.
+- **Legacy internal-content FTS archives migrate without an OOM (#349).**
+  `MIGRATION_V14` dropped `fts_messages` from inside the migration runner's
+  transaction, so frankensqlite's bounded page-free batches all joined one
+  transaction and a multi-GB `WITHOUT ROWID` FTS shadow exhausted memory.
+  The V14 teardown now runs in autocommit before the attributed migration
+  steps, so each batch commits independently; only the derived
+  `fts_messages` virtual table and its shadows are dropped while V14 is
+  pending, and canonical tables are untouched. V14 still records
+  `fts_contentless` and the archive resumes if the drop lands before the
+  ledger row.
+- **Legacy and orphan FTS shadow residue converges through one repair path
+  (#495).** A derived `fts_messages` shadow whose registration is absent but
+  whose `fts_messages_*` tables survive, or whose registration uses a DDL cass
+  no longer writes, is classified as residue by the same catalog rule in
+  `cass doctor`'s check surface and in the mutating repair. Both now name the
+  same repair (`cass doctor --rebuild-canonical-fts --yes`), and an intact
+  legacy `_docsize` no longer reads as healthy. A rowid collision during
+  partial catch-up — the reporter's `PRIMARY KEY constraint failed` — routes
+  through the reviewed drop-and-recreate path instead of retrying the same
+  insert, while the corpus bound still admits it only when the shadow may
+  exist. Canonical `messages` rows are never modified and repeated repairs
+  settle.
 - **The canonical-archive message count is bounded and honest about not
   knowing (#381).** The preflight count of canonical messages ran as one
   unbounded `SELECT COUNT(*) FROM messages`; on the reported
@@ -125,6 +167,31 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   and the run degrades to the same safe behavior the skip variable
   selects: the sparse-index repair branch is skipped and the normal scan
   loop continues.
+- **`cass sources setup` reports incomplete fleet probes.** The setup wizard
+  now counts hosts that answered, timed out, or failed for another reason,
+  names timed-out hosts, and includes the same report in `--json` output.
+  A timeout can no longer look like a complete fleet sweep.
+- **Lower retained memory during large full indexes.** Serial lexical ingest
+  batches share one bounded accumulator. Linux GNU binaries use jemalloc to
+  reduce memory retained between giant conversation batches.
+- **Reader-pool slots are released when their owner is dropped.** A process
+  spawned concurrently can briefly inherit a duplicate descriptor; it no
+  longer keeps a dropped reader or policy lock held and causes a spurious
+  `admission_busy` response.
+- **An upgrade no longer forces a full reparse of every source.** The ingest
+  contract that decides whether a completed source may be reused was a hash
+  over every file under `src/`, so any change anywhere in the crate — the
+  TUI, the HTML exporter, a doc comment — invalidated every stored
+  completion, and the next incremental `cass index` reparsed and rewrote
+  every source (471k messages: 189 s, 439 MB written). The contract is now
+  scoped: a shared core covers the normalization, redaction, storage and
+  source-identity code that every provider runs through, and each
+  connector's own sources are scoped to that connector. A change outside the
+  ingest surface now leaves every contract untouched, so the next run
+  reuses every completion, and a connector edit only invalidates that
+  connector's completions. A provider slug without a scope entry falls back
+  to a contract that covers every connector's files, and the GH#426
+  local-path-dependency blocker still disables reuse entirely.
 - **`cass swarm status` reads Beads with br 0.7.x (#529).** The live Beads
   reader accepted only br 0.6.x, so with the current br it reported the
   provider unavailable and left the ready, in-progress and blocked counts
@@ -492,6 +559,17 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 - **`cass doctor` repairs a 0.6.24-era archive with the #434 autoindex
   signature in place (#503).** The engine repair for the missing FTS5
   shadow autoindex ships in frankensqlite 0.4.9, so doctor now offers it.
+- **`cass status` and read-only admission open a 0.6.24-era archive
+  (#503).** A pre-#434 `fts_messages_config` catalog refused every
+  read-only-first open, so a readable archive reported
+  `database.opened=false` and the natural next step (`index`, `search`)
+  looked like data loss. Both sync read openings now fall back to the
+  engine's legacy-tolerant deferred-FTS5 lane under `query_only` without
+  writing the archive; status reports the canonical counts and adds
+  `database.fts_shadow_repair` (`kind: schema-repair-required`) pointing
+  at `cass doctor --rebuild-canonical-fts --yes --json`. The repair stays
+  explicit; a genuinely missing unique index on a user table still fails
+  closed.
 - **Doctor run-history verbs parse as documented.** `cass doctor ls`,
   `undo`, `diff`, `explain`, `watch`, `capabilities` and
   `gc --before <ts>` are what `cass robot-docs` documents. They failed with
