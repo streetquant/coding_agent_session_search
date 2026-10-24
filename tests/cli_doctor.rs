@@ -1257,7 +1257,29 @@ fn doctor_rebuild_canonical_fts_repairs_the_503_legacy_shadow_catalog_in_place()
         "pre_repair_search",
         Some("the admitted legacy shadow already serves lexical search"),
     );
-    let found = run(&["search", "canonicalreplyneedle", "--mode", "lexical", "--json"]);
+    // Drop the repo's 128 MiB `RUST_MIN_STACK`: the shipped binary must serve
+    // this path on a default-size thread stack, not only under cargo's env.
+    let search = cass_cmd(test_home)
+        .env_remove("RUST_MIN_STACK")
+        .args([
+            "search",
+            "canonicalreplyneedle",
+            "--mode",
+            "lexical",
+            "--json",
+            "--data-dir",
+            data_dir_arg,
+        ])
+        .output()
+        .expect("run cass search");
+    assert!(
+        search.status.success(),
+        "pre-repair search failed: exit={:?} stdout={} stderr={}",
+        search.status.code(),
+        String::from_utf8_lossy(&search.stdout),
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let found: Value = serde_json::from_slice(&search.stdout).expect("search json");
     assert_eq!(found["count"], 1, "{found}");
     assert_eq!(
         found["hits"][0]["content"], "canonicalreplyneedle run the repair",

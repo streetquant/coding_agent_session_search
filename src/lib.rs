@@ -29793,13 +29793,23 @@ fn repair_lexical_index_for_search_with_stall_watchdog(
     let worker_progress = Arc::clone(&progress);
     let worker_db_path = db_path.to_path_buf();
     let worker_data_dir = data_dir.to_path_buf();
-    let worker = std::thread::spawn(move || {
-        crate::indexer::repair_lexical_index_from_canonical_db_for_search(
-            &worker_db_path,
-            &worker_data_dir,
-            Some(worker_progress),
-        )
-    });
+    let worker = std::thread::Builder::new()
+        .name("cass-search-lexical-repair".to_string())
+        // The repair can open a pre-#434 archive through the engine's
+        // deferred-FTS5 state machine; its debug-build future does not fit
+        // the default 2 MiB stack (GH #503). A first `search` against such
+        // an archive otherwise dies with a stack overflow before serving.
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            crate::indexer::repair_lexical_index_from_canonical_db_for_search(
+                &worker_db_path,
+                &worker_data_dir,
+                Some(worker_progress),
+            )
+        })
+        .map_err(|error| {
+            anyhow::anyhow!("failed to start search lexical repair worker: {error}")
+        })?;
     let poll_interval = Duration::from_millis(100);
     let mut watchdog =
         IndexStallWatchdog::aborting_lexical_phases(data_dir.to_path_buf(), Duration::from_secs(1));
