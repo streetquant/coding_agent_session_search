@@ -1149,14 +1149,12 @@ fn doctor_repair_leaked_pages_refuses_a_doubled_reference() {
 /// sqlite_master autoindex row). The fixture is a synthetic two-message
 /// archive written by cass, with that one table rewritten by stock SQLite
 /// (writable_schema); its paths come from the generating machine's scratch
-/// directory. Ordinary opens still refuse that catalog, but since
-/// frankensqlite 0.4.7 the deferred-FTS5 repair open binds the missing
-/// autoindex (doctor_recover::ENGINE_REPAIRS_MISSING_FTS5_SHADOW_AUTOINDEX),
-/// so status routes to the shadow repair, the dry-run plans it without
-/// touching the bytes, and --yes rebuilds the derived shadow from the
-/// unchanged canonical rows. Afterwards the archive opens normally, a repeat
-/// dry-run finds the shadow healthy and plans no rebuild, and the
-/// conversation indexes and searches again.
+/// directory. The read-only lane admits that catalog through the engine's
+/// legacy-tolerant deferred-FTS5 open (reporting `database.fts_shadow_repair`)
+/// without touching the bytes, the dry-run plans the repair, and --yes rebuilds
+/// the derived shadow from the unchanged canonical rows. Afterwards the archive
+/// opens normally, a repeat dry-run finds the shadow healthy and plans no
+/// rebuild, and the conversation indexes and searches again.
 #[test]
 fn doctor_rebuild_canonical_fts_repairs_the_503_legacy_shadow_catalog_in_place() {
     let tracker = PhaseTracker::new(
@@ -1192,21 +1190,28 @@ fn doctor_rebuild_canonical_fts_repairs_the_503_legacy_shadow_catalog_in_place()
         .output()
         .expect("run cass status");
     let status: Value = serde_json::from_slice(&status.stdout).expect("status json");
-    assert_eq!(status["database"]["opened"].as_bool(), Some(false));
-    let open_error = status["database"]["open_error"]
-        .as_str()
-        .expect("open_error");
-    assert!(
-        open_error.contains("missing implicit autoindex slot 1 for table `fts_messages_config`"),
-        "{open_error}"
+    assert_eq!(
+        status["database"]["opened"].as_bool(),
+        Some(true),
+        "the readable legacy archive must be admitted: {status}"
     );
-    assert!(
-        open_error.contains("cass doctor --rebuild-canonical-fts --dry-run --json"),
-        "{open_error}"
+    assert_eq!(status["database"]["conversations"], 1, "{status}");
+    assert_eq!(status["database"]["messages"], 2, "{status}");
+    assert_eq!(status["database"]["open_error"], Value::Null, "{status}");
+    let repair = &status["database"]["fts_shadow_repair"];
+    assert_eq!(
+        repair["kind"], "schema-repair-required",
+        "the derived shadow repair must still be reported: {status}"
     );
+    assert_eq!(repair["pending"], true, "{status}");
+    assert_eq!(
+        repair["command"], "cass doctor --rebuild-canonical-fts --yes --json",
+        "{status}"
+    );
+    let detail = repair["detail"].as_str().expect("repair detail");
     assert!(
-        !open_error.contains("cannot rebuild that shadow in place"),
-        "{open_error}"
+        detail.contains("missing implicit autoindex slot 1 for table `fts_messages_config`"),
+        "{detail}"
     );
     tracker.end(
         "status",
@@ -1249,6 +1254,27 @@ fn doctor_rebuild_canonical_fts_repairs_the_503_legacy_shadow_catalog_in_place()
     );
 
     let phase = tracker.start(
+        "pre_repair_search",
+        Some("the admitted legacy shadow already serves lexical search"),
+    );
+    let found = run(&["search", "canonicalreplyneedle", "--mode", "lexical", "--json"]);
+    assert_eq!(found["count"], 1, "{found}");
+    assert_eq!(
+        found["hits"][0]["content"], "canonicalreplyneedle run the repair",
+        "{found}"
+    );
+    assert_eq!(
+        test_file_blake3(&db_path),
+        legacy_blake3,
+        "a read-only search must leave the archive bytes unchanged"
+    );
+    tracker.end(
+        "pre_repair_search",
+        Some("the admitted legacy shadow already serves lexical search"),
+        phase,
+    );
+
+    let phase = tracker.start(
         "repair",
         Some("--yes rebuilds the derived shadow; the archive opens normally"),
     );
@@ -1262,6 +1288,10 @@ fn doctor_rebuild_canonical_fts_repairs_the_503_legacy_shadow_catalog_in_place()
     assert_eq!(status["database"]["opened"], true, "{status}");
     assert_eq!(status["database"]["conversations"], 1, "{status}");
     assert_eq!(status["database"]["messages"], 2, "{status}");
+    assert!(
+        status["database"].get("fts_shadow_repair").is_none(),
+        "the repaired archive must not report a pending shadow repair: {status}"
+    );
     // The canonical rows are the fixture's, byte for byte.
     let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).expect("open");
     let messages: Vec<(i64, String)> = conn
@@ -2558,10 +2588,10 @@ fn doctor_rejects_repeated_repair_override_without_fix_before_executor() {
     );
 
     let payload = doctor_error_json(&out.stderr);
-    assert_eq!(payload["error"]["code"].as_i64(), Some(2));
-    assert_eq!(payload["error"]["kind"].as_str(), Some("usage"));
+    assert_eq!(payload["err"]["code"].as_i64(), Some(2));
+    assert_eq!(payload["err"]["kind"].as_str(), Some("usage"));
     assert!(
-        payload["error"]["message"]
+        payload["err"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("--allow-repeated-repair")),
         "usage error should name the invalid flag combination: {payload:#}"
@@ -2991,7 +3021,7 @@ fn doctor_baseline_surfaces_reject_ignored_safety_controls() {
     let diff_error = doctor_error_json(&diff_out.stderr);
     assert_eq!(test_error_kind(&diff_error), Some("usage"));
     assert!(
-        diff_error["error"]["message"]
+        diff_error["err"]["message"]
             .as_str()
             .or_else(|| diff_error["message"].as_str())
             .is_some_and(|message| message.contains("diagnostic-only")),
@@ -3502,7 +3532,7 @@ fn doctor_baseline_diff_rejects_missing_duplicate_incompatible_and_drifted_basel
     let bad_schema_error = doctor_error_json(&bad_schema_out.stderr);
     assert_eq!(test_error_kind(&bad_schema_error), Some("config"));
     assert!(
-        bad_schema_error["error"]["message"]
+        bad_schema_error["err"]["message"]
             .as_str()
             .or_else(|| bad_schema_error["message"].as_str())
             .is_some_and(|message| message.contains("schema_version")),
@@ -3538,7 +3568,7 @@ fn doctor_baseline_diff_rejects_missing_duplicate_incompatible_and_drifted_basel
     let drifted_error = doctor_error_json(&drifted_out.stderr);
     assert_eq!(test_error_kind(&drifted_error), Some("config"));
     assert!(
-        drifted_error["error"]["message"]
+        drifted_error["err"]["message"]
             .as_str()
             .or_else(|| drifted_error["message"].as_str())
             .is_some_and(|message| message.contains("checksum mismatch")),
@@ -4025,7 +4055,7 @@ fn doctor_check_rejects_mutating_or_rebuild_flags() {
     let payload = doctor_error_json(&out.stderr);
     assert_eq!(test_error_code(&payload), Some(2));
     assert!(
-        payload["error"]["message"]
+        payload["err"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("doctor check")),
         "usage error should explain the read-only surface: {payload:#}"

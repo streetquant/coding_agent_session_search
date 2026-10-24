@@ -21269,6 +21269,14 @@ fn state_db_strict_open_error_message(
             "{base}; the open rejects only the derived fts_messages FTS5 shadow's legacy catalog (written by cass before the #434 fix), not the conversations or messages. This read-only probe leaves the archive unchanged. This build cannot rebuild that shadow in place (GH #503): keep the archive as it is and do not run 'cass doctor --fix'"
         );
     }
+    let rendered = format!("{err:#}");
+    if rendered.contains("conflicting virtual-table entries")
+        && rendered.contains("`fts_messages")
+    {
+        return format!(
+            "{base}; sqlite_master carries duplicate fts_messages virtual-table entries, so the derived catalog needs the explicit duplicate-row repair, not a read. This read-only probe leaves the archive unchanged; run 'cass doctor --fix --json' (or 'cass doctor --fix --yes --json') to repair it"
+        );
+    }
     if doctor_recover::is_fts_shadow_schema_level_open_failure(err) {
         return format!(
             "{base}; the open rejects only the derived fts_messages FTS5 shadow's catalog (a legacy shape written by older cass), not the conversations or messages. This read-only probe leaves the archive unchanged; 'cass doctor --rebuild-canonical-fts --dry-run --json' inspects it and '--yes' drops and rebuilds the derived shadow without modifying canonical rows"
@@ -88718,7 +88726,7 @@ fn run_status(
         } else {
             serde_json::Value::String("cass doctor check --json".to_string())
         };
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
             "health_level": if ingest_quarantine_state_error.is_some() || ingest_quarantine_critical { "critical" } else if healthy && quarantined_conversations > 0 { "degraded" } else { status },
@@ -88795,6 +88803,14 @@ fn run_status(
             }),
             "_meta": state.get("_meta").cloned().unwrap_or(serde_json::Value::Null),
         });
+        // GH #503: the status envelope projects `database` field-by-field, so
+        // carry the additive pre-#434 FTS-shadow repair marker through the
+        // projection. Ordinary archives never grow the key.
+        if let Some(repair) = state.pointer("/database/fts_shadow_repair").cloned()
+            && let Some(database) = payload.get_mut("database").and_then(|v| v.as_object_mut())
+        {
+            database.insert("fts_shadow_repair".to_string(), repair);
+        }
         return output_structured_value(payload, fmt);
     }
 

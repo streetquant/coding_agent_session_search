@@ -31,8 +31,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::storage::sqlite::{
-    FrankenStorage, FtsConsistencyRepair, FtsDryRunParity, FtsShadowParity, FtsShadowParityStatus,
-    RecoveryConversationRow,
+    FrankenStorage, FtsConsistencyRepair, FtsDryRunParity, FtsRebuildProgress, FtsShadowParity,
+    FtsShadowParityStatus, RecoveryConversationRow,
 };
 use crate::{CliError, CliResult, RobotFormat, default_data_dir};
 
@@ -151,9 +151,11 @@ pub(crate) fn is_fts_shadow_schema_level_open_failure(err: &anyhow::Error) -> bo
 /// Whether the pinned frankensqlite's deferred-FTS5 repair open accepts an
 /// FTS5 shadow table whose declared implicit autoindex has no `sqlite_master`
 /// row: the catalog cass wrote for `fts_messages_config` before the #434
-/// writer fix (GH #503). Ordinary opens still refuse that catalog; since
-/// frankensqlite 0.4.7 (cbd0b98dc) the repair open binds the missing
-/// autoindex, so `--rebuild-canonical-fts` rebuilds that shadow in place.
+/// writer fix (GH #503). Since frankensqlite 0.4.7 (cbd0b98dc) the repair
+/// open binds the missing autoindex, so `--rebuild-canonical-fts` rebuilds
+/// that shadow in place; cass's read-only lanes admit the same catalog through
+/// that engine lane and report the pending repair (see
+/// `FrankenStorage::legacy_fts5_shadow_repair_detail`).
 /// `pinned_engine_deferred_open_matches_the_legacy_shadow_catalog_policy`
 /// runs the real repair open on a fixture with that catalog and fails when a
 /// pin bump changes the answer, so this cannot silently go stale.
@@ -162,8 +164,7 @@ pub(crate) const ENGINE_REPAIRS_MISSING_FTS5_SHADOW_AUTOINDEX: bool = true;
 /// The GH #503 open refusal: an `fts_messages*` shadow table declares an
 /// implicit autoindex that `sqlite_master` does not have.
 pub(crate) fn is_missing_fts5_shadow_autoindex_failure(err: &anyhow::Error) -> bool {
-    let rendered = format!("{err:#}");
-    rendered.contains("missing implicit autoindex slot") && rendered.contains("`fts_messages")
+    crate::storage::sqlite::is_legacy_fts5_shadow_autoindex_open_error(err)
 }
 
 /// The refusal both `--rebuild-canonical-fts --dry-run` and `--yes` report
@@ -184,6 +185,32 @@ fn legacy_fts_shadow_catalog_unrepairable_error(
     )
 }
 
+/// Report the planned derived-shadow repair for the GH #503 catalog without
+/// opening the archive writable.
+///
+/// `detail` is the ordinary open's refusal (or the recorded refusal when a
+/// tolerant read-only open admitted the archive). Both routes plan the same
+/// drop+recreate; canonical rows are never touched.
+fn report_legacy_fts_shadow_catalog_dry_run(
+    detail: &str,
+    structured_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    let envelope = serde_json::json!({
+        "surface": "doctor_rebuild_canonical_fts_dry_run",
+        "status": "shadow_structure_corrupt",
+        "planned_action": "drop_recreate_rebuild_from_canonical",
+        "detail": detail,
+    });
+    if structured_format.is_some() {
+        print_json(&envelope)?;
+    } else {
+        println!(
+            "Canonical FTS5 dry-run: status=shadow_structure_corrupt, planned_action=drop_recreate_rebuild_from_canonical; re-run with --yes to drop, recreate, and rebuild the corrupt shadow from canonical"
+        );
+    }
+    Ok(())
+}
+
 /// The distinct, non-alarming diagnostic for the GH #369 oversized-leaf case:
 /// canonical rows and the Tantivy index are intact and fully serve search; only
 /// the optional SQLite-side FTS5 shadow cannot be materialized for this corpus.
@@ -195,8 +222,8 @@ fn fts5_oversized_leaf_shadow_error(db_path: &Path) -> CliError {
             "the canonical SQLite FTS5 shadow cannot be built for {} because a single insert \
              batch in this corpus encodes past the frankensqlite FTS5 segment-leaf u16 offset \
              ceiling (one-leaf-per-segment limitation, GH #369) — this is an engine limitation, \
-             not corruption of your archive, and the failed rebuild was rolled back without \
-             publishing a partial shadow",
+             not corruption of your archive, and the failing batch was rolled back while the \
+             batches committed before it stay queryable",
             db_path.display()
         ),
         hint: Some(
@@ -578,7 +605,7 @@ fn fts_parity_json(parity: &FtsShadowParity) -> serde_json::Value {
 
 fn planned_fts_repair(status: FtsShadowParityStatus) -> &'static str {
     match status {
-        FtsShadowParityStatus::Absent => "failure_atomic_recreate",
+        FtsShadowParityStatus::Absent => "bounded_resumable_recreate",
         FtsShadowParityStatus::Residue => "drop_residue_and_recreate_from_canonical",
         FtsShadowParityStatus::Healthy => "verify_and_record_generation",
         FtsShadowParityStatus::Partial => "resumable_incremental_catch_up",
@@ -666,11 +693,56 @@ fn fts_rebuild_dry_run_envelope(
     })
 }
 
+/// GH #345: report durable rebuild progress for a human-facing repair.
+///
+/// The reporter fires after every committed batch; throttle to one line per
+/// five seconds so a multi-million-message archive does not flood the
+/// terminal. Structured output must stay a single JSON envelope, so JSON runs
+/// install nothing. Every reported count is already durable, so an interrupted
+/// rebuild resumes from the last printed prefix.
+fn install_fts_rebuild_progress_printer(
+    storage: &FrankenStorage,
+    db_path: &Path,
+    structured_format: Option<RobotFormat>,
+) {
+    if structured_format.is_some() {
+        return;
+    }
+    let last_printed = std::sync::Mutex::new(None::<std::time::Instant>);
+    let db_path = db_path.to_path_buf();
+    storage.set_fts_rebuild_progress(Some(Box::new(move |progress: FtsRebuildProgress| {
+        let now = std::time::Instant::now();
+        let mut last = last_printed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last.is_some_and(|at| now.duration_since(at) < std::time::Duration::from_secs(5)) {
+            return;
+        }
+        *last = Some(now);
+        if progress.total_rows > 0 {
+            eprintln!(
+                "Canonical FTS5 rebuild: {}/{} rows committed in {} (durable; an interrupted \
+                 rebuild resumes from this prefix)",
+                progress.committed_rows,
+                progress.total_rows,
+                db_path.display()
+            );
+        } else {
+            eprintln!(
+                "Canonical FTS5 rebuild: {} rows committed in {} (durable)",
+                progress.committed_rows,
+                db_path.display()
+            );
+        }
+    })));
+}
+
 /// Verify and safely repair the canonical FTS5 shadow tables in place.
 ///
 /// Queryable partial shadows are retained and caught up in bounded, resumable
-/// batches. An absent shadow is created in a transaction so interruption
-/// cannot publish a partial table. Unqueryable or divergent artifacts are
+/// batches. Recreated shadows are repopulated in bounded batches, each
+/// committed durably so an interruption leaves a resumable Partial shadow
+/// rather than publishing nothing. Unqueryable or divergent artifacts are
 /// preserved for bundle-level recovery rather than destroyed in place. Exact
 /// canonical/indexable/FTS parity is required before success.
 pub fn run_doctor_rebuild_canonical_fts(
@@ -689,7 +761,7 @@ pub fn run_doctor_rebuild_canonical_fts(
             kind: "refused-unsafe",
             message: "`cass doctor --rebuild-canonical-fts` mutates the canonical archive's derived FTS5 shadow and requires `--yes`".to_string(),
             hint: Some(
-                "Inspect first with `--rebuild-canonical-fts --dry-run --json`, then re-run with `--rebuild-canonical-fts --yes` only when the plan is applicable. Queryable partial shadows are caught up in place and absent shadows are created failure-atomically; unqueryable/divergent artifacts are preserved for bundle-level recovery. Canonical rows are never modified.".to_string(),
+                "Inspect first with `--rebuild-canonical-fts --dry-run --json`, then re-run with `--rebuild-canonical-fts --yes` only when the plan is applicable. Queryable partial shadows are caught up in place; absent, corrupt, and divergent shadows are dropped, recreated, and repopulated in bounded batches, each durable so an interrupted rebuild resumes from its committed prefix. Unqueryable artifacts are preserved for bundle-level recovery. Canonical rows are never modified.".to_string(),
             ),
             retryable: false,
         });
@@ -754,20 +826,10 @@ pub fn run_doctor_rebuild_canonical_fts(
                 // planned repair straight from the open error, WITHOUT opening
                 // the archive writable or taking the doctor mutation lock that
                 // `open_deferred_fts5_for_repair` acquires.
-                let envelope = serde_json::json!({
-                    "surface": "doctor_rebuild_canonical_fts_dry_run",
-                    "status": "shadow_structure_corrupt",
-                    "planned_action": "drop_recreate_rebuild_from_canonical",
-                    "detail": format!("{open_err:#}"),
-                });
-                if structured_format.is_some() {
-                    print_json(&envelope)?;
-                } else {
-                    println!(
-                        "Canonical FTS5 dry-run: status=shadow_structure_corrupt, planned_action=drop_recreate_rebuild_from_canonical; re-run with --yes to drop, recreate, and rebuild the corrupt shadow from canonical"
-                    );
-                }
-                return Ok(());
+                return report_legacy_fts_shadow_catalog_dry_run(
+                    &format!("{open_err:#}"),
+                    structured_format,
+                );
             }
             let deferred = FrankenStorage::open_deferred_fts5_for_repair(&db_path).map_err(|e| {
                 // #434 defect 2: BOTH structured opens failed. Say so
@@ -783,6 +845,7 @@ pub fn run_doctor_rebuild_canonical_fts(
                     ),
                 )
             })?;
+            install_fts_rebuild_progress_printer(&deferred, &db_path, structured_format);
             let inserted = deferred
                 .rebuild_fts_shadow_via_drop_recreate()
                 .map_err(|e| {
@@ -828,6 +891,14 @@ pub fn run_doctor_rebuild_canonical_fts(
             ));
         }
     };
+    // GH #503: a tolerant read-only open admitted the pre-#434 catalog while
+    // the ordinary repair open would still refuse it. The only repair that
+    // settles that catalog is the same drop+recreate, so the dry-run reports
+    // it from the recorded refusal without a writable open.
+    if dry_run && let Some(detail) = storage.legacy_fts5_shadow_repair_detail() {
+        return report_legacy_fts_shadow_catalog_dry_run(detail, structured_format);
+    }
+    install_fts_rebuild_progress_printer(&storage, &db_path, structured_format);
     if dry_run {
         let before = storage
             .inspect_search_fallback_fts_parity_dry_run(fts_dry_run_rowid_comparison_cap())
@@ -991,7 +1062,7 @@ pub fn run_doctor_rebuild_canonical_fts(
             ("resumable_incremental_catch_up", inserted_rows)
         }
         FtsConsistencyRepair::Rebuilt { inserted_rows } => {
-            ("failure_atomic_recreate", inserted_rows)
+            ("bounded_resumable_recreate", inserted_rows)
         }
     };
 
@@ -1008,7 +1079,7 @@ pub fn run_doctor_rebuild_canonical_fts(
         "parity_after": fts_parity_json(&after),
         "mutated_asset_class": "canonical_fts5_shadow",
         "canonical_rows_modified": false,
-        "note": "Queryable shadows are preserved and caught up resumably; recreation is transactionally published only after exact parity validation. Canonical rows are never modified.",
+        "note": "Queryable partial shadows are caught up in place; recreated shadows are repopulated in bounded batches, each committed durably so an interrupted rebuild resumes from its published prefix. Exact parity is verified before success. Canonical rows are never modified.",
     });
 
     if structured_format.is_some() {
@@ -2360,7 +2431,7 @@ mod tests {
         let mut fits = oversized(FtsShadowParityStatus::Absent);
         fits.indexable_messages = 1;
         let fits = fts_rebuild_dry_run_envelope(db, &fits, true);
-        assert_eq!(fits["planned_action"], "failure_atomic_recreate");
+        assert_eq!(fits["planned_action"], "bounded_resumable_recreate");
         assert_eq!(fits["would_mutate"], true);
     }
 
@@ -2718,13 +2789,25 @@ mod tests {
         )
         .unwrap();
 
+        // GH #503: the ordinary read-only lane now admits the catalog through
+        // the engine's legacy-tolerant deferred-FTS5 open and records the
+        // ordinary open's refusal for status/doctor. The refusal text keeps
+        // the #503 shape.
         let ordinary = FrankenStorage::open_readonly(&db_path)
-            .err()
-            .expect("the legacy shadow catalog fails an ordinary open");
+            .expect("the legacy shadow catalog must open for a read-only probe");
+        let detail = ordinary
+            .legacy_fts5_shadow_repair_detail()
+            .expect("the tolerant open must record the ordinary open's refusal")
+            .to_string();
         assert!(
-            is_missing_fts5_shadow_autoindex_failure(&ordinary),
-            "fixture must reproduce the #503 refusal: {ordinary:#}"
+            detail.contains("missing implicit autoindex slot 1 for table `fts_messages_config`"),
+            "fixture must reproduce the #503 refusal: {detail}"
         );
+        ordinary.close_without_checkpoint().unwrap();
+        let synthetic_refusal = anyhow::anyhow!(
+            "database disk image is malformed: sqlite_master is missing implicit autoindex slot 1 for table `fts_messages_config`"
+        );
+        assert!(is_missing_fts5_shadow_autoindex_failure(&synthetic_refusal));
 
         let repair_open = FrankenStorage::open_deferred_fts5_for_repair(&db_path);
         assert_eq!(
