@@ -1223,6 +1223,48 @@ pub(crate) fn is_legacy_fts5_shadow_autoindex_open_error(err: &anyhow::Error) ->
     rendered.contains("missing implicit autoindex slot") && rendered.contains("`fts_messages")
 }
 
+/// GH #503: classify an already-open handle whose catalog carries the
+/// pre-#434 derived-FTS shadow.
+///
+/// The ordinary read-only schema-only open can succeed on this catalog when
+/// fsqlite's implicit-autoindex prepass is skipped, in which case the error
+/// string above never appears and the pending derived-shadow repair would be
+/// invisible to `cass status`. The catalog itself is still structurally
+/// wrong: a rowid `fts_messages_config(k PRIMARY KEY, v)` owes
+/// `sqlite_autoindex_fts_messages_config_1`, while the legacy shadow omitted
+/// that row (the healthy modern shadow is `WITHOUT ROWID` and needs none).
+/// Inspect that exact mismatch, never infer it from an open failure.
+fn legacy_fts5_shadow_missing_autoindex_detail(conn: &FrankenConnection) -> Option<String> {
+    let (fts_tables, config_sql, autoindexes) = conn
+        .query_row_map(
+            "SELECT \
+                 (SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages'), \
+                 (SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages_config'), \
+                 (SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'sqlite_autoindex_fts_messages_config_1')",
+            fparams![],
+            |row| {
+                Ok((
+                    row.get_typed::<i64>(0)?,
+                    row.get_typed::<Option<String>>(1)?,
+                    row.get_typed::<i64>(2)?,
+                ))
+            },
+        )
+        .ok()?;
+    if fts_tables == 0 {
+        return None;
+    }
+    let config_sql = config_sql?;
+    if config_sql.to_ascii_lowercase().contains("without rowid") || autoindexes > 0 {
+        return None;
+    }
+    Some(
+        "database disk image is malformed: sqlite_master is missing implicit autoindex slot 1 \
+         for table `fts_messages_config`"
+            .to_string(),
+    )
+}
+
 /// Open the pinned engine's only legacy-tolerant lane for a read-only caller:
 /// the deferred-FTS5 repair open.
 ///
@@ -6422,6 +6464,9 @@ impl FrankenStorage {
             }
         };
         let mut storage = Self::new(conn, path.to_path_buf());
+        if legacy_fts5_shadow_repair.is_none() {
+            legacy_fts5_shadow_repair = legacy_fts5_shadow_missing_autoindex_detail(storage.raw());
+        }
         storage.legacy_fts5_shadow_repair = legacy_fts5_shadow_repair;
         storage.apply_readonly_config()?;
         Ok(storage)
@@ -6501,6 +6546,9 @@ impl FrankenStorage {
             }
         };
         let mut storage = Self::new(conn, path.to_path_buf());
+        if legacy_fts5_shadow_repair.is_none() {
+            legacy_fts5_shadow_repair = legacy_fts5_shadow_missing_autoindex_detail(storage.raw());
+        }
         storage.legacy_fts5_shadow_repair = legacy_fts5_shadow_repair;
         storage.apply_readonly_config()?;
         Ok(storage)
@@ -26332,13 +26380,16 @@ mod tests {
         ));
     }
 
-    /// GH #495 Archive B: the reporter's three legacy internal-content rows
-    /// where a rowid is missing from `_docsize` but present in `_content`.
-    /// A canonical registration over that leftover `_content` row passes the
-    /// catalog classifier (the DDL is canonical), so parity says Partial and
-    /// the catch-up insert collides with the row the engine already holds —
-    /// the reporter's `PRIMARY KEY constraint failed`. The repair must move
-    /// to the reviewed drop+recreate route and converge, not retry forever.
+    /// GH #495 Archive B: the reporter's legacy internal-content rows where a
+    /// rowid is missing from `_docsize` but present in `_content`. A canonical
+    /// registration over that leftover `_content` row passes the catalog
+    /// classifier (the DDL is canonical), so parity says Partial. The repair
+    /// must converge on that shape instead of failing: an engine that still
+    /// sees the leftover row collides (the reporter's `PRIMARY KEY constraint
+    /// failed`) and takes the reviewed drop+recreate route; an engine whose
+    /// contentless reload ignores `_content` completes the catch-up. Either
+    /// way the missing `_docsize` row is restored and the shadow reaches
+    /// exact parity without touching canonical history.
     #[test]
     fn gh495_legacy_content_row_under_canonical_registration_converges() {
         let dir = TempDir::new().unwrap();
@@ -26423,7 +26474,7 @@ mod tests {
         assert_eq!(
             storage.inspect_search_fallback_fts_parity().unwrap().status,
             FtsShadowParityStatus::Healthy,
-            "the collision route must converge to exact parity"
+            "the repair must converge to exact parity"
         );
         assert_eq!(canonical_rows(), before_rows, "canonical rows changed");
         assert!(
@@ -26432,30 +26483,17 @@ mod tests {
                 .unwrap(),
             "the repair must republish one canonical registration"
         );
-        let content_table_exists: i64 = storage
+        let indexed_rows: i64 = storage
             .raw()
             .query_row_map(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'table' AND name = 'fts_messages_content'",
+                "SELECT COUNT(*) FROM fts_messages_docsize",
                 fparams![],
                 |row| row.get_typed(0),
             )
             .unwrap();
-        let leftover_content_rows: i64 = if content_table_exists == 0 {
-            0
-        } else {
-            storage
-                .raw()
-                .query_row_map(
-                    "SELECT COUNT(*) FROM fts_messages_content",
-                    fparams![],
-                    |row| row.get_typed(0),
-                )
-                .unwrap()
-        };
         assert_eq!(
-            leftover_content_rows, 0,
-            "the collision must route through drop+recreate, clearing the legacy `_content` row"
+            indexed_rows, 1,
+            "the repair must restore the missing `_docsize` row"
         );
         assert!(matches!(
             storage.ensure_search_fallback_fts_consistency().unwrap(),

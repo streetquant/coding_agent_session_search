@@ -3830,6 +3830,55 @@ fn gh495_residue_fts_shadows_converge_through_doctor_and_full_index() {
 /// healthy queryable shadow just because its `_docsize` cardinality happens
 /// to line up (the reporter's "intact legacy _docsize misleadingly looks
 /// healthy"), and both surfaces must name the same repair.
+fn seed_gh495_canonical_archive(db_path: &std::path::Path) {
+    use coding_agent_search::model::types::{
+        Agent, AgentKind, Conversation, Message, MessageRole,
+    };
+    use std::path::PathBuf;
+
+    let storage = SqliteStorage::open(db_path).expect("open GH495 doctor fixture");
+    let agent_id = storage
+        .ensure_agent(&Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })
+        .expect("seed GH495 agent");
+    let conversation = Conversation {
+        id: None,
+        agent_slug: "codex".into(),
+        workspace: Some(PathBuf::from("/tmp/gh495-doctor")),
+        external_id: Some("gh495-doctor".into()),
+        title: Some("GH495 doctor fixture".into()),
+        source_path: PathBuf::from("/tmp/gh495-doctor.jsonl"),
+        started_at: Some(1_700_000_000_000),
+        ended_at: Some(1_700_000_000_001),
+        approx_tokens: None,
+        metadata_json: serde_json::Value::Null,
+        messages: vec![Message {
+            id: None,
+            idx: 0,
+            role: MessageRole::User,
+            author: Some("user".into()),
+            created_at: Some(1_700_000_000_001),
+            content: "doctor and rebuild agree on derived residue".into(),
+            extra_json: serde_json::Value::Null,
+            snippets: Vec::new(),
+        }],
+        source_id: "local".into(),
+        origin_host: None,
+    };
+    storage
+        .insert_conversation_tree(agent_id, None, &conversation)
+        .expect("seed GH495 conversation");
+    storage
+        .rebuild_fts()
+        .expect("materialize canonical GH495 shadow");
+    storage.close().expect("close GH495 fixture");
+}
+
 #[test]
 fn gh495_doctor_check_and_rebuild_agree_on_residue_shadows() {
     use coding_agent_search::franken_sync::compat::ConnectionExt;
@@ -3888,7 +3937,6 @@ fn gh495_doctor_check_and_rebuild_agree_on_residue_shadows() {
         let home = tmp.path();
         let data_dir = home.join("cass_data");
         fs::create_dir_all(&data_dir).unwrap();
-        seed_fts_liveness_sessions(home);
         let cass = |args: &[&str]| {
             base_cmd(home)
                 .current_dir(home)
@@ -3903,13 +3951,8 @@ fn gh495_doctor_check_and_rebuild_agree_on_residue_shadows() {
                 .output()
                 .unwrap()
         };
-        let seeded = cass(&["index", "--full", "--json", "--no-progress-events"]);
-        assert!(
-            seeded.status.success(),
-            "{shape}: seed failed: {}",
-            String::from_utf8_lossy(&seeded.stderr)
-        );
         let db_path = data_dir.join("agent_search.db");
+        seed_gh495_canonical_archive(&db_path);
         reshape(&db_path, shape);
 
         // The doctor's read-only check surface.
