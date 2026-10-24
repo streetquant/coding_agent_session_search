@@ -893,6 +893,12 @@ const ENGINE_LIVENESS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// #413) burns microseconds per second; a sealing/merging engine burns most
 /// of a core.
 const ENGINE_LIVENESS_MIN_CPU_ADVANCE: Duration = Duration::from_millis(100);
+/// Minimum storage-layer I/O (bytes read+written) within one sample interval
+/// for an I/O-bound interval to count as work. GH #450: the engine's
+/// compatibility repair reads the whole archive at ~2.7 MiB/s and may not
+/// rewrite the main file during the integrity walk; a healthy interval still
+/// moves far more than this, while a wedge moves nothing.
+const ENGINE_LIVENESS_MIN_IO_ADVANCE: u64 = 256 * 1024;
 
 /// GH #446: liveness ticks from inside the Quill sink.
 ///
@@ -1000,6 +1006,13 @@ pub(crate) struct EngineLivenessSample {
     pub directory_footprint: (u64, u64),
     /// Process user+system CPU time; `None` where unavailable.
     pub process_cpu_time: Option<Duration>,
+    /// Cumulative storage-layer bytes read+written by the process
+    /// (`/proc/self/io` `read_bytes` + `write_bytes`); `None` where
+    /// unavailable. GH #450: an I/O-bound repair can move gigabytes while
+    /// consuming well under the CPU threshold and, for a read-only integrity
+    /// walk, while changing no watched file's size. Without this signal that
+    /// healthy work looked exactly like a deadlock.
+    pub process_io_bytes: Option<u64>,
 }
 
 impl EngineLivenessSample {
@@ -1007,6 +1020,7 @@ impl EngineLivenessSample {
         Self {
             directory_footprint: watch_target_footprint(targets),
             process_cpu_time: process_cpu_time(),
+            process_io_bytes: process_io_bytes(),
         }
     }
 }
@@ -1061,14 +1075,20 @@ pub(crate) struct EngineLivenessTracker {
 
 impl EngineLivenessTracker {
     /// Returns `true` when `sample` shows progress relative to the previous
-    /// one: the directory footprint changed, or CPU advanced by at least
-    /// [`ENGINE_LIVENESS_MIN_CPU_ADVANCE`]. The first sample of an op only
-    /// establishes the baseline.
+    /// one: the watched footprint changed, CPU advanced by at least
+    /// [`ENGINE_LIVENESS_MIN_CPU_ADVANCE`], or storage I/O advanced by at
+    /// least [`ENGINE_LIVENESS_MIN_IO_ADVANCE`]. The first sample of an op
+    /// only establishes the baseline.
     pub(crate) fn observe(&mut self, sample: EngineLivenessSample) -> bool {
         let Some(previous) = self.previous.replace(sample) else {
             return false;
         };
         if sample.directory_footprint != previous.directory_footprint {
+            return true;
+        }
+        if let (Some(before), Some(now)) = (previous.process_io_bytes, sample.process_io_bytes)
+            && now.saturating_sub(before) >= ENGINE_LIVENESS_MIN_IO_ADVANCE
+        {
             return true;
         }
         match (previous.process_cpu_time, sample.process_cpu_time) {
@@ -1134,6 +1154,32 @@ fn process_cpu_time() -> Option<Duration> {
 
 #[cfg(not(unix))]
 fn process_cpu_time() -> Option<Duration> {
+    None
+}
+
+/// Cumulative storage-layer I/O (`read_bytes + write_bytes`) from
+/// `/proc/self/io`; `None` where the kernel does not expose it.
+#[cfg(target_os = "linux")]
+fn process_io_bytes() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/self/io").ok()?;
+    let mut total = 0_u64;
+    let mut saw_field = false;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if matches!(key, "read_bytes" | "write_bytes")
+            && let Ok(bytes) = value.trim().parse::<u64>()
+        {
+            total = total.saturating_add(bytes);
+            saw_field = true;
+        }
+    }
+    saw_field.then_some(total)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_io_bytes() -> Option<u64> {
     None
 }
 
@@ -2603,10 +2649,11 @@ mod tests {
     // footprint growth OR a real CPU advance counts as engine work; a frozen
     // engine (nothing written, no CPU) never ticks.
     #[test]
-    fn engine_liveness_tracker_ticks_on_footprint_or_cpu_advance_only() {
+    fn engine_liveness_tracker_ticks_on_footprint_cpu_or_io_advance() {
         let sample = |bytes: u64, files: u64, cpu_ms: u64| EngineLivenessSample {
             directory_footprint: (bytes, files),
             process_cpu_time: Some(Duration::from_millis(cpu_ms)),
+            process_io_bytes: None,
         };
         let mut tracker = EngineLivenessTracker::default();
         assert!(!tracker.observe(sample(100, 2, 1_000)), "baseline");
@@ -2634,10 +2681,34 @@ mod tests {
         let no_cpu = |bytes: u64| EngineLivenessSample {
             directory_footprint: (bytes, 1),
             process_cpu_time: None,
+            process_io_bytes: None,
         };
         assert!(!tracker.observe(no_cpu(1)));
         assert!(!tracker.observe(no_cpu(1)));
         assert!(tracker.observe(no_cpu(2)));
+
+        // GH #450: an I/O-bound repair may move no watched file and burn
+        // almost no CPU while it walks the archive. Storage I/O growth is work;
+        // a trickle below the threshold and a frozen counter are not.
+        let io_sample = |bytes: u64, io: u64| EngineLivenessSample {
+            directory_footprint: (bytes, 1),
+            process_cpu_time: Some(Duration::from_millis(1_000)),
+            process_io_bytes: Some(io),
+        };
+        let mut tracker = EngineLivenessTracker::default();
+        assert!(!tracker.observe(io_sample(1, 1_000_000)), "baseline");
+        assert!(
+            !tracker.observe(io_sample(1, 1_000_000 + ENGINE_LIVENESS_MIN_IO_ADVANCE - 1)),
+            "a sub-threshold I/O trickle is not proof of work"
+        );
+        assert!(
+            tracker.observe(io_sample(1, 1_000_000 + ENGINE_LIVENESS_MIN_IO_ADVANCE)),
+            "a 256 KiB storage-I/O advance is work"
+        );
+        assert!(
+            !tracker.observe(io_sample(1, 1_000_000 + ENGINE_LIVENESS_MIN_IO_ADVANCE)),
+            "frozen I/O and CPU is a wedge"
+        );
     }
 
     /// GH #450: a long blocking call that keeps growing a watched file must

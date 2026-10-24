@@ -110,6 +110,23 @@ fn background_index_defers_migration_repair_of_a_large_unmigrated_archive() {
         "{error}"
     );
     assert_eq!(fs::metadata(&db_path).unwrap().len(), 8192);
+    let receipt_path = std::path::PathBuf::from(format!(
+        "{}{}",
+        db_path.display(),
+        ".cass-compat-repair.json"
+    ));
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipt_path).expect("durable deferral receipt"))
+            .expect("valid deferral receipt");
+    assert_eq!(receipt["state"], "deferred", "{receipt}");
+    assert_eq!(receipt["exit_code"], 7, "{receipt}");
+    assert_eq!(receipt["archive_bytes"], 8192, "{receipt}");
+    assert!(
+        receipt["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("background")),
+        "the receipt must name the deferral policy: {receipt}"
+    );
     for suffix in [
         "-wal",
         "-fsqlite-ns-gate",
@@ -139,6 +156,330 @@ fn background_index_defers_migration_repair_of_a_large_unmigrated_archive() {
         Some(serde_json::Value::from("migration-repair-pending")),
         "{proceeded:?}"
     );
+}
+
+/// GH #450: the foreground pre-index compatibility repair is a named
+/// `compatibility_repair` phase with byte counters (not the old silent
+/// `preparing 0/0` stretch), it publishes measured evidence, and a prior
+/// attempt killed mid-pass is reported and safely resumed by re-running.
+#[test]
+fn foreground_index_names_preindex_compatibility_repair_and_resumes_an_interrupted_attempt() {
+    use std::io::Write as _;
+    use std::time::{Duration, Instant};
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    // One real session so the archive has measurable bytes/pages.
+    let project = home.join(".claude/projects/-gh450-repair");
+    fs::create_dir_all(&project).unwrap();
+    writeln!(
+        fs::File::create(project.join("repair.jsonl")).unwrap(),
+        "{}",
+        serde_json::json!({
+            "type": "user",
+            "sessionId": "gh450-repair",
+            "uuid": "gh450-repair-1",
+            "timestamp": "2025-11-12T18:31:18.697Z",
+            "cwd": home.to_string_lossy(),
+            "message": {"role": "user", "content": "compatibility repair evidence"}
+        })
+    )
+    .unwrap();
+    let data_dir = home.join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("agent_search.db");
+
+    // First run creates the archive. A fresh engine archive is stamped at
+    // birth, so there is no repair and no receipt.
+    let first = gh450_index_std_cmd(home, &data_dir).output().unwrap();
+    assert!(
+        first.status.success(),
+        "first index failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let marker = std::path::PathBuf::from(format!(
+        "{}{}",
+        db_path.display(),
+        ".fsqlite-migration-state"
+    ));
+    let receipt_path = std::path::PathBuf::from(format!(
+        "{}{}",
+        db_path.display(),
+        ".cass-compat-repair.json"
+    ));
+    assert!(marker.is_file(), "the healthy archive carries a marker");
+    assert!(
+        !receipt_path.exists(),
+        "no repair was pending, so no receipt is written"
+    );
+
+    // Simulate an attempt that was killed mid-repair: the marker is absent
+    // and the last receipt still says `running`.
+    fs::remove_file(&marker).unwrap();
+    let archive_bytes = fs::metadata(&db_path).unwrap().len();
+    let interrupted_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    fs::write(
+        &receipt_path,
+        serde_json::to_vec(&serde_json::json!({
+            "state": "running",
+            "archive_path": db_path.display().to_string(),
+            "archive_bytes": archive_bytes,
+            "pages_total": 1,
+            "page_size": 4096,
+            "progress_current": 0,
+            "progress_total": archive_bytes,
+            "started_at_unix": interrupted_at.saturating_sub(60),
+            "updated_at_unix": interrupted_at.saturating_sub(1),
+            "last_activity_at_unix": interrupted_at.saturating_sub(1),
+            "elapsed_ms": 59_000,
+            "attempts": 1,
+            "interrupted_attempts": 0,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Hold the engine's writable open so the phase and its durable receipt are
+    // observable; release it to let the idempotent pass finish.
+    let ready = home.join("repair-open-ready.json");
+    let release = home.join("repair-open-release");
+    let mut child = gh450_index_std_cmd(home, &data_dir);
+    child
+        .env("CASS_TEST_INDEX_ENGINE_OPEN_READY", &ready)
+        .env("CASS_TEST_INDEX_ENGINE_OPEN_RELEASE", &release)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = child.spawn().expect("spawn indexing child");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        ready.exists(),
+        "the test rendezvous must observe the compatibility repair open"
+    );
+    // Hold past one progress interval so the named phase is sampled and
+    // emitted; the rendezvous alone can be shorter than the poll cadence.
+    std::thread::sleep(Duration::from_millis(400));
+    let during = read_compat_repair_receipt(&db_path);
+    assert_eq!(during["state"], "running", "{during}");
+    assert_eq!(during["attempts"], 2, "{during}");
+    assert_eq!(during["interrupted_attempts"], 1, "{during}");
+    assert!(
+        during["archive_bytes"].as_u64().unwrap() > 0,
+        "{during}"
+    );
+    assert!(
+        during["progress_total"].as_u64().unwrap() > 0,
+        "{during}"
+    );
+    assert!(
+        during["updated_at_unix"].as_u64().unwrap() >= interrupted_at.saturating_sub(1),
+        "the durable receipt must advance with the new attempt: {during}"
+    );
+    fs::write(&release, b"go").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "resumed index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The live phase event carries byte units and the nested evidence, then
+    // the durable receipt settles on completion (only the engine's marker
+    // can claim that).
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let repair_event = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .find(|payload| payload["phase"] == "compatibility_repair")
+        .unwrap_or_else(|| panic!("no compatibility_repair progress event in: {stderr}"));
+    assert_eq!(repair_event["phase_code"], 11, "{repair_event}");
+    assert_eq!(repair_event["unit"], "bytes", "{repair_event}");
+    assert!(
+        repair_event["total"].as_u64().unwrap() > 0,
+        "{repair_event}"
+    );
+    assert!(
+        repair_event["compatibility_repair"]["archive_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0),
+        "{repair_event}"
+    );
+
+    let finished = read_compat_repair_receipt(&db_path);
+    assert_eq!(finished["state"], "completed", "{finished}");
+    assert_eq!(finished["exit_code"], 0, "{finished}");
+    assert_eq!(finished["attempts"], 2, "{finished}");
+    assert_eq!(finished["interrupted_attempts"], 1, "{finished}");
+    assert!(
+        finished["pages_total"].as_u64().unwrap() > 0,
+        "{finished}"
+    );
+    assert!(
+        finished["bytes_written"].as_u64().unwrap_or(0) > 0,
+        "the completed receipt must retain measured work counters: {finished}"
+    );
+    assert!(marker.is_file(), "the resumed pass records completion");
+
+    // The archive stays readable for a status/query open during and after.
+    let readonly = SqliteStorage::open_readonly(&db_path).expect("archive readable after repair");
+    assert!(readonly.schema_version().is_ok());
+}
+
+/// GH #450: when the repair cannot be admitted (here: an impossible free
+/// space floor), the foreground run leaves the archive untouched, exits 7
+/// with a retryable migration-repair-pending, and a later run resumes the
+/// same attempt instead of restarting from scratch or failing the archive.
+#[test]
+fn foreground_index_defers_an_unaffordable_compatibility_repair_then_resumes() {
+    use std::io::Write as _;
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let project = home.join(".claude/projects/-gh450-defer");
+    fs::create_dir_all(&project).unwrap();
+    writeln!(
+        fs::File::create(project.join("defer.jsonl")).unwrap(),
+        "{}",
+        serde_json::json!({
+            "type": "user",
+            "sessionId": "gh450-defer",
+            "uuid": "gh450-defer-1",
+            "timestamp": "2025-11-12T18:31:18.697Z",
+            "cwd": home.to_string_lossy(),
+            "message": {"role": "user", "content": "compatibility repair deferral"}
+        })
+    )
+    .unwrap();
+    let data_dir = home.join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("agent_search.db");
+    let marker = std::path::PathBuf::from(format!(
+        "{}{}",
+        db_path.display(),
+        ".fsqlite-migration-state"
+    ));
+
+    let first = gh450_index_std_cmd(home, &data_dir).output().unwrap();
+    assert!(
+        first.status.success(),
+        "first index failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    fs::remove_file(&marker).unwrap();
+    let archive_before = fs::read(&db_path).unwrap();
+
+    let deferred = gh450_index_std_cmd(home, &data_dir)
+        .env("CASS_COMPAT_REPAIR_MIN_FREE_BYTES", "1099511627776")
+        .output()
+        .unwrap();
+    assert_eq!(deferred.status.code(), Some(7), "{deferred:?}");
+    let envelope = String::from_utf8_lossy(&deferred.stderr)
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .expect("a JSON error envelope");
+    // Robot index failures are emitted by the index entrypoint as top-level
+    // `error` (message string) + kind/retryable; the fatal handler's nested
+    // shape is accepted too so the contract can evolve without losing the
+    // assertion.
+    let nested = envelope.get("error").filter(|error| error.is_object());
+    let field = |name: &str| {
+        nested
+            .and_then(|error| error.get(name))
+            .or_else(|| envelope.get(name))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    assert_eq!(field("kind"), "migration-repair-pending", "{envelope}");
+    assert_eq!(field("retryable"), true, "{envelope}");
+    let message = if nested.is_some() {
+        field("message")
+    } else {
+        envelope["error"].clone()
+    };
+    assert!(
+        message
+            .as_str()
+            .is_some_and(|message| message.contains("free space")),
+        "{envelope}"
+    );
+
+    let receipt = read_compat_repair_receipt(&db_path);
+    assert_eq!(receipt["state"], "deferred", "{receipt}");
+    assert_eq!(receipt["exit_code"], 7, "{receipt}");
+    assert!(
+        receipt["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("free space")),
+        "{receipt}"
+    );
+    assert!(
+        receipt["admission"]["free_bytes"]
+            .as_u64()
+            .is_some_and(|free| free < 1_099_511_627_776),
+        "the durable receipt must record the measured admission: {receipt}"
+    );
+    assert!(!marker.exists(), "a refused run must not open the archive");
+    assert_eq!(
+        fs::read(&db_path).unwrap(),
+        archive_before,
+        "a refused run must not mutate the archive"
+    );
+    let readonly = SqliteStorage::open_readonly(&db_path)
+        .expect("the archive remains readable after a deferral");
+    assert!(readonly.schema_version().is_ok());
+
+    // The retry is admitted once the floor is realistic and resumes the same
+    // pending repair: the deferred attempt is carried forward by `attempts`,
+    // while a deferral is not an interruption.
+    let resumed = gh450_index_std_cmd(home, &data_dir).output().unwrap();
+    assert!(
+        resumed.status.success(),
+        "resumed index failed: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let finished = read_compat_repair_receipt(&db_path);
+    assert_eq!(finished["state"], "completed", "{finished}");
+    assert_eq!(finished["attempts"], 2, "{finished}");
+    assert_eq!(finished["interrupted_attempts"], 0, "{finished}");
+    assert!(marker.is_file());
+}
+
+fn read_compat_repair_receipt(db_path: &std::path::Path) -> serde_json::Value {
+    let path = std::path::PathBuf::from(format!(
+        "{}{}",
+        db_path.display(),
+        ".cass-compat-repair.json"
+    ));
+    serde_json::from_slice(&fs::read(&path).expect("compat repair receipt exists"))
+        .expect("valid compat repair receipt")
+}
+
+fn gh450_index_std_cmd(
+    home: &std::path::Path,
+    data_dir: &std::path::Path,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+    cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("CODEX_HOME", home.join(".codex"))
+        .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+        // The host's live connector roots are not part of this fixture.
+        .env("CASS_CLOUDMCP_DATA_ROOT", home.join("empty-cloudmcp"))
+        .env("CASS_OPENWEBUI_DATA_ROOT", home.join("empty-openwebui"))
+        .env("CASS_AUTO_REFRESH", "0")
+        .current_dir(home)
+        .args(["index", "--json", "--data-dir"])
+        .arg(data_dir)
+        .args(["--progress-interval-ms", "250"]);
+    cmd
 }
 
 #[test]
@@ -1492,6 +1833,231 @@ fn make_codex_session(
     }
     fs::write(&file, sample).unwrap();
     file
+}
+
+#[test]
+fn kigjq_full_scan_reads_old_sources_beyond_saved_connector_cutoff() {
+    kigjq_assert_unbounded_scan_reads_old_source(false);
+}
+
+#[test]
+fn kigjq_quarantine_repair_reads_old_sources_and_retries_after_restart() {
+    kigjq_assert_unbounded_scan_reads_old_source(true);
+}
+
+fn kigjq_assert_unbounded_scan_reads_old_source(repair: bool) {
+    use coding_agent_search::connectors::{Connector, aider::AiderConnector};
+    use coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    // Aider's provider-native cutoff is the history file's modification
+    // time. Its scan uses the ordinary connector path, without the source
+    // ledger's deliberate admission of never-recorded old sources.
+    assert!(!AiderConnector::new().supports_source_boundaries());
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let data_dir = home.join("cass-data");
+    let db_path = data_dir.join("agent_search.db");
+    fs::create_dir_all(&data_dir).unwrap();
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(home.join(".env"))
+        .unwrap();
+    let command = |full: bool| {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        cmd.env_clear();
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        cmd.current_dir(home)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("CASS_AIDER_DATA_ROOT", home)
+            .env("CASS_CURSOR_PROJECTS_ROOT", home.join(".cursor/projects"))
+            .env("CASS_CLOUDMCP_DATA_ROOT", home.join("cloudmcp"))
+            .env("CASS_OPENWEBUI_DATA_ROOT", home.join("openwebui"))
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            // Aider has no source-boundary lifecycle, so it remains on the
+            // batch fallback path and applies the saved cutoff directly.
+            .env("CASS_STREAMING_INDEX", "0")
+            .args(["index", "--json", "--no-progress-events", "--data-dir"])
+            .arg(&data_dir)
+            .timeout(Duration::from_secs(180));
+        if full {
+            cmd.arg("--full");
+        }
+        cmd
+    };
+    let run = |full: bool| {
+        let output = command(full).output().unwrap();
+        assert!(
+            output.status.success(),
+            "full={full} repair={repair}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let counts = || {
+        let storage = SqliteStorage::open_readonly(&db_path).unwrap();
+        let counts = (
+            storage.total_conversation_count().unwrap(),
+            storage.total_message_count().unwrap(),
+        );
+        storage.close().unwrap();
+        counts
+    };
+    let save_cutoffs = || {
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        storage.set_last_scan_ts(i64::MAX).unwrap();
+        storage
+            .set_connector_last_scan_ts("aider", i64::MAX)
+            .unwrap();
+        storage.close().unwrap();
+        let storage = SqliteStorage::open_readonly(&db_path).unwrap();
+        assert_eq!(storage.get_last_scan_ts().unwrap(), Some(i64::MAX));
+        assert_eq!(
+            storage.get_connector_last_scan_ts("aider").unwrap(),
+            Some(i64::MAX)
+        );
+        storage.close().unwrap();
+    };
+
+    fs::write(
+        home.join(".aider.chat.history.md"),
+        "> kigjq_seed\n\nkigjq_seed_response\n",
+    )
+    .unwrap();
+    run(true);
+    assert_eq!(counts(), (1, 2));
+    let old_project = home.join("old-project");
+    fs::create_dir_all(&old_project).unwrap();
+    let old = old_project.join(".aider.chat.history.md");
+    fs::write(&old, "> kigjq_old_source\n\nkigjq_old_response\n").unwrap();
+    let historical_mtime = UNIX_EPOCH + Duration::from_secs(1_577_836_800);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(historical_mtime)
+        .unwrap();
+    let old_bytes = fs::read(&old).unwrap();
+    let old_mtime = fs::metadata(&old).unwrap().modified().unwrap();
+    save_cutoffs();
+    run(false);
+    assert_eq!(
+        counts(),
+        (1, 2),
+        "ordinary batch incremental scans must honor the saved connector cutoff"
+    );
+    save_cutoffs();
+
+    let poison = data_dir.join("quarantine/index_ingest_poison.jsonl");
+    if repair {
+        fs::create_dir_all(poison.parent().unwrap()).unwrap();
+        // An unreadable quarantine record must fail before a repair can
+        // consume its retry or advance either persisted scan watermark.
+        fs::write(&poison, [0xff, b'\n']).unwrap();
+        let failed = command(false).output().unwrap();
+        assert!(!failed.status.success(), "{failed:?}");
+        assert_eq!(fs::read(&poison).unwrap(), [0xff, b'\n']);
+        assert_eq!(counts(), (1, 2));
+        let storage = SqliteStorage::open_readonly(&db_path).unwrap();
+        assert_eq!(storage.get_last_scan_ts().unwrap(), Some(i64::MAX));
+        assert_eq!(
+            storage.get_connector_last_scan_ts("aider").unwrap(),
+            Some(i64::MAX)
+        );
+        storage.close().unwrap();
+        fs::write(
+            &poison,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "conversation_id": "kigjq-missing-source",
+                    "schema_version_at_quarantine": CURRENT_SCHEMA_VERSION,
+                    "cass_version_at_quarantine": "0.0.0",
+                    "reason": "index-ingest-out-of-memory"
+                })
+            ),
+        )
+        .unwrap();
+    }
+
+    let repaired = run(!repair);
+    assert_eq!(repaired["messages"], 4, "{repaired}");
+    assert_eq!(counts(), (2, 4));
+    let storage = SqliteStorage::open_readonly(&db_path).unwrap();
+    let recovered = storage
+        .list_conversations(10, 0)
+        .unwrap()
+        .into_iter()
+        .find(|conversation| conversation.source_path == old)
+        .expect("the old source must actually be archived");
+    assert_eq!(recovered.agent_slug, "aider");
+    assert_eq!(recovered.started_at, Some(1_577_836_800_000));
+    let recovered_messages = storage.fetch_messages(recovered.id.unwrap()).unwrap();
+    assert_eq!(recovered_messages.len(), 2);
+    assert!(
+        recovered_messages
+            .iter()
+            .any(|message| message.content == "kigjq_old_source")
+    );
+    storage.close().unwrap();
+    assert_eq!(fs::read(&old).unwrap(), old_bytes);
+    assert_eq!(fs::metadata(&old).unwrap().modified().unwrap(), old_mtime);
+    if repair {
+        let record: serde_json::Value =
+            serde_json::from_str(fs::read_to_string(&poison).unwrap().trim()).unwrap();
+        assert_eq!(
+            record["cass_version_at_quarantine"],
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(record["conversation_id"], "kigjq-missing-source");
+    }
+    let later_old_project = home.join("later-old-project");
+    fs::create_dir_all(&later_old_project).unwrap();
+    let later_old = later_old_project.join(".aider.chat.history.md");
+    fs::write(
+        &later_old,
+        "> kigjq_later_old_source\n\nkigjq_later_old_response\n",
+    )
+    .unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&later_old)
+        .unwrap()
+        .set_modified(historical_mtime)
+        .unwrap();
+    run(false);
+    assert_eq!(
+        counts(),
+        (2, 4),
+        "a fresh process must preserve repaired rows and resume the ordinary cutoff"
+    );
+    let fresh_project = home.join("fresh-project");
+    fs::create_dir_all(&fresh_project).unwrap();
+    fs::write(
+        fresh_project.join(".aider.chat.history.md"),
+        "> kigjq_fresh_source\n\nkigjq_fresh_response\n",
+    )
+    .unwrap();
+    run(false);
+    assert_eq!(
+        counts(),
+        (3, 6),
+        "incremental indexing must still admit fresh sources"
+    );
 }
 
 #[test]
@@ -3257,6 +3823,173 @@ fn gh495_residue_fts_shadows_converge_through_doctor_and_full_index() {
     }
 }
 
+/// GH #495 (bead 2l1b0.45): the doctor's read-only check surface and the
+/// doctor's rebuild surface must reach ONE truthful verdict about the same
+/// archive. A legacy or orphan shadow is residue — it must be dropped and
+/// recreated from canonical rows — so `doctor` must not report it as a
+/// healthy queryable shadow just because its `_docsize` cardinality happens
+/// to line up (the reporter's "intact legacy _docsize misleadingly looks
+/// healthy"), and both surfaces must name the same repair.
+#[test]
+fn gh495_doctor_check_and_rebuild_agree_on_residue_shadows() {
+    use coding_agent_search::franken_sync::compat::ConnectionExt;
+    use frankensqlite::compat::RowExt;
+
+    const LEGACY_DDL: &str = "CREATE VIRTUAL TABLE fts_messages USING fts5(
+        content, title, agent, workspace, source_path,
+        created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
+    let reshape = |db_path: &std::path::Path, shape: &str| {
+        let storage = SqliteStorage::open(db_path).unwrap();
+        let raw = storage.raw();
+        let mut statements: Vec<&str> = Vec::new();
+        match shape {
+            "orphan-shadow-tables" => statements.extend([
+                "DROP TABLE fts_messages",
+                "CREATE TABLE fts_messages_config(k PRIMARY KEY, v) WITHOUT ROWID",
+                "CREATE TABLE fts_messages_content(id INTEGER PRIMARY KEY, c0, c1, c2, c3, c4, c5, c6)",
+                "CREATE TABLE fts_messages_data(id INTEGER PRIMARY KEY, block BLOB)",
+                "CREATE TABLE fts_messages_docsize(id INTEGER PRIMARY KEY, sz BLOB)",
+                "CREATE TABLE fts_messages_idx(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID",
+                "INSERT INTO fts_messages_data(id, block) VALUES (10, X'00')",
+            ]),
+            "legacy-ddl" => statements.extend(["DROP TABLE fts_messages", LEGACY_DDL]),
+            "canonical-control" => {}
+            other => panic!("unknown shape {other}"),
+        }
+        for statement in statements {
+            raw.execute(statement)
+                .unwrap_or_else(|err| panic!("{shape}: {statement}: {err}"));
+        }
+        if shape == "legacy-ddl" {
+            // Populate the legacy internal-content shadow one row per message,
+            // as the pre-V14 writer did: its `_docsize` is intact, so only the
+            // registered DDL gives the shadow away.
+            let messages: Vec<(i64, String)> = raw
+                .query("SELECT id, content FROM messages ORDER BY id")
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.get_typed(0).unwrap(), row.get_typed(1).unwrap()))
+                .collect();
+            for (id, content) in &messages {
+                raw.execute_compat(
+                    "INSERT INTO fts_messages(
+                        rowid, content, title, agent, workspace, source_path, created_at, message_id
+                     ) VALUES (?1, ?2, '', '', '', '', 0, ?1)",
+                    coding_agent_search::franken_sync::params![*id, content.as_str()],
+                )
+                .unwrap_or_else(|err| panic!("{shape}: legacy shadow row {id}: {err}"));
+            }
+        }
+        storage.close().unwrap();
+    };
+
+    for shape in ["orphan-shadow-tables", "legacy-ddl", "canonical-control"] {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let data_dir = home.join("cass_data");
+        fs::create_dir_all(&data_dir).unwrap();
+        seed_fts_liveness_sessions(home);
+        let cass = |args: &[&str]| {
+            base_cmd(home)
+                .current_dir(home)
+                .args(args)
+                .arg("--data-dir")
+                .arg(&data_dir)
+                .env("CASS_AUTO_REFRESH", "0")
+                // 0 means "no bound": the shadow stays viable, so the
+                // rebuild surface plans the residue repair instead of a
+                // retirement.
+                .env("CASS_FTS_SHADOW_MAX_MESSAGES", "0")
+                .output()
+                .unwrap()
+        };
+        let seeded = cass(&["index", "--full", "--json", "--no-progress-events"]);
+        assert!(
+            seeded.status.success(),
+            "{shape}: seed failed: {}",
+            String::from_utf8_lossy(&seeded.stderr)
+        );
+        let db_path = data_dir.join("agent_search.db");
+        reshape(&db_path, shape);
+
+        // The doctor's read-only check surface.
+        let doctor = cass(&["doctor", "--json"]);
+        let doctor_json: serde_json::Value =
+            serde_json::from_slice(&doctor.stdout).unwrap_or_else(|err| {
+                panic!(
+                    "{shape}: doctor --json output is JSON: {err}: {}",
+                    String::from_utf8_lossy(&doctor.stderr)
+                )
+            });
+        let fts_check = doctor_json["checks"]
+            .as_array()
+            .and_then(|checks| checks.iter().find(|check| check["name"] == "fts_table"))
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("{shape}: doctor must report an fts_table check: {doctor_json}")
+            });
+
+        // The doctor's rebuild surface.
+        let dry_run = cass(&["doctor", "--rebuild-canonical-fts", "--dry-run", "--json"]);
+        assert!(
+            dry_run.status.success(),
+            "{shape}: dry-run failed: {}",
+            String::from_utf8_lossy(&dry_run.stderr)
+        );
+        let dry_run_json: serde_json::Value = serde_json::from_slice(&dry_run.stdout)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "{shape}: dry-run output is JSON: {err}: {}",
+                    String::from_utf8_lossy(&dry_run.stderr)
+                )
+            });
+        let parity_status = dry_run_json["parity"]["status"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("{shape}: the dry-run must report a parity status: {dry_run_json}")
+            });
+
+        if shape == "canonical-control" {
+            assert_eq!(
+                fts_check["status"], "pass",
+                "{shape}: a canonical shadow is healthy: {fts_check}"
+            );
+            assert_eq!(
+                parity_status, "healthy",
+                "{shape}: the rebuild surface must agree: {dry_run_json}"
+            );
+            assert_eq!(
+                dry_run_json["planned_action"], "verify_and_record_generation",
+                "{shape}: {dry_run_json}"
+            );
+            continue;
+        }
+
+        // GH #495: the reporter's shapes are residue on BOTH surfaces.
+        assert_eq!(
+            parity_status, "residue",
+            "{shape}: the rebuild surface must classify the shadow as residue: {dry_run_json}"
+        );
+        assert_eq!(
+            dry_run_json["planned_action"], "drop_residue_and_recreate_from_canonical",
+            "{shape}: {dry_run_json}"
+        );
+        assert_eq!(
+            fts_check["status"], "warn",
+            "{shape}: the check surface must not report residue as healthy: {fts_check}"
+        );
+        let message = fts_check["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("residue"),
+            "{shape}: the check must say the shadow is residue: {fts_check}"
+        );
+        assert!(
+            message.contains("cass doctor --rebuild-canonical-fts --yes"),
+            "{shape}: the check must name the repair the rebuild surface plans: {fts_check} / {dry_run_json}"
+        );
+    }
+}
+
 /// GH #497 follow-up (reporter validation on 2026-09-23): an archive whose
 /// corpus is over `CASS_FTS_SHADOW_MAX_MESSAGES` and that still carries the
 /// `content=''`-only `fts_messages` registration must settle through
@@ -3495,7 +4228,7 @@ fn gh497_oversized_residue_retires_successfully_and_settles() {
     );
     let unbounded = json(&unbounded);
     assert_eq!(
-        unbounded["repair_kind"], "failure_atomic_recreate",
+        unbounded["repair_kind"], "bounded_resumable_recreate",
         "{unbounded}"
     );
     assert_eq!(
