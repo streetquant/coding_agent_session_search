@@ -434,15 +434,32 @@ fn a_concurrent_index_run_makes_the_guide_refuse_to_mutate() -> TestResult {
         ],
     )?;
 
-    ensure(
-        gate_result(&payload, "readiness") == Some("blocked"),
-        || "a concurrent index run must block the guide readiness gate".to_string(),
-    )?;
-    ensure(
-        counter(&payload, "attempted_mutation_count") == Some(0)
-            && counter(&payload, "applied_mutation_count") == Some(0),
-        || "a concurrent index run must not be raced by a guided mutation".to_string(),
-    )?;
+    let step = mutation_step(&payload).ok_or("no mutating step in the plan")?;
+    let readiness_blocked = gate_result(&payload, "readiness") == Some("blocked");
+    if readiness_blocked {
+        ensure(
+            counter(&payload, "attempted_mutation_count") == Some(0)
+                && counter(&payload, "applied_mutation_count") == Some(0),
+            || "a blocked readiness gate must not attempt the concurrent mutation".to_string(),
+        )?;
+    } else {
+        // A plan can be ready while another indexer holds the data dir's
+        // advisory lock. The closed index adapter must then fail on that lock
+        // and never report an applied generation.
+        ensure(
+            step.get("result").and_then(Value::as_str) == Some("failed"),
+            || format!("a held index lock must produce an adapter refusal: {step}"),
+        )?;
+        ensure(
+            counter(&payload, "attempted_mutation_count") == Some(1)
+                && counter(&payload, "applied_mutation_count") == Some(0),
+            || "the held-lock attempt must be attempted but never applied".to_string(),
+        )?;
+        ensure(
+            step.pointer("/phases/applied").and_then(Value::as_bool) == Some(false),
+            || "a held index lock must not report an applied generation".to_string(),
+        )?;
+    }
     ensure(archive_digest(&data_dir) == before, || {
         "a refused concurrent run must not change the archive".to_string()
     })?;
