@@ -40,6 +40,7 @@ pub mod fleet_version_skew;
 mod followup_coordinates;
 pub mod franken_sync;
 pub mod ftui_harness;
+pub mod guide_adapters;
 pub mod guide_planner;
 pub mod guide_runner;
 pub mod html_export;
@@ -1065,6 +1066,13 @@ pub enum Commands {
         /// confirmation never carries across steps.
         #[arg(long, value_delimiter = ',')]
         confirm_step: Vec<usize>,
+        /// Bind this apply to the exact plan identity a prior dry run reported,
+        /// spelled `<step>=<identity>`. Repeat for multiple steps. A mutating
+        /// step whose adapter publishes a plan identity may only run when the
+        /// approval matches the identity observed now: a stale plan is
+        /// refused, never silently re-planned.
+        #[arg(long, value_delimiter = ',')]
+        expect_plan_identity: Vec<String>,
         /// Confirm an operator-context preflight fact as true. Repeatable; the
         /// confirmation is recorded in the robot transcript.
         #[arg(long)]
@@ -8939,6 +8947,7 @@ async fn execute_cli(
                     data_dir,
                     apply,
                     confirm_step,
+                    expect_plan_identity,
                     confirm_fact,
                     accept_privacy_tier,
                     accept_cost_risk,
@@ -8955,6 +8964,7 @@ async fn execute_cli(
                         structured_format,
                         apply,
                         &confirm_step,
+                        &expect_plan_identity,
                         &confirm_fact,
                         accept_privacy_tier.as_deref(),
                         accept_cost_risk.as_deref(),
@@ -27779,6 +27789,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  Doctor outcomes: branch on doctor.operation_outcome.kind (kebab-case) before prose; exit_code_kind says whether the outcome is success, health-failure, usage-error, lock-busy, or repair-failure.".to_string(),
             "  Doctor v2 schemas: use introspect.response_schemas doctor-* keys. First branch on err.kind/status/operation_outcome.kind/outcome_kind/asset_class/risk_level/fallback_mode; never scrape diagnostic prose.".to_string(),
             "  Doctor repairs: start with `cass doctor check --json`; use repair dry-run fingerprints for apply; support bundles and failure contexts report artifact_manifest_path/event_log_path instead of putting logs in stdout.".to_string(),
+            "  Guided operations: `cass guide <intent> --json` is read-only by default. `--apply --confirm-step N` runs one closed adapter; `--expect-plan-identity N=<identity>` binds that approval to the plan identity the dry run published, and a stale identity is refused instead of re-planned. Read execution.phases and execution.verified_mutation_count to tell planned from attempted, applied and verified.".to_string(),
             "  Doctor validation: use `scripts/e2e/doctor_v2.sh list|describe|run --json`; `--artifact-dir` creates a fresh run child, and run-summary.json lists scenario ids, labels, mutation class, log paths, failure_context path, and rerun command.".to_string(),
             "  Doctor failure reports: attach the redacted failure_context.json plus manifest/commands/events artifacts; do not attach raw session logs, exact source paths, or live archive copies by default.".to_string(),
             "  Swarm status: `cass swarm status --json` is read-only. It composes Beads, Agent Mail metadata, git, build pressure, cass health/status, and proof refs without claiming work or releasing reservations.".to_string(),
@@ -87043,6 +87054,7 @@ fn run_guide(
     output_format: Option<RobotFormat>,
     apply: bool,
     confirmed_steps: &[usize],
+    expected_plan_identities: &[String],
     confirmed_facts: &[String],
     accepted_privacy_tier: Option<&str>,
     accepted_cost_risk: Option<&str>,
@@ -87141,6 +87153,7 @@ fn run_guide(
         &crate::guide_runner::GuideRunRequest {
             apply,
             confirmed_steps,
+            expected_plan_identities,
             confirmed_facts,
             accepted_privacy_tier,
             accepted_cost_risk,

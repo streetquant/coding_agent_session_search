@@ -11,10 +11,11 @@
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+
+use crate::guide_adapters::{self, has_shell_metacharacter, run_bounded_cass};
 
 pub const SCHEMA_VERSION: &str = "cass.guide.execution.v1";
 pub const BEAD_ID: &str = "coding_agent_session_search-guided-ops-repro-trust-5u82n.17";
@@ -23,6 +24,10 @@ pub const BEAD_ID: &str = "coding_agent_session_search-guided-ops-repro-trust-5u
 pub struct GuideRunRequest<'a> {
     pub apply: bool,
     pub confirmed_steps: &'a [usize],
+    /// Plan identities the operator approved, each spelled `<step>=<identity>`.
+    /// A mutating step whose adapter has an identity may only run when the
+    /// approval matches the identity observed at apply time.
+    pub expected_plan_identities: &'a [String],
     pub confirmed_facts: &'a [String],
     pub accepted_privacy_tier: Option<&'a str>,
     pub accepted_cost_risk: Option<&'a str>,
@@ -50,6 +55,9 @@ enum Adapter {
     SupportEvidence,
     KeyPolicy,
     SupportBundle,
+    DoctorRebuild,
+    IndexIncremental,
+    SourcesDrySync,
     ObservationOnly,
 }
 
@@ -112,7 +120,7 @@ const ALLOWLIST: &[AllowedCommand] = &[
     AllowedCommand {
         id: "doctor.rebuild-stale-assets",
         mutation_class: "derived-asset-mutation",
-        adapter: Adapter::ObservationOnly,
+        adapter: Adapter::DoctorRebuild,
     },
     AllowedCommand {
         id: "privacy.preview-exposure",
@@ -122,12 +130,12 @@ const ALLOWLIST: &[AllowedCommand] = &[
     AllowedCommand {
         id: "sources.dry-sync",
         mutation_class: "read-only-proof",
-        adapter: Adapter::ObservationOnly,
+        adapter: Adapter::SourcesDrySync,
     },
     AllowedCommand {
         id: "index.incremental",
         mutation_class: "index-mutation",
-        adapter: Adapter::ObservationOnly,
+        adapter: Adapter::IndexIncremental,
     },
     AllowedCommand {
         id: "export.confirm-key-policy",
@@ -159,15 +167,6 @@ fn is_mutating(class: &str) -> bool {
     class != "read-only-proof"
 }
 
-fn has_shell_metacharacter(token: &str) -> bool {
-    token.chars().any(|ch| {
-        matches!(
-            ch,
-            ';' | '|' | '&' | '>' | '<' | '`' | '$' | '\n' | '\r' | '\0'
-        )
-    })
-}
-
 fn allowlisted_argv(command: AllowedCommand, data_dir: &Path) -> Option<Vec<String>> {
     let data_dir = data_dir.display().to_string();
     let argv = match command.adapter {
@@ -193,6 +192,22 @@ fn allowlisted_argv(command: AllowedCommand, data_dir: &Path) -> Option<Vec<Stri
             &data_dir,
             "--json",
         ],
+        // The read-only half of the doctor repair path: it prints the
+        // fingerprinted plan the apply is bound to and mutates nothing.
+        Adapter::DoctorRebuild => vec![
+            "cass",
+            "doctor",
+            "--repair",
+            "--dry-run",
+            "--json",
+            "--data-dir",
+            &data_dir,
+        ],
+        // The read-only precondition probe for an incremental index. The
+        // apply argv is the closed `cass index` form and never carries
+        // `--full` or `--semantic`.
+        Adapter::IndexIncremental => vec!["cass", "status", "--data-dir", &data_dir, "--json"],
+        Adapter::SourcesDrySync => vec!["cass", "sources", "sync", "--dry-run", "--json"],
         Adapter::ObservationOnly => return None,
     };
     let tokens = argv.into_iter().map(str::to_string).collect::<Vec<_>>();
@@ -300,6 +315,28 @@ fn evaluate_read_only_proof(
     {
         return evaluate_live_proof(command, request.data_dir, deadline);
     }
+    if request.source_kind != "fixture" && command.adapter == Adapter::SourcesDrySync {
+        // The read-only half of the remote source path: the dry sync reports
+        // what it would transfer and transfers nothing.
+        let observation = guide_adapters::observe_sources_dry_sync(request.data_dir, deadline);
+        let result: &'static str = match observation.get("result").and_then(Value::as_str) {
+            Some("passed") => "passed",
+            Some("failed") => "failed",
+            _ => "not-run",
+        };
+        let detail = observation
+            .get("detail")
+            .and_then(Value::as_str)
+            .unwrap_or("the read-only source dry sync did not report a verdict")
+            .to_string();
+        let observation = observation.get("observation").cloned();
+        return ProofResult {
+            result,
+            source: "sources-dry-sync",
+            detail,
+            observation,
+        };
+    }
     if let Some(passed) = (request.source_kind == "fixture")
         .then(|| fixture_proof(request.fixture_context, proof_gate))
         .flatten()
@@ -384,75 +421,21 @@ fn evaluate_read_only_proof(
             source: "operator-and-preflight",
             detail: "requires an available key and exact privacy-tier acceptance".to_string(),
         },
-        Adapter::SearchCoverage | Adapter::SupportBundle | Adapter::ObservationOnly => {
-            ProofResult {
-                result: "not-run",
-                observation: None,
-                source: "none",
-                detail: "no automatic read-only proof adapter".to_string(),
-            }
-        }
+        Adapter::SearchCoverage
+        | Adapter::SupportBundle
+        | Adapter::SourcesDrySync
+        | Adapter::DoctorRebuild
+        | Adapter::IndexIncremental
+        | Adapter::ObservationOnly => ProofResult {
+            result: "not-run",
+            observation: None,
+            source: "none",
+            detail: "no automatic read-only proof adapter".to_string(),
+        },
     }
 }
 
-/// Whether a command may already have produced side effects is independent of
-/// its exit status. In particular, a timeout after spawn is not a read-only run.
-struct CommandFailure {
-    started: bool,
-    detail: &'static str,
-}
-
-impl CommandFailure {
-    fn before_start(detail: &'static str) -> Self {
-        Self {
-            started: false,
-            detail,
-        }
-    }
-
-    fn after_start(detail: &'static str) -> Self {
-        Self {
-            started: true,
-            detail,
-        }
-    }
-}
-
-/// Run the installed binary, never another `cass` selected by PATH. The shared
-/// supervisor bounds both captured streams and terminates timed-out children.
-fn run_bounded_cass(argv: &[String], timeout: Duration) -> Result<Output, CommandFailure> {
-    let args = argv
-        .get(1..)
-        .filter(|args| !args.is_empty())
-        .ok_or_else(|| CommandFailure::before_start("missing argv"))?;
-    if argv.first().map(String::as_str) != Some("cass") || timeout.is_zero() {
-        return Err(CommandFailure::before_start(
-            "invalid command or exhausted command budget",
-        ));
-    }
-    #[cfg(target_os = "linux")]
-    let mut child = Command::new("/proc/self/exe");
-    #[cfg(not(target_os = "linux"))]
-    let mut child =
-        Command::new(std::env::current_exe().map_err(|_| {
-            CommandFailure::before_start("cannot resolve the running cass executable")
-        })?);
-    child
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("CASS_AUTO_REFRESH", "0")
-        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
-    crate::sources::configure_child_process_group(&mut child);
-    let child = child
-        .spawn()
-        .map_err(|_| CommandFailure::before_start("could not start cass command"))?;
-    crate::sources::wait_for_child_output_with_limit(child, timeout, Some(2 * 1024 * 1024))
-        .map_err(|_| CommandFailure::after_start("cass command failed to capture bounded output"))?
-        .ok_or_else(|| CommandFailure::after_start("cass command deadline exceeded"))
-}
-
+/// A live proof that could not run at all is never a pass.
 fn unavailable_live_proof(detail: impl Into<String>) -> ProofResult {
     ProofResult {
         result: "not-run",
@@ -558,20 +541,36 @@ fn classify_live_proof(adapter: Adapter, exit_code: Option<i32>, payload: &Value
 }
 
 struct MutationResult {
-    status: &'static str,
-    proof_result: &'static str,
+    status: String,
+    proof_result: String,
     detail: String,
     started: bool,
     observation: Option<Value>,
+    /// `applied` | `failed` | `not-run`.
+    phase: &'static str,
+    /// Whether the operation was applied by its adapter.
+    applied: bool,
+    /// Whether the applied state was confirmed by the verification surface.
+    verified: bool,
+    /// The typed verification outcome.
+    verification: Value,
 }
 
 fn failed_mutation(started: bool, detail: impl Into<String>) -> MutationResult {
     MutationResult {
-        status: "failed",
-        proof_result: "failed",
+        status: "failed".to_string(),
+        proof_result: "failed".to_string(),
         detail: detail.into(),
         started,
         observation: None,
+        phase: "failed",
+        applied: false,
+        verified: false,
+        verification: json!({
+            "result": "not-run",
+            "source": "none",
+            "detail": "the operation was not applied, so no postcondition was checked"
+        }),
     }
 }
 
@@ -677,13 +676,21 @@ fn classify_support_bundle(
         Err(detail) => return failed_mutation(true, detail),
     };
     MutationResult {
-        status: "executed",
-        proof_result: "passed",
+        status: "executed".to_string(),
+        proof_result: "passed".to_string(),
         detail:
             "support bundle produced; bounded manifest receipt recorded without private contents"
                 .to_string(),
         started: true,
         observation: Some(observation),
+        phase: "applied",
+        applied: true,
+        verified: true,
+        verification: json!({
+            "result": "verified",
+            "source": "support-bundle-receipt",
+            "detail": "the produced bundle manifest was read back inside the selected data dir"
+        }),
     }
 }
 
@@ -694,15 +701,75 @@ fn execute_support_bundle(argv: &[String], data_dir: &Path) -> MutationResult {
     }
 }
 
-fn execute_mutation(command: AllowedCommand, argv: &[String], data_dir: &Path) -> MutationResult {
+/// The plan identity the operator approved for one step, if any.
+fn expected_plan_identity(request: &GuideRunRequest<'_>, order: usize) -> Option<String> {
+    request.expected_plan_identities.iter().find_map(|raw| {
+        let (step, identity) = raw.split_once('=')?;
+        let step = step.trim().parse::<usize>().ok()?;
+        (step == order).then(|| identity.trim().to_string())
+    })
+}
+
+/// Run one mutating step through its closed adapter: preview, apply, verify.
+#[allow(clippy::too_many_arguments)]
+fn execute_mutation(
+    command: AllowedCommand,
+    structured: &str,
+    argv: &[String],
+    data_dir: &Path,
+    preview: &guide_adapters::OperationPreview,
+    expected_identity: Option<&str>,
+    mutation_deadline: Instant,
+    verify_deadline: Instant,
+) -> MutationResult {
     match command.adapter {
         Adapter::SupportBundle => execute_support_bundle(argv, data_dir),
+        Adapter::DoctorRebuild | Adapter::IndexIncremental => {
+            let outcome = guide_adapters::apply_operation(
+                structured,
+                preview,
+                expected_identity,
+                mutation_deadline,
+            );
+            let applied = outcome.status == "executed";
+            let verification = if applied {
+                guide_adapters::verify_operation(structured, data_dir, verify_deadline)
+            } else {
+                guide_adapters::VerificationOutcome {
+                    result: "not-run".to_string(),
+                    source: "none".to_string(),
+                    detail: "the operation was not applied, so no postcondition was checked"
+                        .to_string(),
+                    observation: None,
+                }
+            };
+            let verified = applied && verification.result == "verified";
+            MutationResult {
+                status: outcome.status,
+                proof_result: if applied { "passed" } else { "failed" }.to_string(),
+                detail: outcome.detail,
+                started: outcome.started,
+                observation: outcome.observation,
+                phase: if applied { "applied" } else { "failed" },
+                applied,
+                verified,
+                verification: verification.to_json(),
+            }
+        }
         _ => MutationResult {
-            status: "adapter-unavailable",
-            proof_result: "not-run",
+            status: "adapter-unavailable".to_string(),
+            proof_result: "not-run".to_string(),
             detail: "structured mutation has no closed, parameter-complete adapter".to_string(),
             started: false,
             observation: None,
+            phase: "not-run",
+            applied: false,
+            verified: false,
+            verification: json!({
+                "result": "not-run",
+                "source": "none",
+                "detail": "no adapter ran, so no postcondition was checked"
+            }),
         },
     }
 }
@@ -716,7 +783,8 @@ fn mutation_contract(apply: bool, attempted: usize) -> Value {
         "mutates_db": false,
         "touches_network": false,
         "per_step_confirmation_required": true,
-        "shell_evaluation": false
+        "shell_evaluation": false,
+        "compensation_executed": false
     })
 }
 
@@ -883,6 +951,31 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
             format!("unknown step confirmations: {invalid_confirmations:?}"),
         ));
     }
+    // A plan identity is only meaningful when it names a mutating step and
+    // carries a non-empty fingerprint. Anything else is an unusable approval
+    // and must block before a child starts.
+    let invalid_identities = request
+        .expected_plan_identities
+        .iter()
+        .filter(|raw| match raw.split_once('=') {
+            Some((step, identity)) => {
+                !step
+                    .trim()
+                    .parse::<usize>()
+                    .is_ok_and(|step| mutating_steps.contains(&step))
+                    || identity.trim().is_empty()
+            }
+            None => true,
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !invalid_identities.is_empty() {
+        global_gates.push(gate(
+            "step-identities",
+            "blocked",
+            format!("unusable plan identities: {invalid_identities:?}"),
+        ));
+    }
 
     let global_mutation_ready = readiness == "ready"
         && stops_clear
@@ -892,16 +985,23 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
         && cost_accepted
         && !resource_blocked
         && (!offload_mutation || request.allow_rch)
-        && invalid_confirmations.is_empty();
+        && invalid_confirmations.is_empty()
+        && invalid_identities.is_empty();
     let mut prior_proofs_passed = true;
     let mut transcript = Vec::with_capacity(steps.len());
     let mut automatic_read_only_count = 0usize;
     let mut applied_mutation_count = 0usize;
     let mut attempted_mutation_count = 0usize;
+    let mut verified_mutation_count = 0usize;
+    let mut unavailable_mutation_count = 0usize;
     let mut awaiting_confirmation = false;
     let mut blocked_step = false;
 
     let proof_deadline = Instant::now() + Duration::from_secs(15);
+    // A fixture run is permanently offline: it never starts a child process,
+    // so its preview is the static one.
+    let preview_deadline =
+        (request.source_kind != "fixture").then(|| Instant::now() + Duration::from_secs(120));
     for step in &steps {
         let order = step
             .get("order")
@@ -962,6 +1062,19 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
         }
 
         if !request.apply {
+            // A mutating step still gets its typed preview in the dry run: the
+            // operator must see the exact operation scope, the identity the
+            // apply would be bound to, and the compensation state before
+            // approving anything. The preview is read-only.
+            let preview = declared_mutates.then(|| {
+                guide_adapters::preview_operation(structured, request.data_dir, preview_deadline)
+            });
+            if preview
+                .as_ref()
+                .is_some_and(|preview| !preview.is_available())
+            {
+                unavailable_mutation_count += 1;
+            }
             transcript.push(json!({
                 "step": order,
                 "structured_command": structured,
@@ -972,6 +1085,23 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
                 "confirmation": { "required": declared_mutates, "provided": false },
                 "rch": { "rule": rch_rule, "result": "not-run" },
                 "proof_gate": { "name": proof_gate, "result": "not-run", "source": "dry-run" },
+                "phase": "planned",
+                "phases": { "planned": true, "attempted": false, "applied": false, "verified": false },
+                "preview": preview.as_ref().map(guide_adapters::OperationPreview::to_json).unwrap_or(Value::Null),
+                "plan_identity": preview
+                    .as_ref()
+                    .and_then(|preview| preview.identity.as_ref())
+                    .map(guide_adapters::PlanIdentity::to_json)
+                    .unwrap_or(Value::Null),
+                "compensation": preview
+                    .as_ref()
+                    .map(|preview| preview.compensation.clone())
+                    .unwrap_or(Value::Null),
+                "verification": {
+                    "result": "not-run",
+                    "source": "none",
+                    "detail": "dry-run: no step was applied, so no postcondition was checked"
+                },
                 "result": "planned",
                 "detail": "dry-run: no step executed"
             }));
@@ -1022,60 +1152,103 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
 
         let confirmed = confirmed_steps.contains(&order);
         let step_rch_ready = rch_rule != "offload-build" || request.allow_rch;
+        let mut step_preview = Value::Null;
+        let mut step_identity = Value::Null;
+        let mut step_compensation = Value::Null;
+        let mut step_verification = json!({
+            "result": "not-run",
+            "source": "none",
+            "detail": "the step was not applied, so no postcondition was checked"
+        });
+        let mut step_phase = "not-run".to_string();
+        let mut step_applied = false;
+        let mut step_verified = false;
         let mut mutation_observation = None;
         let mut mutation_started = false;
         let (result, proof_result, detail) = if !global_mutation_ready {
             blocked_step = true;
             (
-                "blocked",
-                "not-run",
-                "one or more readiness/privacy/cost/rch/stop-condition gates did not pass".into(),
+                "blocked".to_string(),
+                "not-run".to_string(),
+                "one or more readiness/privacy/cost/rch/stop-condition gates did not pass"
+                    .to_string(),
             )
         } else if !prior_proofs_passed {
             blocked_step = true;
             (
-                "blocked",
-                "not-run",
-                "a preceding proof gate did not pass".into(),
+                "blocked".to_string(),
+                "not-run".to_string(),
+                "a preceding proof gate did not pass".to_string(),
             )
         } else if !confirmed {
             awaiting_confirmation = true;
             (
-                "awaiting-confirmation",
-                "not-run",
-                "mutation requires --confirm-step for this exact step".into(),
+                "awaiting-confirmation".to_string(),
+                "not-run".to_string(),
+                "mutation requires --confirm-step for this exact step".to_string(),
             )
         } else if request.source_kind == "fixture" {
             blocked_step = true;
             (
-                "fixture-protected",
-                "not-run",
-                "fixture apply is permanently non-mutating".into(),
-            )
-        } else if argv.is_none() {
-            blocked_step = true;
-            (
-                "adapter-unavailable",
-                "not-run",
-                "no parameter-complete argv adapter is available".into(),
+                "fixture-protected".to_string(),
+                "not-run".to_string(),
+                "fixture apply is permanently non-mutating".to_string(),
             )
         } else {
-            let mutation = execute_mutation(
-                command,
-                argv.as_deref().unwrap_or_default(),
-                request.data_dir,
-            );
-            mutation_started = mutation.started;
-            if mutation_started {
-                attempted_mutation_count += 1;
-            }
-            mutation_observation = mutation.observation;
-            if mutation.status == "executed" {
-                applied_mutation_count += 1;
-            } else {
+            // The typed preview is computed before the apply: it names the
+            // exact operation scope, the identity the apply is bound to, and
+            // the compensation state a failure would leave behind.
+            let preview =
+                guide_adapters::preview_operation(structured, request.data_dir, preview_deadline);
+            step_preview = preview.to_json();
+            step_identity = preview
+                .identity
+                .as_ref()
+                .map(guide_adapters::PlanIdentity::to_json)
+                .unwrap_or(Value::Null);
+            step_compensation = preview.compensation.clone();
+            if !preview.is_available() {
                 blocked_step = true;
+                unavailable_mutation_count += 1;
+                (
+                    "adapter-unavailable".to_string(),
+                    "not-run".to_string(),
+                    format!(
+                        "no closed adapter for this structured command: {}",
+                        preview.detail
+                    ),
+                )
+            } else {
+                let expected = expected_plan_identity(request, order);
+                let mutation = execute_mutation(
+                    command,
+                    structured,
+                    argv.as_deref().unwrap_or_default(),
+                    request.data_dir,
+                    &preview,
+                    expected.as_deref(),
+                    Instant::now() + Duration::from_secs(600),
+                    Instant::now() + Duration::from_secs(120),
+                );
+                mutation_started = mutation.started;
+                if mutation_started {
+                    attempted_mutation_count += 1;
+                }
+                mutation_observation = mutation.observation;
+                step_phase = mutation.phase.to_string();
+                step_applied = mutation.applied;
+                step_verified = mutation.verified;
+                step_verification = mutation.verification;
+                if mutation.verified {
+                    verified_mutation_count += 1;
+                }
+                if mutation.applied {
+                    applied_mutation_count += 1;
+                } else {
+                    blocked_step = true;
+                }
+                (mutation.status, mutation.proof_result, mutation.detail)
             }
-            (mutation.status, mutation.proof_result, mutation.detail)
         };
         prior_proofs_passed &= proof_result == "passed";
         transcript.push(json!({
@@ -1088,6 +1261,17 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
             "confirmation": { "required": true, "provided": confirmed },
             "rch": { "rule": rch_rule, "result": if step_rch_ready { "passed" } else { "needs-confirmation" } },
             "proof_gate": { "name": proof_gate, "result": proof_result, "source": "mutation-adapter" },
+            "phase": step_phase,
+            "phases": {
+                "planned": true,
+                "attempted": mutation_started,
+                "applied": step_applied,
+                "verified": step_verified
+            },
+            "preview": step_preview,
+            "plan_identity": step_identity,
+            "compensation": step_compensation,
+            "verification": step_verification,
             "result": result,
             "detail": detail
         }));
@@ -1119,10 +1303,14 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
         "shell_evaluation": false,
         "fixture_mutation_allowed": false,
         "confirmed_facts": request.confirmed_facts,
+        "expected_plan_identities": request.expected_plan_identities,
         "global_gates": global_gates,
         "automatic_read_only_step_count": automatic_read_only_count,
+        "planned_mutation_count": mutating_steps.len(),
         "applied_mutation_count": applied_mutation_count,
         "attempted_mutation_count": attempted_mutation_count,
+        "verified_mutation_count": verified_mutation_count,
+        "unavailable_mutation_count": unavailable_mutation_count,
         "transcript": transcript
     });
     if let Some(map) = plan.as_object_mut() {
@@ -1130,7 +1318,9 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
         if request.apply {
             map.insert(
                 "status".to_string(),
-                json!(if overall_status == "completed" {
+                json!(if overall_status == "completed"
+                    && applied_mutation_count == verified_mutation_count
+                {
                     "ok"
                 } else {
                     "warning"
@@ -1169,6 +1359,7 @@ mod tests {
         GuideRunRequest {
             apply: false,
             confirmed_steps: &[],
+            expected_plan_identities: &[],
             confirmed_facts: &[],
             accepted_privacy_tier: None,
             accepted_cost_risk: None,
@@ -1482,14 +1673,14 @@ mod tests {
 
     #[test]
     fn failed_started_mutations_never_claim_read_only_or_automatic_rollback() {
-        let error = super::CommandFailure::after_start("timeout");
+        let error = crate::guide_adapters::CommandFailure::after_start("timeout");
         let result = super::failed_mutation(error.started, error.detail);
         assert_eq!(result.status, "failed");
         let contract = super::mutation_contract(true, usize::from(result.started));
         assert_eq!(contract["read_only"], false);
         assert_eq!(contract["mutates_files"], true);
         assert_eq!(contract["mutates_db"], false);
-        let not_started = super::CommandFailure::before_start("spawn failure");
+        let not_started = crate::guide_adapters::CommandFailure::before_start("spawn failure");
         let contract = super::mutation_contract(true, usize::from(not_started.started));
         assert_eq!(contract["read_only"], true);
         assert_eq!(contract["mutates_files"], false);

@@ -1985,6 +1985,14 @@
           "repeatable": true
         },
         {
+          "name": "expect-plan-identity",
+          "description": "Bind this apply to the exact plan identity a prior dry run reported, spelled `<step>=<identity>`. Repeat for multiple steps. A mutating step whose adapter publishes a plan identity may only run when the approval matches the identity observed now: a stale plan is refused, never silently re-planned",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
           "name": "confirm-fact",
           "description": "Confirm an operator-context preflight fact as true. Repeatable; the confirmation is recorded in the robot transcript",
           "arg_type": "option",
