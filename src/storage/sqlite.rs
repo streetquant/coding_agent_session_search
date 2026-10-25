@@ -5268,8 +5268,9 @@ CREATE TABLE IF NOT EXISTS semantic_source_identity_v1 (
     database_uuid TEXT NOT NULL,
     change_sequence INTEGER NOT NULL CHECK(typeof(change_sequence) = 'integer' AND change_sequence >= 0)
 );
-INSERT OR IGNORE INTO semantic_source_identity_v1(singleton, database_uuid, change_sequence)
-VALUES (1, lower(hex(randomblob(16))), 0);
+INSERT INTO semantic_source_identity_v1(singleton, database_uuid, change_sequence)
+SELECT 1, lower(hex(randomblob(16))), 0
+WHERE NOT EXISTS (SELECT 1 FROM semantic_source_identity_v1 WHERE singleton = 1);
 
 CREATE TABLE IF NOT EXISTS semantic_source_certificates_v1 (
     contract_sha256 TEXT PRIMARY KEY,
