@@ -431,7 +431,21 @@ fn gh536_a_new_device_number_after_a_remount_does_not_reparse_unchanged_sources(
             });
             fs::create_dir_all(&directory).unwrap();
             let first = transcript(&directory, provider, 0);
-            transcript(&directory, provider, 1);
+            let second = transcript(&directory, provider, 1);
+            // A local incremental shortcut reuses a source whose mtime predates
+            // the previous scan by more than one second before it consults the
+            // ledger, and emits no source_ingest_observation event. A future
+            // fixture mtime keeps the reuse decision on the ledger path even
+            // when a debug CLI takes over a second to start.
+            let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+            for path in [&first, &second] {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_modified(future)
+                    .unwrap();
+            }
             index(home, streaming, "initial", 0, 2);
             let initial = archive(home, 2, false);
             // The number an older build saved before the remount; the mount
