@@ -14,9 +14,33 @@ fn ci_yml_path() -> PathBuf {
         .join("ci.yml")
 }
 
-fn read_ci_yml() -> serde_yaml::Value {
-    let body = std::fs::read_to_string(ci_yml_path()).expect(".github/workflows/ci.yml must exist");
-    serde_yaml::from_str(&body).expect("ci.yml must be valid YAML")
+fn read_ci_yml() -> serde_json::Value {
+    let file = std::fs::File::open(ci_yml_path()).expect(".github/workflows/ci.yml must exist");
+    serde_saphyr::from_reader_with_options(
+        file,
+        serde_saphyr::options! {
+            strict_booleans: true,
+            with_snippet: false,
+            budget: serde_saphyr::budget! {
+                max_reader_input_bytes: Some(1024 * 1024),
+                max_total_scalar_bytes: 1024 * 1024,
+                max_recorded_anchor_bytes: 1024 * 1024,
+                max_recorded_anchor_events: 8192,
+                max_events: 16384,
+                max_nodes: 8192,
+                max_depth: 32,
+                max_documents: 1,
+                max_anchors: 64,
+                max_aliases: 64,
+            },
+            alias_limits: serde_saphyr::alias_limits! {
+                max_total_replayed_events: 8192,
+                max_replay_stack_depth: 16,
+                max_alias_expansions_per_anchor: 64,
+            },
+        },
+    )
+    .expect("ci.yml must be valid YAML")
 }
 
 #[test]
@@ -48,10 +72,7 @@ fn ubs_gate_runs_canonical_invocation() {
 fn ubs_gate_triggers_on_pull_request_and_push_main() {
     tracing::info!(target: "dpfvr_test", check = "triggers");
     let yml = read_ci_yml();
-    let on = yml
-        .get(serde_yaml::Value::Bool(true))
-        .or_else(|| yml.get("on"))
-        .expect("ci.yml must have an `on:` block (YAML may parse as bool true)");
+    let on = yml.get("on").expect("ci.yml must have an `on:` string key");
     assert!(
         on.get("pull_request").is_some(),
         "ci.yml must trigger on pull_request"
@@ -60,7 +81,7 @@ fn ubs_gate_triggers_on_pull_request_and_push_main() {
         .get("push")
         .and_then(|p| p.get("branches"))
         .expect("ci.yml `on.push.branches` must be set");
-    let branches: Vec<String> = serde_yaml::from_value(push_branches.clone())
+    let branches: Vec<String> = serde_json::from_value(push_branches.clone())
         .expect("push.branches must be a sequence of strings");
     assert!(
         branches.iter().any(|b| b == "main"),

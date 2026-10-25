@@ -331,8 +331,31 @@ fn install_ps1_derives_sibling_urls_without_host_path_semantics() {
 
 #[test]
 fn release_workflow_pins_linux_glibc_to_installer_floor() {
-    let workflow: serde_yaml::Value = must(
-        serde_yaml::from_str(include_str!("../.github/workflows/release.yml")),
+    let workflow: serde_json::Value = must(
+        serde_saphyr::from_reader_with_options(
+            include_bytes!("../.github/workflows/release.yml").as_slice(),
+            serde_saphyr::options! {
+                strict_booleans: true,
+                with_snippet: false,
+                budget: serde_saphyr::budget! {
+                    max_reader_input_bytes: Some(1024 * 1024),
+                    max_total_scalar_bytes: 1024 * 1024,
+                    max_recorded_anchor_bytes: 1024 * 1024,
+                    max_recorded_anchor_events: 8192,
+                    max_events: 16384,
+                    max_nodes: 8192,
+                    max_depth: 32,
+                    max_documents: 1,
+                    max_anchors: 64,
+                    max_aliases: 64,
+                },
+                alias_limits: serde_saphyr::alias_limits! {
+                    max_total_replayed_events: 8192,
+                    max_replay_stack_depth: 16,
+                    max_alias_expansions_per_anchor: 64,
+                },
+            },
+        ),
         "parse release workflow",
     );
     let floor = workflow["env"]["LINUX_GLIBC_VERSION"]
@@ -346,7 +369,7 @@ fn release_workflow_pins_linux_glibc_to_installer_floor() {
         "installer admission must agree with the release ABI floor"
     );
     let matrix = workflow["jobs"]["build"]["strategy"]["matrix"]["include"]
-        .as_sequence()
+        .as_array()
         .expect("release platform matrix");
     for (os, target) in [
         ("ubuntu-24.04", "x86_64-unknown-linux-gnu"),
@@ -360,7 +383,7 @@ fn release_workflow_pins_linux_glibc_to_installer_floor() {
         );
     }
     let steps = workflow["jobs"]["build"]["steps"]
-        .as_sequence()
+        .as_array()
         .expect("release build steps");
     let step = |name: &str| {
         steps
