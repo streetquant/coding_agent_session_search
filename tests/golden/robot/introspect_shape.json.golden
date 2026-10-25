@@ -9800,6 +9800,14 @@
                             }
                           }
                         },
+                        "mirror_alias_of_linked_count": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "missing_current_source_count": {
                           "type": "object",
                           "properties": {
@@ -41260,6 +41268,14 @@
                           }
                         },
                         "mirror_without_db_link_count": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "mirror_alias_of_linked_count": {
                           "type": "object",
                           "properties": {
                             "type": {

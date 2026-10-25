@@ -7,7 +7,6 @@
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)
 ![Rust](https://img.shields.io/badge/Rust-pinned%20nightly-orange.svg)
 ![Status](https://img.shields.io/badge/status-alpha-purple.svg)
-[![Coverage](https://codecov.io/gh/Dicklesworthstone/coding_agent_session_search/branch/main/graph/badge.svg)](https://codecov.io/gh/Dicklesworthstone/coding_agent_session_search)
 ![License](https://img.shields.io/badge/license-MIT%2BOpenAI%2FAnthropic%20Rider-green.svg)
 
 **Unified, high-performance TUI to index and search your local coding agent history.**
@@ -603,22 +602,32 @@ When the wizard installs `cass` on remote machines, it tries every viable method
 
 | Priority | Method | Speed | Requirements |
 |----------|--------|-------|--------------|
-| 1 | **cargo-binstall** | ~30s | `cargo-binstall` pre-installed, compatible release binary |
-| 2 | **Pre-built binary** | ~10s | curl/wget, GitHub access, compatible release binary |
-| 3 | **cargo install** | ~5min | Rust toolchain, 1GB disk, 2GB RAM |
-| 4 | **Full bootstrap** | ~10min | curl, 1GB disk, 2GB RAM (installs rustup) |
+| 1 | **Pre-built binary** | ~10s | curl/wget, GitHub access, compatible release binary |
+| 2 | **Source build** | ~30 min | rustup and cargo, curl/wget, 6GB free disk in `$HOME`, 10GB RAM |
+| 3 | **Full bootstrap** | ~30 min | curl, 6GB free disk in `$HOME`, 10GB RAM (installs rustup, then builds as in 2) |
 
-> **crates.io publishing resumed at 0.7.0 (GH#416):** the long-stale
-> registry gap (0.6.13, published before the Quill/OMP era) is closed — the
-> entire dependency chain now resolves from crates.io (`frankensearch
-> 0.4.0`, the `frankentorch-*` family, `frankenhnsw`), so
-> `cargo install coding-agent-search` builds the current line again. The
-> installer and GitHub Release binaries remain the fastest paths.
+The source build does what `install.sh --from-source` does: it downloads the
+release tag's source archive into `$HOME`, installs the Rust toolchain that
+tag's `rust-toolchain.toml` pins (a dated nightly; cass does not build on
+stable), and runs `cargo install --locked --path . --bin cass` inside it, so the
+binary lands in `~/.cargo/bin/cass`. The unpacked tree is removed afterwards. It
+does not use crates.io. It builds with thin LTO instead of the release
+profile's fat LTO, so the binary is somewhat larger and slower than the
+published one. Measured building v0.10.0 on a fresh account (two build jobs):
+28 minutes, 8.6 GB peak compiler memory (10.9 GB and 36 minutes with fat LTO),
+1.5 GB toolchain, 0.8 GB cargo cache and a 2.6 GB build tree. The wizard
+offers it only to hosts above those floors.
+> **crates.io lags the releases:** the newest version on crates.io is 0.7.0
+> (2026-08-25), so `cargo install coding-agent-search` builds 0.7.0. Later
+> versions depend on `franken-agent-detection` at a git revision, and crates.io
+> does not accept git dependencies, so they cannot be published there until FAD
+> is (bead zztql). Use the installer or the GitHub Release binaries for a
+> current version.
 
 **Resource Requirements**:
-- Minimum 1GB disk space for installation
-- Recommended 2GB RAM for compilation
-- Linux pre-built binaries require glibc 2.38+ on conventional FHS-style distributions; older glibc, musl-only, and NixOS hosts fall back to source installation when possible.
+- Minimum 1GB free disk in `$HOME` for the pre-built binary
+- 6GB free disk in `$HOME` and 10GB RAM for a source build
+- Linux pre-built binaries require glibc 2.28+ on conventional FHS-style distributions (see *System Requirements*); older glibc, musl-only, and NixOS hosts fall back to source installation when possible.
 - SSH access with key-based authentication
 
 **What Gets Installed**:
@@ -2712,47 +2721,15 @@ classDiagram
  +messages Vec~NormalizedMessage~
  }
 
- Connector <|-- CodexConnector
- Connector <|-- ClineConnector
  Connector <|-- ClaudeCodeConnector
- Connector <|-- GeminiConnector
- Connector <|-- ClawdbotConnector
- Connector <|-- VibeConnector
- Connector <|-- OpenCodeConnector
- Connector <|-- AmpConnector
+ Connector <|-- CodexConnector
  Connector <|-- CursorConnector
- Connector <|-- ChatGptConnector
- Connector <|-- AiderConnector
- Connector <|-- PiAgentConnector
- Connector <|-- FactoryConnector
- Connector <|-- CopilotConnector
- Connector <|-- CopilotCliConnector
- Connector <|-- OpenClawConnector
- Connector <|-- CrushConnector
- Connector <|-- HermesConnector
- Connector <|-- KimiConnector
- Connector <|-- QwenConnector
 
- CodexConnector ..> NormalizedConversation : emits
- ClineConnector ..> NormalizedConversation : emits
  ClaudeCodeConnector ..> NormalizedConversation : emits
- GeminiConnector ..> NormalizedConversation : emits
- ClawdbotConnector ..> NormalizedConversation : emits
- VibeConnector ..> NormalizedConversation : emits
- OpenCodeConnector ..> NormalizedConversation : emits
- AmpConnector ..> NormalizedConversation : emits
+ CodexConnector ..> NormalizedConversation : emits
  CursorConnector ..> NormalizedConversation : emits
- ChatGptConnector ..> NormalizedConversation : emits
- AiderConnector ..> NormalizedConversation : emits
- PiAgentConnector ..> NormalizedConversation : emits
- FactoryConnector ..> NormalizedConversation : emits
- CopilotConnector ..> NormalizedConversation : emits
- CopilotCliConnector ..> NormalizedConversation : emits
- OpenClawConnector ..> NormalizedConversation : emits
- CrushConnector ..> NormalizedConversation : emits
- HermesConnector ..> NormalizedConversation : emits
- KimiConnector ..> NormalizedConversation : emits
- QwenConnector ..> NormalizedConversation : emits
+
+ note "34 connectors are registered at runtime; cass capabilities --json lists them"
 ```
 
 - **Polymorphic Scanning**: The indexer runs connector factories in parallel via rayon, creating fresh `Box<dyn Connector>` instances that are unaware of each other's underlying file formats (JSONL, SQLite, specialized JSON).
@@ -2780,27 +2757,12 @@ flowchart LR
  classDef pastel4 fill:#fff7e6,stroke:#f2c27f,color:#4d350f;
  classDef pastel5 fill:#ffeef2,stroke:#f5b0c2,color:#4d1f2c;
 
- subgraph Sources["Local Sources"]
- A1[Codex]:::pastel
- A2[Cline]:::pastel
- A3[Gemini]:::pastel
- A4[Claude]:::pastel
- A5[OpenCode]:::pastel
- A6[Amp]:::pastel
- A7[Cursor]:::pastel
- A8[ChatGPT]:::pastel
- A9[Aider]:::pastel
- A10[Pi-Agent]:::pastel
- A11[Factory]:::pastel
- A12[Copilot Chat]:::pastel
- A13[Copilot CLI]:::pastel
- A14[OpenClaw]:::pastel
- A15[Clawdbot]:::pastel
- A16[Vibe]:::pastel
- A17[Crush]:::pastel
- A18[Hermes]:::pastel
- A19[Kimi]:::pastel
- A20[Qwen]:::pastel
+ subgraph Sources["Local Sources (34 connectors)"]
+ A1[Claude Code]:::pastel
+ A2[Codex]:::pastel
+ A3[Cursor]:::pastel
+ A4[Gemini]:::pastel
+ A5["… 30 more\n(cass capabilities --json)"]:::pastel
  end
 
  subgraph Remote["Remote Sources"]
@@ -2828,21 +2790,6 @@ flowchart LR
  A3 --> C1
  A4 --> C1
  A5 --> C1
- A6 --> C1
- A7 --> C1
- A8 --> C1
- A9 --> C1
- A10 --> C1
- A11 --> C1
- A12 --> C1
- A13 --> C1
- A14 --> C1
- A15 --> C1
- A16 --> C1
- A17 --> C1
- A18 --> C1
- A19 --> C1
- A20 --> C1
  R1 --> R2
  R2 --> R3
  R3 --> C1
@@ -2991,7 +2938,7 @@ Data integrity is paramount. `cass` treats the SQLite database (`src/storage/sql
   - Conversation rows are updated as they grow: end time, last message index, token summaries, title and metadata.
   - Deduplication, `forget` and purge delete rows.
 - **Deduplication**: messages are keyed by `UNIQUE(conversation_id, idx)`. New conversations are written with batched plain `INSERT`s, with the unique index as the backstop. Appends to a known conversation use `INSERT OR IGNORE`, so an agent re-writing a file cannot store a message twice. BLAKE3 content hashes are used only in memory, as merge fingerprints.
-- **Versioning**: a `_schema_migrations` table and a strict migration path keep upgrades safe and atomic; see *Database Schema Migrations*. Production creates a fresh database with one combined `full_schema_v13` step and then applies v14–v21, so a new database records versions 13–21. The v1–v12 SQL is compiled only into tests.
+- **Versioning**: a `_schema_migrations` table and a strict migration path keep upgrades safe and atomic; see *Database Schema Migrations*. Production creates a fresh database with one combined `full_schema_v13` step and then applies v14–v22, so a new database records versions 13–22. The v1–v12 SQL is compiled only into tests.
 
 ---
 
@@ -3071,7 +3018,7 @@ This means corrupted lexical data is a repairable derivative-state problem. Oper
 
 ### Database Schema Migrations
 
-The SQLite database uses 21 versioned schema migrations, tracked in the `_schema_migrations` table (`CURRENT_SCHEMA_VERSION = 21` and `MIGRATION_NAMES` in `src/storage/sqlite.rs`):
+The SQLite database uses 22 versioned schema migrations, tracked in the `_schema_migrations` table (`CURRENT_SCHEMA_VERSION = 22` and `MIGRATION_NAMES` in `src/storage/sqlite.rs`):
 
 | Version | Migration | Version | Migration |
 |---------|-----------|---------|-----------|
@@ -3084,8 +3031,8 @@ The SQLite database uses 21 versioned schema migrations, tracked in the `_schema
 | 7 | `msgpack_columns` | 18 | `conversation_tail_state_hot_table` |
 | 8 | `daily_stats` | 19 | `conversation_external_lookup` |
 | 9 | `embedding_jobs` | 20 | `conversation_external_tail_lookup` |
-| 10 | `token_analytics` | 21 | `conversation_context_index` (current) |
-| 11 | `message_metrics` | | |
+| 10 | `token_analytics` | 21 | `conversation_context_index` |
+| 11 | `message_metrics` | 22 | `forgotten_sources` (current) |
 
 **Migration Process**:
 1. On startup, `cass` checks `_schema_migrations` in the database (older databases that still record `schema_version` in the `meta` table are transitioned automatically)
@@ -3858,6 +3805,24 @@ Generated from the env-var registry (`cass capabilities --json | jq .env_vars`).
 | `CASS_DB_PATH` | unset | Override the SQLite database path. |
 | `CASS_DEBUG_CACHE_METRICS` | unset | Enable cache hit/miss logging |
 | `CASS_DEFER_ANALYTICS_UPDATES` | 0 | Set to 1 to defer derived analytics writes during indexing. A legacy OMP identity migration keeps its analytics phase and durable cursor pending until a later index run with this unset. |
+| `CASS_QUILL_QUERY_FUEL_BUDGET` | Quill default (10000000) | Escape hatch for Quill's deterministic per-query work ceiling (GH #441). Zero or unparseable values keep the engine default. When fuel runs out on a hybrid query the lexical leg is dropped, the semantic leg still answers, and `_meta.lexical_degrade_reason` reports `query_fuel_exhausted`; lexical-only queries return an actionable hint. The durable fix for fuel exhaustion is a consolidated index (an incremental `cass index` folds fragmented generations in its maintenance pass; `--full` rebuilds from scratch), and cass now publishes Quill snapshots only on its own commits (no per-second visibility seals), which is what let segment counts grow into the hundreds on append-only archives |
+| `CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES` | 1073741824 (1 GiB) | Maximum estimated output per lexical merge run, including the covered document-ID range. Oversized singleton segments remain unmerged. This is a merge-planning limit, not a total-process RSS ceiling. Positive byte values accept underscores; zero or invalid values keep the default. Independently of this cap, a merge run never holds more than 4,194,304 documents (Quill's per-term posting limit), and Quill's own tier merge is disabled, so archives with several million messages rebuild into several segments (GH #498). |
+| `CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES` | 8388608 (8 MiB) | Most text of any one message that the lexical index holds; the rest of that message (typically a pasted image or base64 blob) is not searchable. It never limits a conversation: every message of a long session is indexed, and rebuilds and incremental updates read long sessions in bounded chunks. Zero or invalid values keep the default. |
+| `CASS_INDEX_SKIP_DISK_HEADROOM_CHECK` | unset | Skips the free-space preflight that `cass index --full` / `--force-rebuild` runs before starting, and the rebuild's free-space floor. The requirement is `max(512 MiB, lexical_rebuild_basis_bytes * 9 / 4 - rebuild_staging_bytes + db_bundle_bytes / 16 + migration_copy_bytes)`: the basis is the live published index (a rebuild wrote 2.12x of it in measurement, the new generation plus the fold into one segment), or the database bundle when no live index exists to size the rebuild by; the database is charged a 1/16 growth allowance, and a whole copy only while the engine's one-time migration repair is pending (`migration_copy_bytes`). Merge-retired segments, retained publish backups and failed-rebuild quarantine bundles are reported but not charged, and a failed rebuild's leftover `.rebuild-staging` generation is credited against the lexical charge, because the next rebuild resumes into it or clears it first. A refusal names the rule's terms and what `cass index --gc`, `cass doctor cleanup` and `cass lexical-quarantine --plan` would reclaim. While running, a rebuild stops (exit 14, kind `storage`, retryable) once free space where it writes falls below 512 MiB, keeping what it committed so the rerun resumes, and it skips the final fold into one segment when there is no room for it. Query the requirement before a run with `cass doctor --json \| jq .storage_pressure.full_rebuild_readiness`, which shows `required_bytes`, `available_bytes`, `shortfall_bytes` and each input (GH #496). Set to `1` only when you know the disk can hold the rebuild. |
+| `CASS_SEARCH_EXACT_TOTAL_COUNT_MAX_DOCS` | 5000000 (50000 in v0.9.0 and earlier) | Largest index (in documents) for which a full result page still reports an exact `total_matches`; above it the count is `limit + 1`, a lower bound (`_meta.cursor_manifest.count_precision` says which). `0` disables exact counting. See *Match Counts: Exact or Lower Bound* |
+| `CASS_SEARCH_BUDGET_MS` | 120000 | Default robot-mode search budget when `--timeout` is not given. A search that runs out of it exits 0 with `budget.timed_out: true`, which means "no complete answer", not "no matches" |
+| `CASS_SEARCH_ACTIVE_REBUILD_WAIT_MS` | 30000 | How long a human-mode search, or a robot search whose index is still readable, waits for an active lexical rebuild before returning exit 7 `index-busy`. With `--timeout`, the wait also stops at nine tenths of the time remaining. A robot search with no searchable generation does not wait |
+| `CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES` | 1073741824 (1 GiB) | Largest archive (database plus WAL) that a search may repair inline; plain `cass index` compares the database file alone against the same value to decide whether to defer the authoritative lexical repair to `--full`. Over it, search refuses with `maintenance-required` and starts a detached `cass index --full --background` (see *When the Index Is Missing*) |
+| **Semantic Search** | | |
+| `CASS_SEMANTIC_EMBEDDER` | auto | Force embedder: `hash`, `minilm`, or explicit `multilingual-minilm` |
+| `CASS_SEMANTIC_PROGRESS_JSONL` | unset | Absolute path to a JSONL file the semantic backfill appends one event per transition to (`selection_*`, `packet_replay_*`, `embed_batch_*`, `staging_write_*`, `checkpoint_save_*`, `publish_*`, `error`, `cancelled`, `complete`). Each line carries timestamp, phase + sub-phase, batch/row counters, byte counts, elapsed-since-start, and a cheap RSS estimate. Silent when unset. Best-effort writes — failures log at debug and never crash a backfill. See [cass#257](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/257). |
+| `CASS_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS` | 30000 | Warn when one embedder batch takes more than 30s. Derived from cass#257 boxed quality-corpus telemetry: 60 MiniLM batches averaged ~5.95s, so the default is about 5x the observed healthy batch. Set `0` to disable warnings. |
+| `CASS_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS` | 300000 | Abort a semantic backfill batch after a single embedder batch returns if it exceeded 5 minutes. Derived as a conservative ~50x multiple of the cass#257 healthy 128-doc MiniLM batch average. Set `0` to disable failure. |
+| `CASS_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT` | 10000 | Soft cap for `cass models backfill`: checkpoint after a whole-conversation prefix near 10k selected messages. Derived from cass#257 high-volume proof (7,618 docs in ~6 minutes) plus the original 10k-message workaround. Set `0` for no message cap. |
+| `CASS_SEMANTIC_MAX_BYTES_PER_CHECKPOINT` | 8388608 | Soft cap for `cass models backfill`: checkpoint after a whole-conversation prefix near 8 MiB selected content. Derived from cass#257 high-volume proof (4.3 MiB selected bytes) with about 2x headroom. Set `0` for no byte cap. |
+| **TUI** | | |
+| `TUI_HEADLESS` | unset | Disable interactive features |
+| `CASS_ALLOW_DUMB_TERM` | unset | Allow TUI startup even when `TERM=dumb` |
 | `CASS_DISABLE_ANIMATIONS` | unset | Disable UI animations |
 | `CASS_DOCTOR_BUDGET_MS` | 8000 | Structured doctor reporting budget in milliseconds. Reports whose elapsed time exceeds it set budget.timed_out. |
 | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY` | unset | Set to `1` to hash every raw-mirror descriptor/chunk during a read-only doctor run, overriding the default bounded verification limits |
@@ -4142,25 +4107,11 @@ opt-level = 3           # Maximum runtime optimization
 - LTO and a single codegen unit prioritize runtime optimization at the cost of build time
 - No stack traces on panic (use debug builds for development)
 
-### CI Pipeline & Artifacts
+### Verification and Release Pipeline
 
-**Note:** GitHub Actions workflows under `.github/workflows/` are permanently disabled (`NO GH ACTIONS, PERIOD!`); verification runs through `rch` via `scripts/gate.sh` (fmt, clippy `-D warnings`, lib and integration tests, goldens, and UBS scan), and cross-platform builds and releases run through `/dsr` (`dsr health all`, `dsr build`, `dsr release`, `dsr fallback`):
+This repository has no GitHub Actions: `.github/workflows/` stays empty, `scripts/gate.sh` refuses to run on a tree that carries a workflow file, and `tests/no_github_actions.rs` fails on one. Verification runs on the `rch` build fleet through `scripts/gate.sh`, in one fleet admission. Its stages are source identity and freshness, `cargo fmt --check`, `clippy --all-targets -D warnings`, the lib build and tests, the selected integration targets, the `cass` binary's own tests, the golden-file contracts and a UBS scan of the changed files. Each stage prints a `STAGE=<name> EXIT=<code>` receipt line, and commits and bead closures cite those lines. `--lib-filter`, `--integration name:filter,...`, `--no-lib` and `--no-bin` narrow a run.
 
-| Job | Purpose | Artifacts |
-|-----|---------|-----------|
-| `check` | fmt, clippy, tests, benches, UBS scan | None |
-| `e2e` | Integration tests (install, index, filters) | `test-artifacts-e2e` (traces, logs) |
-| `coverage` | Code coverage with llvm-cov | `coverage-report` (lcov.info, summary) |
-
-**Coverage Reports:**
-- `lcov.info` - LCOV format for tools like codecov
-- `coverage-summary.txt` - Human-readable summary
-- Coverage % shown in GitHub Actions step summary
-
-**Test Artifacts:**
-- Trace files from `--trace-file` runs
-- Test run summary logs
-- Retained for 7 days (e2e) / 30 days (coverage)
+Cross-platform builds and releases run through `dsr` (`dsr health all`, `dsr build`, `dsr release`, `dsr fallback`); native Windows and macOS checks run on its build hosts. No coverage report is published; generate one locally:
 
 ```bash
 # Generate coverage through rch

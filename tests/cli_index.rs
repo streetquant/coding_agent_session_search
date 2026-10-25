@@ -5971,10 +5971,27 @@ fn gh453_back_to_back_runs_report_retired_segments_and_size_headroom_from_live_b
         "the live figure must exclude the retired files: {snapshot:?}"
     );
     assert_eq!(
+        snapshot.db_growth_allowance_bytes,
+        snapshot.db_bundle_bytes / 16,
+        "{snapshot:?}"
+    );
+    assert!(
+        snapshot.migration_copy_bytes == 0
+            || snapshot.migration_copy_bytes == snapshot.db_bundle_bytes,
+        "the db is copied whole or not at all: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.lexical_rebuild_basis_bytes, snapshot.lexical_index_bytes,
+        "a live index sizes the rebuild: {snapshot:?}"
+    );
+    assert_eq!(
         snapshot.required_bytes,
-        (512_u64 * 1024 * 1024)
-            .max(snapshot.db_bundle_bytes * 2 + snapshot.lexical_index_bytes * 2),
-        "the requirement doubles only live bytes: {snapshot:?}"
+        (512_u64 * 1024 * 1024).max(
+            snapshot.lexical_rebuild_basis_bytes * 9 / 4
+                + snapshot.db_growth_allowance_bytes
+                + snapshot.migration_copy_bytes
+        ),
+        "the requirement charges only live lexical bytes: {snapshot:?}"
     );
     let retired_note = snapshot
         .notes
@@ -6289,8 +6306,11 @@ struct Gh453Snapshot {
     retired_segment_files: u64,
     retired_segment_bytes: u64,
     lexical_index_bytes: u64,
+    lexical_rebuild_basis_bytes: u64,
     recursive_index_bytes: u64,
     db_bundle_bytes: u64,
+    db_growth_allowance_bytes: u64,
+    migration_copy_bytes: u64,
     required_bytes: u64,
     notes: Vec<String>,
 }
@@ -6422,8 +6442,11 @@ fn gh453_snapshot(home: &std::path::Path, data_dir: &std::path::Path) -> Gh453Sn
         retired_segment_files: field("retired_segment_files"),
         retired_segment_bytes: field("retired_segment_bytes"),
         lexical_index_bytes: field("lexical_index_bytes"),
+        lexical_rebuild_basis_bytes: field("lexical_rebuild_basis_bytes"),
         recursive_index_bytes,
         db_bundle_bytes: field("db_bundle_bytes"),
+        db_growth_allowance_bytes: field("db_growth_allowance_bytes"),
+        migration_copy_bytes: field("migration_copy_bytes"),
         required_bytes: field("required_bytes"),
         notes: readiness["notes"]
             .as_array()

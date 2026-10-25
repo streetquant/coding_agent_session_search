@@ -940,15 +940,20 @@
     "full_rebuild_readiness": {
       "status": "ready",
       "enforced": true,
-      "formula": "max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2 - rebuild_staging_bytes)",
+      "formula": "max(512 MiB, lexical_rebuild_basis_bytes * 9 / 4 - rebuild_staging_bytes + db_bundle_bytes / 16 + migration_copy_bytes), where lexical_rebuild_basis_bytes is lexical_index_bytes, or db_bundle_bytes when no live lexical generation exists",
       "required_bytes": 536870912,
       "floor_bytes": 536870912,
       "db_bundle_bytes": 0,
       "lexical_index_bytes": 0,
+      "lexical_rebuild_basis_bytes": 0,
       "retired_segment_bytes": 0,
       "retired_segment_files": 0,
       "retained_publish_backup_bytes": 0,
       "rebuild_staging_bytes": 0,
+      "quarantine_bytes": 0,
+      "db_growth_allowance_bytes": 0,
+      "migration_repair_pending": false,
+      "migration_copy_bytes": 0,
       "available_bytes": "[LIVE_BYTES]",
       "shortfall_bytes": 0,
       "probe_path": "[TEST_HOME]",
@@ -957,7 +962,7 @@
       ],
       "notes": [
         "A full rebuild (cass index --full / --force-rebuild) needs 536870912 bytes free at [TEST_HOME], and the free space there covers it, so the indexer's headroom preflight would pass.",
-        "Requirement is max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2 - rebuild_staging_bytes): db bundle 0 bytes, lexical index 0 bytes, floor 536870912 bytes."
+        "Requirement is max(512 MiB, lexical_rebuild_basis_bytes * 9 / 4 - rebuild_staging_bytes + db_bundle_bytes / 16 + migration_copy_bytes), where lexical_rebuild_basis_bytes is lexical_index_bytes, or db_bundle_bytes when no live lexical generation exists: lexical index 0 bytes, db bundle 0 bytes (growth allowance 0 bytes), floor 536870912 bytes."
       ]
     },
     "total_accounted_bytes": 0,
@@ -2831,6 +2836,7 @@
     "db_without_raw_mirror_count": 0,
     "db_projection_only_count": 0,
     "mirror_without_db_link_count": 0,
+    "mirror_alias_of_linked_count": 0,
     "missing_current_source_count": 0,
     "sole_copy_candidate_count": 0,
     "current_source_newer_than_archive_count": 0,
@@ -2843,7 +2849,8 @@
     "notes": [
       "coverage_summary compares the archive DB, verified raw mirror manifests, and currently visible upstream source files without reading raw session text into robot output.",
       "db_without_raw_mirror_count is a repair-risk signal: rebuilding only from current source files could shrink the archive.",
-      "sole_copy_candidate_count means cass-controlled storage may be the only remaining copy for those upstream-pruned conversations."
+      "sole_copy_candidate_count means cass-controlled storage may be the only remaining copy for those upstream-pruned conversations.",
+      "mirror_alias_of_linked_count counts unlinked manifests whose exact source bytes at the same path are DB-linked through another manifest; they are kept and are not counted as unlinked."
     ]
   },
   "sole_copy_warnings": [],

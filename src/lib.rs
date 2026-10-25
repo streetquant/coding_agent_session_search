@@ -79,6 +79,7 @@ pub mod storage;
 pub mod subsystem_coverage_matrix;
 pub mod swarm_replay_fixture;
 pub mod swarm_status;
+mod timeline_json;
 pub mod top_session_summary;
 pub mod topology_budget;
 pub mod tui_asciicast;
@@ -21986,6 +21987,10 @@ fn error_chain_indicates_index_disk_headroom_blocked(chain: &str) -> bool {
     chain.contains("canonical archive disk headroom check failed")
 }
 
+fn error_chain_indicates_lexical_rebuild_disk_stop(chain: &str) -> bool {
+    chain.contains(crate::indexer::LEXICAL_REBUILD_DISK_STOP_MARKER)
+}
+
 fn error_chain_indicates_orphan_fk_cleanup_blocked(chain: &str) -> bool {
     chain.contains("orphan FK self-heal failed for canonical cass archive")
 }
@@ -22046,6 +22051,22 @@ fn index_disk_headroom_cli_error(chain: &str) -> CliError {
         message: format!("index refused to start because disk headroom is too low: {chain}"),
         hint: Some(
             "Free space on the filesystem that holds the cass data directory, then retry indexing. Run 'cass doctor check --json' for a read-only health report."
+                .to_string(),
+        ),
+        retryable: true,
+    }
+}
+
+/// nw61n: a lexical rebuild that started and then stopped at the free-space
+/// floor. Same exit and kind as the start refusal, its own wording: the
+/// rebuild ran, kept what it committed, and the rerun resumes it.
+fn lexical_rebuild_disk_stop_cli_error(chain: &str) -> CliError {
+    CliError {
+        code: 14,
+        kind: CliErrorKind::Storage.kind_str(),
+        message: format!("index stopped the lexical rebuild because free disk space ran low: {chain}"),
+        hint: Some(
+            "Free space on the filesystem that holds the cass data directory, then rerun the same cass index command; it resumes from what this run committed. Run 'cass doctor check --json' for the headroom a rebuild needs."
                 .to_string(),
         ),
         retryable: true,
@@ -22295,6 +22316,36 @@ mod index_error_mapping_tests {
         assert_eq!(err.code, 14);
         assert_eq!(err.kind, CliErrorKind::Storage.kind_str());
         assert!(err.retryable);
+    }
+
+    /// nw61n: the indexer's own mid-rebuild stop maps to the same retryable
+    /// exit 14 / `storage` as the start refusal, with resume wording, and is
+    /// not mistaken for the start refusal (or the reverse).
+    #[test]
+    fn lexical_rebuild_disk_stop_is_retryable_and_names_the_resume() {
+        let stop = crate::indexer::lexical_rebuild_free_space_verdict(
+            1,
+            512 * 1024 * 1024,
+            Path::new("/data/cass/index"),
+        )
+        .expect_err("below the floor");
+        let chain = format!("lexical rebuild failed | {stop:#}");
+        assert!(error_chain_indicates_lexical_rebuild_disk_stop(&chain));
+        assert!(!error_chain_indicates_index_disk_headroom_blocked(&chain));
+        assert!(!error_chain_indicates_lexical_rebuild_disk_stop(
+            "canonical archive disk headroom check failed for /data: available=1 bytes, required=2 bytes"
+        ));
+        let err = lexical_rebuild_disk_stop_cli_error(&chain);
+        assert_eq!(err.code, 14);
+        assert_eq!(err.kind, CliErrorKind::Storage.kind_str());
+        assert!(err.retryable);
+        assert!(err.message.contains("/data/cass/index"), "{err:?}");
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("resumes")),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -27862,7 +27913,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_INDEX_FINALIZE_ABORT_SECS=<N>       abort grace in seconds during finalize WAL-checkpoint / rebuild-tail windows (default 1800; 0 report-only)".to_string(),
             "  CASS_INDEX_FINAL_WAL_CHECKPOINT_TIMEOUT_SECS=<N>  wall-clock budget in seconds for final wal_checkpoint(TRUNCATE) during index (default 900; 0 keeps default)".to_string(),
             "  CASS_INDEX_REDACTION=full|off            index-time secret redaction mode (default full)".to_string(),
-            "  CASS_INDEX_SKIP_DISK_HEADROOM_CHECK=1    skip free-space preflight before `cass index --full` / `--force-rebuild`".to_string(),
+            "  CASS_INDEX_SKIP_DISK_HEADROOM_CHECK=1    skip the free-space preflight before `cass index --full` / `--force-rebuild` and the rebuild's free-space floor".to_string(),
             "  CASS_INDEX_STALL_ABORT_ALL_PHASES=1      promote stall watchdog warnings to hard abort (exit 70) in all phases".to_string(),
             "  CASS_INDEX_STALL_ABORT_SECS=<N>          seconds without progress before abort-eligible lexical stall exits 70 (default 300; 0 report-only)".to_string(),
             "  CASS_INDEX_STALL_DETECT_SECS=<N>         seconds without phase progress before emitting stall diagnostics (default 120; 0 disables)".to_string(),
@@ -46321,6 +46372,11 @@ struct DoctorCoverageSummary {
     db_without_raw_mirror_count: usize,
     db_projection_only_count: usize,
     mirror_without_db_link_count: usize,
+    /// Unlinked verified manifests whose exact source bytes, at the same path
+    /// and source identity, are DB-linked through another manifest: a second
+    /// capture under a different provider slug (f3grf). Not counted in
+    /// `mirror_without_db_link_count`.
+    mirror_alias_of_linked_count: usize,
     missing_current_source_count: usize,
     sole_copy_candidate_count: usize,
     current_source_newer_than_archive_count: usize,
@@ -47487,8 +47543,12 @@ struct DoctorFullRebuildReadinessReport {
     floor_bytes: u64,
     db_bundle_bytes: u64,
     /// Live lexical bytes: what the current MANIFEST references plus the
-    /// index's own bookkeeping files. This is the figure the formula doubles.
+    /// index's own bookkeeping files.
     lexical_index_bytes: u64,
+    /// nw61n: the generation size the formula charges 9/4 of:
+    /// `lexical_index_bytes`, or `db_bundle_bytes` when no live generation
+    /// exists to size the rebuild by.
+    lexical_rebuild_basis_bytes: u64,
     /// #453: merge-retired segment files still under the lexical index. The
     /// engine's writer-open sweep reclaims them once they have been
     /// unreferenced by both MANIFEST slots for its grace period; a rebuild
@@ -47504,6 +47564,18 @@ struct DoctorFullRebuildReadinessReport {
     /// `index/.<name>.rebuild-staging/`. The next rebuild resumes into it or
     /// clears it first, so it is excluded from `required_bytes`.
     rebuild_staging_bytes: u64,
+    /// nw61n: failed-rebuild quarantine bundles under `index/` (GH #523
+    /// evidence a rebuild never rewrites), excluded from `required_bytes`;
+    /// `lexical_rebuild_quarantine` lists them with their retention verdicts.
+    quarantine_bytes: u64,
+    /// nw61n: the db growth allowance charged (`db_bundle_bytes / 16`).
+    db_growth_allowance_bytes: u64,
+    /// nw61n: whether the engine's one-time migration repair is still
+    /// pending (its `.fsqlite-migration-state` marker absent or incomplete).
+    /// Only then is the whole db bundle charged again, for the repair's
+    /// `.pre-migration-bak` copy (`migration_copy_bytes`).
+    migration_repair_pending: bool,
+    migration_copy_bytes: u64,
     /// Free bytes at the most constrained probe path (`None` when unknown).
     available_bytes: Option<u64>,
     /// `required_bytes - available_bytes` when blocked, else 0.
@@ -47614,15 +47686,36 @@ fn build_doctor_full_rebuild_readiness(
         ),
     };
     notes.push(format!(
-        "Requirement is {}: db bundle {} bytes, lexical index {} bytes, floor {} bytes.",
+        "Requirement is {}: lexical index {} bytes, db bundle {} bytes (growth allowance {} bytes{}), floor {} bytes.",
         crate::indexer::FULL_REBUILD_HEADROOM_FORMULA,
-        projection.db_bundle_bytes,
         projection.lexical_index_bytes,
+        projection.db_bundle_bytes,
+        projection.db_growth_allowance_bytes,
+        if projection.migration_repair_pending {
+            format!(
+                "; the engine's one-time migration repair is pending and keeps a copy of the whole bundle, so migration copy {} bytes",
+                projection.migration_copy_bytes
+            )
+        } else {
+            String::new()
+        },
         projection.floor_bytes
     ));
+    if projection.lexical_index_bytes == 0 && projection.lexical_rebuild_basis_bytes > 0 {
+        notes.push(format!(
+            "There is no live lexical generation to size the rebuild by, so it is sized as the db bundle ({} bytes).",
+            projection.lexical_rebuild_basis_bytes
+        ));
+    }
+    if projection.quarantine_bytes > 0 {
+        notes.push(format!(
+            "{} bytes of failed-rebuild quarantine bundles sit under index/ and are not charged; lexical_rebuild_quarantine lists them with their retention verdicts, and its next_safe_argv previews reclaiming them.",
+            projection.quarantine_bytes
+        ));
+    }
     if projection.retired_segment_bytes > 0 {
         notes.push(format!(
-            "The lexical figure counts only bytes the current MANIFEST references; {} merge-retired segment file(s) totalling {} bytes sit next to it and are not doubled. The engine unlinks them at the next `cass index` open once they have been unreferenced for its {}-second grace period (`cass index --gc` runs that sweep on its own).",
+            "The lexical figure counts only bytes the current MANIFEST references; {} merge-retired segment file(s) totalling {} bytes sit next to it and are not charged. The engine unlinks them at the next `cass index` open once they have been unreferenced for its {}-second grace period (`cass index --gc` runs that sweep on its own).",
             projection.retired_segment_files,
             projection.retired_segment_bytes,
             frankensearch::quill::DEFAULT_GARBAGE_GRACE.as_secs()
@@ -47630,7 +47723,7 @@ fn build_doctor_full_rebuild_readiness(
     }
     if projection.retained_backup_bytes > 0 {
         notes.push(format!(
-            "{} bytes of prior lexical generations are retained under index/.lexical-publish-backups/ and are not doubled either; a staged publish prunes them to the retention cap, and `cass doctor cleanup` reclaims them earlier.",
+            "{} bytes of prior lexical generations are retained under index/.lexical-publish-backups/ and are not charged either; a staged publish prunes them to the retention cap, and `cass doctor cleanup` reclaims them earlier.",
             projection.retained_backup_bytes
         ));
     }
@@ -47655,10 +47748,15 @@ fn build_doctor_full_rebuild_readiness(
         floor_bytes: projection.floor_bytes,
         db_bundle_bytes: projection.db_bundle_bytes,
         lexical_index_bytes: projection.lexical_index_bytes,
+        lexical_rebuild_basis_bytes: projection.lexical_rebuild_basis_bytes,
         retired_segment_bytes: projection.retired_segment_bytes,
         retired_segment_files: projection.retired_segment_files,
         retained_publish_backup_bytes: projection.retained_backup_bytes,
         rebuild_staging_bytes: projection.rebuild_staging_bytes,
+        quarantine_bytes: projection.quarantine_bytes,
+        db_growth_allowance_bytes: projection.db_growth_allowance_bytes,
+        migration_repair_pending: projection.migration_repair_pending,
+        migration_copy_bytes: projection.migration_copy_bytes,
         available_bytes,
         shortfall_bytes,
         probe_path,
@@ -54833,12 +54931,39 @@ fn build_doctor_coverage_summary(
         .filter(|manifest| doctor_raw_mirror_manifest_is_verified(manifest))
         .map(|manifest| manifest.db_link_count)
         .sum::<usize>();
-    let mirror_without_db_link_count = raw_mirror
+    // f3grf: pre-parse capture once filed Claude sources under the registry
+    // name `claude` while the parsed conversation used `claude_code`, leaving
+    // one unlinked manifest per Claude source in every existing archive. An
+    // unlinked manifest whose exact bytes at the same path and source are
+    // linked through another manifest preserves nothing the archive lacks.
+    let alias_key = |manifest: &DoctorRawMirrorManifestReport| {
+        (
+            manifest.source_id.clone(),
+            manifest.origin_kind.clone(),
+            manifest.origin_host.clone(),
+            manifest.original_path_blake3.clone(),
+            manifest.source_content_blake3.clone(),
+        )
+    };
+    let linked_captures: HashSet<_> = raw_mirror
+        .manifests
+        .iter()
+        .filter(|manifest| doctor_raw_mirror_manifest_is_verified(manifest))
+        .filter(|manifest| manifest.db_link_count > 0)
+        .map(alias_key)
+        .collect();
+    let (mirror_alias_of_linked_count, mirror_without_db_link_count) = raw_mirror
         .manifests
         .iter()
         .filter(|manifest| doctor_raw_mirror_manifest_is_verified(manifest))
         .filter(|manifest| manifest.db_link_count == 0)
-        .count();
+        .fold((0usize, 0usize), |(aliases, unlinked), manifest| {
+            if linked_captures.contains(&alias_key(manifest)) {
+                (aliases + 1, unlinked)
+            } else {
+                (aliases, unlinked + 1)
+            }
+        });
     let archived_message_count = backfill
         .receipts
         .iter()
@@ -54922,6 +55047,7 @@ fn build_doctor_coverage_summary(
         db_without_raw_mirror_count,
         db_projection_only_count: backfill.db_projection_only_count,
         mirror_without_db_link_count,
+        mirror_alias_of_linked_count,
         missing_current_source_count: backfill.source_missing_count,
         sole_copy_candidate_count: sole_copy_warnings.len(),
         current_source_newer_than_archive_count,
@@ -54935,6 +55061,7 @@ fn build_doctor_coverage_summary(
             "coverage_summary compares the archive DB, verified raw mirror manifests, and currently visible upstream source files without reading raw session text into robot output.".to_string(),
             "db_without_raw_mirror_count is a repair-risk signal: rebuilding only from current source files could shrink the archive.".to_string(),
             "sole_copy_candidate_count means cass-controlled storage may be the only remaining copy for those upstream-pruned conversations.".to_string(),
+            "mirror_alias_of_linked_count counts unlinked manifests whose exact source bytes at the same path are DB-linked through another manifest; they are kept and are not counted as unlinked.".to_string(),
         ],
     }
 }
@@ -82532,6 +82659,63 @@ paths = ["~/.claude/projects"]
         assert_eq!(full_meta["full_details_command"], serde_json::Value::Null);
     }
 
+    /// f3grf: archives indexed before the fix hold, for every Claude source, a
+    /// pre-parse manifest under provider `claude` beside the linked
+    /// `claude_code` one. Same bytes at the same path are not unlinked
+    /// evidence; a different file, or the same path with other bytes, is.
+    #[test]
+    fn f3grf_coverage_counts_alias_captures_apart_from_unlinked_manifests() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let sessions_dir = data_dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let claude_source = sessions_dir.join("claude-session.jsonl");
+        let claude_bytes = b"{\"type\":\"user\",\"text\":\"claude\"}\n";
+        let link = DoctorRawMirrorDbLink {
+            conversation_id: Some(1),
+            message_count: Some(2),
+            source_path: Some(claude_source.display().to_string()),
+            started_at_ms: Some(1_700_000_000_000),
+        };
+        let write = |provider: &str, path: &Path, bytes: &[u8], links| {
+            let manifest =
+                raw_mirror_test_manifest(&data_dir, provider, "local", path, bytes, links);
+            write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
+        };
+        write("claude_code", &claude_source, claude_bytes, vec![link]);
+        write("claude", &claude_source, claude_bytes, Vec::new());
+        // Unlinked evidence that must still count: the same path with older
+        // bytes, and a file no archive row names.
+        write(
+            "claude",
+            &claude_source,
+            b"{\"type\":\"user\",\"text\":\"earlier\"}\n",
+            Vec::new(),
+        );
+        write(
+            "codex",
+            &sessions_dir.join("orphan.jsonl"),
+            b"{\"type\":\"message\",\"text\":\"orphan\"}\n",
+            Vec::new(),
+        );
+        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
+        assert_eq!(raw_mirror.manifests.len(), 4);
+        let source_inventory =
+            build_doctor_source_inventory_report(&data_dir, true, None, Vec::new(), Vec::new());
+
+        let summary = build_doctor_coverage_summary(
+            &source_inventory,
+            &raw_mirror,
+            &DoctorRawMirrorBackfillReport::default(),
+            &[],
+        );
+
+        assert_eq!(summary.raw_mirror_db_link_count, 1);
+        assert_eq!(summary.mirror_alias_of_linked_count, 1);
+        assert_eq!(summary.mirror_without_db_link_count, 2);
+        assert!(summary.coverage_reducing_live_source_rebuild_refused);
+    }
+
     #[test]
     fn doctor_coverage_summary_classifies_ledger_gaps_and_confidence_tiers() {
         let temp = tempfile::TempDir::new().expect("tempdir");
@@ -105590,6 +105774,7 @@ fn response_schema_doctor_coverage_summary() -> serde_json::Value {
             "db_without_raw_mirror_count": { "type": "integer" },
             "db_projection_only_count": { "type": "integer" },
             "mirror_without_db_link_count": { "type": "integer" },
+            "mirror_alias_of_linked_count": { "type": "integer" },
             "missing_current_source_count": { "type": "integer" },
             "sole_copy_candidate_count": { "type": "integer" },
             "current_source_newer_than_archive_count": { "type": "integer" },
@@ -109975,10 +110160,12 @@ mod response_schema_tests {
         );
     }
 
-    /// GH#442 reproduction shape: a 100 GiB (sparse) archive projects a
-    /// 200 GiB requirement, and doctor reports it blocked against the free
-    /// space the indexer's refusal named, even though the 1 GiB general
-    /// pressure floor is satisfied.
+    /// GH#442 reproduction shape: a 100 GiB (sparse) archive with no engine
+    /// migration marker and no lexical index projects a 331.25 GiB
+    /// requirement (a rebuild sized as the bundle, 9/4 of it, plus one copy
+    /// for the pending migration repair and the 1/16 growth allowance; nw61n), and
+    /// doctor reports it blocked against the free space the indexer's refusal
+    /// named, even though the 1 GiB general pressure floor is satisfied.
     #[test]
     fn doctor_full_rebuild_readiness_reports_the_indexer_refusal_numbers() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -109990,7 +110177,13 @@ mod response_schema_tests {
         drop(db);
 
         let projection = crate::indexer::full_rebuild_headroom_projection(root, &db_path);
-        assert_eq!(projection.required_bytes, 214_748_364_800);
+        assert!(projection.migration_repair_pending);
+        assert_eq!(projection.lexical_index_bytes, 0);
+        assert_eq!(
+            projection.lexical_rebuild_basis_bytes,
+            projection.db_bundle_bytes
+        );
+        assert_eq!(projection.required_bytes, 355_676_979_200);
 
         let available = 45_252_415_488_u64;
         let report = build_doctor_storage_pressure_report(
@@ -110009,9 +110202,21 @@ mod response_schema_tests {
         assert_eq!(report.low_disk_risk, "none");
         let readiness = &report.full_rebuild_readiness;
         assert_eq!(readiness.status, "blocked");
-        assert_eq!(readiness.required_bytes, 214_748_364_800);
+        assert_eq!(readiness.required_bytes, 355_676_979_200);
         assert_eq!(readiness.available_bytes, Some(available));
-        assert_eq!(readiness.shortfall_bytes, 214_748_364_800 - available);
+        assert_eq!(readiness.shortfall_bytes, 355_676_979_200 - available);
+        assert_eq!(
+            readiness.lexical_rebuild_basis_bytes,
+            projection.db_bundle_bytes
+        );
+        assert!(
+            readiness
+                .notes
+                .iter()
+                .any(|note| note.starts_with("There is no live lexical generation")),
+            "{:?}",
+            readiness.notes
+        );
 
         let json = serde_json::to_value(&report).expect("serialize storage pressure");
         assert_eq!(json["schema_version"], 4);
@@ -110021,7 +110226,7 @@ mod response_schema_tests {
         );
         assert_eq!(
             json["full_rebuild_readiness"]["required_bytes"].as_u64(),
-            Some(214_748_364_800)
+            Some(355_676_979_200)
         );
         assert_eq!(
             json["full_rebuild_readiness"]["formula"].as_str(),
@@ -110039,10 +110244,15 @@ mod response_schema_tests {
             floor_bytes: 512 * 1024 * 1024,
             db_bundle_bytes: 11_900_000_000,
             lexical_index_bytes: 6_800_000_000,
+            lexical_rebuild_basis_bytes: 6_800_000_000,
             retired_segment_bytes: 4_200_000_000,
             retired_segment_files: 1_642,
             retained_backup_bytes: 6_400_000_000,
             rebuild_staging_bytes: 32_000_000_000,
+            quarantine_bytes: 34_600_000_000,
+            db_growth_allowance_bytes: 11_900_000_000 / 16,
+            migration_repair_pending: false,
+            migration_copy_bytes: 0,
         };
         let root = PathBuf::from("/probe");
         let blocked = build_doctor_full_rebuild_readiness(
@@ -110087,6 +110297,24 @@ mod response_schema_tests {
             staging_note.contains("subtracted from the requirement"),
             "{staging_note}"
         );
+        let quarantine_note = blocked
+            .notes
+            .iter()
+            .find(|note| note.contains("quarantine bundles"))
+            .expect("quarantine note (nw61n)");
+        assert!(
+            quarantine_note.contains("34600000000 bytes"),
+            "{quarantine_note}"
+        );
+        assert!(quarantine_note.contains("not charged"), "{quarantine_note}");
+        assert!(
+            blocked
+                .notes
+                .iter()
+                .all(|note| !note.starts_with("There is no live lexical generation")),
+            "a live index sizes the rebuild: {:?}",
+            blocked.notes
+        );
         assert!(
             blocked
                 .notes
@@ -110104,6 +110332,11 @@ mod response_schema_tests {
             Some(6_400_000_000)
         );
         assert_eq!(json["rebuild_staging_bytes"].as_u64(), Some(32_000_000_000));
+        assert_eq!(json["quarantine_bytes"].as_u64(), Some(34_600_000_000));
+        assert_eq!(
+            json["lexical_rebuild_basis_bytes"].as_u64(),
+            Some(6_800_000_000)
+        );
 
         // With nothing reclaimable the notes stay exactly the two-line shape
         // the robot goldens pin.
@@ -110113,6 +110346,7 @@ mod response_schema_tests {
                 retired_segment_files: 0,
                 retained_backup_bytes: 0,
                 rebuild_staging_bytes: 0,
+                quarantine_bytes: 0,
                 ..projection
             },
             vec![(root, Ok(37_000_000_000))],
@@ -115468,6 +115702,9 @@ fn run_index_with_data(
             }
             if error_chain_indicates_index_disk_headroom_blocked(&chain) {
                 return index_disk_headroom_cli_error(&chain);
+            }
+            if error_chain_indicates_lexical_rebuild_disk_stop(&chain) {
+                return lexical_rebuild_disk_stop_cli_error(&chain);
             }
             if error_chain_indicates_orphan_fk_cleanup_blocked(&chain) {
                 return index_orphan_fk_cleanup_cli_error(&chain);
@@ -124874,6 +125111,33 @@ fn run_timeline(
             fmt
         }
     });
+
+    // GH#521: serialize borrowed summaries directly, rather than cloning all
+    // selected title/path strings into a second JSON Value tree. Keep the
+    // other robot formats on their existing projection/formatting path.
+    if let Some(fmt) = structured_format
+        && matches!(fmt, RobotFormat::Json | RobotFormat::Compact)
+    {
+        let stdout = std::io::stdout();
+        let mut writer = std::io::BufWriter::new(stdout.lock());
+        timeline_json::write(
+            &mut writer,
+            &sessions,
+            start_ts,
+            end_ts,
+            group_by,
+            matches!(fmt, RobotFormat::Json),
+        )
+        .and_then(|()| writer.flush())
+        .map_err(|error| CliError {
+            code: 9,
+            kind: CliErrorKind::EncodeJson.kind_str(),
+            message: format!("failed to write structured output: {error}"),
+            hint: None,
+            retryable: false,
+        })?;
+        return Ok(());
+    }
 
     if let Some(fmt) = structured_format {
         let output = match group_by {

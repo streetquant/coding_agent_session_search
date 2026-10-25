@@ -21722,7 +21722,10 @@ fn ensure_index_storage_headroom(
         return Ok(());
     }
 
-    let required = required_index_headroom_bytes(data_dir, db_path, requirement);
+    let projection = index_headroom_projection(data_dir, db_path, requirement);
+    let required = projection.map_or(INDEX_MIN_FREE_SPACE_BYTES, |projection| {
+        projection.required_bytes
+    });
     for probe_path in existing_headroom_probe_paths(data_dir, db_path) {
         let available = fs2::available_space(&probe_path).with_context(|| {
             format!(
@@ -21736,16 +21739,163 @@ fn ensure_index_storage_headroom(
 
         return Err(anyhow::anyhow!(
             "canonical archive disk headroom check failed for {}: available={} bytes, required={} bytes. \
-             Free space before running cass index so SQLite, WAL, and lexical scratch writes cannot fail mid-commit.{} \
+             Free space before running cass index so SQLite, WAL, and lexical scratch writes cannot fail mid-commit.{}{} \
              Run 'cass doctor check --json' for a read-only health report.",
             probe_path.display(),
             available,
             required,
+            projection
+                .map(|projection| full_rebuild_refusal_terms(data_dir, &probe_path, &projection))
+                .unwrap_or_default(),
             raw_mirror_headroom_note(data_dir, &probe_path)
         ));
     }
 
     Ok(())
+}
+
+/// What a full-rebuild refusal says beyond the two numbers (nw61n): the rule
+/// and the terms it charged, and, on the data dir's filesystem, the space cass
+/// can give back without touching the live index. Merge-retired segments,
+/// retained publish backups and failed-rebuild quarantine bundles are not
+/// charged, so freeing them raises the available side only. The quarantine
+/// inventory is a bounded metadata scan, run only on this refusal path.
+fn full_rebuild_refusal_terms(
+    data_dir: &Path,
+    probe_path: &Path,
+    projection: &FullRebuildHeadroomProjection,
+) -> String {
+    let mut terms = format!(
+        " The requirement is {FULL_REBUILD_HEADROOM_FORMULA}: lexical index {} bytes, \
+         staged generation credit {} bytes, db bundle {} bytes (growth allowance {} bytes), \
+         floor {} bytes.",
+        projection.lexical_index_bytes,
+        projection.rebuild_staging_bytes,
+        projection.db_bundle_bytes,
+        projection.db_growth_allowance_bytes,
+        projection.floor_bytes
+    );
+    if projection.lexical_index_bytes == 0 && projection.lexical_rebuild_basis_bytes > 0 {
+        terms.push_str(&format!(
+            " There is no live lexical generation to size the rebuild by, so it is sized as \
+             the db bundle ({} bytes).",
+            projection.lexical_rebuild_basis_bytes
+        ));
+    }
+    if projection.migration_repair_pending {
+        terms.push_str(&format!(
+            " It includes {} bytes for the engine's one-time migration repair, which is still \
+             pending for this archive and keeps a copy of the whole db bundle while it runs.",
+            projection.migration_copy_bytes
+        ));
+    }
+    let probes_data_dir = nearest_existing_path(data_dir)
+        .is_some_and(|data_dir_probe| same_headroom_probe_path(&data_dir_probe, probe_path));
+    if !probes_data_dir {
+        return terms;
+    }
+    if projection.retired_segment_bytes > 0 {
+        terms.push_str(&format!(
+            " {} bytes of merge-retired lexical segments are reclaimable: 'cass index --gc' \
+             removes them once no published generation has referenced them for the engine's \
+             grace period.",
+            projection.retired_segment_bytes
+        ));
+    }
+    if projection.retained_backup_bytes > 0 {
+        terms.push_str(&format!(
+            " {} bytes of prior lexical generations under index/.lexical-publish-backups/ are \
+             reclaimable with 'cass doctor cleanup'.",
+            projection.retained_backup_bytes
+        ));
+    }
+    if let Ok(inventory) = crate::search::lexical_quarantine::inspect(data_dir)
+        && inventory.total_bytes > 0
+    {
+        terms.push_str(&format!(
+            " Failed-rebuild quarantine bundles hold {} bytes, {} of them eligible under the \
+             retention policy; 'cass lexical-quarantine --data-dir {} --plan --json' previews \
+             reclaiming them.",
+            inventory.total_bytes,
+            inventory.eligible_bytes,
+            data_dir.display()
+        ));
+    }
+    terms
+}
+
+/// Marker the CLI matches to report a rebuild that stopped for disk space
+/// (exit 14, kind `storage`, retryable).
+pub(crate) const LEXICAL_REBUILD_DISK_STOP_MARKER: &str =
+    "lexical rebuild stopped: free disk space fell below the floor";
+
+/// Stop an authoritative lexical rebuild, keeping what it has committed, once
+/// free space where it writes falls below the preflight floor (nw61n). The
+/// preflight sizes the whole run from measurements; this catches a short
+/// projection before the filesystem fills, which is how the July trj rebuild
+/// failed (`disk I/O error (10)` with the root filesystem at 0 bytes). It runs
+/// before each commit, at the progress heartbeat and before the terminal
+/// commit, so one commit can still write past the floor; it is a backstop, not
+/// a reservation. `CASS_INDEX_SKIP_DISK_HEADROOM_CHECK` disables it with the
+/// preflight.
+fn ensure_lexical_rebuild_free_space(build_path: &Path) -> Result<()> {
+    if index_disk_headroom_check_disabled() {
+        return Ok(());
+    }
+    let Some(probe_path) = nearest_existing_path(build_path) else {
+        return Ok(());
+    };
+    let available = fs2::available_space(&probe_path).with_context(|| {
+        format!(
+            "checking free disk space for the lexical rebuild at {}",
+            probe_path.display()
+        )
+    })?;
+    lexical_rebuild_free_space_verdict(available, INDEX_MIN_FREE_SPACE_BYTES, &probe_path)
+}
+
+pub(crate) fn lexical_rebuild_free_space_verdict(
+    available: u64,
+    floor: u64,
+    probe_path: &Path,
+) -> Result<()> {
+    if available >= floor {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "{LEXICAL_REBUILD_DISK_STOP_MARKER} at {}: available={available} bytes, floor={floor} bytes. \
+         The live lexical index is unchanged, and what this rebuild committed stays in its staged \
+         generation; free space, then rerun the same cass index command to resume. Run \
+         'cass doctor check --json' for the headroom a rebuild needs.",
+        probe_path.display()
+    ))
+}
+
+/// Whether the post-rebuild fold (one `force_merge` over the staged
+/// generation) fits: it writes about as much as the generation holds while the
+/// inputs stay on disk. When it does not, the rebuild publishes the unmerged
+/// generation, which is what a failed fold already does (#441).
+fn lexical_rebuild_fold_fits(available: u64, generation_bytes: u64, floor: u64) -> bool {
+    available >= generation_bytes.saturating_add(floor)
+}
+
+/// Why the post-rebuild fold of `build_path` does not fit, or `None` when it
+/// does (or the headroom checks are disabled, or space cannot be read).
+fn lexical_rebuild_fold_shortfall(build_path: &Path) -> Option<String> {
+    if index_disk_headroom_check_disabled() {
+        return None;
+    }
+    let probe_path = nearest_existing_path(build_path)?;
+    let available = fs2::available_space(&probe_path).ok()?;
+    let generation_bytes = directory_size_bytes_best_effort(build_path);
+    (!lexical_rebuild_fold_fits(available, generation_bytes, INDEX_MIN_FREE_SPACE_BYTES)).then(
+        || {
+            format!(
+                "available={available} bytes at {}, generation={generation_bytes} bytes, floor={INDEX_MIN_FREE_SPACE_BYTES} bytes",
+                probe_path.display()
+            )
+        },
+    )
 }
 
 /// The raw mirror sits in the data dir and is the one large store there that
@@ -21842,26 +21992,55 @@ fn nearest_existing_path(path: &Path) -> Option<PathBuf> {
 /// Directory holding the lexical (Tantivy) index, relative to the data dir.
 const LEXICAL_INDEX_ROOT_DIR: &str = "index";
 
+/// The full-rebuild projection a requirement is checked against; the
+/// incremental requirement is the bare floor and has none.
+fn index_headroom_projection(
+    data_dir: &Path,
+    db_path: &Path,
+    requirement: IndexStorageHeadroomRequirement,
+) -> Option<FullRebuildHeadroomProjection> {
+    match requirement {
+        IndexStorageHeadroomRequirement::IncrementalStartup => None,
+        IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild => {
+            Some(full_rebuild_headroom_projection(data_dir, db_path))
+        }
+    }
+}
+
+#[cfg(test)]
 fn required_index_headroom_bytes(
     data_dir: &Path,
     db_path: &Path,
     requirement: IndexStorageHeadroomRequirement,
 ) -> u64 {
-    match requirement {
-        IndexStorageHeadroomRequirement::IncrementalStartup => INDEX_MIN_FREE_SPACE_BYTES,
-        IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild => {
-            full_rebuild_headroom_projection(data_dir, db_path).required_bytes
-        }
-    }
+    index_headroom_projection(data_dir, db_path, requirement)
+        .map_or(INDEX_MIN_FREE_SPACE_BYTES, |projection| {
+            projection.required_bytes
+        })
 }
 
 /// Human-readable statement of the full-rebuild headroom rule, reported by
 /// `doctor` next to the numbers so an agent can see *why* a rebuild is
 /// blocked. Keep in sync with [`full_rebuild_headroom_projection`].
-/// `lexical_index_bytes` is the LIVE lexical footprint (see
-/// [`LexicalIndexFootprint::live_bytes`]).
-pub(crate) const FULL_REBUILD_HEADROOM_FORMULA: &str =
-    "max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2 - rebuild_staging_bytes)";
+/// `lexical_rebuild_basis_bytes` is the LIVE lexical footprint (see
+/// [`LexicalIndexFootprint::live_bytes`]), or the db bundle when there is no
+/// live generation; `migration_copy_bytes` is the db bundle while the engine's
+/// one-time migration repair is pending, else 0.
+pub(crate) const FULL_REBUILD_HEADROOM_FORMULA: &str = "max(512 MiB, lexical_rebuild_basis_bytes * 9 / 4 - rebuild_staging_bytes + db_bundle_bytes / 16 + migration_copy_bytes), where lexical_rebuild_basis_bytes is lexical_index_bytes, or db_bundle_bytes when no live lexical generation exists";
+
+/// What a lexical rebuild writes per live lexical byte, as a fraction: the new
+/// generation's segments plus the post-run fold that rewrites them into one
+/// segment while the inputs are still on disk. Measured 2,821 MiB written for
+/// 1,329 MiB live (2.12x) rebuilding a 256k-message archive (nw61n,
+/// 2026-10-23); 9/4 keeps a margin over that.
+const LEXICAL_REBUILD_BYTES_PER_LIVE_BYTE: (u64, u64) = (9, 4);
+
+/// The db bundle's growth a rebuild or full rescan is charged for (WAL and the
+/// rows a rescan inserts), as a divisor of the bundle. The same measurement
+/// saw no growth for `--force-rebuild` or for a `--full` rescan of an
+/// unchanged archive; the July trj rebuild (25 GB db) wrote about 1 GB beyond
+/// twice its lexical index.
+const REBUILD_DB_GROWTH_DIVISOR: u64 = 16;
 
 /// The inputs and result of the full-rebuild headroom rule, so `doctor` can
 /// report the same requirement `index --full` / `--force-rebuild` enforces.
@@ -21876,6 +22055,9 @@ pub(crate) struct FullRebuildHeadroomProjection {
     /// Live on-disk size of the lexical index tree: the bytes a rebuild has
     /// to write a second copy of ([`LexicalIndexFootprint::live_bytes`]).
     pub(crate) lexical_index_bytes: u64,
+    /// The generation size the rule charges for: `lexical_index_bytes`, or
+    /// `db_bundle_bytes` when no live generation exists to size it by.
+    pub(crate) lexical_rebuild_basis_bytes: u64,
     /// Merge-retired segment files still on disk under the lexical index
     /// ([`LexicalIndexFootprint::retired_segment_bytes`]). Already consumed,
     /// reclaimed by the engine, never rewritten by a rebuild: excluded from
@@ -21894,13 +22076,26 @@ pub(crate) struct FullRebuildHeadroomProjection {
     /// for: they are subtracted from `required_bytes` (GH #496: doubling them
     /// locked a failed large rebuild out of its retry; GH #498 left 32 GB).
     pub(crate) rebuild_staging_bytes: u64,
+    /// Failed-rebuild quarantine bundles under `index/`
+    /// ([`LexicalIndexFootprint::quarantine_bytes`]): evidence a rebuild
+    /// never rewrites; excluded from `required_bytes`.
+    pub(crate) quarantine_bytes: u64,
+    /// The db growth allowance charged (`db_bundle_bytes / 16`).
+    pub(crate) db_growth_allowance_bytes: u64,
+    /// Whether the engine's one-time migration repair is still pending for
+    /// the archive (its `.fsqlite-migration-state` marker is absent or
+    /// incomplete). That repair keeps a `.pre-migration-bak` copy of the
+    /// whole bundle, so only then is the bundle charged a second time.
+    pub(crate) migration_repair_pending: bool,
+    /// `db_bundle_bytes` while `migration_repair_pending`, else 0.
+    pub(crate) migration_copy_bytes: u64,
 }
 
 /// Single source of truth for the authoritative (full) rebuild headroom rule.
 ///
-/// An authoritative rebuild writes a *second* full lexical index (plus staged
-/// shard/merge scratch) while the existing one is still on disk, so the db
-/// bundle alone badly under-projects the requirement.
+/// An authoritative rebuild writes a *second* full lexical index (plus the
+/// fold that rewrites it into one segment) while the existing one is still on
+/// disk, so the db bundle alone badly under-projects the requirement.
 ///
 /// Sizing this as `db_bundle * 2` (the pre-2026-07 formula) let a real
 /// rebuild run a filesystem to 0 bytes: on a host with a 25 GB db and a
@@ -21908,6 +22103,16 @@ pub(crate) struct FullRebuildHeadroomProjection {
 /// free, then consumed ~115 GB and died on `disk I/O error (10)`.
 /// Counting the lexical index makes that case fail the preflight
 /// instead of failing mid-commit.
+///
+/// The db is charged for what touches it (nw61n). A lexical rebuild of a
+/// migrated archive reads it and writes almost nothing there: rebuilding a
+/// 3.0 GB db / 1.3 GiB-live archive used 2.8 GB, all lexical, while
+/// `db * 2 + lexical * 2` demanded 9.1 GB and refused a `--full` that then
+/// wrote nothing. So the bundle is charged a growth allowance, plus one
+/// whole copy only while the engine's one-time migration repair (which keeps
+/// a `.pre-migration-bak` copy) is pending. The rebuild itself stops at the
+/// free-space floor rather than filling the disk if the projection is short
+/// ([`ensure_lexical_rebuild_free_space`]).
 ///
 /// Only the LIVE lexical bytes count (#453). Merge-retired segment files the
 /// MANIFEST no longer references and prior generations parked under
@@ -21923,25 +22128,63 @@ pub(crate) fn full_rebuild_headroom_projection(
     db_path: &Path,
 ) -> FullRebuildHeadroomProjection {
     let db_bundle_bytes = database_bundle_size_bytes(db_path);
-    let footprint = lexical_index_footprint(data_dir);
+    let migration_repair_pending =
+        db_path.is_file() && !crate::storage::sqlite::index_engine_migration_is_complete(db_path);
+    full_rebuild_headroom_projection_from(
+        db_bundle_bytes,
+        lexical_index_footprint(data_dir),
+        migration_repair_pending,
+    )
+}
+
+/// The rule of [`full_rebuild_headroom_projection`] over measured inputs.
+fn full_rebuild_headroom_projection_from(
+    db_bundle_bytes: u64,
+    footprint: LexicalIndexFootprint,
+    migration_repair_pending: bool,
+) -> FullRebuildHeadroomProjection {
+    let (per_live_num, per_live_den) = LEXICAL_REBUILD_BYTES_PER_LIVE_BYTE;
+    // With no live generation to size it by (the index was deleted, or only
+    // backups, staging or quarantine are left), a repair still writes a whole
+    // generation: size it as the db bundle. Measured generations were 0.44x
+    // (nw61n fixture) and 0.96x (ts1) of their bundle, so this over-provisions
+    // rather than projecting the floor for a full rebuild.
+    let lexical_rebuild_basis_bytes = if footprint.live_bytes > 0 {
+        footprint.live_bytes
+    } else {
+        db_bundle_bytes
+    };
+    let lexical_rebuild_bytes =
+        lexical_rebuild_basis_bytes.saturating_mul(per_live_num) / per_live_den;
+    let db_growth_allowance_bytes = db_bundle_bytes / REBUILD_DB_GROWTH_DIVISOR;
+    let migration_copy_bytes = if migration_repair_pending {
+        db_bundle_bytes
+    } else {
+        0
+    };
     // A leftover staged generation occupies disk the rebuild gets back: a
     // resume continues writing into it, and a from-zero restart clears it
     // before writing. Either way the new generation's bytes already on disk
     // (or about to be freed) are not needed a second time, so they are
-    // credited against the requirement rather than merely left out of it.
-    let projected = db_bundle_bytes
-        .saturating_mul(2)
-        .saturating_add(footprint.live_bytes.saturating_mul(2))
-        .saturating_sub(footprint.rebuild_staging_bytes);
+    // credited against the lexical charge rather than merely left out of it.
+    let projected = lexical_rebuild_bytes
+        .saturating_sub(footprint.rebuild_staging_bytes)
+        .saturating_add(db_growth_allowance_bytes)
+        .saturating_add(migration_copy_bytes);
     FullRebuildHeadroomProjection {
         required_bytes: INDEX_MIN_FREE_SPACE_BYTES.max(projected),
         floor_bytes: INDEX_MIN_FREE_SPACE_BYTES,
         db_bundle_bytes,
         lexical_index_bytes: footprint.live_bytes,
+        lexical_rebuild_basis_bytes,
         retired_segment_bytes: footprint.retired_segment_bytes,
         retired_segment_files: footprint.retired_segment_files,
         retained_backup_bytes: footprint.retained_backup_bytes,
         rebuild_staging_bytes: footprint.rebuild_staging_bytes,
+        quarantine_bytes: footprint.quarantine_bytes,
+        db_growth_allowance_bytes,
+        migration_repair_pending,
+        migration_copy_bytes,
     }
 }
 
@@ -21970,6 +22213,12 @@ pub(crate) struct LexicalIndexFootprint {
     /// resumes into it or clears it before starting over, so a rebuild never
     /// writes it a second time (GH #496).
     pub(crate) rebuild_staging_bytes: u64,
+    /// Everything under a failed rebuild's quarantine bundle (or an
+    /// interrupted reclaim of one) beneath `index/`, GH #523: evidence a
+    /// rebuild never rewrites, retired by retention and `cass
+    /// lexical-quarantine` (nw61n; ts1 held 34.6 GB of it, which the rule
+    /// had been charging as live).
+    pub(crate) quarantine_bytes: u64,
 }
 
 impl LexicalIndexFootprint {
@@ -21980,6 +22229,7 @@ impl LexicalIndexFootprint {
             .saturating_add(self.retired_segment_bytes)
             .saturating_add(self.retained_backup_bytes)
             .saturating_add(self.rebuild_staging_bytes)
+            .saturating_add(self.quarantine_bytes)
     }
 }
 
@@ -22096,9 +22346,10 @@ pub fn run_lexical_segment_gc(data_dir: &Path) -> Result<LexicalSegmentGcReport>
 pub(crate) fn lexical_index_footprint(data_dir: &Path) -> LexicalIndexFootprint {
     let mut footprint = LexicalIndexFootprint::default();
     // (path, whether an ancestor is the retained-backups directory, whether
-    // an ancestor is a staged rebuild's scratch generation)
-    let mut stack = vec![(data_dir.join(LEXICAL_INDEX_ROOT_DIR), false, false)];
-    while let Some((path, in_backups, in_staging)) = stack.pop() {
+    // an ancestor is a staged rebuild's scratch generation, whether an
+    // ancestor is a failed rebuild's quarantine bundle)
+    let mut stack = vec![(data_dir.join(LEXICAL_INDEX_ROOT_DIR), false, false, false)];
+    while let Some((path, in_backups, in_staging, in_quarantine)) = stack.pop() {
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
             continue;
         };
@@ -22114,6 +22365,9 @@ pub(crate) fn lexical_index_footprint(data_dir: &Path) -> LexicalIndexFootprint 
                 footprint.rebuild_staging_bytes = footprint
                     .rebuild_staging_bytes
                     .saturating_add(metadata.len());
+            } else if in_quarantine {
+                footprint.quarantine_bytes =
+                    footprint.quarantine_bytes.saturating_add(metadata.len());
             } else {
                 footprint.live_bytes = footprint.live_bytes.saturating_add(metadata.len());
             }
@@ -22131,8 +22385,14 @@ pub(crate) fn lexical_index_footprint(data_dir: &Path) -> LexicalIndexFootprint 
             || path
                 .file_name()
                 .is_some_and(is_lexical_rebuild_staging_dir_name);
-        // Backups and staging are counted whole, never split by a MANIFEST.
-        let quill = if in_backups || in_staging {
+        let in_quarantine = in_quarantine
+            || path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(crate::search::lexical_quarantine::is_bundle_name);
+        // Backups, staging and quarantine are counted whole, never split by a
+        // MANIFEST.
+        let quill = if in_backups || in_staging || in_quarantine {
             None
         } else {
             crate::search::quill_bridge::quill_directory_footprint(&path)
@@ -22154,7 +22414,7 @@ pub(crate) fn lexical_index_footprint(data_dir: &Path) -> LexicalIndexFootprint 
             if quill.is_some() && !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                 continue;
             }
-            stack.push((entry.path(), in_backups, in_staging));
+            stack.push((entry.path(), in_backups, in_staging, in_quarantine));
         }
     }
     footprint
@@ -25498,6 +25758,7 @@ fn rebuild_tantivy_from_db_once(
                     commit_interval_messages,
                     commit_interval_message_bytes,
                 ) {
+                    ensure_lexical_rebuild_free_space(&build_path)?;
                     flush_streamed_lexical_rebuild_batch(
                         &mut pending_batch,
                         &mut pending_batch_message_count,
@@ -25613,6 +25874,7 @@ fn rebuild_tantivy_from_db_once(
                             pending_batch_message_bytes,
                         ),
                     );
+                    ensure_lexical_rebuild_free_space(&build_path)?;
                     persist_pending_lexical_rebuild_progress(
                         &index_path,
                         &build_path,
@@ -25949,6 +26211,7 @@ fn rebuild_tantivy_from_db_once(
     // one. The merge is a Q1-preserving concat behind an atomic MANIFEST
     // publish, so a failure leaves the (valid, merely unmerged) generation in
     // place and is logged rather than failing a completed rebuild.
+    ensure_lexical_rebuild_free_space(&build_path)?;
     let publication = lexical_publish::Finalization::new(
         &index_path,
         &build_path,
@@ -25964,6 +26227,15 @@ fn rebuild_tantivy_from_db_once(
         tracing::warn!(
             segments = t_index.segment_count(),
             "post-rebuild segment merge skipped by CASS_TEST_SKIP_POST_RUN_LEXICAL_MAINTENANCE (test hook)"
+        );
+    } else if let Some(shortfall) = lexical_rebuild_fold_shortfall(&build_path) {
+        // nw61n: the fold rewrites the whole generation while its inputs stay
+        // on disk. Without room for that, publish the unmerged generation, as
+        // a failed fold already does, instead of filling the filesystem.
+        tracing::warn!(
+            segments = t_index.segment_count(),
+            shortfall = %shortfall,
+            "skipping the post-rebuild segment fold for lack of disk space; publishing the unmerged generation (#441)"
         );
     } else {
         match t_index.force_merge() {
@@ -32044,6 +32316,11 @@ fn capture_connector_sources_before_parse(
     since_ts: Option<i64>,
     active_source_filter: &ActiveSessionSourceFilter,
 ) -> (ConnectorIngestRun, bool) {
+    // f3grf: raw-mirror captures use the slug the parsed conversations carry
+    // (the manifest id hashes the provider). Under the registry name, `claude`
+    // sources got a second manifest that no DB link ever reached. Diagnostics
+    // keep the registry name.
+    let mirror_provider = crate::connectors::archive_provider_slug(provider);
     let mut active_source_skipped = false;
     let (observed_sources, discovery_error) = match connector.discover_source_files(ctx) {
         Ok(sources) if !sources.is_empty() => {
@@ -32067,7 +32344,7 @@ fn capture_connector_sources_before_parse(
                         active_source_skipped = true;
                         continue;
                     }
-                    capture_discovered_source_file_before_parse(data_dir, provider, &source);
+                    capture_discovered_source_file_before_parse(data_dir, mirror_provider, &source);
                     observed_sources.push(source);
                 }
                 if batch_empty {
@@ -32080,7 +32357,7 @@ fn capture_connector_sources_before_parse(
             for root in fallback_roots {
                 active_source_skipped |= capture_scan_sources_before_parse(
                     data_dir,
-                    provider,
+                    mirror_provider,
                     root,
                     since_ts,
                     active_source_filter,
@@ -32097,7 +32374,7 @@ fn capture_connector_sources_before_parse(
             for root in fallback_roots {
                 active_source_skipped |= capture_scan_sources_before_parse(
                     data_dir,
-                    provider,
+                    mirror_provider,
                     root,
                     since_ts,
                     active_source_filter,
@@ -40611,6 +40888,69 @@ mod tests {
         assert_eq!(
             std::fs::read(&source_path).expect("source remains untouched"),
             source_bytes
+        );
+    }
+
+    /// f3grf: the Claude connector registers as `claude` and its conversations
+    /// are `claude_code`. Pre-parse capture under the registry name filed a
+    /// second manifest for every Claude source, which no DB link reached, and
+    /// doctor reported a critical coverage finding on a fresh install.
+    #[test]
+    fn f3grf_claude_preparse_and_parsed_captures_share_one_manifest() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let provider_root = temp.path().join("projects");
+        std::fs::create_dir_all(&provider_root).expect("provider root");
+        let source_path = provider_root.join("session.jsonl");
+        std::fs::write(&source_path, b"{\"type\":\"user\"}\n").expect("write source");
+        let root = ScanRoot::local(provider_root);
+        let connector = FailingDiscoveryConnector {
+            sources: vec![discovered_test_source(
+                &root,
+                source_path.clone(),
+                crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+            )],
+        };
+        let ctx =
+            crate::connectors::ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
+        capture_connector_sources_before_parse(
+            &connector,
+            &ctx,
+            &data_dir,
+            "claude",
+            &[],
+            None,
+            &ActiveSessionSourceFilter::default(),
+        );
+
+        let mut conv = NormalizedConversation {
+            agent_slug: "claude_code".to_string(),
+            external_id: Some("f3grf-session".to_string()),
+            title: None,
+            workspace: None,
+            source_path: source_path.clone(),
+            started_at: Some(1_733_000_000_000),
+            ended_at: Some(1_733_000_000_100),
+            metadata: serde_json::json!({}),
+            messages: Vec::new(),
+        };
+        inject_provenance(&mut conv, &Origin::local());
+        attach_raw_mirror_capture(&data_dir, &mut conv);
+
+        let manifests = raw_mirror_manifest_values(&data_dir);
+        let providers: Vec<_> = manifests
+            .iter()
+            .map(|manifest| manifest["provider"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            providers,
+            vec!["claude_code"],
+            "one Claude source must leave one manifest, under the archive slug"
+        );
+        assert_eq!(
+            conv.metadata["cass"]["raw_mirror"]["manifest_id"].as_str(),
+            manifests[0]["manifest_id"].as_str(),
+            "the parsed conversation must reuse the pre-parse manifest that DB links will reach"
         );
     }
 
@@ -53431,40 +53771,46 @@ mod tests {
         let db_path = data_dir.join("agent_search.db");
         // Fixtures must clear INDEX_MIN_FREE_SPACE_BYTES (512 MiB), otherwise the
         // floor dominates both sides and the lexical contribution is invisible.
-        // Sparse `set_len` keeps this cheap.
+        // An unmigrated 640 MiB db is charged 640 + 40 MiB. Sparse `set_len`
+        // keeps this cheap.
         std::fs::File::create(&db_path)
             .unwrap()
-            .set_len(300 * 1024 * 1024)
+            .set_len(640 * 1024 * 1024)
             .unwrap();
 
-        let without_index = required_index_headroom_bytes(
-            &data_dir,
-            &db_path,
-            IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
+        let db_bytes = 640 * 1024 * 1024;
+        let required = || {
+            required_index_headroom_bytes(
+                &data_dir,
+                &db_path,
+                IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
+            )
+        };
+
+        // No live generation yet: the rebuild is sized as the db bundle.
+        assert_eq!(
+            required(),
+            expected_rebuild_requirement(db_bytes, db_bytes, 0, true)
         );
 
-        // A rebuild must also make room for a second copy of the lexical index.
+        // With a live index, the rebuild is sized by it, and a larger index
+        // raises the requirement by 9/4 of the difference (nw61n).
         let index_dir = data_dir.join(LEXICAL_INDEX_ROOT_DIR).join("seg");
         std::fs::create_dir_all(&index_dir).unwrap();
-        std::fs::File::create(index_dir.join("0.store"))
-            .unwrap()
-            .set_len(200 * 1024 * 1024)
-            .unwrap();
-
-        let with_index = required_index_headroom_bytes(
-            &data_dir,
-            &db_path,
-            IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
+        let store = std::fs::File::create(index_dir.join("0.store")).unwrap();
+        store.set_len(200 * 1024 * 1024).unwrap();
+        let with_index = required();
+        assert_eq!(
+            with_index,
+            expected_rebuild_requirement(db_bytes, 200 * 1024 * 1024, 0, true)
         );
-
-        assert!(
-            with_index > without_index,
-            "lexical index size must raise the rebuild headroom requirement \
-             (without={without_index}, with={with_index})"
+        store.set_len(400 * 1024 * 1024).unwrap();
+        let with_larger_index = required();
+        assert_eq!(
+            with_larger_index - with_index,
+            200 * 1024 * 1024 * 9 / 4,
+            "lexical index size must raise the rebuild headroom requirement"
         );
-        // db(300 MiB)*2 = 600 MiB already clears the 512 MiB floor, so the whole
-        // delta is attributable to the lexical index being counted twice.
-        assert_eq!(with_index - without_index, 2 * 200 * 1024 * 1024);
     }
 
     #[test]
@@ -53604,7 +53950,29 @@ mod tests {
         assert_eq!(t_index.doc_count().expect("doc count"), 6);
     }
 
-    /// #453: the headroom projection doubles only the live lexical bytes.
+    /// The full-rebuild rule written out independently of the implementation:
+    /// max(512 MiB, basis * 9/4 - staging (not below 0) + db / 16 + db while
+    /// the migration repair is pending), where the caller passes the live
+    /// lexical bytes as the basis, or the db bundle when there are none.
+    fn expected_rebuild_requirement(
+        db_bundle_bytes: u64,
+        basis_bytes: u64,
+        staging_bytes: u64,
+        migration_pending: bool,
+    ) -> u64 {
+        let lexical = (u128::from(basis_bytes) * 9 / 4).saturating_sub(u128::from(staging_bytes));
+        let db = u128::from(db_bundle_bytes) / 16
+            + if migration_pending {
+                u128::from(db_bundle_bytes)
+            } else {
+                0
+            };
+        u64::try_from(lexical + db)
+            .unwrap_or(u64::MAX)
+            .max(INDEX_MIN_FREE_SPACE_BYTES)
+    }
+
+    /// #453: the headroom projection charges only the live lexical bytes.
     /// Merge-retired segment files and retained publish backups are already
     /// on disk and are not rewritten by a rebuild, so they are reported but
     /// excluded from the requirement.
@@ -53615,7 +53983,7 @@ mod tests {
         let db_path = data_dir.join("agent_search.db");
         std::fs::File::create(&db_path)
             .unwrap()
-            .set_len(300 * 1024 * 1024)
+            .set_len(640 * 1024 * 1024)
             .unwrap();
         let index_path = plant_merged_quill_index(&data_dir, 4);
 
@@ -53682,16 +54050,33 @@ mod tests {
             projection.retained_backup_bytes,
             with_extras.retained_backup_bytes
         );
-        // db(300 MiB)*2 clears the floor, so the requirement is exactly the
-        // rule over live bytes: the 64 MiB backup and the retired inputs are
-        // not doubled into it.
+        // The planted db file has no engine migration marker, so it is charged
+        // one copy plus the growth allowance, which clears the floor: the
+        // requirement is exactly the rule over live bytes, and the 64 MiB
+        // backup and the retired inputs are not charged.
+        assert!(projection.migration_repair_pending);
+        assert_eq!(projection.migration_copy_bytes, projection.db_bundle_bytes);
+        assert_eq!(
+            projection.db_growth_allowance_bytes,
+            projection.db_bundle_bytes / 16
+        );
         assert_eq!(
             projection.required_bytes,
-            projection.db_bundle_bytes * 2 + with_extras.live_bytes * 2
+            expected_rebuild_requirement(
+                projection.db_bundle_bytes,
+                with_extras.live_bytes,
+                0,
+                true
+            )
         );
         assert!(
             projection.required_bytes
-                < projection.db_bundle_bytes * 2 + with_extras.total_bytes() * 2,
+                < expected_rebuild_requirement(
+                    projection.db_bundle_bytes,
+                    with_extras.total_bytes(),
+                    0,
+                    true
+                ),
             "the recursive size would have demanded more"
         );
     }
@@ -53706,9 +54091,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().to_path_buf();
         let db_path = data_dir.join("agent_search.db");
+        // Unmigrated (no marker), so the db charge alone clears the floor and
+        // the lexical credit stays visible in the requirement.
         std::fs::File::create(&db_path)
             .unwrap()
-            .set_len(320 * 1024 * 1024)
+            .set_len(640 * 1024 * 1024)
             .unwrap();
         let index_path = plant_merged_quill_index(&data_dir, 2);
         let before = lexical_index_footprint(&data_dir);
@@ -53743,32 +54130,183 @@ mod tests {
 
         let projection = full_rebuild_headroom_projection(&data_dir, &db_path);
         assert_eq!(projection.rebuild_staging_bytes, staged);
-        // db(320 MiB)*2 clears the 512 MiB floor after the 96 MiB credit,
-        // independently of the live index's accumulator/segment layout.
-        assert!(
-            projection.db_bundle_bytes * 2 - staged > INDEX_MIN_FREE_SPACE_BYTES,
-            "the fixture must exercise staging credit above the absolute floor"
+        assert_eq!(
+            projection_before.required_bytes,
+            expected_rebuild_requirement(projection.db_bundle_bytes, before.live_bytes, 0, true)
         );
-        // Above the floor, the requirement is exactly 2*db + 2*live - staging.
         assert_eq!(
             projection.required_bytes,
-            projection.db_bundle_bytes * 2 + after.live_bytes * 2 - staged
+            expected_rebuild_requirement(
+                projection.db_bundle_bytes,
+                after.live_bytes,
+                staged,
+                true
+            )
         );
+        let lexical_charge = after.live_bytes * 9 / 4;
         assert_eq!(
-            projection.required_bytes + staged,
-            projection_before.required_bytes,
-            "the staged bytes are credited one-for-one against the requirement"
+            projection_before.required_bytes - projection.required_bytes,
+            staged.min(lexical_charge),
+            "the staged bytes are credited one-for-one against the lexical charge, never beyond it"
         );
 
-        // The credit never takes the requirement below the absolute floor.
+        // A staged generation larger than the lexical charge pays that charge
+        // and nothing more: the db terms stay.
         let huge = staging.join("seg-00000000000001ff.fslx");
         std::fs::File::create(&huge)
             .unwrap()
             .set_len(4 * 1024 * 1024 * 1024)
             .unwrap();
-        let floored = full_rebuild_headroom_projection(&data_dir, &db_path);
-        assert!(floored.rebuild_staging_bytes > floored.db_bundle_bytes * 2);
-        assert_eq!(floored.required_bytes, INDEX_MIN_FREE_SPACE_BYTES);
+        let capped = full_rebuild_headroom_projection(&data_dir, &db_path);
+        assert!(capped.rebuild_staging_bytes > capped.lexical_index_bytes * 9 / 4);
+        assert_eq!(
+            capped.required_bytes,
+            capped.db_growth_allowance_bytes + capped.migration_copy_bytes
+        );
+    }
+
+    /// nw61n, on the measured fixture (256k messages: db bundle 3,161,862,224
+    /// bytes, live lexical 1,393,617,850 bytes; `--force-rebuild` wrote 2,821
+    /// MiB). The db is charged only its growth allowance once migrated, so the
+    /// requirement covers the measured rebuild with margin and falls well
+    /// below the old `2*db + 2*live` (9,110,960,148 bytes, which refused a
+    /// `--full` that wrote nothing). Negative: with the engine's migration
+    /// repair pending the whole bundle is charged on top.
+    #[test]
+    fn full_rebuild_headroom_charges_the_db_only_for_what_touches_it() {
+        let footprint = LexicalIndexFootprint {
+            live_bytes: 1_393_617_850,
+            retired_segment_bytes: 1_563_884_292,
+            retired_segment_files: 150,
+            retained_backup_bytes: 2_937_502_205,
+            rebuild_staging_bytes: 0,
+            quarantine_bytes: 0,
+        };
+        let db = 3_161_862_224;
+        let migrated = full_rebuild_headroom_projection_from(db, footprint, false);
+        assert_eq!(
+            migrated.required_bytes,
+            expected_rebuild_requirement(db, footprint.live_bytes, 0, false)
+        );
+        assert!(!migrated.migration_repair_pending);
+        assert_eq!(migrated.migration_copy_bytes, 0);
+        let measured_force_rebuild_peak = 2_821 * 1024 * 1024;
+        assert!(migrated.required_bytes >= measured_force_rebuild_peak);
+        assert!(migrated.required_bytes < 9_110_960_148 / 2);
+
+        let pending = full_rebuild_headroom_projection_from(db, footprint, true);
+        assert!(pending.migration_repair_pending);
+        assert_eq!(pending.migration_copy_bytes, db);
+        assert_eq!(pending.required_bytes, migrated.required_bytes + db);
+
+        // Small archives sit on the floor; a staged generation never takes
+        // the requirement below it.
+        let small = LexicalIndexFootprint {
+            live_bytes: 8 * 1024 * 1024,
+            rebuild_staging_bytes: 64 * 1024 * 1024,
+            ..LexicalIndexFootprint::default()
+        };
+        assert_eq!(
+            full_rebuild_headroom_projection_from(16 * 1024 * 1024, small, false).required_bytes,
+            INDEX_MIN_FREE_SPACE_BYTES
+        );
+
+        // Quarantine bundles are evidence a rebuild never rewrites: ts1's
+        // 34.6 GB of them change nothing in the requirement.
+        let with_quarantine = LexicalIndexFootprint {
+            quarantine_bytes: 34_600_000_000,
+            ..footprint
+        };
+        let quarantined = full_rebuild_headroom_projection_from(db, with_quarantine, false);
+        assert_eq!(quarantined.required_bytes, migrated.required_bytes);
+        assert_eq!(quarantined.quarantine_bytes, 34_600_000_000);
+        assert_eq!(
+            quarantined.lexical_rebuild_basis_bytes,
+            footprint.live_bytes
+        );
+
+        // With no live generation left (only backups, retired segments and
+        // quarantine), the rebuild is sized as the db bundle, not the floor.
+        let no_live = LexicalIndexFootprint {
+            live_bytes: 0,
+            ..with_quarantine
+        };
+        let repair = full_rebuild_headroom_projection_from(db, no_live, false);
+        assert_eq!(repair.lexical_index_bytes, 0);
+        assert_eq!(repair.lexical_rebuild_basis_bytes, db);
+        assert_eq!(
+            repair.required_bytes,
+            expected_rebuild_requirement(db, db, 0, false)
+        );
+        assert!(repair.required_bytes > measured_force_rebuild_peak);
+        // Negative: an empty data dir with no db stays on the floor.
+        assert_eq!(
+            full_rebuild_headroom_projection_from(0, LexicalIndexFootprint::default(), false)
+                .required_bytes,
+            INDEX_MIN_FREE_SPACE_BYTES
+        );
+    }
+
+    /// The walker sets quarantine bundles (and interrupted reclaims of them)
+    /// apart from the live generation, by the inventory's own names.
+    #[test]
+    fn lexical_index_footprint_counts_quarantine_bundles_apart_from_live_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let index = tmp.path().join(LEXICAL_INDEX_ROOT_DIR);
+        let live = index.join("v9-quill");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(live.join("schema.json"), vec![0_u8; 100]).unwrap();
+        for (bundle, bytes) in [
+            (".lexical-rebuild-quarantine-Ab12Cd", 1_000_usize),
+            (".lexical-rebuild-reclaim-Ef34Gh", 300),
+        ] {
+            let generation = index.join(bundle).join("index");
+            std::fs::create_dir_all(&generation).unwrap();
+            std::fs::write(generation.join("seg-1.fslx"), vec![0_u8; bytes]).unwrap();
+        }
+        // Negative: a name the inventory would not match stays live.
+        let lookalike = index.join(".lexical-rebuild-quarantine-toolong1");
+        std::fs::create_dir_all(&lookalike).unwrap();
+        std::fs::write(lookalike.join("data"), vec![0_u8; 20]).unwrap();
+
+        let footprint = lexical_index_footprint(tmp.path());
+        assert_eq!(footprint.quarantine_bytes, 1_300);
+        assert_eq!(footprint.live_bytes, 120);
+        assert_eq!(footprint.total_bytes(), 1_420);
+    }
+
+    /// The rebuild's runtime backstop: below the floor it stops with the marker
+    /// the CLI maps to exit 14, naming the resume; at or above it, it runs on.
+    /// The fold runs only with room for a second copy of the generation plus
+    /// the floor.
+    #[test]
+    fn lexical_rebuild_free_space_backstop_stops_below_the_floor() {
+        let probe = Path::new("/data/cass/index");
+        let floor = INDEX_MIN_FREE_SPACE_BYTES;
+        assert!(lexical_rebuild_free_space_verdict(floor, floor, probe).is_ok());
+        assert!(lexical_rebuild_free_space_verdict(u64::MAX, floor, probe).is_ok());
+        let stopped = lexical_rebuild_free_space_verdict(floor - 1, floor, probe)
+            .expect_err("one byte below the floor stops the rebuild");
+        let message = format!("{stopped:#}");
+        assert!(
+            message.contains(LEXICAL_REBUILD_DISK_STOP_MARKER),
+            "{message}"
+        );
+        assert!(message.contains("/data/cass/index"), "{message}");
+        assert!(message.contains("resume"), "{message}");
+
+        let generation = 3 * 1024 * 1024 * 1024;
+        assert!(lexical_rebuild_fold_fits(
+            generation + floor,
+            generation,
+            floor
+        ));
+        assert!(!lexical_rebuild_fold_fits(
+            generation + floor - 1,
+            generation,
+            floor
+        ));
+        assert!(!lexical_rebuild_fold_fits(u64::MAX - 1, u64::MAX, floor));
     }
 
     /// An unreadable MANIFEST must make the walk conservative: every byte in
@@ -53907,6 +54445,146 @@ mod tests {
         assert_eq!(raw_mirror_headroom_note(&data_dir, &db_parent), "");
     }
 
+    /// nw61n: a full-rebuild refusal names the rule and the terms it charged,
+    /// and on the data dir's filesystem what cass can reclaim without touching
+    /// the live index (none of which the requirement charges).
+    #[test]
+    fn full_rebuild_refusal_names_the_rule_terms_and_reclaimable_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        let elsewhere = tmp.path().join("custom-db");
+        std::fs::create_dir_all(data_dir.join(LEXICAL_INDEX_ROOT_DIR)).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let projection = FullRebuildHeadroomProjection {
+            required_bytes: 9_000,
+            floor_bytes: INDEX_MIN_FREE_SPACE_BYTES,
+            db_bundle_bytes: 3_200,
+            lexical_index_bytes: 1_600,
+            lexical_rebuild_basis_bytes: 1_600,
+            retired_segment_bytes: 4_096,
+            retired_segment_files: 2,
+            retained_backup_bytes: 8_192,
+            rebuild_staging_bytes: 512,
+            quarantine_bytes: 0,
+            db_growth_allowance_bytes: 200,
+            migration_repair_pending: true,
+            migration_copy_bytes: 3_200,
+        };
+        let terms = full_rebuild_refusal_terms(&data_dir, &data_dir, &projection);
+        // The formula itself names the fallback; the sentence below is the
+        // refusal saying it applied.
+        assert!(
+            !terms.contains("There is no live lexical generation"),
+            "{terms}"
+        );
+        let no_live = FullRebuildHeadroomProjection {
+            lexical_index_bytes: 0,
+            lexical_rebuild_basis_bytes: 3_200,
+            ..projection
+        };
+        let no_live_terms = full_rebuild_refusal_terms(&data_dir, &data_dir, &no_live);
+        assert!(
+            no_live_terms.contains("There is no live lexical generation to size the rebuild by")
+                && no_live_terms.contains("(3200 bytes)"),
+            "{no_live_terms}"
+        );
+        for expected in [
+            FULL_REBUILD_HEADROOM_FORMULA,
+            "lexical index 1600 bytes",
+            "staged generation credit 512 bytes",
+            "db bundle 3200 bytes (growth allowance 200 bytes)",
+            "It includes 3200 bytes for the engine's one-time migration repair",
+            "4096 bytes of merge-retired lexical segments",
+            "'cass index --gc'",
+            "8192 bytes of prior lexical generations",
+            "'cass doctor cleanup'",
+        ] {
+            assert!(terms.contains(expected), "missing {expected:?}: {terms}");
+        }
+        assert!(!terms.contains("quarantine"), "{terms}");
+
+        // A failed rebuild's quarantine bundle is named with its size and the
+        // read-only preview that would reclaim it.
+        let evidence = b"failed rebuild evidence";
+        let bundle = data_dir
+            .join(LEXICAL_INDEX_ROOT_DIR)
+            .join(".lexical-rebuild-quarantine-000001");
+        std::fs::create_dir_all(bundle.join("index")).unwrap();
+        std::fs::write(bundle.join("index/MANIFEST"), evidence).unwrap();
+        let terms = full_rebuild_refusal_terms(&data_dir, &data_dir, &projection);
+        assert!(
+            terms.contains(&format!(
+                "quarantine bundles hold {} bytes, 0 of them eligible",
+                evidence.len()
+            )),
+            "{terms}"
+        );
+        assert!(
+            terms.contains(&format!(
+                "'cass lexical-quarantine --data-dir {} --plan --json'",
+                data_dir.display()
+            )),
+            "{terms}"
+        );
+
+        // A probe elsewhere gets the rule but none of the data dir's
+        // reclaimable space, and a migrated archive no migration copy.
+        let migrated = FullRebuildHeadroomProjection {
+            migration_repair_pending: false,
+            migration_copy_bytes: 0,
+            ..projection
+        };
+        let elsewhere_terms = full_rebuild_refusal_terms(&data_dir, &elsewhere, &migrated);
+        assert!(
+            elsewhere_terms.contains(FULL_REBUILD_HEADROOM_FORMULA),
+            "{elsewhere_terms}"
+        );
+        for absent in [
+            "migration repair",
+            "merge-retired",
+            "publish-backups",
+            "quarantine",
+        ] {
+            assert!(
+                !elsewhere_terms.contains(absent),
+                "unexpected {absent:?}: {elsewhere_terms}"
+            );
+        }
+    }
+
+    /// nw61n: the production refusal carries those terms under the prefix the
+    /// CLI maps to exit 14 / storage. A sparse 2 TiB archive without an engine
+    /// migration marker needs more than any test host has free.
+    #[test]
+    fn full_rebuild_refusal_message_carries_the_rule_terms() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+        let db = std::fs::File::create(&db_path).unwrap();
+        db.set_len(2 * 1024 * 1024 * 1024 * 1024).unwrap();
+        drop(db);
+
+        let message = format!(
+            "{:#}",
+            ensure_index_storage_headroom(
+                &data_dir,
+                &db_path,
+                IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
+            )
+            .expect_err("a 2 TiB unmigrated archive cannot fit")
+        );
+        assert!(
+            message.starts_with("canonical archive disk headroom check failed for "),
+            "{message}"
+        );
+        assert!(message.contains(FULL_REBUILD_HEADROOM_FORMULA), "{message}");
+        assert!(
+            message.contains("one-time migration repair, which is still pending"),
+            "{message}"
+        );
+    }
+
     #[test]
     fn database_sidecar_paths_preserve_filename_bytes_without_display_roundtrip() {
         let db_path = PathBuf::from("/tmp/cass.db");
@@ -53968,20 +54646,29 @@ mod tests {
         );
     }
 
+    /// `--full` and `--force-rebuild` take the full-rebuild requirement. With no
+    /// lexical index the projection is the db charge: a whole copy of the
+    /// bundle while the engine's one-time migration repair is pending (it keeps
+    /// a `.pre-migration-bak`), plus the 1/16 growth allowance. Neither path
+    /// clones the canonical archive otherwise (a `--full` that would need to
+    /// replace it is refused), so once the migration marker is complete only
+    /// the allowance remains (nw61n).
     #[test]
-    fn full_and_force_rebuild_startup_headroom_keep_archive_clone_requirement() {
+    fn full_and_force_rebuild_startup_headroom_charge_the_archive_copy_only_while_migration_is_pending()
+     {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("agent_search.db");
         std::fs::File::create(&db_path)
             .unwrap()
-            .set_len(300 * 1024 * 1024)
+            .set_len(640 * 1024 * 1024)
             .unwrap();
         std::fs::write(database_path_with_suffix(&db_path, "-wal"), vec![0_u8; 256]).unwrap();
         std::fs::write(database_path_with_suffix(&db_path, "-shm"), vec![0_u8; 512]).unwrap();
-        // No lexical index exists in this fixture, so the rebuild projection is
-        // still just the archive-clone requirement.
-        let clone_requirement =
-            INDEX_MIN_FREE_SPACE_BYTES.max(database_bundle_size_bytes(&db_path).saturating_mul(2));
+        let bundle = database_bundle_size_bytes(&db_path);
+        // No lexical index here, so the rebuild itself is sized as the bundle.
+        let pending_requirement = expected_rebuild_requirement(bundle, bundle, 0, true);
+        let migrated_requirement = expected_rebuild_requirement(bundle, bundle, 0, false);
+        assert_eq!(pending_requirement - migrated_requirement, bundle);
 
         assert_eq!(
             index_startup_storage_headroom_requirement(true, false),
@@ -53997,8 +54684,27 @@ mod tests {
                 &db_path,
                 IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
             ),
-            clone_requirement,
-            "full/force rebuilds still need enough scratch for atomic publish safety"
+            pending_requirement,
+            "an unmigrated archive is charged the migration repair's whole copy"
+        );
+
+        // A completed engine migration marker removes the copy and nothing else.
+        std::fs::write(
+            database_path_with_suffix(&db_path, ".fsqlite-migration-state"),
+            br#"{"last_upgrade_version":1,"last_run_at":0,"repairs_applied":[]}"#,
+        )
+        .unwrap();
+        assert!(crate::storage::sqlite::index_engine_migration_is_complete(
+            &db_path
+        ));
+        assert_eq!(
+            required_index_headroom_bytes(
+                tmp.path(),
+                &db_path,
+                IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
+            ),
+            migrated_requirement,
+            "a migrated archive is not charged the migration repair's copy"
         );
     }
 
