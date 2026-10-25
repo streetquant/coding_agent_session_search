@@ -9286,6 +9286,7 @@ schemas: (auto-generated from contract)
         - exists: boolean
         - fresh: boolean
         - last_indexed_at: ?
+        - manifest_source: ?
         - partial: ?
         - partial_reason: ?
         - pending_sessions: integer
@@ -9589,6 +9590,7 @@ schemas: (auto-generated from contract)
         - exists: boolean
         - fresh: boolean
         - last_indexed_at: ?
+        - manifest_source: ?
         - partial: ?
         - partial_reason: ?
         - pending_sessions: integer

@@ -10526,7 +10526,7 @@ impl SearchClient {
             .get()
             .map(|(reader, _)| {
                 crate::search::quill_bridge::reader_manifest_source(&reader)
-                    .map(crate::search::quill_bridge::manifest_source_token)
+                    .map(crate::search::quill_bridge::QuillManifestSource::as_str)
             })
             .transpose()
     }

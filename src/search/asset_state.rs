@@ -541,6 +541,10 @@ pub(crate) struct LexicalAssetState {
     /// metadata alone (`None` when no manifest decodes or the generation
     /// predates the Quill engine).
     pub live_docs: Option<u64>,
+    /// The MANIFEST slot `live_docs` was read from (mknmt): anything but
+    /// `Current` means readers serve an older generation than the newest
+    /// publish. Same `None` cases as `live_docs`.
+    pub manifest_source: Option<crate::search::quill_bridge::QuillManifestSource>,
     pub status_reason: Option<String>,
     pub fingerprint: LexicalFingerprintState,
     pub checkpoint: LexicalCheckpointState,
@@ -1652,7 +1656,7 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
         maintenance,
         checkpoint: checkpoint.as_ref(),
         current_db_fingerprint: current_db_fingerprint.as_deref(),
-        live_docs: crate::search::tantivy::searchable_index_live_doc_count(&index_path),
+        live: crate::search::tantivy::searchable_index_live_docs(&index_path),
     }))
 }
 
@@ -1666,9 +1670,10 @@ struct LexicalObservationInput<'a> {
     maintenance: SearchMaintenanceSnapshot,
     checkpoint: Option<&'a LexicalRebuildCheckpoint>,
     current_db_fingerprint: Option<&'a str>,
-    /// Live documents the published generation serves, from manifest metadata
-    /// alone (GH #457); `None` when no manifest decodes.
-    live_docs: Option<u64>,
+    /// Live documents the published generation serves and the MANIFEST slot
+    /// they were read from, from manifest metadata alone (GH #457, mknmt);
+    /// `None` when no manifest decodes.
+    live: Option<crate::search::tantivy::SearchableLiveDocs>,
 }
 
 /// GH #457: floor, as a percentage of the completed checkpoint's
@@ -1765,6 +1770,10 @@ pub(crate) fn completed_lexical_checkpoint_indexed_docs(
 /// established archive guessing after the engine flip.
 pub(crate) const LEGACY_ENGINE_STATUS_REASON: &str = "lexical index was built by the legacy Tantivy engine and the current Quill engine cannot read it; search is unavailable until `cass index --full` completes a one-time full lexical rebuild (cost scales with message count: minutes on small archives, an hour-scale run on multi-million-message archives; `--force-rebuild` skips the filesystem rescan)";
 
+/// mknmt: a corrupt current MANIFEST is read through `MANIFEST.prev`, so
+/// search keeps answering from the generation before the newest publish.
+pub(crate) const CORRUPT_MANIFEST_STATUS_REASON: &str = "the lexical index's current MANIFEST is corrupt, so search serves the previous generation (MANIFEST.prev), which lacks the newest publish; `cass index` rebuilds the generation from the canonical database";
+
 fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> LexicalAssetState {
     let LexicalObservationInput {
         index_path,
@@ -1775,8 +1784,12 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         maintenance,
         checkpoint,
         current_db_fingerprint,
-        live_docs,
+        live,
     } = input;
+    let live_docs = live.map(|live| live.live_docs);
+    let manifest_source = live.map(|live| live.manifest_source);
+    let manifest_corrupt = manifest_source
+        == Some(crate::search::quill_bridge::QuillManifestSource::PreviousAfterCorruptCurrent);
     let exists = crate::search::tantivy::searchable_index_exists(index_path);
     // b4uax: a Tantivy-era `meta.json` without a Quill `MANIFEST` (or a
     // federated manifest) is an index generation the current engine cannot
@@ -1891,7 +1904,8 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
                 || checkpoint_incomplete
                 || contract_mismatch
                 || fingerprint_mismatch
-                || hollow)
+                || hollow
+                || manifest_corrupt)
     };
     let fresh = exists && !stale && !rebuilding;
     let status = if stalled {
@@ -1922,6 +1936,8 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         Some(LEGACY_ENGINE_STATUS_REASON.to_string())
     } else if let Some(verdict) = hollow_verdict {
         Some(verdict.reason())
+    } else if manifest_corrupt {
+        Some(CORRUPT_MANIFEST_STATUS_REASON.to_string())
     } else if checkpoint_db_mismatch {
         Some("lexical rebuild checkpoint points at a different database".to_string())
     } else if contract_mismatch {
@@ -1992,6 +2008,7 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
             .map(|state| state.indexed_docs as u64),
         hollow,
         live_docs,
+        manifest_source,
         status_reason,
         fingerprint: LexicalFingerprintState {
             current_db_fingerprint: current_db_fingerprint.map(ToOwned::to_owned),
@@ -2974,7 +2991,10 @@ mod tests {
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint,
             current_db_fingerprint: Some("content-v1:10:10:100"),
-            live_docs,
+            live: live_docs.map(|live_docs| crate::search::tantivy::SearchableLiveDocs {
+                live_docs,
+                manifest_source: crate::search::quill_bridge::QuillManifestSource::Current,
+            }),
         })
     }
 
@@ -3024,6 +3044,72 @@ mod tests {
         let grown = hollow_probe_state(&index_path, &db_path, Some(&checkpoint), Some(5_000));
         assert!(!grown.hollow);
         assert_eq!(grown.status, "ready");
+    }
+
+    /// mknmt: a corrupt current MANIFEST is read through `MANIFEST.prev`, so
+    /// the generation is stale (searchable, one publish behind) and the reason
+    /// names the slot and the repair. A missing current slot is reported as
+    /// missing, never as corruption.
+    #[test]
+    fn lexical_state_reports_a_corrupt_current_manifest_as_stale() {
+        use crate::search::quill_bridge::QuillManifestSource;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v9-quill");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        let marker = index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER);
+        std::fs::write(&marker, b"{}").expect("write quill manifest");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+        let checkpoint = hollow_probe_checkpoint(&db_path, 1_000);
+        let probe = |manifest_source| {
+            lexical_state_from_observations(LexicalObservationInput {
+                index_path: &index_path,
+                db_path: &db_path,
+                stale_threshold: 3600,
+                last_indexed_at_ms: Some(1_733_000_000_000),
+                now_ms: 1_733_000_001_000,
+                maintenance: SearchMaintenanceSnapshot::default(),
+                checkpoint: Some(&checkpoint),
+                current_db_fingerprint: Some("content-v1:10:10:100"),
+                live: Some(crate::search::tantivy::SearchableLiveDocs {
+                    live_docs: 1_000,
+                    manifest_source,
+                }),
+            })
+        };
+
+        let current = probe(QuillManifestSource::Current);
+        assert_eq!(current.status, "ready");
+        assert!(current.fresh);
+        assert_eq!(current.manifest_source, Some(QuillManifestSource::Current));
+
+        let corrupt = probe(QuillManifestSource::PreviousAfterCorruptCurrent);
+        assert_eq!(corrupt.status, "stale");
+        assert!(corrupt.stale);
+        assert!(!corrupt.fresh);
+        assert!(
+            !corrupt.hollow,
+            "the served count still matches the checkpoint"
+        );
+        assert_eq!(
+            corrupt.manifest_source,
+            Some(QuillManifestSource::PreviousAfterCorruptCurrent)
+        );
+        assert_eq!(
+            corrupt.status_reason.as_deref(),
+            Some(CORRUPT_MANIFEST_STATUS_REASON)
+        );
+
+        let parked = index_path.join("MANIFEST.parked");
+        std::fs::rename(&marker, &parked).expect("park MANIFEST");
+        let missing = probe(QuillManifestSource::PreviousAfterMissingCurrent);
+        assert_eq!(missing.status, "missing");
+        assert_eq!(
+            missing.manifest_source,
+            Some(QuillManifestSource::PreviousAfterMissingCurrent)
+        );
+        let reason = missing.status_reason.as_deref().unwrap_or_default();
+        assert!(!reason.contains("corrupt"), "{reason}");
     }
 
     /// GH #457: without a certifying checkpoint, or without a decodable
@@ -3122,7 +3208,7 @@ mod tests {
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint: None,
             current_db_fingerprint: None,
-            live_docs: None,
+            live: None,
         });
         assert!(state.exists, "a legacy generation still counts as existing");
         assert!(state.engine_incompatible);
@@ -3172,7 +3258,7 @@ mod tests {
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: Some("content-v1:10:20:30"),
-            live_docs: None,
+            live: None,
         });
 
         assert_eq!(state.status, "ready");
@@ -3222,7 +3308,7 @@ mod tests {
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: Some("after"),
-            live_docs: None,
+            live: None,
         });
 
         assert_eq!(state.status, "stale");
@@ -3283,7 +3369,7 @@ mod tests {
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint: Some(&checkpoint),
             current_db_fingerprint,
-            live_docs: None,
+            live: None,
         };
 
         let covered = lexical_state_from_observations(input(Some("content-v1:10:10:100")));
@@ -3346,7 +3432,7 @@ mod tests {
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: Some("content-v1:10:10:100"),
-            live_docs: None,
+            live: None,
         });
 
         assert_eq!(state.status, "stale");
@@ -3390,7 +3476,7 @@ mod tests {
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: None,
-            live_docs: None,
+            live: None,
         });
 
         assert_eq!(state.status, "stale");
@@ -3427,7 +3513,7 @@ mod tests {
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint: None,
             current_db_fingerprint: None,
-            live_docs: None,
+            live: None,
         });
 
         assert_eq!(state.status, "missing");
@@ -3488,7 +3574,7 @@ mod tests {
             },
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: Some("after"),
-            live_docs: None,
+            live: None,
         });
 
         assert_eq!(state.status, "building");
@@ -3542,7 +3628,7 @@ mod tests {
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: Some("before"),
-            live_docs: None,
+            live: None,
         });
 
         assert_eq!(state.status, "stale");
@@ -3604,7 +3690,7 @@ mod tests {
             },
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: Some("after"),
-            live_docs: None,
+            live: None,
         });
 
         assert_eq!(state.status, "building");
@@ -3661,7 +3747,7 @@ mod tests {
             },
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: Some("after"),
-            live_docs: None,
+            live: None,
         });
 
         assert_eq!(state.status, "stale");
@@ -3718,7 +3804,7 @@ mod tests {
             },
             checkpoint: None,
             current_db_fingerprint: None,
-            live_docs: None,
+            live: None,
         });
 
         assert_eq!(state.status, "ready");
@@ -3778,7 +3864,7 @@ mod tests {
             },
             checkpoint: None,
             current_db_fingerprint: None,
-            live_docs: None,
+            live: None,
         });
 
         assert!(state.rebuilding, "active rebuild lock must still register");
@@ -3852,7 +3938,7 @@ mod tests {
             },
             checkpoint: None,
             current_db_fingerprint: None,
-            live_docs: None,
+            live: None,
         });
 
         assert!(state.rebuilding);
@@ -3903,7 +3989,7 @@ mod tests {
             },
             checkpoint: None,
             current_db_fingerprint: None,
-            live_docs: None,
+            live: None,
         });
 
         assert!(state.rebuilding);
@@ -3962,7 +4048,7 @@ mod tests {
             },
             checkpoint: None,
             current_db_fingerprint: None,
-            live_docs: None,
+            live: None,
         });
 
         let age = state

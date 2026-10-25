@@ -6303,6 +6303,12 @@
               "type": [
                 "string",
                 "null"
+              ],
+              "enum": [
+                "current",
+                "previous_after_missing_current",
+                "previous_after_corrupt_current",
+                null
               ]
             },
             "live_documents": {
@@ -14638,6 +14644,12 @@
               "type": [
                 "string",
                 "null"
+              ],
+              "enum": [
+                "current",
+                "previous_after_missing_current",
+                "previous_after_corrupt_current",
+                null
               ]
             },
             "live_documents": {
@@ -23944,6 +23956,12 @@
               "type": [
                 "string",
                 "null"
+              ],
+              "enum": [
+                "current",
+                "previous_after_missing_current",
+                "previous_after_corrupt_current",
+                null
               ]
             },
             "live_documents": {
@@ -33700,6 +33718,12 @@
               "type": [
                 "string",
                 "null"
+              ],
+              "enum": [
+                "current",
+                "previous_after_missing_current",
+                "previous_after_corrupt_current",
+                null
               ]
             },
             "live_documents": {
@@ -44394,6 +44418,12 @@
               "type": [
                 "string",
                 "null"
+              ],
+              "enum": [
+                "current",
+                "previous_after_missing_current",
+                "previous_after_corrupt_current",
+                null
               ]
             },
             "live_documents": {
@@ -49712,6 +49742,12 @@
               "type": [
                 "string",
                 "null"
+              ],
+              "enum": [
+                "current",
+                "previous_after_missing_current",
+                "previous_after_corrupt_current",
+                null
               ]
             },
             "live_documents": {
@@ -61333,6 +61369,12 @@
               "type": [
                 "string",
                 "null"
+              ],
+              "enum": [
+                "current",
+                "previous_after_missing_current",
+                "previous_after_corrupt_current",
+                null
               ]
             },
             "live_documents": {
@@ -69561,6 +69603,12 @@
               "type": [
                 "string",
                 "null"
+              ],
+              "enum": [
+                "current",
+                "previous_after_missing_current",
+                "previous_after_corrupt_current",
+                null
               ]
             },
             "live_documents": {
@@ -79652,6 +79700,12 @@
               "type": [
                 "string",
                 "null"
+              ],
+              "enum": [
+                "current",
+                "previous_after_missing_current",
+                "previous_after_corrupt_current",
+                null
               ]
             },
             "live_documents": {
@@ -90054,6 +90108,12 @@
                   "type": [
                     "string",
                     "null"
+                  ],
+                  "enum": [
+                    "current",
+                    "previous_after_missing_current",
+                    "previous_after_corrupt_current",
+                    null
                   ]
                 },
                 "live_documents": {
@@ -90833,6 +90893,18 @@
                 },
                 "engine_incompatible": {
                   "type": "boolean"
+                },
+                "manifest_source": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "current",
+                    "previous_after_missing_current",
+                    "previous_after_corrupt_current",
+                    null
+                  ]
                 },
                 "rebuilding": {
                   "type": "boolean"
@@ -92482,6 +92554,12 @@
               "type": [
                 "string",
                 "null"
+              ],
+              "enum": [
+                "current",
+                "previous_after_missing_current",
+                "previous_after_corrupt_current",
+                null
               ]
             },
             "search_mode": {
@@ -93221,6 +93299,12 @@
                       "type": [
                         "string",
                         "null"
+                      ],
+                      "enum": [
+                        "current",
+                        "previous_after_missing_current",
+                        "previous_after_corrupt_current",
+                        null
                       ]
                     },
                     "live_documents": {
@@ -94001,6 +94085,18 @@
                     "engine_incompatible": {
                       "type": "boolean"
                     },
+                    "manifest_source": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "enum": [
+                        "current",
+                        "previous_after_missing_current",
+                        "previous_after_corrupt_current",
+                        null
+                      ]
+                    },
                     "rebuilding": {
                       "type": "boolean"
                     },
@@ -94166,6 +94262,18 @@
                 },
                 "engine_incompatible": {
                   "type": "boolean"
+                },
+                "manifest_source": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "current",
+                    "previous_after_missing_current",
+                    "previous_after_corrupt_current",
+                    null
+                  ]
                 },
                 "rebuilding": {
                   "type": "boolean"
@@ -94675,6 +94783,12 @@
               "type": [
                 "string",
                 "null"
+              ],
+              "enum": [
+                "current",
+                "previous_after_missing_current",
+                "previous_after_corrupt_current",
+                null
               ]
             },
             "live_documents": {
@@ -96996,6 +97110,12 @@
               "type": [
                 "string",
                 "null"
+              ],
+              "enum": [
+                "current",
+                "previous_after_missing_current",
+                "previous_after_corrupt_current",
+                null
               ]
             },
             "live_documents": {
@@ -99318,6 +99438,12 @@
                   "type": [
                     "string",
                     "null"
+                  ],
+                  "enum": [
+                    "current",
+                    "previous_after_missing_current",
+                    "previous_after_corrupt_current",
+                    null
                   ]
                 },
                 "live_documents": {

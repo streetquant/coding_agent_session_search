@@ -103,16 +103,17 @@ fn manifest_source_distinguishes_live_slots_from_the_pinned_snapshot() -> Result
     let middle = damaged.len() / 2;
     damaged[middle] ^= 0x80;
     std::fs::write(&manifest, &damaged)?;
-    assert_eq!(
-        session.status()["manifest_source"],
-        "previous_after_corrupt_current"
-    );
+    assert_eq!(session.status()["manifest_source"], "current");
     assert_eq!(session.status()["snapshot_manifest_source"], "current");
     assert_eq!(search(&mut session, 2, "manifestneedle")["count"], 2);
 
     let (reply, stopped) = session.handle(request(json!({"op":"reload", "id":3})));
     assert!(!stopped);
     assert!(reply.ok, "{reply:?}");
+    assert_eq!(
+        session.status()["manifest_source"],
+        "previous_after_corrupt_current"
+    );
     assert_eq!(
         session.status()["snapshot_manifest_source"],
         "previous_after_corrupt_current"
@@ -123,7 +124,7 @@ fn manifest_source_distinguishes_live_slots_from_the_pinned_snapshot() -> Result
     std::fs::rename(&manifest, path.join("MANIFEST.fixture-corrupt"))?;
     assert_eq!(
         session.status()["manifest_source"],
-        "previous_after_missing_current"
+        "previous_after_corrupt_current"
     );
     assert_eq!(
         session.status()["snapshot_manifest_source"],
@@ -131,6 +132,10 @@ fn manifest_source_distinguishes_live_slots_from_the_pinned_snapshot() -> Result
     );
     let (reply, _) = session.handle(request(json!({"op":"reload", "id":5})));
     assert!(reply.ok, "{reply:?}");
+    assert_eq!(
+        session.status()["manifest_source"],
+        "previous_after_missing_current"
+    );
     assert_eq!(
         session.status()["snapshot_manifest_source"],
         "previous_after_missing_current"
@@ -141,6 +146,7 @@ fn manifest_source_distinguishes_live_slots_from_the_pinned_snapshot() -> Result
         "readers must not repair the missing current slot"
     );
     session.unload();
+    assert!(session.status()["manifest_source"].is_null());
     assert!(session.status()["snapshot_manifest_source"].is_null());
     Ok(())
 }
@@ -662,6 +668,41 @@ fn publication_is_invisible_until_reload_and_new_snapshot_replaces_old() -> Resu
     assert_eq!(fresh["count"], 2);
     assert_eq!(fresh["snapshot"]["reader_epoch"], 2);
     assert_eq!(fresh["snapshot"]["freshness"], "not_checked");
+    Ok(())
+}
+
+/// mknmt: the snapshot names the MANIFEST slot it was opened from. After the
+/// current MANIFEST is corrupted, a reload serves the previous generation and
+/// says so instead of passing it off as the newest publish.
+#[test]
+fn reload_reports_a_snapshot_served_from_the_previous_manifest_slot() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("index");
+    let mut writer = index(&path, &[document(41, "needle original", "local")])?;
+    writer.add_prebuilt_documents_slice(&[document(42, "needle appended", "local")])?;
+    writer.commit()?;
+    drop(writer);
+    let mut session = Session::new(path.clone());
+    let current = search(&mut session, 1, "needle");
+    assert_eq!(current["count"], 2);
+    assert_eq!(current["snapshot"]["manifest_source"], "current");
+
+    let manifest = path.join("MANIFEST");
+    let mut bytes = std::fs::read(&manifest)?;
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xff;
+    std::fs::write(&manifest, &bytes)?;
+    let (reload, _) = session.handle(Request::Reload { id: 2 });
+    assert!(reload.ok, "{reload:?}");
+    let previous = search(&mut session, 3, "needle");
+    assert_eq!(
+        previous["count"], 1,
+        "MANIFEST.prev lacks the newest publish"
+    );
+    assert_eq!(
+        previous["snapshot"]["manifest_source"],
+        "previous_after_corrupt_current"
+    );
     Ok(())
 }
 

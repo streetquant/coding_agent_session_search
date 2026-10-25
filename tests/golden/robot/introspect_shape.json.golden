@@ -4281,6 +4281,12 @@
                               "items": {
                                 "type": "string"
                               }
+                            },
+                            "enum": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
                             }
                           }
                         },
@@ -22823,6 +22829,12 @@
                           "type": "object",
                           "properties": {
                             "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "enum": {
                               "type": "array",
                               "items": {
                                 "type": "string"
@@ -44034,6 +44046,12 @@
                               "items": {
                                 "type": "string"
                               }
+                            },
+                            "enum": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
                             }
                           }
                         },
@@ -64690,6 +64708,12 @@
                           "type": "object",
                           "properties": {
                             "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "enum": {
                               "type": "array",
                               "items": {
                                 "type": "string"
@@ -89108,6 +89132,12 @@
                               "items": {
                                 "type": "string"
                               }
+                            },
+                            "enum": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
                             }
                           }
                         },
@@ -100854,6 +100884,12 @@
                           "type": "object",
                           "properties": {
                             "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "enum": {
                               "type": "array",
                               "items": {
                                 "type": "string"
@@ -126460,6 +126496,12 @@
                               "items": {
                                 "type": "string"
                               }
+                            },
+                            "enum": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
                             }
                           }
                         },
@@ -145000,6 +145042,12 @@
                           "type": "object",
                           "properties": {
                             "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "enum": {
                               "type": "array",
                               "items": {
                                 "type": "string"
@@ -167678,6 +167726,12 @@
                           "type": "object",
                           "properties": {
                             "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "enum": {
                               "type": "array",
                               "items": {
                                 "type": "string"
@@ -190791,6 +190845,12 @@
                                       "items": {
                                         "type": "string"
                                       }
+                                    },
+                                    "enum": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
                                     }
                                   }
                                 },
@@ -192462,6 +192522,23 @@
                                   "properties": {
                                     "type": {
                                       "type": "string"
+                                    }
+                                  }
+                                },
+                                "manifest_source": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "enum": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
                                     }
                                   }
                                 },
@@ -196352,6 +196429,12 @@
                               "items": {
                                 "type": "string"
                               }
+                            },
+                            "enum": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
                             }
                           }
                         },
@@ -198002,6 +198085,12 @@
                                           "type": "object",
                                           "properties": {
                                             "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            },
+                                            "enum": {
                                               "type": "array",
                                               "items": {
                                                 "type": "string"
@@ -199680,6 +199769,23 @@
                                             }
                                           }
                                         },
+                                        "manifest_source": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            },
+                                            "enum": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
                                         "rebuilding": {
                                           "type": "object",
                                           "properties": {
@@ -200035,6 +200141,23 @@
                                   "properties": {
                                     "type": {
                                       "type": "string"
+                                    }
+                                  }
+                                },
+                                "manifest_source": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "enum": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
                                     }
                                   }
                                 },
@@ -201135,6 +201258,12 @@
                           "type": "object",
                           "properties": {
                             "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "enum": {
                               "type": "array",
                               "items": {
                                 "type": "string"
@@ -206124,6 +206253,12 @@
                               "items": {
                                 "type": "string"
                               }
+                            },
+                            "enum": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
                             }
                           }
                         },
@@ -211060,6 +211195,12 @@
                                   "type": "object",
                                   "properties": {
                                     "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "enum": {
                                       "type": "array",
                                       "items": {
                                         "type": "string"

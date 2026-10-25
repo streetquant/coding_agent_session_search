@@ -988,7 +988,11 @@ fn gh501_manifest_source_health_and_status_distinguish_all_durable_slots() -> an
             assert_eq!(index["manifest_source"], *source, "{value}");
             assert_eq!(value["healthy"], state == 0, "{value}");
             if state != 0 {
-                assert_eq!(index["status"], "recovered_previous");
+                assert_eq!(
+                    index["status"],
+                    if state == 1 { "stale" } else { "missing" },
+                    "{value}"
+                );
                 assert_eq!(index["fresh"], false);
                 assert!(
                     value["recommended_action"]
@@ -999,9 +1003,16 @@ fn gh501_manifest_source_health_and_status_distinguish_all_durable_slots() -> an
                     .as_str()
                     .ok_or_else(|| anyhow::anyhow!("manifest reason"))?;
                 assert!(
-                    reason.contains(if state == 1 { "corrupt" } else { "absent" }),
+                    reason.contains(if state == 1 {
+                        "corrupt"
+                    } else {
+                        "metadata missing"
+                    }),
                     "{reason}"
                 );
+                if state == 1 {
+                    assert!(reason.contains("MANIFEST.prev"), "{reason}");
+                }
                 if state == 2 {
                     assert!(!reason.contains("is corrupt"), "{reason}");
                 }

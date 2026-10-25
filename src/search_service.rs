@@ -47,6 +47,8 @@ use clap::{Parser, Subcommand};
 use coding_agent_search::search::query::{
     FieldMask, SearchClient, SearchClientOptions, SearchFilters, SearchHit,
 };
+use coding_agent_search::search::quill_bridge::QuillManifestSource;
+use coding_agent_search::search::tantivy::searchable_index_live_docs;
 use coding_agent_search::sources::provenance::SourceFilter;
 use serde_json::{Value, json};
 
@@ -360,6 +362,9 @@ struct Session {
     canonical_read_attempts: u64,
     canonical_reads_completed: u64,
     client: Option<SearchClient>,
+    /// MANIFEST slot read beside the snapshot open (mknmt): anything but
+    /// `Current` means the pinned snapshot is older than the newest publish.
+    manifest_source: Option<QuillManifestSource>,
     snapshot_manifest_source: Option<&'static str>,
     // Declaration/drop order matters: reader destruction precedes lease release.
     reader_lease: Option<admission::Lease>,
@@ -383,6 +388,7 @@ impl Session {
             canonical_read_attempts: 0,
             canonical_reads_completed: 0,
             client: None,
+            manifest_source: None,
             snapshot_manifest_source: None,
             reader_lease: None,
             admission_pool: None,
@@ -403,6 +409,8 @@ impl Session {
             let client = open_snapshot(&self.index)?;
             let manifest_source = client.lexical_manifest_source()?;
             self.successful_opens = self.successful_opens.saturating_add(1);
+            self.manifest_source =
+                searchable_index_live_docs(&self.index).map(|live| live.manifest_source);
             self.snapshot_manifest_source = manifest_source;
             self.client = Some(client);
             if lease.is_some() {
@@ -425,19 +433,12 @@ impl Session {
         self.refiner.unload();
         self.semantic.unload();
         drop(self.client.take());
+        self.manifest_source = None;
         self.snapshot_manifest_source = None;
         drop(self.reader_lease.take());
     }
 
     fn status(&self) -> Value {
-        let manifest_source = coding_agent_search::search::quill_bridge::manifest_live_doc_count(
-            &self.index,
-        )
-        .map(|manifest| {
-            coding_agent_search::search::quill_bridge::manifest_source_token(
-                manifest.manifest_source,
-            )
-        });
         let memory = self.memory_observation.as_ref().map(|observation| {
             let sample = observation.sample();
             json!({
@@ -466,7 +467,7 @@ impl Session {
             "successful_opens": self.successful_opens,
             "queries_completed": self.queries_completed,
             "snapshot_policy": "pinned_until_reload",
-            "manifest_source": manifest_source,
+            "manifest_source": self.manifest_source.map(QuillManifestSource::as_str),
             "snapshot_manifest_source": self.snapshot_manifest_source,
             "freshness": "not_checked",
             "canonical_view_enabled": self.archive.is_some(),
