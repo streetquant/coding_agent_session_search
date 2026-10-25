@@ -63,7 +63,7 @@ pub(crate) fn file_observation(path: &Path) -> Option<Value> {
             let observation = {
                 use std::os::unix::fs::MetadataExt;
                 let mut observation = observation;
-                observation["device"] = serde_json::json!(metadata.dev());
+                // No st_dev: see LEGACY_DEVICE_FIELD.
                 observation["inode"] = serde_json::json!(metadata.ino());
                 observation["ctime"] = serde_json::json!([metadata.ctime(), metadata.ctime_nsec()]);
                 observation
@@ -75,6 +75,27 @@ pub(crate) fn file_observation(path: &Path) -> Option<Value> {
         }
         Err(_) => None,
     }
+}
+
+/// Unix observations recorded `st_dev` before GH #536. btrfs gives a subvolume
+/// mount a new anonymous device number when it is mounted (some network and
+/// FUSE file systems do the same), so after a reboot every unchanged source
+/// looked changed and `cass index` parsed the whole corpus again. The path is
+/// the ledger key, and size, mtime, inode and ctime still record a change, so
+/// the device is no longer recorded, and a saved one is ignored so rows written
+/// before this change stay reusable.
+const LEGACY_DEVICE_FIELD: &str = "device";
+
+fn same_observation(saved: &Value, current: &Value) -> bool {
+    let (Some(saved), Some(current)) = (saved.as_object(), current.as_object()) else {
+        return saved == current;
+    };
+    let evidence = |(key, _): &(&String, &Value)| key.as_str() != LEGACY_DEVICE_FIELD;
+    saved.iter().filter(evidence).count() == current.iter().filter(evidence).count()
+        && saved
+            .iter()
+            .filter(evidence)
+            .all(|(key, value)| current.get(key) == Some(value))
 }
 
 pub(crate) fn ledger_matches(
@@ -94,7 +115,7 @@ pub(crate) fn ledger_matches(
     let Some(primary) = file_observation(source_path) else {
         return false;
     };
-    if primary["absent"].as_bool() == Some(true) || saved["primary"] != primary {
+    if primary["absent"].as_bool() == Some(true) || !same_observation(&saved["primary"], &primary) {
         return false;
     }
     let Some(files) = saved["dependencies"].as_array() else {
@@ -120,7 +141,8 @@ pub(crate) fn ledger_matches(
     files.iter().all(|file| {
         file["path"].as_str().is_some_and(|path| {
             Some(Path::new(path)) == ignored_parent
-                || file_observation(Path::new(path)).as_ref() == Some(file)
+                || file_observation(Path::new(path))
+                    .is_some_and(|current| same_observation(file, &current))
         })
     })
 }
@@ -150,6 +172,247 @@ mod tests {
             }
         }
         panic!("fixture could not produce an observable directory change");
+    }
+
+    #[cfg(unix)]
+    fn legacy_row(path: &Path, dependencies: Vec<Value>, device: u64) -> Value {
+        let mut row: Value = serde_json::from_str(&saved(path, dependencies)).unwrap();
+        row["primary"]["device"] = serde_json::json!(device);
+        for dependency in row["dependencies"].as_array_mut().unwrap() {
+            if dependency.get("inode").is_some() {
+                dependency["device"] = serde_json::json!(device);
+            }
+        }
+        row
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh536_legacy_devices_match_primary_parent_and_explicit_sidecars() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("primary");
+        let sidecar = temp.path().join("metadata");
+        let optional = temp.path().join("optional");
+        fs::write(&path, b"transcript").unwrap();
+        fs::write(&sidecar, b"metadata").unwrap();
+        let dependencies = vec![
+            file_observation(temp.path()).unwrap(),
+            file_observation(&sidecar).unwrap(),
+            file_observation(&optional).unwrap(),
+        ];
+        let new_row = saved(&path, dependencies.clone());
+        for observes_parent in [false, true] {
+            assert!(ledger_matches(&new_row, &path, observes_parent, CONTRACT));
+        }
+        let different_device = fs::metadata(&path).unwrap().dev() ^ 1;
+        for device in [different_device, 36, 54, u64::MAX] {
+            let row = legacy_row(&path, dependencies.clone(), device).to_string();
+            for observes_parent in [false, true] {
+                assert!(ledger_matches(&row, &path, observes_parent, CONTRACT));
+            }
+        }
+        let new_row: Value = serde_json::from_str(&new_row).unwrap();
+        assert!(new_row["primary"].get("device").is_none());
+        for dependency in &dependencies {
+            assert!(dependency.get("device").is_none());
+        }
+        let row = legacy_row(&path, dependencies, 36).to_string();
+        fs::write(&optional, b"appeared").unwrap();
+        for observes_parent in [false, true] {
+            assert!(!ledger_matches(&row, &path, observes_parent, CONTRACT));
+        }
+        let row = legacy_row(
+            &path,
+            vec![
+                file_observation(temp.path()).unwrap(),
+                file_observation(&sidecar).unwrap(),
+                file_observation(&optional).unwrap(),
+            ],
+            54,
+        )
+        .to_string();
+        fs::write(&sidecar, b"changed metadata").unwrap();
+        for observes_parent in [false, true] {
+            assert!(!ledger_matches(&row, &path, observes_parent, CONTRACT));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh536_legacy_device_equivalence_keeps_other_evidence_strict() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("primary");
+        let sidecar = temp.path().join("metadata");
+        fs::write(&path, b"transcript").unwrap();
+        fs::write(&sidecar, b"metadata").unwrap();
+        let base = legacy_row(
+            &path,
+            vec![
+                file_observation(temp.path()).unwrap(),
+                file_observation(&sidecar).unwrap(),
+                file_observation(&temp.path().join("optional")).unwrap(),
+            ],
+            36,
+        );
+        for observes_parent in [false, true] {
+            assert!(ledger_matches(
+                &base.to_string(),
+                &path,
+                observes_parent,
+                CONTRACT
+            ));
+        }
+        for (field, changed) in [
+            ("path", serde_json::json!(temp.path().join("other-primary"))),
+            ("size", serde_json::json!(11)),
+            (
+                "mtime_ns",
+                serde_json::json!(format!(
+                    "{}0",
+                    base["primary"]["mtime_ns"].as_str().unwrap()
+                )),
+            ),
+            (
+                "inode",
+                serde_json::json!(base["primary"]["inode"].as_u64().unwrap() ^ 1),
+            ),
+            ("ctime", serde_json::json!([0, 0])),
+        ] {
+            assert_ne!(base["primary"][field], changed);
+            let mut row = base.clone();
+            row["primary"][field] = changed;
+            for observes_parent in [false, true] {
+                assert!(!ledger_matches(
+                    &row.to_string(),
+                    &path,
+                    observes_parent,
+                    CONTRACT
+                ));
+            }
+        }
+        for dependency in [0, 1] {
+            let mut row = base.clone();
+            row["dependencies"][dependency]["inode"] =
+                serde_json::json!(base["dependencies"][dependency]["inode"].as_u64().unwrap() ^ 1);
+            assert!(!ledger_matches(&row.to_string(), &path, true, CONTRACT));
+            assert_eq!(
+                ledger_matches(&row.to_string(), &path, false, CONTRACT),
+                dependency == 0,
+                "only the self-contained connector's implicit parent is irrelevant"
+            );
+        }
+        // The saved device is skipped by name, whatever value an old row put
+        // there; every other field stays strict (below).
+        for malformed in [
+            Value::Null,
+            serde_json::json!(-1),
+            serde_json::json!("36"),
+            serde_json::json!([36]),
+            serde_json::json!({}),
+        ] {
+            let mut row = base.clone();
+            row["primary"]["device"] = malformed.clone();
+            for observes_parent in [false, true] {
+                assert!(ledger_matches(
+                    &row.to_string(),
+                    &path,
+                    observes_parent,
+                    CONTRACT
+                ));
+            }
+            for dependency in [0, 1] {
+                let mut row = base.clone();
+                row["dependencies"][dependency]["device"] = malformed.clone();
+                assert!(ledger_matches(&row.to_string(), &path, true, CONTRACT));
+            }
+        }
+        // An old observation that never carried metadata may still have been
+        // stamped by a row rewriter; the device key alone does not refuse it.
+        let mut row = base.clone();
+        row["dependencies"][2]["device"] = serde_json::json!(36);
+        for observes_parent in [false, true] {
+            assert!(ledger_matches(
+                &row.to_string(),
+                &path,
+                observes_parent,
+                CONTRACT
+            ));
+        }
+        for row in [
+            {
+                let mut row = base.clone();
+                row["producer_contract"] = serde_json::json!("other-producer");
+                row
+            },
+            {
+                let mut row = base.clone();
+                row["primary"]["unknown-evidence"] = serde_json::json!(true);
+                row
+            },
+        ] {
+            for observes_parent in [false, true] {
+                assert!(!ledger_matches(
+                    &row.to_string(),
+                    &path,
+                    observes_parent,
+                    CONTRACT
+                ));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh536_legacy_devices_do_not_hide_changed_replaced_or_missing_primaries() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("primary");
+        fs::write(&path, b"old transcript").unwrap();
+        let row = legacy_row(&path, vec![file_observation(temp.path()).unwrap()], 36).to_string();
+        for observes_parent in [false, true] {
+            assert!(ledger_matches(&row, &path, observes_parent, CONTRACT));
+        }
+        fs::write(&path, b"changed transcript").unwrap();
+        for observes_parent in [false, true] {
+            assert!(!ledger_matches(&row, &path, observes_parent, CONTRACT));
+        }
+        fs::write(&path, b"old transcript").unwrap();
+        let replacement = temp.path().join("replacement");
+        fs::write(&replacement, b"new transcript").unwrap();
+        let before = fs::metadata(&path).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_modified(before.modified().unwrap())
+            .unwrap();
+        assert_ne!(before.ino(), fs::metadata(&replacement).unwrap().ino());
+        let row = legacy_row(&path, vec![file_observation(temp.path()).unwrap()], 54).to_string();
+        for observes_parent in [false, true] {
+            assert!(ledger_matches(&row, &path, observes_parent, CONTRACT));
+        }
+        fs::rename(&path, temp.path().join("retained-original")).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        assert_ne!(before.ino(), after.ino());
+        for observes_parent in [false, true] {
+            assert!(!ledger_matches(&row, &path, observes_parent, CONTRACT));
+        }
+        fs::rename(&path, temp.path().join("retained-replacement")).unwrap();
+        for observes_parent in [false, true] {
+            assert!(!ledger_matches(&row, &path, observes_parent, CONTRACT));
+            assert!(!ledger_matches(
+                &row,
+                Path::new("invalid\0path"),
+                observes_parent,
+                CONTRACT
+            ));
+        }
     }
 
     #[test]
@@ -292,6 +555,69 @@ mod tests {
         for observes_parent in [false, true] {
             assert!(!ledger_matches(&row, &path, observes_parent, CONTRACT));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh536_device_number_is_not_evidence_and_legacy_rows_stay_reusable() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("primary");
+        fs::write(&path, b"transcript").unwrap();
+        let primary = file_observation(&path).unwrap();
+        let parent = file_observation(temp.path()).unwrap();
+        assert!(primary.get(LEGACY_DEVICE_FIELD).is_none());
+        assert!(parent.get(LEGACY_DEVICE_FIELD).is_none());
+        assert!(primary["inode"].is_u64() && primary["ctime"].is_array());
+
+        // A row written before the change, on the device the file still has
+        // (the upgrade), and after a remount gave the subvolume a new number.
+        let device = fs::metadata(&path).unwrap().dev();
+        let legacy = |observation: &Value, device: u64| {
+            let mut observation = observation.clone();
+            observation[LEGACY_DEVICE_FIELD] = serde_json::json!(device);
+            observation
+        };
+        for saved_device in [device, device + 18] {
+            let row = serde_json::json!({"producer_contract": CONTRACT,
+                "primary": legacy(&primary, saved_device),
+                "dependencies": [legacy(&parent, saved_device)]})
+            .to_string();
+            for observes_parent in [false, true] {
+                assert!(ledger_matches(&row, &path, observes_parent, CONTRACT));
+            }
+        }
+
+        // The device is the only field that is skipped: any other difference
+        // next to it, or a field this build does not record, still refuses.
+        let mut changed_inode = legacy(&primary, device);
+        changed_inode["inode"] = serde_json::json!(primary["inode"].as_u64().unwrap() + 1);
+        let mut unknown_field = legacy(&primary, device);
+        unknown_field["generation"] = serde_json::json!(1);
+        for saved in [changed_inode, unknown_field] {
+            let row = serde_json::json!({"producer_contract": CONTRACT,
+                "primary": saved, "dependencies": []})
+            .to_string();
+            assert!(!ledger_matches(&row, &path, false, CONTRACT));
+        }
+
+        // A real change still refuses a legacy row: new content, then the same
+        // path replaced by another file (new inode).
+        let row = serde_json::json!({"producer_contract": CONTRACT,
+            "primary": legacy(&primary, device + 18), "dependencies": []})
+        .to_string();
+        fs::write(&path, b"transcript plus a new message").unwrap();
+        assert!(!ledger_matches(&row, &path, false, CONTRACT));
+        let replacement = temp.path().join("replacement");
+        fs::write(&replacement, b"transcript").unwrap();
+        let replaced = file_observation(&replacement).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let row = serde_json::json!({"producer_contract": CONTRACT,
+            "primary": legacy(&primary, device), "dependencies": []})
+        .to_string();
+        assert_ne!(replaced["inode"], primary["inode"]);
+        assert!(!ledger_matches(&row, &path, false, CONTRACT));
     }
 
     // Pre-GH512 decision logic, kept live in the SAME benchmark invocation.
