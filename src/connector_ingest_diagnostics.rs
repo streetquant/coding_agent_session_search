@@ -151,6 +151,11 @@ pub enum IngestFailureKind {
     /// The source is larger than the connector's per-source read budget, so it
     /// was not indexed; raising the budget admits it on the next run.
     SourceOverReadBudget,
+    /// The source changed while it was being read (it was rewritten, replaced
+    /// or grew between two passes). The bytes were readable; the read raced a
+    /// live writer, so nothing from that source is published and re-indexing
+    /// picks up its current content.
+    SourceChangedDuringRead,
     /// The store uses a layout or format version this build's connector does
     /// not read (a newer Pi durable schema, a Pi Session Store V2 sidecar).
     /// It was not indexed from that store, and the store is left untouched.
@@ -172,6 +177,7 @@ impl IngestFailureKind {
             IngestFailureKind::UnsupportedSchema => "unsupported-schema",
             IngestFailureKind::UnparseableSource => "unparseable-source",
             IngestFailureKind::SourceOverReadBudget => "source-over-read-budget",
+            IngestFailureKind::SourceChangedDuringRead => "source-changed-during-read",
             IngestFailureKind::UnsupportedStoreFormat => "unsupported-store-format",
         }
     }
@@ -374,6 +380,16 @@ fn classify_kind(
                  bytes), then re-index"
             ),
         ),
+        IngestFailureKind::SourceChangedDuringRead => (
+            IngestSeverity::Error,
+            true, // the next run reads the source's current content
+            SourceIngestDisposition::Skipped,
+            format!(
+                "{provider} source changed while it was being read and was not indexed; the file \
+                 was readable, so this is not a permissions problem — re-index to read its current \
+                 content"
+            ),
+        ),
         IngestFailureKind::UnsupportedStoreFormat => (
             IngestSeverity::Warning,
             false, // the same build reads the same store the same way
@@ -458,6 +474,13 @@ fn connector_scan_failure_kind(error: &anyhow::Error) -> IngestFailureKind {
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ResourceBusy
         ) {
             IngestFailureKind::SourceLocked
+        } else if io.kind() == std::io::ErrorKind::Interrupted {
+            // The Codex consumer raises Interrupted only for a source that
+            // changed under the read (rewritten, replaced or grown between
+            // two passes). Those bytes were readable: reporting them as an
+            // unreadable source sent operators to check permissions for a
+            // file they could read the whole time.
+            IngestFailureKind::SourceChangedDuringRead
         } else {
             IngestFailureKind::UnreadableSource
         };
@@ -1280,6 +1303,7 @@ mod tests {
             IngestFailureKind::UnsupportedSchema,
             IngestFailureKind::UnparseableSource,
             IngestFailureKind::SourceOverReadBudget,
+            IngestFailureKind::SourceChangedDuringRead,
             IngestFailureKind::UnsupportedStoreFormat,
         ];
         let destructive = ["rm ", "--delete", "--purge", "reset", "drop ", "rm -rf"];
@@ -1439,6 +1463,7 @@ mod tests {
             IngestFailureKind::TruncatedSession,
             IngestFailureKind::UnsupportedSchema,
             IngestFailureKind::SourceOverReadBudget,
+            IngestFailureKind::SourceChangedDuringRead,
         ];
         verify_eq!(
             serde_json::to_value(failure_kinds)?,
@@ -1453,7 +1478,8 @@ mod tests {
                 "unparseable-source",
                 "truncated-session",
                 "unsupported-schema",
-                "source-over-read-budget"
+                "source-over-read-budget",
+                "source-changed-during-read"
             ])
         );
         for (k, w) in [
@@ -1482,6 +1508,10 @@ mod tests {
             (
                 IngestFailureKind::SourceOverReadBudget,
                 "source-over-read-budget",
+            ),
+            (
+                IngestFailureKind::SourceChangedDuringRead,
+                "source-changed-during-read",
             ),
         ] {
             verify_eq!(k.as_str(), w);
@@ -1829,6 +1859,61 @@ mod tests {
             IngestFailureKind::UnreadableSource
         );
         verify_eq!(report.diagnostics[0].source_path, "/data");
+        Ok(())
+    }
+
+    /// A source that changed while it was being read WAS readable: the Codex
+    /// consumer raises Interrupted for exactly that condition (rewritten,
+    /// replaced or grown between two passes). Reporting it as an unreadable
+    /// source sent operators to check permissions on a file they could read
+    /// the whole time, which is the same defect class the over-budget
+    /// diagnostic already fixed.
+    #[test]
+    fn a_source_that_changed_during_the_read_is_not_reported_as_unreadable() -> TestResult {
+        let ctx = ScanContext::local_default(PathBuf::from("/data"), None);
+        let changed = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "Codex source changed across parsing or enrichment; retry this source",
+        ))
+        .context("scanning codex");
+
+        let mut run = ConnectorIngestRun::begin("codex", Path::new("/data"), &ctx, &[]);
+        run.observe_connector_scan_error(Path::new("/data"), &changed);
+        let report = run.finish();
+        verify_eq!(report.diagnostics.len(), 1);
+        let diagnostic = &report.diagnostics[0];
+        verify_eq!(
+            diagnostic.failure_kind,
+            IngestFailureKind::SourceChangedDuringRead
+        );
+        verify_eq!(diagnostic.severity, IngestSeverity::Error);
+        verify!(diagnostic.retryable, "a re-read sees the current content");
+        verify_eq!(diagnostic.disposition, SourceIngestDisposition::Skipped);
+        verify!(
+            !diagnostic.safe_next_action.contains("check permissions"),
+            "a changed source was readable: {}",
+            diagnostic.safe_next_action
+        );
+        verify!(
+            diagnostic.safe_next_action.contains("re-index"),
+            "{}",
+            diagnostic.safe_next_action
+        );
+        verify_eq!(report.summary.skipped, 1);
+
+        // An ordinary I/O failure keeps its unreadable classification.
+        let denied = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ))
+        .context("scanning codex");
+        let mut run = ConnectorIngestRun::begin("codex", Path::new("/data"), &ctx, &[]);
+        run.observe_connector_scan_error(Path::new("/data"), &denied);
+        let report = run.finish();
+        verify_eq!(
+            report.diagnostics[0].failure_kind,
+            IngestFailureKind::UnreadableSource
+        );
         Ok(())
     }
 
