@@ -107,6 +107,89 @@ impl HostProbeResult {
     }
 }
 
+/// The outcome of probing one host: the probe result plus whether the bounded
+/// transport deadline expired.
+///
+/// A host whose transport exceeds the deadline is *reported*, never dropped:
+/// the outcome exists so the fleet report can state how many hosts were
+/// probed, how many answered and how many timed out.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostProbeOutcome {
+    /// The probe result for the host.
+    pub result: HostProbeResult,
+    /// True when the host's transport exceeded the probe deadline.
+    pub timed_out: bool,
+}
+
+impl HostProbeOutcome {
+    /// A host that failed to answer for a reason other than a timeout.
+    fn failed(host_name: &str, error: impl Into<String>) -> Self {
+        Self {
+            result: HostProbeResult::unreachable(host_name, error),
+            timed_out: false,
+        }
+    }
+
+    /// A host whose transport exceeded the probe deadline.
+    fn timed_out(host_name: &str, error: impl Into<String>) -> Self {
+        Self {
+            result: HostProbeResult::unreachable(host_name, error),
+            timed_out: true,
+        }
+    }
+}
+
+/// Completeness accounting for one bounded fleet probe.
+///
+/// `probed` counts the hosts the probe attempted. Every probed host falls into
+/// exactly one of `answered` (the host replied inside the deadline),
+/// `timed_out` (the transport exceeded the deadline) or `failed` (the transport
+/// failed for another reason), so a partial sweep is distinguishable from a
+/// complete one instead of silently looking like the whole fleet answered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbeFleetReport {
+    /// Hosts the probe attempted.
+    pub probed: usize,
+    /// Hosts that answered inside the probe deadline.
+    pub answered: usize,
+    /// Hosts whose transport exceeded the probe deadline.
+    pub timed_out: usize,
+    /// Hosts whose transport failed for a reason other than a timeout.
+    pub failed: usize,
+    /// Names of the hosts whose transport exceeded the probe deadline.
+    pub timed_out_hosts: Vec<String>,
+}
+
+impl ProbeFleetReport {
+    /// Derive the report from the per-host outcomes of one probe.
+    pub fn from_outcomes(outcomes: &[HostProbeOutcome]) -> Self {
+        let mut report = Self {
+            probed: outcomes.len(),
+            answered: 0,
+            timed_out: 0,
+            failed: 0,
+            timed_out_hosts: Vec::new(),
+        };
+        for outcome in outcomes {
+            if outcome.timed_out {
+                report.timed_out += 1;
+                let host_name = outcome.result.host_name.clone(); // ubs:ignore[rust.collections.clone-in-loop] The persisted report outlives the borrowed outcomes and owns one name per timed-out host.
+                report.timed_out_hosts.push(host_name); // ubs:ignore[rust.security.path-traversal] Vec<String> stores display host labels; this performs no filesystem path operation.
+            } else if outcome.result.reachable {
+                report.answered += 1;
+            } else {
+                report.failed += 1;
+            }
+        }
+        report
+    }
+
+    /// True when every probed host answered inside the probe deadline.
+    pub fn is_complete(&self) -> bool {
+        self.timed_out == 0 && self.failed == 0
+    }
+}
+
 /// Status of cass installation on a remote host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -599,6 +682,16 @@ echo "===PROBE_END==="
 /// # Returns
 /// A `HostProbeResult` with all gathered information, or error details if probe failed.
 pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
+    probe_host_outcome(host, timeout_secs).result
+}
+
+/// Probe a single SSH host and report whether the bounded transport deadline
+/// expired.
+///
+/// The deadline and the transport's own timeout are both reported as
+/// `timed_out` outcomes, so the fleet report can tell a host that was too
+/// slow apart from a host that refused the connection.
+pub fn probe_host_outcome(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeOutcome {
     let start = Instant::now();
     let timeout_secs = timeout_secs.max(1);
     let command_timeout = Duration::from_secs(timeout_secs);
@@ -610,7 +703,7 @@ pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
     let child_stdin = match file_backed_child_stdin(probe_script.as_bytes()) {
         Ok(stdin) => stdin,
         Err(e) => {
-            return HostProbeResult::unreachable(
+            return HostProbeOutcome::failed(
                 &host.name,
                 format!("Failed to prepare SSH probe input: {e}"),
             );
@@ -631,10 +724,7 @@ pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            return HostProbeResult::unreachable(
-                &host.name,
-                format!("Failed to execute ssh: {}", e),
-            );
+            return HostProbeOutcome::failed(&host.name, format!("Failed to execute ssh: {}", e));
         }
     };
 
@@ -642,13 +732,13 @@ pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
     let output = match wait_for_child_output_with_timeout(child, command_timeout) {
         Ok(Some(o)) => o,
         Ok(None) => {
-            return HostProbeResult::unreachable(
+            return HostProbeOutcome::timed_out(
                 &host.name,
                 format!("Connection timed out after {timeout_secs} seconds"),
             );
         }
         Err(e) => {
-            return HostProbeResult::unreachable(&host.name, format!("SSH command failed: {}", e));
+            return HostProbeOutcome::failed(&host.name, format!("SSH command failed: {}", e));
         }
     };
 
@@ -657,25 +747,34 @@ pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
     // Check for SSH failures
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let error_msg = if stderr.contains("Connection refused") {
-            "Connection refused".to_string()
+        let (error_msg, timed_out) = if stderr.contains("Connection refused") {
+            ("Connection refused".to_string(), false)
         } else if stderr.contains("Connection timed out") || stderr.contains("timed out") {
-            "Connection timed out".to_string()
+            ("Connection timed out".to_string(), true)
         } else if stderr.contains("Permission denied") {
-            "Permission denied (key not loaded in ssh-agent?)".to_string()
+            (
+                "Permission denied (key not loaded in ssh-agent?)".to_string(),
+                false,
+            )
         } else if is_host_key_verification_failure(&stderr) {
-            host_key_verification_error(&host.name)
+            (host_key_verification_error(&host.name), false)
         } else if stderr.contains("No route to host") {
-            "No route to host".to_string()
+            ("No route to host".to_string(), false)
         } else {
-            format!("SSH failed: {}", stderr.trim())
+            (format!("SSH failed: {}", stderr.trim()), false)
         };
 
-        return HostProbeResult::unreachable(&host.name, error_msg);
+        return HostProbeOutcome {
+            result: HostProbeResult::unreachable(&host.name, error_msg),
+            timed_out,
+        };
     }
     // Parse successful output
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_probe_output(&host.name, &stdout, connection_time_ms)
+    HostProbeOutcome {
+        result: parse_probe_output(&host.name, &stdout, connection_time_ms),
+        timed_out: false,
+    }
 }
 
 /// Parse the probe script output into a HostProbeResult.
@@ -919,6 +1018,30 @@ pub fn probe_hosts_parallel<F>(
 where
     F: Fn(usize, usize, &str) + Send + Sync,
 {
+    probe_hosts_parallel_outcomes(hosts, timeout_secs, on_progress)
+        .into_iter()
+        .map(|outcome| outcome.result)
+        .collect()
+}
+
+/// Probe multiple hosts in parallel, reporting per-host outcomes.
+///
+/// Same bounded fan-out as [`probe_hosts_parallel`]: a dedicated Rayon pool
+/// with at most four workers per batch, one outcome per supplied host in input
+/// order, and a sequential fallback when the pool cannot be created. The
+/// difference is that each outcome records whether the host's transport
+/// exceeded the probe deadline, so a host that timed out is reported as such
+/// instead of being indistinguishable from a host that refused the
+/// connection. Derive the fleet-wide accounting with
+/// [`ProbeFleetReport::from_outcomes`].
+pub fn probe_hosts_parallel_outcomes<F>(
+    hosts: &[DiscoveredHost],
+    timeout_secs: u64,
+    on_progress: F,
+) -> Vec<HostProbeOutcome>
+where
+    F: Fn(usize, usize, &str) + Send + Sync,
+{
     use rayon::prelude::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -930,10 +1053,10 @@ where
     let completed = Arc::new(AtomicUsize::new(0));
     let on_progress = Arc::new(on_progress);
     let probe = |host: &DiscoveredHost| {
-        let result = probe_host(host, timeout_secs);
+        let outcome = probe_host_outcome(host, timeout_secs);
         let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
         on_progress(done, total, &host.name);
-        result
+        outcome
     };
 
     // GH505: a CPU-sized pool is not a network admission policy. Do not use
@@ -2457,6 +2580,205 @@ exit "$status"
         assert!(results.is_empty());
     }
 
+    /// Run only the named test against a local stub transport.
+    ///
+    /// The stub `ssh` in `PATH` answers one host, refuses one host and hangs
+    /// past the probe deadline on a third. No real host is contacted and no
+    /// process-wide environment change leaks into parallel library tests.
+    #[cfg(target_os = "linux")]
+    fn probe_timeout_fixture_child(test_name: &str) -> bool {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        if dotenvy::var("CASS_TEST_PROBE_TIMEOUT_CHILD").is_ok_and(|name| name == test_name) {
+            return true;
+        }
+        let root = tempfile::tempdir().unwrap();
+        for directory in ["bin", "home", "config", "cache", "data", "tmp"] {
+            fs::create_dir_all(root.path().join(directory)).unwrap();
+        }
+        let stub = root.path().join("bin/ssh");
+        fs::write(
+            &stub,
+            r#"#!/bin/sh
+set -eu
+host=""
+for arg in "$@"; do
+  case "$arg" in
+    100.64.0.*) host="$arg" ;;
+  esac
+done
+printf 'probe %s\n' "$host" >> "$CASS_TEST_PROBE_ROOT/probes"
+case "$host" in
+  100.64.0.2)
+    printf '===PROBE_START===\nCASS_VERSION=0.7.1\nCASS_HEALTH=NOT_INDEXED\nOS=Linux\nARCH=x86_64\nHOME=/home/developer\n===PROBE_END===\n'
+    exit 0
+    ;;
+  100.64.0.3)
+    printf 'Connection refused\n' >&2
+    exit 255
+    ;;
+  100.64.0.1)
+    # A transport that never answers: the probe deadline must expire.
+    /bin/sleep 30
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(root.path().join("probes"), "").unwrap();
+        let output = assert_cmd::Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .current_dir(root.path())
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", root.path().join("bin").display()),
+            )
+            .env("HOME", root.path().join("home"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("CASS_DATA_DIR", root.path().join("cass-data"))
+            .env("TMPDIR", root.path().join("tmp"))
+            .env("CASS_TEST_PROBE_ROOT", root.path())
+            .env("CASS_TEST_PROBE_TIMEOUT_CHILD", test_name)
+            .env("RUST_MIN_STACK", "134217728")
+            .args([
+                "--exact",
+                test_name,
+                "--nocapture",
+                "--test-threads=1",
+                "--color=never",
+            ])
+            .timeout(Duration::from_secs(120))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            "the isolated regression must actually run: {output:?}"
+        );
+        false
+    }
+
+    /// A bounded fleet probe must report the hosts whose transport exceeded
+    /// the deadline instead of dropping them: the fleet report states how many
+    /// hosts were probed, how many answered and how many timed out.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_parallel_probe_reports_timed_out_hosts_instead_of_dropping_them() {
+        if !probe_timeout_fixture_child(
+            "sources::probe::tests::test_parallel_probe_reports_timed_out_hosts_instead_of_dropping_them",
+        ) {
+            return;
+        }
+        let hosts: Vec<_> = ["100.64.0.1", "100.64.0.2", "100.64.0.3"]
+            .into_iter()
+            .map(|name| DiscoveredHost {
+                name: name.to_string(),
+                hostname: None,
+                user: None,
+                port: None,
+                identity_file: None,
+            })
+            .collect();
+        let outcomes = probe_hosts_parallel_outcomes(&hosts, 1, |_, _, _| {});
+
+        // Every probed host is reported, in input order: the host that
+        // exceeded the transport deadline is not dropped.
+        assert_eq!(outcomes.len(), hosts.len());
+        assert_eq!(
+            outcomes
+                .iter()
+                .map(|outcome| outcome.result.host_name.clone())
+                .collect::<Vec<_>>(),
+            hosts
+                .iter()
+                .map(|host| host.name.clone())
+                .collect::<Vec<_>>()
+        );
+
+        let report = ProbeFleetReport::from_outcomes(&outcomes);
+        assert_eq!(report.probed, 3);
+        assert_eq!(report.answered, 1);
+        assert_eq!(report.timed_out, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.timed_out_hosts, vec!["100.64.0.1".to_string()]);
+        assert!(
+            !report.is_complete(),
+            "a timed-out host is not a complete probe"
+        );
+
+        let timed_out = outcomes
+            .iter()
+            .find(|outcome| outcome.timed_out)
+            .expect("the slow host is reported as timed out");
+        assert!(!timed_out.result.reachable);
+        assert!(
+            timed_out
+                .result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("timed out"),
+            "the timed-out host names the deadline: {:?}",
+            timed_out.result.error
+        );
+
+        // A refused connection is a failure, not a timeout.
+        let refused = outcomes
+            .iter()
+            .find(|outcome| outcome.result.host_name == "100.64.0.3")
+            .expect("the refusing host is reported");
+        assert!(!refused.timed_out);
+        assert!(!refused.result.reachable);
+
+        // The answering host is reachable and not a timeout.
+        let answered = outcomes
+            .iter()
+            .find(|outcome| outcome.result.host_name == "100.64.0.2")
+            .expect("the answering host is reported");
+        assert!(answered.result.reachable);
+        assert!(!answered.timed_out);
+    }
+
+    /// The plain result API keeps working next to the outcome API: it returns
+    /// the same per-host results, one per host.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_parallel_probe_results_stay_one_per_host() {
+        if !probe_timeout_fixture_child(
+            "sources::probe::tests::test_parallel_probe_results_stay_one_per_host",
+        ) {
+            return;
+        }
+        let hosts: Vec<_> = ["100.64.0.1", "100.64.0.2", "100.64.0.3"]
+            .into_iter()
+            .map(|name| DiscoveredHost {
+                name: name.to_string(),
+                hostname: None,
+                user: None,
+                port: None,
+                identity_file: None,
+            })
+            .collect();
+        let results = probe_hosts_parallel(&hosts, 1, |_, _, _| {});
+        assert_eq!(results.len(), hosts.len());
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.host_name.clone())
+                .collect::<Vec<_>>(),
+            hosts
+                .iter()
+                .map(|host| host.name.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// Run only the named test in an isolated environment. Real OpenSSH uses
     /// a refusing ProxyCommand; only external Tailscale status is a fixture.
     /// No process-wide environment changes leak into parallel library tests.
@@ -2693,7 +3015,10 @@ exec /bin/cat "$CASS_TEST_PROBE_ROOT/status.json"
             .unwrap_err();
             // All eligible hosts reach real OpenSSH; the refusing transport
             // makes each unreachable. Provider endpoints must never get here.
-            assert!(matches!(error, super::super::setup::SetupError::NoHosts));
+            assert!(matches!(
+                error,
+                super::super::setup::SetupError::NoHosts { .. }
+            ));
         });
         let expected: Vec<_> = (1..=17).map(|index| format!("100.64.0.{index}")).collect();
         assert_bounded_probe_transports(&expected);

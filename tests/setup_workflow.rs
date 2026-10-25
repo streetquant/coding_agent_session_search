@@ -310,7 +310,7 @@ fn setup_error_cancelled_display() {
 /// Test SetupError::NoHosts display.
 #[test]
 fn setup_error_no_hosts_display() {
-    let err = SetupError::NoHosts;
+    let err = SetupError::NoHosts { probe_report: None };
     assert_eq!(format!("{err}"), "No SSH hosts found or selected");
 }
 
@@ -352,6 +352,7 @@ fn setup_result_structure() {
         total_sessions: 150,
         dry_run: false,
         sync_pending: false,
+        probe_report: None,
     };
 
     assert_eq!(result.sources_added, 3);
@@ -371,6 +372,7 @@ fn setup_result_dry_run() {
         total_sessions: 0,
         dry_run: true,
         sync_pending: false,
+        probe_report: None,
     };
 
     assert!(result.dry_run);
@@ -497,7 +499,7 @@ mod retry {
     use super::*;
     use coding_agent_search::sources::config::SourcesConfig;
     use coding_agent_search::sources::probe::{
-        DetectedAgent, HostProbeResult, ResourceInfo, SystemInfo,
+        DetectedAgent, HostProbeResult, ProbeFleetReport, ResourceInfo, SystemInfo,
     };
     use coding_agent_search::sources::setup::SetupDiscoveryMode;
     use std::collections::BTreeSet;
@@ -854,6 +856,69 @@ mod retry {
         fixture.save_initial();
         let output = fixture.run(&["--json", "--skip-sync"]);
         fixture.assert_configured(&output);
+    }
+
+    #[test]
+    fn setup_resume_json_reports_partial_probe_without_reprobing() {
+        let mut fixture = RetryFixture::new(false);
+        let report = ProbeFleetReport {
+            probed: 4,
+            answered: 3,
+            timed_out: 1,
+            failed: 0,
+            timed_out_hosts: vec!["slow-host".into()],
+        };
+        fixture.initial.discovered_hosts = 4;
+        fixture
+            .initial
+            .discovered_host_names
+            .push("slow-host".into());
+        fixture
+            .initial
+            .probed_hosts
+            .push(HostProbeResult::unreachable(
+                "slow-host",
+                "Connection timed out after 1 seconds",
+            ));
+        fixture.initial.probe_report = Some(report.clone());
+        fixture.initial.completed_installs = HOSTS.iter().map(|host| (*host).into()).collect();
+        fixture.initial.completed_indexes = fixture.initial.completed_installs.clone();
+        fixture.save_initial();
+
+        let output = fixture.run(&["--json", "--skip-sync"]);
+        fixture.assert_configured(&output);
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(payload["status"], "success");
+        assert_eq!(payload["probe"], serde_json::to_value(report).unwrap());
+    }
+
+    #[test]
+    fn setup_resume_json_reports_all_timed_out_hosts_without_false_completeness() {
+        let mut fixture = RetryFixture::new(false);
+        let report = ProbeFleetReport {
+            probed: HOSTS.len(),
+            answered: 0,
+            timed_out: HOSTS.len(),
+            failed: 0,
+            timed_out_hosts: HOSTS.iter().map(|host| (*host).into()).collect(),
+        };
+        fixture.initial.probed_hosts = HOSTS
+            .iter()
+            .map(|host| HostProbeResult::unreachable(host, "Connection timed out"))
+            .collect();
+        fixture.initial.probe_report = Some(report.clone());
+        fixture.save_initial();
+
+        let output = fixture.run(&["--json"]);
+        assert!(output.status.success(), "{output:?}");
+        assert!(fixture.transports().is_empty());
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(payload["status"], "no_hosts");
+        assert_eq!(payload["probe"], serde_json::to_value(report).unwrap());
+        assert_eq!(
+            fs::read(fixture.root.path().join("config/cass/sources.toml")).unwrap(),
+            CONFIG.as_bytes()
+        );
     }
 
     #[test]

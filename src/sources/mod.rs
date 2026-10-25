@@ -382,8 +382,9 @@ pub use sync::{
 
 // Re-export commonly used probe types
 pub use probe::{
-    CassStatus, DetectedAgent, HostProbeResult, ProbeCache, ResourceInfo, SystemInfo, probe_host,
-    probe_hosts_parallel,
+    CassStatus, DetectedAgent, HostProbeOutcome, HostProbeResult, ProbeCache, ProbeFleetReport,
+    ResourceInfo, SystemInfo, probe_host, probe_host_outcome, probe_hosts_parallel,
+    probe_hosts_parallel_outcomes,
 };
 
 // Re-export commonly used install types
