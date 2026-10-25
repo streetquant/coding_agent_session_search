@@ -44,6 +44,8 @@ fn command(home: &Path, streaming: &str) -> Command {
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"))
         .env("CASS_DATA_DIR", home.join("data"))
+        .env("CASS_CLOUDMCP_DATA_ROOT", home.join("cloudmcp-empty"))
+        .env("CASS_OPENWEBUI_DATA_ROOT", home.join("openwebui-empty"))
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         .env("CASS_STREAMING_INDEX", streaming)
         .env("CASS_AUTO_REFRESH", "0")
