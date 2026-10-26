@@ -2226,9 +2226,8 @@ mod gh470_native_long_messages {
     #[ignore = "writes the frozen GH470 grounded fixture and queries to GH470_FIXTURE_OUT"]
     fn gh470_dump_grounded_fixture() -> Result<()> {
         use std::io::Write;
-        let out = PathBuf::from(
-            dotenvy::var("GH470_FIXTURE_OUT").context("set GH470_FIXTURE_OUT")?,
-        );
+        let out =
+            PathBuf::from(dotenvy::var("GH470_FIXTURE_OUT").context("set GH470_FIXTURE_OUT")?);
         let (messages, queries) = corpus();
         let mut file = fs::File::create(&out)?;
         for message in &messages {
@@ -2268,9 +2267,9 @@ mod gh470_native_long_messages {
     #[ignore = "exports CASS-canonical baseline and passages for GH470_CORPUS into GH470_CANON_OUT"]
     fn gh470_export_canonical_inputs() -> Result<()> {
         use std::io::{BufRead, BufReader, BufWriter, Write};
-        let corpus_path =
-            PathBuf::from(dotenvy::var("GH470_CORPUS").context("set GH470_CORPUS")?);
-        let out_path = PathBuf::from(dotenvy::var("GH470_CANON_OUT").context("set GH470_CANON_OUT")?);
+        let corpus_path = PathBuf::from(dotenvy::var("GH470_CORPUS").context("set GH470_CORPUS")?);
+        let out_path =
+            PathBuf::from(dotenvy::var("GH470_CANON_OUT").context("set GH470_CANON_OUT")?);
         let reader = BufReader::new(fs::File::open(&corpus_path)?);
         let mut writer = BufWriter::new(fs::File::create(&out_path)?);
         let mut messages = 0u64;
@@ -2579,6 +2578,112 @@ mod gh470_native_long_messages {
         );
         Ok(())
     }
+    fn scale_retrieval_ranks(
+        queries: &[(String, String, Option<u64>)],
+        uid_idx: &std::collections::HashMap<String, usize>,
+        baseline: &[f32],
+        candidate: &[f32],
+    ) -> Result<Vec<Value>> {
+        let query_count = queries.len();
+        anyhow::ensure!(query_count > 0, "scale retrieval needs grounded queries");
+        anyhow::ensure!(
+            baseline.len() == candidate.len() && baseline.len().is_multiple_of(query_count),
+            "scale retrieval score matrices do not match the query count"
+        );
+        let message_count = baseline.len() / query_count;
+
+        fn rank_of(scores: &[f32], qn: usize, target: usize, qi: usize) -> Result<Value> {
+            let target_score = *scores
+                .get(target * qn + qi)
+                .context("grounded target is outside the score matrix")?;
+            let mut greater = 0usize;
+            let mut ties = 0usize;
+            for &score in scores.iter().skip(qi).step_by(qn) {
+                if score.is_finite() {
+                    if score > target_score {
+                        greater += 1;
+                    } else if score == target_score {
+                        ties += 1;
+                    }
+                }
+            }
+            Ok(json!({
+                "target_score": target_score,
+                "target_rank": if target_score.is_finite() { Value::from(greater + 1) } else { Value::Null },
+                "tie_count": ties.saturating_sub(1),
+            }))
+        }
+
+        queries
+            .iter()
+            .enumerate()
+            .map(|(qi, (name, _text, target))| {
+                let (baseline_rank, candidate_rank) = if let Some(target) = target {
+                    let uid = format!("fixture:{target}");
+                    let target_idx = *uid_idx.get(&uid).with_context(|| {
+                        format!("grounded target {uid} missing for query {name}")
+                    })?;
+                    anyhow::ensure!(
+                        target_idx < message_count,
+                        "grounded target {uid} is outside the score matrix"
+                    );
+                    (
+                        rank_of(baseline, query_count, target_idx, qi)?,
+                        rank_of(candidate, query_count, target_idx, qi)?,
+                    )
+                } else {
+                    (
+                        json!({"target_rank": Value::Null}),
+                        json!({"target_rank": Value::Null}),
+                    )
+                };
+                Ok(json!({
+                    "query": name,
+                    "baseline": baseline_rank,
+                    "candidate": candidate_rank,
+                }))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gh470_scale_retrieval_uses_each_grounded_target() -> Result<()> {
+        let queries = vec![
+            ("first".into(), "first query".into(), Some(101)),
+            ("second".into(), "second query".into(), Some(202)),
+            ("absent".into(), "no relevant message".into(), None),
+        ];
+        let mut uid_idx = std::collections::HashMap::from([
+            ("fixture:101".into(), 0),
+            ("distractor".into(), 1),
+            ("fixture:202".into(), 2),
+        ]);
+        // Rows are messages, columns are queries. Reusing the first target
+        // would falsely report a second-query improvement from rank 3 to 1;
+        // its actual target regresses from rank 1 to 3.
+        let baseline = [0.9, 0.1, 0.2, 0.1, 0.2, 0.3, 0.2, 0.9, 0.4];
+        let candidate = [0.8, 0.9, 0.2, 0.9, 0.8, 0.3, 0.1, 0.1, 0.4];
+        let reports = scale_retrieval_ranks(&queries, &uid_idx, &baseline, &candidate)?;
+        let [first, second, absent] = reports.as_slice() else {
+            anyhow::bail!("expected all three query reports");
+        };
+        assert_eq!(first.pointer("/baseline/target_rank"), Some(&json!(1)));
+        assert_eq!(first.pointer("/candidate/target_rank"), Some(&json!(2)));
+        assert_eq!(second.pointer("/baseline/target_rank"), Some(&json!(1)));
+        assert_eq!(second.pointer("/candidate/target_rank"), Some(&json!(3)));
+        assert_eq!(absent.pointer("/baseline/target_rank"), Some(&Value::Null));
+        assert_eq!(absent.pointer("/candidate/target_rank"), Some(&Value::Null));
+
+        uid_idx.remove("fixture:202");
+        let Err(error) = scale_retrieval_ranks(&queries, &uid_idx, &baseline, &candidate) else {
+            anyhow::bail!("a missing grounded target must fail the scale report");
+        };
+        assert!(error.to_string().contains("fixture:202"));
+        assert!(scale_retrieval_ranks(&queries, &uid_idx, &baseline, &[0.0]).is_err());
+        assert!(scale_retrieval_ranks(&[], &uid_idx, &[], &[]).is_err());
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires GH470_CANON and CASS_NATIVE_REUSE_MODEL_DIR; full 1.2M native scale run"]
     fn gh470_native_parallel_retrieval() -> Result<()> {
@@ -2588,9 +2693,7 @@ mod gh470_native_long_messages {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let canon = PathBuf::from(dotenvy::var("GH470_CANON").context("set GH470_CANON")?);
-        let fixture = PathBuf::from(
-            dotenvy::var("GH470_FIXTURE").context("set GH470_FIXTURE")?,
-        );
+        let fixture = PathBuf::from(dotenvy::var("GH470_FIXTURE").context("set GH470_FIXTURE")?);
         let threads: usize = dotenvy::var("GH470_THREADS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -2623,7 +2726,10 @@ mod gh470_native_long_messages {
                     .as_str()
                     .context("canonical representation")?
                     == "candidate",
-                text: value["text"].as_str().context("canonical text")?.to_string(),
+                text: value["text"]
+                    .as_str()
+                    .context("canonical text")?
+                    .to_string(),
             });
         }
         let n = uid_count;
@@ -2643,15 +2749,17 @@ mod gh470_native_long_messages {
         };
         assert_eq!(queries.len(), 8);
         let qn = queries.len();
-        let target_idx = queries
-            .iter()
-            .find_map(|(_, _, target)| *target)
-            .and_then(|target| {
+        // Validate every grounded identity before starting millions of native
+        // embeddings; the report resolves each one again against these scores.
+        for (name, _text, target) in &queries {
+            if let Some(target) = target {
                 let uid = format!("fixture:{target}");
-                uid_idx.get(&uid).copied()
-            })
-            .context("fixture target in canonical corpus")?;
-
+                anyhow::ensure!(
+                    uid_idx.contains_key(&uid),
+                    "grounded target {uid} missing for query {name}"
+                );
+            }
+        }
         let rows = Arc::new(rows);
         let query_texts = Arc::new(
             queries
@@ -2681,7 +2789,10 @@ mod gh470_native_long_messages {
                         if batch.len() < 16 {
                             continue;
                         }
-                        let texts = batch.iter().map(|row| row.text.as_str()).collect::<Vec<_>>();
+                        let texts = batch
+                            .iter()
+                            .map(|row| row.text.as_str())
+                            .collect::<Vec<_>>();
                         let vectors = embedder.embed_batch_sync(&texts)?;
                         for (row, vector) in batch.iter().zip(vectors.iter()) {
                             let scores = if row.candidate {
@@ -2689,7 +2800,8 @@ mod gh470_native_long_messages {
                             } else {
                                 &mut baseline[row.idx * qn..(row.idx + 1) * qn]
                             };
-                            for (query_vector, score) in query_vectors.iter().zip(scores.iter_mut()) {
+                            for (query_vector, score) in query_vectors.iter().zip(scores.iter_mut())
+                            {
                                 let dot = vector
                                     .iter()
                                     .zip(query_vector.iter())
@@ -2701,7 +2813,8 @@ mod gh470_native_long_messages {
                             }
                         }
                         local_done += batch.len();
-                        let total = processed.fetch_add(batch.len(), Ordering::Relaxed) + batch.len();
+                        let total =
+                            processed.fetch_add(batch.len(), Ordering::Relaxed) + batch.len();
                         if total / 100_000 != (total - batch.len()) / 100_000 {
                             println!(
                                 "GH470_NATIVE_PROGRESS {} elapsed_s={:.0}",
@@ -2712,7 +2825,10 @@ mod gh470_native_long_messages {
                         batch.clear();
                     }
                     if !batch.is_empty() {
-                        let texts = batch.iter().map(|row| row.text.as_str()).collect::<Vec<_>>();
+                        let texts = batch
+                            .iter()
+                            .map(|row| row.text.as_str())
+                            .collect::<Vec<_>>();
                         let vectors = embedder.embed_batch_sync(&texts)?;
                         for (row, vector) in batch.iter().zip(vectors.iter()) {
                             let scores = if row.candidate {
@@ -2720,7 +2836,8 @@ mod gh470_native_long_messages {
                             } else {
                                 &mut baseline[row.idx * qn..(row.idx + 1) * qn]
                             };
-                            for (query_vector, score) in query_vectors.iter().zip(scores.iter_mut()) {
+                            for (query_vector, score) in query_vectors.iter().zip(scores.iter_mut())
+                            {
                                 let dot = vector
                                     .iter()
                                     .zip(query_vector.iter())
@@ -2759,46 +2876,7 @@ mod gh470_native_long_messages {
         assert_eq!(embedded, rows.len());
         let elapsed = started.elapsed().as_secs_f64();
 
-        fn rank_of(arr: &[f32], qn: usize, target: usize, qi: usize) -> Value {
-            let target_score = arr[target * qn + qi];
-            let mut greater = 0usize;
-            let mut ties = 0usize;
-            for idx in 0..arr.len() / qn {
-                let score = arr[idx * qn + qi];
-                if score.is_finite() {
-                    if score > target_score {
-                        greater += 1;
-                    } else if score == target_score {
-                        ties += 1;
-                    }
-                }
-            }
-            json!({
-                "target_score": target_score,
-                "target_rank": if target_score.is_finite() { Value::from(greater + 1) } else { Value::Null },
-                "tie_count": ties.saturating_sub(1),
-            })
-        }
-
-        let retrieval = queries
-            .iter()
-            .enumerate()
-            .map(|(qi, (name, _text, target))| {
-                let baseline_rank = target.map_or_else(
-                    || json!({"target_rank": Value::Null}),
-                    |_| rank_of(&baseline, qn, target_idx, qi),
-                );
-                let candidate_rank = target.map_or_else(
-                    || json!({"target_rank": Value::Null}),
-                    |_| rank_of(&candidate, qn, target_idx, qi),
-                );
-                json!({
-                    "query": name,
-                    "baseline": baseline_rank,
-                    "candidate": candidate_rank,
-                })
-            })
-            .collect::<Vec<_>>();
+        let retrieval = scale_retrieval_ranks(&queries, &uid_idx, &baseline, &candidate)?;
         println!(
             "GH470_NATIVE_SCALE {}",
             json!({
