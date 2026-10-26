@@ -2174,6 +2174,151 @@ mod gh470_native_long_messages {
 
     #[test]
     #[ignore = "requires CASS_NATIVE_REUSE_MODEL_DIR with the attested five-file MiniLM bundle; never downloads"]
+    fn gh470_native_batch_throughput_probe() -> Result<()> {
+        let data = tempfile::tempdir()?;
+        copy_attested_model(data.path())?;
+        // One 510-character passage per authoritative message: the native
+        // backend's own batch size is the only variable changed here.
+        let inputs: Vec<EmbeddingInput> = (0..512u64)
+            .map(|ordinal| {
+                let marker = format!("batch-throughput-marker-{ordinal:04}");
+                let mut content = String::new();
+                while content.chars().count() < 460 {
+                    content.push_str(
+                        "The deployment dashboard records worker counts, latency histograms, \
+                         staging configuration, and release checklist observations. ",
+                    );
+                }
+                content.push_str(&marker);
+                EmbeddingInput {
+                    message_id: ordinal + 1,
+                    created_at_ms: 1_700_000_000_000 + ordinal as i64,
+                    agent_id: 1,
+                    workspace_id: 1,
+                    source_id: 1,
+                    role: 0,
+                    chunk_idx: 0,
+                    content,
+                }
+            })
+            .collect();
+        for batch_size in [1usize, 8, 64] {
+            let indexer =
+                SemanticIndexer::new("minilm", Some(data.path()))?.with_batch_size(batch_size)?;
+            let started = Instant::now();
+            let embedded = indexer.embed_messages(&inputs)?;
+            let elapsed = started.elapsed().as_secs_f64();
+            assert_eq!(embedded.len(), inputs.len());
+            println!(
+                "GH470_THROUGHPUT {}",
+                json!({
+                    "batch_size": batch_size,
+                    "passages": inputs.len(),
+                    "embedding_ms": elapsed * 1000.0,
+                    "passages_per_second": inputs.len() as f64 / elapsed,
+                })
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "writes the frozen GH470 grounded fixture and queries to GH470_FIXTURE_OUT"]
+    fn gh470_dump_grounded_fixture() -> Result<()> {
+        use std::io::Write;
+        let out = PathBuf::from(
+            dotenvy::var("GH470_FIXTURE_OUT").context("set GH470_FIXTURE_OUT")?,
+        );
+        let (messages, queries) = corpus();
+        let mut file = fs::File::create(&out)?;
+        for message in &messages {
+            writeln!(
+                file,
+                "{}",
+                json!({
+                    "kind": "message",
+                    "message_id": message.message_id,
+                    "created_at_ms": message.created_at_ms,
+                    "agent_id": message.agent_id,
+                    "workspace_id": message.workspace_id,
+                    "source_id": message.source_id,
+                    "role": message.role,
+                    "content": message.content,
+                    "content_sha256": content_hash(&canonicalize_for_embedding(&message.content)),
+                })
+            )?;
+        }
+        for query in &queries {
+            writeln!(
+                file,
+                "{}",
+                json!({
+                    "kind": "query",
+                    "name": query.name,
+                    "text": query.text,
+                    "target": query.target,
+                    "evidence": query.evidence,
+                })
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "exports CASS-canonical baseline and passages for GH470_CORPUS into GH470_CANON_OUT"]
+    fn gh470_export_canonical_inputs() -> Result<()> {
+        use std::io::{BufRead, BufReader, BufWriter, Write};
+        let corpus_path =
+            PathBuf::from(dotenvy::var("GH470_CORPUS").context("set GH470_CORPUS")?);
+        let out_path = PathBuf::from(dotenvy::var("GH470_CANON_OUT").context("set GH470_CANON_OUT")?);
+        let reader = BufReader::new(fs::File::open(&corpus_path)?);
+        let mut writer = BufWriter::new(fs::File::create(&out_path)?);
+        let mut messages = 0u64;
+        let mut baseline_inputs = 0u64;
+        let mut candidate_inputs = 0u64;
+        for line in reader.lines() {
+            let line = line?;
+            let value: Value = serde_json::from_str(&line)?;
+            let uid = value["uid"].as_str().context("corpus uid")?;
+            let raw = value["content"].as_str().context("corpus content")?;
+            messages += 1;
+            let baseline = canonicalize_for_embedding(raw);
+            if !baseline.is_empty() {
+                baseline_inputs += 1;
+                writeln!(
+                    writer,
+                    "{}",
+                    json!({"representation":"baseline","uid":uid,"chunk_idx":0,"text":baseline})
+                )?;
+            }
+            for (chunk_idx, passage) in embedding_passages(raw).into_iter().enumerate() {
+                let canonical = canonicalize_for_embedding(passage);
+                if canonical.is_empty() {
+                    continue;
+                }
+                candidate_inputs += 1;
+                writeln!(
+                    writer,
+                    "{}",
+                    json!({"representation":"candidate","uid":uid,"chunk_idx":chunk_idx,"text":canonical})
+                )?;
+            }
+        }
+        writer.flush()?;
+        println!(
+            "GH470_CANON {}",
+            json!({
+                "messages": messages,
+                "baseline_inputs": baseline_inputs,
+                "candidate_inputs": candidate_inputs,
+                "vector_multiplier": candidate_inputs as f64 / messages as f64,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CASS_NATIVE_REUSE_MODEL_DIR with the attested five-file MiniLM bundle; never downloads"]
     fn gh470_native_backfill_hydrates_passages_without_duplicate_messages() -> Result<()> {
         use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
         use coding_agent_search::model::types::{
@@ -2431,6 +2576,243 @@ mod gh470_native_long_messages {
             json!({"corpus_revision":CORPUS_REVISION,
                 "authoritative_messages":19,"stored_vectors":44,"backfill":report,"retrieval":retrieval,
                 "limits":"real CLI backfill and native exact search with SQLite hydration; no ANN or performance certification"})
+        );
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires GH470_CANON and CASS_NATIVE_REUSE_MODEL_DIR; full 1.2M native scale run"]
+    fn gh470_native_parallel_retrieval() -> Result<()> {
+        use std::collections::HashMap;
+        use std::io::BufRead;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let canon = PathBuf::from(dotenvy::var("GH470_CANON").context("set GH470_CANON")?);
+        let fixture = PathBuf::from(
+            dotenvy::var("GH470_FIXTURE").context("set GH470_FIXTURE")?,
+        );
+        let threads: usize = dotenvy::var("GH470_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32);
+        assert!(threads > 0);
+
+        let data = tempfile::tempdir()?;
+        let (_manifest, model_dir, _copy_ms) = copy_attested_model(data.path())?;
+        let model_dir = Arc::new(model_dir);
+
+        struct Row {
+            idx: usize,
+            candidate: bool,
+            text: String,
+        }
+        let mut rows = Vec::new();
+        let mut uid_idx = HashMap::new();
+        let mut uid_count = 0usize;
+        for line in std::io::BufReader::new(fs::File::open(&canon)?).lines() {
+            let value: Value = serde_json::from_str(&line?)?;
+            let uid = value["uid"].as_str().context("canonical uid")?.to_string();
+            let idx = *uid_idx.entry(uid).or_insert_with(|| {
+                let idx = uid_count;
+                uid_count += 1;
+                idx
+            });
+            rows.push(Row {
+                idx,
+                candidate: value["representation"]
+                    .as_str()
+                    .context("canonical representation")?
+                    == "candidate",
+                text: value["text"].as_str().context("canonical text")?.to_string(),
+            });
+        }
+        let n = uid_count;
+        let queries = {
+            let mut queries = Vec::new();
+            for line in std::io::BufReader::new(fs::File::open(&fixture)?).lines() {
+                let value: Value = serde_json::from_str(&line?)?;
+                if value["kind"] == "query" {
+                    queries.push((
+                        value["name"].as_str().context("query name")?.to_string(),
+                        value["text"].as_str().context("query text")?.to_string(),
+                        value["target"].as_u64(),
+                    ));
+                }
+            }
+            queries
+        };
+        assert_eq!(queries.len(), 8);
+        let qn = queries.len();
+        let target_idx = queries
+            .iter()
+            .find_map(|(_, _, target)| *target)
+            .and_then(|target| {
+                let uid = format!("fixture:{target}");
+                uid_idx.get(&uid).copied()
+            })
+            .context("fixture target in canonical corpus")?;
+
+        let rows = Arc::new(rows);
+        let query_texts = Arc::new(
+            queries
+                .iter()
+                .map(|(_, text, _)| text.clone())
+                .collect::<Vec<_>>(),
+        );
+        let processed = Arc::new(AtomicUsize::new(0));
+        let started = Instant::now();
+        let handles = (0..threads)
+            .map(|tid| {
+                let rows = Arc::clone(&rows);
+                let query_texts = Arc::clone(&query_texts);
+                let model_dir = Arc::clone(&model_dir);
+                let processed = Arc::clone(&processed);
+                std::thread::spawn(move || -> Result<(Vec<f32>, Vec<f32>, usize)> {
+                    let embedder = FastEmbedder::load_from_dir(&model_dir)?;
+                    let query_refs = query_texts.iter().map(String::as_str).collect::<Vec<_>>();
+                    let query_vectors = embedder.embed_batch_sync(&query_refs)?;
+                    assert_eq!(query_vectors.len(), qn);
+                    let mut baseline = vec![f32::NEG_INFINITY; n * qn];
+                    let mut candidate = vec![f32::NEG_INFINITY; n * qn];
+                    let mut local_done = 0usize;
+                    let mut batch = Vec::with_capacity(16);
+                    for row in rows.iter().skip(tid).step_by(threads) {
+                        batch.push(row);
+                        if batch.len() < 16 {
+                            continue;
+                        }
+                        let texts = batch.iter().map(|row| row.text.as_str()).collect::<Vec<_>>();
+                        let vectors = embedder.embed_batch_sync(&texts)?;
+                        for (row, vector) in batch.iter().zip(vectors.iter()) {
+                            let scores = if row.candidate {
+                                &mut candidate[row.idx * qn..(row.idx + 1) * qn]
+                            } else {
+                                &mut baseline[row.idx * qn..(row.idx + 1) * qn]
+                            };
+                            for (query_vector, score) in query_vectors.iter().zip(scores.iter_mut()) {
+                                let dot = vector
+                                    .iter()
+                                    .zip(query_vector.iter())
+                                    .map(|(a, b)| a * b)
+                                    .sum::<f32>();
+                                if dot > *score {
+                                    *score = dot;
+                                }
+                            }
+                        }
+                        local_done += batch.len();
+                        let total = processed.fetch_add(batch.len(), Ordering::Relaxed) + batch.len();
+                        if total / 100_000 != (total - batch.len()) / 100_000 {
+                            println!(
+                                "GH470_NATIVE_PROGRESS {} elapsed_s={:.0}",
+                                total,
+                                started.elapsed().as_secs_f64()
+                            );
+                        }
+                        batch.clear();
+                    }
+                    if !batch.is_empty() {
+                        let texts = batch.iter().map(|row| row.text.as_str()).collect::<Vec<_>>();
+                        let vectors = embedder.embed_batch_sync(&texts)?;
+                        for (row, vector) in batch.iter().zip(vectors.iter()) {
+                            let scores = if row.candidate {
+                                &mut candidate[row.idx * qn..(row.idx + 1) * qn]
+                            } else {
+                                &mut baseline[row.idx * qn..(row.idx + 1) * qn]
+                            };
+                            for (query_vector, score) in query_vectors.iter().zip(scores.iter_mut()) {
+                                let dot = vector
+                                    .iter()
+                                    .zip(query_vector.iter())
+                                    .map(|(a, b)| a * b)
+                                    .sum::<f32>();
+                                if dot > *score {
+                                    *score = dot;
+                                }
+                            }
+                        }
+                        local_done += batch.len();
+                        processed.fetch_add(batch.len(), Ordering::Relaxed);
+                    }
+                    Ok((baseline, candidate, local_done))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut baseline = vec![f32::NEG_INFINITY; n * qn];
+        let mut candidate = vec![f32::NEG_INFINITY; n * qn];
+        let mut embedded = 0usize;
+        for handle in handles {
+            let (thread_baseline, thread_candidate, count) = handle.join().unwrap()?;
+            embedded += count;
+            for (dst, src) in baseline.iter_mut().zip(thread_baseline) {
+                if src > *dst {
+                    *dst = src;
+                }
+            }
+            for (dst, src) in candidate.iter_mut().zip(thread_candidate) {
+                if src > *dst {
+                    *dst = src;
+                }
+            }
+        }
+        assert_eq!(embedded, rows.len());
+        let elapsed = started.elapsed().as_secs_f64();
+
+        fn rank_of(arr: &[f32], qn: usize, target: usize, qi: usize) -> Value {
+            let target_score = arr[target * qn + qi];
+            let mut greater = 0usize;
+            let mut ties = 0usize;
+            for idx in 0..arr.len() / qn {
+                let score = arr[idx * qn + qi];
+                if score.is_finite() {
+                    if score > target_score {
+                        greater += 1;
+                    } else if score == target_score {
+                        ties += 1;
+                    }
+                }
+            }
+            json!({
+                "target_score": target_score,
+                "target_rank": if target_score.is_finite() { Value::from(greater + 1) } else { Value::Null },
+                "tie_count": ties.saturating_sub(1),
+            })
+        }
+
+        let retrieval = queries
+            .iter()
+            .enumerate()
+            .map(|(qi, (name, _text, target))| {
+                let baseline_rank = target.map_or_else(
+                    || json!({"target_rank": Value::Null}),
+                    |_| rank_of(&baseline, qn, target_idx, qi),
+                );
+                let candidate_rank = target.map_or_else(
+                    || json!({"target_rank": Value::Null}),
+                    |_| rank_of(&candidate, qn, target_idx, qi),
+                );
+                json!({
+                    "query": name,
+                    "baseline": baseline_rank,
+                    "candidate": candidate_rank,
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "GH470_NATIVE_SCALE {}",
+            json!({
+                "model": "all-minilm-l6-v2",
+                "vector_space": MINILM_VECTOR_SPACE_REVISION,
+                "threads": threads,
+                "canonical_rows": rows.len(),
+                "baseline_inputs": rows.iter().filter(|row| !row.candidate).count(),
+                "candidate_inputs": rows.iter().filter(|row| row.candidate).count(),
+                "messages": n,
+                "elapsed_s": elapsed,
+                "retrieval": retrieval,
+                "limits": "native parallel embedding and exhaustive ranking over canonical inputs; not a SQLite backfill or ANN certification",
+            })
         );
         Ok(())
     }
