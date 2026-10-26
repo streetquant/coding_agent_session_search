@@ -5,7 +5,7 @@ mod source_budget;
 pub(crate) use source_budget::over_budget_scan_error;
 pub(crate) use source_budget::over_budget_sources;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 
@@ -216,14 +216,28 @@ fn augment_modern_codex_reader(
             .enumerate()
             .map(|(index, message)| (modern_codex_message_signature(message), index))
             .collect();
-    let mut message_indices_by_call_id: HashMap<String, usize> = conversation
+    let mut message_indices_by_call_id: HashMap<(String, String), usize> = conversation
         .messages
         .iter()
         .enumerate()
         .flat_map(|(index, message)| {
-            modern_codex_message_call_ids(message).map(move |call_id| (call_id, index))
+            modern_codex_message_call_ids(message)
+                .map(move |call_id| ((message.role.clone(), call_id), index))
         })
         .collect();
+    // Large-file FAD messages keep their complete tool text but compact away
+    // raw result IDs. Match these original occurrences once, in source order,
+    // before enriching their presentation and retaining the native result ID.
+    let mut unidentified_tool_results: HashMap<ModernCodexMessageSignature, VecDeque<usize>> =
+        HashMap::new();
+    for (index, message) in conversation.messages.iter().enumerate() {
+        if message.role == "tool" && modern_codex_message_call_ids(message).next().is_none() {
+            unidentified_tool_results
+                .entry(modern_codex_message_signature(message))
+                .or_default()
+                .push_back(index);
+        }
+    }
     let mut message_indices_by_raw_entry: HashMap<[u8; 32], usize> = conversation
         .messages
         .iter()
@@ -292,7 +306,28 @@ fn augment_modern_codex_reader(
             .copied()
             .or_else(|| {
                 modern_codex_message_call_ids(&message)
-                    .find_map(|call_id| message_indices_by_call_id.get(&call_id).copied())
+                    .find_map(|call_id| {
+                        message_indices_by_call_id
+                            .get(&(message.role.clone(), call_id))
+                            .copied()
+                    })
+                    .filter(|index| {
+                        message.role != "tool"
+                            || conversation
+                                .messages
+                                .get(*index)
+                                .is_some_and(|existing| same_tool_result_body(existing, &message))
+                    })
+            })
+            .or_else(|| {
+                let output = tool_result_output(&message)?;
+                let signature = ModernCodexMessageSignature {
+                    role: message.role.clone(),
+                    author: message.author.clone(),
+                    created_at: message.created_at,
+                    content_hash: *blake3::hash(output.as_bytes()).as_bytes(),
+                };
+                unidentified_tool_results.get_mut(&signature)?.pop_front()
             })
             .or_else(|| {
                 message_indices_by_signature
@@ -305,12 +340,15 @@ fn augment_modern_codex_reader(
 
         if let Some(existing_index) = existing_index {
             let existing = &mut conversation.messages[existing_index];
-            if merge_modern_codex_tool_call(existing, &message) {
+            let call_changed = merge_modern_codex_tool_call(existing, &message);
+            let result_changed = merge_modern_codex_tool_result(existing, &message);
+            if call_changed || result_changed {
                 message_indices_by_signature
                     .insert(modern_codex_message_signature(existing), existing_index);
                 message_indices_by_call_id.extend(
                     modern_codex_message_call_ids(existing)
-                        .map(|call_id| (call_id, existing_index)),
+                        // ubs:ignore -- Each lookup owns its small role key; the full tool body is never cloned.
+                        .map(|call_id| ((existing.role.clone(), call_id), existing_index)),
                 );
             }
             message_indices_by_raw_entry.insert(raw_signature, existing_index);
@@ -321,8 +359,11 @@ fn augment_modern_codex_reader(
         conversation.messages.push(message);
         let stored = &conversation.messages[message_index];
         message_indices_by_signature.insert(message_signature, message_index);
-        message_indices_by_call_id
-            .extend(modern_codex_message_call_ids(stored).map(|call_id| (call_id, message_index)));
+        message_indices_by_call_id.extend(
+            modern_codex_message_call_ids(stored)
+                // ubs:ignore -- Distinct result/call namespaces need owned role keys, not copies of message content.
+                .map(|call_id| ((stored.role.clone(), call_id), message_index)),
+        );
         message_indices_by_raw_entry.insert(raw_signature, message_index);
         added = true;
     }
@@ -432,7 +473,7 @@ fn response_item_message(
                 }],
             ))
         }
-        Some("function_call_output") => {
+        Some("function_call_output" | "custom_tool_call_output") => {
             let output = payload.get("output").and_then(Value::as_str)?;
             let call_id = payload.get("call_id").and_then(Value::as_str);
             Some(normalized_message(
@@ -664,10 +705,93 @@ fn modern_codex_raw_signature(raw: &Value) -> [u8; 32] {
 }
 
 fn modern_codex_message_call_ids(message: &NormalizedMessage) -> impl Iterator<Item = String> + '_ {
+    let result_call_id = (message.role == "tool")
+        .then(|| {
+            message
+                .extra
+                .pointer("/cass/tool_result_call_id")
+                .or_else(|| message.extra.pointer("/payload/call_id"))
+                .and_then(Value::as_str)
+        })
+        .flatten();
     message
         .invocations
         .iter()
         .filter_map(|invocation| invocation.call_id.clone())
+        .chain(result_call_id.map(str::to_owned))
+}
+
+fn tool_result_output(message: &NormalizedMessage) -> Option<&str> {
+    (message.role == "tool")
+        .then(|| {
+            message
+                .extra
+                .pointer("/payload/output")
+                .and_then(Value::as_str)
+        })
+        .flatten()
+}
+
+fn same_tool_result_body(existing: &NormalizedMessage, candidate: &NormalizedMessage) -> bool {
+    if existing.role != "tool" || existing.created_at != candidate.created_at {
+        return false;
+    }
+    let Some(output) = tool_result_output(candidate) else {
+        return false;
+    };
+    if existing.content == output {
+        return true;
+    }
+    let Some(call_id) = modern_codex_message_call_ids(candidate).next() else {
+        return false;
+    };
+    existing
+        .content
+        .strip_prefix(&format!("[Tool output: {call_id}]\n"))
+        == Some(output)
+}
+
+fn merge_modern_codex_tool_result(
+    existing: &mut NormalizedMessage,
+    candidate: &NormalizedMessage,
+) -> bool {
+    if !same_tool_result_body(existing, candidate) {
+        return false;
+    }
+    let Some(call_id) = modern_codex_message_call_ids(candidate).next() else {
+        return false;
+    };
+    let mut changed = false;
+    // Preserve the entire authoritative primary output, including text beyond
+    // the enrichment-only projection cap. The native prefix also keeps two
+    // identical outputs from distinct calls distinct in canonical storage.
+    if tool_result_output(candidate) == Some(existing.content.as_str()) {
+        existing
+            .content
+            .insert_str(0, &format!("[Tool output: {call_id}]\n"));
+        changed = true;
+    }
+    // Ordinary messages already retain the native ID in their raw payload.
+    // Only compacted messages need a recovery field; adding it on replay to
+    // a freshly projected result would make unchanged enrichment non-idempotent.
+    if modern_codex_message_call_ids(existing).any(|existing_id| existing_id == call_id) {
+        return changed;
+    }
+    if existing.extra.is_null() {
+        existing.extra = Value::Object(serde_json::Map::new());
+    }
+    if let Some(extra) = existing.extra.as_object_mut() {
+        let cass = extra
+            .entry("cass")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(cass) = cass.as_object_mut()
+            && cass.get("tool_result_call_id").and_then(Value::as_str) != Some(call_id.as_str())
+        {
+            cass.insert("tool_result_call_id".to_owned(), Value::String(call_id));
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Identical tool text is not identical tool activity. Prefer native call IDs
@@ -998,6 +1122,81 @@ mod tests {
             parsed.content,
             "[Tool: exec_command]\n{\"cmd\":\"git status\"}"
         );
+    }
+
+    #[test]
+    fn result_enrichment_matches_large_compacted_primary_occurrences() -> Result<()> {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("rollout-compacted-results.jsonl");
+        let output = "x".repeat(MAX_INDEXED_TOOL_OUTPUT_CHARS + 4096);
+        let call = response(serde_json::json!({
+            "type": "function_call", "name": "exec_command", "call_id": "shared-1",
+            "arguments": "{\"cmd\":\"true\"}"
+        }));
+        let mut first = response(serde_json::json!({
+            "type": "function_call_output", "call_id": "shared-1", "output": output
+        }));
+        let mut second = response(serde_json::json!({
+            "type": "custom_tool_call_output", "call_id": "shared-2", "output": output
+        }));
+        first["model"] = Value::String("native-model".to_owned());
+        second["model"] = Value::String("native-model".to_owned());
+        {
+            let mut file = File::create(&path)?;
+            // Exercise the pinned primary parser's real 32 MiB compaction,
+            // rather than inventing a compacted message fixture ourselves.
+            let padding = serde_json::json!({
+                "type": "fixture_padding", "padding": "x".repeat(1024 * 1024)
+            });
+            for _ in 0..33 {
+                writeln!(file, "{padding}")?;
+            }
+            writeln!(file, "{call}\n{first}\n{second}")?;
+        }
+        let ctx = ScanContext::with_roots(
+            dir.path().join("archive"),
+            vec![crate::connectors::ScanRoot::local(path.clone())],
+            None,
+        );
+        let mut conversations = franken_agent_detection::CodexConnector::new().scan(&ctx)?;
+        assert_eq!(conversations.len(), 1);
+        let mut conversation = conversations.pop().context("native conversation")?;
+        assert_eq!(conversation.messages.len(), 3);
+        assert!(
+            conversation
+                .messages
+                .iter()
+                .all(|message| message.extra.get("payload").is_none())
+        );
+        augment_modern_codex_messages(&mut conversation, None)?;
+        assert_eq!(conversation.messages.len(), 3);
+        assert_eq!(conversation.messages[0].role, "assistant");
+        for (index, call_id) in ["shared-1", "shared-2"].into_iter().enumerate() {
+            let message = &conversation.messages[index + 1];
+            assert_eq!(message.idx, (index + 1) as i64);
+            assert_eq!(message.role, "tool");
+            assert_eq!(
+                message.content,
+                format!("[Tool output: {call_id}]\n{output}")
+            );
+            assert_eq!(
+                message
+                    .extra
+                    .pointer("/cass/tool_result_call_id")
+                    .and_then(Value::as_str),
+                Some(call_id)
+            );
+            assert_eq!(
+                message.extra.pointer("/cass/model").and_then(Value::as_str),
+                Some("native-model")
+            );
+        }
+        let snapshot = serde_json::to_value(&conversation)?;
+        augment_modern_codex_messages(&mut conversation, None)?;
+        assert_eq!(serde_json::to_value(&conversation)?, snapshot);
+        Ok(())
     }
 
     #[test]
