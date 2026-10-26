@@ -57,7 +57,7 @@ const DETECTION_ONLY: &[&str] = &["windsurf"];
 // In particular, a live Kilo SQLite/WAL must not be rsync-copied as though it
 // were an immutable transcript. Local detection and explicit exported roots
 // are supported; automatic SSH discovery is not advertised for these readers.
-const CASS_NATIVE: &[&str] = &["kilo", "cloudmcp", "openwebui"];
+const CASS_NATIVE: &[&str] = &["kilo", "cloudmcp", "openwebui", "dsh"];
 
 /// Extract a function body from source code, including the braces.
 fn extract_function_body(source: &str, fn_prefix: &str) -> String {

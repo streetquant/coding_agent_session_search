@@ -275,6 +275,7 @@ pub mod copilot;
 pub mod copilot_cli;
 pub mod crush;
 pub mod cursor;
+pub mod dsh;
 pub mod factory;
 pub mod gemini;
 pub mod goose;
@@ -427,6 +428,9 @@ pub(crate) fn get_connector_registrations() -> Vec<source_dependencies::Connecto
     }));
     registrations.push(ConnectorRegistration::new("openwebui", || {
         Box::new(openwebui::OpenWebUiConnector::new())
+    }));
+    registrations.push(ConnectorRegistration::new("dsh", || {
+        Box::new(dsh::DshConnector::new())
     }));
     registrations
 }

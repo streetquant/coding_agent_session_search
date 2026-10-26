@@ -68,9 +68,9 @@ use crate::connectors::{
     amp::AmpConnector, antigravity::AntigravityConnector, chatgpt::ChatGptConnector,
     claude_code::ClaudeCodeConnector, clawdbot::ClawdbotConnector, cline::ClineConnector,
     cloudmcp::CloudMcpConnector, codex::CodexConnector, copilot::CopilotConnector,
-    copilot_cli::CopilotCliConnector, cursor::CursorConnector, factory::FactoryConnector,
-    gemini::GeminiConnector, grok::GrokConnector, kilo::KiloConnector, kimi::KimiConnector,
-    muse::MuseConnector, omp::OmpConnector, openclaw::OpenClawConnector,
+    copilot_cli::CopilotCliConnector, cursor::CursorConnector, dsh::DshConnector,
+    factory::FactoryConnector, gemini::GeminiConnector, grok::GrokConnector, kilo::KiloConnector,
+    kimi::KimiConnector, muse::MuseConnector, omp::OmpConnector, openclaw::OpenClawConnector,
     opencode::OpenCodeConnector, openwebui::OpenWebUiConnector, pi_agent::PiAgentConnector,
     qwen::QwenConnector, vibe::VibeConnector,
 };
@@ -21525,6 +21525,7 @@ fn recover_canonical_archive_from_verified_raw_mirror(
         if !archived_bundle.exists() {
             break;
         }
+        // ubs:ignore -- At most 99 collision probes need distinct quarantine paths; no transcript data is copied.
         archived_bundle = db_path.with_extension(format!("corrupt.{timestamp}.{suffix}"));
     }
     let moved = crate::storage::sqlite::move_database_bundle(db_path, &archived_bundle)
@@ -24872,6 +24873,7 @@ fn remove_lexical_index_dir_placeholder(index_path: &Path) {
     let placeholder_sidecars = [
         lexical_rebuild_state_path(index_path),
         index_path.join(ARCHIVE_FINGERPRINT_CACHE_FILE),
+        // ubs:ignore -- This is the compile-time basename ".archive-count-cache.json", not an input path.
         index_path.join(archive_count::ARCHIVE_COUNT_CACHE_FILE),
     ];
     let mut sidecars = Vec::new();
@@ -29385,6 +29387,7 @@ impl ConnectorKind {
             "opencode" => Some(Self::OpenCode),
             "kilo" => Some(Self::Kilo),
             "cloudmcp" => Some(Self::CloudMcp),
+            "dsh" => Some(Self::Dsh),
             "openwebui" => Some(Self::OpenWebUi),
             "aider" => Some(Self::Aider),
             "cursor" => Some(Self::Cursor),
@@ -29428,6 +29431,7 @@ impl ConnectorKind {
             Self::OpenCode => "opencode",
             Self::Kilo => "kilo",
             Self::CloudMcp => "cloudmcp",
+            Self::Dsh => "dsh",
             Self::OpenWebUi => "openwebui",
             Self::Aider => "aider",
             Self::Cursor => "cursor",
@@ -29475,6 +29479,7 @@ impl ConnectorKind {
             Self::OpenCode => Box::new(OpenCodeConnector::new()),
             Self::Kilo => Box::new(KiloConnector::new()),
             Self::CloudMcp => Box::new(CloudMcpConnector::new()),
+            Self::Dsh => Box::new(DshConnector::new()),
             Self::OpenWebUi => Box::new(OpenWebUiConnector::new()),
             Self::Aider => Box::new(AiderConnector::new()),
             Self::Cursor => Box::new(CursorConnector::new()),
@@ -31250,6 +31255,8 @@ enum ConnectorKind {
     Kilo,
     #[serde(rename = "mc", alias = "CloudMcp")]
     CloudMcp,
+    #[serde(rename = "ds", alias = "Dsh")]
+    Dsh,
     #[serde(rename = "wu", alias = "OpenWebUi")]
     OpenWebUi,
     #[serde(rename = "oc", alias = "OpenCode")]
@@ -31586,7 +31593,9 @@ fn explicit_watch_once_connector_hint(path: &Path) -> Option<ConnectorKind> {
             .any(|window| window[0] == left && window[1] == right)
     };
 
-    if crate::connectors::openwebui::owns_source_path(path) {
+    if has_pair(".dsh", "sessions") {
+        Some(ConnectorKind::Dsh)
+    } else if crate::connectors::openwebui::owns_source_path(path) {
         Some(ConnectorKind::OpenWebUi)
     } else if crate::connectors::cloudmcp::rollout_header(path).is_some() {
         Some(ConnectorKind::CloudMcp)
@@ -60835,6 +60844,24 @@ c.close()
                 Some(ConnectorKind::PrimeAgent)
             );
         }
+    }
+
+    #[test]
+    fn dsh_watch_routing_preserves_provider_identity() {
+        assert_eq!(ConnectorKind::from_slug("dsh"), Some(ConnectorKind::Dsh));
+        assert_eq!(ConnectorKind::Dsh.slug(), "dsh");
+        assert_eq!(
+            explicit_watch_once_connector_hint(Path::new(
+                "/home/user/.dsh/sessions/workspace/session-native/session.jsonl.zstd"
+            )),
+            Some(ConnectorKind::Dsh)
+        );
+        assert_ne!(
+            explicit_watch_once_connector_hint(Path::new(
+                "/home/user/.dsh-other/sessions/workspace/session-native/session.jsonl.zstd"
+            )),
+            Some(ConnectorKind::Dsh)
+        );
     }
 
     #[test]

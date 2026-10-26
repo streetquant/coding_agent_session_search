@@ -208,6 +208,9 @@ qrcode = { version = "0.14.1", optional = true }
 image = { version = "0.25.10", optional = true, default-features = false, features = ["png"] }
 unicode-width = "0.2.2"
 
+# Native DSH journals are compressed; also used by Codex compression fixtures.
+zstd = { version = "0.13", default-features = false }
+
 # macOS keychain access (optional, for ChatGPT decryption)
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7.0"
@@ -277,9 +280,6 @@ arbitrary = { version = "1", features = ["derive"] }
 serde-saphyr = { version = "2.0.0", default-features = false, features = ["deserialize"] }
 rand = "0.10"
 rand_chacha = "0.10"
-# GH513 writes rollouts the way Codex compresses them; production reads them
-# through franken-agent-detection's codex-zstd feature.
-zstd = { version = "0.13", default-features = false }
 # GH470 measures native model input tokens without padding or silent truncation.
 # Reuse the tokenizer and regex backend already resolved by native MiniLM.
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }

@@ -146,6 +146,7 @@ pub(crate) const PROVIDER_SCOPE: &[(&str, &[&str])] = &[
     ("crush", &["src/connectors/crush.rs"]),
     ("cursor", &["src/connectors/cursor.rs"]),
     ("devin", &[]),
+    ("dsh", &["src/connectors/dsh.rs"]),
     ("factory", &["src/connectors/factory.rs"]),
     ("gemini", &["src/connectors/gemini.rs"]),
     ("goose", &["src/connectors/goose.rs"]),
