@@ -855,15 +855,32 @@ pub struct RunConfig {
 }
 
 fn last_json_document(stdout: &str) -> Option<serde_json::Value> {
-    // Steps print exactly one JSON document, but tolerate leading noise by
-    // taking the last line that parses (compact) or the whole buffer (pretty).
+    // Steps normally print one document. Warnings can surround a pretty
+    // report, and JSONL steps can print several complete reports.
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
         return Some(value);
     }
-    stdout
-        .lines()
-        .rev()
-        .find_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+    let mut remaining = stdout;
+    let mut last = None;
+    while !remaining.is_empty() {
+        let candidate = remaining.trim_start();
+        if candidate.starts_with('{') || candidate.starts_with('[') {
+            let mut documents =
+                serde_json::Deserializer::from_str(candidate).into_iter::<serde_json::Value>();
+            if let Some(Ok(value)) = documents.next() {
+                // Skip the entire document so nested values, such as an
+                // agent string on its own line, cannot replace its report.
+                last = Some(value);
+                remaining = candidate.get(documents.byte_offset()..)?;
+                continue;
+            }
+        }
+        let Some((_, rest)) = candidate.split_once('\n') else {
+            break;
+        };
+        remaining = rest;
+    }
+    last
 }
 
 fn run_step(
@@ -905,6 +922,11 @@ fn run_step(
                 let _ = log.write_all(stderr.as_bytes());
             }
             let exit_code = output.status.code();
+            let result = last_json_document(&stdout).or_else(|| {
+                (!output.status.success())
+                    .then(|| last_json_document(&stderr))
+                    .flatten()
+            });
             StepReport {
                 name: name.to_string(),
                 argv,
@@ -912,7 +934,7 @@ fn run_step(
                 ok: output.status.success(),
                 duration_ms,
                 skipped_reason: None,
-                result: last_json_document(&stdout),
+                result,
                 stderr_tail: stderr_tail(&stderr),
             }
         }
@@ -2274,6 +2296,27 @@ mod tests {
         let noisy = "warning: x\n{\"a\":1}\n{\"a\":2}\n";
         assert_eq!(last_json_document(noisy).unwrap()["a"], 2);
         assert!(last_json_document("nothing").is_none());
+    }
+
+    #[test]
+    fn last_json_document_keeps_noisy_pretty_index_accounting() {
+        let report = serde_json::json!({
+            "success": false,
+            "failed_source_count": 46,
+            "agents": ["codex", "cloudmcp"]
+        });
+        let output = format!(
+            "warning: incomplete sources\n{}\nindexing retained completed work\n",
+            serde_json::to_string_pretty(&report).unwrap()
+        );
+        assert_eq!(last_json_document(&output), Some(report));
+    }
+
+    #[test]
+    fn last_json_document_selects_complete_reports_without_nested_scalars() {
+        let output = "note: starting\n{\n  \"pass\": 1\n}\n{\n  \"pass\": 2,\n  \"agents\": [\n    \"cloudmcp\"\n  ]\n}\nfinished\n";
+        assert_eq!(last_json_document(output).unwrap()["pass"], 2);
+        assert!(last_json_document("warning\n{\n  \"agents\": [\n    \"cloudmcp\"\n").is_none());
     }
 
     #[test]
