@@ -9,7 +9,8 @@ use crate::evidence_bundle::{
     EvidenceBundleKind, EvidenceBundleManifest,
 };
 use crate::model::conversation_packet::{
-    ConversationPacket, ConversationPacketMessage, ConversationPacketProvenance,
+    ConversationPacket, ConversationPacketBuilder, ConversationPacketMessage,
+    ConversationPacketProvenance,
 };
 use crate::search::canonicalize::is_hard_message_noise;
 use crate::sources::provenance::LOCAL_SOURCE_ID;
@@ -307,27 +308,33 @@ fn push_cass_document_into_pending(
 /// [`ConversationPacket`]. Packet builders (raw scan + canonical replay)
 /// already normalized identity, provenance, metadata, and timestamps, so
 /// the lexical builder no longer has to re-walk the raw connector
-/// payload (`coding_agent_session_search-ibuuh.32`). We still re-derive
-/// `source_id`/`origin_kind`/`origin_host` from `metadata.cass.origin`
-/// (rather than trusting `packet.payload.provenance` blindly) so the
-/// packet pipeline produces byte-identical CassDocuments to the legacy
-/// `cass_doc_context` path — that's the equivalence gate covered by
-/// `packet_driven_lexical_pipeline_matches_legacy_for_normalized_conv`.
+/// payload (`coding_agent_session_search-ibuuh.32`). Raw connector packets
+/// retain the legacy `metadata.cass.origin` projection. Canonical replay uses
+/// its bound provenance: canonical rows need not carry connector metadata,
+/// and retained metadata may describe an older source identity.
 fn cass_doc_context_from_packet(packet: &ConversationPacket) -> CassDocContext {
     let payload = &packet.payload;
     let metadata = &payload.metadata_json;
     let cass_origin = metadata.get("cass").and_then(|c| c.get("origin"));
-    let raw_source_id = cass_origin
-        .and_then(|o| o.get("source_id"))
-        .and_then(|v| v.as_str());
-    let raw_origin_kind = cass_origin
-        .and_then(|o| o.get("kind"))
-        .and_then(|v| v.as_str());
-    let origin_host = normalized_index_origin_host(
-        cass_origin
-            .and_then(|o| o.get("host"))
-            .and_then(|v| v.as_str()),
-    );
+    let (raw_source_id, raw_origin_kind, raw_origin_host) = match packet.diagnostics.builder {
+        ConversationPacketBuilder::CanonicalReplay => (
+            Some(payload.provenance.source_id.as_str()),
+            Some(payload.provenance.origin_kind.as_str()),
+            payload.provenance.origin_host.as_deref(),
+        ),
+        ConversationPacketBuilder::RawConnectorScan => (
+            cass_origin
+                .and_then(|o| o.get("source_id"))
+                .and_then(|v| v.as_str()),
+            cass_origin
+                .and_then(|o| o.get("kind"))
+                .and_then(|v| v.as_str()),
+            cass_origin
+                .and_then(|o| o.get("host"))
+                .and_then(|v| v.as_str()),
+        ),
+    };
+    let origin_host = normalized_index_origin_host(raw_origin_host);
     let source_id =
         normalized_index_source_id(raw_source_id, raw_origin_kind, origin_host.as_deref());
     let origin_kind = normalized_index_origin_kind(&source_id, raw_origin_kind);
@@ -3467,6 +3474,62 @@ mod tests {
             Some("ws-42.example"),
             "metadata.cass.origin.host must surface as origin_host"
         );
+    }
+
+    #[test]
+    fn canonical_packet_lexical_projection_preserves_bound_remote_provenance() {
+        use crate::model::types::{Conversation, Message, MessageRole};
+
+        for metadata_json in [
+            Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"cass":{"origin":{
+                "source_id":"obsolete-source","kind":"local","host":"obsolete-host"
+            }}}),
+        ] {
+            let conversation = Conversation {
+                id: Some(77),
+                agent_slug: "codex".into(),
+                workspace: None,
+                external_id: Some("canonical-remote".into()),
+                title: None,
+                source_path: PathBuf::from("/shared/session.jsonl"),
+                started_at: Some(1_700_000_000_000),
+                ended_at: None,
+                approx_tokens: None,
+                metadata_json,
+                messages: vec![Message {
+                    id: Some(123),
+                    idx: 5,
+                    role: MessageRole::Agent,
+                    author: None,
+                    created_at: None,
+                    content: "canonical remote evidence".into(),
+                    extra_json: Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: "canonical-remote".into(),
+                origin_host: Some("canonical-host".into()),
+            };
+            let packet = ConversationPacket::from_canonical_replay_owned(
+                conversation,
+                ConversationPacketProvenance {
+                    source_id: " canonical-remote ".into(),
+                    origin_kind: "ssh".into(),
+                    origin_host: Some(" canonical-host ".into()),
+                },
+            );
+            let docs = TantivyIndex::build_packet_documents(&packet, None);
+            assert_eq!(docs.len(), 1);
+            let doc = docs.first().expect("canonical message must be indexed");
+            assert_eq!(doc.source_id, "canonical-remote");
+            assert_eq!(doc.origin_kind, "remote");
+            assert_eq!(doc.origin_host.as_deref(), Some("canonical-host"));
+            assert_eq!(doc.source_path, "/shared/session.jsonl");
+            assert_eq!(doc.conversation_id, Some(77));
+            assert_eq!(doc.msg_idx, 5);
+            assert_eq!(doc.content, "canonical remote evidence");
+        }
     }
 
     /// Pins the `add_conversation_with_id` migration: the convenience
