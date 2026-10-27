@@ -20166,8 +20166,7 @@ fn message_insert_batch_sql(row_count: usize) -> Result<&'static str> {
                 })
                 .collect::<Vec<_>>()
                 .join(",");
-            // ubs:ignore[rust.perf.string-alloc-in-loop] -- Populate the bounded row-count SQL cache once; normal batch insertion reuses these owned templates.
-            sql_by_row_count.push(format!(
+            sql_by_row_count.push(format!( // ubs:ignore[rust.perf.string-alloc-in-loop] -- Populate the bounded row-count SQL cache once; normal batch insertion reuses these owned templates.
                 "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES {placeholders}"
             ));
         }

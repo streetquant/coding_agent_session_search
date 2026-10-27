@@ -740,8 +740,7 @@ impl ExportEngine {
                             )?;
                         }
 
-                        // ubs:ignore[rust.perf.string-alloc-in-loop] -- The two independently flushed FTS queues each own the redacted content after the source row is released.
-                        pending_fts.push((*source_message_id, content.to_string()));
+                        pending_fts.push((*source_message_id, content.to_string())); // ubs:ignore[rust.perf.string-alloc-in-loop] -- The two independently flushed FTS queues each own the redacted content after the source row is released.
                         pending_code_fts.push((*source_message_id, content.into_owned()));
                         if pending_fts.len() == FTS_INSERT_BATCH_ROWS {
                             flush_fts_inserts(&tx, "messages_fts", &mut pending_fts)?;
