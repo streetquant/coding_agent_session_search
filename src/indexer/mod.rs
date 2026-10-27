@@ -70022,7 +70022,10 @@ c.close()
         expected_metadata
             .as_object_mut()
             .expect("upstream Codex metadata must remain an object")
-            .insert("native_session_id".to_string(), serde_json::json!("modern-id"));
+            .insert(
+                "native_session_id".to_string(),
+                serde_json::json!("modern-id"),
+            );
         assert_eq!(conversation.metadata, expected_metadata);
         assert_eq!(repeated.metadata, expected_metadata);
         let stable_message_identity = |conversation: &NormalizedConversation| {
