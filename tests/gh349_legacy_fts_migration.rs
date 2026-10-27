@@ -69,9 +69,8 @@ fn legacy_internal_content_fts_migrates_and_preserves_canonical_messages() {
     // backfills 1..=13 and leaves v14 pending.
     {
         let fixture = fixture_conn(&db_path);
-        fixture
-            .execute_batch(
-                "DROP TABLE IF EXISTS fts_messages;
+        // ubs:ignore[rust.domain.sql-concat] -- This immutable disposable legacy fixture uses SQL recursion and arithmetic only; no runtime text constructs the statement.
+        const LEGACY_FTS_FIXTURE_SQL: &str = "DROP TABLE IF EXISTS fts_messages;
                  DROP TABLE IF EXISTS _schema_migrations;
                  -- A 0.2.0 archive predates V23. Its re-seed is not
                  -- idempotent while the authority row exists, because the
@@ -101,9 +100,8 @@ fn legacy_internal_content_fts_migrates_and_preserves_canonical_messages() {
                         'legacy', 'codex', '/legacy/workspace',
                         '/legacy/session.jsonl', 1700000000000, 100000 + n
                    FROM seq;
-                 COMMIT;",
-            )
-            .unwrap();
+                 COMMIT;";
+        fixture.execute_batch(LEGACY_FTS_FIXTURE_SQL).unwrap();
     }
 
     // The fixture must be genuinely structural: real, populated

@@ -40,6 +40,7 @@ fn main() -> ExitCode {
 
     let mut failures = 0_usize;
     for file in DOCUMENTS {
+        // ubs:ignore[rust.security.path-traversal] -- DOCUMENTS contains only the fixed README.md and AGENTS.md basenames beneath the explicitly selected root.
         if let Err(error) = regenerate(&root.join(file), file, check) {
             eprintln!("{file}: {error}");
             failures += 1;

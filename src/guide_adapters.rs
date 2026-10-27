@@ -1006,6 +1006,7 @@ fn typed_error_kind(stderr: &[u8]) -> Option<String> {
             continue;
         };
         if let Some(kind) = payload.pointer("/error/kind").and_then(Value::as_str) {
+            // ubs:ignore[rust.perf.string-alloc-in-loop] -- Return one owned error kind before the parsed stderr JSON is dropped; successful extraction ends the loop.
             return Some(kind.to_string());
         }
     }

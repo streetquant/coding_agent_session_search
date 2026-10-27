@@ -231,13 +231,17 @@ pub fn count_messages_bounded(
                 row.get_typed::<i64>(0)
             })
             .context("counting canonical messages in a bounded window")?;
-        if ids.is_empty() {
+        let Some(&last_id) = ids.last() else {
             break;
-        }
+        };
         // The cursor advances to the last id of the window, so the window has
         // to be strictly ascending; a window that is not would silently skip
         // rows and would report a wrong (too low) exact count.
-        if ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+        if ids
+            .iter()
+            .zip(ids.iter().skip(1))
+            .any(|(left, right)| left >= right)
+        {
             anyhow::bail!(
                 "canonical message ids are not strictly ascending inside a count window; \
                  refusing to report an exact count"
@@ -248,7 +252,7 @@ pub fn count_messages_bounded(
         if ids.len() < ARCHIVE_COUNT_WINDOW_ROWS as usize {
             break;
         }
-        cursor = *ids.last().expect("window is not empty");
+        cursor = last_id;
     }
     Ok(ArchiveCountOutcome::Exact {
         count: count as usize,
@@ -338,6 +342,7 @@ pub fn cached_archive_count(cache_dir: &Path, identity: &ArchiveCountIdentity) -
 
 /// The path of the count memo inside `cache_dir`.
 pub fn archive_count_cache_path(cache_dir: &Path) -> PathBuf {
+    // ubs:ignore[rust.security.path-traversal] -- The child is a fixed basename; the operator-selected cache directory is the intended parent.
     cache_dir.join(ARCHIVE_COUNT_CACHE_FILE)
 }
 

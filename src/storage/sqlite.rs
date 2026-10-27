@@ -5375,6 +5375,7 @@ pub fn semantic_source_clock_trigger_contracts() -> Vec<(String, String)> {
     ] {
         for event in ["insert", "update", "delete"] {
             let name = format!("cass_semantic_source_{table}_{event}");
+            // ubs:ignore[rust.perf.string-alloc-in-loop] -- Build the finite table/event trigger definitions once for the returned schema contract, not per archive row.
             let sql = format!(
                 // ubs:ignore[rust.domain.sql-concat] -- Clock arithmetic is SQL; identifiers come only from the fixed table/event lists above.
                 "CREATE TRIGGER {name} AFTER {} ON {table} BEGIN UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1; END",
@@ -19263,6 +19264,7 @@ pub(crate) fn fts_insert_error_is_rowid_collision(error: &anyhow::Error) -> bool
         ) {
             collision = true;
         }
+        // ubs:ignore[rust.perf.string-alloc-in-loop] -- Error-chain Display text is materialized only on a failed insert to distinguish FTS collisions from unrelated primary-key failures.
         if cause.to_string().contains("into fts_messages") {
             fts_shadow_insert = true;
         }
@@ -20164,6 +20166,7 @@ fn message_insert_batch_sql(row_count: usize) -> Result<&'static str> {
                 })
                 .collect::<Vec<_>>()
                 .join(",");
+            // ubs:ignore[rust.perf.string-alloc-in-loop] -- Populate the bounded row-count SQL cache once; normal batch insertion reuses these owned templates.
             sql_by_row_count.push(format!(
                 "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES {placeholders}"
             ));
@@ -20701,8 +20704,8 @@ fn franken_collect_batched_existing_new_messages<'a>(
             .unwrap_or_default();
         for msg in &tail_plan.messages {
             let fingerprint = message_merge_fingerprint(msg);
-            by_idx.insert(msg.idx, fingerprint.clone());
             replay.insert(replay_fingerprint_from_merge(&fingerprint));
+            by_idx.insert(msg.idx, fingerprint);
         }
         return Ok((tail_plan, by_idx, replay));
     }
@@ -20736,8 +20739,8 @@ fn franken_collect_batched_existing_new_messages<'a>(
             .unwrap_or_default();
         for msg in &tail_plan.messages {
             let fingerprint = message_merge_fingerprint(msg);
-            by_idx.insert(msg.idx, fingerprint.clone());
             replay.insert(replay_fingerprint_from_merge(&fingerprint));
+            by_idx.insert(msg.idx, fingerprint);
         }
         return Ok((tail_plan, by_idx, replay));
     }
@@ -20759,8 +20762,8 @@ fn franken_collect_batched_existing_new_messages<'a>(
             .unwrap_or_default();
         for msg in &tail_plan.messages {
             let fingerprint = message_merge_fingerprint(msg);
-            by_idx.insert(msg.idx, fingerprint.clone());
             replay.insert(replay_fingerprint_from_merge(&fingerprint));
+            by_idx.insert(msg.idx, fingerprint);
         }
         return Ok((tail_plan, by_idx, replay));
     }
@@ -20814,6 +20817,7 @@ fn franken_batch_insert_fts(
             .enumerate()
             .map(|(i, _)| {
                 let base = i * 7 + 1; // +1 for 1-indexed params
+                // ubs:ignore[rust.perf.string-alloc-in-loop] -- Each row contributes seven distinct numbered placeholders to this bounded FTS statement; content remains bound.
                 format!(
                     "(?{},?{},?{},?{},?{},?{},?{})",
                     base,
@@ -20828,6 +20832,7 @@ fn franken_batch_insert_fts(
             .collect::<Vec<_>>()
             .join(",");
 
+        // ubs:ignore[rust.perf.string-alloc-in-loop] -- One SQL string is required per bounded FTS chunk to match its actual placeholder count, including the final short chunk.
         let sql = format!(
             "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at) VALUES {placeholders}"
         );
@@ -20905,6 +20910,7 @@ fn franken_batch_insert_fts_on_connection(
             .enumerate()
             .map(|(i, _)| {
                 let base = i * 7 + 1;
+                // ubs:ignore[rust.perf.string-alloc-in-loop] -- The streaming connection path emits one seven-column placeholder group per row in a capped FTS chunk.
                 format!(
                     "(?{},?{},?{},?{},?{},?{},?{})",
                     base,
@@ -20919,6 +20925,7 @@ fn franken_batch_insert_fts_on_connection(
             .collect::<Vec<_>>()
             .join(",");
 
+        // ubs:ignore[rust.perf.string-alloc-in-loop] -- This connection-local FTS batch owns one statement with the exact bounded chunk arity; message values are parameters.
         let sql = format!(
             "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at) VALUES {placeholders}"
         );
@@ -20936,6 +20943,7 @@ fn franken_batch_insert_fts_on_connection(
 
         conn.execute_with_params(&sql, &param_values)
             .with_context(|| {
+                // ubs:ignore[rust.perf.string-alloc-in-loop] -- Lazy error context allocates only when a streaming FTS insert fails, preserving the failed batch size.
                 format!(
                     "inserting {} rows into fts_messages during streaming FTS maintenance",
                     chunk.len()
@@ -21282,13 +21290,19 @@ fn franken_insert_token_usage_batched_in_tx(
             ParamValue::from(e.conversation_id),
             ParamValue::from(e.agent_id),
             ParamValue::from(e.workspace_id),
+            // ubs:ignore[rust.collections.clone-in-loop] -- The owned token-usage parameter keeps the source identity independent of the retained input entry.
             ParamValue::from(e.source_id.clone()),
             ParamValue::from(e.timestamp_ms),
             ParamValue::from(e.day_id),
+            // ubs:ignore[rust.collections.clone-in-loop] -- Bind the optional model name without consuming the input entry, which remains available to the caller.
             ParamValue::from(e.model_name.clone()),
+            // ubs:ignore[rust.collections.clone-in-loop] -- The SQL parameter owns the normalized family while this borrowed usage batch remains intact.
             ParamValue::from(e.model_family.clone()),
+            // ubs:ignore[rust.collections.clone-in-loop] -- Preserve the borrowed usage entry while supplying an owned optional model-tier parameter.
             ParamValue::from(e.model_tier.clone()),
+            // ubs:ignore[rust.collections.clone-in-loop] -- The service-tier parameter must outlive its conversion without moving a field out of the borrowed usage entry.
             ParamValue::from(e.service_tier.clone()),
+            // ubs:ignore[rust.collections.clone-in-loop] -- Keep the caller's provider metadata intact while the SQL argument owns its text.
             ParamValue::from(e.provider.clone()),
             ParamValue::from(e.input_tokens),
             ParamValue::from(e.output_tokens),
@@ -21297,10 +21311,12 @@ fn franken_insert_token_usage_batched_in_tx(
             ParamValue::from(e.thinking_tokens),
             ParamValue::from(e.total_tokens),
             ParamValue::from(e.estimated_cost_usd),
+            // ubs:ignore[rust.collections.clone-in-loop] -- The per-row role argument owns its bytes; the source token-usage record is borrowed and reusable.
             ParamValue::from(e.role.clone()),
             ParamValue::from(e.content_chars),
             ParamValue::from(e.has_tool_calls as i64),
             ParamValue::from(e.tool_call_count as i64),
+            // ubs:ignore[rust.collections.clone-in-loop] -- Bind an owned provenance label without changing the caller's retained usage entry.
             ParamValue::from(e.data_source.clone()),
         ];
 
@@ -21439,22 +21455,31 @@ fn franken_insert_message_metrics_batched_in_tx(
             ParamValue::from(e.created_at_ms),
             ParamValue::from(e.hour_id),
             ParamValue::from(e.day_id),
+            // ubs:ignore[rust.collections.clone-in-loop] -- The metrics SQL argument owns its agent label while this borrowed batch remains available for rollups.
             ParamValue::from(e.agent_slug.clone()),
             ParamValue::from(e.workspace_id),
+            // ubs:ignore[rust.collections.clone-in-loop] -- Preserve the source dimension in the retained metrics record while binding owned text for insertion.
             ParamValue::from(e.source_id.clone()),
+            // ubs:ignore[rust.collections.clone-in-loop] -- Bind the role without moving it out of the caller's borrowed metrics entry.
             ParamValue::from(e.role.clone()),
             ParamValue::from(e.content_chars),
             ParamValue::from(e.content_tokens_est),
+            // ubs:ignore[rust.collections.clone-in-loop] -- The optional model name is retained for aggregation and separately owned by this SQL argument.
             ParamValue::from(e.model_name.clone()),
+            // ubs:ignore[rust.collections.clone-in-loop] -- The model-family dimension must remain in the borrowed metrics batch after insertion.
             ParamValue::from(e.model_family.clone()),
+            // ubs:ignore[rust.collections.clone-in-loop] -- Supply an owned tier argument while preserving the caller's metrics dimensions.
             ParamValue::from(e.model_tier.clone()),
+            // ubs:ignore[rust.collections.clone-in-loop] -- Preserve provider attribution in the retained metrics entry and bind a separate owned SQL value.
             ParamValue::from(e.provider.clone()),
             ParamValue::from(e.api_input_tokens),
             ParamValue::from(e.api_output_tokens),
             ParamValue::from(e.api_cache_read_tokens),
             ParamValue::from(e.api_cache_creation_tokens),
             ParamValue::from(e.api_thinking_tokens),
+            // ubs:ignore[rust.collections.clone-in-loop] -- The optional API tier cannot be moved from the shared metrics batch used after this insert.
             ParamValue::from(e.api_service_tier.clone()),
+            // ubs:ignore[rust.collections.clone-in-loop] -- Retain API provenance for later rollups while its bound parameter owns the same short label.
             ParamValue::from(e.api_data_source.clone()),
             ParamValue::from(e.tool_call_count),
             ParamValue::from(e.has_tool_calls as i64),
@@ -21729,6 +21754,7 @@ fn franken_reassociate_provider_analytics_workspace(
         let mut params: Vec<ParamValue> = ids.iter().copied().map(ParamValue::from).collect();
         params.push(ParamValue::from(metrics_workspace));
         let entries = tx.query_map_collect(
+            // ubs:ignore[rust.perf.string-alloc-in-loop] -- A capped 128-ID query owns the exact IN-list arity needed to move only this conversation's metrics.
             &format!(
                 "SELECT message_id, created_at_ms, hour_id, day_id,
                 agent_slug, workspace_id, source_id, role, content_chars, content_tokens_est,
@@ -21836,10 +21862,12 @@ fn franken_reassociate_provider_analytics_workspace(
         let mut params: Vec<ParamValue> = ids.iter().copied().map(ParamValue::from).collect();
         params.push(ParamValue::from(metrics_workspace));
         let id_slots = (1..=ids.len())
+            // ubs:ignore[rust.perf.string-alloc-in-loop] -- The capped workspace-update batch needs one numbered parameter slot for each actual message ID.
             .map(|idx| format!("?{idx}"))
             .collect::<Vec<_>>()
             .join(", ");
         tx.execute_compat(
+            // ubs:ignore[rust.perf.string-alloc-in-loop] -- Emit one bounded workspace-update statement with its actual parameter count; all IDs and workspace values stay bound.
             &format!("UPDATE message_metrics SET workspace_id = ?{} WHERE message_id IN ({}) AND workspace_id != ?{}",
                 params.len(), id_slots, params.len()),
             &params,
@@ -21935,7 +21963,9 @@ fn franken_relocate_rollup_subtract(
             "Cursor workspace analytics drift: negative {column} contribution"
         );
         params.push(ParamValue::from(amount));
+        // ubs:ignore[rust.perf.string-alloc-in-loop] -- Each fixed rollup counter contributes one distinct parameterized subtraction assignment to the single atomic update.
         assignments.push(format!("{column} = {column} - ?{}", params.len()));
+        // ubs:ignore[rust.perf.string-alloc-in-loop] -- Pair every fixed counter with its non-underflow guard; amount values remain SQL parameters.
         guards.push(format!("{column} >= ?{}", params.len()));
     }
     let changed = tx.execute_compat(
@@ -22219,6 +22249,7 @@ impl FrankenStorage {
                 last_conversation_id = conversation_id;
                 let conversation_day_id = started_at.map(Self::day_id_from_millis).unwrap_or(0);
                 let mut last_token_usage_id = 0_i64;
+                // ubs:ignore[rust.perf.string-alloc-in-loop] -- One owned accumulator survives this conversation's paged usage rows and is replaced only by observed model metadata.
                 let mut session_model_family = String::from("unknown");
 
                 loop {
@@ -23099,18 +23130,13 @@ impl FrankenStorage {
                     .model_name
                     .as_deref()
                     .map(crate::connectors::normalize_model);
-                let model_family = model_info
-                    .as_ref()
-                    .map(|i| i.family.clone())
-                    .unwrap_or_else(|| "unknown".into());
-                let model_tier = model_info
-                    .as_ref()
-                    .map(|i| i.tier.clone())
-                    .unwrap_or_else(|| "unknown".into());
+                let (model_family, model_tier, inferred_provider) = model_info
+                    .map(|info| (info.family, info.tier, Some(info.provider)))
+                    .unwrap_or_else(|| ("unknown".into(), "unknown".into(), None));
                 let provider = usage
                     .provider
-                    .clone()
-                    .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
+                    .take()
+                    .or(inferred_provider)
                     .unwrap_or_else(|| "unknown".into());
 
                 let entry = MessageMetricsEntry {
@@ -23121,6 +23147,7 @@ impl FrankenStorage {
                     agent_slug: agent_slug.clone(),
                     workspace_id: workspace_id.unwrap_or(0),
                     source_id: source_id.clone(),
+                    // ubs:ignore[rust.collections.clone-in-loop] -- The retained compact metrics entry owns the role after this canonical source page is dropped.
                     role: role.clone(),
                     content_chars,
                     content_tokens_est,
@@ -23134,6 +23161,7 @@ impl FrankenStorage {
                     api_cache_creation_tokens: usage.cache_creation_tokens,
                     api_thinking_tokens: usage.thinking_tokens,
                     api_service_tier: usage.service_tier,
+                    // ubs:ignore[rust.perf.string-alloc-in-loop] -- Compact metrics own the short provenance label independently of the temporary extracted token-usage value.
                     api_data_source: usage.data_source.as_str().to_string(),
                     tool_call_count: usage.tool_call_count as i64,
                     has_tool_calls: usage.has_tool_calls,
@@ -23188,6 +23216,7 @@ impl FrankenStorage {
                         "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
                         fparams![
                             LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY,
+                            // ubs:ignore[rust.perf.string-alloc-in-loop] -- Serialize one durable processed-row cursor per committed page so interrupted analytics can resume honestly.
                             next_processed.to_string()
                         ],
                     )?;
@@ -23218,8 +23247,8 @@ impl FrankenStorage {
                 last_id,
                 chunk = fetched,
                 inserted = total_inserted,
-                elapsed_secs = format!("{elapsed_secs:.1}"),
-                msgs_per_sec = format!("{rate:.0}"),
+                elapsed_secs = %format_args!("{elapsed_secs:.1}"),
+                msgs_per_sec = %format_args!("{rate:.0}"),
                 "analytics_rebuild_progress"
             );
             if let Some(progress) = progress {
@@ -23396,6 +23425,7 @@ impl FrankenStorage {
                 }
                 Err(err) => {
                     return Err(err).with_context(|| {
+                        // ubs:ignore[rust.perf.string-alloc-in-loop] -- Only a failed conversation scan renders this owned phase/cursor diagnostic; successful pages allocate no error text.
                         format!(
                             "daily_stats phase=conversation_scan last_conversation_id={last_conversation_id} batch_size={conversation_batch_size}"
                         )
@@ -23430,6 +23460,7 @@ impl FrankenStorage {
                     control()?;
                 }
                 let mut batch_tx = self.conn.transaction().with_context(|| {
+                    // ubs:ignore[rust.perf.string-alloc-in-loop] -- Lazy context names the failed conversation-stage begin and its durable cursor only on an error.
                     format!(
                         "daily_stats phase=conversation_stage_begin last_conversation_id={last_conversation_id}"
                     )
@@ -23440,6 +23471,7 @@ impl FrankenStorage {
                     DailyStatsBatchTarget::RebuildStage,
                 )
                 .with_context(|| {
+                    // ubs:ignore[rust.perf.string-alloc-in-loop] -- Failed conversation-stage upserts retain their resume cursor; normal bounded batches do not render this diagnostic.
                     format!(
                         "daily_stats phase=conversation_stage_upsert last_conversation_id={last_conversation_id}"
                     )
@@ -23448,6 +23480,7 @@ impl FrankenStorage {
                     control()?;
                 }
                 batch_tx.commit().with_context(|| {
+                    // ubs:ignore[rust.perf.string-alloc-in-loop] -- A failed conversation-stage commit needs its cursor in the owned error chain, once at termination.
                     format!(
                         "daily_stats phase=conversation_stage_commit last_conversation_id={last_conversation_id}"
                     )
@@ -23529,6 +23562,7 @@ impl FrankenStorage {
                         }
                         Err(err) => {
                             return Err(err).with_context(|| {
+                                // ubs:ignore[rust.perf.string-alloc-in-loop] -- Render message-scan phase and page bounds only when that scan fails, preserving actionable resume evidence.
                                 format!(
                                     "daily_stats phase=message_scan conversation_id={conversation_id} cursor_message_idx={page_start_message_idx} batch_size={message_batch_size}"
                                 )
@@ -23550,6 +23584,7 @@ impl FrankenStorage {
                             control()?;
                         }
                         let mut batch_tx = self.conn.transaction().with_context(|| {
+                            // ubs:ignore[rust.perf.string-alloc-in-loop] -- The failed message-stage transaction begin records its source and cursor through lazy error context.
                             format!(
                                 "daily_stats phase=message_stage_begin conversation_id={conversation_id} cursor_message_idx={cursor_message_idx}"
                             )
@@ -23560,6 +23595,7 @@ impl FrankenStorage {
                             DailyStatsBatchTarget::RebuildStage,
                         )
                         .with_context(|| {
+                            // ubs:ignore[rust.perf.string-alloc-in-loop] -- This allocation occurs only for a failed message-stage upsert and identifies the exact resumable page.
                             format!(
                                 "daily_stats phase=message_stage_upsert conversation_id={conversation_id} cursor_message_idx={cursor_message_idx}"
                             )
@@ -23568,6 +23604,7 @@ impl FrankenStorage {
                             control()?;
                         }
                         batch_tx.commit().with_context(|| {
+                            // ubs:ignore[rust.perf.string-alloc-in-loop] -- Lazy failed-commit context retains the message cursor; successful page commits allocate no diagnostic.
                             format!(
                                 "daily_stats phase=message_stage_commit conversation_id={conversation_id} cursor_message_idx={cursor_message_idx}"
                             )
@@ -23930,6 +23967,7 @@ impl StatsAggregator {
                 if permutations[..idx].contains(&(a, s)) {
                     continue;
                 }
+                // ubs:ignore[rust.perf.string-alloc-in-loop] -- The returned expanded daily-rollup map owns each distinct agent/source key after this borrowed input aggregation ends.
                 let key = (*day_id, a.to_owned(), s.to_owned());
                 let entry = expanded.entry(key).or_default();
                 entry.session_count_delta += delta.session_count_delta;
@@ -24084,6 +24122,7 @@ impl TokenStatsAggregator {
                 if permutations[..idx].contains(&(a, s, m)) {
                     continue;
                 }
+                // ubs:ignore[rust.perf.string-alloc-in-loop] -- Expanded token rollups retain their own agent/source/model keys, including the deduplicated global dimensions.
                 let key = (*day_id, a.to_owned(), s.to_owned(), m.to_owned());
                 let entry = expanded.entry(key).or_default();
                 entry.api_call_count += delta.api_call_count;

@@ -1064,7 +1064,8 @@ impl LocalSshServer {
     fn wait_until_listening(&self) {
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
-            if TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
+            if let Ok(stream) = TcpStream::connect(("127.0.0.1", self.port)) {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
                 return;
             }
             std::thread::sleep(Duration::from_millis(100));

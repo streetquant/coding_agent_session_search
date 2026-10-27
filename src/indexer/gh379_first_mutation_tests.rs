@@ -1059,6 +1059,7 @@ fn measure_in_child(
 ) -> Result<Witness> {
     let out_path = db_path.with_extension("witness.json");
     let current_exe = std::env::current_exe().context("locating the test binary")?;
+    // ubs:ignore[rust.security.command-executable] -- Re-execute this exact native test binary for an isolated witness; no fixture string selects an executable.
     let output = Command::new(&current_exe)
         .arg(CHILD_TEST_FILTER)
         .arg("--nocapture")

@@ -8,6 +8,7 @@
 //! confirmation for the exact step number. Fixture runs are deterministic and
 //! permanently non-mutating.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::Path;
@@ -1095,6 +1096,7 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
                     .unwrap_or(Value::Null),
                 "compensation": preview
                     .as_ref()
+                    // ubs:ignore[rust.collections.clone-in-loop] -- The owned transcript retains compensation beside the preview and its separately rendered identity.
                     .map(|preview| preview.compensation.clone())
                     .unwrap_or(Value::Null),
                 "verification": {
@@ -1160,7 +1162,7 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
             "source": "none",
             "detail": "the step was not applied, so no postcondition was checked"
         });
-        let mut step_phase = "not-run".to_string();
+        let mut step_phase = Cow::Borrowed("not-run");
         let mut step_applied = false;
         let mut step_verified = false;
         let mut mutation_observation = None;
@@ -1168,31 +1170,32 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
         let (result, proof_result, detail) = if !global_mutation_ready {
             blocked_step = true;
             (
-                "blocked".to_string(),
-                "not-run".to_string(),
-                "one or more readiness/privacy/cost/rch/stop-condition gates did not pass"
-                    .to_string(),
+                Cow::Borrowed("blocked"),
+                Cow::Borrowed("not-run"),
+                Cow::Borrowed(
+                    "one or more readiness/privacy/cost/rch/stop-condition gates did not pass",
+                ),
             )
         } else if !prior_proofs_passed {
             blocked_step = true;
             (
-                "blocked".to_string(),
-                "not-run".to_string(),
-                "a preceding proof gate did not pass".to_string(),
+                Cow::Borrowed("blocked"),
+                Cow::Borrowed("not-run"),
+                Cow::Borrowed("a preceding proof gate did not pass"),
             )
         } else if !confirmed {
             awaiting_confirmation = true;
             (
-                "awaiting-confirmation".to_string(),
-                "not-run".to_string(),
-                "mutation requires --confirm-step for this exact step".to_string(),
+                Cow::Borrowed("awaiting-confirmation"),
+                Cow::Borrowed("not-run"),
+                Cow::Borrowed("mutation requires --confirm-step for this exact step"),
             )
         } else if request.source_kind == "fixture" {
             blocked_step = true;
             (
-                "fixture-protected".to_string(),
-                "not-run".to_string(),
-                "fixture apply is permanently non-mutating".to_string(),
+                Cow::Borrowed("fixture-protected"),
+                Cow::Borrowed("not-run"),
+                Cow::Borrowed("fixture apply is permanently non-mutating"),
             )
         } else {
             // The typed preview is computed before the apply: it names the
@@ -1206,17 +1209,19 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
                 .as_ref()
                 .map(guide_adapters::PlanIdentity::to_json)
                 .unwrap_or(Value::Null);
+            // ubs:ignore[rust.collections.clone-in-loop] -- Record the before-apply compensation while the mutation adapter still borrows the complete preview for identity validation.
             step_compensation = preview.compensation.clone();
             if !preview.is_available() {
                 blocked_step = true;
                 unavailable_mutation_count += 1;
                 (
-                    "adapter-unavailable".to_string(),
-                    "not-run".to_string(),
-                    format!(
+                    Cow::Borrowed("adapter-unavailable"),
+                    Cow::Borrowed("not-run"),
+                    // ubs:ignore[rust.perf.string-alloc-in-loop] -- An unavailable adapter emits one owned diagnostic with its specific detail; normal status labels stay borrowed.
+                    Cow::Owned(format!(
                         "no closed adapter for this structured command: {}",
                         preview.detail
-                    ),
+                    )),
                 )
             } else {
                 let expected = expected_plan_identity(request, order);
@@ -1235,7 +1240,7 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
                     attempted_mutation_count += 1;
                 }
                 mutation_observation = mutation.observation;
-                step_phase = mutation.phase.to_string();
+                step_phase = Cow::Owned(mutation.phase);
                 step_applied = mutation.applied;
                 step_verified = mutation.verified;
                 step_verification = mutation.verification;
@@ -1247,7 +1252,11 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
                 } else {
                     blocked_step = true;
                 }
-                (mutation.status, mutation.proof_result, mutation.detail)
+                (
+                    Cow::Owned(mutation.status),
+                    Cow::Owned(mutation.proof_result),
+                    Cow::Owned(mutation.detail),
+                )
             }
         };
         prior_proofs_passed &= proof_result == "passed";

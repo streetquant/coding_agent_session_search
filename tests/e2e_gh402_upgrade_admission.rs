@@ -420,12 +420,13 @@ fn remove_derived_fts(db: &Path) {
 /// index run. The archive stays openable; the derived generation is stale.
 fn add_canonical_message_ahead_of_derived(db: &Path, conversation_id: i64) {
     let conn = open_stock(db);
+    // ubs:ignore[rust.domain.sql-concat] -- SQL advances the ordinal inside this immutable statement; the runtime conversation ID remains a bound parameter.
+    const NEXT_MESSAGE_ORDINAL_SQL: &str =
+        "SELECT COALESCE(MAX(idx), -1) + 1 FROM messages WHERE conversation_id = ?1";
     let next_idx: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(idx), -1) + 1 FROM messages WHERE conversation_id = ?1",
-            [conversation_id],
-            |row| row.get(0),
-        )
+        .query_row(NEXT_MESSAGE_ORDINAL_SQL, [conversation_id], |row| {
+            row.get(0)
+        })
         .expect("choose the next message ordinal");
     conn.execute(
         "INSERT INTO messages(conversation_id, idx, role, content, created_at)

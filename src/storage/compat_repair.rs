@@ -917,6 +917,7 @@ mod tests {
             ..bundle()
         };
         let (admission, refusal) = limits.refusal(10 * MIB, &tight_disk);
+        // ubs:ignore[rust.ownership.guarded-later-unwrap] -- This negative fixture must fail if disk admission unexpectedly succeeds; the prior None belongs to the independent healthy case.
         let detail = refusal.expect("a short disk must defer");
         assert!(detail.contains("free space"), "{detail}");
         assert!(detail.contains(".pre-migration-bak"), "{detail}");

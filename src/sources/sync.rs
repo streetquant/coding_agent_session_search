@@ -3160,6 +3160,7 @@ impl SyncStatus {
                 Some(disk_info) => disk_info.last_sync > info.last_sync,
             };
             if !keep_disk {
+                // ubs:ignore[rust.collections.clone-in-loop] -- The merged durable ledger owns entries while this caller's immutable snapshot remains available for conflict resolution.
                 merged.sources.insert(name.clone(), info.clone());
             }
         }

@@ -57148,9 +57148,13 @@ fn doctor_candidate_reconstruct_archive_from_raw_mirror(
         )?;
     let mut receipts = Vec::new();
     for manifest_index in recovered_manifest_indices {
+        let manifest = raw_mirror
+            .manifests
+            .get(manifest_index)
+            .ok_or("reconstructed raw-mirror manifest index is out of range")?;
         receipts.extend(doctor_candidate_copy_raw_mirror_evidence_to_staging(
             copy_context,
-            &raw_mirror.manifests[manifest_index],
+            manifest,
         ));
     }
     Ok((

@@ -99,6 +99,8 @@ fn flush_fts_inserts(
     table: &str,
     rows: &mut Vec<(i64, String)>,
 ) -> Result<()> {
+    use std::fmt::Write as _;
+
     if rows.is_empty() {
         return Ok(());
     }
@@ -110,7 +112,7 @@ fn flush_fts_inserts(
         if index > 0 {
             sql.push(',');
         }
-        sql.push_str(&format!("({rowid},?{})", index + 1));
+        write!(&mut sql, "({rowid},?{})", index + 1)?;
         values.push(SqliteValue::from(content));
     }
     tx.execute_with_params_skip_statement_savepoint(&sql, &values)
@@ -738,6 +740,7 @@ impl ExportEngine {
                             )?;
                         }
 
+                        // ubs:ignore[rust.perf.string-alloc-in-loop] -- The two independently flushed FTS queues each own the redacted content after the source row is released.
                         pending_fts.push((*source_message_id, content.to_string()));
                         pending_code_fts.push((*source_message_id, content.into_owned()));
                         if pending_fts.len() == FTS_INSERT_BATCH_ROWS {

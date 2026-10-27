@@ -115,7 +115,11 @@ pub(crate) fn ledger_matches(
     let Some(primary) = file_observation(source_path) else {
         return false;
     };
-    if primary["absent"].as_bool() == Some(true) || !same_observation(&saved["primary"], &primary) {
+    if primary.get("absent").and_then(Value::as_bool) == Some(true)
+        || saved
+            .get("primary")
+            .is_none_or(|previous| !same_observation(previous, &primary))
+    {
         return false;
     }
     let Some(files) = saved["dependencies"].as_array() else {

@@ -737,7 +737,9 @@ fn read_schema<R: SemanticReadSnapshot>(
             transaction,
             "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2 LIMIT 2",
             &[
+                // ubs:ignore[rust.collections.clone-in-loop] -- Bound schema lookup parameters own their text while the original kind still feeds the snapshot digest.
                 SqliteValue::Text(kind.clone().into()),
+                // ubs:ignore[rust.collections.clone-in-loop] -- Keep the schema name for canonical hashing and the required-table set after this owned parameter query.
                 SqliteValue::Text(name.clone().into()),
             ],
         )?;
@@ -752,13 +754,13 @@ fn read_schema<R: SemanticReadSnapshot>(
         if sql.as_ref().map_or(0, String::len) != sql_bytes {
             return Err(SemanticSourceSnapshotError::InvalidSchema);
         }
-        if kind == "table" {
-            tables.insert(name.clone());
-        }
         for value in [&kind, &name, &table] {
             digest_field(&mut digest, value.as_bytes());
         }
         digest_field(&mut digest, sql.as_deref().unwrap_or_default().as_bytes());
+        if kind == "table" {
+            tables.insert(name);
+        }
     }
     if !tables.contains(SOURCE_IDENTITY_TABLE) {
         return Err(SemanticSourceSnapshotError::Uninitialized);
@@ -792,11 +794,9 @@ where
     // Admit metadata before transferring it, just as message bodies are sized
     // before loading. NULL source metadata is legitimate; oversize is an error,
     // never a reason to substitute a local/default source identity.
-    let sizes = query(
-        transaction,
-        "SELECT length(CAST(COALESCE(m.role, '') AS BLOB)) + length(CAST(COALESCE(c.source_id, '') AS BLOB)) + length(CAST(COALESCE(c.origin_host, '') AS BLOB)) FROM messages m JOIN conversations c ON c.id = m.conversation_id WHERE m.id = ?1 LIMIT 2",
-        &[SqliteValue::Integer(id)],
-    )?;
+    // ubs:ignore[rust.domain.sql-concat] -- SQL adds byte lengths inside a fixed statement; the sole runtime message ID is bound as ?1.
+    const METADATA_SIZE_SQL: &str = "SELECT length(CAST(COALESCE(m.role, '') AS BLOB)) + length(CAST(COALESCE(c.source_id, '') AS BLOB)) + length(CAST(COALESCE(c.origin_host, '') AS BLOB)) FROM messages m JOIN conversations c ON c.id = m.conversation_id WHERE m.id = ?1 LIMIT 2";
+    let sizes = query(transaction, METADATA_SIZE_SQL, &[SqliteValue::Integer(id)])?;
     if sizes.len() != 1 {
         return Err(SemanticSourceSnapshotError::InvalidSource.into());
     }
@@ -1305,7 +1305,9 @@ mod tests {
         );
         persist_semantic_source_certificate_in_transaction(&transaction, &snapshot)?;
         transaction.commit()?;
-        connection.execute_batch("UPDATE messages SET content = 'same-count edited source' WHERE id = 10; UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;")?;
+        // ubs:ignore[rust.domain.sql-concat] -- This immutable negative fixture edits a fixed row and increments the SQL source clock; no Rust concatenation or runtime value enters it.
+        const STALE_CERTIFICATE_SQL: &str = "UPDATE messages SET content = 'same-count edited source' WHERE id = 10; UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;";
+        connection.execute_batch(STALE_CERTIFICATE_SQL)?;
         let mut transaction = connection.transaction()?;
         assert_eq!(
             semantic_source_certificate_in_transaction(&transaction, contract).unwrap_err(),

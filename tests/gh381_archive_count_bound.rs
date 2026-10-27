@@ -347,6 +347,7 @@ fn the_count_answers_with_an_active_reader_and_an_interrupted_writer() {
             .expect("commit the interrupted writer");
         // Leaking the connection skips the close-time checkpoint, which is
         // exactly the state a crashed writer leaves behind.
+        // ubs:ignore[rust.unsafe-memory.forget] -- One disposable fixture connection deliberately preserves the uncheckpointed WAL; process exit reclaims its resources.
         std::mem::forget(writer);
     }
     let wal_path = format!("{}-wal", db_path.to_string_lossy());

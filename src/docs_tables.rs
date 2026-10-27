@@ -89,6 +89,7 @@ pub fn render(marker: &str) -> String {
         "TUI KEYMAP" => crate::ui::shortcuts::markdown_reference(),
         "TUI DETAIL KEYMAP" => crate::ui::shortcuts::markdown_detail_reference(),
         "TUI EXPORT KEYMAP" => crate::ui::shortcuts::markdown_export_reference(),
+        // ubs:ignore[rust.ownership.panic-macro] -- This internal dispatcher is called with the fixed generated-block registries; an unknown marker is a programmer error, not document input.
         other => panic!("unknown generated-docs marker: {other}"),
     }
 }
@@ -99,12 +100,18 @@ pub fn apply_blocks(doc: &str) -> Result<(String, usize), String> {
     let mut out = doc.to_string();
     let mut replaced = 0;
     for marker in ALL_MARKERS.iter().copied() {
+        // ubs:ignore[rust.perf.string-alloc-in-loop] -- Each of the nine fixed registry markers needs its own exact opening delimiter for document replacement.
         let begin = format!("<!-- BEGIN GENERATED {marker} -->");
+        // ubs:ignore[rust.perf.string-alloc-in-loop] -- Pair this registry marker with its distinct closing delimiter; no per-message or unbounded input loop is involved.
         let end = format!("<!-- END GENERATED {marker} -->");
         let Some(start) = out.find(&begin) else {
             continue;
         };
-        let Some(relative_end) = out[start + begin.len()..].find(&end) else {
+        let Some(relative_end) = out
+            .get(start + begin.len()..)
+            .and_then(|tail| tail.find(&end))
+        else {
+            // ubs:ignore[rust.perf.string-alloc-in-loop] -- A malformed generated block returns one marker-specific diagnostic and stops rewriting immediately.
             return Err(format!(
                 "{marker}: BEGIN marker without a matching END marker"
             ));
@@ -126,12 +133,17 @@ pub fn apply_blocks(doc: &str) -> Result<(String, usize), String> {
 pub fn drifted_markers(doc: &str) -> Vec<&'static str> {
     let mut drifted = Vec::new();
     for marker in ALL_MARKERS.iter().copied() {
+        // ubs:ignore[rust.perf.string-alloc-in-loop] -- Drift detection checks the nine fixed generated-block opening delimiters, each once per document.
         let begin = format!("<!-- BEGIN GENERATED {marker} -->");
+        // ubs:ignore[rust.perf.string-alloc-in-loop] -- The corresponding fixed closing delimiter is required to distinguish incomplete blocks from valid output.
         let end = format!("<!-- END GENERATED {marker} -->");
         let Some(start) = doc.find(&begin) else {
             continue;
         };
-        let Some(relative_end) = doc[start + begin.len()..].find(&end) else {
+        let Some(relative_end) = doc
+            .get(start + begin.len()..)
+            .and_then(|tail| tail.find(&end))
+        else {
             drifted.push(marker);
             continue;
         };
@@ -293,8 +305,10 @@ fn connectors_table() -> String {
 fn dependency_pins_table() -> String {
     use std::fmt::Write as _;
 
+    // ubs:ignore[rust.ownership.unwrap-expect,rust.parsing.serde-unwrap] -- Cargo already parsed this immutable compile-time manifest before building the registry renderer; no runtime file is deserialized here.
     let manifest: toml::Value = toml::from_str(include_str!("../Cargo.toml"))
         .expect("Cargo.toml must parse for the generated dependency table");
+    // ubs:ignore[rust.ownership.unwrap-expect] -- This crate's compile-time Cargo.toml necessarily has its required dependency table; document contents never select it.
     let dependencies = manifest
         .get("dependencies")
         .and_then(toml::Value::as_table)
