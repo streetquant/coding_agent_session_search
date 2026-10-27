@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::search::semantic_manifest::{
     SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION, SemanticArtifactValidationEvidence,
-    SemanticExpectedCurrentV1, SemanticGenerationStatus, SemanticGenerationTopology,
-    SemanticProducerAttestation,
+    SemanticExpectedCurrentV1, SemanticGenerationPurpose, SemanticGenerationStatus,
+    SemanticGenerationTopology, SemanticProducerAttestation,
 };
 use crate::search::semantic_reader::{SemanticResultPhase, SemanticShardExpectation};
 use crate::search::vector_index::{ROLE_USER, SemanticDocId};
@@ -240,6 +240,7 @@ fn fixture(
     };
     let manifest = SemanticGenerationManifestV1 {
         schema_version: SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION,
+        purpose: SemanticGenerationPurpose::Semantic,
         generation_id: name.into(),
         build_id: format!("build-{name}"),
         request_id: None,

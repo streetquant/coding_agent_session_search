@@ -962,7 +962,8 @@ fn historical_archive_shapes_are_admitted_without_source_mutation() {
         // copies. WAL/SHM headers may carry engine-generated salts, so only
         // their presence is compared.
         assert_eq!(
-            before_a.get(""), before_b.get(""),
+            before_a.get(""),
+            before_b.get(""),
             "{shape:?}: the two disposable copies must start with identical canonical DB bytes"
         );
         assert_eq!(
@@ -971,7 +972,8 @@ fn historical_archive_shapes_are_admitted_without_source_mutation() {
             "{shape:?}: the two copies must start with the same sidecar set"
         );
         assert_eq!(
-            after_a.get(""), after_b.get(""),
+            after_a.get(""),
+            after_b.get(""),
             "{shape:?}: two identical copies must end with identical canonical DB bytes"
         );
         assert_eq!(
@@ -1136,7 +1138,11 @@ fn checked_in_gh503_catalog_is_read_only_admitted_and_repairs_only_on_request() 
     );
     assert_unchanged(&before_bundle, &bundle_snapshot(&db), &db, "gh503 view");
     if let Some(before) = source_hash_before {
-        assert_eq!(before, hash_file(&source_path), "gh503 view mutated the source file");
+        assert_eq!(
+            before,
+            hash_file(&source_path),
+            "gh503 view mutated the source file"
+        );
     }
 
     let mut search = cass_cmd(&home, &data_dir, &db);

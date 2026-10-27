@@ -17,7 +17,6 @@ use std::sync::Arc;
 
 use crate::franken_sync::compat::RowExt;
 use crate::indexer::semantic::expected_vector_space_revision;
-use anyhow::anyhow;
 use crate::search::ann_index::hnsw_index_path;
 use crate::search::embedder::{CassPassageProducer, Embedder};
 use crate::search::fastembed_embedder::{FastEmbedder, LazyFastEmbedder};
@@ -49,6 +48,7 @@ use crate::search::vector_index::{
     SemanticProgressiveUnavailableReason, VectorIndex, vector_index_path,
 };
 use crate::storage::sqlite::FrankenStorage;
+use anyhow::anyhow;
 
 /// Unified TUI state machine for semantic search availability.
 ///
@@ -1653,7 +1653,9 @@ fn refuse_stale_semantic_assets(
                 identity_meta_key.into(),
             )],
         )
-        .map_err(|error| format!("checking canonical semantic identity invalidation marker: {error}"))
+        .map_err(|error| {
+            format!("checking canonical semantic identity invalidation marker: {error}")
+        })
         .and_then(|rows| {
             let Some(row) = rows.first() else {
                 return Ok(None);

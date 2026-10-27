@@ -19,8 +19,7 @@ use coding_agent_search::search::fastembed_embedder::FastEmbedder;
 use coding_agent_search::search::hash_embedder::HashEmbedder;
 use coding_agent_search::search::model_manager::{
     load_hash_semantic_context_strict, load_hash_semantic_context_with_snapshot,
-    load_semantic_context_for_embedder_strict,
-    load_semantic_context_for_embedder_with_snapshot,
+    load_semantic_context_for_embedder_strict, load_semantic_context_for_embedder_with_snapshot,
 };
 use coding_agent_search::search::query::{
     FieldMask, SearchClient, SearchClientOptions, SearchFilters, SearchHit, rrf_fuse_hits,
@@ -442,11 +441,9 @@ impl Semantic {
         .context("canonical semantic archive is missing")?;
         let setup = client
             .with_semantic_read_snapshot(|snapshot| match config.embedder {
-                EmbedderChoice::Hash => load_hash_semantic_context_with_snapshot(
-                    &config.data_dir,
-                    db,
-                    snapshot,
-                ),
+                EmbedderChoice::Hash => {
+                    load_hash_semantic_context_with_snapshot(&config.data_dir, db, snapshot)
+                }
                 _ => load_semantic_context_for_embedder_with_snapshot(
                     &config.data_dir,
                     db,

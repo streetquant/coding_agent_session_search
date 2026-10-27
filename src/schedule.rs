@@ -1474,7 +1474,7 @@ pub fn soften_busy_index_step(step: &mut StepReport) -> bool {
 }
 
 /// A field from the last JSON error envelope a step wrote to stderr.
-fn step_error_field(step: &StepReport, pointer: &str) -> Option<String> {
+pub(crate) fn step_error_field(step: &StepReport, pointer: &str) -> Option<String> {
     step.stderr_tail.as_deref()?.lines().rev().find_map(|line| {
         serde_json::from_str::<serde_json::Value>(line.trim())
             .ok()?

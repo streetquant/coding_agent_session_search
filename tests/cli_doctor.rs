@@ -230,7 +230,10 @@ fn cass_cmd(test_home: &Path) -> Command {
         // These connectors default to host roots outside HOME; without the
         // overrides a one-session fixture also indexes the developer's archive.
         .env("CASS_CLOUDMCP_DATA_ROOT", test_home.join("cloudmcp-empty"))
-        .env("CASS_OPENWEBUI_DATA_ROOT", test_home.join("openwebui-empty"))
+        .env(
+            "CASS_OPENWEBUI_DATA_ROOT",
+            test_home.join("openwebui-empty"),
+        )
         .current_dir(test_home);
     cmd
 }

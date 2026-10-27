@@ -86,6 +86,8 @@ pub enum ErrorKind {
     InvalidAgent,
     InvalidFilename,
     InvalidLine,
+    InvalidMessageAnchor,
+    StaleMessageAnchor,
     Io,
     LexicalRebuild,
     /// Snake-case wire literal (legacy): `lexical_generation`.
@@ -140,6 +142,7 @@ pub enum ErrorKind {
     Ssh,
     Storage,
     StorageFingerprint,
+    StorageRecoveryRequired,
     Timeout,
     Tui,
     TuiHeadlessOnce,
@@ -194,6 +197,8 @@ impl ErrorKind {
             Self::InvalidAgent => "invalid-agent",
             Self::InvalidFilename => "invalid-filename",
             Self::InvalidLine => "invalid-line",
+            Self::InvalidMessageAnchor => "invalid-message-anchor",
+            Self::StaleMessageAnchor => "stale-message-anchor",
             Self::Io => "io",
             Self::LexicalRebuild => "lexical-rebuild",
             Self::LexicalGeneration => "lexical-generation",
@@ -243,6 +248,7 @@ impl ErrorKind {
             Self::Ssh => "ssh",
             Self::Storage => "storage",
             Self::StorageFingerprint => "storage-fingerprint",
+            Self::StorageRecoveryRequired => "storage-recovery-required",
             Self::Timeout => "timeout",
             Self::Tui => "tui",
             Self::TuiHeadlessOnce => "tui-headless-once",
@@ -296,6 +302,8 @@ impl ErrorKind {
             "invalid-agent" => Self::InvalidAgent,
             "invalid-filename" => Self::InvalidFilename,
             "invalid-line" => Self::InvalidLine,
+            "invalid-message-anchor" => Self::InvalidMessageAnchor,
+            "stale-message-anchor" => Self::StaleMessageAnchor,
             "io" => Self::Io,
             "lexical-rebuild" => Self::LexicalRebuild,
             "lexical-generation" => Self::LexicalGeneration,
@@ -345,6 +353,7 @@ impl ErrorKind {
             "ssh" => Self::Ssh,
             "storage" => Self::Storage,
             "storage-fingerprint" => Self::StorageFingerprint,
+            "storage-recovery-required" => Self::StorageRecoveryRequired,
             "timeout" => Self::Timeout,
             "tui" => Self::Tui,
             "tui-headless-once" => Self::TuiHeadlessOnce,
@@ -398,6 +407,8 @@ impl ErrorKind {
             Self::InvalidAgent,
             Self::InvalidFilename,
             Self::InvalidLine,
+            Self::InvalidMessageAnchor,
+            Self::StaleMessageAnchor,
             Self::Io,
             Self::LexicalRebuild,
             Self::LexicalGeneration,
@@ -447,6 +458,7 @@ impl ErrorKind {
             Self::Ssh,
             Self::Storage,
             Self::StorageFingerprint,
+            Self::StorageRecoveryRequired,
             Self::Timeout,
             Self::Tui,
             Self::TuiHeadlessOnce,
@@ -519,9 +531,11 @@ mod tests {
         // `missing-index` and `io-error` into `io`, and dropped `update-check`,
         // whose only producer (the pre-TUI update prompt) 2l1b0.56 removed.
         // 2l1b0.65 added `schema-repair-required` (93).
+        // dnj94 added `storage-recovery-required` (94). Message-anchor
+        // validation added `invalid-message-anchor` and `stale-message-anchor` (96).
         // If lib.rs grows a new kind, bump this count AND add the variant +
         // arms above.
-        const AUDITED_KIND_COUNT: usize = 93;
+        const AUDITED_KIND_COUNT: usize = 96;
         assert_eq!(
             ErrorKind::all_variants().len(),
             AUDITED_KIND_COUNT,

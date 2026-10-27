@@ -20,6 +20,7 @@
 //! * the measurement separates the count stage from the total wall time and
 //!   captures the RSS and block-IO deltas.
 
+use std::fmt::Write;
 use std::path::Path;
 use std::time::Duration;
 
@@ -133,7 +134,17 @@ fn build_archive(db_path: &Path, conversations: usize, messages: usize) -> (Fran
                 if row > 0 {
                     message_sql.push(',');
                 }
-                message_sql.push_str("(?,?,?,?,?)");
+                let first = row * 5 + 1;
+                write!(
+                    message_sql,
+                    "(?{},?{},?{},?{},?{})",
+                    first,
+                    first + 1,
+                    first + 2,
+                    first + 3,
+                    first + 4
+                )
+                .expect("write numbered fixture placeholders");
             }
             params.clear();
             for offset in 0..batch {

@@ -27974,7 +27974,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  Pack vs search: use search to explore/paginate/aggregate candidates; use pack once you need a bounded handoff artifact.".to_string(),
             "  Pack vs export-html: export-html creates a complete browsable session archive; pack creates a token-budgeted evidence bundle.".to_string(),
             "  Pack vs doctor/status: status/health report readiness before a handoff; doctor diagnoses or repairs derived assets and is not a summarizer.".to_string(),
-            "  Pack warnings: inspect health, freshness, privacy, and warnings for semantic_fallback_lexical (realized.fallback_reason names the cause; pack_enrichment_unavailable means pack itself selects evidence lexically), privacy_redactions_applied, and no_evidence_found before copying output; stale evidence is structural via freshness.stale_evidence_count.".to_string(),
+            "  Pack warnings: inspect health, freshness, privacy, and warnings for semantic_fallback_lexical (realized.fallback_reason names the cause), privacy_redactions_applied, and no_evidence_found before copying output; stale evidence is structural via freshness.stale_evidence_count.".to_string(),
             "  Pack budgets: tune --max-tokens, --max-evidence, --max-sessions, --max-excerpt-chars, and --fields summary/minimal to fit the recipient context.".to_string(),
             "  Default search: hybrid-preferred. With --robot-meta, inspect requested_search_mode, search_mode, semantic_refinement, fallback_tier, and fallback_reason.".to_string(),
             "  Quick history: use --workspace PATH --days 7 --mode lexical --no-maintenance --robot --robot-meta --fields source_path,line_number,agent,source_id,conversation_id,message_anchor --limit 5 --max-tokens 2000 --timeout 2000.".to_string(),
@@ -35016,19 +35016,9 @@ fn run_cli_pack(
 
     let requested_mode = mode.unwrap_or_default();
     let mut mode_meta = SearchModeMeta::new(requested_mode, mode.is_none());
-    if matches!(requested_mode, crate::search::query::SearchMode::Semantic) {
-        return Err(CliError {
-            code: 15,
-            kind: CliErrorKind::SemanticUnavailable.kind_str(),
-            message: "cass pack cannot currently run semantic-only evidence selection".to_string(),
-            hint: Some("Use --mode lexical or the default hybrid-preferred mode, which fails open to lexical evidence.".to_string()),
-            retryable: true,
-        });
-    }
-    if matches!(requested_mode, crate::search::query::SearchMode::Hybrid) {
-        mode_meta
-            .fall_back_to_lexical("pack semantic enrichment unavailable; using lexical evidence");
-    }
+    // A budgeted pack may finish before selection runs. Report semantic work
+    // only after the bounded worker returns a completed search.
+    mode_meta.semantic_work_completed = false;
 
     if cass_not_initialized(
         db_path.exists(),
@@ -35090,7 +35080,7 @@ fn run_cli_pack(
                 &worker_data_dir,
                 &worker_db_path,
                 &worker_index_path,
-                Some(crate::search::query::SearchMode::Lexical),
+                Some(requested_mode),
                 timeout_ms,
                 start_time,
                 true,
@@ -35114,7 +35104,7 @@ fn run_cli_pack(
             &data_dir,
             &db_path,
             &index_path,
-            Some(crate::search::query::SearchMode::Lexical),
+            Some(requested_mode),
             timeout_ms,
             start_time,
             true,
@@ -35170,43 +35160,54 @@ fn run_cli_pack(
         limit
     };
     let search_sparse_threshold = sparse_threshold_for_visible_limit(3, candidate_limit, false);
-    let result = if session_scope_empty {
-        empty_search_result()
+    let (result, realized_mode_meta) = if session_scope_empty {
+        (empty_search_result(), mode_meta.clone())
     } else if structured_pack && (hard_deadline_reached || pack_budget.is_exhausted()) {
         hard_deadline_reached = true;
         if !skipped_sections.iter().any(|section| section == "search") {
             skipped_sections.push("search".to_string());
         }
-        empty_search_result()
+        (empty_search_result(), mode_meta.clone())
     } else {
         let client = client.expect("completed pack setup provides a search client");
         let query = query.to_string();
+        let worker_data_dir = data_dir.clone();
+        let worker_db_path = db_path.clone();
+        let worker_mode_meta = mode_meta.clone();
+        let fuel_recovery_command =
+            cass_dataset_command(&data_dir, &db_path, &["index", "--full", "--json"]);
         let search_task = move || {
             maybe_test_pack_delay();
-            client
-                .search_with_fallback(
-                    &query,
-                    filters,
-                    candidate_limit,
-                    0,
-                    search_sparse_threshold,
-                    FieldMask::FULL,
-                )
-                .map_err(|error| {
-                    let invariant_hint = lexical_engine_invariant_hint(&error);
-                    CliError {
-                        code: 9,
-                        kind: CliErrorKind::Search.kind_str(),
-                        message: format!("pack search failed: {error}"),
-                        retryable: invariant_hint.is_none(),
-                        hint: invariant_hint.or_else(|| {
-                            Some(
-                                "Try `cass search <query> --robot --robot-meta` to inspect the search path."
-                                    .to_string(),
-                            )
-                        }),
-                    }
-                })
+            let semantic_opts = SemanticSearchOptions::default();
+            let worker_mode_meta =
+                if worker_mode_meta.realized == crate::search::query::SearchMode::Lexical {
+                    worker_mode_meta
+                } else {
+                    configure_bounded_search_semantics(
+                        Arc::clone(&client),
+                        worker_data_dir,
+                        worker_db_path,
+                        worker_mode_meta,
+                        semantic_opts.clone(),
+                        true,
+                    )?
+                    .0
+                };
+            let (result, mut completed_mode_meta) = execute_search_operation(
+                client,
+                query,
+                filters,
+                candidate_limit,
+                0,
+                search_sparse_threshold,
+                FieldMask::FULL,
+                semantic_opts.approximate,
+                semantic_opts.tier_mode,
+                worker_mode_meta,
+                fuel_recovery_command,
+            )?;
+            completed_mode_meta.semantic_work_completed = true;
+            Ok((result, completed_mode_meta))
         };
         if structured_pack {
             match run_read_only_search_worker(pack_budget.remaining_ms(), search_task)? {
@@ -35214,13 +35215,14 @@ fn run_cli_pack(
                 None => {
                     hard_deadline_reached = true;
                     skipped_sections.push("search".to_string());
-                    empty_search_result()
+                    (empty_search_result(), mode_meta.clone())
                 }
             }
         } else {
             search_task()?
         }
     };
+    mode_meta = realized_mode_meta;
 
     let query_term_count = pack_query_term_count(query);
     let query_phrase_count = pack_query_phrase_count(query);
@@ -35413,6 +35415,10 @@ fn run_cli_pack(
             },
             semantic_readiness: if mode_meta.fell_back_to_lexical() {
                 PackSemanticReadiness::FallbackLexical
+            } else if mode_meta.semantic_refinement() {
+                PackSemanticReadiness::Joined
+            } else if requested_mode != crate::search::query::SearchMode::Lexical {
+                PackSemanticReadiness::NotReported
             } else {
                 PackSemanticReadiness::Disabled
             },
@@ -107064,7 +107070,7 @@ fn response_schema_pack() -> serde_json::Value {
                     "fallback_mode": { "type": ["string", "null"] },
                     "fallback_reason": {
                         "type": ["string", "null"],
-                        "description": "Why the pack's search fell back to fallback_mode, as the executor recorded it (the typed codes of search's _meta.semantic_fallback_reason; pack_enrichment_unavailable means pack itself selects evidence lexically). Null when there was no fallback, or when none was supplied, which also adds the warning semantic_fallback_reason_unreported."
+                        "description": "Why the pack's search fell back to fallback_mode, as the executor recorded it (the typed codes of search's _meta.semantic_fallback_reason). Null when there was no fallback, or when none was supplied, which also adds the warning semantic_fallback_reason_unreported."
                     },
                     "semantic_joined": { "type": "boolean" },
                     "candidate_count": { "type": "integer" },

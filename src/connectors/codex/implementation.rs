@@ -245,6 +245,9 @@ fn augment_modern_codex_reader(
         .map(|(index, message)| (modern_codex_raw_signature(&message.extra), index))
         .collect();
     let mut added = false;
+    let mut native_session_id = None;
+    let mut native_session_header_seen = false;
+    let mut native_session_metadata_valid = true;
     let mut line = String::new();
     let mut bytes_read = 0_u64;
     let mut line_no = 0_usize;
@@ -296,10 +299,25 @@ fn augment_modern_codex_reader(
                 continue;
             }
         };
+        if raw.get("type").and_then(Value::as_str) == Some("session_meta") {
+            let id = raw
+                .pointer("/payload/id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty() && id.len() <= 4096);
+            if native_session_header_seen || id.is_none() {
+                native_session_metadata_valid = false;
+            }
+            native_session_header_seen = true;
+            native_session_id = id.map(str::to_owned);
+            continue;
+        }
         let raw_signature = modern_codex_raw_signature(&raw);
         let Some(message) = modern_codex_message(&raw) else {
             continue;
         };
+        if !native_session_header_seen {
+            native_session_metadata_valid = false;
+        }
         let message_signature = modern_codex_message_signature(&message);
         let existing_index = message_indices_by_raw_entry
             .get(&raw_signature)
@@ -366,6 +384,30 @@ fn augment_modern_codex_reader(
         );
         message_indices_by_raw_entry.insert(raw_signature, message_index);
         added = true;
+    }
+
+    // Archive the actual header identity while this bounded source snapshot is
+    // open. Rollout-relative filenames cannot establish a native session ID.
+    if let Some(id) = native_session_id.filter(|_| native_session_metadata_valid) {
+        if conversation.metadata.is_null() {
+            conversation.metadata = serde_json::json!({});
+        }
+        if let Some(metadata) = conversation.metadata.as_object_mut() {
+            if metadata.get("native_session_id").is_some_and(|previous| {
+                !previous.is_null() && previous.as_str() != Some(id.as_str())
+            }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "Codex native session identity changed between parser passes; retry this source",
+                )
+                .into());
+            }
+            metadata.insert("native_session_id".to_string(), Value::String(id));
+        }
+    } else if let Some(metadata) = conversation.metadata.as_object_mut() {
+        // Missing, malformed, duplicate or late headers cannot certify a
+        // session, even if another parser supplied an unproven value.
+        metadata.remove("native_session_id");
     }
 
     if added {
@@ -1066,6 +1108,112 @@ mod tests {
             metadata: Value::Null,
             messages: Vec::new(),
         }
+    }
+
+    #[test]
+    fn enrichment_archives_native_session_id_and_preserves_other_metadata() -> Result<()> {
+        let header = serde_json::json!({
+            "type": "session_meta", "payload": {"id": "native-session-proof"}
+        });
+        let body = custom_call("identity-call", "native identity evidence");
+        let source = format!("{header}\n{body}\n");
+        for metadata in [
+            Value::Null,
+            serde_json::json!({"source": "rollout", "peer": 7}),
+            serde_json::json!({"source": "rollout", "peer": 7, "native_session_id": null}),
+            serde_json::json!({
+                "source": "rollout", "peer": 7, "native_session_id": "native-session-proof"
+            }),
+        ] {
+            let mut conversation =
+                conversation_at(std::path::Path::new("rollout-native-identity.jsonl"));
+            let had_other_metadata = !metadata.is_null();
+            conversation.metadata = metadata;
+            let mut reader = io::Cursor::new(source.as_bytes());
+            let bytes = augment_modern_codex_reader(&mut conversation, None, &mut reader)?;
+            assert_eq!(bytes, u64::try_from(source.len())?);
+            assert_eq!(conversation.messages.len(), 1);
+            assert_eq!(
+                conversation.metadata["native_session_id"],
+                "native-session-proof"
+            );
+            if had_other_metadata {
+                assert_eq!(conversation.metadata["source"], "rollout");
+                assert_eq!(conversation.metadata["peer"], 7);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn enrichment_does_not_certify_missing_malformed_duplicate_or_late_headers() -> Result<()> {
+        let header = serde_json::json!({
+            "type": "session_meta", "payload": {"id": "native-session-proof"}
+        });
+        let body = custom_call("identity-call", "native identity evidence");
+        for records in [
+            vec![body.clone()],
+            vec![
+                serde_json::json!({"type": "session_meta", "payload": {}}),
+                body.clone(),
+            ],
+            vec![
+                serde_json::json!({"type": "session_meta", "payload": {"id": null}}),
+                body.clone(),
+            ],
+            vec![
+                serde_json::json!({"type": "session_meta", "payload": {"id": "  "}}),
+                body.clone(),
+            ],
+            vec![
+                serde_json::json!({"type": "session_meta", "payload": {"id": "x".repeat(4097)}}),
+                body.clone(),
+            ],
+            vec![header.clone(), header.clone(), body.clone()],
+            vec![
+                header.clone(),
+                serde_json::json!({"type": "session_meta", "payload": {"id": "other-session"}}),
+                body.clone(),
+            ],
+            vec![body.clone(), header.clone()],
+        ] {
+            let mut conversation =
+                conversation_at(std::path::Path::new("rollout-native-identity.jsonl"));
+            conversation.metadata = serde_json::json!({
+                "source": "rollout", "peer": 7, "native_session_id": "unproven"
+            });
+            let mut source = String::new();
+            for record in records {
+                source.push_str(&serde_json::to_string(&record)?);
+                source.push('\n');
+            }
+            let mut reader = io::Cursor::new(source.as_bytes());
+            augment_modern_codex_reader(&mut conversation, None, &mut reader)?;
+            assert_eq!(conversation.messages.len(), 1);
+            assert!(conversation.metadata.get("native_session_id").is_none());
+            assert_eq!(conversation.metadata["source"], "rollout");
+            assert_eq!(conversation.metadata["peer"], 7);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn enrichment_refuses_conflicting_native_identity_from_the_primary_parser() -> Result<()> {
+        let header = serde_json::json!({
+            "type": "session_meta", "payload": {"id": "native-session-proof"}
+        });
+        let mut conversation =
+            conversation_at(std::path::Path::new("rollout-native-identity.jsonl"));
+        conversation.metadata = serde_json::json!({"native_session_id": "other-session"});
+        let source = format!("{header}\n");
+        let mut reader = io::Cursor::new(source.as_bytes());
+        let error = augment_modern_codex_reader(&mut conversation, None, &mut reader).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::Interrupted)
+        );
+        assert_eq!(conversation.metadata["native_session_id"], "other-session");
+        Ok(())
     }
 
     #[test]

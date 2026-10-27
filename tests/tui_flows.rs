@@ -129,6 +129,7 @@ fn search_hit(
         origin_kind: "local".to_string(),
         origin_host: None,
         conversation_id: Some(42),
+        message_anchor: None,
     }
 }
 

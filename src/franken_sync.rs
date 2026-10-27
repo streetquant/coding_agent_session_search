@@ -137,6 +137,12 @@ impl Drop for CancellationScope {
     }
 }
 
+/// Whether SQL on this thread is supervised by a cancellation scope.
+/// Storage uses this to bound native lock waits that do not poll the engine Cx.
+pub(crate) fn cancellation_scope_active() -> bool {
+    CANCELLATION.with(|slot| slot.borrow().is_some())
+}
+
 struct CancellationRegistration {
     handle: CancellationHandle,
     relay: Arc<LocalCancelRelay>,

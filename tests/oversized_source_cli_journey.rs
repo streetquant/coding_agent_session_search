@@ -74,13 +74,12 @@ fn index(home: &Path, cap: &str, key: &str, full: bool) -> std::process::Output 
     if full {
         command.arg("--full");
     }
-    let output = command
+    command
         .args(["--json", "--data-dir"])
         .arg(home.join("archive"))
         .args(["--idempotency-key", key])
         .output()
-        .expect("run index command");
-    output
+        .expect("run index command")
 }
 
 fn json_output(output: &std::process::Output) -> Value {

@@ -1,5 +1,7 @@
 //! Search ordinals and physical lines must never be silently interchanged.
-use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+use coding_agent_search::franken_sync::compat::{
+    ConnectionExt, OpenFlags, RowExt, open_with_flags,
+};
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::storage::sqlite::FrankenStorage;
 use serde_json::{Value, json};
@@ -24,6 +26,7 @@ mod pack_identity_regressions {
     fn hit(conversation_id: Option<i64>, number: Option<usize>, content_hash: u64) -> SearchHit {
         SearchHit {
             title: "pack identity".into(),
+            message_anchor: None,
             snippet: format!("distinct evidence {content_hash}"),
             content: format!("distinct evidence {content_hash}"),
             content_hash,
@@ -504,6 +507,8 @@ mod pack_identity_regressions {
                             &conversation.to_string(),
                             "--message-index",
                             &number,
+                            "--message-anchor",
+                            citation["message_anchor"].as_str().unwrap(),
                             "-C",
                             "0",
                             "--json",
@@ -647,12 +652,54 @@ impl Fixture {
     }
 
     fn follow(&self, subcommand: &str, index: usize, extra: &[&str]) -> Output {
-        self.command(subcommand)
+        let mut command = self.command(subcommand);
+        command
             .arg(&self.path)
-            .args(["--message-index", &index.to_string(), "-C", "0", "--json"])
-            .args(extra)
-            .output()
+            .args(["--message-index", &index.to_string(), "-C", "0", "--json"]);
+        if !extra.contains(&"--message-anchor") && !extra.contains(&"--message_anchor") {
+            command.arg("--message-anchor").arg(self.anchor(index));
+        }
+        command.args(extra).output().unwrap()
+    }
+
+    fn anchor(&self, index: usize) -> String {
+        let storage =
+            open_with_flags(self.db.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let source_id = storage
+            .query_map_collect(
+                "SELECT source_id FROM conversations WHERE id = ?1",
+                coding_agent_search::franken_sync::params![self.conversation_id],
+                |row| row.get_typed::<String>(0),
+            )
             .unwrap()
+            .into_iter()
+            .next()
+            .expect("fixture conversation source");
+        let body = i64::try_from(index)
+            .ok()
+            .and_then(|number| {
+                storage
+                    .query_map_collect(
+                        "SELECT content FROM messages WHERE conversation_id = ?1 AND idx = ?2",
+                        coding_agent_search::franken_sync::params![
+                            self.conversation_id,
+                            number - 1
+                        ],
+                        |row| row.get_typed::<String>(0),
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .next()
+            })
+            .unwrap_or_default();
+        coding_agent_search::search::query::message_anchor_for_content(
+            &source_id,
+            self.path.to_str().unwrap(),
+            Some(self.conversation_id),
+            Some(index),
+            &body,
+        )
+        .unwrap_or_else(|| format!("v1:{}", "0".repeat(64)))
     }
 }
 
@@ -729,7 +776,7 @@ fn actual_search_hit_round_trips_through_both_followup_commands() {
         vec!["--robot-meta"],
         vec![
             "--fields",
-            "conversation_id,line_number,source_id,source_path,content",
+            "conversation_id,line_number,source_id,source_path,content,message_anchor",
         ],
     ] {
         let found = decode(
@@ -761,6 +808,9 @@ fn actual_search_hit_round_trips_through_both_followup_commands() {
             .expect("search conversation id");
         assert_eq!(hit_conversation_id, fixture.conversation_id);
         assert_eq!(hit["source_path"], fixture.path.to_string_lossy().as_ref());
+        let anchor = hit["message_anchor"]
+            .as_str()
+            .expect("complete message anchor");
         for command in ["expand", "view"] {
             let output = fixture.follow(
                 command,
@@ -770,6 +820,8 @@ fn actual_search_hit_round_trips_through_both_followup_commands() {
                     hit["source_id"].as_str().unwrap(),
                     "--conversation-id",
                     &hit_conversation_id.to_string(),
+                    "--message-anchor",
+                    anchor,
                 ],
             );
             assert_target(&decode(output), command, index, fixture.conversation_id);
@@ -869,6 +921,8 @@ fn missing_archive_is_not_created_and_does_not_use_file_lines() {
             .arg(command)
             .arg(&fixture.path)
             .args(["--message-index", "2", "--json"])
+            .arg("--message-anchor")
+            .arg(fixture.anchor(2))
             .output()
             .unwrap();
         assert!(!output.status.success());
@@ -917,6 +971,8 @@ fn conflicting_selectors_are_rejected_and_huge_context_does_not_overflow() {
                     &usize::MAX.to_string(),
                     "--json",
                 ])
+                .arg("--message-anchor")
+                .arg(fixture.anchor(2))
                 .output()
                 .unwrap(),
         );
@@ -950,6 +1006,7 @@ fn pasted_search_fields_and_snake_case_selectors_use_canonical_messages() {
                     .arg(format!("source_path={}", fixture.path.display()))
                     .arg("source_id=local")
                     .arg(format!("conversation_id={}", fixture.conversation_id))
+                    .arg(format!("message_anchor={}", fixture.anchor(8)))
                     .args([selector, "context=0", "--json"])
                     .output()
                     .unwrap(),
@@ -961,6 +1018,8 @@ fn pasted_search_fields_and_snake_case_selectors_use_canonical_messages() {
                 .command(subcommand)
                 .arg(&fixture.path)
                 .args(["--message_index", "8", "-C", "0", "--json"])
+                .arg("--message_anchor")
+                .arg(fixture.anchor(8))
                 .output()
                 .unwrap(),
         );
@@ -1066,6 +1125,8 @@ fn malformed_archive_is_not_repaired_or_replaced_with_a_live_file() {
             .arg(subcommand)
             .arg(&fixture.path)
             .args(["--message-index", "2", "--json"])
+            .arg("--message-anchor")
+            .arg(fixture.anchor(2))
             .output()
             .unwrap();
         assert!(!output.status.success());
@@ -1338,6 +1399,7 @@ fn search_hit_serialization_preserves_available_identity_without_inventing_one()
     use coding_agent_search::search::query::{MatchType, SearchHit};
     let mut hit = SearchHit {
         title: "identity".into(),
+        message_anchor: None,
         snippet: "anchor".into(),
         content: "anchor".into(),
         content_hash: 123,
@@ -1390,9 +1452,12 @@ fn shared_path_search_hits_round_trip_in_every_robot_projection() {
         for fields in [
             None,
             Some("minimal"),
+            Some("minimal,message_anchor"),
             Some("summary"),
+            Some("summary,message_anchor"),
             Some("all"),
             Some("source_path,line_number,source_id,conversation_id"),
+            Some("source_path,line_number,source_id,conversation_id,message_anchor"),
         ] {
             // Plain JSON exercises the handwritten fast serializers. Truncation
             // forces the general projection; JSONL and compact use that path too.
@@ -1460,17 +1525,41 @@ fn shared_path_search_hits_round_trip_in_every_robot_projection() {
                         assert_eq!(hit.as_object().unwrap().len(), 4);
                     }
                     for subcommand in ["view", "expand"] {
-                        let payload = decode(fixture.follow(
-                            subcommand,
-                            8,
-                            &[
-                                "--source",
-                                hit["source_id"].as_str().unwrap(),
-                                "--conversation-id",
-                                &cid.to_string(),
-                            ],
-                        ));
-                        assert_target(&payload, subcommand, 8, cid);
+                        if let Some(anchor) = hit["message_anchor"].as_str() {
+                            let payload = decode(fixture.follow(
+                                subcommand,
+                                8,
+                                &[
+                                    "--source",
+                                    hit["source_id"].as_str().unwrap(),
+                                    "--conversation-id",
+                                    &cid.to_string(),
+                                    "--message-anchor",
+                                    anchor,
+                                ],
+                            ));
+                            assert_target(&payload, subcommand, 8, cid);
+                        } else {
+                            let output = fixture
+                                .command(subcommand)
+                                .arg(&fixture.path)
+                                .args([
+                                    "--message-index",
+                                    "8",
+                                    "--source",
+                                    hit["source_id"].as_str().unwrap(),
+                                    "--conversation-id",
+                                    &cid.to_string(),
+                                    "--json",
+                                ])
+                                .output()
+                                .unwrap();
+                            assert!(!output.status.success());
+                            assert!(output.stdout.is_empty());
+                            assert!(
+                                String::from_utf8_lossy(&output.stderr).contains("message-anchor")
+                            );
+                        }
                     }
                 }
                 assert_eq!(seen, expected);
@@ -1530,6 +1619,7 @@ fn corrected_robot_failures_are_one_error_envelope_and_success_still_teaches() {
                     "line_number=8",
                     "context=0",
                 ])
+                .arg(format!("message_anchor={}", fixture.anchor(8)))
                 .args(*flags);
             if flags.is_empty() {
                 command.env("CASS_OUTPUT_FORMAT", "json");
@@ -1555,6 +1645,7 @@ fn corrected_robot_failures_are_one_error_envelope_and_success_still_teaches() {
             .command(subcommand)
             .arg(format!("source_path={}", fixture.path.display()))
             .args(["source_id=local", "line_number=8", "context=0", "--json"])
+            .arg(format!("message_anchor={}", fixture.anchor(8)))
             .output()
             .unwrap();
         assert!(
@@ -1567,6 +1658,7 @@ fn corrected_robot_failures_are_one_error_envelope_and_success_still_teaches() {
             .command(subcommand)
             .arg(format!("source_path={}", fixture.path.display()))
             .args(["line_number=8", "conversation_id=999999", "context=0"])
+            .arg(format!("message_anchor={}", fixture.anchor(8)))
             .output()
             .unwrap();
         assert!(!human.status.success());
@@ -1590,6 +1682,7 @@ fn pack_candidate(
     PackCandidate::from_search_hit(
         &SearchHit {
             title: "pack identity".into(),
+            message_anchor: None,
             snippet: "pack evidence".into(),
             content: format!("distinct pack evidence {hash}"),
             content_hash: hash,
@@ -1754,6 +1847,14 @@ fn pack_renderer_coordinates_are_self_describing_without_bypassing_privacy() {
     );
     candidate.origin_kind = "ssh".into();
     candidate.origin_host = Some("alice.internal".into());
+    candidate.message_anchor = coding_agent_search::search::query::message_anchor_for_content(
+        &candidate.source_id,
+        &candidate.source_path,
+        candidate.conversation_id,
+        candidate.message_index,
+        &candidate.excerpt,
+    );
+    let anchor = candidate.message_anchor.clone().unwrap();
     let plan = plan_answer_pack(PackPlanRequest {
         candidates: vec![candidate],
         ..Default::default()
@@ -1774,6 +1875,8 @@ fn pack_renderer_coordinates_are_self_describing_without_bypassing_privacy() {
         assert!(!output.contains("/home/alice"));
         if format == PackRenderFormat::Markdown {
             assert!(output.contains("conversation_id=42 message_index=8 (1-based)"));
+            assert!(output.contains(&format!("message_anchor={anchor}")));
+            assert!(output.contains("followup_unavailable_reason=redacted-source-coordinates"));
         } else if format == PackRenderFormat::Jsonl {
             let lines: Vec<Value> = output
                 .lines()
@@ -1786,12 +1889,22 @@ fn pack_renderer_coordinates_are_self_describing_without_bypassing_privacy() {
                 .unwrap()["evidence"]["citation"];
             assert_eq!(citation["message_index_base"], 1);
             assert_eq!(citation["message_index"], 8);
+            assert_eq!(citation["message_anchor"], anchor);
+            assert_eq!(
+                citation["followup_unavailable_reason"],
+                "redacted-source-coordinates"
+            );
         } else {
             let payload: Value = serde_json::from_str(&output).unwrap();
             assert_eq!(payload["schema_version"], "cass.pack.v2");
             let citation = &payload["evidence"][0]["citation"];
             assert_eq!(citation["message_index_base"], 1);
             assert_eq!(citation["message_index"], 8);
+            assert_eq!(citation["message_anchor"], anchor);
+            assert_eq!(
+                citation["followup_unavailable_reason"],
+                "redacted-source-coordinates"
+            );
             assert_eq!(citation["conversation_id"], 42);
             assert!(citation["line_start"].is_null());
         }
@@ -1933,6 +2046,8 @@ fn actual_pack_citations_round_trip_unchanged_with_shared_paths_and_missing_sour
                         .arg(cid.to_string())
                         .arg("--message-index")
                         .arg(citation["message_index"].as_u64().unwrap().to_string())
+                        .arg("--message-anchor")
+                        .arg(citation["message_anchor"].as_str().unwrap())
                         .args(["-C", "0", "--json"])
                         .output()
                         .unwrap(),
@@ -1978,4 +2093,929 @@ fn actual_pack_citations_round_trip_unchanged_with_shared_paths_and_missing_sour
     assert_eq!(std::fs::read(&fixture.db).unwrap(), before);
     assert_eq!(std::fs::read(&retained_source).unwrap(), source);
     assert!(!fixture.path.exists());
+}
+
+/// Synthetic native connector acceptance, not the reporter's private archive.
+/// Expected rows come from the canonical archive; every outward identity field
+/// is checked in addition to content and the immutable anchor.
+mod native_anchor_journey {
+    use super::*;
+    use coding_agent_search::search::query::message_anchor_for_content;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    const QUERY: &str = "GH493NATIVE";
+    const DUPLICATE: &str = "GH493NATIVE same text at several positions and sessions";
+
+    #[derive(Clone, Debug)]
+    struct Expected {
+        message_id: i64,
+        conversation_id: i64,
+        index: usize,
+        source: String,
+        path: String,
+        agent: String,
+        role: String,
+        content: String,
+    }
+
+    impl Expected {
+        fn anchor(&self) -> String {
+            message_anchor_for_content(
+                &self.source,
+                &self.path,
+                Some(self.conversation_id),
+                Some(self.index),
+                &self.content,
+            )
+            .unwrap()
+        }
+
+        fn assert_followup(&self, payload: &Value, command: &str) {
+            let rows = if command == "view" {
+                &payload["lines"]
+            } else {
+                payload
+            };
+            let rows = rows.as_array().unwrap();
+            assert_eq!(rows.len(), 1);
+            let target = &rows[0];
+            assert_eq!(target["message_id"], self.message_id);
+            assert_eq!(target["conversation_id"], self.conversation_id);
+            assert_eq!(target["source_id"], self.source);
+            assert_eq!(target["message_index"], self.index);
+            assert_eq!(target["line"], self.index);
+            assert_eq!(target["message_anchor"], self.anchor());
+            assert_eq!(target["content"], self.content);
+            assert_eq!(target["role"], self.role);
+            assert_eq!(target["is_target"], true);
+            assert_eq!(target["highlighted"], true);
+            assert_eq!(target["content_source"], "archive");
+            assert_eq!(target["coordinate_space"], "message_index");
+            if command == "view" {
+                assert_eq!(payload["path"], self.path);
+                assert_eq!(payload["source_id"], self.source);
+                assert_eq!(payload["conversation_id"], self.conversation_id);
+                assert_eq!(payload["target_message_index"], self.index);
+                assert_eq!(payload["target_line"], self.index);
+            }
+        }
+    }
+
+    struct Corpus {
+        root: TempDir,
+        data: PathBuf,
+        db: PathBuf,
+        codex: PathBuf,
+        claude: PathBuf,
+        source: PathBuf,
+        binary: PathBuf,
+        binary_sha256: String,
+    }
+
+    fn output(command: Command) -> Output {
+        assert_cmd::Command::from_std(command)
+            .timeout(Duration::from_secs(90))
+            .output()
+            .unwrap()
+    }
+
+    fn binary_sha256(path: &Path) -> String {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path).expect("selected candidate must exist");
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        hex::encode(digest.finalize())
+    }
+
+    impl Corpus {
+        fn new() -> Self {
+            // Release qualification supplies both the exact candidate and its
+            // attested SHA. An invalid supplied override never falls back.
+            let override_path = match dotenvy::var("CASS_TEST_CANDIDATE_BIN") {
+                Ok(value) => Some(value),
+                Err(dotenvy::Error::EnvVar(std::env::VarError::NotPresent)) => None,
+                Err(error) => panic!("invalid candidate override: {error}"),
+            };
+            let binary = PathBuf::from(
+                override_path
+                    .as_deref()
+                    .unwrap_or(env!("CARGO_BIN_EXE_cass")),
+            );
+            let binary_sha256 = binary_sha256(&binary);
+            if override_path.is_some() {
+                let expected = dotenvy::var("CASS_TEST_CANDIDATE_SHA256")
+                    .expect("candidate override requires its attested SHA256");
+                assert_eq!(binary_sha256, expected, "selected candidate hash mismatch");
+            }
+            eprintln!(
+                "GH493_BINARY SHA256={binary_sha256} OVERRIDE={}",
+                override_path.is_some()
+            );
+            let root = tempfile::tempdir().unwrap();
+            // RCH can place tempdirs inside an ignored checkout subtree.
+            // This boundary keeps the native corpus independent of that policy.
+            std::fs::create_dir(root.path().join(".git")).unwrap();
+            let data = root.path().join("data");
+            let codex = root.path().join("codex");
+            let claude = root.path().join("claude");
+            let sessions = codex.join("sessions/2024/11/20");
+            let projects = claude.join("projects/gh493-native");
+            std::fs::create_dir_all(&sessions).unwrap();
+            std::fs::create_dir_all(&projects).unwrap();
+            std::fs::create_dir_all(&data).unwrap();
+            let source = sessions.join("rollout-gh493-native.jsonl");
+            // This value is deliberately synthetic and must be redacted by ingestion.
+            let credential_assignment = format!("password={}", "gh493_synthetic_fixture_value");
+            let records = [
+                json!({"timestamp":"2024-11-20T00:00:00Z","type":"session_meta","payload":{"id":"gh493-native-codex","cwd":"/gh493-work","cli_version":"0.42.0"}}),
+                json!({"timestamp":"2024-11-20T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":DUPLICATE}]}}),
+                json!({"timestamp":"2024-11-20T00:00:02Z","type":"event_msg","payload":{"type":"token_count","input_tokens":17}}),
+                json!({"timestamp":"2024-11-20T00:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"synthetic-tool","output":"GH493NATIVE tool-only result"}}),
+                json!({"timestamp":"2024-11-20T00:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"GH493NATIVE multi block naïve café 日本語"},{"type":"output_text","text":"second block 😀"}]}}),
+                json!({"timestamp":"2024-11-20T00:00:05Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":DUPLICATE}]}}),
+                json!({"timestamp":"2024-11-20T00:00:06Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":format!("GH493NATIVE redacted {credential_assignment}")}]}}),
+                json!({"timestamp":"2024-11-20T00:00:07Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":format!("GH493NATIVE long {}", "complete text 日本語 ".repeat(80))}]}}),
+            ];
+            let mut bytes = String::new();
+            for record in records {
+                bytes.push_str(&record.to_string());
+                bytes.push('\n');
+            }
+            std::fs::write(&source, bytes).unwrap();
+            let claude_records = [
+                json!({"type":"user","cwd":"/gh493-work","sessionId":"gh493-native-claude","timestamp":"2024-11-20T00:00:01Z","message":{"role":"user","content":DUPLICATE}}),
+                json!({"type":"summary","summary":"Skipped metadata has no canonical ordinal"}),
+                json!({"type":"assistant","timestamp":"2024-11-20T00:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"GH493NATIVE Claude Unicode Ελληνικά"}]}}),
+            ];
+            let mut bytes = String::new();
+            for record in claude_records {
+                bytes.push_str(&record.to_string());
+                bytes.push('\n');
+            }
+            std::fs::write(projects.join("session.jsonl"), bytes).unwrap();
+            let corpus = Self {
+                root,
+                db: data.join("agent_search.db"),
+                data,
+                codex,
+                claude,
+                source,
+                binary,
+                binary_sha256,
+            };
+            let mut index = corpus.command("index");
+            index
+                .args(["--full", "--semantic", "--embedder", "hash", "--json"])
+                .arg("--data-dir")
+                .arg(&corpus.data);
+            decode(output(index));
+
+            // A remote session deliberately shares the exact local source path.
+            let storage = FrankenStorage::open(&corpus.db).unwrap();
+            let agent = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "codex".into(),
+                    name: "Codex".into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
+            let remote = storage
+                .insert_conversation_tree(
+                    agent,
+                    None,
+                    &Conversation {
+                        id: None,
+                        agent_slug: "codex".into(),
+                        workspace: None,
+                        external_id: Some("gh493-native-remote".into()),
+                        title: Some("GH493NATIVE remote".into()),
+                        source_path: corpus.source.clone(),
+                        started_at: Some(1_733_011_200_000),
+                        ended_at: None,
+                        approx_tokens: None,
+                        metadata_json: json!({}),
+                        messages: vec![Message {
+                            id: None,
+                            idx: 0,
+                            role: MessageRole::Agent,
+                            author: None,
+                            created_at: Some(1_733_011_200_000),
+                            content: "GH493NATIVE remote evidence".into(),
+                            extra_json: json!({}),
+                            snippets: Vec::new(),
+                        }],
+                        source_id: "gh493-remote".into(),
+                        origin_host: Some("gh493-remote".into()),
+                    },
+                )
+                .unwrap();
+            drop(storage);
+            let mut reconcile = corpus.command("index");
+            reconcile
+                .args([
+                    "--reconcile-conversation",
+                    &remote.conversation_id.to_string(),
+                    "--json",
+                ])
+                .arg("--data-dir")
+                .arg(&corpus.data);
+            decode(output(reconcile));
+            let mut index = corpus.command("index");
+            index
+                .args(["--semantic", "--embedder", "hash", "--json"])
+                .arg("--data-dir")
+                .arg(&corpus.data);
+            decode(output(index));
+            corpus
+        }
+
+        fn command(&self, command: &str) -> Command {
+            // ubs:ignore[rust.security.command-executable] -- Test-only Cargo executable or explicit SHA256-checked release candidate; archive and query inputs never select this path.
+            let mut cmd = Command::new(&self.binary);
+            let empty = self.root.path().join("empty");
+            cmd.arg("--db")
+                .arg(&self.db)
+                .arg(command)
+                .current_dir(self.root.path())
+                .env("HOME", self.root.path())
+                .env("CODEX_HOME", &self.codex)
+                .env("CLAUDE_CONFIG_DIR", &self.claude)
+                .env("XDG_CONFIG_HOME", self.root.path().join("config"))
+                .env("XDG_DATA_HOME", self.root.path().join("xdg"))
+                .env("XDG_CACHE_HOME", self.root.path().join("cache"))
+                .env("CASS_OPENWEBUI_DATA_ROOT", &empty)
+                .env("CASS_CLOUDMCP_DATA_ROOT", &empty)
+                .env("PI_SESSIONS_DIR", &empty)
+                .env("PI_CODING_AGENT_DIR", &empty)
+                .env("PI_CODING_AGENT_SESSION_DIR", &empty)
+                .env_remove("PI_CONFIG_DIR")
+                .env_remove("PI_PROFILE")
+                .env("CASS_RAW_MIRROR", "0")
+                .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+                .env_remove("CASS_EXCLUDE_PATHS")
+                .env("CASS_AUTO_REFRESH", "0")
+                .env("CASS_SEMANTIC_EMBEDDER", "hash")
+                .env("CASS_VIEW_BUDGET_MS", "30000")
+                .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+                .env_remove("CASS_OUTPUT_FORMAT")
+                .env_remove("TOON_DEFAULT_FORMAT")
+                .env_remove("CASS_TEST_VIEW_SLOW_MS");
+            cmd
+        }
+
+        fn expected(&self) -> Vec<Expected> {
+            let storage =
+                open_with_flags(self.db.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .unwrap();
+            storage.query_map_collect(
+                "SELECT m.id, c.id, m.idx, c.source_id, c.source_path, a.slug, m.role, m.content
+                 FROM messages m JOIN conversations c ON c.id = m.conversation_id
+                 JOIN agents a ON a.id = c.agent_id ORDER BY c.id, m.idx",
+                &[], |row| {
+                    let role = row.get_typed::<String>(6)?;
+                    Ok(Expected { message_id: row.get_typed(0)?, conversation_id: row.get_typed(1)?,
+                        index: usize::try_from(row.get_typed::<i64>(2)?).unwrap() + 1,
+                        source: row.get_typed(3)?, path: row.get_typed(4)?, agent: row.get_typed(5)?,
+                        role: if role == "agent" { "assistant".into() } else { role }, content: row.get_typed(7)? })
+                }).unwrap()
+        }
+
+        fn search(&self, mode: &str, extra: &[&str]) -> Value {
+            let mut command = self.command("search");
+            command
+                .args([
+                    QUERY,
+                    "--mode",
+                    mode,
+                    "--model",
+                    "hash",
+                    "--json",
+                    "--robot-meta",
+                    "--no-maintenance",
+                    "--limit",
+                    "30",
+                    "--timeout",
+                    "60000",
+                ])
+                .args(extra)
+                .arg("--data-dir")
+                .arg(&self.data);
+            decode(output(command))
+        }
+
+        fn follow(&self, command: &str, expected: &Expected, anchor: &str) -> Output {
+            let mut cmd = self.command(command);
+            cmd.arg(&expected.path).args([
+                "--source",
+                &expected.source,
+                "--conversation-id",
+                &expected.conversation_id.to_string(),
+                "--message-index",
+                &expected.index.to_string(),
+                "--message-anchor",
+                anchor,
+                "-C",
+                "0",
+                "--json",
+            ]);
+            output(cmd)
+        }
+
+        fn pack(&self, mode: &str, max_excerpt: &str) -> Value {
+            let mut command = self.command("pack");
+            command
+                .args([
+                    QUERY,
+                    "--mode",
+                    mode,
+                    "--json",
+                    "--freshness-policy",
+                    "allow-stale",
+                    "--max-tokens",
+                    "24000",
+                    "--max-sessions",
+                    "8",
+                    "--max-evidence",
+                    "20",
+                    "--max-excerpt-chars",
+                    max_excerpt,
+                    "--require-evidence",
+                    "--timeout",
+                    "60000",
+                ])
+                .arg("--data-dir")
+                .arg(&self.data);
+            decode(output(command))
+        }
+    }
+
+    #[test]
+    fn native_pack_requires_the_selected_semantic_producer_and_reports_unfinished_work() {
+        let corpus = Corpus::new();
+        let original = corpus.expected();
+        // Hash vectors exist, but cannot stand in for the explicitly selected
+        // native producer, whose model and vectors were never installed here.
+        let mut semantic = corpus.command("pack");
+        semantic
+            .env("CASS_SEMANTIC_EMBEDDER", "minilm")
+            .args([
+                QUERY,
+                "--mode",
+                "semantic",
+                "--json",
+                "--timeout",
+                "60000",
+                "--data-dir",
+            ])
+            .arg(&corpus.data);
+        let refused = output(semantic);
+        assert_eq!(refused.status.code(), Some(15));
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        let error: Value = serde_json::from_str(
+            stderr
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(error["error"]["kind"], "semantic-unavailable");
+
+        let mut hybrid = corpus.command("pack");
+        hybrid
+            .env("CASS_SEMANTIC_EMBEDDER", "minilm")
+            .args([
+                QUERY,
+                "--mode",
+                "hybrid",
+                "--json",
+                "--freshness-policy",
+                "allow-stale",
+                "--timeout",
+                "60000",
+                "--data-dir",
+            ])
+            .arg(&corpus.data);
+        let fallback = decode(output(hybrid));
+        assert_eq!(fallback["realized"]["search_mode"], "lexical");
+        assert_eq!(fallback["realized"]["fallback_mode"], "lexical");
+        assert_eq!(fallback["realized"]["semantic_joined"], false);
+        assert!(
+            fallback["evidence"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty())
+        );
+        assert!(
+            fallback["realized"]["fallback_reason"]
+                .as_str()
+                .is_some_and(|reason| {
+                    reason.starts_with("semantic_") && reason != "semantic_not_applied"
+                })
+        );
+
+        let mut delayed = corpus.command("pack");
+        delayed
+            .env("CASS_TEST_SEARCH_SEMANTIC_SETUP_SLOW_MS", "60000")
+            .args([
+                QUERY,
+                "--mode",
+                "semantic",
+                "--json",
+                "--timeout",
+                "1000",
+                "--data-dir",
+            ])
+            .arg(&corpus.data);
+        let started = std::time::Instant::now();
+        let partial = decode(output(delayed));
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert_eq!(partial["budget"]["timed_out"], true);
+        assert_eq!(partial["realized"]["semantic_joined"], false);
+        assert!(partial["evidence"].as_array().is_some_and(Vec::is_empty));
+
+        let after = corpus.expected();
+        assert_eq!(after.len(), original.len());
+        for (before, after) in original.iter().zip(&after) {
+            assert_eq!(before.message_id, after.message_id);
+            assert_eq!(before.conversation_id, after.conversation_id);
+            assert_eq!(before.source, after.source);
+            assert_eq!(before.index, after.index);
+            assert_eq!(before.content, after.content);
+        }
+        eprintln!(
+            "GH493_PACK_NEGATIVES EXPLICIT_NATIVE_REFUSAL=15 HYBRID_FALLBACK=lexical TIMEOUT_SEMANTIC_JOINED=false ARCHIVE_MESSAGES={}",
+            after.len()
+        );
+    }
+
+    #[test]
+    fn native_index_search_followups_and_packs_preserve_complete_content_anchors() {
+        let started = std::time::Instant::now();
+        let corpus = Corpus::new();
+        let expected = corpus.expected();
+        let conversations = expected
+            .iter()
+            .map(|row| row.conversation_id)
+            .collect::<HashSet<_>>()
+            .len();
+        eprintln!(
+            "GH493_CORPUS KIND=synthetic_native PLATFORM={}/{} CONVERSATIONS={conversations} MESSAGES={} CODEX_SHA256={} CLAUDE_SHA256={}",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            expected.len(),
+            binary_sha256(&corpus.source),
+            binary_sha256(&corpus.claude.join("projects/gh493-native/session.jsonl"))
+        );
+        assert!(expected.iter().any(|row| row.agent == "claude_code"));
+        assert!(expected.iter().any(|row| row.agent == "codex"));
+        assert!(expected.iter().any(|row| row.role == "tool"));
+        assert!(
+            expected
+                .iter()
+                .any(|row| row.content.contains("naïve café 日本語")
+                    && row.content.contains("second block 😀"))
+        );
+        assert!(
+            expected
+                .iter()
+                .any(|row| row.content == "GH493NATIVE redacted [REDACTED]")
+        );
+        let duplicates: HashSet<_> = expected
+            .iter()
+            .filter(|row| row.content == DUPLICATE)
+            .map(|row| (row.conversation_id, row.index))
+            .collect();
+        assert_eq!(
+            duplicates.len(),
+            3,
+            "same text must survive in two native sessions"
+        );
+        let local = expected
+            .iter()
+            .find(|row| row.path == corpus.source.to_string_lossy() && row.source == "local")
+            .unwrap();
+        let remote = expected
+            .iter()
+            .find(|row| row.source == "gh493-remote")
+            .unwrap();
+        assert_eq!(local.path, remote.path);
+        assert_ne!(local.conversation_id, remote.conversation_id);
+        assert_ne!(local.anchor(), remote.anchor());
+
+        for mode in ["lexical", "semantic", "hybrid"] {
+            let payload = corpus.search(mode, &["--fields", "source_path,source_id,conversation_id,line_number,agent,content,message_anchor"]);
+            assert_eq!(payload["_meta"]["search_mode"], mode);
+            if mode == "hybrid" {
+                assert_eq!(payload["_meta"]["semantic_refinement"], true);
+            }
+            let hits = payload["hits"].as_array().unwrap();
+            assert!(
+                !hits.is_empty(),
+                "{mode} must execute a real retrieval tier"
+            );
+            eprintln!(
+                "GH493_SEARCH MODE={mode} HITS={} GENERATION={} ELAPSED_MS={}",
+                hits.len(),
+                payload["_meta"]["query_plan"]["index_generation"]["lexical_shard_generation"],
+                started.elapsed().as_millis()
+            );
+            let mut found = HashSet::new();
+            for hit in hits {
+                let row = expected
+                    .iter()
+                    .find(|row| {
+                        hit["conversation_id"] == row.conversation_id
+                            && hit["line_number"] == row.index
+                    })
+                    .unwrap();
+                assert_eq!(hit["source_id"], row.source);
+                assert_eq!(hit["source_path"], row.path);
+                assert_eq!(hit["agent"], row.agent);
+                assert_eq!(hit["content"], row.content);
+                assert_eq!(hit["message_anchor"], row.anchor());
+                assert!(found.insert((row.conversation_id, row.index)));
+                for command in ["view", "expand"] {
+                    row.assert_followup(
+                        &decode(corpus.follow(command, row, &row.anchor())),
+                        command,
+                    );
+                }
+            }
+            if mode == "lexical" {
+                let query_rows: HashSet<_> = expected
+                    .iter()
+                    .filter(|row| row.content.contains(QUERY))
+                    .map(|row| (row.conversation_id, row.index))
+                    .collect();
+                assert_eq!(
+                    found, query_rows,
+                    "lexical must retrieve every native query row, including tool-only and Unicode multiblock messages"
+                );
+                assert!(duplicates.is_subset(&found));
+            }
+            let packed = corpus.pack(mode, "8000");
+            assert_eq!(packed["realized"]["search_mode"], mode);
+            assert!(packed["realized"]["fallback_mode"].is_null());
+            let evidence = packed["evidence"].as_array().unwrap();
+            assert!(!evidence.is_empty());
+            let packed_identities: HashSet<_> = evidence
+                .iter()
+                .map(|item| {
+                    (
+                        item["citation"]["conversation_id"].as_i64().unwrap(),
+                        item["citation"]["message_index"].as_u64().unwrap() as usize,
+                    )
+                })
+                .collect();
+            if mode == "lexical" {
+                for row in expected.iter().filter(|row| {
+                    row.role == "tool"
+                        || row.content.contains("naïve café 日本語")
+                        || row.content == "GH493NATIVE redacted [REDACTED]"
+                }) {
+                    assert!(
+                        packed_identities.contains(&(row.conversation_id, row.index)),
+                        "native special-case row must reach actual pack hydration"
+                    );
+                }
+            }
+            eprintln!(
+                "GH493_PACK MODE={mode} EVIDENCE={} GENERATION={} ELAPSED_MS={}",
+                evidence.len(),
+                packed["health"]["index_generation"],
+                started.elapsed().as_millis()
+            );
+            for item in evidence {
+                let citation = &item["citation"];
+                let row = expected
+                    .iter()
+                    .find(|row| {
+                        citation["conversation_id"] == row.conversation_id
+                            && citation["message_index"] == row.index
+                    })
+                    .unwrap();
+                assert!(found.contains(&(row.conversation_id, row.index)));
+                assert_eq!(citation["message_index_base"], 1);
+                if citation["followup_unavailable_reason"].is_null() {
+                    assert_eq!(citation["source_id"], row.source);
+                    assert_eq!(citation["source_path"], row.path);
+                } else {
+                    assert_eq!(
+                        citation["followup_unavailable_reason"],
+                        "redacted-source-coordinates"
+                    );
+                    assert!(
+                        citation["source_id"] != row.source || citation["source_path"] != row.path
+                    );
+                    assert!(item["redactions"].is_array());
+                }
+                assert_eq!(citation["agent"], row.agent);
+                assert_eq!(citation["message_anchor"], row.anchor());
+                assert_eq!(item["excerpt"], row.content);
+                assert_eq!(
+                    citation["verified"],
+                    row.source == "local" && row.agent == "codex",
+                    "local Codex header provenance must verify; remote and unsupported formats must remain unverified"
+                );
+                assert_eq!(
+                    citation["excerpt_sha256"],
+                    hex::encode(Sha256::digest(row.content.as_bytes()))
+                );
+                if citation["verified"] == true {
+                    assert_eq!(
+                        row.source, "local",
+                        "remote paths cannot be verified as local bytes"
+                    );
+                    let line = citation["line_start"].as_u64().unwrap() as usize;
+                    assert!(line > 0);
+                    assert_eq!(citation["line_end"], line);
+                    let source = std::fs::read_to_string(&row.path).unwrap();
+                    let session: Value =
+                        serde_json::from_str(source.lines().next().unwrap()).unwrap();
+                    assert_eq!(session["type"], "session_meta");
+                    assert_eq!(session["payload"]["id"], "gh493-native-codex");
+                    let record = source.lines().nth(line - 1).unwrap();
+                    assert_eq!(
+                        citation["span_hash"],
+                        blake3::hash(record.as_bytes()).to_hex().to_string()
+                    );
+                    let raw: Value = serde_json::from_str(record).unwrap();
+                    let raw_role = if raw["payload"]["type"] == "function_call_output" {
+                        "tool"
+                    } else {
+                        raw["payload"]["role"].as_str().unwrap()
+                    };
+                    assert_eq!(raw_role, row.role);
+                    let body = if let Some(blocks) = raw["payload"]["content"].as_array() {
+                        blocks
+                            .iter()
+                            .filter_map(|block| block["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    } else {
+                        let call_id = raw["payload"]["call_id"]
+                            .as_str()
+                            .expect("verified tool output call ID");
+                        let output = raw["payload"]["output"]
+                            .as_str()
+                            .expect("verified tool output");
+                        format!("[Tool output: {call_id}]\n{output}")
+                    };
+                    assert_eq!(
+                        coding_agent_search::indexer::redact_secrets::redact_text(&body).as_ref(),
+                        row.content
+                    );
+                } else {
+                    assert!(citation["line_start"].is_null());
+                    assert!(citation["line_end"].is_null());
+                }
+                for command in ["view", "expand"] {
+                    row.assert_followup(
+                        &decode(corpus.follow(
+                            command,
+                            row,
+                            citation["message_anchor"].as_str().unwrap(),
+                        )),
+                        command,
+                    );
+                }
+            }
+        }
+
+        let long = expected
+            .iter()
+            .find(|row| row.content.starts_with("GH493NATIVE long "))
+            .unwrap();
+        for command in ["view", "expand"] {
+            let output = output({
+                let mut process = corpus.command(command);
+                process.arg(&long.path).args([
+                    "--message-index",
+                    &long.index.to_string(),
+                    "--source",
+                    &long.source,
+                    "--conversation-id",
+                    &long.conversation_id.to_string(),
+                    "--json",
+                ]);
+                process
+            });
+            assert!(
+                !output.status.success(),
+                "unanchored target must be refused"
+            );
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("message-anchor"));
+        }
+        let projected = corpus.search(
+            "lexical",
+            &[
+                "--fields",
+                "conversation_id,line_number,message_anchor,content",
+                "--max-content-length",
+                "16",
+            ],
+        );
+        let hit = projected["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|hit| {
+                hit["conversation_id"] == long.conversation_id && hit["line_number"] == long.index
+            })
+            .unwrap();
+        assert_ne!(hit["content"], long.content);
+        assert_eq!(
+            hit["message_anchor"],
+            long.anchor(),
+            "anchor must precede display truncation"
+        );
+        let shortened = corpus.pack("lexical", "80");
+        let shortened = shortened["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| {
+                item["citation"]["conversation_id"] == long.conversation_id
+                    && item["citation"]["message_index"] == long.index
+            })
+            .expect("long evidence must be retained with a shortened excerpt");
+        assert_eq!(shortened["excerpt_truncated"], true);
+        assert_ne!(shortened["excerpt"], long.content);
+        assert_eq!(shortened["citation"]["message_anchor"], long.anchor());
+        for command in ["view", "expand"] {
+            long.assert_followup(
+                &decode(corpus.follow(command, long, &long.anchor())),
+                command,
+            );
+        }
+
+        let redacted = expected
+            .iter()
+            .find(|row| row.content == "GH493NATIVE redacted [REDACTED]")
+            .unwrap();
+        assert!(
+            !std::fs::read_to_string(&corpus.source)
+                .unwrap()
+                .contains(&redacted.content)
+        );
+        let original_raw = std::fs::read_to_string(&corpus.source).unwrap();
+        for changed_source in [
+            original_raw.replace("gh493-native-codex", "gh493-unrelated-session"),
+            original_raw.replace("\"role\":\"assistant\"", "\"role\":\"user\""),
+        ] {
+            assert_ne!(changed_source, original_raw);
+            std::fs::write(&corpus.source, changed_source).unwrap();
+            let changed_pack = corpus.pack("lexical", "8000");
+            let cited = changed_pack["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| {
+                    item["citation"]["conversation_id"] == redacted.conversation_id
+                        && item["citation"]["message_index"] == redacted.index
+                })
+                .expect("canonical evidence survives a changed raw session or role");
+            assert_eq!(cited["citation"]["verified"], false);
+            assert!(cited["citation"]["line_start"].is_null());
+            assert!(cited["citation"]["line_end"].is_null());
+            assert_eq!(cited["citation"]["message_anchor"], redacted.anchor());
+            assert_eq!(cited["excerpt"], redacted.content);
+        }
+        std::fs::write(&corpus.source, &original_raw).unwrap();
+        std::fs::write(
+            &corpus.source,
+            "{\"role\":\"assistant\",\"content\":\"GH493NATIVE unrelated raw replacement\"}\n",
+        )
+        .unwrap();
+        for command in ["view", "expand"] {
+            redacted.assert_followup(
+                &decode(corpus.follow(command, redacted, &redacted.anchor())),
+                command,
+            );
+        }
+        std::fs::rename(
+            &corpus.source,
+            corpus.source.with_extension("retained-jsonl"),
+        )
+        .unwrap();
+        for command in ["view", "expand"] {
+            redacted.assert_followup(
+                &decode(corpus.follow(command, redacted, &redacted.anchor())),
+                command,
+            );
+            remote.assert_followup(
+                &decode(corpus.follow(command, remote, &remote.anchor())),
+                command,
+            );
+        }
+        let missing_source_pack = corpus.pack("lexical", "8000");
+        for item in missing_source_pack["evidence"].as_array().unwrap() {
+            let citation = &item["citation"];
+            let row = expected
+                .iter()
+                .find(|row| {
+                    citation["conversation_id"] == row.conversation_id
+                        && citation["message_index"] == row.index
+                })
+                .unwrap();
+            if row.path == corpus.source.to_string_lossy().as_ref() {
+                assert_eq!(citation["verified"], false);
+                assert!(citation["line_start"].is_null());
+                assert!(citation["line_end"].is_null());
+                assert_eq!(citation["message_anchor"], row.anchor());
+                assert_eq!(item["excerpt"], row.content);
+                for command in ["view", "expand"] {
+                    row.assert_followup(
+                        &decode(corpus.follow(command, row, &row.anchor())),
+                        command,
+                    );
+                }
+            }
+        }
+
+        let storage = FrankenStorage::open(&corpus.db).unwrap();
+        storage
+            .raw()
+            .execute_compat(
+                "UPDATE messages SET content = ?1 WHERE id = ?2",
+                coding_agent_search::franken_sync::params![
+                    "GH493NATIVE different text at the same ordinal",
+                    redacted.message_id
+                ],
+            )
+            .unwrap();
+        drop(storage);
+        for command in ["view", "expand"] {
+            let failed = corpus.follow(command, redacted, &redacted.anchor());
+            assert!(!failed.status.success());
+            assert!(failed.stdout.is_empty(), "no stale target may escape");
+            let error: Value = serde_json::from_slice(&failed.stderr).unwrap();
+            assert_eq!(error["error"]["kind"], "stale-message-anchor");
+            for invalid in [
+                "",
+                "v1:broken",
+                "v2:0000000000000000000000000000000000000000000000000000000000000000",
+            ] {
+                let failed = corpus.follow(command, redacted, invalid);
+                assert!(!failed.status.success());
+                assert!(failed.stdout.is_empty());
+                let error: Value = serde_json::from_slice(&failed.stderr).unwrap();
+                assert_eq!(error["error"]["kind"], "invalid-message-anchor");
+            }
+            // A valid anchor copied from a different session/source also fails.
+            let failed = corpus.follow(command, local, &remote.anchor());
+            assert!(!failed.status.success());
+            assert!(failed.stdout.is_empty());
+        }
+        assert_eq!(
+            binary_sha256(&corpus.binary),
+            corpus.binary_sha256,
+            "executed candidate changed during acceptance"
+        );
+        eprintln!(
+            "GH493_NEGATIVES REWRITE=passed MISSING_SOURCE=passed STALE_ANCHOR=passed MALFORMED_ANCHOR=passed SOURCE_COLLISION=passed ELAPSED_MS={}",
+            started.elapsed().as_millis()
+        );
+        eprintln!("GH493_BINARY_AFTER SHA256={}", corpus.binary_sha256);
+    }
+
+    #[test]
+    fn anchor_frames_every_identity_component_and_exact_unicode_bytes() {
+        let anchor = |source, path, conversation, index, content| {
+            message_anchor_for_content(source, path, conversation, index, content)
+        };
+        let baseline = anchor("local", "/session", Some(1), Some(2), "café\n日本語").unwrap();
+        let alternatives = [
+            anchor("remote", "/session", Some(1), Some(2), "café\n日本語"),
+            anchor("local", "/other", Some(1), Some(2), "café\n日本語"),
+            anchor("local", "/session", Some(2), Some(2), "café\n日本語"),
+            anchor("local", "/session", Some(1), Some(3), "café\n日本語"),
+            anchor("local", "/session", Some(1), Some(2), "café 日本語"),
+        ];
+        assert!(
+            alternatives
+                .into_iter()
+                .all(|value| value.unwrap() != baseline)
+        );
+        assert_ne!(
+            anchor("a\nb", "c", Some(1), Some(2), "body"),
+            anchor("a", "b\nc", Some(1), Some(2), "body")
+        );
+        assert!(anchor("local", "/session", None, Some(2), "body").is_none());
+        assert!(anchor("local", "/session", Some(1), None, "body").is_none());
+        assert!(anchor("local", "/session", Some(0), Some(2), "body").is_none());
+        assert!(anchor("local", "/session", Some(1), Some(0), "body").is_none());
+    }
 }

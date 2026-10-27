@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -137,7 +137,7 @@ pub struct RawMirrorInventoryBudget {
 
 impl RawMirrorInventoryBudget {
     /// A budget that never truncates, for callers that require an exact
-    /// figure (the indexer's own accounting, the prune planner).
+    /// figure (the indexer's own accounting).
     pub const fn unbounded() -> Self {
         Self {
             max_entries: usize::MAX,
@@ -400,15 +400,40 @@ pub struct RawMirrorPruneReport {
     pub applied_blob_count: u64,
     pub applied_staging_count: u64,
     pub applied_reclaim_bytes: u64,
+    /// Retained evidence is never included in reclaimable candidate bytes.
+    pub audit_log_bytes_before: u64,
+    pub audit_log_bytes_after: u64,
     pub audit_log_path: Option<String>,
+    pub recovered_action_count: u64,
+    pub recovered_reclaim_bytes: u64,
+    /// An unlocked preview is an observation; apply always plans again under a lock.
+    pub inventory_consistency: String,
     /// Preview details omitted from `entries`; aggregate counts still cover the full plan.
     pub omitted_entry_count: u64,
     pub entries: Vec<RawMirrorPruneEntry>,
 }
 
 const PRUNE_PREVIEW_ENTRY_LIMIT: usize = 1_000;
+const PRUNE_INVENTORY_ENTRY_LIMIT: usize = 100_000;
+const PRUNE_MANIFEST_INVENTORY_MAX_BYTES: u64 = 128 * 1024 * 1024;
+const PRUNE_AUDIT_RECORD_MAX_BYTES: u64 = 64 * 1024;
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy)]
+struct RawMirrorPruneLimits {
+    max_entries: usize,
+    max_manifest_bytes: u64,
+}
+
+impl Default for RawMirrorPruneLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: PRUNE_INVENTORY_ENTRY_LIMIT,
+            max_manifest_bytes: PRUNE_MANIFEST_INVENTORY_MAX_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RawMirrorPruneEntry {
     pub kind: String,
     pub path: String,
@@ -418,6 +443,54 @@ pub struct RawMirrorPruneEntry {
     pub size_bytes: u64,
     pub reason: String,
     pub applied: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawMirrorPruneAction {
+    id: String,
+    nonce: String,
+    source_identity: Option<String>,
+    staging_entries: Vec<RawMirrorPruneStagingEntry>,
+    entry: RawMirrorPruneEntry,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RawMirrorPruneStagingEntry {
+    path: String,
+    directory: bool,
+    identity: Option<String>,
+    size_bytes: u64,
+    blake3: Option<String>,
+}
+
+impl RawMirrorPruneAction {
+    fn expected_id(&self) -> String {
+        canonical_blake3(
+            "raw-mirror-prune-action-v1",
+            json!({
+                "nonce": self.nonce,
+                "source_identity": self.source_identity,
+                "staging_entries": self.staging_entries,
+                "entry": self.entry,
+            }),
+        )
+    }
+
+    fn descriptor_path(&self, root: &Path) -> PathBuf {
+        root.join("prune-actions").join(format!("{}.json", self.id))
+    }
+
+    fn payload_path(&self, root: &Path) -> PathBuf {
+        root.join("prune-actions")
+            .join(format!("{}.payload", self.id))
+    }
+}
+
+#[derive(Default)]
+struct RawMirrorPruneActionState {
+    intended: bool,
+    result: Option<bool>,
+    reclaimed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -446,6 +519,14 @@ struct RawMirrorPhysicalBlob {
 }
 
 pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirrorPruneReport> {
+    prune_with_limits(data_dir, options, RawMirrorPruneLimits::default())
+}
+
+fn prune_with_limits(
+    data_dir: &Path,
+    options: RawMirrorPruneOptions,
+    limits: RawMirrorPruneLimits,
+) -> Result<RawMirrorPruneReport> {
     let providers = options
         .providers
         .iter()
@@ -506,7 +587,12 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         applied_blob_count: 0,
         applied_staging_count: 0,
         applied_reclaim_bytes: 0,
+        audit_log_bytes_before: 0,
+        audit_log_bytes_after: 0,
         audit_log_path: None,
+        recovered_action_count: 0,
+        recovered_reclaim_bytes: 0,
+        inventory_consistency: "uninitialized".to_string(),
         omitted_entry_count: 0,
         entries: Vec::new(),
     };
@@ -525,20 +611,50 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         );
     }
     report.initialized = true;
-    // Both modes need one stable manifest/blob view. Applied prunes also
-    // serialize their durable audit writes under this lock.
-    let _mutation_lock = acquire_raw_mirror_mutation_lock(&root)?;
+    // Previews never create/chmod a lock. An existing lock excludes capture
+    // mutations through a shared, read-only handle. A restored/manual mirror
+    // without that lock can still be observed, but cannot promise a stable
+    // snapshot. Apply always plans afresh under an exclusive mutation lock.
+    let mutation_lock = if options.apply {
+        Some(acquire_raw_mirror_mutation_lock(&root)?)
+    } else {
+        acquire_raw_mirror_preview_lock(&root)?
+    };
+    report.inventory_consistency = if mutation_lock.is_some() {
+        "mutation-lock"
+    } else {
+        "unlocked-observation"
+    }
+    .to_string();
+    report.audit_log_bytes_before = prune_audit_log_bytes(&root)?;
+    report.audit_log_bytes_after = report.audit_log_bytes_before;
     let _index_run_lock = options
         .apply
         .then(|| try_acquire_index_run_lock_for_prune(data_dir))
         .transpose()?;
+    if options.apply {
+        let (count, bytes) = reconcile_prune_actions(&root)?;
+        report.recovered_action_count = count;
+        report.recovered_reclaim_bytes = bytes;
+        if count > 0 {
+            report.audit_log_path = Some(root.join("pruned.jsonl").display().to_string());
+        }
+    }
 
-    let manifests = collect_prune_manifests(&root)?;
+    let manifests = collect_prune_manifests(&root, limits)?;
     report.manifest_count = manifests.len() as u64;
-    let (physical_blobs, physical_blobs_complete) =
-        collect_raw_mirror_physical_blobs(&root, &RawMirrorInventoryBudget::unbounded())?;
+    let (physical_blobs, physical_blobs_complete) = collect_raw_mirror_physical_blobs(
+        &root,
+        &RawMirrorInventoryBudget {
+            max_entries: limits.max_entries,
+            deadline: None,
+        },
+    )?;
     if !physical_blobs_complete {
-        anyhow::bail!("refusing to prune: the raw mirror blob inventory was truncated");
+        anyhow::bail!(
+            "refusing to prune: raw mirror blob inventory exceeds the {} entry budget; no partial plan is applied",
+            limits.max_entries
+        );
     }
     let physical_blob_by_relative = physical_blobs
         .iter()
@@ -892,7 +1008,7 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
     // unscoped prune reclaims it.
     if !scoped {
         let staging_cutoff_ms = now.saturating_sub(ABANDONED_STAGING_MIN_AGE_MS);
-        for staging in collect_capture_staging_dirs(&root)? {
+        for staging in collect_capture_staging_dirs(&root, limits.max_entries)? {
             if staging.contains_symlink || staging.newest_modified_ms > staging_cutoff_ms {
                 continue;
             }
@@ -978,6 +1094,7 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
     // A preview returns its plan to the caller without writing one audit row
     // per candidate. Only applied operations need durable intent/result records;
     // repeated previews must not grow the archive they are meant to inspect.
+    report.audit_log_bytes_after = prune_audit_log_bytes(&root)?;
     Ok(report)
 }
 
@@ -987,11 +1104,36 @@ fn apply_prune_entries(
     audit_path: &Path,
     audit_file: &mut File,
 ) -> Result<()> {
-    append_prune_audit_records(audit_file, audit_path, &report.entries, "intent")?;
-    for entry in &mut report.entries {
-        let path = root.join(&entry.path);
-        let removed = remove_prune_entry_file(root, entry)
-            .with_context(|| format!("applying raw mirror prune for {}", path.display()))?;
+    let mut actions = Vec::new();
+    let mut descriptor_bytes = 0_u64;
+    for entry in &report.entries {
+        let action = new_prune_action(root, entry)?;
+        descriptor_bytes =
+            descriptor_bytes.saturating_add(serde_json::to_vec(&action)?.len() as u64);
+        if descriptor_bytes > PRUNE_MANIFEST_INVENTORY_MAX_BYTES {
+            anyhow::bail!("prune action descriptors exceed their cumulative byte budget");
+        }
+        actions.push(action);
+    }
+    for action in &actions {
+        append_prune_audit_action(audit_file, audit_path, action, "intent", false)?;
+    }
+    #[cfg(test)]
+    prune_test_pause("intents-synced");
+    for action in &actions {
+        persist_prune_action(root, action)?;
+    }
+    for (entry, action) in report.entries.iter_mut().zip(&actions) {
+        let removed = finish_prune_action(
+            root,
+            action,
+            &RawMirrorPruneActionState {
+                intended: true,
+                ..Default::default()
+            },
+            audit_file,
+            audit_path,
+        )?;
         entry.applied = removed;
         if removed {
             if entry.kind == "manifest" {
@@ -1005,19 +1147,660 @@ fn apply_prune_entries(
                 .applied_reclaim_bytes
                 .saturating_add(entry.size_bytes);
         }
-        // Persist the completed prefix before advancing. A later validation or
-        // removal error must not erase evidence of earlier successful removals.
-        append_prune_audit_records(
-            audit_file,
-            audit_path,
-            std::slice::from_ref(entry),
-            "result",
-        )?;
     }
     Ok(())
 }
 
-fn collect_prune_manifests(root: &Path) -> Result<Vec<RawMirrorPruneManifest>> {
+fn prune_target_path(root: &Path, entry: &RawMirrorPruneEntry) -> Result<PathBuf> {
+    let relative = Path::new(&entry.path);
+    let expected = match entry.kind.as_str() {
+        "blob" => entry
+            .blob_blake3
+            .as_deref()
+            .and_then(raw_mirror_blob_relative_path)
+            .context("prune action descriptor names a non-canonical target")?,
+        "manifest" => {
+            let id = relative
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .context("prune action manifest target name")?;
+            if !id
+                .strip_prefix("doctor-raw-mirror-manifest-id-v1-")
+                .is_some_and(|digest| {
+                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            {
+                anyhow::bail!("prune action descriptor names a non-canonical target");
+            }
+            format!("manifests/{id}.json")
+        }
+        "staging" => {
+            let name = relative
+                .file_name()
+                .and_then(|value| value.to_str())
+                .context("prune action staging target name")?;
+            if !is_capture_staging_name(name) {
+                anyhow::bail!("prune action descriptor names a non-canonical target");
+            }
+            format!("tmp/{name}")
+        }
+        _ => anyhow::bail!("prune action descriptor names a non-canonical target"),
+    };
+    if entry.path != expected {
+        anyhow::bail!("prune action descriptor names a non-canonical target");
+    }
+    Ok(root.join(expected))
+}
+
+fn new_prune_action(root: &Path, entry: &RawMirrorPruneEntry) -> Result<RawMirrorPruneAction> {
+    use ring::rand::SecureRandom as _;
+
+    let source = prune_target_path(root, entry)?;
+    let metadata = fs::symlink_metadata(&source)?;
+    let mut nonce = [0_u8; 32];
+    ring::rand::SystemRandom::new()
+        .fill(&mut nonce)
+        .map_err(|_| anyhow!("generate raw mirror prune action nonce"))?;
+    let mut action = RawMirrorPruneAction {
+        id: String::new(),
+        nonce: blake3::hash(&nonce).to_hex().to_string(),
+        source_identity: source_identity_token(&metadata),
+        staging_entries: if entry.kind == "staging" {
+            collect_prune_staging_entries(&source)?
+        } else {
+            Vec::new()
+        },
+        entry: entry.clone(),
+    };
+    action.entry.applied = false;
+    action.id = action.expected_id();
+    Ok(action)
+}
+
+fn persist_prune_action(root: &Path, action: &RawMirrorPruneAction) -> Result<()> {
+    let directory = root.join("prune-actions");
+    ensure_private_dir_descendant(root, &directory)?;
+    sync_parent_unconditionally(&directory)?;
+    let bytes = serde_json::to_vec(action)?;
+    if bytes.len() as u64 > PRUNE_AUDIT_RECORD_MAX_BYTES {
+        anyhow::bail!("raw mirror prune action exceeds its descriptor budget");
+    }
+    let path = action.descriptor_path(root);
+    let mut file = private_create_new_file(&path)?;
+    file.write_all(&bytes)?;
+    #[cfg(test)]
+    prune_test_pause("descriptor-written");
+    file.sync_all()?;
+    sync_parent_unconditionally(&path)?;
+    #[cfg(test)]
+    prune_test_pause("descriptor-synced");
+    Ok(())
+}
+
+fn finish_prune_action(
+    root: &Path,
+    action: &RawMirrorPruneAction,
+    state: &RawMirrorPruneActionState,
+    audit: &mut File,
+    audit_path: &Path,
+) -> Result<bool> {
+    if !state.intended {
+        anyhow::bail!("prune action {} has no durable approved intent", action.id);
+    }
+    let payload = action.payload_path(root);
+    let payload_exists = match fs::symlink_metadata(&payload) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if state.reclaimed && (payload_exists || state.result != Some(true)) {
+        anyhow::bail!(
+            "prune action {} has conflicting reclaimed evidence",
+            action.id
+        );
+    }
+    if state.result == Some(false) {
+        if payload_exists {
+            anyhow::bail!("unapplied prune action {} has a payload", action.id);
+        }
+        remove_prune_action_descriptor(root, action)?;
+        return Ok(false);
+    }
+    if payload_exists {
+        ensure_prune_source_retired(root, action)?;
+        validate_prune_payload(root, action, state.result == Some(true))?;
+    } else if state.result.is_none() {
+        let source = root.join(&action.entry.path);
+        let metadata = fs::symlink_metadata(&source).with_context(|| {
+            format!(
+                "prune action {} has neither a confirmed result nor a recoverable target",
+                action.id
+            )
+        })?;
+        if source_identity_token(&metadata) != action.source_identity {
+            anyhow::bail!("prune action {} source identity changed", action.id);
+        }
+        quarantine_prune_entry(root, action)?;
+        validate_prune_payload(root, action, false)?;
+    }
+    ensure_prune_source_retired(root, action)?;
+    if state.result.is_none() {
+        append_prune_audit_action(audit, audit_path, action, "result", true)?;
+        #[cfg(test)]
+        prune_test_pause("result-synced");
+    }
+    // A durable result confirms the exact canonical target was quarantined.
+    // Only now can its bytes be destroyed; a kill after unlink still has one
+    // durable completed-action result. Reclamation has a separate truth field.
+    let payload_still_exists = match fs::symlink_metadata(&payload) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if payload_still_exists {
+        validate_prune_payload(root, action, true)?;
+        if action.entry.kind == "staging" {
+            purge_prune_staging(action, &payload)?;
+        } else {
+            fs::remove_file(&payload)?;
+        }
+        #[cfg(test)]
+        prune_test_pause("payload-unlinked");
+        sync_parent_unconditionally(&payload)?;
+        #[cfg(test)]
+        prune_test_pause("payload-purged");
+    }
+    if !state.reclaimed {
+        append_prune_audit_action(audit, audit_path, action, "reclaimed", true)?;
+        #[cfg(test)]
+        prune_test_pause("reclaimed-synced");
+    }
+    remove_prune_action_descriptor(root, action)?;
+    Ok(true)
+}
+
+fn ensure_prune_source_retired(root: &Path, action: &RawMirrorPruneAction) -> Result<()> {
+    match fs::symlink_metadata(root.join(&action.entry.path)) {
+        Ok(metadata) if source_identity_token(&metadata) == action.source_identity => {
+            anyhow::bail!(
+                "prune action {} claims a target still at its source",
+                action.id
+            );
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remove_prune_action_descriptor(root: &Path, action: &RawMirrorPruneAction) -> Result<()> {
+    let descriptor = action.descriptor_path(root);
+    fs::remove_file(&descriptor)?;
+    #[cfg(test)]
+    prune_test_pause("descriptor-unlinked");
+    sync_parent_unconditionally(&descriptor)?;
+    #[cfg(test)]
+    prune_test_pause("descriptor-retired");
+    Ok(())
+}
+
+fn validate_prune_payload(
+    root: &Path,
+    action: &RawMirrorPruneAction,
+    allow_missing: bool,
+) -> Result<()> {
+    let payload = action.payload_path(root);
+    if raw_mirror_path_has_symlink_below_root(root, &payload) {
+        anyhow::bail!("prune action {} payload contains a symlink", action.id);
+    }
+    let metadata = fs::symlink_metadata(&payload)?;
+    if source_identity_token(&metadata) != action.source_identity {
+        anyhow::bail!("prune action {} payload identity changed", action.id);
+    }
+    match action.entry.kind.as_str() {
+        "staging" => {
+            let observed = collect_prune_staging_entries(&payload)?;
+            let expected = action
+                .staging_entries
+                .iter()
+                .map(|entry| (entry.path.as_str(), entry))
+                .collect::<HashMap<_, _>>();
+            if !metadata.is_dir()
+                || (!allow_missing && observed.len() != expected.len())
+                || observed
+                    .iter()
+                    .any(|entry| expected.get(entry.path.as_str()).copied() != Some(entry))
+            {
+                anyhow::bail!("prune action {} staging payload changed", action.id);
+            }
+        }
+        "blob" | "manifest" => {
+            if !metadata.is_file() || metadata.len() != action.entry.size_bytes {
+                anyhow::bail!("prune action {} payload type/size changed", action.id);
+            }
+            if action.entry.kind == "blob" {
+                verify_existing_file(
+                    &payload,
+                    action
+                        .entry
+                        .blob_blake3
+                        .as_deref()
+                        .context("prune action blob checksum")?,
+                )?;
+            } else {
+                let manifest = read_raw_mirror_manifest(&payload)?;
+                validate_raw_mirror_manifest_contents(&manifest, &manifest.manifest_id)?;
+                if manifest.manifest_blake3 != action.entry.manifest_blake3 {
+                    anyhow::bail!("prune action {} manifest payload changed", action.id);
+                }
+            }
+        }
+        _ => anyhow::bail!("prune action {} has an unsupported target kind", action.id),
+    }
+    Ok(())
+}
+
+fn collect_prune_staging_entries(path: &Path) -> Result<Vec<RawMirrorPruneStagingEntry>> {
+    let mut paths = Vec::new();
+    for entry in walkdir::WalkDir::new(path).follow_links(false) {
+        if paths.len() >= PRUNE_INVENTORY_ENTRY_LIMIT {
+            anyhow::bail!("prune staging checksum inventory exceeds its entry budget");
+        }
+        let entry = entry?;
+        if entry.file_type().is_symlink() {
+            anyhow::bail!("prune staging contains a symlink");
+        }
+        paths.push(entry.into_path());
+    }
+    paths.sort();
+    let mut entries = Vec::new();
+    let mut encoded_bytes = 0_u64;
+    for current in paths {
+        let relative = current
+            .strip_prefix(path)?
+            .to_str()
+            .context("prune staging path is not UTF-8")?;
+        let metadata = fs::symlink_metadata(&current)?;
+        let digest = if metadata.is_file() {
+            let mut content = blake3::Hasher::new();
+            content.update_reader(File::open(&current)?)?;
+            Some(content.finalize().to_hex().to_string()) // ubs:ignore[rust.perf.string-alloc-in-loop] -- One retained checksum outlives this stack formatter and enters a content-bound durable descriptor capped at 64 KiB.
+        } else if metadata.is_dir() {
+            None
+        } else {
+            anyhow::bail!("prune staging contains a non-file");
+        };
+        let entry = RawMirrorPruneStagingEntry {
+            path: relative.to_string(), // ubs:ignore[rust.perf.string-alloc-in-loop] -- One retained relative path outlives current PathBuf and enters a content-bound durable descriptor capped at 64 KiB.
+            directory: metadata.is_dir(),
+            identity: source_identity_token(&metadata),
+            size_bytes: if metadata.is_file() {
+                metadata.len()
+            } else {
+                0
+            },
+            blake3: digest,
+        };
+        encoded_bytes = encoded_bytes.saturating_add(serde_json::to_vec(&entry)?.len() as u64);
+        if encoded_bytes > PRUNE_AUDIT_RECORD_MAX_BYTES {
+            anyhow::bail!("prune staging entries exceed their descriptor byte budget");
+        }
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+fn purge_prune_staging(action: &RawMirrorPruneAction, payload: &Path) -> Result<()> {
+    // Deepest paths first; remove_dir refuses unapproved extra children.
+    for entry in action.staging_entries.iter().rev() {
+        let path = payload.join(&entry.path);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink()
+            || source_identity_token(&metadata) != entry.identity
+            || metadata.is_dir() != entry.directory
+        {
+            anyhow::bail!("prune staging entry changed during purge");
+        }
+        if entry.directory {
+            fs::remove_dir(&path)?;
+        } else {
+            if metadata.len() != entry.size_bytes {
+                anyhow::bail!("prune staging entry size changed");
+            }
+            verify_existing_file(
+                &path,
+                entry.blake3.as_deref().context("staging file checksum")?,
+            )?;
+            fs::remove_file(&path)?;
+            #[cfg(test)]
+            prune_test_pause("staging-entry-unlinked");
+        }
+        sync_parent_unconditionally(&path)?;
+        #[cfg(test)]
+        if !entry.directory {
+            prune_test_pause("staging-entry-purged");
+        }
+    }
+    Ok(())
+}
+
+fn pending_prune_actions(root: &Path) -> Result<Vec<RawMirrorPruneAction>> {
+    let directory = root.join("prune-actions");
+    let metadata = match fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!("prune action directory is not a regular directory");
+    }
+    let mut actions = Vec::new();
+    let mut bytes = 0_u64;
+    let mut payload_ids = HashSet::new();
+    for (index, entry) in fs::read_dir(&directory)?.enumerate() {
+        if index >= PRUNE_INVENTORY_ENTRY_LIMIT * 6 {
+            anyhow::bail!("pending prune action inventory exceeds its entry budget");
+        }
+        let path = entry?.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("prune journal contains a symlink");
+        }
+        if path.extension().and_then(|value| value.to_str()) == Some("payload") {
+            payload_ids.insert(
+                path.file_stem()
+                    .context("prune payload name")?
+                    .to_os_string(),
+            );
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("json")
+            || !metadata.is_file()
+            || metadata.len() > PRUNE_AUDIT_RECORD_MAX_BYTES
+        {
+            anyhow::bail!("prune journal contains an invalid or oversized descriptor");
+        }
+        let mut file = open_stable_source_file(&path, &metadata)?;
+        let mut encoded = Vec::new();
+        (&mut file)
+            .take(PRUNE_AUDIT_RECORD_MAX_BYTES + 1)
+            .read_to_end(&mut encoded)?;
+        bytes = bytes.saturating_add(encoded.len() as u64);
+        if encoded.len() as u64 > PRUNE_AUDIT_RECORD_MAX_BYTES
+            || bytes > PRUNE_MANIFEST_INVENTORY_MAX_BYTES
+        {
+            anyhow::bail!("pending prune action descriptors exceed their byte budget");
+        }
+        let action: RawMirrorPruneAction = serde_json::from_slice(&encoded)
+            .context("refusing torn or malformed prune action descriptor")?;
+        if action.id != action.expected_id()
+            || path != action.descriptor_path(root)
+            || action.entry.applied
+        {
+            anyhow::bail!("prune action descriptor identity is invalid");
+        }
+        // An intent may name only a canonical mirror payload, never journal,
+        // database, ledger, source, absolute, or parent-traversing paths.
+        prune_target_path(root, &action.entry)?;
+        let mut staging_paths = HashSet::new();
+        for entry in &action.staging_entries {
+            if !Path::new(&entry.path)
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+                || (entry.path.is_empty() && !entry.directory)
+                || !staging_paths.insert(entry.path.as_str())
+            {
+                anyhow::bail!("prune action descriptor has an unsafe staging path");
+            }
+        }
+        if action.entry.kind == "staging" {
+            if !staging_paths.contains("") {
+                anyhow::bail!("prune staging descriptor has no root identity");
+            }
+        } else if !action.staging_entries.is_empty() {
+            anyhow::bail!("non-staging prune descriptor carries staging authority");
+        }
+        drop(staging_paths);
+        actions.push(action);
+    }
+    let mut targets = HashSet::new();
+    for action in &actions {
+        if !targets.insert(action.entry.path.as_str()) {
+            anyhow::bail!("pending prune actions contain duplicate target authority");
+        }
+    }
+    drop(targets);
+    let descriptor_ids = actions
+        .iter()
+        .map(|action| std::ffi::OsStr::new(&action.id))
+        .collect::<HashSet<_>>();
+    for id in payload_ids {
+        if !descriptor_ids.contains(id.as_os_str()) {
+            anyhow::bail!("prune journal has an unauthenticated orphan payload");
+        }
+    }
+    drop(descriptor_ids);
+    let kind_order = |action: &RawMirrorPruneAction| match action.entry.kind.as_str() {
+        "manifest" => 0,
+        "blob" => 1,
+        _ => 2,
+    };
+    actions.sort_by(|left, right| {
+        kind_order(left)
+            .cmp(&kind_order(right))
+            .then_with(|| left.entry.path.cmp(&right.entry.path))
+    });
+    Ok(actions)
+}
+
+fn reconcile_prune_actions(root: &Path) -> Result<(u64, u64)> {
+    let actions = pending_prune_actions(root)?;
+    if actions.is_empty() {
+        return Ok((0, 0));
+    }
+    let (audit_path, mut audit) = open_prune_audit_log(root)?;
+    let wanted = actions
+        .iter()
+        .map(|action| (action.id.as_str(), action))
+        .collect::<HashMap<_, _>>();
+    let mut states = HashMap::<String, RawMirrorPruneActionState>::new();
+    visit_prune_audit_records(&mut audit, &audit_path, |record| {
+        let Some(id) = record.get("action_id").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let Some(action) = wanted.get(id) else {
+            return Ok(());
+        };
+        if record.get("action") != Some(&serde_json::to_value(action)?) {
+            anyhow::bail!("prune action {id} does not match its durable approved intent");
+        }
+        let entry = &action.entry;
+        let phase = record.get("phase").and_then(Value::as_str);
+        let applied = record.get("applied").and_then(Value::as_bool);
+        let reclaim_confirmed = record.get("reclaim_confirmed").and_then(Value::as_bool);
+        if record.get("path").and_then(Value::as_str) != Some(entry.path.as_str())
+            || record.get("kind").and_then(Value::as_str) != Some(entry.kind.as_str())
+            || record.get("size_bytes").and_then(Value::as_u64) != Some(entry.size_bytes)
+            || record.get("blob_blake3") != Some(&json!(entry.blob_blake3))
+            || record.get("manifest_blake3") != Some(&json!(entry.manifest_blake3))
+            || record.get("reason").and_then(Value::as_str) != Some(entry.reason.as_str())
+            || record.get("mode").and_then(Value::as_str) != Some("apply")
+            || reclaim_confirmed != Some(phase == Some("reclaimed"))
+        {
+            anyhow::bail!("prune action {id} has mismatched audit fields");
+        }
+        let state = states.entry(id.to_string()).or_default();
+        match phase {
+            Some("intent")
+                if !state.intended && state.result.is_none() && applied == Some(false) =>
+            {
+                state.intended = true
+            }
+            Some("result") if state.intended && state.result.is_none() => {
+                state.result = Some(applied.context("prune result applied flag")?);
+            }
+            Some("reclaimed")
+                if state.result == Some(true)
+                    && !state.reclaimed
+                    && applied == Some(true)
+                    && reclaim_confirmed == Some(true) =>
+            {
+                state.reclaimed = true
+            }
+            _ => anyhow::bail!("prune action {id} has duplicate or out-of-order audit evidence"),
+        }
+        Ok(())
+    })?;
+    // Validate approval for the whole pending set before advancing any action.
+    if actions
+        .iter()
+        .any(|action| !states.get(&action.id).is_some_and(|state| state.intended))
+    {
+        anyhow::bail!("pending prune action has no durable approved intent");
+    }
+    let pending_blobs = actions
+        .iter()
+        .filter(|action| action.entry.kind == "blob")
+        .map(|action| (action.entry.path.as_str(), action))
+        .collect::<HashMap<_, _>>();
+    let mut verified_blobs = HashSet::new();
+    for action in &actions {
+        let state = states.get(&action.id).context("approved prune state")?;
+        let payload = action.payload_path(root);
+        let payload_exists = match fs::symlink_metadata(&payload) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        if (state.reclaimed && (payload_exists || state.result != Some(true)))
+            || (state.result == Some(false) && payload_exists)
+        {
+            anyhow::bail!(
+                "prune action {} has conflicting completion evidence",
+                action.id
+            );
+        }
+        if payload_exists || state.result == Some(true) {
+            ensure_prune_source_retired(root, action)?;
+        }
+        let manifest_path = if payload_exists {
+            validate_prune_payload(root, action, state.result == Some(true))?;
+            Some(payload)
+        } else if state.result.is_none() {
+            if !validate_prune_source(root, action)? {
+                anyhow::bail!("prune action {} has no recoverable target", action.id);
+            }
+            Some(root.join(&action.entry.path))
+        } else {
+            None
+        };
+        if action.entry.kind == "manifest"
+            && let Some(path) = manifest_path
+        {
+            let manifest = read_raw_mirror_manifest(&path)?;
+            for reference in raw_mirror_manifest_blob_references(&manifest)? {
+                if !verified_blobs.insert(reference.blob_relative_path.clone()) {
+                    continue;
+                }
+                if let Some(blob) = pending_blobs.get(reference.blob_relative_path.as_str())
+                    && blob.payload_path(root).try_exists()?
+                {
+                    validate_prune_payload(root, blob, false)?;
+                } else {
+                    verify_existing_blob_reference(root, &reference)?;
+                }
+            }
+        }
+    }
+    let pending_manifests = actions
+        .iter()
+        .filter(|action| action.entry.kind == "manifest")
+        .map(|action| (action.entry.path.as_str(), action))
+        .collect::<HashMap<_, _>>();
+    for manifest in collect_prune_manifests(root, RawMirrorPruneLimits::default())? {
+        if !manifest
+            .blob_references
+            .iter()
+            .any(|reference| pending_blobs.contains_key(reference.blob_relative_path.as_str()))
+        {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(root.join(&manifest.relative_path))?;
+        if !pending_manifests
+            .get(manifest.relative_path.as_str())
+            .is_some_and(|action| {
+                states
+                    .get(&action.id)
+                    .is_some_and(|state| state.result.is_none())
+                    && source_identity_token(&metadata) == action.source_identity
+            })
+        {
+            anyhow::bail!(
+                "a retained manifest references a pending prune blob; preserve the pending approval for operator review"
+            );
+        }
+    }
+    // Observing complete bytes after a writer was killed does not prove its
+    // fsync completed. Re-establish the validated approval/result and journal
+    // namespace barriers before permanently purging any recovered payload.
+    #[cfg(test)]
+    prune_test_pause("recovery-audit-observed");
+    #[cfg(test)]
+    if dotenvy::var("CASS_PRUNE_TEST_FAIL_AT").ok().as_deref() == Some("recovery-audit-sync") {
+        anyhow::bail!("test-only recovery audit sync failure");
+    }
+    audit
+        .sync_all()
+        .context("sync validated prune recovery audit")?;
+    sync_parent_unconditionally(&audit_path)?;
+    #[cfg(test)]
+    prune_test_pause("recovery-audit-synced");
+    for action in &actions {
+        let descriptor = action.descriptor_path(root);
+        let metadata = fs::symlink_metadata(&descriptor)?;
+        open_stable_source_file(&descriptor, &metadata)?.sync_all()?;
+        sync_parent_unconditionally(&descriptor)?;
+        sync_parent_unconditionally(&action.payload_path(root))?;
+        sync_parent_unconditionally(&root.join(&action.entry.path))?;
+    }
+    let mut count = 0_u64;
+    let mut bytes = 0_u64;
+    for action in &actions {
+        let state = states
+            .get(&action.id)
+            .context("approved prune action state")?;
+        if finish_prune_action(root, action, state, &mut audit, &audit_path)? {
+            count += 1;
+            if !state.reclaimed {
+                bytes = bytes.saturating_add(action.entry.size_bytes);
+            }
+        }
+    }
+    Ok((count, bytes))
+}
+
+#[cfg(test)]
+fn prune_test_pause(boundary: &str) {
+    if dotenvy::var("CASS_PRUNE_TEST_PAUSE_AT").ok().as_deref() == Some(boundary) {
+        let marker = dotenvy::var("CASS_PRUNE_TEST_MARKER").expect("test-only boundary marker");
+        let mut file = File::create(marker).expect("test-only boundary marker");
+        file.write_all(boundary.as_bytes())
+            .expect("boundary marker bytes");
+        file.sync_all().expect("boundary marker sync");
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
+fn collect_prune_manifests(
+    root: &Path,
+    limits: RawMirrorPruneLimits,
+) -> Result<Vec<RawMirrorPruneManifest>> {
     let manifests_dir = root.join("manifests");
     let metadata = match fs::symlink_metadata(&manifests_dir) {
         Ok(metadata) => metadata,
@@ -1032,9 +1815,17 @@ fn collect_prune_manifests(root: &Path) -> Result<Vec<RawMirrorPruneManifest>> {
     }
 
     let mut manifests = Vec::new();
-    for entry in
-        fs::read_dir(&manifests_dir).with_context(|| format!("read {}", manifests_dir.display()))?
+    let mut remaining_bytes = limits.max_manifest_bytes;
+    for (scanned, entry) in fs::read_dir(&manifests_dir)
+        .with_context(|| format!("read {}", manifests_dir.display()))?
+        .enumerate()
     {
+        if scanned >= limits.max_entries {
+            anyhow::bail!(
+                "refusing to prune: raw mirror manifest inventory exceeds the {} entry budget",
+                limits.max_entries
+            );
+        }
         let entry = entry?;
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
@@ -1048,7 +1839,26 @@ fn collect_prune_manifests(root: &Path) -> Result<Vec<RawMirrorPruneManifest>> {
                 path.display()
             );
         }
-        let parsed_manifest = read_raw_mirror_manifest(&path)?;
+        if manifest_metadata.len() > RAW_MIRROR_MANIFEST_MAX_BYTES {
+            anyhow::bail!(
+                "refusing to read raw mirror manifest {} larger than {} bytes",
+                path.display(),
+                RAW_MIRROR_MANIFEST_MAX_BYTES
+            );
+        }
+        if manifest_metadata.len() > remaining_bytes {
+            anyhow::bail!(
+                "refusing to prune: raw mirror manifest inventory exceeds the {} byte budget",
+                limits.max_manifest_bytes
+            );
+        }
+        let mut file = open_stable_source_file(&path, &manifest_metadata)?;
+        let (parsed_manifest, bytes_read) = read_raw_mirror_manifest_from_open_file(
+            &path,
+            &mut file,
+            remaining_bytes.min(RAW_MIRROR_MANIFEST_MAX_BYTES),
+        )?;
+        remaining_bytes = remaining_bytes.saturating_sub(bytes_read);
         let expected_path = root.join(raw_mirror_manifest_relative_path(
             &parsed_manifest.manifest_id,
         ));
@@ -1327,16 +2137,41 @@ fn validate_prune_target_file(root: &Path, path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-fn remove_prune_entry_file(root: &Path, entry: &RawMirrorPruneEntry) -> Result<bool> {
+fn quarantine_prune_entry(root: &Path, action: &RawMirrorPruneAction) -> Result<bool> {
+    if !validate_prune_source(root, action)? {
+        return Ok(false);
+    }
+    rename_prune_target(root, action)
+}
+
+fn validate_prune_source(root: &Path, action: &RawMirrorPruneAction) -> Result<bool> {
+    let entry = &action.entry;
     let path = root.join(&entry.path);
     if entry.kind == "staging" {
-        return remove_abandoned_capture_staging(root, &path, entry.size_bytes);
+        if !validate_prune_target_staging(root, &path)? {
+            return Ok(false);
+        }
+        let mut remaining = PRUNE_INVENTORY_ENTRY_LIMIT;
+        let (size, _, symlink) = measure_capture_staging(&path, &mut remaining)?;
+        if symlink || size != entry.size_bytes {
+            anyhow::bail!(
+                "raw mirror capture staging {} changed after preflight",
+                path.display()
+            );
+        }
+        if collect_prune_staging_entries(&path)? != action.staging_entries {
+            anyhow::bail!("prune action {} staging source changed", action.id);
+        }
+        return Ok(true);
     }
     if !validate_prune_target_file(root, &path)? {
         return Ok(false);
     }
     let metadata = fs::symlink_metadata(&path)
         .with_context(|| format!("restat raw mirror prune target {}", path.display()))?;
+    if source_identity_token(&metadata) != action.source_identity {
+        anyhow::bail!("prune action {} source identity changed", action.id);
+    }
     if metadata.len() != entry.size_bytes {
         return Err(anyhow!(
             "raw mirror prune target {} changed size after preflight: observed {}, expected {}",
@@ -1406,8 +2241,30 @@ fn remove_prune_entry_file(root: &Path, entry: &RawMirrorPruneEntry) -> Result<b
         }
     }
 
-    fs::remove_file(&path).with_context(|| format!("remove raw mirror file {}", path.display()))?;
-    sync_parent_unconditionally(&path)?;
+    Ok(true)
+}
+
+fn rename_prune_target(root: &Path, action: &RawMirrorPruneAction) -> Result<bool> {
+    let source = root.join(&action.entry.path);
+    let payload = action.payload_path(root);
+    let metadata = fs::symlink_metadata(&source)?;
+    if source_identity_token(&metadata) != action.source_identity {
+        anyhow::bail!("prune action {} source identity changed", action.id);
+    }
+    match fs::symlink_metadata(&payload) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => anyhow::bail!("prune action {} quarantine already exists", action.id),
+        Err(error) => return Err(error.into()),
+    }
+    fs::rename(&source, &payload)?;
+    #[cfg(test)]
+    prune_test_pause("quarantine-renamed");
+    // Persist the destination first, so the recovery payload is durable before
+    // the source directory can durably lose its old name.
+    sync_parent_unconditionally(&payload)?;
+    sync_parent_unconditionally(&source)?;
+    #[cfg(test)]
+    prune_test_pause("quarantine-synced");
     Ok(true)
 }
 
@@ -1432,7 +2289,7 @@ fn is_capture_staging_name(name: &str) -> bool {
             .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
-fn collect_capture_staging_dirs(root: &Path) -> Result<Vec<CaptureStagingDir>> {
+fn collect_capture_staging_dirs(root: &Path, max_entries: usize) -> Result<Vec<CaptureStagingDir>> {
     let tmp = root.join("tmp");
     let metadata = match fs::symlink_metadata(&tmp) {
         Ok(metadata) => metadata,
@@ -1446,7 +2303,9 @@ fn collect_capture_staging_dirs(root: &Path) -> Result<Vec<CaptureStagingDir>> {
         );
     }
     let mut staging = Vec::new();
+    let mut remaining_entries = max_entries;
     for entry in fs::read_dir(&tmp).with_context(|| format!("read {}", tmp.display()))? {
+        charge_prune_staging_entry(&mut remaining_entries)?;
         let entry = entry?;
         let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
             continue;
@@ -1460,7 +2319,8 @@ fn collect_capture_staging_dirs(root: &Path) -> Result<Vec<CaptureStagingDir>> {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             continue;
         }
-        let (size_bytes, newest_modified_ms, contains_symlink) = measure_capture_staging(&path)?;
+        let (size_bytes, newest_modified_ms, contains_symlink) =
+            measure_capture_staging(&path, &mut remaining_entries)?;
         staging.push(CaptureStagingDir {
             relative_path: format!("tmp/{name}"),
             size_bytes,
@@ -1474,7 +2334,14 @@ fn collect_capture_staging_dirs(root: &Path) -> Result<Vec<CaptureStagingDir>> {
 
 /// File bytes below `path`, the newest mtime of it or anything in it (an
 /// unknown mtime counts as now), and whether a symlink appears below it.
-fn measure_capture_staging(path: &Path) -> Result<(u64, i64, bool)> {
+fn charge_prune_staging_entry(remaining: &mut usize) -> Result<()> {
+    *remaining = remaining.checked_sub(1).ok_or_else(|| {
+        anyhow!("refusing to prune: raw mirror staging inventory exceeds its entry budget")
+    })?;
+    Ok(())
+}
+
+fn measure_capture_staging(path: &Path, remaining_entries: &mut usize) -> Result<(u64, i64, bool)> {
     let mut size_bytes = 0_u64;
     let mut newest_modified_ms = i64::MIN;
     let mut contains_symlink = false;
@@ -1494,6 +2361,9 @@ fn measure_capture_staging(path: &Path) -> Result<(u64, i64, bool)> {
             for entry in
                 fs::read_dir(&current).with_context(|| format!("read {}", current.display()))?
             {
+                // Charge before adding to the queue, so a wide directory
+                // cannot allocate an unbounded traversal stack.
+                charge_prune_staging_entry(remaining_entries)?;
                 pending.push(entry?.path());
             }
         } else {
@@ -1524,35 +2394,14 @@ fn validate_prune_target_staging(root: &Path, path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-fn remove_abandoned_capture_staging(
-    root: &Path,
-    path: &Path,
-    expected_size_bytes: u64,
-) -> Result<bool> {
-    if !validate_prune_target_staging(root, path)? {
-        return Ok(false);
-    }
-    let (size_bytes, _, contains_symlink) = measure_capture_staging(path)?;
-    if contains_symlink || size_bytes != expected_size_bytes {
-        return Err(anyhow!(
-            "raw mirror capture staging {} changed after preflight: observed {size_bytes} bytes, expected {expected_size_bytes}",
-            path.display()
-        ));
-    }
-    fs::remove_dir_all(path)
-        .with_context(|| format!("remove raw mirror capture staging {}", path.display()))?;
-    sync_parent_unconditionally(path)?;
-    Ok(true)
-}
-
 fn open_prune_audit_log(root: &Path) -> Result<(PathBuf, File)> {
     ensure_private_dir(root)?;
     let audit_path = root.join("pruned.jsonl");
     ensure_prune_audit_log_appendable(&audit_path)?;
     let mut options = OpenOptions::new();
-    options.create(true).append(true);
+    options.create(true).append(true).read(true);
     configure_lock_open_options(&mut options);
-    let file = options
+    let mut file = options
         .open(&audit_path)
         .with_context(|| format!("open raw mirror prune audit {}", audit_path.display()))?;
     let opened_metadata = file.metadata().with_context(|| {
@@ -1572,34 +2421,101 @@ fn open_prune_audit_log(root: &Path) -> Result<(PathBuf, File)> {
             audit_path.display()
         ));
     }
+    validate_prune_audit_records(&mut file, &audit_path)?;
     set_private_open_file_permissions(&file, &audit_path)?;
     Ok((audit_path, file))
 }
 
-fn append_prune_audit_records(
+fn prune_audit_log_bytes(root: &Path) -> Result<u64> {
+    let path = root.join("pruned.jsonl");
+    ensure_prune_audit_log_appendable(&path)?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error).with_context(|| format!("stat prune audit {}", path.display())),
+    }
+}
+
+/// Preserve precious evidence byte-for-byte. A torn/malformed record needs
+/// operator review; appending would hide the boundary or join two JSON values.
+/// Scan with one bounded record buffer, independent of the ledger's total size.
+fn validate_prune_audit_records(file: &mut File, path: &Path) -> Result<()> {
+    visit_prune_audit_records(file, path, |_| Ok(()))
+}
+
+fn visit_prune_audit_records(
+    file: &mut File,
+    path: &Path,
+    mut visit: impl FnMut(Value) -> Result<()>,
+) -> Result<()> {
+    let expected_size = file.metadata()?.len();
+    file.seek(SeekFrom::Start(0))?;
+    let mut reader = BufReader::new(file.take(expected_size.saturating_add(1)));
+    let mut record = Vec::new();
+    let mut scanned_bytes = 0_u64;
+    loop {
+        record.clear();
+        let count = (&mut reader)
+            .take(PRUNE_AUDIT_RECORD_MAX_BYTES + 1)
+            .read_until(b'\n', &mut record)
+            .with_context(|| format!("read prune audit {}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        scanned_bytes = scanned_bytes.saturating_add(count as u64);
+        let parsed = serde_json::from_slice::<Value>(&record);
+        if count as u64 > PRUNE_AUDIT_RECORD_MAX_BYTES
+            || record.last() != Some(&b'\n')
+            || parsed.is_err()
+        {
+            anyhow::bail!(
+                "refusing to append raw mirror prune audit {}: torn, malformed or oversized record; preserve the ledger for operator review",
+                path.display()
+            );
+        }
+        visit(parsed.context("validated prune audit record")?)?;
+    }
+    if scanned_bytes != expected_size {
+        anyhow::bail!(
+            "prune audit {} changed while being validated",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn append_prune_audit_action(
     file: &mut File,
     audit_path: &Path,
-    entries: &[RawMirrorPruneEntry],
+    action: &RawMirrorPruneAction,
     phase: &str,
+    applied: bool,
 ) -> Result<()> {
     let now = now_ms();
-    for entry in entries {
-        let record = json!({
-            "schema_version": 1,
-            "recorded_at_ms": now,
-            "mode": "apply",
-            "phase": phase,
-            "kind": entry.kind,
-            "path": entry.path,
-            "blob_blake3": entry.blob_blake3,
-            "manifest_blake3": entry.manifest_blake3,
-            "size_bytes": entry.size_bytes,
-            "reason": entry.reason,
-            "applied": entry.applied,
-        });
-        writeln!(file, "{record}")
-            .with_context(|| format!("write raw mirror prune audit {}", audit_path.display()))?;
+    let entry = &action.entry;
+    let record = json!({
+        "schema_version": 1,
+        "recorded_at_ms": now,
+        "mode": "apply",
+        "phase": phase,
+        "kind": entry.kind,
+        "path": entry.path,
+        "blob_blake3": entry.blob_blake3,
+        "manifest_blake3": entry.manifest_blake3,
+        "size_bytes": entry.size_bytes,
+        "reason": entry.reason,
+        "applied": applied,
+        "action_id": action.id,
+        "action": action,
+        "reclaim_confirmed": phase == "reclaimed",
+    });
+    if serde_json::to_vec(&record)?.len() as u64 + 1 > PRUNE_AUDIT_RECORD_MAX_BYTES {
+        anyhow::bail!("prune action audit record exceeds its byte budget");
     }
+    writeln!(file, "{record}")
+        .with_context(|| format!("write raw mirror prune audit {}", audit_path.display()))?;
+    #[cfg(test)]
+    prune_test_pause(&format!("{phase}-written"));
     // Unlike optional capture durability, this journal authorizes deletion.
     // Never advance past an intent/result whose sync failed or was disabled.
     file.sync_all()
@@ -1631,6 +2547,43 @@ fn ensure_prune_audit_log_appendable(path: &Path) -> Result<()> {
             )
         }),
     }
+}
+
+fn acquire_raw_mirror_preview_lock(root: &Path) -> Result<Option<RawMirrorFileLockGuard>> {
+    let lock_path = root.join(RAW_MIRROR_MUTATION_LOCK_FILE);
+    let metadata = match fs::symlink_metadata(&lock_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("stat raw mirror preview lock"),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!(
+            "raw mirror preview lock {} is not a regular file",
+            lock_path.display()
+        );
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_lock_open_options(&mut options);
+    let file = options
+        .open(&lock_path)
+        .with_context(|| format!("open raw mirror preview lock {}", lock_path.display()))?;
+    file.lock_shared()
+        .with_context(|| format!("acquire raw mirror preview lock {}", lock_path.display()))?;
+    let guard = RawMirrorFileLockGuard { file };
+    let opened = guard.file.metadata()?;
+    let current = fs::symlink_metadata(&lock_path)?;
+    if current.file_type().is_symlink()
+        || !current.is_file()
+        || !same_source_identity(&opened, &current)
+        || !same_source_identity(&metadata, &current)
+    {
+        anyhow::bail!(
+            "raw mirror preview lock {} changed identity",
+            lock_path.display()
+        );
+    }
+    Ok(Some(guard))
 }
 
 fn acquire_raw_mirror_mutation_lock(root: &Path) -> Result<RawMirrorFileLockGuard> {
@@ -2464,29 +3417,32 @@ fn read_raw_mirror_manifest(path: &Path) -> Result<RawMirrorManifestFile> {
         ));
     }
     let mut file = open_stable_source_file(path, &metadata)?;
-    read_raw_mirror_manifest_from_open_file(path, &mut file)
+    read_raw_mirror_manifest_from_open_file(path, &mut file, RAW_MIRROR_MANIFEST_MAX_BYTES)
+        .map(|(manifest, _)| manifest)
 }
 
 fn read_raw_mirror_manifest_from_open_file(
     path: &Path,
     file: &mut File,
-) -> Result<RawMirrorManifestFile> {
+    max_bytes: u64,
+) -> Result<(RawMirrorManifestFile, u64)> {
     // A metadata check alone does not bound a file that grows before/during
     // reading. Read one sentinel byte beyond the limit, then reject before JSON
     // parsing rather than accepting a truncated prefix.
     let mut bytes = Vec::new();
-    file.take(RAW_MIRROR_MANIFEST_MAX_BYTES + 1)
+    file.take(max_bytes + 1)
         .read_to_end(&mut bytes)
         .with_context(|| format!("read raw mirror manifest {}", path.display()))?;
-    if bytes.len() as u64 > RAW_MIRROR_MANIFEST_MAX_BYTES {
+    if bytes.len() as u64 > max_bytes {
         anyhow::bail!(
             "refusing to read raw mirror manifest {} larger than {} bytes",
             path.display(),
-            RAW_MIRROR_MANIFEST_MAX_BYTES
+            max_bytes
         );
     }
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse raw mirror manifest {}", path.display()))
+    let manifest = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse raw mirror manifest {}", path.display()))?;
+    Ok((manifest, bytes.len() as u64))
 }
 
 fn raw_mirror_root(data_dir: &Path) -> PathBuf {
@@ -2709,17 +3665,17 @@ fn raw_mirror_stored_blob_fingerprints(
         references.extend(storage.chunks.iter().cloned());
     }
 
-    let mut seen = HashSet::new();
-    let mut fingerprints = Vec::with_capacity(references.len());
-    for reference in references {
+    for reference in &references {
         if raw_mirror_blob_relative_path(&reference.blob_blake3).as_deref()
             != Some(reference.blob_relative_path.as_str())
         {
             return None;
         }
-        if !seen.insert(reference.blob_relative_path.clone()) {
-            continue;
-        }
+    }
+    references.sort_by(|left, right| left.blob_relative_path.cmp(&right.blob_relative_path));
+    references.dedup_by(|left, right| left.blob_relative_path == right.blob_relative_path);
+    let mut fingerprints = Vec::with_capacity(references.len());
+    for reference in references {
         let path = root.join(&reference.blob_relative_path);
         if raw_mirror_path_has_symlink_below_root(root, &path) {
             return None;
@@ -4772,8 +5728,12 @@ mod tests {
             .open(&path)?
             .set_len(RAW_MIRROR_MANIFEST_MAX_BYTES * 4)?;
 
-        let error = read_raw_mirror_manifest_from_open_file(&path, &mut opened)
-            .expect_err("growth after stat/open must not bypass the byte limit");
+        let error = read_raw_mirror_manifest_from_open_file(
+            &path,
+            &mut opened,
+            RAW_MIRROR_MANIFEST_MAX_BYTES,
+        )
+        .expect_err("growth after stat/open must not bypass the byte limit");
         assert!(error.to_string().contains("larger than 16777216 bytes"));
         assert_eq!(
             std::io::Seek::stream_position(&mut opened)?,
@@ -4943,6 +5903,651 @@ mod tests {
     }
 
     #[test]
+    fn prune_inventory_limits_fail_closed_before_any_audit_or_removal() -> Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let data_dir = temp.path().join("cass-data");
+        let mut candidates = Vec::new();
+        let mut manifest_bytes = 0_u64;
+        for index in 0..2 {
+            let source_path = temp.path().join(format!("source-{index}.jsonl"));
+            fs::write(&source_path, format!("session {index}"))?;
+            let captured = capture_source_file(RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "codex",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source_path,
+                db_links: &[],
+            })?;
+            let root = raw_mirror_root(&data_dir);
+            let manifest = root.join(captured.manifest_relative_path);
+            manifest_bytes += fs::metadata(&manifest)?.len();
+            candidates.push(manifest);
+            candidates.push(root.join(captured.blob_relative_path));
+        }
+        let before = candidates
+            .iter()
+            .map(fs::read)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let root = raw_mirror_root(&data_dir);
+        let audit = root.join("pruned.jsonl");
+        let historical = b"{\"mode\":\"apply\",\"applied\":true}\n";
+        fs::write(&audit, historical)?;
+        for apply in [false, true] {
+            for limits in [
+                RawMirrorPruneLimits {
+                    max_entries: 1,
+                    max_manifest_bytes: manifest_bytes,
+                },
+                RawMirrorPruneLimits {
+                    max_entries: 100,
+                    max_manifest_bytes: manifest_bytes - 1,
+                },
+            ] {
+                let error = prune_with_limits(
+                    &data_dir,
+                    RawMirrorPruneOptions {
+                        max_size_bytes: Some(0),
+                        apply,
+                        ..Default::default()
+                    },
+                    limits,
+                )
+                .expect_err("partial inventories cannot authorize a plan");
+                assert!(format!("{error:#}").contains("inventory exceeds"));
+                for (path, bytes) in candidates.iter().zip(&before) {
+                    assert_eq!(fs::read(path)?, *bytes);
+                }
+                assert_eq!(fs::read(&audit)?, historical);
+            }
+        }
+        let exact = prune_with_limits(
+            &data_dir,
+            RawMirrorPruneOptions {
+                max_size_bytes: Some(0),
+                ..Default::default()
+            },
+            RawMirrorPruneLimits {
+                max_entries: 100,
+                max_manifest_bytes: manifest_bytes,
+            },
+        )?;
+        assert_eq!(exact.manifest_count, 2);
+        assert_eq!(exact.planned_manifest_count, 2);
+        assert_eq!(exact.audit_log_bytes_before, historical.len() as u64);
+        assert_eq!(exact.audit_log_bytes_after, historical.len() as u64);
+        Ok(())
+    }
+
+    #[test]
+    fn prune_blob_and_staging_walk_limits_refuse_partial_plans() -> Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let data_dir = temp.path().join("cass-data");
+        let root = ensure_raw_mirror_root(&data_dir)?;
+        let digest = blake3::hash(b"orphan").to_hex().to_string();
+        let blob = root.join(raw_mirror_blob_relative_path(&digest).context("digest")?);
+        fs::create_dir_all(blob.parent().context("blob parent")?)?;
+        fs::write(&blob, b"orphan")?;
+        for apply in [false, true] {
+            let error = prune_with_limits(
+                &data_dir,
+                RawMirrorPruneOptions {
+                    max_size_bytes: Some(0),
+                    apply,
+                    ..Default::default()
+                },
+                RawMirrorPruneLimits {
+                    max_entries: 1,
+                    ..Default::default()
+                },
+            )
+            .expect_err("blob directory plus blob exceeds one entry");
+            assert!(format!("{error:#}").contains("blob inventory exceeds"));
+            assert_eq!(fs::read(&blob)?, b"orphan");
+            assert!(!root.join("pruned.jsonl").exists());
+        }
+        let staging = root.join("tmp/capture.1.2.3");
+        fs::create_dir_all(&staging)?;
+        for name in ["a", "b", "c"] {
+            fs::write(staging.join(name), b"unfinished capture")?;
+        }
+        let error = prune_with_limits(
+            &data_dir,
+            RawMirrorPruneOptions {
+                max_size_bytes: Some(0),
+                apply: true,
+                ..Default::default()
+            },
+            RawMirrorPruneLimits {
+                max_entries: 2,
+                ..Default::default()
+            },
+        )
+        .expect_err("staging queue cannot exceed its budget");
+        assert!(format!("{error:#}").contains("staging inventory exceeds"));
+        assert_eq!(fs::read(&blob)?, b"orphan");
+        assert!(staging.join("c").exists());
+        assert!(!root.join("pruned.jsonl").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn prune_apply_refuses_torn_malformed_and_oversized_audit_records() -> Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let data_dir = temp.path().join("cass-data");
+        let root = ensure_raw_mirror_root(&data_dir)?;
+        let digest = blake3::hash(b"preserved").to_hex().to_string();
+        let blob = root.join(raw_mirror_blob_relative_path(&digest).context("digest")?);
+        fs::create_dir_all(blob.parent().context("blob parent")?)?;
+        fs::write(&blob, b"preserved")?;
+        let audit = root.join("pruned.jsonl");
+        let valid_prefix = b"{\"phase\":\"intent\",\"applied\":false}\n";
+        for tail in [
+            b"{\"phase\":\"result\",\"applied\":".to_vec(),
+            b"invalid json\n".to_vec(),
+            vec![b' '; PRUNE_AUDIT_RECORD_MAX_BYTES as usize + 1],
+        ] {
+            let mut evidence = valid_prefix.to_vec();
+            evidence.extend(tail);
+            fs::write(&audit, &evidence)?;
+            let preview = prune(
+                &data_dir,
+                RawMirrorPruneOptions {
+                    max_size_bytes: Some(0),
+                    ..Default::default()
+                },
+            )?;
+            assert_eq!(preview.audit_log_bytes_before, evidence.len() as u64);
+            let error = prune(
+                &data_dir,
+                RawMirrorPruneOptions {
+                    max_size_bytes: Some(0),
+                    apply: true,
+                    ..Default::default()
+                },
+            )
+            .expect_err("never append after damaged evidence");
+            assert!(format!("{error:#}").contains("torn, malformed or oversized record"));
+            assert_eq!(fs::read(&audit)?, evidence);
+            assert_eq!(fs::read(&blob)?, b"preserved");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prune_durable_boundary_child() -> Result<()> {
+        let Ok(data_dir) = dotenvy::var("CASS_PRUNE_TEST_ROOT") else {
+            return Ok(());
+        };
+        prune(
+            Path::new(&data_dir),
+            RawMirrorPruneOptions {
+                max_size_bytes: Some(0),
+                apply: true,
+                ..Default::default()
+            },
+        )?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn kill_prune_child_at(data_dir: &Path, marker: &Path, boundary: &str) -> Result<()> {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "raw_mirror::store::tests::prune_durable_boundary_child",
+                "--nocapture",
+            ])
+            .env("CASS_PRUNE_TEST_ROOT", data_dir)
+            .env("CASS_PRUNE_TEST_PAUSE_AT", boundary)
+            .env("CASS_PRUNE_TEST_MARKER", marker)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while fs::read_to_string(marker).ok().as_deref() != Some(boundary) {
+            if child.try_wait()?.is_some() || std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output()?;
+                anyhow::bail!(
+                    "{boundary} did not reach its boundary: stdout={} stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        child.kill()?;
+        assert!(!child.wait_with_output()?.status.success());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_sigkill_reconciles_every_durable_boundary_exactly_once() -> Result<()> {
+        let boundaries = [
+            "intent-written",
+            "intents-synced",
+            "descriptor-written",
+            "descriptor-synced",
+            "quarantine-renamed",
+            "quarantine-synced",
+            "result-written",
+            "result-synced",
+            "payload-unlinked",
+            "payload-purged",
+            "reclaimed-written",
+            "reclaimed-synced",
+            "descriptor-unlinked",
+            "descriptor-retired",
+        ];
+        for kind in ["blob", "manifest", "staging"] {
+            let mut checkpoints = boundaries.to_vec();
+            if kind == "staging" {
+                checkpoints.push("staging-entry-unlinked");
+                checkpoints.push("staging-entry-purged");
+            }
+            for boundary in checkpoints {
+                let temp = tempfile::TempDir::new()?;
+                let data_dir = temp.path().join("cass-data");
+                let root = ensure_raw_mirror_root(&data_dir)?;
+                if kind == "blob" {
+                    let digest = blake3::hash(b"durable orphan").to_hex().to_string();
+                    let path = root.join(raw_mirror_blob_relative_path(&digest).context("digest")?);
+                    fs::create_dir_all(path.parent().context("parent")?)?;
+                    fs::write(path, b"durable orphan")?;
+                } else if kind == "manifest" {
+                    let source = temp.path().join("session.jsonl");
+                    fs::write(&source, b"durable captured source\n")?;
+                    capture_source_file(RawMirrorCaptureInput {
+                        data_dir: &data_dir,
+                        provider: "codex",
+                        source_id: "local",
+                        origin_kind: "local",
+                        origin_host: None,
+                        source_path: &source,
+                        db_links: &[],
+                    })?;
+                } else {
+                    let staging = root.join("tmp/capture.1.2.3");
+                    fs::create_dir_all(staging.join("nested"))?;
+                    fs::write(staging.join("a"), b"first abandoned chunk")?;
+                    fs::write(staging.join("nested/b"), b"other abandoned chunk")?;
+                    let old = SystemTime::now()
+                        .checked_sub(Duration::from_secs(7200))
+                        .context("old mtime")?;
+                    for entry in walkdir::WalkDir::new(&staging).contents_first(true) {
+                        File::open(entry?.path())?
+                            .set_times(fs::FileTimes::new().set_modified(old))?;
+                    }
+                }
+                let preview = prune(
+                    &data_dir,
+                    RawMirrorPruneOptions {
+                        max_size_bytes: Some(0),
+                        ..Default::default()
+                    },
+                )?;
+                assert!(!preview.entries.is_empty(), "{kind}/{boundary}");
+                let marker = temp.path().join("boundary.marker");
+                kill_prune_child_at(&data_dir, &marker, boundary)?;
+                let audit_path = root.join("pruned.jsonl");
+                let interrupted = fs::read(&audit_path)?;
+                // Before physical purge, an unconfirmed canonical retirement
+                // must still own a recoverable authenticated payload.
+                let pending = pending_prune_actions(&root)?;
+                let interrupted_rows = interrupted
+                    .split(|byte| *byte == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .map(serde_json::from_slice::<Value>)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for entry in &preview.entries {
+                    if !root.join(&entry.path).exists()
+                        && !interrupted_rows.iter().any(|row| {
+                            row["phase"] == "result"
+                                && row["path"] == entry.path
+                                && row["applied"] == true
+                        })
+                    {
+                        let action = pending
+                            .iter()
+                            .find(|action| action.entry.path == entry.path)
+                            .context("unconfirmed retirement descriptor")?;
+                        validate_prune_payload(&root, action, false)?;
+                    }
+                }
+                if boundary == "result-written" {
+                    // The killed writer never ran its result fsync. A failed
+                    // recovery sync must preserve every quarantined byte and
+                    // append nothing; both sides of the real sync barrier
+                    // must also remain safe when the recovery is killed.
+                    let failure = std::process::Command::new(std::env::current_exe()?)
+                        .args([
+                            "--exact",
+                            "raw_mirror::store::tests::prune_durable_boundary_child",
+                            "--nocapture",
+                        ])
+                        .env("CASS_PRUNE_TEST_ROOT", &data_dir)
+                        .env("CASS_PRUNE_TEST_FAIL_AT", "recovery-audit-sync")
+                        .output()?;
+                    assert!(!failure.status.success());
+                    assert!(
+                        String::from_utf8_lossy(&failure.stderr)
+                            .contains("test-only recovery audit sync failure"),
+                        "{}",
+                        String::from_utf8_lossy(&failure.stderr)
+                    );
+                    for checkpoint in ["recovery-audit-observed", "recovery-audit-synced"] {
+                        assert_eq!(fs::read(&audit_path)?, interrupted);
+                        for action in &pending {
+                            if !root.join(&action.entry.path).exists() {
+                                validate_prune_payload(&root, action, false)?;
+                            }
+                        }
+                        kill_prune_child_at(&data_dir, &marker, checkpoint)?;
+                    }
+                    assert_eq!(fs::read(&audit_path)?, interrupted);
+                    for action in &pending {
+                        if !root.join(&action.entry.path).exists() {
+                            validate_prune_payload(&root, action, false)?;
+                        }
+                    }
+                    writeln!(
+                        std::io::stderr(),
+                        "GH488_RECOVERY_BARRIER kind={kind} writer_killed_before_fsync=true sync_failure_preserved_payload=true recovery_killed_before_and_after_fsync=true ledger_unchanged=true"
+                    )?;
+                }
+                prune(
+                    &data_dir,
+                    RawMirrorPruneOptions {
+                        max_size_bytes: Some(0),
+                        apply: true,
+                        ..Default::default()
+                    },
+                )?;
+                let completed = fs::read(&audit_path)?;
+                let rows = completed
+                    .split(|byte| *byte == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .map(serde_json::from_slice::<Value>)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for entry in &preview.entries {
+                    assert!(
+                        !root.join(&entry.path).exists(),
+                        "{kind}/{boundary}: survived restart"
+                    );
+                    for phase in ["result", "reclaimed"] {
+                        assert_eq!(
+                            rows.iter()
+                                .filter(|row| row["phase"] == phase
+                                    && row["path"] == entry.path
+                                    && row["applied"] == true)
+                                .count(),
+                            1,
+                            "{kind}/{boundary}/{phase}"
+                        );
+                    }
+                }
+                assert!(pending_prune_actions(&root)?.is_empty());
+                prune(
+                    &data_dir,
+                    RawMirrorPruneOptions {
+                        max_size_bytes: Some(0),
+                        apply: true,
+                        ..Default::default()
+                    },
+                )?;
+                assert_eq!(
+                    fs::read(audit_path)?,
+                    completed,
+                    "empty retry changed evidence"
+                );
+                writeln!(
+                    std::io::stderr(),
+                    "GH488_BOUNDARY kind={kind} phase={boundary} killed=true restart_results_exactly_once=true reclaimed_exactly_once=true entries={}",
+                    preview.entries.len()
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_recovery_preserves_blobs_referenced_by_a_capture_after_sigkill() -> Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let data_dir = temp.path().join("cass-data");
+        let source = temp.path().join("session.jsonl");
+        fs::write(&source, b"capture survives stale prune authority\n")?;
+        let input = || RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source,
+            db_links: &[],
+        };
+        let original = capture_source_file(input())?;
+        let root = raw_mirror_root(&data_dir);
+        let blob = root.join(&original.blob_relative_path);
+        let blob_identity = source_identity_token(&fs::symlink_metadata(&blob)?);
+        kill_prune_child_at(
+            &data_dir,
+            &temp.path().join("boundary.marker"),
+            "descriptor-retired",
+        )?;
+        assert!(!root.join(&original.manifest_relative_path).exists());
+        assert!(blob.exists());
+        let captured = capture_source_file(input())?;
+        assert_eq!(captured.manifest_id, original.manifest_id);
+        assert_eq!(
+            source_identity_token(&fs::symlink_metadata(&blob)?),
+            blob_identity
+        );
+        let before = walkdir::WalkDir::new(&root)
+            .into_iter()
+            .map(|entry| entry.context("capture interleave entry"))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| Ok((entry.path().to_path_buf(), fs::read(entry.path())?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let error = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                max_size_bytes: Some(0),
+                keep_latest: Some(1),
+                apply: true,
+                ..Default::default()
+            },
+        )
+        .expect_err("new retained capture invalidates old pending blob authority");
+        assert!(
+            error
+                .to_string()
+                .contains("retained manifest references a pending prune blob")
+        );
+        for (path, bytes) in before {
+            assert_eq!(
+                fs::read(path)?,
+                bytes,
+                "stale recovery changed live capture/evidence"
+            );
+        }
+        assert_eq!(
+            read_source_bytes(&data_dir, &captured.manifest_id)?,
+            fs::read(&source)?
+        );
+        writeln!(
+            std::io::stderr(),
+            "GH488_CAPTURE_INTERLEAVE killed_after_manifest=true capture_reused_pending_blob=true stale_recovery_refused=true ledger_unchanged=true captured_content_preserved=true"
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn prune_recovery_refuses_unapproved_forged_torn_or_replaced_authority() -> Result<()> {
+        for fault in [
+            "unapproved",
+            "forged",
+            "torn",
+            "replaced-source",
+            "changed-payload",
+            "duplicate-target",
+            "mismatched-intent",
+            "missing-nullable-field",
+            "unapplied-result",
+            "reclaimed-with-payload",
+            "unapplied-with-payload",
+            "linked-payload",
+            "aliased-target",
+        ] {
+            let temp = tempfile::TempDir::new()?;
+            let data_dir = temp.path().join("cass-data");
+            let root = ensure_raw_mirror_root(&data_dir)?;
+            let digest = blake3::hash(b"protected orphan").to_hex().to_string();
+            let relative = raw_mirror_blob_relative_path(&digest).context("digest")?;
+            let source = root.join(&relative);
+            fs::create_dir_all(source.parent().context("parent")?)?;
+            fs::write(&source, b"protected orphan")?;
+            let preview = prune(
+                &data_dir,
+                RawMirrorPruneOptions {
+                    max_size_bytes: Some(0),
+                    ..Default::default()
+                },
+            )?;
+            let action = new_prune_action(&root, preview.entries.first().context("entry")?)?;
+            let (audit_path, mut audit) = open_prune_audit_log(&root)?;
+            if fault != "unapproved" {
+                append_prune_audit_action(&mut audit, &audit_path, &action, "intent", false)?;
+            }
+            persist_prune_action(&root, &action)?;
+            if fault == "forged" {
+                let mut changed = action.clone();
+                changed.entry.size_bytes += 1;
+                fs::write(action.descriptor_path(&root), serde_json::to_vec(&changed)?)?;
+            } else if fault == "torn" {
+                fs::write(action.descriptor_path(&root), b"{\"id\":")?;
+            } else if fault == "replaced-source" {
+                fs::rename(&source, temp.path().join("preserved-original"))?;
+                fs::write(&source, b"protected orphan")?;
+            } else if fault == "changed-payload" {
+                quarantine_prune_entry(&root, &action)?;
+                fs::write(action.payload_path(&root), b"tampered orphan!")?;
+            } else if fault == "duplicate-target" {
+                // Both descriptors and intents are individually valid. They
+                // still cannot jointly authorize the same canonical target.
+                let duplicate = new_prune_action(&root, &action.entry)?;
+                assert_ne!(duplicate.id, action.id);
+                append_prune_audit_action(&mut audit, &audit_path, &duplicate, "intent", false)?;
+                persist_prune_action(&root, &duplicate)?;
+            } else if fault == "mismatched-intent" {
+                let mut changed = action.clone();
+                changed.entry.reason.push_str(" forged authority");
+                // A self-consistent descriptor still needs the matching
+                // immutable action in the durable intent ledger.
+                changed.id = changed.expected_id();
+                fs::rename(
+                    action.descriptor_path(&root),
+                    changed.descriptor_path(&root),
+                )?;
+                fs::write(
+                    changed.descriptor_path(&root),
+                    serde_json::to_vec(&changed)?,
+                )?;
+            } else if fault == "missing-nullable-field" {
+                // Writer rows carry an explicit null for absent checksums.
+                // An incomplete authority envelope must not authorize purge.
+                let mut record: Value = serde_json::from_slice(&fs::read(&audit_path)?)?;
+                record
+                    .as_object_mut()
+                    .context("synthetic intent object")?
+                    .remove("manifest_blake3");
+                let mut encoded = serde_json::to_vec(&record)?;
+                encoded.push(b'\n');
+                fs::write(&audit_path, encoded)?;
+            } else if fault == "unapplied-result" {
+                append_prune_audit_action(&mut audit, &audit_path, &action, "result", true)?;
+            } else if fault == "linked-payload" {
+                fs::hard_link(&source, action.payload_path(&root))?;
+            } else if fault == "aliased-target" {
+                let mut aliased = action.entry.clone();
+                aliased.path = aliased.path.replacen("blobs/", "blobs//", 1);
+                let mut duplicate = action.clone();
+                duplicate.entry = aliased;
+                duplicate.id = duplicate.expected_id();
+                append_prune_audit_action(&mut audit, &audit_path, &duplicate, "intent", false)?;
+                persist_prune_action(&root, &duplicate)?;
+            } else if fault == "reclaimed-with-payload" || fault == "unapplied-with-payload" {
+                quarantine_prune_entry(&root, &action)?;
+                let applied = fault == "reclaimed-with-payload";
+                append_prune_audit_action(&mut audit, &audit_path, &action, "result", applied)?;
+                if applied {
+                    append_prune_audit_action(&mut audit, &audit_path, &action, "reclaimed", true)?;
+                }
+            }
+            let ledger_before = fs::read(&audit_path)?;
+            let before = walkdir::WalkDir::new(&root)
+                .into_iter()
+                .map(|entry| entry.context("entry"))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|entry| entry.file_type().is_file())
+                .map(|entry| Ok((entry.path().to_path_buf(), fs::read(entry.path())?)))
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            let error = prune(
+                &data_dir,
+                RawMirrorPruneOptions {
+                    max_size_bytes: Some(0),
+                    apply: true,
+                    ..Default::default()
+                },
+            )
+            .expect_err("unsafe recovery must refuse");
+            assert!(!error.to_string().is_empty(), "{fault}");
+            if fault == "duplicate-target" {
+                assert!(error.to_string().contains("duplicate target authority"));
+            } else if fault == "mismatched-intent" {
+                assert!(error.to_string().contains("no durable approved intent"));
+            } else if fault == "missing-nullable-field" {
+                assert!(error.to_string().contains("mismatched audit fields"));
+            } else if fault == "aliased-target" {
+                assert!(error.to_string().contains("non-canonical target"));
+            } else if fault == "unapplied-result" || fault == "linked-payload" {
+                assert!(error.to_string().contains("target still at its source"));
+            } else if fault == "reclaimed-with-payload" || fault == "unapplied-with-payload" {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("conflicting completion evidence")
+                );
+            }
+            assert_eq!(
+                fs::read(&audit_path)?,
+                ledger_before,
+                "{fault}: appended after invalid evidence"
+            );
+            for (path, bytes) in before {
+                assert_eq!(
+                    fs::read(path)?,
+                    bytes,
+                    "{fault}: changed protected evidence"
+                );
+            }
+            writeln!(
+                std::io::stderr(),
+                "GH488_AUTHORITY_CONTROL fault={fault} refused=true ledger_unchanged=true protected_bytes_unchanged=true"
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn prune_partial_apply_preserves_completed_results_and_retry_does_not_repeat_them() -> Result<()>
     {
         let temp = tempfile::TempDir::new()?;
@@ -4985,8 +6590,8 @@ mod tests {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         assert_eq!(
             records.len(),
-            3,
-            "two intents and the completed first result"
+            4,
+            "two intents, the completed first result and its reclamation"
         );
         assert!(
             records[..2]
@@ -4996,9 +6601,12 @@ mod tests {
         assert_eq!(records[2]["phase"], "result");
         assert_eq!(records[2]["path"], report.entries[0].path);
         assert_eq!(records[2]["applied"], true);
+        assert_eq!(records[2]["reclaim_confirmed"], false);
+        assert_eq!(records[3]["phase"], "reclaimed");
+        assert_eq!(records[3]["reclaim_confirmed"], true);
         drop(audit_file);
 
-        fs::write(&second, original)?;
+        fs::write(&second, &original)?;
         let retry = prune(
             &data_dir,
             RawMirrorPruneOptions {
@@ -5007,14 +6615,16 @@ mod tests {
                 ..RawMirrorPruneOptions::default()
             },
         )?;
-        assert_eq!(retry.applied_blob_count, 1);
+        assert_eq!(retry.applied_blob_count, 0);
+        assert_eq!(retry.recovered_action_count, 1);
+        assert_eq!(retry.recovered_reclaim_bytes, original.len() as u64);
         assert!(!second.exists());
         let completed_audit = fs::read_to_string(&audit_path)?;
         let results = completed_audit
             .lines()
             .map(serde_json::from_str::<serde_json::Value>)
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        assert_eq!(results.len(), 5);
+        assert_eq!(results.len(), 6);
         for entry in &report.entries {
             assert_eq!(
                 results
@@ -5191,7 +6801,8 @@ mod tests {
         replacement[0] ^= 1;
         fs::write(&blob_path, replacement).expect("replace blob after plan preflight");
 
-        let error = remove_prune_entry_file(&root, &entry)
+        let action = new_prune_action(&root, &entry).expect("prune action");
+        let error = quarantine_prune_entry(&root, &action)
             .expect_err("same-size replacement must not be deleted");
         assert!(
             format!("{error:#}").contains("checksum mismatch"),
@@ -5250,7 +6861,8 @@ mod tests {
         );
         fs::write(&manifest_path, replacement).expect("replace manifest after preflight");
 
-        let error = remove_prune_entry_file(&root, &entry)
+        let action = new_prune_action(&root, &entry).expect("prune action");
+        let error = quarantine_prune_entry(&root, &action)
             .expect_err("same-size valid replacement manifest must not be deleted");
         assert!(
             format!("{error:#}").contains("manifest checksum changed after preflight"),

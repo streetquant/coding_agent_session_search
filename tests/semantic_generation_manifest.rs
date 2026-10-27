@@ -269,9 +269,9 @@ use coding_agent_search::search::semantic_manifest::{
     SemanticArtifactRole, SemanticArtifactSealStateV1, SemanticArtifactValidationEvidence,
     SemanticCorpusSnapshotIdentity, SemanticCurrentPointerV1, SemanticExpectedCurrentV1,
     SemanticGenerationArtifact, SemanticGenerationDiskStateV1, SemanticGenerationError,
-    SemanticGenerationManifestV1, SemanticGenerationRecoveryAction, SemanticGenerationStatus,
-    SemanticGenerationTopology, SemanticProducerAttestation, load_current_semantic_generation,
-    resolve_semantic_generation_disk_state,
+    SemanticGenerationManifestV1, SemanticGenerationPurpose, SemanticGenerationRecoveryAction,
+    SemanticGenerationStatus, SemanticGenerationTopology, SemanticProducerAttestation,
+    load_current_semantic_generation, resolve_semantic_generation_disk_state,
 };
 use coding_agent_search::search::semantic_reader::publication::{
     SelectedSemanticGeneration, SemanticSelectionBudget,
@@ -503,6 +503,7 @@ fn accepted_manifest(data_dir: &Path) -> SemanticGenerationManifestV1 {
         requested_topology: SemanticGenerationTopology::QualityOnly,
         realized_topology: SemanticGenerationTopology::QualityOnly,
         status: SemanticGenerationStatus::Sealed,
+        purpose: SemanticGenerationPurpose::Semantic,
         corpus,
         producer: SemanticProducerAttestation {
             cass_git_commit: "a".repeat(40),

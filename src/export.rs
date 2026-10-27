@@ -7,7 +7,6 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
-use std::borrow::Cow;
 
 use crate::search::query::SearchHit;
 
@@ -202,23 +201,24 @@ fn export_markdown(hits: &[SearchHit], options: &ExportOptions) -> String {
         }
 
         if options.include_path {
-            let source_path_chars = hit.source_path.chars().count();
-            let path_display: Cow<'_, str> = if source_path_chars > 60 {
-                let skip = source_path_chars - 57;
-                Cow::Owned(format!(
-                    "...{}",
-                    hit.source_path.chars().skip(skip).collect::<String>()
-                ))
-            } else {
-                Cow::Borrowed(hit.source_path.as_str())
-            };
             output.push_str(&format!(
                 "| Source | {} |\n",
-                escape_markdown(path_display.as_ref())
+                escape_markdown(&hit.source_path)
             ));
+            output.push_str("| Source ID | ");
+            output.push_str(&escape_markdown(&hit.source_id));
+            output.push_str(" |\n");
+            if let Some(conversation_id) = hit.conversation_id {
+                output.push_str(&format!("| Conversation ID | {conversation_id} |\n"));
+            }
 
             if let Some(line) = hit.line_number {
-                output.push_str(&format!("| Line | {line} |\n"));
+                output.push_str(&format!("| Message index | {line} |\n"));
+            }
+            if let Some(anchor) = &hit.message_anchor {
+                output.push_str("| Message anchor | ");
+                output.push_str(&escape_markdown(anchor));
+                output.push_str(" |\n");
             }
         }
 
@@ -295,6 +295,18 @@ fn export_hit_json(hit: &SearchHit, options: &ExportOptions) -> serde_json::Valu
             "source_path".to_string(),
             serde_json::json!(hit.source_path),
         );
+        obj.insert("source_id".to_string(), serde_json::json!(hit.source_id));
+        obj.insert(
+            "conversation_id".to_string(),
+            serde_json::json!(hit.conversation_id),
+        );
+        obj.insert(
+            "coordinate_space".to_string(),
+            serde_json::json!("message_index"),
+        );
+        if let Some(anchor) = &hit.message_anchor {
+            obj.insert("message_anchor".to_string(), serde_json::json!(anchor));
+        }
         if let Some(line) = hit.line_number {
             obj.insert("line_number".to_string(), serde_json::json!(line));
         }
@@ -372,8 +384,19 @@ fn export_plain_text(hits: &[SearchHit], options: &ExportOptions) -> String {
 
         if options.include_path {
             output.push_str(&format!("Source: {}\n", hit.source_path));
+            output.push_str("Source ID: ");
+            output.push_str(&hit.source_id);
+            output.push('\n');
+            if let Some(conversation_id) = hit.conversation_id {
+                output.push_str(&format!("Conversation ID: {conversation_id}\n"));
+            }
             if let Some(line) = hit.line_number {
-                output.push_str(&format!("Line: {line}\n"));
+                output.push_str(&format!("Message index: {line}\n"));
+            }
+            if let Some(anchor) = &hit.message_anchor {
+                output.push_str("Message anchor: ");
+                output.push_str(anchor);
+                output.push('\n');
             }
         }
 
@@ -381,13 +404,17 @@ fn export_plain_text(hits: &[SearchHit], options: &ExportOptions) -> String {
         output.push_str("Snippet:\n");
         let snippet = truncate_text(&hit.snippet, options.max_snippet_len);
         for line in snippet.lines() {
-            output.push_str(&format!("  {line}\n"));
+            output.push_str("  ");
+            output.push_str(line);
+            output.push('\n');
         }
 
         if options.include_content && !hit.content.is_empty() {
             output.push_str("\nFull Content:\n");
             for line in hit.content.lines() {
-                output.push_str(&format!("  {line}\n"));
+                output.push_str("  ");
+                output.push_str(line);
+                output.push('\n');
             }
         }
 
@@ -459,6 +486,7 @@ mod tests {
             content: "Full content here".to_string(),
             content_hash: crate::search::query::stable_content_hash("Full content here"),
             conversation_id: None,
+            message_anchor: None,
             score: 8.5,
             source_path: "/path/to/file.jsonl".to_string(),
             agent: "claude_code".to_string(),
@@ -570,6 +598,9 @@ mod tests {
                     "snippet": "This is a test snippet",
                     "score": 8.5,
                     "source_path": "/path/to/file.jsonl",
+                    "source_id": "local",
+                    "conversation_id": null,
+                    "coordinate_space": "message_index",
                     "line_number": 42,
                     "created_at": 1700000000000i64,
                     "created_at_formatted": "2023-11-14T22:13:20+00:00"
@@ -599,6 +630,9 @@ mod tests {
             ("snippet", serde_json::json!("This is...")),
             ("score", serde_json::json!(0.0)),
             ("source_path", serde_json::json!("/path/to/file.jsonl")),
+            ("source_id", serde_json::json!("local")),
+            ("conversation_id", serde_json::Value::Null),
+            ("coordinate_space", serde_json::json!("message_index")),
             ("line_number", serde_json::json!(42)),
             ("created_at", serde_json::json!(1700000000000i64)),
             (
@@ -609,7 +643,80 @@ mod tests {
         ] {
             assert_json_field(&projected, key, expected);
         }
-        assert_eq!(projected.as_object().expect("object").len(), 10);
+        assert_eq!(projected.as_object().expect("object").len(), 13);
+    }
+
+    #[test]
+    fn gh493_exports_preserve_exact_identity_for_same_text_in_shared_path_sessions() {
+        let mut first = sample_hit();
+        first.source_path = format!("/archive/{}/shared.jsonl", "long-path/".repeat(8));
+        first.conversation_id = Some(7);
+        first.message_anchor = crate::search::query::message_anchor_for_content(
+            &first.source_id,
+            &first.source_path,
+            first.conversation_id,
+            first.line_number,
+            &first.content,
+        );
+        let mut second = first.clone();
+        second.conversation_id = Some(8);
+        second.message_anchor = crate::search::query::message_anchor_for_content(
+            &second.source_id,
+            &second.source_path,
+            second.conversation_id,
+            second.line_number,
+            &second.content,
+        );
+        assert!(first.message_anchor.is_some());
+        assert_ne!(first.message_anchor, second.message_anchor);
+        let hits = [first, second];
+        let options = ExportOptions {
+            max_snippet_len: 5,
+            ..ExportOptions::default()
+        };
+        let json = export_json_value(&hits, &options, "fixed");
+        let markdown = export_markdown(&hits, &options);
+        let plain = export_plain_text(&hits, &options);
+        for (index, hit) in hits.iter().enumerate() {
+            let item = &json["hits"][index];
+            assert_eq!(item["source_path"], hit.source_path);
+            assert_eq!(item["source_id"], hit.source_id);
+            assert_eq!(item["conversation_id"].as_i64(), hit.conversation_id);
+            assert_eq!(
+                item["line_number"].as_u64(),
+                hit.line_number.map(|n| n as u64)
+            );
+            assert_eq!(item["coordinate_space"], "message_index");
+            assert_eq!(
+                item["message_anchor"].as_str(),
+                hit.message_anchor.as_deref()
+            );
+            assert!(markdown.contains(&hit.source_path));
+            assert!(markdown.contains(hit.message_anchor.as_deref().unwrap()));
+            assert!(plain.contains(hit.message_anchor.as_deref().unwrap()));
+        }
+        assert!(markdown.contains("| Message index | 42 |"));
+        assert!(plain.contains("Message index: 42"));
+        let hidden = export_json_value(
+            &hits,
+            &ExportOptions {
+                include_path: false,
+                ..options
+            },
+            "fixed",
+        );
+        for hit in hidden["hits"].as_array().unwrap() {
+            for key in [
+                "source_path",
+                "source_id",
+                "conversation_id",
+                "line_number",
+                "message_anchor",
+                "coordinate_space",
+            ] {
+                assert!(hit.get(key).is_none());
+            }
+        }
     }
 
     #[test]

@@ -33,6 +33,37 @@ const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 16 * 1024;
 
+pub(crate) mod snapshot_seal {
+    pub trait Sealed {}
+}
+
+/// Read access to one caller-owned canonical archive transaction.
+///
+/// Only CASS transaction owners implement this sealed interface. In particular,
+/// arbitrary client rows cannot stand in for canonical source evidence. The
+/// caller keeps the same snapshot active throughout retrieval and hydration;
+/// this interface cannot begin, replace, commit or roll back that snapshot.
+pub trait SemanticReadSnapshot: snapshot_seal::Sealed {
+    #[doc(hidden)]
+    fn query_with_params(
+        &self,
+        sql: &str,
+        params: &[crate::franken_sync::SqliteValue],
+    ) -> Result<Vec<crate::franken_sync::Row>, crate::franken_sync::FrankenError>;
+}
+
+impl snapshot_seal::Sealed for Transaction<'_> {}
+
+impl SemanticReadSnapshot for Transaction<'_> {
+    fn query_with_params(
+        &self,
+        sql: &str,
+        params: &[crate::franken_sync::SqliteValue],
+    ) -> Result<Vec<crate::franken_sync::Row>, crate::franken_sync::FrankenError> {
+        Transaction::query_with_params(self, sql, params)
+    }
+}
+
 /// The caller must explicitly name the projection used to build the artifact.
 /// There is no default or automatic reinterpretation of an old input contract.
 /// In either case a result is accepted only if its exact passage digest matches.
@@ -202,7 +233,7 @@ impl SemanticSearchBatch {
     /// edits outside it can legitimately leave its digest unchanged.
     pub fn hydrate_in_transaction(
         &self,
-        transaction: &Transaction<'_>,
+        transaction: &dyn SemanticReadSnapshot,
         projection: PassageProjection,
         budget: HydrationBudget,
     ) -> Result<HydratedSemanticBatch<Self>, HydrationError> {
@@ -250,7 +281,7 @@ impl SemanticSearchBatch {
 impl SelectedSemanticBatch {
     pub fn hydrate_in_transaction(
         &self,
-        transaction: &Transaction<'_>,
+        transaction: &dyn SemanticReadSnapshot,
         projection: PassageProjection,
         budget: HydrationBudget,
     ) -> Result<HydratedSemanticBatch<Self>, HydrationError> {
@@ -354,7 +385,7 @@ impl Work {
 
 fn hydrate(
     batch: &SemanticSearchBatch,
-    transaction: &Transaction<'_>,
+    transaction: &dyn SemanticReadSnapshot,
     projection: PassageProjection,
     budget: HydrationBudget,
     started: Instant,
@@ -367,7 +398,7 @@ fn hydrate(
 // passages are returned; an exhausted account is never reset by phase progress.
 fn hydrate_with_work(
     batch: &SemanticSearchBatch,
-    transaction: &Transaction<'_>,
+    transaction: &dyn SemanticReadSnapshot,
     projection: PassageProjection,
     work: &mut Work,
 ) -> Result<Vec<HydratedPassage>, HydrationError> {
@@ -484,7 +515,7 @@ impl SourceMessage {
 }
 
 fn read_message(
-    transaction: &Transaction<'_>,
+    transaction: &dyn SemanticReadSnapshot,
     id: u64,
     work: &mut Work,
 ) -> Result<SourceMessage, HydrationError> {

@@ -27380,21 +27380,34 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("fts-page-snapshot.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        seed_atomic_fts_rebuild_fixture(&storage);
-        let unicode_body = "é🙂";
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
         storage
-            .raw()
-            .execute_compat(
-                "UPDATE messages SET id = 100, content = ?1 WHERE idx = 0",
-                fparams![unicode_body],
-            )
+            .insert_conversation_tree(agent_id, None, &frontier_test_conversation(&[]))
             .unwrap();
         let conversation_id: i64 = storage
             .raw()
             .query_row_map(
-                "SELECT conversation_id FROM messages WHERE id = 100",
+                "SELECT id FROM conversations WHERE external_id = 'frontier-test'",
                 fparams![],
                 |row| row.get_typed(0),
+            )
+            .unwrap();
+        let unicode_body = "é🙂";
+        // Referenced message IDs are immutable; seed the sparse ID directly.
+        storage
+            .raw()
+            .execute_compat(
+                "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
+                 VALUES(100, ?1, 0, 'user', ?2, 1700000000001)",
+                fparams![conversation_id, unicode_body],
             )
             .unwrap();
         let sql_body_bytes: i64 = storage

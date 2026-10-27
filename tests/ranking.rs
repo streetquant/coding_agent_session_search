@@ -40,6 +40,7 @@ fn hit(title: &str, score: f32, age_days: Option<i64>, match_type: MatchType) ->
         origin_kind: "local".into(),
         origin_host: None,
         conversation_id: None,
+        message_anchor: None,
     }
 }
 

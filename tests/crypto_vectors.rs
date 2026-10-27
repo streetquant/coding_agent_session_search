@@ -13,10 +13,7 @@ fn parse_yaml<T: DeserializeOwned>(mut reader: impl Read) -> Result<T, serde_sap
     // fixture without a document is incomplete input, not an empty vector.
     if input.iter().all(u8::is_ascii_whitespace) {
         return Err(serde_saphyr::Error::IOError {
-            cause: std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "empty YAML document",
-            ),
+            cause: std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "empty YAML document"),
         });
     }
     serde_saphyr::from_reader_with_options(

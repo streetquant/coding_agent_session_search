@@ -1207,7 +1207,9 @@ mod tests {
                         let sql = if change_schema {
                             "CREATE INDEX changed_during_visit ON messages(role)"
                         } else {
-                            "UPDATE messages SET content = 'changed during visit' WHERE id = 11"
+                            // Preserve the preflight body length so this exercises
+                            // the final source clock check rather than size drift.
+                            "UPDATE messages SET content = 'mutate canonical source passage' WHERE id = 11"
                         };
                         transaction.execute(sql)?;
                     }
@@ -1227,6 +1229,34 @@ mod tests {
             ));
             transaction.rollback()?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn source_passage_visitor_rejects_body_length_drift_before_certifying() -> TestResult {
+        let connection = fixture()?;
+        let mut transaction = connection.transaction()?;
+        let mut calls = 0;
+        let result = visit_semantic_source_passages_in_transaction(
+            &transaction,
+            SemanticSourceContract::new(PassageProjection::RawPassagesV2),
+            Default::default(),
+            |_| {
+                transaction.execute(
+                    "UPDATE messages SET content = 'changed during visit' WHERE id = 11",
+                )?;
+                calls += 1;
+                Ok::<(), crate::franken_sync::FrankenError>(())
+            },
+        );
+        assert_eq!(calls, 1);
+        assert!(matches!(
+            result,
+            Err(SemanticSourceVisitError::Source(
+                SemanticSourceSnapshotError::InvalidSource
+            ))
+        ));
+        transaction.rollback()?;
         Ok(())
     }
 
@@ -1574,6 +1604,7 @@ mod tests {
         let mut identity = model.identity()?.clone();
         identity.storage.format = "fsvi-v2".into();
         identity.storage.quantization = QuantizationFormat::F16;
+        identity.storage.endianness = "little-endian".into();
         let binding = FsviV2IdentityBinding::new(
             ArtifactGenerationIdentityV1::new(1, [19; 16])?,
             identity.freeze()?,

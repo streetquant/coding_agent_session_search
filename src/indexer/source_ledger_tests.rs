@@ -20,7 +20,8 @@ fn discovered(path: &Path, slug: &str) -> DiscoveredSourceFile {
 fn saved_row(source: &DiscoveredSourceFile, dependencies: Vec<serde_json::Value>) -> String {
     serde_json::json!({
         "primary": source_file_observation(&source.source_path).unwrap(),
-        "producer_contract": env!("CASS_SOURCE_INGEST_CONTRACT"),
+        "producer_contract": crate::connectors::ingest_contract::provider_contract(
+            &source.provider_slug),
         "dependencies": dependencies,
     })
     .to_string()
@@ -378,12 +379,18 @@ fn gh512_benchmark_4159_unchanged_sources_in_10_growing_folders() {
     );
 }
 
-// Verbatim pre-fix matcher for the same-invocation benchmark.
+// Pre-fix matcher for the same-invocation benchmark: the pre-fix row shape
+// and the pre-fix observation work, compared against the running contract of
+// the provider that produced the source.
 fn gh512_incumbent_source_ledger_matches(observation: &str, source: &DiscoveredSourceFile) -> bool {
     let Ok(saved) = serde_json::from_str::<serde_json::Value>(observation) else {
         return false;
     };
-    if saved["producer_contract"].as_str() != Some(env!("CASS_SOURCE_INGEST_CONTRACT")) {
+    if saved["producer_contract"].as_str()
+        != Some(crate::connectors::ingest_contract::provider_contract(
+            &source.provider_slug,
+        ))
+    {
         return false;
     }
     if saved["primary"] != source_file_observation(&source.source_path).unwrap_or_default() {

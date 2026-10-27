@@ -150,6 +150,8 @@ impl PaletteGroup {
 /// Action identifiers the palette can emit. These map to app-level commands.
 #[derive(Clone, Debug)]
 pub enum PaletteAction {
+    /// A global action from the same registry used by terminal dispatch/help.
+    Keymap(&'static str),
     ToggleTheme,
     ToggleDensity,
     ToggleHelpStrip,
@@ -192,6 +194,7 @@ impl PaletteAction {
     /// Returns the categorical group this action belongs to.
     pub fn group(&self) -> PaletteGroup {
         match self {
+            Self::Keymap(_) => PaletteGroup::View,
             Self::ToggleTheme
             | Self::ToggleDensity
             | Self::ToggleHelpStrip
@@ -231,6 +234,7 @@ impl PaletteAction {
     /// the match is exhaustive by design.
     pub fn target_msg_name(&self) -> &'static str {
         match self {
+            Self::Keymap(_) => "shared keymap action",
             // Chrome
             Self::ToggleTheme => "ThemeToggled",
             Self::ToggleDensity => "DensityModeCycled",
@@ -280,6 +284,8 @@ impl PaletteAction {
 /// into concrete `Cmd<CassMsg>` dispatches.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PaletteResult {
+    /// Execute the global action identified by its primary shortcut.
+    Keymap(&'static str),
     /// Toggle the UI theme (light/dark).
     ToggleTheme,
     /// Cycle the density mode (compact/normal/relaxed).
@@ -363,6 +369,7 @@ impl PaletteAction {
     /// `PaletteResult` into concrete `Cmd<CassMsg>` via `palette_result_to_cmd`.
     pub fn dispatch(&self) -> PaletteResult {
         match self {
+            Self::Keymap(primary) => PaletteResult::Keymap(primary),
             // Chrome
             Self::ToggleTheme => PaletteResult::ToggleTheme,
             Self::ToggleDensity => PaletteResult::CycleDensity,
@@ -647,21 +654,29 @@ pub fn default_actions() -> Vec<PaletteItem> {
     items.push(item(
         PaletteAction::Sources,
         "Sources management",
-        "Ctrl+Shift+S",
+        shortcuts::SOURCES,
     ));
     // Slots 1-9
     for slot in 1..=9 {
         items.push(item(
             PaletteAction::SaveViewSlot(slot),
             format!("Save view to slot {slot}"),
-            format!("Ctrl+{slot}"),
+            format!("Ctrl+F{slot}"),
         ));
         items.push(item(
             PaletteAction::LoadViewSlot(slot),
             format!("Load view from slot {slot}"),
-            format!("Shift+{slot}"),
+            format!("Alt+F{slot}"),
         ));
     }
+    items.extend(shortcuts::KEYMAP.iter().filter_map(|entry| {
+        let primary = entry.keys.first().copied()?;
+        Some(item(
+            PaletteAction::Keymap(primary),
+            entry.description,
+            entry.keys.join(" / "),
+        ))
+    }));
     items
 }
 

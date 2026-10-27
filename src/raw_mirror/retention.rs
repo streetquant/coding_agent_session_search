@@ -161,13 +161,16 @@ fn maintain(data_dir: &Path, policy: &RawMirrorAutomaticRetention, now: i64) -> 
     // while holding the mirror lock it needs for capture.
     let _index_run = try_acquire_index_run_lock_for_prune(data_dir)?;
     let _mutation = acquire_raw_mirror_mutation_lock(&root)?;
+    if !pending_prune_actions(&root)?.is_empty() {
+        anyhow::bail!("pending prune actions require explicit cass mirror prune --apply recovery");
+    }
     let used = measured_usage(&root)?;
     let available = fs2::available_space(&root)?;
     let mut result = RawMirrorMaintenanceReport {
         used_bytes_before: used, used_bytes_after: used, available_bytes_after: available,
         ..RawMirrorMaintenanceReport::default()
     };
-    let inventory = collect_prune_manifests(&root)?;
+    let inventory = collect_prune_manifests(&root, RawMirrorPruneLimits::default())?;
     let (physical_blobs, physical_blobs_complete) =
         collect_raw_mirror_physical_blobs(&root, &RawMirrorInventoryBudget::unbounded())?;
     if !physical_blobs_complete {
@@ -254,8 +257,12 @@ fn maintain(data_dir: &Path, policy: &RawMirrorAutomaticRetention, now: i64) -> 
         planned_manifest_count: selected.len() as u64, planned_blob_count: 0, planned_reclaim_bytes: 0,
         planned_staging_count: 0,
         applied_manifest_count: 0, applied_blob_count: 0, applied_staging_count: 0, applied_reclaim_bytes: 0,
+        audit_log_bytes_before: prune_audit_log_bytes(&root)?, audit_log_bytes_after: 0,
+        recovered_action_count: 0, recovered_reclaim_bytes: 0,
+        inventory_consistency: "mutation-lock".to_string(),
         audit_log_path: None, omitted_entry_count: 0, entries: Vec::new(),
     };
+    report.audit_log_bytes_after = report.audit_log_bytes_before;
     for item in &inventory {
         if let Some(successor) = selected.get(&item.manifest_id) {
             let old = &manifests[&item.manifest_id];
@@ -296,6 +303,7 @@ fn maintain(data_dir: &Path, policy: &RawMirrorAutomaticRetention, now: i64) -> 
         let (audit_path, mut audit_file) = open_prune_audit_log(&root)?;
         report.audit_log_path = Some(audit_path.display().to_string());
         apply_prune_entries(&root, &mut report, &audit_path, &mut audit_file)?;
+        report.audit_log_bytes_after = audit_file.metadata()?.len();
     }
     result.retired_manifests = report.applied_manifest_count;
     result.reclaimed_bytes = report.applied_reclaim_bytes;

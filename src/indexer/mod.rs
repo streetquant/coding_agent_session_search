@@ -70018,7 +70018,13 @@ c.close()
         assert_eq!(conversation.source_path, upstream.source_path);
         assert_eq!(conversation.started_at, upstream.started_at);
         assert_eq!(conversation.ended_at, upstream.ended_at);
-        assert_eq!(conversation.metadata, upstream.metadata);
+        let mut expected_metadata = upstream.metadata.clone();
+        expected_metadata
+            .as_object_mut()
+            .expect("upstream Codex metadata must remain an object")
+            .insert("native_session_id".to_string(), serde_json::json!("modern-id"));
+        assert_eq!(conversation.metadata, expected_metadata);
+        assert_eq!(repeated.metadata, expected_metadata);
         let stable_message_identity = |conversation: &NormalizedConversation| {
             conversation
                 .messages

@@ -65,7 +65,10 @@ impl Default for SemanticSelectionBudget {
 }
 
 impl SemanticSelectionBudget {
-    fn check(self, manifest: &SemanticGenerationManifestV1) -> SemanticSelectionResult<()> {
+    pub(crate) fn check(
+        self,
+        manifest: &SemanticGenerationManifestV1,
+    ) -> SemanticSelectionResult<()> {
         let declared = manifest
             .artifacts
             .iter()

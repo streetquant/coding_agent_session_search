@@ -4,6 +4,12 @@
 //! This module provides re-export stubs plus the CASS-specific wrappers used by
 //! every connector factory exposed to the indexer.
 
+pub(crate) mod ingest_contract;
+// The scope tables are shared with the build script, which resolves them
+// against the crate tree; the runtime only reads the baked contracts, so the
+// resolution helpers are exercised by the build script and the scope tests.
+#[allow(dead_code)]
+pub(crate) mod ingest_scope;
 pub(crate) mod source_dependencies;
 
 use std::fs;

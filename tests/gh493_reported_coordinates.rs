@@ -3,8 +3,11 @@
 //! Seed canonical rows deliberately: this suite tests archive addressing and
 //! rendering, not provider ingestion or search. The separate
 //! gh493_message_coordinates target retains its real search round-trip test.
-use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+use coding_agent_search::franken_sync::compat::{
+    ConnectionExt, OpenFlags, RowExt, open_with_flags,
+};
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+use coding_agent_search::search::query::message_anchor_for_content;
 use coding_agent_search::storage::sqlite::FrankenStorage;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -122,7 +125,31 @@ impl Fixture {
         }
     }
 
-    fn follow(&self, command: &str, number: usize, context: usize) -> Output {
+    fn message_anchor(&self, number: usize) -> String {
+        let connection =
+            open_with_flags(&self.db.to_string_lossy(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let content = connection
+            .query_map_collect(
+                "SELECT content FROM messages WHERE conversation_id = ?1 AND idx = ?2",
+                coding_agent_search::franken_sync::params![
+                    self.conversation_id,
+                    i64::try_from(number.checked_sub(1).unwrap()).unwrap()
+                ],
+                |row| row.get_typed::<String>(0),
+            )
+            .unwrap();
+        assert_eq!(content.len(), 1, "fixture target must be unique");
+        message_anchor_for_content(
+            "local",
+            self.path.to_string_lossy().as_ref(),
+            Some(self.conversation_id),
+            Some(number),
+            &content[0],
+        )
+        .unwrap()
+    }
+
+    fn follow(&self, command: &str, number: usize, context: usize, anchor: &str) -> Output {
         Command::new(env!("CARGO_BIN_EXE_cass"))
             .arg("--db")
             .arg(&self.db)
@@ -137,6 +164,8 @@ impl Fixture {
             .args([
                 "--message-index",
                 &number.to_string(),
+                "--message-anchor",
+                anchor,
                 "-C",
                 &context.to_string(),
                 "--json",
@@ -181,7 +210,8 @@ fn reported_129_and_541_targets_preserve_canonical_text_and_tool_role() {
         for (number, content, role) in
             [(129, TOOL_TEXT, "tool"), (541, ASSISTANT_TEXT, "assistant")]
         {
-            let result = rows(fixture.follow(command, number, 0), command);
+            let anchor = fixture.message_anchor(number);
+            let result = rows(fixture.follow(command, number, 0, &anchor), command);
             assert_eq!(result.len(), 1);
             let target = &result[0];
             assert_eq!(target["content"], content);
@@ -189,6 +219,7 @@ fn reported_129_and_541_targets_preserve_canonical_text_and_tool_role() {
             assert_eq!(target["message_index"], number);
             assert_eq!(target["line"], number);
             assert_eq!(target["conversation_id"], fixture.conversation_id);
+            assert_eq!(target["message_anchor"], anchor);
             assert_eq!(target["source_id"], "local");
             assert_eq!(target["coordinate_space"], "message_index");
             assert_eq!(target["content_source"], "archive");
@@ -204,7 +235,8 @@ fn reported_129_and_541_targets_preserve_canonical_text_and_tool_role() {
 fn context_counts_messages_across_large_index_gaps_without_substituting_targets() {
     let fixture = Fixture::new(false);
     for command in ["expand", "view"] {
-        let result = rows(fixture.follow(command, 541, 1), command);
+        let anchor = fixture.message_anchor(541);
+        let result = rows(fixture.follow(command, 541, 1, &anchor), command);
         let numbers: Vec<_> = result
             .iter()
             .map(|row| row["message_index"].as_u64().unwrap())
@@ -215,8 +247,11 @@ fn context_counts_messages_across_large_index_gaps_without_substituting_targets(
             1
         );
         assert_eq!(result[1]["content"], ASSISTANT_TEXT);
+        assert_eq!(result[1]["message_anchor"], anchor);
         for missing in [128, 130, 540, 542, 2375] {
-            let output = fixture.follow(command, missing, 1);
+            // A real retained token must not turn an absent ordinal into its
+            // neighbouring message, even when the token names that neighbour.
+            let output = fixture.follow(command, missing, 1, &anchor);
             assert!(
                 !output.status.success(),
                 "substituted a neighbour for {missing}"
@@ -230,10 +265,12 @@ fn context_counts_messages_across_large_index_gaps_without_substituting_targets(
 fn pretty_printed_json_is_not_treated_as_a_message_numbered_file() {
     let fixture = Fixture::new(true);
     for command in ["expand", "view"] {
-        let result = rows(fixture.follow(command, 541, 0), command);
+        let anchor = fixture.message_anchor(541);
+        let result = rows(fixture.follow(command, 541, 0, &anchor), command);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["content"], ASSISTANT_TEXT);
         assert_eq!(result[0]["message_index"], 541);
+        assert_eq!(result[0]["message_anchor"], anchor);
         assert_eq!(result[0]["is_target"], true);
     }
 }
@@ -248,6 +285,7 @@ fn quickstart_does_not_feed_search_ordinals_to_raw_line_flags() {
             .find(|line| line.starts_with("cass ") && line.contains(&format!(" {command} ")))
             .expect("documented follow-up");
         assert!(line.contains("--message-index"), "{line}");
+        assert!(line.contains("--message-anchor"), "{line}");
         assert!(line.contains("--source"), "{line}");
         assert!(line.contains("--conversation-id"), "{line}");
         assert!(line.contains("--db"), "{line}");

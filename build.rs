@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fs;
@@ -6,6 +6,16 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
 use toml::Value;
+
+/// The ingest scope tables are shared verbatim with the crate so the build
+/// script and the runtime resolve the same scope. The module may only use
+/// `std` and `blake3`.
+///
+/// The scope helpers are exercised by the build script and by the crate's
+/// scope tests; the ones this script does not call are allowed to be unused.
+#[allow(dead_code)]
+#[path = "src/connectors/ingest_scope.rs"]
+mod ingest_scope;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ValidationMode {
@@ -416,13 +426,19 @@ fn main() {
     validate_path_dependency_contracts(&manifest_dir, &manifest, packaged_manifest);
     emit_vergen_metadata();
     emit_build_commit_metadata(&manifest_dir);
-    emit_source_ingest_contract(&manifest_dir);
+    emit_source_ingest_contracts(&manifest_dir);
 }
 
 /// A completed source is reusable only by the parser/normalizer that read it.
 /// Hash build inputs rather than Git HEAD: release tarballs have no Git metadata,
 /// and two dirty builds at the same commit can contain different parser fixes.
-fn emit_source_ingest_contract(manifest_dir: &Path) {
+///
+/// The contract is scoped per provider: an edit to one connector's code
+/// invalidates that connector's completions, while an edit outside the ingest
+/// surface (the TUI, the HTML exporter, a doc comment) leaves every contract
+/// untouched and the next incremental run reuses every completion
+/// (bead `coding_agent_session_search-ayhvu`).
+fn emit_source_ingest_contracts(manifest_dir: &Path) {
     // Cargo pins registry/git source bytes, but a local path dependency can
     // change its parser without changing this crate's manifest or lockfile.
     // Such development builds must reparse instead of reusing an unproven
@@ -469,55 +485,100 @@ fn emit_source_ingest_contract(manifest_dir: &Path) {
         "cargo:rustc-env=CASS_SOURCE_INGEST_REUSE_BLOCKER={}",
         reuse_blocker.unwrap_or_default()
     );
-    let mut inputs = BTreeSet::from([
-        PathBuf::from("Cargo.toml"),
-        PathBuf::from("Cargo.lock"),
-        PathBuf::from("build.rs"),
-    ]);
-    let mut directories = vec![PathBuf::from("src")];
-    while let Some(directory) = directories.pop() {
-        println!("cargo:rerun-if-changed={}", directory.display());
-        let entries = fs::read_dir(manifest_dir.join(&directory))
-            .unwrap_or_else(|error| fatal(format!("cannot read ingest inputs: {error}")));
-        for entry in entries {
-            let entry = entry
-                .unwrap_or_else(|error| fatal(format!("cannot inspect ingest input: {error}")));
-            let path = directory.join(entry.file_name());
-            let kind = entry.file_type().unwrap_or_else(|error| {
-                fatal(format!("cannot inspect ingest input type: {error}"))
-            });
-            if kind.is_dir() {
-                directories.push(path);
-            } else {
-                inputs.insert(path);
-            }
-        }
-    }
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"cass-source-ingest-contract-v1\0");
-    for input in inputs {
-        println!("cargo:rerun-if-changed={}", input.display());
-        let name = input.to_string_lossy().replace('\\', "/");
-        let bytes = fs::read(manifest_dir.join(&input))
-            .unwrap_or_else(|error| fatal(format!("cannot read ingest input {name}: {error}")));
-        hasher.update(&(name.len() as u64).to_le_bytes());
-        hasher.update(name.as_bytes());
-        hasher.update(&(bytes.len() as u64).to_le_bytes());
-        hasher.update(&bytes);
-    }
+
+    // The enabled feature set is a build input of every provider's producer.
     let features: BTreeSet<_> = env::vars()
         .filter(|(name, _)| name.starts_with("CARGO_FEATURE_"))
         .collect();
+    let mut feature_hasher = blake3::Hasher::new();
+    feature_hasher.update(b"cass-source-ingest-features-v1\0");
     for (name, value) in features {
-        hasher.update(name.as_bytes());
-        hasher.update(b"=");
-        hasher.update(value.as_bytes());
-        hasher.update(b"\0");
+        feature_hasher.update(name.as_bytes());
+        feature_hasher.update(b"=");
+        feature_hasher.update(value.as_bytes());
+        feature_hasher.update(b"\0");
     }
+    let feature_digest = feature_hasher.finalize().to_hex().to_string();
+
+    let core_files = ingest_scope::core_scope(manifest_dir)
+        .unwrap_or_else(|error| fatal(format!("cannot resolve the ingest scope: {error}")));
+    let core_digest = ingest_scope::digest_files(&core_files, manifest_dir, &BTreeMap::new())
+        .unwrap_or_else(|error| fatal(format!("cannot digest the ingest scope: {error}")));
+    for file in &core_files {
+        emit_scope_watch_paths(file);
+    }
+    for entry in ingest_scope::BUILD_INPUTS
+        .iter()
+        .chain(ingest_scope::CORE_SCOPE.iter())
+    {
+        println!("cargo:rerun-if-changed={entry}");
+    }
+
+    let mut scope_digests: BTreeMap<&str, String> = BTreeMap::new();
+    let mut contracts: BTreeMap<&str, String> = BTreeMap::new();
+    for (provider, _) in ingest_scope::PROVIDER_SCOPE {
+        let own_files = ingest_scope::provider_scope(provider, manifest_dir)
+            .unwrap_or_else(|error| fatal(format!("cannot resolve the ingest scope: {error}")));
+        for file in &own_files {
+            emit_scope_watch_paths(file);
+        }
+        let own_digest = ingest_scope::digest_files(&own_files, manifest_dir, &BTreeMap::new())
+            .unwrap_or_else(|error| fatal(format!("cannot digest the ingest scope: {error}")));
+        let scope_digest = ingest_scope::compose_digest(&[&core_digest, &own_digest]);
+        let contract = ingest_scope::compose_digest(&[&scope_digest, &feature_digest]);
+        scope_digests.insert(*provider, scope_digest);
+        contracts.insert(*provider, contract);
+    }
+
+    // A provider slug without a scope entry is unknown: give it the
+    // conservative contract that covers every provider's files, so it can
+    // never be reused on the strength of a narrower scope.
+    let all_files = ingest_scope::all_provider_scopes(manifest_dir)
+        .unwrap_or_else(|error| fatal(format!("cannot resolve the ingest scope: {error}")));
+    let all_digest = ingest_scope::digest_files(&all_files, manifest_dir, &BTreeMap::new())
+        .unwrap_or_else(|error| fatal(format!("cannot digest the ingest scope: {error}")));
+    let fallback_scope = ingest_scope::compose_digest(&[&core_digest, &all_digest]);
+    let fallback_contract = ingest_scope::compose_digest(&[&fallback_scope, &feature_digest]);
+    scope_digests.insert("*", fallback_scope);
+    contracts.insert("*", fallback_contract);
+
     println!(
-        "cargo:rustc-env=CASS_SOURCE_INGEST_CONTRACT={}",
-        hasher.finalize()
+        "cargo:rustc-env=CASS_SOURCE_INGEST_CONTRACTS={}",
+        encode_contracts(&contracts)
     );
+    println!(
+        "cargo:rustc-env=CASS_SOURCE_INGEST_SCOPE_DIGESTS={}",
+        encode_contracts(&scope_digests)
+    );
+}
+
+/// Encode the contract map the runtime reads back: `slug=digest` pairs in a
+/// stable order, with `*` naming the conservative fallback.
+fn encode_contracts(contracts: &BTreeMap<&str, String>) -> String {
+    let mut encoded = String::from("v2");
+    for (slug, digest) in contracts {
+        encoded.push(';');
+        encoded.push_str(slug);
+        encoded.push('=');
+        encoded.push_str(digest);
+    }
+    encoded
+}
+
+/// Watch a scoped file and the directories above it, so a file added to a
+/// scoped directory is picked up by the next contract computation. Without
+/// the directories, a new module under a scoped directory would enter the
+/// crate without entering the contract.
+fn emit_scope_watch_paths(file: &Path) {
+    println!("cargo:rerun-if-changed={}", file.display());
+    let mut directory = file.parent();
+    while let Some(parent) = directory {
+        if parent.as_os_str().is_empty() {
+            break;
+        }
+        println!("cargo:rerun-if-changed={}", parent.display());
+        directory = parent.parent();
+    }
 }
 
 /// Embed the build commit at compile time (GH #399).

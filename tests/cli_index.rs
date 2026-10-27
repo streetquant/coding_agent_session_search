@@ -268,14 +268,8 @@ fn foreground_index_names_preindex_compatibility_repair_and_resumes_an_interrupt
     assert_eq!(during["state"], "running", "{during}");
     assert_eq!(during["attempts"], 2, "{during}");
     assert_eq!(during["interrupted_attempts"], 1, "{during}");
-    assert!(
-        during["archive_bytes"].as_u64().unwrap() > 0,
-        "{during}"
-    );
-    assert!(
-        during["progress_total"].as_u64().unwrap() > 0,
-        "{during}"
-    );
+    assert!(during["archive_bytes"].as_u64().unwrap() > 0, "{during}");
+    assert!(during["progress_total"].as_u64().unwrap() > 0, "{during}");
     assert!(
         during["updated_at_unix"].as_u64().unwrap() >= interrupted_at.saturating_sub(1),
         "the durable receipt must advance with the new attempt: {during}"
@@ -315,10 +309,7 @@ fn foreground_index_names_preindex_compatibility_repair_and_resumes_an_interrupt
     assert_eq!(finished["exit_code"], 0, "{finished}");
     assert_eq!(finished["attempts"], 2, "{finished}");
     assert_eq!(finished["interrupted_attempts"], 1, "{finished}");
-    assert!(
-        finished["pages_total"].as_u64().unwrap() > 0,
-        "{finished}"
-    );
+    assert!(finished["pages_total"].as_u64().unwrap() > 0, "{finished}");
     assert!(
         finished["bytes_written"].as_u64().unwrap_or(0) > 0,
         "the completed receipt must retain measured work counters: {finished}"
@@ -3831,9 +3822,7 @@ fn gh495_residue_fts_shadows_converge_through_doctor_and_full_index() {
 /// to line up (the reporter's "intact legacy _docsize misleadingly looks
 /// healthy"), and both surfaces must name the same repair.
 fn seed_gh495_canonical_archive(db_path: &std::path::Path) {
-    use coding_agent_search::model::types::{
-        Agent, AgentKind, Conversation, Message, MessageRole,
-    };
+    use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use std::path::PathBuf;
 
     let storage = SqliteStorage::open(db_path).expect("open GH495 doctor fixture");

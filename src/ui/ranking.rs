@@ -113,6 +113,7 @@ mod tests {
             content: String::new(),
             content_hash: 0,
             conversation_id: None,
+            message_anchor: None,
             score,
             source_path: format!("/sessions/{title}.jsonl"),
             agent: "codex".to_string(),

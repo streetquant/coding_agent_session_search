@@ -844,9 +844,9 @@ fn capabilities_are_self_describing_for_agents() {
     );
     assert!(
         recoveries.iter().any(|recovery| recovery["wrong"]
-            == "cass view source_path=session.jsonl source_id=local line_number=42 --json"
+            == "cass view source_path=session.jsonl source_id=local line_number=42 message_anchor=<message_anchor> --json"
             && recovery["canonical"]
-                == "cass view session.jsonl --source local --message-index 42 --json"
+                == "cass view session.jsonl --source local --message-index 42 --message-anchor <message_anchor> --json"
             && recovery["accepted"] == true),
         "capabilities should advertise search-hit field bundle recovery"
     );
@@ -1566,6 +1566,7 @@ fn assert_pack_command_returns_evidence(command: &str, extra_args: &[&str]) {
     );
     assert_eq!(report["messages"], 1, "only the seeded message is indexed");
     let mut cmd = isolated_cass_cmd(home);
+    cmd.env("CASS_SEMANTIC_EMBEDDER", "hash");
     cmd.args([command, "auth", "--json", "--data-dir"]);
     cmd.arg(&data_dir);
     cmd.args([
@@ -1600,9 +1601,8 @@ fn assert_pack_command_returns_evidence(command: &str, extra_args: &[&str]) {
     );
     assert_eq!(citation["verified"], true);
 
-    // GH #507: pack selects evidence lexically. A default (hybrid-preferred)
-    // request reports that fallback with its cause; an explicit lexical
-    // request is not a fallback at all.
+    // This fixture has no semantic vectors. A hybrid request reports that
+    // actual unavailability; an explicit lexical request is not a fallback.
     let warnings: Vec<&str> = json["_meta"]["warnings"]
         .as_array()
         .expect("pack warnings")
@@ -1626,7 +1626,7 @@ fn assert_pack_command_returns_evidence(command: &str, extra_args: &[&str]) {
     } else {
         assert_eq!(realized["fallback_mode"], "lexical", "{json}");
         assert_eq!(
-            realized["fallback_reason"], "pack_enrichment_unavailable",
+            realized["fallback_reason"], "semantic_context_unavailable",
             "{json}"
         );
         assert!(warnings.contains(&"semantic_fallback_lexical"), "{json}");
@@ -1784,6 +1784,10 @@ fn view_search_hit_assignments_require_an_archive_instead_of_reading_raw_lines()
             .arg(&missing)
             .arg("view")
             .args(fields)
+            // Keep this probe focused on the absent archive, rather than
+            // the earlier missing-token refusal.
+            .arg("--message-anchor")
+            .arg(format!("v1:{}", "0".repeat(64)))
             .arg("--json");
         let output = cmd.assert().failure().get_output().clone();
         assert!(output.stdout.is_empty(), "must not emit a raw-line target");
@@ -4114,6 +4118,12 @@ fn binary_dispatched_serve_and_archive_are_discoverable() {
 
         let stdout = |args: &[&str]| -> String {
             let mut cmd = base_cmd();
+            // Clap renders help before normal output preferences initialize.
+            // Keep command registration independent of host terminal styling.
+            cmd.env("NO_COLOR", "1");
+            cmd.env_remove("CLICOLOR_FORCE");
+            cmd.env_remove("FORCE_COLOR");
+            cmd.arg("--color=never");
             cmd.args(args);
             String::from_utf8_lossy(&cmd.assert().success().get_output().stdout).into_owned()
         };

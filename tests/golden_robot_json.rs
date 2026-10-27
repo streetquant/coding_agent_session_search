@@ -524,6 +524,22 @@ fn normalize_live_robot_values(value: &mut Value) {
                     *child = json!("[RESULT_SNIPPET]");
                     continue;
                 }
+                // The digest binds the original unsanitized source path and
+                // complete body. Path/text placeholders cannot normalize it.
+                if redact_result_content
+                    && key == "message_anchor"
+                    && child.as_str().is_some_and(|anchor| {
+                        anchor.strip_prefix("v1:").is_some_and(|digest| {
+                            digest.len() == 64
+                                && digest.bytes().all(|byte| {
+                                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                                })
+                        })
+                    })
+                {
+                    *child = json!("[MESSAGE_ANCHOR]");
+                    continue;
+                }
 
                 match key.as_str() {
                     "os" | "arch" if child.is_string() => {
@@ -866,7 +882,8 @@ fn live_value_scrubbing_redacts_repo_paths_and_result_content() -> Result<(), St
                 "line_number": 42,
                 "agent": "aider",
                 "snippet": "private snippet",
-                "content": "private prompt and assistant transcript"
+                "content": "private prompt and assistant transcript",
+                "message_anchor": format!("v1:{}", "a".repeat(64))
             },
             {
                 "source_path": format!("{legacy_fixture_root}/tests/fixtures/aider/session.md"),
@@ -874,9 +891,26 @@ fn live_value_scrubbing_redacts_repo_paths_and_result_content() -> Result<(), St
                 "line_number": 7,
                 "agent": "aider",
                 "snippet": "legacy private snippet",
-                "content": "legacy private prompt and assistant transcript"
+                "content": "legacy private prompt and assistant transcript",
+                "message_anchor": null
+            },
+            {
+                "source_path": "missing-proof.jsonl",
+                "line_number": 1,
+                "agent": "codex",
+                "message_anchor": "malformed-proof"
+            },
+            {
+                "source_path": "no-proof.jsonl",
+                "line_number": 1,
+                "agent": "codex"
             }
-        ]
+        ],
+        "response_schemas": {
+            "search": {"type": "object", "properties": {
+                "message_anchor": {"type": ["string", "null"]}
+            }}
+        }
     }))
     .expect("serialize fixture");
 
@@ -891,6 +925,7 @@ fn live_value_scrubbing_redacts_repo_paths_and_result_content() -> Result<(), St
     require_json_string_eq(&scrubbed, "/results/0/workspace", "[REPO]")?;
     require_json_string_eq(&scrubbed, "/results/0/snippet", "[RESULT_SNIPPET]")?;
     require_json_string_eq(&scrubbed, "/results/0/content", "[RESULT_CONTENT]")?;
+    require_json_string_eq(&scrubbed, "/results/0/message_anchor", "[MESSAGE_ANCHOR]")?;
     require_json_string_eq(
         &scrubbed,
         "/results/1/source_path",
@@ -899,6 +934,13 @@ fn live_value_scrubbing_redacts_repo_paths_and_result_content() -> Result<(), St
     require_json_string_eq(&scrubbed, "/results/1/workspace", "[REPO]")?;
     require_json_string_eq(&scrubbed, "/results/1/snippet", "[RESULT_SNIPPET]")?;
     require_json_string_eq(&scrubbed, "/results/1/content", "[RESULT_CONTENT]")?;
+    assert!(scrubbed["results"][1]["message_anchor"].is_null());
+    assert_eq!(scrubbed["results"][2]["message_anchor"], "malformed-proof");
+    assert!(scrubbed["results"][3].get("message_anchor").is_none());
+    assert_eq!(
+        scrubbed["response_schemas"]["search"]["properties"]["message_anchor"]["type"],
+        json!(["string", "null"])
+    );
     let serialized = serde_json::to_string(&scrubbed).expect("serialize scrubbed fixture");
     if serialized.contains("private prompt") {
         return Err("scrubbed fixture leaked private prompt text".to_string());

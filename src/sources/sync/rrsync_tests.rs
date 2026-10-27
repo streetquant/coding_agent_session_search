@@ -113,7 +113,7 @@ fn restricted_readonly_transfer() {
         std::fs::create_dir_all(&destination).expect("create destination");
         let destination_str = destination.to_str().expect("UTF-8 destination");
         let transfer = |protection| {
-            run_rsync_command("5", &transport, &remote, destination_str, protection)
+            run_rsync_command("5", &transport, &remote, destination_str, protection, &[])
                 .expect("execute real rsync")
         };
         let rejected = transfer(protection);

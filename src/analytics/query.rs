@@ -4623,6 +4623,7 @@ mod tests {
                 created_at_ms INTEGER,
                 tool_call_count INTEGER NOT NULL DEFAULT 0,
                 content_tokens_est INTEGER,
+                api_data_source TEXT,
                 api_input_tokens INTEGER,
                 api_output_tokens INTEGER,
                 api_cache_read_tokens INTEGER,
@@ -4687,17 +4688,17 @@ mod tests {
         conn.execute(
             "INSERT INTO message_metrics
              (message_id, created_at_ms, tool_call_count, content_tokens_est,
-              api_input_tokens, api_output_tokens, api_cache_read_tokens,
+              api_data_source, api_input_tokens, api_output_tokens, api_cache_read_tokens,
               api_cache_creation_tokens, api_thinking_tokens)
-             VALUES (11, 1700000000000, 2, 30, 10, 20, 0, 0, 0)",
+             VALUES (11, 1700000000000, 2, 30, 'api', 10, 20, 0, 0, 0)",
         )
         .unwrap();
         conn.execute(
             "INSERT INTO message_metrics
              (message_id, created_at_ms, tool_call_count, content_tokens_est,
-              api_input_tokens, api_output_tokens, api_cache_read_tokens,
+              api_data_source, api_input_tokens, api_output_tokens, api_cache_read_tokens,
               api_cache_creation_tokens, api_thinking_tokens)
-             VALUES (21, 1700000001000, 7, 90, 30, 70, 0, 0, 0)",
+             VALUES (21, 1700000001000, 7, 90, 'api', 30, 70, 0, 0, 0)",
         )
         .unwrap();
 
