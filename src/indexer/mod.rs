@@ -69846,9 +69846,9 @@ c.close()
     fn cass_connector_registry_installs_every_cass_adapter() -> anyhow::Result<()> {
         let upstream = franken_agent_detection::get_connector_factories();
         let configured = get_connector_factories();
-        anyhow::ensure!(configured.len() == upstream.len() + 3);
+        anyhow::ensure!(configured.len() == upstream.len() + 4);
 
-        for native in ["kilo", "cloudmcp", "openwebui"] {
+        for native in ["kilo", "cloudmcp", "openwebui", "dsh"] {
             anyhow::ensure!(
                 configured
                     .iter()
