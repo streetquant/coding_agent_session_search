@@ -1186,6 +1186,8 @@ fn grok_bot_fifo_cli_preserves_evicted_and_new_messages() {
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("XDG_DATA_HOME", home.join(".local/share"))
             .env("CASS_GROK_BOT_DATA_ROOT", root)
+            .env("CASS_CLOUDMCP_DATA_ROOT", home.join("empty-cloudmcp"))
+            .env("CASS_OPENWEBUI_DATA_ROOT", home.join("empty-openwebui"))
             .env("CASS_DATA_DIR", data)
             .env("CASS_IGNORE_SOURCES_CONFIG", "1")
             .env("CASS_STREAMING_INDEX", streaming)

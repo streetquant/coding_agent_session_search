@@ -616,6 +616,7 @@ ubs_delta_gate() {
             # insertion point is after the file's leading inner attributes
             # and inner doc comments, which is always a top-level position.
             python3 - "$base_tree/$control_rel" "$base_tree/control_probe.txt" <<'PYPLANT'
+import json
 import sys
 from pathlib import Path
 
@@ -625,7 +626,17 @@ probe_lines = [
     "// report as a new finding. Planted by scripts/gate.sh in a temporary tree.",
     "fn __cass_ubs_gate_control_probe() -> usize {",
     "    let value: Option<usize> = Some(1);",
-    "    value.unwrap()",
+    # Identifiers are erased by the pinned scanner's fingerprint normalizer.
+    # A bare unwrap collides with old calls and shifts their ordinal instead
+    # of reporting this plant. Keep a distinct literal on the unwrap's line.
+    "    value.unwrap() + 0xCA55_5A17",
+    "}",
+    "// ubs:ignore[rust.domain.sql-concat] -- Scope control: immutable SQL arithmetic.",
+    'const __CASS_UBS_SQL_CONTROL: &str = r#"',
+    "    UPDATE gate_counter SET value = value + 0xCA55_5A18;",
+    '"#;',
+    "fn __cass_ubs_sql_control(untrusted: &str) -> String {",
+    '    "SELECT 0xCA55_5A19 " .to_string() + untrusted',
     "}",
 ]
 text = target.read_text(encoding="utf-8")
@@ -638,8 +649,15 @@ for index, line in enumerate(lines):
     else:
         break
 planted = [line + "\n" for line in probe_lines]
-target.write_text("".join(lines[:insert_at] + planted + lines[insert_at:]), encoding="utf-8")
-Path(sys.argv[2]).write_text("%d %d\n" % (insert_at + 1, insert_at + len(planted)), encoding="utf-8")
+planted_text = "".join(lines[:insert_at] + planted + lines[insert_at:])
+target.write_text(planted_text, encoding="utf-8")
+source_copy = Path(sys.argv[2]).with_suffix(".rs")
+source_copy.write_text(planted_text, encoding="utf-8")
+Path(sys.argv[2]).write_text(json.dumps({
+    "path": str(target.resolve()), "source": str(source_copy),
+    "unwrap": insert_at + 5, "static_sql": insert_at + 9,
+    "dynamic_sql": insert_at + 12,
+}) + "\n", encoding="utf-8")
 PYPLANT
             ( cd "$base_tree" && JOBS=1 UBS_ALLOW_UNVERIFIED_HELPERS=0 bash "$scanner" --module-dir="$modules" --no-auto-update --format=json --ci --baseline="$baseline_json" --new-only --fail-on-warning "$control_rel" ) >"$base_tree/control_planted.json" 2>"$base_tree/control_planted.err"
             planted_rc=$?
@@ -670,7 +688,7 @@ PYPLANT
     #   a tests//benches/ path component, a file that is only reachable
     #   through cfg(test)-gated `mod` declarations
     #   (ubs_core.analyzers.cfg_test_only_rust.compute_test_only), or a line
-    #   inside a cfg(test)-gated item.
+    #   inside a cfg(test)-gated item or an exact #[test] function.
     # Upstream's own --exclude-tests also drops everything at or after a
     # file's first `#[cfg(test)]` or `mod tests` line. Upstream's docstring
     # warns that this heuristic "can encompass later production code", so
@@ -687,6 +705,7 @@ import json
 import os
 import re
 import sys
+from bisect import bisect_right
 from collections import Counter
 from pathlib import Path
 
@@ -742,7 +761,11 @@ ITEM_SIG_RE = re.compile(
     r"(?:unsafe\s+)?(?:extern\s+\"[^\"]*\"\s+)?"
     r"(?:fn|mod|struct|enum|impl|trait|union)\b"
 )
-# How far a cfg(test) item's signature may run before its body must open.
+TEST_FN_SIG_RE = re.compile(
+    r"^(?:pub(?:\s*\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?"
+    r"(?:unsafe\s+)?fn\b"
+)
+# How far a test-only item's signature may run before its body must open.
 ITEM_BODY_LOOKAHEAD = 200
 
 
@@ -780,7 +803,7 @@ def test_boundary(path_str):
     return b1 or b2
 
 
-def strip_rust(text):
+def strip_rust(text, literal_spans=None):
     """Blank out comments and literals so brace counting sees code only."""
     def blank(chunk):
         return "".join(ch if ch == "\n" else " " for ch in chunk)
@@ -808,6 +831,8 @@ def strip_rust(text):
                     stop += 2
                 else:
                     stop += 1
+            if depth and literal_spans is not None:
+                literal_spans.append((None, None))
             out.append(blank(text[index:stop]))
             index = stop
             continue
@@ -822,19 +847,25 @@ def strip_rust(text):
                 term = "\"" + "#" * hashes
                 found = text.find(term, stop)
                 stop = size if found < 0 else found + len(term)
+                if literal_spans is not None:
+                    literal_spans.append((index, stop) if found >= 0 else (None, None))
                 out.append(blank(text[index:stop]))
                 index = stop
                 continue
         if ch == "\"":
             stop = index + 1
+            terminated = False
             while stop < size:
                 if text[stop] == "\\":
                     stop += 2
                     continue
                 if text[stop] == "\"":
                     stop += 1
+                    terminated = True
                     break
                 stop += 1
+            if literal_spans is not None:
+                literal_spans.append((index, stop) if terminated else (None, None))
             out.append(blank(text[index:stop]))
             index = stop
             continue
@@ -850,8 +881,8 @@ def strip_rust(text):
     return "".join(out)
 
 
-def cfg_test_regions(path_str):
-    """Lines that sit inside a #[cfg(test)]-gated item.
+def rust_test_regions(raw):
+    """Exact body lines of cfg(test) items and #[test] functions.
 
     This is the sound part of upstream's test classification: a finding is
     test code only when the file is a test-only file or the line is inside an
@@ -860,67 +891,201 @@ def cfg_test_regions(path_str):
     `#[cfg(test)]` or `mod tests` line, which can hide production code that
     follows the test module; that part is reported, not excluded.
     """
+    source = strip_rust(raw)
+    lines = source.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    stack = []
+    closing = {}
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    for offset, char in enumerate(source):
+        if char in pairs:
+            stack.append((offset, char))
+        elif char in ")]}":
+            if not stack or pairs[stack[-1][1]] != char:
+                return set(), False
+            opened, opener = stack.pop()
+            if opener == "{":
+                closing[opened] = offset
+    if stack:
+        # Ambiguous or unbalanced source never grants an exemption.
+        return set(), False
+    marked = set()
+    pending = None
+    for index, line in enumerate(lines):
+        text = line.strip()
+        match = ATTR_RE.fullmatch(text)
+        if match:
+            if CFG_TEST_RE.match(match.group(1)):
+                pending = "cfg"
+            elif match.group(1).strip() == "test" and pending != "cfg":
+                pending = "test"
+            continue
+        if not text:
+            continue
+        if pending:
+            signature = TEST_FN_SIG_RE if pending == "test" else ITEM_SIG_RE
+            if signature.match(text):
+                limit = offsets[min(len(lines), index + ITEM_BODY_LOOKAHEAD + 1)]
+                # A declaration or scope end cannot borrow a later item's
+                # body. Unsupported signatures stay enforced.
+                opening = re.search(r"[;{}]", source[offsets[index]:limit])
+                if opening and opening.group() == "{":
+                    body = offsets[index] + opening.start()
+                    end = closing[body]
+                    end_line = bisect_right(offsets, end) - 1
+                    # Findings have line precision. A production item after
+                    # the closing brace shares that line, so retain it all.
+                    tail = source[end + 1:offsets[end_line + 1]].strip()
+                    stop = end_line if tail else end_line + 1
+                    marked.update(range(index + 1, stop + 1))
+            pending = None
+    return marked, True
+
+
+def cfg_test_regions(path_str):
     try:
         raw = Path(path_str).read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return set(), False
-    lines = raw.splitlines()
-    stripped = strip_rust(raw).splitlines()
-    if len(stripped) != len(lines):
-        return set(), False
-    before = []
-    after = []
-    depth = 0
-    for line in stripped:
-        before.append(depth)
-        depth += line.count("{") - line.count("}")
-        after.append(depth)
-    if depth != 0:
-        # An unbalanced file is not classifiable; keep every finding in it.
-        return set(), False
-    marked = set()
-    pending = False
-    for index, line in enumerate(lines):
-        match = ATTR_RE.match(line)
-        if match:
-            if CFG_TEST_RE.match(match.group(1)):
-                pending = True
+    return rust_test_regions(raw)
+
+
+SQL_CONSTANT_RULE = "rust.domain.sql-concat"
+SQL_CONSTANT_LINES = {}
+
+
+def annotated_sql_constant_lines(raw):
+    """Honor the exact SQL rule marker on a sole immutable string initializer.
+
+    UBS 5.4.4 loses a const declaration's marker at raw-string body lines.
+    Its pinned marker parser still owns comment recognition. Unsupported
+    expressions, ambiguous physical lines and malformed source stay enforced.
+    """
+    spans = []
+    code = strip_rust(raw, spans)
+    if any(start is None for start, _ in spans) or not rust_test_regions(raw)[1]:
+        return set()
+    markers = parse_markers(raw, lang="rust")
+    admitted = set()
+    for start, stop in spans:
+        boundary = max(code.rfind(";", 0, start), code.rfind("{", 0, start),
+                       code.rfind("}", 0, start)) + 1
+        prefix = code[boundary:start]
+        if not re.fullmatch(
+                r"\s*(?:pub(?:\s*\([^)]*\))?\s+)?const\s+[A-Za-z_][A-Za-z_0-9]*"
+                r"\s*:\s*&\s*(?:'static\s+)?str\s*=\s*", prefix):
             continue
-        text = line.strip()
-        if not text or text.startswith("//"):
+        declaration = boundary + len(prefix) - len(prefix.lstrip())
+        line_start = code.rfind("\n", 0, declaration) + 1
+        if code[line_start:declaration].strip():
             continue
-        if pending:
-            if after[index] > before[index]:
-                stop = index + 1
-                while stop < len(lines) and before[stop] > before[index]:
-                    stop += 1
-            elif ITEM_SIG_RE.match(text) and not text.endswith(";"):
-                # The attributed item opens its body on a later line (a
-                # multi-line signature or a where clause), so the body
-                # extent starts at the first following line that opens a
-                # brace. The item signature is required first, so a
-                # cfg(test) attribute on a plain statement never widens the
-                # excluded region past its own line.
-                body = index
-                while (
-                    body < len(lines)
-                    and body <= index + ITEM_BODY_LOOKAHEAD
-                    and after[body] <= before[body]
-                ):
-                    body += 1
-                if body < len(lines) and after[body] > before[body]:
-                    stop = body + 1
-                    while stop < len(lines) and before[stop] > before[body]:
-                        stop += 1
-                else:
-                    stop = index
-            else:
-                stop = index
-            for number in range(index + 1, stop + 2):
-                if number <= len(lines):
-                    marked.add(number)
-            pending = False
-    return marked, True
+        end = re.match(r"\s*;", code[stop:])
+        if end is None:
+            continue
+        semicolon = stop + end.end()
+        line_end = code.find("\n", semicolon)
+        if code[semicolon:len(code) if line_end < 0 else line_end].strip():
+            continue
+        first = raw.count("\n", 0, declaration) + 1
+        if not any(marker.rules and SQL_CONSTANT_RULE in marker.rules
+                   and (marker.line == first or
+                        marker.standalone and marker.line == first - 1)
+                   for marker in markers):
+            continue
+        admitted.update(range(raw.count("\n", 0, start) + 1,
+                              raw.count("\n", 0, stop) + 2))
+    return admitted
+
+
+def reviewed_sql_constant(item, source_override=None):
+    if finding_rule(item) != SQL_CONSTANT_RULE:
+        return False
+    path = finding_path(item)
+    if not path.endswith(".rs"):
+        return False
+    if source_override is not None:
+        marked = annotated_sql_constant_lines(source_override)
+    else:
+        if path not in SQL_CONSTANT_LINES:
+            try:
+                raw = Path(path).read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                return False
+            SQL_CONSTANT_LINES[path] = annotated_sql_constant_lines(raw)
+        marked = SQL_CONSTANT_LINES[path]
+    return finding_line(item) in marked
+
+
+def verify_sql_constant_controls():
+    marker = "// ubs:ignore[rust.domain.sql-concat] -- reviewed immutable SQL\n"
+    literal = 'const SQL: &str = r#"\nUPDATE t SET n = n + 1;\n"#;\n'
+    dynamic = 'fn query(input: &str) { let q = "SELECT " .to_string() + input; }\n'
+    cases = [
+        ("marked-raw", marker + literal + dynamic, {3}, {5}),
+        ("unmarked", literal + dynamic, set(), {2, 4}),
+        ("wrong-rule", marker.replace(SQL_CONSTANT_RULE, "rust.panic.direct-indexing") + literal,
+         set(), {3}),
+        ("bare-marker", "// ubs:ignore\n" + literal, set(), {3}),
+        ("mutable-static", marker + literal.replace("const SQL", "static mut SQL"), set(), {3}),
+        ("dynamic-initializer", marker + 'const SQL: String =\n"SELECT " .to_string() + input;\n',
+         set(), {3}),
+        ("concatenated-initializer", marker + literal.replace('"#;', '"# + input;'), set(), {3}),
+        ("same-line-tail", marker + literal.rstrip() + dynamic, set(), {3, 4}),
+        ("same-line-prefix", marker + 'fn p() {} ' + literal, set(), {3}),
+        ("marker-in-string", 'const DOC: &str = r###"\n' + marker + '"###;\n' + literal,
+         set(), {5}),
+        ("marker-in-outer-comment", '/*\n' + marker + literal + '*/\n' + literal,
+         set(), {8}),
+        ("unbalanced", marker + literal + 'fn unfinished() {\n', set(), {3}),
+        ("unterminated-literal", marker + literal[:-4], set(), {3}),
+        ("unterminated-comment", marker + literal + '/*', set(), {3}),
+        ("normal-string", marker + 'const SQL: &str = "UPDATE t SET n = n + 1;";\n',
+         {2}, set()),
+    ]
+    for label, raw, admitted, enforced in cases:
+        marked = annotated_sql_constant_lines(raw)
+        if not admitted <= marked or enforced & marked:
+            raise ValueError("SQL constant scope control failed: %s" % label)
+    print("UBS_SQL_CONSTANT_SCOPE_CONTROL=%d passed (only annotated immutable literals admitted)" % len(cases))
+
+
+def verify_test_region_controls():
+    # These exercise the production parser directly; scanner clean/planted
+    # controls below independently verify that production findings still block.
+    cases = [
+        ("included-functions", "fn helper() { assert!(false); }\n#[test]\n"
+         "fn oracle() { assert!(true); }\nfn production() { assert!(false); }\n",
+         {3}, {1, 4}, True),
+        ("cfg-after-body", "#[cfg(test)]\nmod tests {\n"
+         "fn oracle() { assert!(true); }\n}\nfn production() { assert!(false); }\n",
+         {2, 3, 4}, {5}, True),
+        ("same-line-production-tail", "#[cfg(test)]\nmod tests {\n"
+         "fn oracle() { assert!(true); }\n} fn production() { assert!(false); }\n",
+         {2, 3}, {4}, True),
+        ("test-same-line-tail", "#[test]\n"
+         "fn oracle() { assert!(true); } fn production() { assert!(false); }\n",
+         set(), {2}, True),
+        ("raw-string-attribute", 'const RAW: &str = r#"\n#[cfg(test)]\n'
+         'fn fake() {\n}\n"#;\nfn production() {\nassert!(false);\n}\n',
+         set(), {3, 6, 7, 8}, True),
+        ("comment-attribute", "/*\n#[test]\n*/\n"
+         "fn production() { assert!(false); }\n", set(), {4}, True),
+        ("multiline-test", "#[test]\nfn oracle(\n)\n{\nassert!(true);\n}\n"
+         "fn production() { assert!(false); }\n", {2, 3, 4, 5, 6}, {7}, True),
+        ("test-on-nonfunction", "#[test]\nmod unsupported {\n"
+         "fn production() { assert!(false); }\n}\n", set(), {2, 3, 4}, True),
+        ("declaration-no-body", "#[cfg(test)]\nfn declaration();\n"
+         "fn production() { assert!(false); }\n", set(), {2, 3}, True),
+        ("unbalanced", "#[test]\nfn oracle() {\nassert!(true);\n",
+         set(), {2, 3}, False),
+    ]
+    for label, source, admitted, enforced, expected_sound in cases:
+        marked, sound = rust_test_regions(source)
+        if (sound != expected_sound or not admitted <= marked or enforced & marked):
+            raise ValueError("Rust test region control failed: %s" % label)
+    print("UBS_DELTA_TEST_REGION_CONTROL=%d passed (test bodies only; helpers, tails, literals and unsupported source enforced)" % len(cases))
 
 
 def in_test_path(path_str, test_only):
@@ -943,7 +1108,7 @@ REGIONS = {}
 
 
 def is_test_line(path_str, line_no, test_only):
-    """Sound test-code classification: test-only file or cfg(test) region."""
+    """Sound classification: test-only file, cfg(test) item or #[test] fn."""
     if in_test_path(path_str, test_only):
         return True
     if path_str not in REGIONS:
@@ -1022,34 +1187,56 @@ def reviewed_python_popen(item):
     return False
 
 
-def classify(findings, test_only):
+def classify(findings, test_only, source_overrides=None):
     excluded = []
     enforced = []
     upstream_excluded = []
     python_site_excluded = []
+    sql_constant_excluded = []
     for item in findings:
         path = finding_path(item)
+        source_override = (source_overrides or {}).get(path)
         lang = (item.get("lang") or "").lower()
         rust = lang == "rust" or path.endswith(".rs")
         if rust and is_test_line_upstream(path, finding_line(item), test_only):
             upstream_excluded.append(item)
-        if (rust and is_test_line(path, finding_line(item), test_only)
+        if source_override is None:
+            test_line = rust and is_test_line(path, finding_line(item), test_only)
+        else:
+            marked, sound = rust_test_regions(source_override)
+            test_line = rust and (in_test_path(path, test_only) or
+                                  sound and finding_line(item) in marked)
+        if (test_line
                 and finding_severity(item) in BLOCKING
                 and finding_rule(item) in TEST_ONLY_EXEMPTIONS):
             excluded.append(item)
         elif reviewed_python_popen(item):
             python_site_excluded.append(item)
+        elif rust and reviewed_sql_constant(item, source_override):
+            sql_constant_excluded.append(item)
         else:
             enforced.append(item)
-    return excluded, enforced, upstream_excluded, python_site_excluded
+    return excluded, enforced, upstream_excluded, python_site_excluded, sql_constant_excluded
 
+
+try:
+    verify_test_region_controls()
+except Exception as exc:
+    print("gate: UBS delta test-region controls failed: %s" % exc)
+    sys.exit(3)
 
 universe = repo_rust_files(repo_root)
 sys.path.insert(0, str(modules_dir / "helpers"))
 try:
     from ubs_core.analyzers.cfg_test_only_rust import compute_test_only
+    from ubs_core.suppression import parse_markers
 except Exception as exc:
     print("gate: UBS delta could not load the upstream test-only classifier: %s" % exc)
+    sys.exit(3)
+try:
+    verify_sql_constant_controls()
+except Exception as exc:
+    print("gate: UBS SQL constant scope controls failed: %s" % exc)
     sys.exit(3)
 try:
     test_only_list = compute_test_only(universe)
@@ -1088,7 +1275,7 @@ findings = doc.get("findings") or []
 totals = doc.get("totals") or {}
 status = doc.get("status")
 failed_modules = doc.get("failed_modules") or []
-excluded, enforced, upstream_excluded, python_site_excluded = classify(findings, test_only)
+excluded, enforced, upstream_excluded, python_site_excluded, sql_constant_excluded = classify(findings, test_only)
 blocking = [item for item in enforced if finding_severity(item) in BLOCKING]
 if len(python_site_excluded) > len(PYTHON_POPEN_SITES):
     print("gate: Python lifecycle waiver matched more findings than reviewed sites")
@@ -1107,6 +1294,7 @@ print("UBS_DELTA_NEW=%d critical=%s warning=%s info=%s" % (
 print("UBS_DELTA_TEST_EXCLUDED=%d (reviewed blocking rules in test-only Rust code)" % len(excluded))
 print("UBS_DELTA_PYTHON_SITE_EXCLUDED=%d (three reviewed retained-worker ownership sites)" % len(python_site_excluded))
 print("UBS_DELTA_PYTHON_SITE_CONTROL=unmarked same-file findings remain blocking")
+print("UBS_DELTA_SQL_CONSTANT_EXCLUDED=%d (explicit SQL-rule markers on sole immutable literals)" % len(sql_constant_excluded))
 print("UBS_DELTA_UPSTREAM_TEST_EXCLUDED=%d (upstream --exclude-tests boundary rule, for the win/lose split)" % len(upstream_excluded))
 print("UBS_DELTA_ENFORCED_BLOCKING=%d" % len(blocking))
 for rule, count in sorted(Counter(finding_rule(item) for item in excluded).items()):
@@ -1123,6 +1311,9 @@ for item in excluded[:20]:
 for item in python_site_excluded:
     print("UBS_DELTA_PYTHON_SITE_EXCLUDED_FINDING=%s | %s:%s | %s | reason=retained worker has explicit kill/wait cleanup" % (
         finding_rule(item), finding_path(item), finding_line(item), finding_severity(item)))
+for item in sql_constant_excluded:
+    print("UBS_DELTA_SQL_CONSTANT_EXCLUDED_FINDING=%s | %s:%s | %s | reason=annotated immutable SQL literal" % (
+        finding_rule(item), finding_path(item), finding_line(item), finding_severity(item)))
 for item in blocking[:50]:
     print("UBS_DELTA_FINDING=%s | %s:%s | %s | %s" % (
         finding_rule(item), finding_path(item), finding_line(item), finding_severity(item),
@@ -1135,36 +1326,54 @@ print("UBS_DELTA_VERDICT=%d" % verdict)
 # planted production unwrap must be reported as a production finding, not
 # excluded as test code.
 if control_clean_path and control_planted_path:
+    for control_path in (control_clean_path, control_planted_path):
+        try:
+            control_document = json.load(open(control_path, encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print("gate: UBS control document could not be read: %s" % exc)
+            sys.exit(3)
+        if control_document.get("status") != "ok" or control_document.get("failed_modules"):
+            print("gate: UBS control scan was partial: %s" % control_path)
+            sys.exit(3)
     clean_findings = load_findings(control_clean_path)
     planted_findings = load_findings(control_planted_path)
     if clean_findings is None or planted_findings is None:
         print("gate: UBS delta control findings could not be read")
         sys.exit(3)
-    clean_excluded, clean_enforced, _, _ = classify(clean_findings, test_only)
-    planted_excluded, planted_enforced, _, _ = classify(planted_findings, test_only)
+    try:
+        probe_info = json.load(open(control_probe_path, encoding="utf-8"))
+        probe_source = Path(probe_info["source"]).read_text(encoding="utf-8")
+        probe_target = Path(probe_info["path"])
+        probe_relative = str(probe_target.relative_to(Path(control_probe_path).parent))
+        source_overrides = {str(probe_target): probe_source, probe_relative: probe_source,
+                            "./" + probe_relative: probe_source}
+        probe_lines = [int(probe_info[key]) for key in ("unwrap", "static_sql", "dynamic_sql")]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print("gate: UBS control source/coordinates could not be read: %s" % exc)
+        sys.exit(3)
+    clean_excluded, clean_enforced, _, _, _ = classify(clean_findings, test_only)
+    planted_excluded, planted_enforced, _, _, planted_sql_excluded = classify(
+        planted_findings, test_only, source_overrides)
     clean_blocking = [item for item in clean_enforced if finding_severity(item) in BLOCKING]
     planted_blocking = [item for item in planted_enforced if finding_severity(item) in BLOCKING]
     clean_verdict = 1 if clean_blocking else 0
     planted_verdict = 1 if planted_blocking else 0
     print("UBS_DELTA_CONTROL_VERDICT=clean=%d planted=%d (clean_new=%d planted_new=%d)" % (
         clean_verdict, planted_verdict, len(clean_findings), len(planted_findings)))
-    probe_lines = None
-    if control_probe_path and os.path.exists(control_probe_path):
-        raw = open(control_probe_path, encoding="utf-8").read().split()
-        if len(raw) == 2:
-            probe_lines = (int(raw[0]), int(raw[1]))
-    if probe_lines is not None:
-        probe = [item for item in planted_findings
-                 if probe_lines[0] <= finding_line(item) <= probe_lines[1]]
-        probe_excluded = [item for item in probe if item in planted_excluded]
-        print("UBS_DELTA_CONTROL_PROBE=lines %d-%d findings=%d excluded=%d" % (
-            probe_lines[0], probe_lines[1], len(probe), len(probe_excluded)))
-        if not probe:
-            print("gate: the planted production unwrap was not reported by the delta")
-            sys.exit(3)
-        if probe_excluded:
-            print("gate: the planted production unwrap was excluded as test code")
-            sys.exit(3)
+    unwrap_probe = [item for item in planted_findings
+                    if finding_line(item) == probe_lines[0]
+                    and finding_rule(item) == "rust.ownership.unwrap-expect"]
+    static_probe = [item for item in planted_findings
+                    if finding_line(item) == probe_lines[1] and finding_rule(item) == SQL_CONSTANT_RULE]
+    dynamic_probe = [item for item in planted_findings
+                     if finding_line(item) == probe_lines[2] and finding_rule(item) == SQL_CONSTANT_RULE]
+    if (not unwrap_probe or not static_probe or not dynamic_probe
+            or any(item not in planted_enforced for item in unwrap_probe + dynamic_probe)
+            or any(item not in planted_sql_excluded for item in static_probe)):
+        print("gate: production unwrap/dynamic SQL must stay enforced; only the marked SQL constant may be admitted")
+        sys.exit(3)
+    print("UBS_DELTA_CONTROL_PROBE=unwrap=%d dynamic_sql=%d enforced; static_sql=%d admitted" % (
+        len(unwrap_probe), len(dynamic_probe), len(static_probe)))
     if clean_verdict != 0 or planted_verdict != 1:
         print("gate: the filtered delta must pass on the base file and fail on the planted unwrap")
         sys.exit(3)

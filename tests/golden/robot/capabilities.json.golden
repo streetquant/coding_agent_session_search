@@ -78,7 +78,8 @@
     "shelley",
     "kilo",
     "cloudmcp",
-    "openwebui"
+    "openwebui",
+    "dsh"
   ],
   "global_flags": [
     {

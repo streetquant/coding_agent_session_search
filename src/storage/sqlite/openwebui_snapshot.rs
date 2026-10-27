@@ -7,6 +7,240 @@ pub(super) struct SnapshotOutcome {
     pub messages_changed: bool,
     pub inserted_indices: Vec<i64>,
     pub updated_indices: Vec<i64>,
+    pub rebuild_analytics: bool,
+}
+
+struct CodexProjectionPlan {
+    conversation: Conversation,
+    duplicates: Vec<i64>,
+}
+
+fn empty_extra(message: &Message) -> bool {
+    message.extra_json.is_null()
+        || message
+            .extra_json
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
+}
+
+/// Repair only the historical compacted Codex projection, not arbitrary
+/// mutable transcripts. Each shortened result needs its original full body
+/// still present in the archive as independent evidence of the omitted text.
+fn codex_projection_plan(
+    incoming: &Conversation,
+    previous: &[Message],
+) -> Result<Option<CodexProjectionPlan>> {
+    const LEGACY_TOOL_CHARS: usize = 128 * 1024;
+    if !previous.iter().any(|message| {
+        message.role == MessageRole::Tool
+            && empty_extra(message)
+            && message
+                .content
+                .ends_with(" additional chars from tool output]")
+    }) {
+        return Ok(None);
+    }
+    let mut by_body = HashMap::<_, Vec<usize>>::new();
+    for (position, message) in previous.iter().enumerate() {
+        by_body
+            .entry(message_replay_fingerprint(message))
+            .or_default()
+            .push(position);
+    }
+    let mut conversation = clone_conversation_header(incoming);
+    let mut used = HashSet::new();
+    let mut native_ids = HashSet::new();
+    let mut witnesses = HashMap::<_, Vec<i64>>::new();
+    for (position, message) in incoming.messages.iter().enumerate() {
+        if message.idx != i64::try_from(position)? {
+            return Ok(None);
+        }
+        let exact = message_replay_fingerprint(message);
+        let exact_match = by_body.get(&exact).and_then(|positions| {
+            positions.iter().copied().find(|index| {
+                !used.contains(index)
+                    && previous.get(*index).is_some_and(|old| {
+                        old.extra_json == message.extra_json
+                            || (empty_extra(old) && empty_extra(message))
+                    })
+            })
+        });
+        let mut old_position = exact_match;
+        if let Some(call_id) = message
+            .extra_json
+            .pointer("/cass/tool_result_call_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            if message.role != MessageRole::Tool
+                || call_id.is_empty()
+                || !native_ids.insert(call_id)
+            {
+                return Ok(None);
+            }
+            let prefix = format!("[Tool output: {call_id}]\n"); // ubs:ignore[rust.perf.string-alloc-in-loop] -- The historical call-ID prefix is required to verify the archived projection.
+            let Some(body) = message.content.strip_prefix(&prefix) else {
+                return Ok(None);
+            };
+            if old_position.is_none() {
+                let trimmed = body.trim();
+                let mut characters = trimmed.chars();
+                let mut projection = prefix;
+                projection.extend(characters.by_ref().take(LEGACY_TOOL_CHARS));
+                let omitted = characters.count();
+                if omitted == 0 {
+                    return Ok(None);
+                }
+                let notice = format!("\n[truncated {omitted} additional chars from tool output]"); // ubs:ignore[rust.perf.string-alloc-in-loop] -- Exact historical notice required for evidence comparison.
+                projection.push_str(&notice);
+                let projected = MessageReplayFingerprint {
+                    content_hash: *blake3::hash(projection.as_bytes()).as_bytes(),
+                    ..exact
+                };
+                old_position = by_body.get(&projected).and_then(|positions| {
+                    positions.iter().copied().find(|index| {
+                        !used.contains(index) && previous.get(*index).is_some_and(empty_extra)
+                    })
+                });
+                let Some(old) = old_position.and_then(|index| previous.get(index)) else {
+                    return Ok(None);
+                };
+                witnesses
+                    .entry(MessageReplayFingerprint {
+                        content_hash: *blake3::hash(body.as_bytes()).as_bytes(),
+                        ..message_replay_fingerprint(message)
+                    })
+                    .or_default()
+                    .push(old.id.context("legacy Codex result has no canonical ID")?);
+            }
+        }
+        let Some(old_position) = old_position else {
+            // An incomplete packet must never retire messages outside it.
+            return Ok(None);
+        };
+        used.insert(old_position);
+        let old = previous
+            .get(old_position)
+            .context("legacy message position")?;
+        // ubs:ignore[rust.collections.clone-in-loop] -- Only a fully verified repair owns a replacement snapshot; ordinary replay returns before this loop.
+        let mut revised = message.clone();
+        revised.id = old.id;
+        conversation.messages.push(revised);
+    }
+    if witnesses.is_empty() {
+        return Ok(None);
+    }
+    let mut duplicates = Vec::new();
+    let mut audit = Vec::new();
+    for (position, old) in previous.iter().enumerate() {
+        if used.contains(&position) {
+            continue;
+        }
+        let fingerprint = message_replay_fingerprint(old);
+        let Some(replacements) = witnesses.remove(&fingerprint) else {
+            return Ok(None);
+        };
+        if old.role != MessageRole::Tool || !empty_extra(old) {
+            return Ok(None);
+        }
+        let identity = old
+            .id
+            .context("legacy Codex duplicate has no canonical ID")?;
+        duplicates.push(identity);
+        audit.push(serde_json::json!({
+            "message_id": identity, "idx": old.idx,
+            "body_blake3": blake3::hash(old.content.as_bytes()).to_hex().as_str(),
+            "preserved_in_message_ids": replacements,
+        }));
+    }
+    if !witnesses.is_empty() {
+        return Ok(None);
+    }
+    if conversation.metadata_json.is_null() {
+        conversation.metadata_json = serde_json::json!({});
+    }
+    if !conversation.metadata_json.is_object() {
+        return Ok(None);
+    }
+    // ubs:ignore[rust.panic.direct-indexing] -- The object check above makes this a JSON object insertion.
+    conversation.metadata_json["codex_compacted_projection_repair"] = serde_json::json!({
+        "version": 1, "retired_duplicate_projections": audit,
+        "original_positions": previous.iter().map(|message| (message.id, message.idx)).collect::<Vec<_>>()
+    });
+    Ok(Some(CodexProjectionPlan {
+        conversation,
+        duplicates,
+    }))
+}
+
+pub(super) fn reconcile_codex_projection(
+    storage: &FrankenStorage,
+    tx: &FrankenTransaction<'_>,
+    agent_id: i64,
+    workspace_id: Option<i64>,
+    incoming: &Conversation,
+    defer_lexical: bool,
+    defer_analytics: bool,
+) -> Result<Option<SnapshotOutcome>> {
+    if incoming.agent_slug != "codex"
+        || !incoming.messages.iter().any(|message| {
+            message
+                .extra_json
+                .pointer("/cass/tool_result_call_id")
+                .is_some()
+        })
+    {
+        return Ok(None);
+    }
+    let Some(external_id) = incoming.external_id.as_deref() else {
+        return Ok(None);
+    };
+    let existing: Option<i64> = tx
+        .query_row_map(
+            "SELECT id FROM conversations WHERE source_id=?1 AND agent_id=?2 AND external_id=?3",
+            fparams![incoming.source_id.as_str(), agent_id, external_id],
+            |row| row.get_typed(0),
+        )
+        .optional()?;
+    let Some(conversation_id) = existing else {
+        return Ok(None);
+    };
+    let legacy: i64 = tx.query_row_map(
+        "SELECT EXISTS(SELECT 1 FROM messages
+         WHERE conversation_id=?1 AND role='tool'
+           AND content LIKE '[Tool output:%'
+           AND content LIKE '% additional chars from tool output]')",
+        fparams![conversation_id],
+        |row| row.get_typed(0),
+    )?;
+    if legacy == 0 {
+        return Ok(None);
+    }
+    let previous = read_messages(tx, conversation_id)?;
+    let Some(plan) = codex_projection_plan(incoming, &previous)? else {
+        return Ok(None);
+    };
+    // A compacted projection never had source snippets or extra metadata to
+    // discard. Refuse instead of silently dropping later canonical additions.
+    for message in &previous {
+        if !franken_codebuff_snippets_match(
+            tx,
+            message.id.context("legacy Codex canonical message ID")?,
+            &[],
+        )? {
+            return Ok(None);
+        }
+    }
+    reconcile_inner(
+        storage,
+        tx,
+        agent_id,
+        workspace_id,
+        incoming,
+        defer_lexical,
+        defer_analytics,
+        Some(plan),
+    )
+    .map(Some)
 }
 
 fn required_text<'value>(value: &'value serde_json::Value, key: &str) -> Result<&'value str> {
@@ -121,6 +355,30 @@ pub(super) fn reconcile(
     defer_lexical: bool,
     defer_analytics: bool,
 ) -> Result<SnapshotOutcome> {
+    reconcile_inner(
+        storage,
+        tx,
+        agent_id,
+        workspace_id,
+        incoming,
+        defer_lexical,
+        defer_analytics,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_inner(
+    storage: &FrankenStorage,
+    tx: &FrankenTransaction<'_>,
+    agent_id: i64,
+    workspace_id: Option<i64>,
+    incoming: &Conversation,
+    defer_lexical: bool,
+    defer_analytics: bool,
+    codex_plan: Option<CodexProjectionPlan>,
+) -> Result<SnapshotOutcome> {
+    let is_codex_projection = codex_plan.is_some();
     let (conversation_id, conversation_inserted) =
         match franken_insert_conversation_or_get_existing(tx, agent_id, workspace_id, incoming)? {
             ConversationInsertStatus::Inserted(identity) => (identity, true),
@@ -166,6 +424,9 @@ pub(super) fn reconcile(
         "source_database",
         "workspace_root",
     ] {
+        if is_codex_projection {
+            break;
+        }
         anyhow::ensure!(
             required_text(&previous_metadata, key)? == required_text(&incoming.metadata_json, key)?,
             "native OpenWebUI canonical {key} changed"
@@ -174,6 +435,9 @@ pub(super) fn reconcile(
     let previous = read_messages(tx, conversation_id)?;
     let mut previous_by_identity = HashMap::new();
     for message in &previous {
+        if is_codex_projection {
+            break;
+        }
         anyhow::ensure!(
             message.idx >= 0,
             "negative canonical OpenWebUI message index"
@@ -185,13 +449,28 @@ pub(super) fn reconcile(
             "duplicate canonical OpenWebUI message ID"
         );
     }
-    let mut conversation = incoming.clone();
+    let (mut conversation, duplicates) = match codex_plan {
+        Some(plan) => {
+            anyhow::ensure!(
+                previous_metadata == incoming.metadata_json
+                    && previous_started == incoming.started_at
+                    && previous_title == incoming.title,
+                "legacy Codex canonical metadata changed"
+            );
+            (plan.conversation, Some(plan.duplicates))
+        }
+        None => (incoming.clone(), None),
+    };
     let mut inserted_indices = Vec::new();
     let mut seen = HashSet::new();
     let mut messages_changed = conversation_inserted
         || previous_started != incoming.started_at
-        || previous_title != incoming.title;
+        || previous_title != incoming.title
+        || is_codex_projection;
     for message in &mut conversation.messages {
+        if is_codex_projection {
+            break;
+        }
         // ubs:ignore[rust.perf.string-alloc-in-loop] -- The owned identity is the lookup key retained in the seen set.
         let identity = message_identity(incoming, message)?.to_owned();
         if let Some(previous_message) = previous_by_identity.get(identity.as_str()) {
@@ -206,6 +485,9 @@ pub(super) fn reconcile(
     }
     let mut retained = Vec::new();
     for message in &previous {
+        if is_codex_projection {
+            break;
+        }
         let identity = message_identity(incoming, message)?;
         if seen.contains(identity) {
             continue;
@@ -220,10 +502,17 @@ pub(super) fn reconcile(
         retained.push(identity.to_owned());
         conversation.messages.push(retained_message);
     }
-    // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing inserts the key and cannot panic.
-    conversation.metadata_json["retained_absent_message_ids"] = serde_json::json!(retained);
+    if !is_codex_projection {
+        // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing inserts the key and cannot panic.
+        conversation.metadata_json["retained_absent_message_ids"] = serde_json::json!(retained);
+    }
+    let lexical_key = if is_codex_projection {
+        "codex_projection_lexical_indices"
+    } else {
+        "openwebui_lexical_indices"
+    };
     let mut lexical_indices = std::collections::BTreeSet::new();
-    if let Some(indices) = previous_metadata.get("openwebui_lexical_indices") {
+    if let Some(indices) = previous_metadata.get(lexical_key) {
         for index in indices
             .as_array()
             .context("invalid native lexical identity ledger")?
@@ -239,7 +528,24 @@ pub(super) fn reconcile(
     lexical_indices.extend(previous.iter().map(|message| message.idx));
     lexical_indices.extend(conversation.messages.iter().map(|message| message.idx));
     // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing inserts the key and cannot panic.
-    conversation.metadata_json["openwebui_lexical_indices"] = serde_json::json!(lexical_indices);
+    conversation.metadata_json[lexical_key] = serde_json::json!(lexical_indices);
+    let (defer_analytics, previous_analytics) = if is_codex_projection {
+        let (metrics, tokens): (i64, i64) = tx.query_row_map(
+            "SELECT (SELECT COUNT(*) FROM message_metrics WHERE message_id IN
+                (SELECT id FROM messages WHERE conversation_id=?1)),
+                (SELECT COUNT(*) FROM token_usage WHERE conversation_id=?1)",
+            fparams![conversation_id],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )?;
+        let complete = metrics == i64::try_from(previous.len())? && tokens == metrics;
+        anyhow::ensure!(
+            complete || (metrics == 0 && tokens == 0),
+            "legacy Codex analytics require repair before replacing projections"
+        );
+        (defer_analytics && !complete, complete)
+    } else {
+        (defer_analytics, !conversation_inserted)
+    };
     let updated_indices = if messages_changed {
         conversation
             .messages
@@ -259,7 +565,7 @@ pub(super) fn reconcile(
                 .min()
         });
         if !defer_analytics {
-            if !conversation_inserted {
+            if previous_analytics {
                 subtract_analytics(tx, incoming, conversation_id, previous_started, &previous)?;
                 franken_update_daily_stats_in_tx(
                     storage,
@@ -317,6 +623,33 @@ pub(super) fn reconcile(
                     return Err(error).context("retiring native snapshot fallback lexical rows");
                 }
             }
+        }
+        if let Some(duplicates) = duplicates {
+            for message_id in duplicates {
+                tx.execute_compat(
+                    "DELETE FROM messages WHERE id=?1 AND conversation_id=?2",
+                    fparams![message_id, conversation_id],
+                )?;
+            }
+            let generation = format!("codex_projection:{:032x}", rand::random::<u128>());
+            for tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
+                tx.execute_compat(
+                    "INSERT OR REPLACE INTO meta(key,value) VALUES(?1,?2)",
+                    fparams![tier.meta_key(), generation.as_str()],
+                )?;
+            }
+            clear_semantic_embed_watermark_after_deletion(tx)?;
+            tx.execute_compat(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES(?1,?2)",
+                fparams![
+                    TOKEN_USAGE_REVISION_GENERATION_META_KEY,
+                    generation.as_str()
+                ],
+            )?;
+            tx.execute_compat(
+                "DELETE FROM meta WHERE key=?1",
+                fparams![TOKEN_DAILY_STATS_REBUILD_CURSOR_KEY],
+            )?;
         }
         if let Some(maximum) = previous.iter().map(|message| message.idx).max() {
             let offset = maximum
@@ -380,6 +713,7 @@ pub(super) fn reconcile(
         messages_changed,
         inserted_indices,
         updated_indices,
+        rebuild_analytics: !defer_analytics,
     })
 }
 
@@ -614,6 +948,210 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn codex_projection_fixture() -> (Conversation, Conversation) {
+        let body = format!("\n{}尾\n", "λ".repeat(128 * 1024 + 19));
+        let mut current = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some("original-rollout".into()),
+            title: Some("Head".into()),
+            source_path: PathBuf::from("/profile/.codex/sessions/original.jsonl"),
+            started_at: None,
+            ended_at: None,
+            approx_tokens: None,
+            metadata_json: serde_json::json!({"source":"rollout"}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: None,
+                content: "Head".into(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        for idx in 1..=2 {
+            current.messages.push(Message {
+                id: None, idx, role: MessageRole::Tool, author: None, created_at: None,
+                content: format!("[Tool output: original-call-{idx}]\n{body}"),
+                extra_json: serde_json::json!({"cass":{"tool_result_call_id":format!("original-call-{idx}")}}),
+                snippets: Vec::new(),
+            });
+        }
+        let mut tail = current.messages[0].clone();
+        tail.idx = 3;
+        tail.content = "Tail".into();
+        current.messages.push(tail.clone());
+        let mut legacy = current.clone();
+        for message in legacy
+            .messages
+            .iter_mut()
+            .filter(|message| message.role == MessageRole::Tool)
+        {
+            message.content = format!(
+                "[Tool output: original-call-{}]\n{}\n[truncated 20 additional chars from tool output]",
+                message.idx,
+                "λ".repeat(128 * 1024),
+            );
+            message.extra_json = serde_json::json!({});
+        }
+        legacy.messages.pop();
+        legacy.messages.push(Message {
+            id: None,
+            idx: 3,
+            role: MessageRole::Tool,
+            author: None,
+            created_at: None,
+            content: body,
+            extra_json: serde_json::json!({}),
+            snippets: Vec::new(),
+        });
+        tail.idx = 5;
+        legacy.messages.push(tail);
+        (legacy, current)
+    }
+
+    #[test]
+    fn codex_legacy_projection_upgrade_preserves_ids_full_bodies_and_replay() -> Result<()> {
+        for materialized in [false, true] {
+            let directory = TempDir::new()?;
+            let storage = FrankenStorage::open(&directory.path().join("archive.db"))?;
+            let agent = storage.ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })?;
+            let (legacy, current) = codex_projection_fixture();
+            let initial = storage.insert_conversation_tree_with_analytics(
+                agent,
+                None,
+                &legacy,
+                !materialized,
+            )?;
+            let before = storage.fetch_messages(initial.conversation_id)?;
+            assert_eq!(before.len(), 5);
+            let completion = SourceIngestLedgerEntry {
+                key: "source_ingest_v1:codex-projection-upgrade".into(),
+                observation: "unchanged original native bytes".into(),
+            };
+            // Explicitly deferred callers must still repair already-published
+            // analytics rather than leave the old projection counted.
+            let outcome = storage
+                .insert_conversations_batched_with_completion(
+                    &[(agent, None, &current)],
+                    true,
+                    Some(&completion),
+                )?
+                .pop()
+                .context("Codex repair outcome")?;
+            assert_eq!(outcome.conversation_id, initial.conversation_id);
+            assert_eq!(outcome.unresolved_message_conflicts, 0);
+            assert!(outcome.inserted_indices.is_empty());
+            assert_eq!(outcome.updated_indices, vec![0, 1, 2, 3]);
+            let after = storage.fetch_messages(initial.conversation_id)?;
+            assert_eq!(after.len(), 4);
+            for ((actual, expected), old_position) in
+                after.iter().zip(&current.messages).zip([0, 1, 2, 4])
+            {
+                assert_eq!(actual.id, before[old_position].id);
+                assert_eq!(actual.content, expected.content);
+                assert_eq!(actual.extra_json, expected.extra_json);
+                assert_eq!(actual.idx, expected.idx);
+            }
+            assert_eq!(
+                storage.source_ingest_ledger_entries()?.get(&completion.key),
+                Some(&completion.observation)
+            );
+            let snapshot =
+                storage.fetch_native_projection_lexical_snapshot(initial.conversation_id)?;
+            assert_eq!(
+                snapshot.metadata_json["codex_projection_lexical_indices"],
+                serde_json::json!([0, 1, 2, 3, 5])
+            );
+            assert_eq!(
+                snapshot.metadata_json["codex_compacted_projection_repair"]["retired_duplicate_projections"]
+                    [0]["message_id"],
+                before[3].id.unwrap()
+            );
+            for table in ["message_metrics", "token_usage"] {
+                let (count, chars): (i64, i64) = storage.raw().query_row_map(
+                    &format!("SELECT COUNT(*), COALESCE(SUM(content_chars),0) FROM {table}"),
+                    fparams![],
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                )?;
+                assert_eq!(count, if materialized { 4 } else { 0 }, "{table}");
+                assert_eq!(
+                    chars,
+                    if materialized {
+                        message_chars(&after)?
+                    } else {
+                        0
+                    },
+                    "{table}"
+                );
+            }
+            if materialized {
+                let (count, chars): (i64,i64) = storage.raw().query_row_map(
+                    "SELECT SUM(message_count),SUM(total_chars) FROM daily_stats WHERE agent_slug='codex' AND source_id='local'",
+                    fparams![], |row| Ok((row.get_typed(0)?,row.get_typed(1)?)),
+                )?;
+                assert_eq!((count, chars), (4, message_chars(&after)?));
+            }
+            let replay =
+                storage.insert_conversation_tree_with_analytics(agent, None, &current, true)?;
+            assert!(replay.inserted_indices.is_empty() && replay.updated_indices.is_empty());
+            assert_eq!(replay.unresolved_message_conflicts, 0);
+            assert_eq!(
+                serde_json::to_value(storage.fetch_messages(initial.conversation_id)?)?,
+                serde_json::to_value(after)?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn codex_legacy_projection_refuses_missing_or_changed_evidence() -> Result<()> {
+        let (mut legacy, current) = codex_projection_fixture();
+        for (position, message) in legacy.messages.iter_mut().enumerate() {
+            message.id = Some(i64::try_from(position)? + 1);
+        }
+        assert!(codex_projection_plan(&current, &legacy.messages)?.is_some());
+        for case in 0..9 {
+            let mut incoming = current.clone();
+            let mut previous = legacy.messages.clone();
+            match case {
+                0 => {
+                    previous.remove(3);
+                }
+                1 => previous[3].content.push_str("changed omitted source text"),
+                2 => previous[1].content.push('!'),
+                3 => previous[1].extra_json = serde_json::json!({"retained":"original metadata"}),
+                4 => previous[3].extra_json = serde_json::json!({"retained":"original metadata"}),
+                5 => incoming.messages[1].created_at = Some(1),
+                6 => {
+                    incoming.messages.pop();
+                }
+                7 => {
+                    incoming.messages[2].extra_json["cass"]["tool_result_call_id"] =
+                        serde_json::json!("original-call-1")
+                }
+                8 => previous[4].content = "different original user message".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                codex_projection_plan(&incoming, &previous)?.is_none(),
+                "case {case}"
+            );
+        }
+        Ok(())
+    }
+
     struct NativeFixture {
         _directory: TempDir,
         storage: FrankenStorage,
@@ -800,7 +1338,7 @@ mod tests {
             assert!(retained.inserted_indices.is_empty());
             let mut stored = fixture
                 .storage
-                .fetch_openwebui_lexical_snapshot(initial.conversation_id)?;
+                .fetch_native_projection_lexical_snapshot(initial.conversation_id)?;
             stored.messages = fixture.storage.fetch_messages(initial.conversation_id)?;
             assert_eq!(
                 stored.metadata_json["retained_absent_message_ids"],
@@ -831,7 +1369,7 @@ mod tests {
             );
             let mut stored = fixture
                 .storage
-                .fetch_openwebui_lexical_snapshot(initial.conversation_id)?;
+                .fetch_native_projection_lexical_snapshot(initial.conversation_id)?;
             stored.messages = fixture.storage.fetch_messages(initial.conversation_id)?;
             assert_eq!(
                 stored.metadata_json["retained_absent_message_ids"],

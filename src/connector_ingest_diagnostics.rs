@@ -627,6 +627,31 @@ pub struct ConnectorIngestReport {
     pub provider: String,
     pub summary: ProviderIngestSummary,
     pub diagnostics: Vec<ConnectorIngestDiagnostic>,
+    // Keep the final scan disposition until persistence has finished. Older
+    // diagnostics can describe a failure followed by a successful read, so
+    // they cannot establish which summary counter owns a source now.
+    #[serde(skip)]
+    sources: BTreeMap<PathBuf, ObservedSource>,
+}
+
+impl ConnectorIngestReport {
+    /// A readable source is only fully indexed after its messages persist.
+    /// Preserve stronger scan diagnoses and count a source once even when
+    /// several of its chunks conflict with retained canonical history.
+    pub(crate) fn reconcile_persistence_conflicts<'a>(
+        &mut self,
+        conflicts: impl IntoIterator<Item = &'a PathBuf>,
+    ) {
+        for path in conflicts {
+            if let Some(source) = self.sources.get_mut(path)
+                && source.disposition == SourceIngestDisposition::Indexed
+            {
+                source.disposition = SourceIngestDisposition::PartiallyIndexed;
+                self.summary.indexed = self.summary.indexed.saturating_sub(1);
+                self.summary.partially_indexed = self.summary.partially_indexed.saturating_add(1);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -817,6 +842,7 @@ impl ConnectorIngestRun {
                     IngestFailureKind::SourceOverReadBudget,
                 );
                 self.sources.insert(
+                    // ubs:ignore[rust.collections.clone-in-loop] -- Retained source diagnostics must own their paths independently of the borrowed scan error.
                     path.clone(),
                     ObservedSource {
                         disposition: diagnostic.disposition,
@@ -892,6 +918,7 @@ impl ConnectorIngestRun {
             provider: self.provider,
             summary,
             diagnostics: self.diagnostics,
+            sources: self.sources,
         }
     }
 
@@ -905,6 +932,7 @@ impl ConnectorIngestRun {
             if !unproductive {
                 continue;
             }
+            // ubs:ignore[rust.collections.clone-in-loop] -- Each connector context owns its data directory while the diagnostic collector retains its configuration.
             let ctx = ScanContext::with_roots(self.scan_data_dir.clone(), vec![root], None);
             for found in connector.store_diagnostics(&ctx) {
                 let kind = match found.code {
@@ -918,6 +946,7 @@ impl ConnectorIngestRun {
                     _ => continue,
                 };
                 let diagnostic = classify_path(&self.provider, &found.path, kind)
+                    // ubs:ignore[rust.perf.string-alloc-in-loop] -- Only failed durable stores produce an owned diagnostic; successful stores are not inspected again.
                     .with_detail(format!("{}: {}", found.code, found.detail));
                 if let Some(source) = self.sources.get_mut(&found.path) {
                     source.disposition = diagnostic.disposition;
@@ -1125,6 +1154,7 @@ mod tests {
     use super::*;
     use crate::connectors::Connector;
     use serde_json::json;
+    use std::collections::BTreeSet;
     use tempfile::tempdir;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1592,8 +1622,11 @@ mod tests {
             messages: Vec::new(),
         };
         run.observe_conversation(&mut conversation);
-        let report = run.finish();
+        let mut report = run.finish();
+        report.reconcile_persistence_conflicts(&BTreeSet::from([conversation.source_path.clone()]));
+        report.reconcile_persistence_conflicts(&BTreeSet::from([conversation.source_path]));
         verify_eq!(report.summary.partially_indexed, 1);
+        verify_eq!(report.summary.indexed, 0);
         verify_eq!(report.diagnostics.len(), 1);
         verify_eq!(report.diagnostics[0].line_or_row, Some(2));
         verify_eq!(
@@ -1815,6 +1848,50 @@ mod tests {
         let value = serde_json::to_value(crate::indexer::IndexingStats::default())?;
         verify_eq!(value["connector_summary"], json!({}));
         verify_eq!(value["connector_diagnostics"], json!([]));
+        Ok(())
+    }
+
+    #[test]
+    fn persistence_conflicts_use_final_source_dispositions() -> TestResult {
+        let ctx = ScanContext::local_default(PathBuf::from("/fixture/data"), None);
+        let recovered = PathBuf::from("/fixture/recovered.jsonl");
+        let locked = PathBuf::from("/fixture/locked.jsonl");
+        let mut run = ConnectorIngestRun::begin("codex", &ctx.data_dir, &ctx, &[]);
+        run.observe_scan_error(&recovered, "database is locked");
+        let mut conversation = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: Some("recovered".into()),
+            title: None,
+            workspace: None,
+            source_path: recovered.clone(),
+            started_at: None,
+            ended_at: None,
+            metadata: json!({}),
+            messages: Vec::new(),
+        };
+        run.observe_conversation(&mut conversation);
+        conversation.source_path = PathBuf::from("/fixture/healthy.jsonl");
+        run.observe_conversation(&mut conversation);
+        conversation.source_path = locked.clone();
+        run.observe_conversation(&mut conversation);
+        run.observe_scan_error(&locked, "database is locked");
+        let mut report = run.finish();
+        verify_eq!(report.summary.indexed, 2);
+        verify_eq!(report.summary.locked, 1);
+        let conflicts = BTreeSet::from([
+            recovered,
+            locked,
+            PathBuf::from("/fixture/not-in-this-scope.jsonl"),
+        ]);
+        report.reconcile_persistence_conflicts(&conflicts);
+        report.reconcile_persistence_conflicts(&conflicts);
+        verify_eq!(report.summary.indexed, 1);
+        verify_eq!(report.summary.partially_indexed, 1);
+        verify_eq!(report.summary.locked, 1);
+        verify_eq!(report.summary.total(), 3);
+        verify_eq!(report.diagnostics.len(), 2);
+        let serialized = serde_json::to_value(&report)?;
+        verify!(serialized.get("sources").is_none());
         Ok(())
     }
 

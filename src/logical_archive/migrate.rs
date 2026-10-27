@@ -3,13 +3,17 @@
 //! Exact-schema restoration remains the default. Cross-version restoration is
 //! deliberately allowlisted rather than inferred from "compatible-looking" SQL
 //! shapes: data backfills can be semantically required even when columns appear
-//! additive. The reviewed bridges are storage schema v20 and v21 -> v22.
+//! additive. The reviewed bridges are storage schema v20, v21 and v22 -> v23.
 //! Repository migration fixtures establish what each step adds. v21 adds the
 //! conversation-context index. v22 adds the `forgotten_sources` table, the
 //! `cass forget` tombstones. An archive older than v22 cannot carry rows for
 //! that table, so a migrated archive gets it empty, which is the state an
-//! in-place v21 -> v22 upgrade leaves. Every other canonical table layout is
-//! unchanged.
+//! in-place v21 -> v22 upgrade leaves. v22 tombstones are instead carried intact.
+//! v23 adds semantic source authority and certificates. Older archives receive
+//! a fresh initializer identity with a zero clock and no certificates; restored
+//! rows are its initial corpus, not changes to a previously certified corpus.
+//! The compiled clock trigger contract must survive publication and retry.
+//! Every other canonical table layout is unchanged.
 //!
 //! The current initializer remains the sole executable schema authority. Archived
 //! `_schema_migrations` rows and `meta.schema_version` are verified as input but
@@ -17,6 +21,7 @@
 //! private staging and streamed back from the persisted publication image before
 //! no-clobber publication. Identical retries use the same read-only projection.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -26,7 +31,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use coding_agent_search::franken_sync::compat::RowExt;
 use coding_agent_search::franken_sync::{Connection, FileIdentity, FrankenError, SqliteValue};
-use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, SqliteStorage};
+use coding_agent_search::storage::sqlite::{
+    CURRENT_SCHEMA_VERSION, SqliteStorage, semantic_source_clock_trigger_contracts,
+};
 
 use super::codec::{self, Cell, Completion, Header, Record, Table, Validator};
 use super::export::{self, DestinationLock};
@@ -39,11 +46,22 @@ const META_TABLE: &str = "meta";
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// Storage schema versions an archive may be migrated from, into
 /// [`REVIEWED_TARGET_VERSION`] only.
-const REVIEWED_SOURCE_VERSIONS: [u32; 2] = [20, 21];
-const REVIEWED_TARGET_VERSION: u32 = 22;
-/// Canonical tables the target added after every reviewed source. A migrated
-/// archive has no rows for them, and they must stay empty.
-const TABLES_ADDED_SINCE_REVIEWED_SOURCES: [&str; 1] = ["forgotten_sources"];
+const REVIEWED_SOURCE_VERSIONS: [u32; 3] = [20, 21, 22];
+const REVIEWED_TARGET_VERSION: u32 = 23;
+/// Reviewed additions, with the first storage schema that owns their rows.
+/// Only the new semantic authority has an initializer row; other additions
+/// must remain empty when they are absent from the archived source schema.
+const REVIEWED_TABLE_ADDITIONS: [(&str, u32); 3] = [
+    ("forgotten_sources", 22),
+    ("semantic_source_certificates_v1", 23),
+    ("semantic_source_identity_v1", 23),
+];
+
+fn table_added_after(name: &str, source_version: u32) -> bool {
+    REVIEWED_TABLE_ADDITIONS
+        .iter()
+        .any(|&(added, first_version)| name == added && source_version < first_version)
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SchemaMigrationReceipt {
@@ -207,15 +225,15 @@ fn inspect(file: &mut File, expected_archive_id: &str) -> Result<Inspected> {
     let mut tables = Vec::new();
     let mut line = 2_u64;
     while let Some(record) = codec::read_record(&mut reader, line)? {
-        if let Record::Table { table } = &record {
-            tables.push(table.clone());
-        }
         validator
             .validate(&record)
             .map_err(|error| super::integrity(format!("record {line}: {error}")))?;
         schema_marker
             .observe(&record)
             .map_err(|error| super::integrity(format!("record {line}: {error}")))?;
+        if let Record::Table { table } = record {
+            tables.push(table);
+        }
         line = line
             .checked_add(1)
             .ok_or_else(|| anyhow!("logical record position overflow"))?;
@@ -233,26 +251,123 @@ fn inspect(file: &mut File, expected_archive_id: &str) -> Result<Inspected> {
     })
 }
 
+/// An older archive has no semantic authority to replay. The initializer's
+/// authority is the restored corpus's initial state, with no certified assets.
+/// Read-only retries must reject a changed clock even if a write was reversed.
+fn require_initial_semantic_authority(connection: &Connection) -> Result<()> {
+    let rows = connection
+        .query(
+            "SELECT singleton, CASE WHEN length(CAST(database_uuid AS BLOB)) = 32 THEN database_uuid ELSE NULL END, change_sequence FROM semantic_source_identity_v1 LIMIT 2",
+        )
+        .map_err(|error| {
+            super::database_failure("cannot inspect migrated semantic source authority", error)
+        })?;
+    ensure!(
+        rows.len() == 1,
+        "migrated semantic source authority must have exactly one initializer row"
+    );
+    let row = rows
+        .first()
+        .context("migrated semantic source authority is absent")?;
+    let singleton = row.get_typed::<i64>(0).map_err(|error| {
+        super::database_failure("cannot decode migrated semantic source singleton", error)
+    })?;
+    let uuid = row.get_typed::<String>(1).map_err(|error| {
+        super::database_failure("cannot decode migrated semantic source identity", error)
+    })?;
+    let clock = row.get_typed::<i64>(2).map_err(|error| {
+        super::database_failure("cannot decode migrated semantic source clock", error)
+    })?;
+    ensure!(
+        singleton == 1
+            && uuid.len() == 32
+            && uuid
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            && clock == 0,
+        "migrated semantic source identity or initial clock differs"
+    );
+
+    // Use the same compiled authority as semantic serving. Matching names
+    // cannot conceal a disabled or weakened canonical-change trigger.
+    let normalized = |sql: &str| {
+        sql.trim()
+            .trim_end_matches(';')
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_uppercase()
+            .replacen("CREATE TRIGGER IF NOT EXISTS ", "CREATE TRIGGER ", 1)
+    };
+    let mut expected: BTreeMap<_, _> = semantic_source_clock_trigger_contracts()
+        .into_iter()
+        .map(|(name, sql)| (name, normalized(&sql)))
+        .collect();
+    let triggers = connection.query(
+        "SELECT CASE WHEN length(CAST(name AS BLOB)) <= 128 THEN name ELSE NULL END, CASE WHEN length(CAST(sql AS BLOB)) <= 16384 THEN sql ELSE NULL END FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'cass_semantic_source_%' ORDER BY name LIMIT 19",
+    ).map_err(|error| super::database_failure("cannot inspect migrated source clock triggers", error))?;
+    ensure!(
+        triggers.len() == expected.len(),
+        "migrated semantic source clock trigger set differs"
+    );
+    for trigger in triggers {
+        let name = trigger.get_typed::<String>(0).map_err(|error| {
+            super::database_failure("cannot decode migrated source clock trigger name", error)
+        })?;
+        let sql = trigger.get_typed::<String>(1).map_err(|error| {
+            super::database_failure(
+                "cannot decode migrated source clock trigger definition",
+                error,
+            )
+        })?;
+        ensure!(
+            expected.remove(&name).as_deref() == Some(normalized(&sql).as_str()),
+            "migrated semantic source clock trigger definition differs"
+        );
+    }
+    ensure!(
+        expected.is_empty(),
+        "migrated source clock trigger is absent"
+    );
+    Ok(())
+}
+
 fn require_reviewed_table_layout(
     connection: &Connection,
     archived: &[Table],
+    source_version: u32,
 ) -> Result<Vec<Table>> {
+    require_reviewed_transition(source_version, target_version()?)?;
     let (added, carried): (Vec<Table>, Vec<Table>) = export::tables(connection)?
         .into_iter()
-        .partition(|table| TABLES_ADDED_SINCE_REVIEWED_SOURCES.contains(&table.name.as_str()));
+        .partition(|table| table_added_after(&table.name, source_version));
     ensure!(
         archived == carried,
-        "reviewed migration to v{REVIEWED_TARGET_VERSION} requires canonical table/column/primary-key descriptors identical to the current ones, apart from tables added since v21; table drift is not authorized"
+        "reviewed migration from v{source_version} to v{REVIEWED_TARGET_VERSION} requires identical canonical table/column/primary-key descriptors apart from reviewed additions after that source; table drift is not authorized"
     );
     ensure!(
-        added.len() == TABLES_ADDED_SINCE_REVIEWED_SOURCES.len(),
+        added.len()
+            == REVIEWED_TABLE_ADDITIONS
+                .iter()
+                .filter(|&&(_, first_version)| source_version < first_version)
+                .count(),
         "current schema lacks a table the reviewed migration adds"
     );
     for table in &added {
-        let sql = format!("SELECT 1 FROM {} LIMIT 1", export::quoted(&table.name)?);
+        if table.name == "semantic_source_identity_v1" {
+            require_initial_semantic_authority(connection)?;
+            continue;
+        }
+        let sql = match table.name.as_str() {
+            "forgotten_sources" => "SELECT 1 FROM forgotten_sources LIMIT 1",
+            "semantic_source_certificates_v1" => {
+                "SELECT 1 FROM semantic_source_certificates_v1 LIMIT 1"
+            }
+            _ => bail!("unreviewed canonical table addition {}", table.name),
+        };
         ensure!(
             connection
-                .query(&sql)
+                .query(sql)
                 .map_err(|error| {
                     super::database_failure(
                         format!("cannot check newly added logical table {}", table.name),
@@ -345,7 +460,7 @@ fn suspend_triggers(connection: &Connection) -> Result<Vec<String>> {
             "canonical trigger definitions exceed restore budget"
         );
         connection
-            .execute(&format!("DROP TRIGGER {}", export::quoted(&name)?))
+            .execute(&format!("DROP TRIGGER {}", export::quoted(&name)?)) // ubs:ignore[rust.perf.string-alloc-in-loop] -- At most 256 quoted trigger names, with definitions bounded by MAX_TRIGGER_BYTES.
             .map_err(|error| {
                 super::database_failure("cannot suspend a canonical migration trigger", error)
             })?;
@@ -374,7 +489,7 @@ fn clear_archived_data(connection: &Connection, archived: &[Table]) -> Result<()
                 })?;
         } else {
             connection
-                .execute(&format!("DELETE FROM {}", export::quoted(&table.name)?))
+                .execute(&format!("DELETE FROM {}", export::quoted(&table.name)?)) // ubs:ignore[rust.perf.string-alloc-in-loop] -- Once per table in the exact reviewed canonical layout, not per archived row.
                 .map_err(|error| {
                     super::database_failure(
                         format!(
@@ -397,7 +512,7 @@ fn restore_reviewed<R: BufRead>(
     let source_version = parse_source_version(&inspected.header)?;
     let target = target_version()?;
     require_reviewed_transition(source_version, target)?;
-    require_reviewed_table_layout(connection, &inspected.tables)?;
+    require_reviewed_table_layout(connection, &inspected.tables, source_version)?;
     verify_current_schema_authority(connection)?;
 
     let Some(Record::Header { header }) = input.record(1)? else {
@@ -720,13 +835,14 @@ fn migrated_row_equal(table: &Table, archived: &[Cell], actual: &[Cell]) -> Resu
     let Some(value_offset) = value_offset else {
         return Ok(archived == actual);
     };
-    for offset in 0..archived.len() {
+    let current_marker = Cell::Text(target_version()?.to_string());
+    for (offset, (archived_cell, actual_cell)) in archived.iter().zip(actual).enumerate() {
         if offset == value_offset {
             ensure!(
-                actual[offset] == Cell::Text(target_version()?.to_string()),
+                actual_cell == &current_marker,
                 "persisted schema marker is not current"
             );
-        } else if archived[offset] != actual[offset] {
+        } else if archived_cell != actual_cell {
             return Ok(false);
         }
     }
@@ -881,7 +997,11 @@ fn verify_persisted_projection(
     }
     super::import::verify_database(&reader)?;
     verify_current_schema_authority(&reader)?;
-    require_reviewed_table_layout(&reader, &inspected.tables)?;
+    require_reviewed_table_layout(
+        &reader,
+        &inspected.tables,
+        parse_source_version(&inspected.header)?,
+    )?;
 
     file.seek(SeekFrom::Start(0))?;
     verify_projection_rows(&reader, BufReader::new(&mut *file), inspected)?;
@@ -912,8 +1032,9 @@ fn migration_receipt(inspected: &Inspected) -> Result<SchemaMigrationReceipt> {
     require_reviewed_transition(source, target_version()?)?;
     Ok(SchemaMigrationReceipt {
         mode: match source {
-            20 => "reviewed_v20_to_v22",
-            21 => "reviewed_v21_to_v22",
+            20 => "reviewed_v20_to_v23",
+            21 => "reviewed_v21_to_v23",
+            22 => "reviewed_v22_to_v23",
             _ => bail!("no reviewed migration mode for storage schema {source}"),
         },
         from_storage_schema_version: inspected.header.storage_schema_version.clone(),
@@ -1657,6 +1778,12 @@ mod tests {
             version: Some("v20-data".into()),
             kind: AgentKind::Cli,
         })?;
+        if source_version >= 22 {
+            storage.raw().execute(
+                "INSERT INTO forgotten_sources (source_path, size_bytes, mtime_ms, forgotten_at_ms) \
+                 VALUES ('/private/forgotten-session.jsonl', 12345, 23456, 34567)",
+            )?;
+        }
         drop(storage);
         if format_version == codec::SEQUENCE_VERSION {
             let writer = Connection::open(export::path_text(&source)?)?;
@@ -1696,10 +1823,7 @@ mod tests {
         })?)?;
 
         for mut table in export::tables(&connection)? {
-            if !carry_added_tables
-                && source_version < REVIEWED_TARGET_VERSION
-                && TABLES_ADDED_SINCE_REVIEWED_SOURCES.contains(&table.name.as_str())
-            {
+            if !carry_added_tables && table_added_after(&table.name, source_version) {
                 continue;
             }
             if descriptor_drift && table.name == "agents" {
@@ -1871,36 +1995,164 @@ mod tests {
 
     #[test]
     fn reviewed_migrations_restore_rows_under_current_authority() -> Result<()> {
-        for (source, mode) in [(20, "reviewed_v20_to_v22"), (21, "reviewed_v21_to_v22")] {
-            let root = tempfile::tempdir()?;
-            let input = versioned_archive(root.path(), source, false, false)?;
-            let destination = root.path().join("restored.db");
-            let outcome = import_compatible(&input, &destination, "reviewed-migration", false)?;
-            let receipt = outcome.migration.context("migration receipt missing")?;
-            assert_eq!(receipt.mode, mode);
-            assert_eq!(receipt.from_storage_schema_version, source.to_string());
-            assert_eq!(
-                receipt.to_storage_schema_version,
-                REVIEWED_TARGET_VERSION.to_string()
-            );
-            assert!(receipt.source_rows_verified);
+        for (source, mode) in [
+            (20, "reviewed_v20_to_v23"),
+            (21, "reviewed_v21_to_v23"),
+            (22, "reviewed_v22_to_v23"),
+        ] {
+            for format in [codec::VERSION, codec::CHUNKED_VERSION] {
+                let root = tempfile::tempdir()?;
+                let input =
+                    versioned_archive_with_format(root.path(), source, false, false, format)?;
+                let destination = root.path().join("restored.db");
+                let outcome = import_compatible(&input, &destination, "reviewed-migration", false)?;
+                let receipt = outcome.migration.context("migration receipt missing")?;
+                assert_eq!(receipt.mode, mode);
+                assert_eq!(receipt.from_storage_schema_version, source.to_string());
+                assert_eq!(
+                    receipt.to_storage_schema_version,
+                    REVIEWED_TARGET_VERSION.to_string()
+                );
+                assert!(receipt.source_rows_verified);
 
-            let storage = SqliteStorage::open_readonly(&destination)?;
-            assert_eq!(
-                u32::try_from(storage.schema_version()?)?,
-                REVIEWED_TARGET_VERSION
-            );
-            let row = storage
+                let storage = SqliteStorage::open_readonly(&destination)?;
+                assert_eq!(
+                    u32::try_from(storage.schema_version()?)?,
+                    REVIEWED_TARGET_VERSION
+                );
+                let row = storage.raw().query_row(
+                    "SELECT slug, version FROM agents WHERE slug = 'migration-fixture'",
+                )?;
+                assert_eq!(row.get_typed::<String>(0)?, "migration-fixture");
+                assert_eq!(row.get_typed::<Option<String>>(1)?, Some("v20-data".into()));
+                // Pre-v22 sources have no tombstones. Existing v22 tombstones
+                // remain canonical data, with every stamp preserved.
+                let forgotten = storage
                 .raw()
-                .query_row("SELECT slug, version FROM agents WHERE slug = 'migration-fixture'")?;
-            assert_eq!(row.get_typed::<String>(0)?, "migration-fixture");
-            assert_eq!(row.get_typed::<Option<String>>(1)?, Some("v20-data".into()));
-            // The table v22 added exists, empty, as an in-place upgrade leaves it.
-            let forgotten = storage
-                .raw()
-                .query_row("SELECT COUNT(*) FROM forgotten_sources")?;
-            assert_eq!(forgotten.get_typed::<i64>(0)?, 0);
+                .query("SELECT source_path, size_bytes, mtime_ms, forgotten_at_ms FROM forgotten_sources")?;
+                if source == 22 {
+                    assert_eq!(forgotten.len(), 1);
+                    assert_eq!(
+                        forgotten[0].get_typed::<String>(0)?,
+                        "/private/forgotten-session.jsonl"
+                    );
+                    assert_eq!(forgotten[0].get_typed::<i64>(1)?, 12345);
+                    assert_eq!(forgotten[0].get_typed::<i64>(2)?, 23456);
+                    assert_eq!(forgotten[0].get_typed::<i64>(3)?, 34567);
+                } else {
+                    assert!(forgotten.is_empty());
+                }
+                require_initial_semantic_authority(storage.raw())?;
+                assert_eq!(
+                    storage
+                        .raw()
+                        .query_row("SELECT COUNT(*) FROM semantic_source_certificates_v1")?
+                        .get_typed::<i64>(0)?,
+                    0
+                );
+                storage.close_without_checkpoint()?;
+                let before = database_files(&destination);
+                assert!(
+                    !import_compatible(&input, &destination, "reviewed-migration", true)?.created
+                );
+                assert_eq!(before, database_files(&destination));
+            }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn migrated_source_authority_survives_reopen_and_refuses_reverted_writes() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let input = versioned_archive(root.path(), 22, false, false)?;
+        let destination = root.path().join("restored.db");
+        import_compatible(&input, &destination, "reviewed-migration", false)?;
+        let storage = SqliteStorage::open(&destination)?;
+        require_initial_semantic_authority(storage.raw())?;
+        let uuid = storage
+            .raw()
+            .query_row("SELECT database_uuid FROM semantic_source_identity_v1 WHERE singleton = 1")?
+            .get_typed::<String>(0)?;
+        storage
+            .raw()
+            .execute("INSERT INTO workspaces(path) VALUES('/after-migration')")?;
+        storage
+            .raw()
+            .execute("DELETE FROM workspaces WHERE path = '/after-migration'")?;
+        assert_eq!(
+            storage
+                .raw()
+                .query_row(
+                    "SELECT change_sequence FROM semantic_source_identity_v1 WHERE singleton = 1"
+                )?
+                .get_typed::<i64>(0)?,
+            2
+        );
+        assert!(
+            storage
+                .raw()
+                .execute(
+                    "UPDATE semantic_source_identity_v1 SET change_sequence = 0 WHERE singleton = 1"
+                )
+                .is_err()
+        );
+        assert!(storage.raw().execute("UPDATE semantic_source_identity_v1 SET database_uuid = 'not-an-initializer-identity' WHERE singleton = 1").is_err());
+        assert!(
+            storage
+                .raw()
+                .execute("DELETE FROM semantic_source_identity_v1")
+                .is_err()
+        );
+        storage.close()?;
+        let readonly = SqliteStorage::open_readonly(&destination)?;
+        assert_eq!(
+            readonly
+                .raw()
+                .query_row(
+                    "SELECT database_uuid FROM semantic_source_identity_v1 WHERE singleton = 1"
+                )?
+                .get_typed::<String>(0)?,
+            uuid
+        );
+        readonly.close_without_checkpoint()?;
+        let before = database_files(&destination);
+        let error = import_compatible(&input, &destination, "reviewed-migration", true)
+            .err()
+            .context("a reverted canonical write must invalidate identical migration retry")?;
+        assert!(error.to_string().contains("initial clock differs"));
+        assert_eq!(before, database_files(&destination));
+        Ok(())
+    }
+
+    #[test]
+    fn initial_source_authority_checks_behavior_and_same_name_trigger_drift() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let storage = SqliteStorage::open(&root.path().join("authority.db"))?;
+        require_initial_semantic_authority(storage.raw())?;
+        storage
+            .raw()
+            .execute("INSERT INTO workspaces(path) VALUES('/temporary-change')")?;
+        storage
+            .raw()
+            .execute("DELETE FROM workspaces WHERE path = '/temporary-change'")?;
+        assert_eq!(
+            storage
+                .raw()
+                .query_row("SELECT COUNT(*) FROM workspaces")?
+                .get_typed::<i64>(0)?,
+            0
+        );
+        assert!(require_initial_semantic_authority(storage.raw()).is_err());
+
+        let untouched = SqliteStorage::open(&root.path().join("trigger-drift.db"))?;
+        require_initial_semantic_authority(untouched.raw())?;
+        untouched.raw().execute_batch(
+            "DROP TRIGGER cass_semantic_source_workspaces_insert;
+             CREATE TRIGGER cass_semantic_source_workspaces_insert AFTER INSERT ON workspaces BEGIN SELECT 1; END;",
+        )?;
+        let error = require_initial_semantic_authority(untouched.raw())
+            .expect_err("a matching trigger name cannot certify the source clock");
+        assert!(error.to_string().contains("trigger definition differs"));
         Ok(())
     }
 
@@ -1922,7 +2174,7 @@ mod tests {
     #[test]
     fn reviewed_v3_migration_preserves_allocation_and_refuses_sequence_only_conflicts() -> Result<()>
     {
-        for source_version in [20, 21] {
+        for source_version in [20, 21, 22] {
             let root = tempfile::tempdir()?;
             let input = versioned_archive_with_format(
                 root.path(),
@@ -1983,7 +2235,7 @@ mod tests {
 
     #[test]
     fn reviewed_retry_rejects_sparse_current_history_even_when_projection_matches() -> Result<()> {
-        for source in [20, 21] {
+        for source in [20, 21, 22] {
             let root = tempfile::tempdir()?;
             let input = versioned_archive(root.path(), source, false, false)?;
             let destination = root.path().join("restored.db");
@@ -2042,19 +2294,29 @@ mod tests {
 
     #[test]
     fn a_row_in_an_added_table_makes_the_migrated_destination_a_conflict() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let input = versioned_archive(root.path(), 21, false, false)?;
-        let destination = root.path().join("restored.db");
-        import_compatible(&input, &destination, "reviewed-migration", false)?;
-        let writer = Connection::open(export::path_text(&destination)?)?;
-        writer.execute(
-            "INSERT INTO forgotten_sources (source_path, size_bytes, mtime_ms, forgotten_at_ms) \
-             VALUES ('/not/from/the/archive.jsonl', 1, 1, 1)",
-        )?;
-        writer.close()?;
-        let before = database_files(&destination);
-        assert!(import_compatible(&input, &destination, "reviewed-migration", true).is_err());
-        assert_eq!(before, database_files(&destination));
+        for (source, insertion) in [
+            (
+                21,
+                "INSERT INTO forgotten_sources (source_path, size_bytes, mtime_ms, forgotten_at_ms) \
+                 VALUES ('/not/from/the/archive.jsonl', 1, 1, 1)",
+            ),
+            (
+                22,
+                "INSERT INTO semantic_source_certificates_v1 (contract_sha256, snapshot_json, snapshot_sha256) \
+                 VALUES ('not-from-the-archive', '{}', 'not-certified')",
+            ),
+        ] {
+            let root = tempfile::tempdir()?;
+            let input = versioned_archive(root.path(), source, false, false)?;
+            let destination = root.path().join("restored.db");
+            import_compatible(&input, &destination, "reviewed-migration", false)?;
+            let writer = Connection::open(export::path_text(&destination)?)?;
+            writer.execute(insertion)?;
+            writer.close()?;
+            let before = database_files(&destination);
+            assert!(import_compatible(&input, &destination, "reviewed-migration", true).is_err());
+            assert_eq!(before, database_files(&destination));
+        }
         Ok(())
     }
 

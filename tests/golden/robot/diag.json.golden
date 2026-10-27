@@ -204,6 +204,11 @@
       "name": "openwebui",
       "path": "(not detected)",
       "found": false
+    },
+    {
+      "name": "dsh",
+      "path": "(not detected)",
+      "found": false
     }
   ]
 }

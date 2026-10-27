@@ -346,6 +346,7 @@ fn conversation_source_is_subagent(source_path: &Path) -> bool {
 fn conversation_is_subagent(conversation: &NormalizedConversation) -> bool {
     conversation_source_is_subagent(&conversation.source_path)
         || (conversation.agent_slug == "shelley"
+            // ubs:ignore[rust.panic.direct-indexing] -- This serde_json::Value read yields Null for missing keys and non-objects.
             && conversation.metadata["source"] == "shelley"
             && conversation
                 .metadata
@@ -1073,6 +1074,8 @@ struct NonWatchIngestOutcome {
     scanned_connectors: BTreeSet<String>,
     scan_had_errors: bool,
     deferred_sources: BTreeSet<PathBuf>,
+    /// Content conflicts, excluding active-source and allocation deferrals.
+    conflicted_sources: BTreeSet<PathBuf>,
 }
 
 impl NonWatchIngestOutcome {
@@ -1081,6 +1084,8 @@ impl NonWatchIngestOutcome {
         scanned_connectors.extend(other.scanned_connectors);
         let mut deferred_sources = self.deferred_sources;
         deferred_sources.extend(other.deferred_sources);
+        let mut conflicted_sources = self.conflicted_sources;
+        conflicted_sources.extend(other.conflicted_sources);
         Self {
             canonical_mutations: self
                 .canonical_mutations
@@ -1092,6 +1097,7 @@ impl NonWatchIngestOutcome {
             scanned_connectors,
             scan_had_errors: self.scan_had_errors || other.scan_had_errors,
             deferred_sources,
+            conflicted_sources,
         }
     }
 }
@@ -12116,6 +12122,9 @@ fn should_repair_daily_stats_after_historical_salvage(
 /// Producers (connector scan threads) send batches of conversations through
 /// the channel. The consumer (main indexing thread) receives and ingests them.
 pub enum IndexMessage {
+    /// Final scan dispositions for a scope. FIFO delivery puts this after
+    /// every source batch from that scope, so persistence can correct them.
+    IngestReport { report: ConnectorIngestReport },
     /// The final bounded batch for an observed source. Earlier batches from
     /// this producer must succeed before its completion can become durable.
     SourceComplete {
@@ -12842,6 +12851,7 @@ fn source_observations_after_scan(
     dependencies_before: &HashMap<PathBuf, serde_json::Value>,
 ) -> Option<(serde_json::Value, Vec<serde_json::Value>)> {
     let primary = source_file_observation(&source.source_path)?;
+    // ubs:ignore[rust.panic.direct-indexing] -- This serde_json::Value read returns Null when the observation has no absent flag.
     if primary["absent"].as_bool() == Some(true)
         || Some(&primary) != primary_before
         || source.fs_metadata_changed()
@@ -13715,7 +13725,14 @@ where
             }
             ingest_diagnostics
                 .observe_reused_sources(std::mem::take(&mut batch_sender.reused_sources));
-            record_connector_ingest_report(config.progress.as_ref(), ingest_diagnostics.finish());
+            if tx
+                .send(IndexMessage::IngestReport {
+                    report: ingest_diagnostics.finish(),
+                })
+                .is_err()
+            {
+                return;
+            }
         }
 
         // Scan explicitly configured additional roots. These may be true remote
@@ -13871,13 +13888,20 @@ where
                     );
                     let _ = tx.send(IndexMessage::ScanError {
                         connector_name: name,
-                        error: format!("remote scan failed for {}: {e:#}", root.path.display()),
+                        error: format!("remote scan failed for {}: {e:#}", root.path.display()), // ubs:ignore[rust.perf.string-alloc-in-loop] -- Only a failed root allocates this owned diagnostic sent to the consumer.
                     });
                 }
             }
             ingest_diagnostics
                 .observe_reused_sources(std::mem::take(&mut batch_sender.reused_sources));
-            record_connector_ingest_report(config.progress.as_ref(), ingest_diagnostics.finish());
+            if tx
+                .send(IndexMessage::IngestReport {
+                    report: ingest_diagnostics.finish(),
+                })
+                .is_err()
+            {
+                return;
+            }
         }
 
         let scan_ms = scan_start.elapsed().as_millis() as u64;
@@ -14126,6 +14150,9 @@ fn run_streaming_consumer(
     // Per-connector stats tracking (T7.4)
     let mut connector_stats: HashMap<String, ConnectorStats> = HashMap::new();
     let mut failed_scan_connectors = BTreeSet::new();
+    // Own each conflicted path once, with the connectors that submitted it.
+    // Conversation trees can then be dropped without copying their paths.
+    let mut conflicted_sources: BTreeMap<PathBuf, BTreeSet<&'static str>> = BTreeMap::new();
     let source_commit_limit = dotenvy::var("CASS_INDEX_MAX_SOURCE_COMMITS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -14305,15 +14332,38 @@ fn run_streaming_consumer(
                 // trees. Drop them before waking blocked producers so the
                 // queue's byte counter never advertises memory that is still
                 // live in this consumer arm (#320).
-                if let Ok(outcome) = &batch_outcome {
+                let batch_outcome = batch_outcome.and_then(|mut outcome| {
+                    for path in std::mem::take(&mut outcome.conflicted_sources) {
+                        let providers = combined_connector_ranges
+                            .iter()
+                            .filter_map(|(name, range)| {
+                                combined_conversations
+                                    .get(range.start..range.end)
+                                    .is_some_and(|conversations| {
+                                        conversations
+                                            .iter()
+                                            .any(|conversation| conversation.source_path == path)
+                                    })
+                                    .then_some(*name)
+                            })
+                            .collect::<BTreeSet<_>>();
+                        conflicted_sources
+                            .entry(path)
+                            .or_default()
+                            .extend(providers);
+                    }
                     for (name, range) in combined_connector_ranges {
-                        if combined_conversations[range].iter().any(|conversation| {
+                        let conversations = combined_conversations
+                            .get(range)
+                            .context("combined connector range exceeds its persisted batch")?;
+                        if conversations.iter().any(|conversation| {
                             outcome.deferred_sources.contains(&conversation.source_path)
                         }) {
                             failed_scan_connectors.insert(name.to_string());
                         }
                     }
-                }
+                    Ok(outcome)
+                });
                 drop(combined_conversations);
                 flow_limiter.release(combined_byte_reservation);
                 ingest_outcome = ingest_outcome.accumulate(batch_outcome?);
@@ -14394,7 +14444,7 @@ fn run_streaming_consumer(
                         completion_written.then_some(&completion),
                     )
                 };
-                let result = match first {
+                let mut result = match first {
                     Err(error) if error_is_out_of_memory(&error) => {
                         // Preserve the ordinary split/defer/quarantine recovery.
                         // A partial retry must never certify this source as complete.
@@ -14417,7 +14467,16 @@ fn run_streaming_consumer(
                         outcome.deferred_sources.contains(&conversation.source_path)
                     })
                 {
+                    completion_written = false;
                     failed_scan_connectors.insert(connector_name.to_string());
+                }
+                if let Ok(outcome) = &mut result {
+                    for path in std::mem::take(&mut outcome.conflicted_sources) {
+                        conflicted_sources
+                            .entry(path)
+                            .or_default()
+                            .insert(connector_name);
+                    }
                 }
                 drop(conversations);
                 flow_limiter.release(byte_reservation);
@@ -14449,6 +14508,15 @@ fn run_streaming_consumer(
                         progress.request_stop();
                     }
                 }
+            }
+            Ok(IndexMessage::IngestReport { mut report }) => {
+                let conflicts = conflicted_sources
+                    .iter()
+                    .filter(|(_, providers)| providers.contains(report.provider.as_str()))
+                    .map(|(path, _)| path)
+                    .collect::<Vec<_>>();
+                report.reconcile_persistence_conflicts(conflicts);
+                record_connector_ingest_report(progress.as_ref(), report);
             }
             Ok(IndexMessage::ScanError {
                 connector_name,
@@ -14487,10 +14555,19 @@ fn run_streaming_consumer(
                 let stats = connector_stats
                     .entry(connector_name.to_string())
                     .or_insert_with(|| ConnectorStats {
+                        // ubs:ignore[rust.perf.string-alloc-in-loop] -- Allocated only when this connector's owned statistics entry is first created.
                         name: connector_name.to_string(),
                         ..Default::default()
                     });
                 stats.scan_ms = scan_ms;
+                if conflicted_sources
+                    .values()
+                    .any(|providers| providers.contains(connector_name))
+                {
+                    stats.error.get_or_insert_with(|| {
+                        "source content conflicts prevented complete ingestion; retained canonical history was preserved and the affected sources must be reconciled before completion".to_owned()
+                    });
+                }
 
                 if is_discovered {
                     remember_discovered_connector(&mut discovered_names, connector_name);
@@ -15052,6 +15129,7 @@ where
         scan_succeeded: bool,
         active_source_skipped: bool,
         scan_error: Option<String>,
+        ingest_reports: Vec<ConnectorIngestReport>,
     }
 
     let progress_ref = opts.progress.as_ref();
@@ -15098,6 +15176,7 @@ where
                 let mut scan_succeeded = true;
                 let mut active_source_skipped = false;
                 let mut scan_errors = Vec::new();
+                let mut ingest_reports = Vec::new();
                 let connector_tick: Option<Arc<dyn Fn() + Send + Sync>> =
                     scan_progress_tick.as_ref().map(|tick| {
                         let tick = Arc::clone(tick);
@@ -15234,10 +15313,7 @@ where
                             "scan exceeded its bounded time budget; the connector's scan watermark was not advanced"
                         );
                     }
-                    record_connector_ingest_report(
-                        progress_ref,
-                        ingest_diagnostics.finish(),
-                    );
+                    ingest_reports.push(ingest_diagnostics.finish());
                 }
 
                 if !additional_scan_roots.is_empty() {
@@ -15326,7 +15402,7 @@ where
                         // follow every root, not only the local one.
                         if scan_budget.expired() {
                             scan_succeeded = false;
-                            scan_errors.push(format!(
+                            scan_errors.push(format!( // ubs:ignore[rust.perf.string-alloc-in-loop] -- Only an expired scan creates this retained, connector-specific error.
                                 "scan for {name} exceeded its bounded time budget"
                             ));
                             tracing::warn!(
@@ -15335,10 +15411,7 @@ where
                                 "scan exceeded its bounded time budget; the connector's scan watermark was not advanced"
                             );
                         }
-                        record_connector_ingest_report(
-                            progress_ref,
-                            ingest_diagnostics.finish(),
-                        );
+                        ingest_reports.push(ingest_diagnostics.finish());
                     }
                 }
 
@@ -15359,7 +15432,7 @@ where
                     p.current.fetch_add(1, Ordering::Relaxed);
                 }
 
-                if convs.is_empty() && !is_discovered && scan_succeeded {
+                if convs.is_empty() && !is_discovered && scan_succeeded && ingest_reports.is_empty() {
                     return None;
                 }
 
@@ -15378,6 +15451,7 @@ where
                     scan_succeeded,
                     active_source_skipped,
                     scan_error,
+                    ingest_reports,
                 })
             })
             .collect();
@@ -15414,7 +15488,7 @@ where
                 .sum::<usize>()
         })
         .sum();
-    let connector_stats: Vec<ConnectorStats> = pending_batches
+    let mut connector_stats: Vec<ConnectorStats> = pending_batches
         .iter()
         .filter(|pending| !pending.convs.is_empty() || pending.scan_error.is_some())
         .map(|pending| {
@@ -15459,6 +15533,20 @@ where
             progress_bump,
         )?;
         let persistence_completed = !batch_outcome.scan_had_errors;
+        for mut report in pending.ingest_reports {
+            report.reconcile_persistence_conflicts(&batch_outcome.conflicted_sources);
+            record_connector_ingest_report(opts.progress.as_ref(), report);
+        }
+        if !batch_outcome.conflicted_sources.is_empty()
+            && let Some(stats) = connector_stats
+                .iter_mut()
+                .find(|stats| stats.name == pending.name)
+        {
+            stats.error.get_or_insert_with(|| {
+                // ubs:ignore[rust.perf.string-alloc-in-loop] -- Lazily retained once for a conflicting connector, outside successful ingestion.
+                "source content conflicts prevented complete ingestion; retained canonical history was preserved and the affected sources must be reconciled before completion".to_owned()
+            });
+        }
         ingest_outcome = ingest_outcome.accumulate(batch_outcome);
         // #426: this connector's complete scan has now been persisted. Advance
         // only its watermark at this transaction boundary. The former timed
@@ -15725,23 +15813,25 @@ pub(crate) fn mirrored_root_owners(root: &ScanRoot) -> Option<&'static [&'static
         .as_deref()?
         .split(['/', '\\'])
         .rev()
-        .find_map(|component| match component {
-            ".claude" => Some(&["claude"][..]),
-            ".codex" => Some(&["codex"][..]),
-            ".pi" => Some(&["pi_agent", "pi_durable"][..]),
-            ".prime" => Some(&["prime_agent"][..]),
-            ".omp" | "omp" => Some(&["omp"][..]),
-            ".factory" => Some(&["factory"][..]),
-            ".gemini" => Some(&["gemini", "antigravity"][..]),
-            "antigravity" | "antigravity-cli" => Some(&["antigravity"][..]),
-            ".vibe" => Some(&["vibe"][..]),
-            ".continue" => Some(&["continue"][..]),
-            ".goose" => Some(&["goose"][..]),
-            "opencode" => Some(&["opencode"][..]),
-            ".aider.chat.history.md" => Some(&["aider"][..]),
-            "saoudrizwan.claude-dev" | "rooveterinaryinc.roo-cline" => Some(&["cline"][..]),
-            "Cursor" => Some(&["cursor", "cline"][..]),
-            _ => None,
+        .find_map(|component| -> Option<&'static [&'static str]> {
+            match component {
+                ".claude" => Some(&["claude"]),
+                ".codex" => Some(&["codex"]),
+                ".pi" => Some(&["pi_agent", "pi_durable"]),
+                ".prime" => Some(&["prime_agent"]),
+                ".omp" | "omp" => Some(&["omp"]),
+                ".factory" => Some(&["factory"]),
+                ".gemini" => Some(&["gemini", "antigravity"]),
+                "antigravity" | "antigravity-cli" => Some(&["antigravity"]),
+                ".vibe" => Some(&["vibe"]),
+                ".continue" => Some(&["continue"]),
+                ".goose" => Some(&["goose"]),
+                "opencode" => Some(&["opencode"]),
+                ".aider.chat.history.md" => Some(&["aider"]),
+                "saoudrizwan.claude-dev" | "rooveterinaryinc.roo-cline" => Some(&["cline"]),
+                "Cursor" => Some(&["cursor", "cline"]),
+                _ => None,
+            }
         })
 }
 
@@ -21319,6 +21409,7 @@ fn full_rebuild_existing_storage_integrity_problem(
                 ));
             }
             Err(err) => {
+                // ubs:ignore[rust.perf.string-alloc-in-loop] -- The first failed canary returns immediately with its owned table-specific error.
                 return Ok(Some(format!(
                     "canonical table canary failed for {table}: {err}"
                 )));
@@ -22532,6 +22623,7 @@ fn quarantine_failed_seed_bundle(db_path: &Path) -> Result<Option<PathBuf>> {
             continue;
         }
         let dest = if suffix.is_empty() {
+            // ubs:ignore[rust.collections.clone-in-loop] -- Only the single database entry copies this retained path; the other two entries are sidecars.
             backup_root.clone()
         } else {
             backup_root.with_file_name(format!(
@@ -23459,7 +23551,7 @@ fn spawn_lexical_rebuild_page_prep_workers(
                                     worker_reservation_order.close();
                                     let _ = worker_result_tx.send(LexicalRebuildPagePrepResult::Error {
                                         sequence,
-                                        error: err.context(format!(
+                                        error: err.context(format!( // ubs:ignore[rust.perf.string-alloc-in-loop] -- A failed page terminates this worker after sending its owned sequence-specific error.
                                             "lexical rebuild page-prep worker {worker_idx} could not prepare page sequence {sequence}"
                                         )),
                                     });
@@ -23470,7 +23562,7 @@ fn spawn_lexical_rebuild_page_prep_workers(
                                     let _ = worker_result_tx.send(LexicalRebuildPagePrepResult::Error {
                                         sequence,
                                         error: anyhow::anyhow!(panic_payload_message(payload))
-                                            .context(format!(
+                                            .context(format!( // ubs:ignore[rust.perf.string-alloc-in-loop] -- Only the terminal panic path constructs this worker/sequence diagnostic.
                                                 "lexical rebuild page-prep worker {worker_idx} panicked while preparing page sequence {sequence}"
                                             )),
                                     });
@@ -23757,6 +23849,7 @@ fn spawn_lexical_rebuild_packet_producer(
                                     &workspace_paths,
                                 )
                                 .with_context(|| {
+                                    // ubs:ignore[rust.perf.string-alloc-in-loop] -- Lazy error context: successful conversation pages allocate no diagnostic.
                                     format!(
                                         "listing lexical rebuild conversations after id {} through planned shard {} upper bound {}",
                                         last_conversation_id,
@@ -23773,10 +23866,7 @@ fn spawn_lexical_rebuild_packet_producer(
                                     &workspace_paths,
                                 )
                                 .with_context(|| {
-                                    format!(
-                                        "listing lexical rebuild conversations after id {}",
-                                        last_conversation_id
-                                    )
+                                    format!("listing lexical rebuild conversations after id {last_conversation_id}") // ubs:ignore[rust.perf.string-alloc-in-loop] -- Allocated only when the bounded DB page lookup fails.
                                 })?
                         };
                         producer_telemetry.set_producer_state(LexicalRebuildProducerParkSite::Idle);
@@ -24714,6 +24804,7 @@ fn prune_lexical_publish_backups(index_path: &Path) -> Result<()> {
     // pruning of the rest.
     let mut entries: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
     for entry in fs::read_dir(&backups_dir).with_context(|| {
+        // ubs:ignore[rust.perf.string-alloc-in-loop] -- The directory is opened once before iteration; context is allocated only if that open fails.
         format!(
             "reading retained lexical-publish backups dir for pruning {}",
             backups_dir.display()
@@ -25966,8 +26057,13 @@ fn rebuild_tantivy_from_db_once(
                                 max_message_id = max_message_id.max(last_message_id);
                             }
                             equivalence_accumulator.absorb_packet(&packet);
-                            if let Some(chunk) =
-                                packet.chunk.clone().filter(|chunk| !chunk.is_final)
+                            // Final chunks need no extra gate handle. A non-final
+                            // chunk retains one until its packet has been flushed.
+                            if let Some(chunk) = packet
+                                .chunk
+                                .as_ref()
+                                .filter(|chunk| !chunk.is_final)
+                                .cloned()
                             {
                                 // A non-final chunk of a long conversation
                                 // (bgn6s): flush it into the index now, freeing
@@ -26602,8 +26698,9 @@ fn ingest_batch_detailed_with_source_completion(
         quarantined_conversations: 0,
         lexical_update_deferred: batch_outcome.lexical_update_deferred,
         scanned_connectors: BTreeSet::new(),
-        scan_had_errors: false,
-        deferred_sources: BTreeSet::new(),
+        scan_had_errors: !batch_outcome.incomplete_sources.is_empty(),
+        deferred_sources: batch_outcome.incomplete_sources.clone(),
+        conflicted_sources: batch_outcome.incomplete_sources,
     })
 }
 
@@ -26838,6 +26935,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
             scanned_connectors: BTreeSet::new(),
             scan_had_errors: true,
             deferred_sources: BTreeSet::from([conv.source_path.clone()]),
+            conflicted_sources: BTreeSet::new(),
         });
     }
 
@@ -26870,6 +26968,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         scanned_connectors: BTreeSet::new(),
         scan_had_errors: true,
         deferred_sources: BTreeSet::from([conv.source_path.clone()]),
+        conflicted_sources: BTreeSet::new(),
     })
 }
 
@@ -27088,12 +27187,19 @@ fn ingest_watch_batch_with_oom_split_inner(
     match batch_result {
         Ok(batch_outcome) => {
             clear_watch_nomem_deferrals(data_dir, convs);
+            let deferred_conversations = convs
+                .iter()
+                .filter(|conv| batch_outcome.incomplete_sources.contains(&conv.source_path))
+                .count();
+            let max_payload_watermark_ms = (deferred_conversations == 0)
+                .then(|| conversations_payload_watermark_ms(convs))
+                .flatten();
             Ok(WatchIngestBatchOutcome {
                 batch_outcome,
                 processed_conversations: convs.len(),
                 quarantined_conversations: 0,
-                deferred_conversations: 0,
-                max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
+                deferred_conversations,
+                max_payload_watermark_ms,
             })
         }
         Err(error) if error_is_out_of_memory(&error) && convs.len() > 1 => {
@@ -28216,6 +28322,7 @@ fn write_poison_jsonl_atomically(path: &Path, lines: &[String]) -> Result<()> {
         let mut writer = BufWriter::new(file);
         for line in lines {
             writeln!(writer, "{line}").with_context(|| {
+                // ubs:ignore[rust.perf.string-alloc-in-loop] -- Successful writes allocate no error context; the first failed write returns immediately.
                 format!(
                     "writing temporary ingest quarantine file {}",
                     temp_path.display()
@@ -28661,6 +28768,7 @@ pub(crate) fn quarantine_source_missing_ids(data_dir: &Path) -> BTreeSet<String>
                     .map(|kind| quarantine_retry_scan_path(kind, source_path))
                     .unwrap_or_else(|| source_path.to_path_buf());
                 if !scan_path.exists() {
+                    // ubs:ignore[rust.perf.string-alloc-in-loop] -- Returned IDs must outlive the decoded ledger row; only missing sources enter this set.
                     missing.insert(conversation_id.to_string());
                 }
             }
@@ -30242,6 +30350,7 @@ fn reindex_paths_with_semantic_delta(
         // Use explicit root context
         let ctx = crate::connectors::ScanContext::with_roots(
             root.path.clone(),
+            // ubs:ignore[rust.collections.clone-in-loop] -- ScanContext owns its root while the watch root remains available for provenance and watermarks.
             vec![root.clone()],
             since_ts,
         );
@@ -30267,6 +30376,7 @@ fn reindex_paths_with_semantic_delta(
             Ok(()) => None,
             Err(error) => {
                 ingest_diagnostics.observe_connector_scan_error(&root.path, &error);
+                // ubs:ignore[rust.perf.string-alloc-in-loop] -- Failed scans retain an owned diagnostic in progress statistics; successful roots skip it.
                 let message = format!("{error:#}");
                 tracing::warn!(
                     ?kind,
@@ -30288,6 +30398,7 @@ fn reindex_paths_with_semantic_delta(
             stats.scan_ms = stats.scan_ms.saturating_add(scan_ms);
             let index = stats.connectors.len();
             stats.connectors.push(ConnectorStats {
+                // ubs:ignore[rust.perf.string-alloc-in-loop] -- This newly appended error-statistics record owns its connector name.
                 name: kind.slug().to_string(),
                 conversations: 0,
                 messages: 0,
@@ -30299,6 +30410,7 @@ fn reindex_paths_with_semantic_delta(
                 .iter()
                 .any(|name| name == kind.slug())
             {
+                // ubs:ignore[rust.perf.string-alloc-in-loop] -- The membership check above allocates a discovered connector name at most once.
                 stats.agents_discovered.push(kind.slug().to_string());
             }
             Some(index)
@@ -30507,7 +30619,9 @@ fn reindex_paths_with_semantic_delta(
                         .try_for_each(|id| {
                             persist::replay_watch_canonical_conversation(
                                 &storage,
-                                t_index_guard.as_mut().expect("watch writer is open"),
+                                t_index_guard
+                                    .as_mut()
+                                    .context("watch replay requires an open lexical writer")?,
                                 *id,
                             )
                         });
@@ -30661,7 +30775,11 @@ fn reindex_paths_with_semantic_delta(
                 error: scan_error,
             };
             if let Some(index) = failed_stats_index {
-                stats.connectors[index] = connector_stats;
+                *stats
+                    .connectors
+                    .get_mut(index)
+                    .context("watch scan lost its earlier connector failure statistics")? =
+                    connector_stats;
             } else {
                 stats.connectors.push(connector_stats);
             }
@@ -31590,7 +31708,7 @@ fn explicit_watch_once_connector_hint(path: &Path) -> Option<ConnectorKind> {
         components
             .windows(2)
             // ubs:ignore -- Filesystem path components are matched against connector layout names.
-            .any(|window| window[0] == left && window[1] == right)
+            .any(|window| matches!(window, [first, second] if first == left && second == right))
     };
 
     if has_pair(".dsh", "sessions") {
@@ -31642,10 +31760,10 @@ fn explicit_watch_once_connector_hint(path: &Path) -> Option<ConnectorKind> {
         // Codex target so `--watch-once` remains targeted and cannot fall
         // back to a broad connector scan.
         Some(ConnectorKind::Codex)
-    } else if components
-        .windows(3)
-        .any(|window| window[0] == ".prime" && window[1] == "agent" && window[2] == "sessions")
-    {
+    } else if components.windows(3).any(|window| {
+        matches!(window, [parent, agent, sessions]
+                if parent == ".prime" && agent == "agent" && sessions == "sessions")
+    }) {
         Some(ConnectorKind::PrimeAgent)
     } else if crate::connectors::omp::owns_session_path(path) {
         Some(ConnectorKind::Omp)
@@ -31831,18 +31949,17 @@ fn classify_paths(
                             && database_sidecar_paths(candidate).contains(p))
                 };
                 if under(match_root_path) || alternate_root_path.as_ref().is_some_and(under) {
-                    if let Some(index) =
+                    if let Some((_, selected_root, selected_path)) =
                         matching_roots
-                            .iter()
-                            .position(|(selected_kind, selected_root, _)| {
+                            .iter_mut()
+                            .find(|(selected_kind, selected_root, _)| {
                                 *selected_kind == *kind && selected_root.origin == root.origin
                             })
                     {
-                        if match_root_path.components().count()
-                            > matching_roots[index].2.components().count()
+                        if match_root_path.components().count() > selected_path.components().count()
                         {
-                            matching_roots[index].1 = root;
-                            matching_roots[index].2 = match_root_path;
+                            *selected_root = root;
+                            *selected_path = match_root_path;
                         }
                     } else {
                         matching_roots.push((*kind, root, match_root_path));
@@ -31854,6 +31971,7 @@ fn classify_paths(
                 let scan_path = if prefer_explicit_paths && !is_database_watch_root(kind, root) {
                     explicit_watch_once_scan_path(kind, &requested, p)
                 } else {
+                    // ubs:ignore[rust.collections.clone-in-loop] -- The queued batch owns its scan path independently of the borrowed root lookup.
                     match_root_path.clone()
                 };
                 let mut scan_root = root.clone();
@@ -32067,6 +32185,7 @@ pub fn build_scan_roots(storage: Option<&FrankenStorage>, data_dir: &Path) -> Ve
                     let mirror_path = mirror_base.join(&safe_name); // ubs:ignore -- path_to_safe_dirname emits one traversal-free basename.
 
                     if mirror_path.exists() {
+                        // ubs:ignore[rust.collections.clone-in-loop] -- Each configured scan root owns its source provenance; other roots still need this origin.
                         let mut scan_root = ScanRoot::remote(mirror_path, origin.clone(), platform)
                             .with_mirrored_source_path(path);
                         scan_root.workspace_rewrites = workspace_rewrites.clone();
@@ -32083,6 +32202,7 @@ pub fn build_scan_roots(storage: Option<&FrankenStorage>, data_dir: &Path) -> Ve
                                 let name_str = name.to_string_lossy();
                                 if name_str.ends_with(&safe_suffix) && entry.path().is_dir() {
                                     let mut scan_root =
+                                        // ubs:ignore[rust.collections.clone-in-loop] -- Only the first matching mirror becomes a root with independently owned provenance.
                                         ScanRoot::remote(entry.path(), origin.clone(), platform)
                                             .with_mirrored_source_path(path);
                                     scan_root.workspace_rewrites = workspace_rewrites.clone();
@@ -32932,7 +33052,7 @@ pub mod persist {
     };
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::ops::Range;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::AtomicI64;
     use std::time::Duration;
@@ -33263,12 +33383,22 @@ pub mod persist {
         pub semantic_delta_inputs: Vec<EmbeddingInput>,
         pub lexical_update_deferred: bool,
         pub lexical_update_error: Option<String>,
+        pub incomplete_sources: BTreeSet<PathBuf>,
     }
 
     impl PersistBatchOutcome {
-        fn record_insert_outcome(&mut self, outcome: &InsertOutcome) {
+        fn record_insert_outcome(&mut self, outcome: &InsertOutcome, source_path: &Path) {
             self.canonical_conversation_ids
                 .insert(outcome.conversation_id);
+            if outcome.unresolved_message_conflicts > 0 {
+                self.incomplete_sources.insert(source_path.to_path_buf());
+                tracing::warn!(
+                    conversation_id = outcome.conversation_id,
+                    conflicts = outcome.unresolved_message_conflicts,
+                    source_path = %source_path.display(),
+                    "incoming messages conflict with archived history; preserving canonical bodies and withholding source completion"
+                );
+            }
             self.inserted_conversations = self
                 .inserted_conversations
                 .saturating_add(usize::from(outcome.conversation_inserted));
@@ -33310,6 +33440,7 @@ pub mod persist {
         pub(super) fn merge(&mut self, other: Self) {
             self.canonical_conversation_ids
                 .extend(other.canonical_conversation_ids);
+            self.incomplete_sources.extend(other.incomplete_sources);
             self.updated_messages = self.updated_messages.saturating_add(other.updated_messages);
             self.workspace_changes = self
                 .workspace_changes
@@ -33337,15 +33468,20 @@ pub mod persist {
         super::error_is_out_of_memory(error)
     }
 
-    fn persist_openwebui_snapshot_lexical(
+    fn persist_native_projection_lexical(
         storage: &FrankenStorage,
         index: &mut TantivyIndex,
         conversation_id: i64,
     ) -> Result<()> {
-        let conversation = storage.fetch_openwebui_lexical_snapshot(conversation_id)?;
+        let conversation = storage.fetch_native_projection_lexical_snapshot(conversation_id)?;
         let historical_indices = conversation
             .metadata_json
             .get("openwebui_lexical_indices")
+            .or_else(|| {
+                conversation
+                    .metadata_json
+                    .get("codex_projection_lexical_indices")
+            })
             .and_then(serde_json::Value::as_array)
             .context("missing native snapshot lexical identities")?
             .iter()
@@ -33476,24 +33612,22 @@ pub mod persist {
             Item = (&'a NormalizedConversation, &'a InsertOutcome),
         >,
     ) {
-        let mut links_by_manifest: BTreeMap<String, Vec<crate::raw_mirror::RawMirrorDbLink>> =
+        let mut links_by_manifest: BTreeMap<&str, Vec<crate::raw_mirror::RawMirrorDbLink>> =
             BTreeMap::new();
         for (conv, outcome) in conversations_and_outcomes {
             let Some(manifest_relative_path) = raw_mirror_manifest_relative_path(conv) else {
                 continue;
             };
             links_by_manifest
-                .entry(manifest_relative_path.to_string())
+                .entry(manifest_relative_path)
                 .or_default()
                 .push(persisted_raw_mirror_db_link(conv, outcome));
         }
 
         for (manifest_relative_path, links) in links_by_manifest {
-            if let Err(error) = crate::raw_mirror::merge_manifest_db_links(
-                data_dir,
-                &manifest_relative_path,
-                &links,
-            ) {
+            if let Err(error) =
+                crate::raw_mirror::merge_manifest_db_links(data_dir, manifest_relative_path, &links)
+            {
                 tracing::warn!(
                     link_count = links.len(),
                     manifest_relative_path,
@@ -34513,7 +34647,7 @@ pub mod persist {
             let internal_conv = internal_convs
                 .get(idx)
                 .ok_or(PersistedConversationIndexOutOfRange { index: idx })?;
-            batch_outcome.record_insert_outcome(&outcome);
+            batch_outcome.record_insert_outcome(&outcome, &internal_conv.source_path);
             if defer_lexical_updates || skip_inline_lexical_updates {
                 if capture_semantic_delta {
                     let (inputs, max_message_id) =
@@ -34531,9 +34665,12 @@ pub mod persist {
             match lexical_strategy {
                 LexicalPopulationStrategy::InlineRebuildFromScan
                 | LexicalPopulationStrategy::IncrementalInline
-                    if crate::storage::sqlite::is_openwebui_saved_snapshot(internal_conv) =>
+                    if crate::storage::sqlite::needs_native_projection_replay(
+                        internal_conv,
+                        &outcome.updated_indices,
+                    ) =>
                 {
-                    let result = persist_openwebui_snapshot_lexical(
+                    let result = persist_native_projection_lexical(
                         storage,
                         t_index
                             .as_deref_mut()
@@ -34583,9 +34720,9 @@ pub mod persist {
                                 Err(anyhow::anyhow!("out of memory"))
                             } else {
                                 publish_changed_packet_messages(
-                                    t_index.as_deref_mut().expect(
+                                    t_index.as_deref_mut().context(
                                         "incremental inline updates require Tantivy writer",
-                                    ),
+                                    )?,
                                     &packet,
                                     &positional,
                                     outcome.conversation_id,
@@ -34955,6 +35092,7 @@ pub mod persist {
             conversation_inserted: _conversation_inserted,
             inserted_indices,
             updated_indices,
+            unresolved_message_conflicts: _,
             workspace_changed: _,
         } = with_ephemeral_writer(storage, false, "persist_conversation", |writer| {
             let agent = Agent {
@@ -34985,9 +35123,12 @@ pub mod persist {
             .copied()
             .collect();
         if !defer_lexical_updates_enabled()
-            && crate::storage::sqlite::is_openwebui_saved_snapshot(&internal_conv)
+            && crate::storage::sqlite::needs_native_projection_replay(
+                &internal_conv,
+                &updated_indices,
+            )
         {
-            persist_openwebui_snapshot_lexical(storage, t_index, conversation_id)?;
+            persist_native_projection_lexical(storage, t_index, conversation_id)?;
         } else if !defer_lexical_updates_enabled() && !changed_indices.is_empty() {
             let packet =
                 lexical_packet_for_changed_messages(storage, conversation_id, &changed_indices)?;
@@ -35026,6 +35167,7 @@ pub mod persist {
             conversation_inserted: _conversation_inserted,
             inserted_indices,
             updated_indices,
+            unresolved_message_conflicts: _,
             workspace_changed: _,
         } = with_ephemeral_writer(storage, false, "persist_conversation", |writer| {
             let agent = Agent {
@@ -35053,10 +35195,13 @@ pub mod persist {
             .copied()
             .collect();
         if !defer_lexical_updates_enabled()
-            && crate::storage::sqlite::is_openwebui_saved_snapshot(&internal_conv)
+            && crate::storage::sqlite::needs_native_projection_replay(
+                &internal_conv,
+                &updated_indices,
+            )
         {
             let started = Instant::now();
-            persist_openwebui_snapshot_lexical(storage, t_index, conversation_id)?;
+            persist_native_projection_lexical(storage, t_index, conversation_id)?;
             profile.tantivy_add_duration += started.elapsed();
         } else if !defer_lexical_updates_enabled() && !changed_indices.is_empty() {
             let packet_started = Instant::now();
@@ -35369,8 +35514,12 @@ pub mod persist {
         conv: &NormalizedConversation,
         range: std::ops::Range<usize>,
         is_final: bool,
-    ) -> NormalizedConversation {
-        let messages = conv.messages[range].to_vec();
+    ) -> Result<NormalizedConversation> {
+        let messages = conv
+            .messages
+            .get(range)
+            .context("conversation persistence slice exceeds its message range")?
+            .to_vec();
         let ended_at = if is_final {
             conv.ended_at
         } else {
@@ -35379,7 +35528,7 @@ pub mod persist {
                 .filter_map(|message| message.created_at)
                 .max()
         };
-        NormalizedConversation {
+        Ok(NormalizedConversation {
             agent_slug: conv.agent_slug.clone(),
             external_id: conv.external_id.clone(),
             title: conv.title.clone(),
@@ -35389,7 +35538,7 @@ pub mod persist {
             ended_at,
             metadata: conv.metadata.clone(),
             messages,
-        }
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -35440,6 +35589,28 @@ pub mod persist {
         limits: PersistSliceLimits,
     ) -> Result<PersistBatchOutcome> {
         let oversized = |conv: &NormalizedConversation| should_slice_conversation(conv, limits);
+        let mut whole_projection_repairs = HashSet::new();
+        for (position, conv) in convs.iter().enumerate() {
+            if conv.agent_slug != "codex" || !oversized(conv) {
+                continue;
+            }
+            let (source_id, _) = extract_provenance(&conv.metadata);
+            if storage.has_legacy_codex_projection(&source_id, conv.external_id.as_deref())? {
+                // The original compacted projection must be verified as a
+                // whole snapshot before any old coordinate can be retired.
+                // Limit this one-time atomic repair to four normal slices;
+                // fresh and already-correct archives retain bounded slicing.
+                let repair_budget = limits.content_bytes.saturating_mul(4);
+                let content_bytes = conv.messages.iter().fold(0usize, |bytes, message| {
+                    bytes.saturating_add(message.content.len())
+                });
+                anyhow::ensure!(
+                    content_bytes <= repair_budget,
+                    "legacy Codex projection upgrade exceeds its bounded atomic repair budget: {content_bytes} bytes > {repair_budget}; canonical history retained"
+                );
+                whole_projection_repairs.insert(position);
+            }
+        }
         if !convs.iter().any(oversized) {
             return persist_conversations_batched_whole(
                 storage,
@@ -35469,11 +35640,25 @@ pub mod persist {
         let mut parts = Vec::new();
         let mut run_start = 0;
         for (pos, conv) in convs.iter().enumerate() {
+            if whole_projection_repairs.contains(&pos) {
+                if run_start < pos {
+                    parts.push(Part::Whole(convs.get(run_start..pos).context(
+                        "ordinary conversation run exceeds its persistence batch",
+                    )?));
+                }
+                parts.push(Part::Whole(convs.get(pos..pos + 1).context(
+                    "legacy projection repair exceeds its persistence batch",
+                )?));
+                run_start = pos + 1;
+                continue;
+            }
             if !oversized(conv) {
                 continue;
             }
             if run_start < pos {
-                parts.push(Part::Whole(&convs[run_start..pos]));
+                parts.push(Part::Whole(convs.get(run_start..pos).context(
+                    "ordinary conversation run exceeds its persistence batch",
+                )?));
             }
             let ranges = persist_slice_ranges(conv, limits);
             let last = ranges.len() - 1;
@@ -35488,7 +35673,9 @@ pub mod persist {
             run_start = pos + 1;
         }
         if run_start < convs.len() {
-            parts.push(Part::Whole(&convs[run_start..]));
+            parts.push(Part::Whole(convs.get(run_start..).context(
+                "trailing conversation run exceeds its persistence batch",
+            )?));
         }
 
         let mut outcome = PersistBatchOutcome::default();
@@ -35516,7 +35703,8 @@ pub mod persist {
             } else {
                 lexical_strategy
             };
-            let completion = source_completion.filter(|_| is_last);
+            let completion =
+                source_completion.filter(|_| is_last && outcome.incomplete_sources.is_empty());
             let part_outcome = match &part {
                 Part::Whole(batch) => persist_conversations_batched_whole(
                     storage,
@@ -35537,8 +35725,11 @@ pub mod persist {
                 } => {
                     // Materialize only the slice being persisted. Building all
                     // slices up front duplicated an entire giant conversation.
-                    let slice =
-                        persist_conversation_slice(conversation, range.start..range.end, *is_final);
+                    let slice = persist_conversation_slice(
+                        conversation,
+                        range.start..range.end,
+                        *is_final,
+                    )?;
                     persist_conversations_batched_whole(
                         storage,
                         t_index.as_deref_mut(),
@@ -35746,6 +35937,12 @@ pub mod persist {
                 for start in (0..prepared.len()).step_by(chunk_size) {
                     let end = (start + chunk_size).min(prepared.len());
                     let chunk_refs = &prepared[start..end];
+                    let completion = source_completion.filter(|_| {
+                        end == prepared.len()
+                            && outcomes.iter().all(|outcome: &InsertOutcome| {
+                                outcome.unresolved_message_conflicts == 0
+                            })
+                    });
                     // GH #401/#406: a single writer can still see a transient
                     // `BusySnapshot`/`WriteConflict` from the engine (the
                     // fsqlite 0.3.1 freelist append-gate false positive, or a
@@ -35756,7 +35953,7 @@ pub mod persist {
                     // conflict as a fatal exit 7 that discards the run.
                     outcomes.extend(with_concurrent_retry(
                         SERIAL_CHUNK_CONTENTION_RETRIES,
-                        || match source_completion.filter(|_| end == prepared.len()) {
+                        || match completion {
                             Some(completion) => writer
                                 .insert_conversations_batched_with_source_completion(
                                     chunk_refs, completion,
@@ -35796,7 +35993,7 @@ pub mod persist {
             let mut rebuilt_conversation_ids = HashSet::new();
             let mut skip_inline_lexical_updates = false;
             for (internal_conv, outcome) in internal_convs.iter().zip(&outcomes) {
-                batch_outcome.record_insert_outcome(outcome);
+                batch_outcome.record_insert_outcome(outcome, &internal_conv.source_path);
                 // gh373/oeu5a: per-conversation liveness through the inline
                 // lexical sink (packet build + Tantivy add can be slow for a
                 // giant conversation).
@@ -35807,9 +36004,12 @@ pub mod persist {
                 match lexical_strategy {
                     LexicalPopulationStrategy::InlineRebuildFromScan
                     | LexicalPopulationStrategy::IncrementalInline
-                        if crate::storage::sqlite::is_openwebui_saved_snapshot(internal_conv) =>
+                        if crate::storage::sqlite::needs_native_projection_replay(
+                            internal_conv,
+                            &outcome.updated_indices,
+                        ) =>
                     {
-                        let result = persist_openwebui_snapshot_lexical(
+                        let result = persist_native_projection_lexical(
                             storage,
                             t_index
                                 .as_deref_mut()
@@ -35858,9 +36058,9 @@ pub mod persist {
                                     Err(anyhow::anyhow!("out of memory"))
                                 } else {
                                     publish_changed_packet_messages(
-                                        t_index.as_deref_mut().expect(
+                                        t_index.as_deref_mut().context(
                                             "incremental inline updates require Tantivy writer",
-                                        ),
+                                        )?,
                                         &packet,
                                         &positional,
                                         outcome.conversation_id,
@@ -35890,8 +36090,8 @@ pub mod persist {
                     .commit()?;
             }
         } else {
-            for outcome in &outcomes {
-                batch_outcome.record_insert_outcome(outcome);
+            for (internal_conv, outcome) in internal_convs.iter().zip(&outcomes) {
+                batch_outcome.record_insert_outcome(outcome, &internal_conv.source_path);
             }
         }
 
@@ -36035,7 +36235,8 @@ pub mod persist {
             }
             let enabled = super::super::redact_secrets::redaction_enabled();
             let message_count = 769;
-            let secret = "password=abcdefgh12345678"; // Synthetic redaction fixture.
+            // ubs:ignore[rust.security.hardcoded-secrets] -- Synthetic redaction canary used only by this test; it is not an authentication credential.
+            let secret = "password=abcdefgh12345678";
             let conv = NormalizedConversation {
                 agent_slug: "codex".into(),
                 external_id: Some("gh474".into()),
@@ -36864,6 +37065,159 @@ pub mod persist {
             assert_eq!(hits("tailmark"), 0, "text past one message's cap stays out");
         }
 
+        #[test]
+        #[serial]
+        fn codex_legacy_projection_timestamped_upgrade_is_bounded_and_replay_stable() {
+            use crate::model::types::{Agent, AgentKind, MessageRole};
+            use crate::search::query::{FieldMask, SearchClient, SearchFilters};
+
+            let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "0");
+            let _analytics = set_env("CASS_DEFER_ANALYTICS_UPDATES", "1");
+            let _begin = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+            for strategy in [
+                LexicalPopulationStrategy::IncrementalInline,
+                LexicalPopulationStrategy::InlineRebuildFromScan,
+            ] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let storage = create_franken_db(&dir.path().join("archive.db"));
+                let agent = storage
+                    .ensure_agent(&Agent {
+                        id: None,
+                        slug: "codex".into(),
+                        name: "Codex".into(),
+                        version: None,
+                        kind: AgentKind::Cli,
+                    })
+                    .unwrap();
+                let body = "x".repeat(128 * 1024 + 19);
+                let current = NormalizedConversation {
+                    agent_slug: "codex".into(),
+                    external_id: Some("timestamped-upgrade".into()),
+                    title: Some("Head".into()),
+                    workspace: None,
+                    source_path: dir.path().join("rollout.jsonl"),
+                    started_at: Some(1000),
+                    ended_at: Some(3000),
+                    metadata: serde_json::json!({"source":"rollout"}),
+                    messages: [
+                        (
+                            "user",
+                            "headupgradecanary".to_owned(),
+                            serde_json::json!({}),
+                        ),
+                        (
+                            "tool",
+                            format!("[Tool output: original-call]\n{body}"),
+                            serde_json::json!({"cass":{"tool_result_call_id":"original-call"}}),
+                        ),
+                        (
+                            "user",
+                            "tailupgradecanary".to_owned(),
+                            serde_json::json!({}),
+                        ),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, (role, content, extra))| NormalizedMessage {
+                        idx: idx as i64,
+                        role: role.into(),
+                        author: None,
+                        created_at: Some((idx as i64 + 1) * 1000),
+                        content,
+                        extra,
+                        snippets: Vec::new(),
+                        invocations: Vec::new(),
+                    })
+                    .collect(),
+                };
+                let expected = map_to_internal(&current);
+                let mut legacy = expected.clone();
+                legacy.messages[1].content = format!(
+                    "[Tool output: original-call]\n{}\n[truncated 19 additional chars from tool output]",
+                    "x".repeat(128 * 1024)
+                );
+                legacy.messages[1].extra_json = serde_json::json!({});
+                let mut witness = legacy.messages[1].clone();
+                witness.idx = 3;
+                witness.content = body;
+                assert_eq!(witness.role, MessageRole::Tool);
+                legacy.messages[2].idx = 5;
+                legacy.messages.insert(2, witness);
+                let seeded = storage
+                    .insert_conversation_tree_with_analytics(agent, None, &legacy, true)
+                    .unwrap();
+                let before = storage.fetch_messages(seeded.conversation_id).unwrap();
+                let index_path = dir.path().join("index");
+                let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+                replay_canonical_conversation_for_rebuild(
+                    &storage,
+                    &mut index,
+                    seeded.conversation_id,
+                )
+                .unwrap();
+                index.commit().unwrap();
+                let persist = |index: &mut TantivyIndex, bytes| {
+                    persist_conversations_batched_sliced(
+                        &storage,
+                        Some(index),
+                        std::slice::from_ref(&current),
+                        strategy,
+                        false,
+                        false,
+                        Some(dir.path()),
+                        PersistHeartbeat::NONE,
+                        None,
+                        PersistSliceLimits {
+                            messages: 16_384,
+                            content_bytes: bytes,
+                        },
+                    )
+                };
+                let failure = persist(&mut index, 16 * 1024).unwrap_err();
+                assert!(failure.to_string().contains("bounded atomic repair budget"));
+                assert_eq!(
+                    serde_json::to_value(storage.fetch_messages(seeded.conversation_id).unwrap())
+                        .unwrap(),
+                    serde_json::to_value(&before).unwrap(),
+                    "over-budget refusal preserves all canonical rows"
+                );
+                assert_eq!(tantivy_doc_count(&mut index), 4);
+                let outcome = persist(&mut index, 64 * 1024).unwrap();
+                assert_eq!(outcome.inserted_messages, 0);
+                assert_eq!(outcome.updated_messages, 3);
+                assert!(outcome.incomplete_sources.is_empty());
+                index.commit().unwrap();
+                let after = storage.fetch_messages(seeded.conversation_id).unwrap();
+                assert_eq!(after.len(), 3);
+                for ((actual, expected), old) in after.iter().zip(&expected.messages).zip([0, 1, 3])
+                {
+                    assert_eq!(actual.id, before[old].id);
+                    assert_eq!(actual.idx, expected.idx);
+                    assert_eq!(actual.content, expected.content);
+                    assert_eq!(actual.extra_json, expected.extra_json);
+                }
+                assert_eq!(
+                    tantivy_doc_count(&mut index),
+                    3,
+                    "retire stale lexical coordinates"
+                );
+                let replay = persist(&mut index, 64 * 1024).unwrap();
+                assert_eq!(replay.inserted_messages, 0);
+                assert_eq!(replay.updated_messages, 0);
+                assert!(replay.incomplete_sources.is_empty());
+                index.commit().unwrap();
+                assert_eq!(tantivy_doc_count(&mut index), 3);
+                drop(index);
+                let client = SearchClient::open(&index_path, None).unwrap().unwrap();
+                for canary in ["headupgradecanary", "tailupgradecanary"] {
+                    let hits = client
+                        .search(canary, SearchFilters::default(), 10, 0, FieldMask::FULL)
+                        .unwrap();
+                    assert_eq!(hits.len(), 1, "{strategy:?} {canary}");
+                }
+            }
+        }
+
         /// m91r6: a giant conversation persisted in slices must store exactly
         /// what one transaction stores, be searchable at both ends, resume
         /// after a crash between slices, and replay as a no-op.
@@ -36927,6 +37281,18 @@ pub mod persist {
                     let dir = tempfile::TempDir::new().unwrap();
                     let conv = conversation(dir.path(), timestamps);
                     assert_eq!(persist_slice_ranges(&conv, limits).len(), 8);
+                    for (start, end) in [(51, 52), (0, 51), (50, 49)] {
+                        assert!(
+                            persist_conversation_slice(&conv, start..end, false).is_err(),
+                            "invalid persistence range {start}..{end} must return an error"
+                        );
+                    }
+                    assert!(
+                        persist_conversation_slice(&conv, 50..50, false)
+                            .unwrap()
+                            .messages
+                            .is_empty()
+                    );
                     // Untimed messages would make every later slice rescan
                     // the stored conversation, so they persist whole.
                     assert_eq!(should_slice_conversation(&conv, limits), timestamps);
@@ -36987,7 +37353,7 @@ pub mod persist {
 
                     // A crash after three slices leaves a stored prefix; the
                     // next run completes it without duplicating a row.
-                    let prefix = persist_conversation_slice(&conv, 0..21, false);
+                    let prefix = persist_conversation_slice(&conv, 0..21, false).unwrap();
                     let (resumed, _, outcomes, resumed_docs) =
                         persist("resumed", &[prefix, conv.clone()], true);
                     assert_eq!(stored(&resumed), expected, "{label}: resumed");
@@ -37503,6 +37869,7 @@ pub mod persist {
                 conversation_inserted: false,
                 inserted_indices: Vec::new(),
                 updated_indices: vec![1],
+                unresolved_message_conflicts: 0,
                 workspace_changed: false,
             };
             let (updated_inputs, updated_maximum) =
@@ -44181,6 +44548,349 @@ mod tests {
             metadata: serde_json::json!({}),
             messages: msgs,
         }
+    }
+
+    #[test]
+    #[serial]
+    fn source_conflicts_preserve_neighbors_and_retry_watermarks() {
+        let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "1");
+        let _concurrent = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+        for mode in 0..4 {
+            let _combine = set_env(
+                "CASS_STREAMING_CONSUMER_COMBINE",
+                if mode == 3 { "1" } else { "0" },
+            );
+            let _chunks = set_env(
+                "CASS_INDEXER_SERIAL_CHUNK_SIZE",
+                if mode == 1 { "1" } else { "128" },
+            );
+            let dir = TempDir::new().unwrap();
+            let storage = FrankenStorage::open(&dir.path().join("conflict.db")).unwrap();
+            let mut original = norm_conv(Some("conflicted"), vec![norm_msg(0, 100)]);
+            original.agent_slug = "codex".into();
+            let baseline = ingest_batch_detailed(
+                &storage,
+                None,
+                dir.path(),
+                std::slice::from_ref(&original),
+                &None,
+                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(!baseline.scan_had_errors);
+            let mut changed = original.clone();
+            changed.messages[0].content = "rewritten native source body".into();
+            let mut healthy = norm_conv(Some("healthy-neighbor"), vec![norm_msg(0, 200)]);
+            healthy.agent_slug = if mode == 3 { "neighbor" } else { "codex" }.into();
+            healthy.source_path = dir.path().join("healthy.jsonl");
+            storage.set_connector_last_scan_ts("codex", 50).unwrap();
+            for round in 0..2 {
+                let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
+                let progress = Some(Arc::new(IndexingProgress::default()));
+                let ctx =
+                    crate::connectors::ScanContext::local_default(dir.path().to_path_buf(), None);
+                let mut report = ConnectorIngestRun::begin("codex", dir.path(), &ctx, &[]);
+                report.observe_conversation(&mut changed);
+                if mode == 3 {
+                    let mut neighbor = ConnectorIngestRun::begin("neighbor", dir.path(), &ctx, &[]);
+                    neighbor.observe_conversation(&mut healthy);
+                    send_conversation_batches(&tx, "codex", vec![changed.clone()], false);
+                    send_conversation_batches(&tx, "neighbor", vec![healthy.clone()], false);
+                    tx.send(IndexMessage::IngestReport {
+                        report: neighbor.finish(),
+                    })
+                    .unwrap();
+                } else {
+                    report.observe_conversation(&mut healthy);
+                    let final_conversations = if mode == 2 {
+                        send_conversation_batches(&tx, "codex", vec![changed.clone()], true);
+                        send_conversation_batches(&tx, "codex", vec![changed.clone()], false);
+                        vec![healthy.clone()]
+                    } else {
+                        vec![changed.clone(), healthy.clone()]
+                    };
+                    tx.send(IndexMessage::SourceComplete {
+                        connector_name: "codex",
+                        conversations: final_conversations,
+                        completion: crate::storage::sqlite::SourceIngestLedgerEntry {
+                            key: "source_ingest_v1:conflicted-batch".into(),
+                            observation: "new source observation".into(),
+                        },
+                        byte_reservation: 0,
+                    })
+                    .unwrap();
+                }
+                tx.send(IndexMessage::IngestReport {
+                    report: report.finish(),
+                })
+                .unwrap();
+                send_done(&tx, "codex", true);
+                if mode == 3 {
+                    send_done(&tx, "neighbor", true);
+                }
+                drop(tx);
+                let (_, outcome) = run_streaming_consumer(
+                    rx,
+                    if mode == 3 { 2 } else { 1 },
+                    &storage,
+                    dir.path(),
+                    None,
+                    Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+                    &progress,
+                    LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                    Some(300),
+                    None,
+                )
+                .unwrap();
+                assert!(outcome.scan_had_errors, "mode={mode} round={round}");
+                assert_eq!(outcome.inserted_messages, usize::from(round == 0));
+                assert!(outcome.deferred_sources.contains(&changed.source_path));
+                assert!(!outcome.scanned_connectors.contains("codex"));
+                if mode == 3 {
+                    assert!(outcome.scanned_connectors.contains("neighbor"));
+                    assert_eq!(
+                        storage.get_connector_last_scan_ts("neighbor").unwrap(),
+                        Some(300)
+                    );
+                } else {
+                    assert!(outcome.scanned_connectors.is_empty());
+                }
+                assert_eq!(
+                    storage.get_connector_last_scan_ts("codex").unwrap(),
+                    Some(50)
+                );
+                assert!(storage.source_ingest_ledger_entries().unwrap().is_empty());
+                let stats = progress.as_ref().unwrap().stats.lock().unwrap();
+                assert_eq!(
+                    stats.connector_summary["codex"].indexed,
+                    u64::from(mode != 3)
+                );
+                assert_eq!(stats.connector_summary["codex"].partially_indexed, 1);
+                if mode == 3 {
+                    assert_eq!(stats.connector_summary["neighbor"].indexed, 1);
+                    assert_eq!(stats.connector_summary["neighbor"].partially_indexed, 0);
+                    assert!(stats.connectors.iter().any(|connector| {
+                        connector.name == "neighbor" && connector.error.is_none()
+                    }));
+                }
+                assert!(
+                    stats
+                        .connectors
+                        .iter()
+                        .any(|connector| connector.name == "codex" && connector.error.is_some())
+                );
+            }
+            let saved: Vec<String> = storage
+                .raw()
+                .query_map_collect(
+                    "SELECT content FROM messages ORDER BY id",
+                    &[] as &[ParamValue],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(
+                saved,
+                vec![
+                    original.messages[0].content.clone(),
+                    healthy.messages[0].content.clone()
+                ]
+            );
+            let mut index = TantivyIndex::open_or_create(&index_dir(dir.path()).unwrap()).unwrap();
+            let watch = ingest_watch_batch_with_oom_split(
+                &storage,
+                &mut index,
+                dir.path(),
+                &[changed, healthy],
+                &None,
+                false,
+                false,
+            )
+            .unwrap();
+            assert_eq!(watch.deferred_conversations, 1);
+            assert_eq!(watch.max_payload_watermark_ms, None);
+            assert_eq!(watch.quarantined_conversations, 0);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn source_conflicts_batch_reports_follow_persistence() -> Result<()> {
+        struct FixtureConnector {
+            conversations: Vec<NormalizedConversation>,
+            scan_error: bool,
+        }
+        impl Connector for FixtureConnector {
+            fn detect(&self) -> DetectionResult {
+                DetectionResult {
+                    detected: true,
+                    evidence: vec!["conflict reporting fixture".into()],
+                    root_paths: Vec::new(),
+                }
+            }
+            fn scan(
+                &self,
+                _ctx: &crate::connectors::ScanContext,
+            ) -> Result<Vec<NormalizedConversation>> {
+                Ok(self.conversations.clone())
+            }
+            fn scan_with_callback(
+                &self,
+                ctx: &crate::connectors::ScanContext,
+                on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+            ) -> Result<()> {
+                for conversation in self.scan(ctx)? {
+                    on_conversation(conversation)?;
+                }
+                if self.scan_error {
+                    anyhow::bail!("fixture scan interrupted");
+                }
+                Ok(())
+            }
+        }
+        let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "1");
+        let _concurrent = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+        for scan_error in [false, true] {
+            let dir = TempDir::new()?;
+            let db_path = dir.path().join("batch-conflict.db");
+            let storage = FrankenStorage::open(&db_path)?;
+            let mut original = norm_conv(Some("batch-conflicted"), vec![norm_msg(0, 100)]);
+            original.agent_slug = "codex".into();
+            ingest_batch_detailed(
+                &storage,
+                None,
+                dir.path(),
+                std::slice::from_ref(&original),
+                &None,
+                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                false,
+                None,
+            )?;
+            let mut changed = original;
+            changed.messages[0].content = "changed batch source".into();
+            let mut healthy = norm_conv(Some("batch-neighbor"), vec![norm_msg(0, 200)]);
+            healthy.agent_slug = "codex".into();
+            healthy.source_path = dir.path().join("batch-neighbor.jsonl");
+            storage.set_connector_last_scan_ts("codex", 50)?;
+            for round in 0..2 {
+                let progress = Arc::new(IndexingProgress::default());
+                let opts = IndexOptions {
+                    full: true,
+                    force_rebuild: false,
+                    watch: false,
+                    watch_once_paths: None,
+                    db_path: db_path.clone(),
+                    data_dir: dir.path().to_path_buf(),
+                    semantic: false,
+                    build_hnsw: false,
+                    embedder: "fastembed".into(),
+                    progress: Some(Arc::clone(&progress)),
+                    watch_interval_secs: 30,
+                };
+                let conversations = vec![changed.clone(), healthy.clone()];
+                let outcome = run_batch_index_with_connector_factories(
+                    &storage,
+                    None,
+                    &opts,
+                    None,
+                    LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                    Vec::new(),
+                    None,
+                    vec![("codex", move || {
+                        Box::new(FixtureConnector {
+                            conversations: conversations.clone(),
+                            scan_error,
+                        }) as Box<dyn Connector + Send>
+                    })],
+                    Some(300),
+                    None,
+                )?;
+                assert!(outcome.scan_had_errors);
+                assert_eq!(outcome.inserted_messages, usize::from(round == 0));
+                assert_eq!(storage.get_connector_last_scan_ts("codex")?, Some(50));
+                let stats = progress.stats.lock().unwrap();
+                assert_eq!(stats.connector_summary["codex"].indexed, 1);
+                assert_eq!(stats.connector_summary["codex"].partially_indexed, 1);
+                let error = stats
+                    .connectors
+                    .iter()
+                    .find(|connector| connector.name == "codex")
+                    .and_then(|connector| connector.error.as_deref())
+                    .unwrap();
+                assert!(error.contains(if scan_error {
+                    "fixture scan interrupted"
+                } else {
+                    "source content conflicts"
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn source_conflicts_before_final_slice_withhold_completion() {
+        let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "1");
+        let _concurrent = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("sliced-conflict.db")).unwrap();
+        let original = norm_conv(
+            Some("sliced-conflict"),
+            vec![norm_msg(0, 100), norm_msg(1, 200)],
+        );
+        ingest_batch_detailed(
+            &storage,
+            None,
+            dir.path(),
+            std::slice::from_ref(&original),
+            &None,
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            false,
+            None,
+        )
+        .unwrap();
+        let mut changed = original.clone();
+        changed.messages[0].content = "changed before the final unchanged slice".into();
+        let completion = crate::storage::sqlite::SourceIngestLedgerEntry {
+            key: "source_ingest_v1:sliced-conflict".into(),
+            observation: "new source".into(),
+        };
+        let outcome = persist::persist_conversations_batched_sliced(
+            &storage,
+            None,
+            std::slice::from_ref(&changed),
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            false,
+            false,
+            Some(dir.path()),
+            persist::PersistHeartbeat::NONE,
+            Some(&completion),
+            persist::PersistSliceLimits {
+                messages: 1,
+                content_bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+        assert!(outcome.incomplete_sources.contains(&original.source_path));
+        assert!(storage.source_ingest_ledger_entries().unwrap().is_empty());
+        assert_eq!(outcome.inserted_messages, 0);
+        let saved: Vec<String> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT content FROM messages ORDER BY id",
+                &[] as &[ParamValue],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            saved,
+            original
+                .messages
+                .into_iter()
+                .map(|message| message.content)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -56128,6 +56838,7 @@ pathlib.Path(str(p) + '-shm').write_bytes(old)
 c.close()
 "#;
         let fixture = std::process::Command::new("python3")
+            // ubs:ignore[rust.security.shell-command] -- The Python fixture is the fixed script above; the temporary archive path is a separate argv value, without a shell.
             .args(["-c", script])
             .arg(&db_path)
             .output()
