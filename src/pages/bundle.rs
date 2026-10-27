@@ -199,6 +199,20 @@ struct BundlePublishGuard {
     lock_file: File,
 }
 
+impl Drop for BundlePublishGuard {
+    fn drop(&mut self) {
+        // Closing only this descriptor can leave the lock held by a duplicate
+        // inherited by a concurrently spawned child. End ownership explicitly.
+        if let Err(error) = self.lock_file.unlock() {
+            tracing::warn!(
+                path = %self.lock_path.display(),
+                %error,
+                "failed explicitly releasing Pages bundle publication lock"
+            );
+        }
+    }
+}
+
 /// The publication namespace is pinned for the entire transaction. Linux
 /// resolves every component with NOFOLLOW and performs namespace operations
 /// against retained directory descriptors, including recursive cleanup.
@@ -4991,6 +5005,44 @@ mod tests {
         let second_guard = acquire_bundle_publish_guard(&second)?;
         require_bundle_publish_guard(&first, &first_guard)?;
         require_bundle_publish_guard(&second, &second_guard)?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn publication_guard_releases_lock_while_duplicate_descriptor_survives() -> Result<()> {
+        let temp = TempDir::new()?;
+        let control_path = temp.path().join("close-only-lock");
+        let close_only = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&control_path)?;
+        close_only.try_lock()?;
+        let retained_control = close_only.try_clone()?;
+        drop(close_only);
+        let contender = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&control_path)?;
+        assert!(matches!(
+            contender.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        retained_control.unlock()?;
+        contender.try_lock()?;
+        contender.unlock()?;
+
+        let final_dir = temp.path().join("bundle");
+        let guard = acquire_bundle_publish_guard(&final_dir)?;
+        let retained = guard.lock_file.try_clone()?;
+        let error = acquire_bundle_publish_guard(&final_dir)
+            .expect_err("a live publication guard must retain exclusive ownership");
+        assert!(error.to_string().contains("lock contention"));
+        drop(guard);
+        let next_guard = acquire_bundle_publish_guard(&final_dir)?;
+        require_bundle_publish_guard(&final_dir, &next_guard)?;
+        assert!(retained.metadata()?.is_file());
         Ok(())
     }
 
