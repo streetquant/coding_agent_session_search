@@ -1162,7 +1162,7 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
             "source": "none",
             "detail": "the step was not applied, so no postcondition was checked"
         });
-        let mut step_phase = Cow::Borrowed("not-run");
+        let mut step_phase = "not-run";
         let mut step_applied = false;
         let mut step_verified = false;
         let mut mutation_observation = None;
@@ -1240,7 +1240,7 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
                     attempted_mutation_count += 1;
                 }
                 mutation_observation = mutation.observation;
-                step_phase = Cow::Owned(mutation.phase);
+                step_phase = mutation.phase;
                 step_applied = mutation.applied;
                 step_verified = mutation.verified;
                 step_verification = mutation.verification;
