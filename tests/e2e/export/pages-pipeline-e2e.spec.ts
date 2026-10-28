@@ -278,32 +278,51 @@ test.describe("Pages Bundle - Browser Validation", () => {
     });
   });
 
-  test("OPFS (Origin Private File System) available", async ({ page }, testInfo) => {
+  test("OPFS (Origin Private File System) available", async ({ playwright, browserName }, testInfo) => {
     test.skip(!server, "Server not started - pages preview not found");
 
-    await page.goto(baseURL, { waitUntil: "domcontentloaded" });
+    // WebKit does not provide OPFS in private contexts. Linux MiniBrowser
+    // also leaves its mature FileSystem and stable StorageAPI features off.
+    // Exercise real storage in a fresh persistent profile with those APIs on.
+    // The profile is retained with the test artifacts; the assertion stays strict.
+    const args = browserName === "webkit" && process.platform === "linux"
+      ? ["--features=+FileSystem,+StorageAPI"]
+      : [];
+    const context = await playwright[browserName].launchPersistentContext(
+      testInfo.outputPath("opfs-profile"),
+      { headless: true, args },
+    );
+    try {
+      const page = await context.newPage();
+      await page.goto(baseURL, { waitUntil: "domcontentloaded" });
 
-    await test.step("Check OPFS availability", async () => {
-      const opfsAvailable = await page.evaluate(async () => {
-        try {
-          const root = await navigator.storage.getDirectory();
-          return root !== null;
-        } catch {
-          return false;
-        }
+      await test.step("Check OPFS availability", async () => {
+        const opfsAvailable = await page.evaluate(async () => {
+          try {
+            const root = await navigator.storage.getDirectory();
+            return root !== null;
+          } catch {
+            return false;
+          }
+        });
+
+        console.log(
+          JSON.stringify({
+            event: "opfs_check",
+            browser: browserName,
+            context: "persistent",
+            args,
+            available: opfsAvailable,
+            ts: new Date().toISOString(),
+          }),
+        );
+
+        // OPFS should be available in modern browsers
+        expect(opfsAvailable).toBe(true);
       });
-
-      console.log(
-        JSON.stringify({
-          event: "opfs_check",
-          available: opfsAvailable,
-          ts: new Date().toISOString(),
-        }),
-      );
-
-      // OPFS should be available in modern browsers
-      expect(opfsAvailable).toBe(true);
-    });
+    } finally {
+      await context.close();
+    }
   });
 
   test("crypto APIs available for decryption", async ({ page }, testInfo) => {
