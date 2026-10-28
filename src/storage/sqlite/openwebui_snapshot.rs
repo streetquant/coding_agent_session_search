@@ -23,6 +23,31 @@ fn empty_extra(message: &Message) -> bool {
             .is_some_and(serde_json::Map::is_empty)
 }
 
+fn codex_projection_metadata_matches(
+    previous: &serde_json::Value,
+    incoming: &serde_json::Value,
+) -> bool {
+    if previous == incoming {
+        return true;
+    }
+    let (Some(previous), Some(incoming)) = (previous.as_object(), incoming.as_object()) else {
+        return false;
+    };
+    // The connector now certifies this identity from the original session
+    // header. Legacy archives lack it; adding it must preserve every archived
+    // field and may never replace an existing identity. The projection plan
+    // independently verifies the original full bodies before reaching here.
+    !previous.contains_key("native_session_id")
+        && incoming
+            .get("native_session_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| !id.trim().is_empty() && id.len() <= 4096)
+        && incoming.len() == previous.len() + 1
+        && previous
+            .iter()
+            .all(|(key, value)| incoming.get(key) == Some(value))
+}
+
 /// Repair only the historical compacted Codex projection, not arbitrary
 /// mutable transcripts. Each shortened result needs its original full body
 /// still present in the archive as independent evidence of the omitted text.
@@ -452,7 +477,7 @@ fn reconcile_inner(
     let (mut conversation, duplicates) = match codex_plan {
         Some(plan) => {
             anyhow::ensure!(
-                previous_metadata == incoming.metadata_json
+                codex_projection_metadata_matches(&previous_metadata, &incoming.metadata_json)
                     && previous_started == incoming.started_at
                     && previous_title == incoming.title,
                 "legacy Codex canonical metadata changed"
@@ -1017,7 +1042,9 @@ mod tests {
 
     #[test]
     fn codex_legacy_projection_upgrade_preserves_ids_full_bodies_and_replay() -> Result<()> {
-        for materialized in [false, true] {
+        for (materialized, enrich_identity) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
             let directory = TempDir::new()?;
             let storage = FrankenStorage::open(&directory.path().join("archive.db"))?;
             let agent = storage.ensure_agent(&Agent {
@@ -1027,7 +1054,11 @@ mod tests {
                 version: None,
                 kind: AgentKind::Cli,
             })?;
-            let (legacy, current) = codex_projection_fixture();
+            let (legacy, mut current) = codex_projection_fixture();
+            if enrich_identity {
+                current.metadata_json["native_session_id"] =
+                    serde_json::json!("original-native-session");
+            }
             let initial = storage.insert_conversation_tree_with_analytics(
                 agent,
                 None,
@@ -1071,6 +1102,10 @@ mod tests {
             let snapshot =
                 storage.fetch_native_projection_lexical_snapshot(initial.conversation_id)?;
             assert_eq!(
+                snapshot.metadata_json.get("native_session_id"),
+                current.metadata_json.get("native_session_id")
+            );
+            assert_eq!(
                 snapshot.metadata_json["codex_projection_lexical_indices"],
                 serde_json::json!([0, 1, 2, 3, 5])
             );
@@ -1110,6 +1145,91 @@ mod tests {
             assert_eq!(
                 serde_json::to_value(storage.fetch_messages(initial.conversation_id)?)?,
                 serde_json::to_value(after)?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn codex_legacy_projection_metadata_conflicts_do_not_commit() -> Result<()> {
+        for case in 0..10 {
+            let directory = TempDir::new()?;
+            let storage = FrankenStorage::open(&directory.path().join("archive.db"))?;
+            let agent = storage.ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })?;
+            let (mut legacy, mut current) = codex_projection_fixture();
+            current.metadata_json["native_session_id"] =
+                serde_json::json!("original-native-session");
+            match case {
+                0 => {
+                    legacy.metadata_json["native_session_id"] =
+                        serde_json::json!("different-native-session");
+                }
+                1 => current.metadata_json["native_session_id"] = serde_json::json!(""),
+                2 => current.metadata_json["native_session_id"] = serde_json::json!(" \t"),
+                3 => current.metadata_json["native_session_id"] = serde_json::json!(17),
+                4 => {
+                    current.metadata_json["native_session_id"] =
+                        serde_json::json!("x".repeat(4097));
+                }
+                5 => current.metadata_json["source"] = serde_json::json!("changed-source"),
+                6 => {
+                    legacy.metadata_json["retained"] = serde_json::json!("original metadata");
+                }
+                7 => current.metadata_json["unrelated"] = serde_json::json!("new metadata"),
+                8 => current.title = Some("Changed title".into()),
+                9 => current.started_at = Some(1),
+                _ => unreachable!(),
+            }
+            let initial = storage.insert_conversation_tree(agent, None, &legacy)?;
+            let before = storage
+                .list_conversations(1, 0)?
+                .pop()
+                .context("legacy canonical conversation")?;
+            let before_messages =
+                serde_json::to_value(storage.fetch_messages(initial.conversation_id)?)?;
+            let completion = SourceIngestLedgerEntry {
+                key: format!("source_ingest_v1:codex-metadata-conflict-{case}"),
+                observation: "must not advance".into(),
+            };
+            let error = storage
+                .insert_conversations_batched_with_completion(
+                    &[(agent, None, &current)],
+                    true,
+                    Some(&completion),
+                )
+                .err()
+                .context("conflicting canonical metadata must reject the repair")?;
+            assert!(
+                error
+                    .to_string()
+                    .contains("legacy Codex canonical metadata changed"),
+                "case {case}: {error:#}"
+            );
+            let after = storage
+                .list_conversations(1, 0)?
+                .pop()
+                .context("retained legacy canonical conversation")?;
+            assert_eq!(
+                serde_json::to_value(after)?,
+                serde_json::to_value(before)?,
+                "case {case}"
+            );
+            assert_eq!(
+                serde_json::to_value(storage.fetch_messages(initial.conversation_id)?)?,
+                before_messages,
+                "case {case}"
+            );
+            assert!(
+                !storage
+                    .source_ingest_ledger_entries()?
+                    .contains_key(&completion.key),
+                "case {case}"
             );
         }
         Ok(())
