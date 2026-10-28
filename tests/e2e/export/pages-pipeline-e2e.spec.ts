@@ -13,19 +13,22 @@
  *   npx playwright test e2e/export/pages-pipeline-e2e.spec.ts
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import http from "http";
 import type { AddressInfo } from "net";
+import type { Page } from "@playwright/test";
 import path from "path";
-import { expect, test, waitForPageReady } from "../setup/test-utils";
+import { collectBrowserErrors, expect, test, waitForPageReady } from "../setup/test-utils";
 
 // Test artifact directory
 const ARTIFACT_DIR = path.join(process.cwd(), "test-results", "e2e", "pages-pipeline");
 
-// Get pages preview bundle path from environment or default
+// Global setup exports the fresh bundle root; its viewer lives under site/.
 const PAGES_PREVIEW_DIR =
   process.env.TEST_PAGES_PREVIEW_DIR ||
-  path.join(process.cwd(), "tests", "e2e", "pages_preview", "bundle", "site");
+  (process.env.TEST_PAGES_PREVIEW_SITE_DIR
+    ? path.join(process.env.TEST_PAGES_PREVIEW_SITE_DIR, "site")
+    : path.join(process.cwd(), "e2e", "pages_preview", "bundle", "site"));
 
 test.describe("Pages Bundle - Static Files", () => {
   test.beforeAll(async () => {
@@ -98,7 +101,7 @@ test.describe("Pages Bundle - Browser Validation", () => {
       let filePath = path.join(PAGES_PREVIEW_DIR, req.url === "/" ? "index.html" : req.url!);
 
       // Handle directory paths
-      if (existsSync(filePath) && require("fs").statSync(filePath).isDirectory()) {
+      if (existsSync(filePath) && statSync(filePath).isDirectory()) {
         filePath = path.join(filePath, "index.html");
       }
 
@@ -343,7 +346,7 @@ test.describe("Pages Bundle - Search Functionality", () => {
     server = http.createServer((req, res) => {
       let filePath = path.join(PAGES_PREVIEW_DIR, req.url === "/" ? "index.html" : req.url!);
 
-      if (existsSync(filePath) && require("fs").statSync(filePath).isDirectory()) {
+      if (existsSync(filePath) && statSync(filePath).isDirectory()) {
         filePath = path.join(filePath, "index.html");
       }
 
@@ -406,6 +409,67 @@ test.describe("Pages Bundle - Search Functionality", () => {
         }),
       );
     });
+  });
+});
+
+// Actual bundle password/recovery/revoked slots come from global setup's CLI.
+test.describe("Pages Bundle - Key Slots", () => {
+  const archivePassword = process.env.TEST_PAGES_PREVIEW_PASSWORD || "";
+  const recoveryKey = process.env.TEST_PAGES_PREVIEW_RECOVERY_KEY || "";
+  const revokedPassword = process.env.TEST_PAGES_PREVIEW_REVOKED_PASSWORD || "";
+  const slotError = process.env.TEST_PAGES_KEY_SLOT_ERROR || "no reason recorded";
+  const unlockTimeout = 60_000;
+  test.describe.configure({ timeout: unlockTimeout + 30_000 });
+
+  async function expectOutcome(
+    page: Page,
+    selector: string,
+    errors: ReturnType<typeof collectBrowserErrors>,
+  ) {
+    try {
+      await expect(page.locator(selector)).toBeVisible({ timeout: unlockTimeout });
+    } catch (error) {
+      const authText = await page.locator("#auth-screen").innerText({ timeout: 1_000 }).catch(() => "");
+      throw new Error(
+        `${selector} never became visible: ${String(error).split("\n")[0]}\n` +
+          `auth screen: ${authText.replace(/\s+/g, " ").slice(0, 400)}\n` +
+          `page errors: ${JSON.stringify(errors.pageErrors)}\n` +
+          `console errors: ${JSON.stringify(errors.consoleErrors)}`,
+      );
+    }
+  }
+
+  test("unlocks with the archive password", async ({ page, previewUrl }) => {
+    test.skip(!previewUrl, "Pages preview server not available");
+    expect(archivePassword, "global-setup exported no archive password").not.toBe("");
+    const errors = collectBrowserErrors(page);
+    await page.goto(previewUrl, { waitUntil: "domcontentloaded" });
+    await page.locator("#password").fill(archivePassword);
+    await page.locator("#unlock-btn").click();
+    await expectOutcome(page, "#app-screen", errors);
+    await expect(page.locator("#auth-screen")).toBeHidden();
+  });
+
+  test("unlocks with the typed recovery key", async ({ page, previewUrl }) => {
+    test.skip(!previewUrl, "Pages preview server not available");
+    expect(recoveryKey, `recovery slot not prepared: ${slotError}`).not.toBe("");
+    const errors = collectBrowserErrors(page);
+    await page.goto(previewUrl, { waitUntil: "domcontentloaded" });
+    await page.locator("#recovery-key-btn").click();
+    await page.locator("#recovery-key-input").fill(recoveryKey);
+    await page.locator("#recovery-key-submit").click();
+    await expectOutcome(page, "#app-screen", errors);
+  });
+
+  test("refuses a revoked password", async ({ page, previewUrl }) => {
+    test.skip(!previewUrl, "Pages preview server not available");
+    expect(revokedPassword, `revoked slot not prepared: ${slotError}`).not.toBe("");
+    const errors = collectBrowserErrors(page);
+    await page.goto(previewUrl, { waitUntil: "domcontentloaded" });
+    await page.locator("#password").fill(revokedPassword);
+    await page.locator("#unlock-btn").click();
+    await expectOutcome(page, "#auth-error", errors);
+    await expect(page.locator("#app-screen")).toBeHidden();
   });
 });
 

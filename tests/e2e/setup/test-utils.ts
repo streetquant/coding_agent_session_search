@@ -316,7 +316,14 @@ export function collectBrowserErrors(page: Page): {
 export async function waitForPageReady(page: Page): Promise<void> {
   // For local file URLs, domcontentloaded is sufficient and more reliable
   await page.waitForLoadState("domcontentloaded");
-  // Stabilize animations/transitions to avoid flake from entrance effects
+  // Pages CSP forbids injected inline styles; reduced motion avoids a CSP error.
+  const cspMeta = await page.locator('meta[http-equiv="Content-Security-Policy" i]').count();
+  if (cspMeta > 0) {
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await page.waitForTimeout(150);
+    return;
+  }
+  // Stabilize animations/transitions to avoid flake from entrance effects.
   await page.addStyleTag({
     content: `
 *,

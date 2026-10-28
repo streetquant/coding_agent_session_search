@@ -7,6 +7,35 @@ import {
   waitForPageReady,
 } from "../setup/test-utils";
 
+/** Read computed fenced-code style and WCAG contrast in the browser. */
+function readCodeBlock(code: Element) {
+  const pre = code.closest("pre") ?? code;
+  const own = window.getComputedStyle(code);
+  const block = window.getComputedStyle(pre);
+  const ctx = document.createElement("canvas").getContext("2d") as CanvasRenderingContext2D;
+  const luminance = (css: string) => {
+    ctx.clearRect(0, 0, 1, 1);
+    ctx.fillStyle = "#000";
+    ctx.fillStyle = css;
+    ctx.fillRect(0, 0, 1, 1);
+    const [r, g, b] = Array.from(ctx.getImageData(0, 0, 1, 1).data).map((v) => {
+      const c = v / 255;
+      return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  };
+  const fg = luminance(own.color);
+  const bg = luminance(block.backgroundColor);
+  return {
+    text: code.textContent ?? "",
+    whiteSpace: own.whiteSpace,
+    fontFamily: own.fontFamily,
+    color: own.color,
+    background: block.backgroundColor,
+    contrast: (Math.max(fg, bg) + 0.05) / (Math.min(fg, bg) + 0.05),
+  };
+}
+
 test.describe("CDN Fallback - No-CDN Mode", () => {
   test("renders correctly without CDN resources", async ({ page, noCdnExportPath }) => {
     test.skip(!noCdnExportPath, "No-CDN export path not available");
@@ -182,6 +211,26 @@ test.describe("CDN Fallback - Network Blocking", () => {
     expect(legibility.backgroundColor).not.toBe("");
     expect(legibility.fontFamily).not.toBe("");
 
+    // A missing fenced block must fail; dark and light themes both stay readable.
+    const fencedCode = page.locator('pre > code[class*="language-"]').first();
+    await fencedCode.scrollIntoViewIfNeeded();
+    await expect(fencedCode).toBeVisible();
+    const codeReadability: Record<string, unknown> = {};
+    for (const theme of ["dark", "light"]) {
+      await page.evaluate((t) => document.documentElement.setAttribute("data-theme", t), theme);
+      const code = await fencedCode.evaluate(readCodeBlock);
+      codeReadability[theme] = code;
+      expect(code.text, `${theme}: code keeps its lines`).toContain("\n");
+      expect(code.whiteSpace, `${theme}: line breaks preserved`).toMatch(/^pre/);
+      expect(code.fontFamily.toLowerCase(), `${theme}: monospace`).toMatch(
+        /mono|courier|consolas|menlo/,
+      );
+      expect(
+        code.contrast,
+        `${theme}: code text ${code.color} on ${code.background}`,
+      ).toBeGreaterThanOrEqual(4.5);
+    }
+
     await testInfo.attach("cdn-degradation-diagnostics", {
       body: Buffer.from(
         JSON.stringify(
@@ -192,6 +241,7 @@ test.describe("CDN Fallback - Network Blocking", () => {
             bodyClasses,
             htmlClasses,
             legibility,
+            codeReadability,
           },
           null,
           2,
