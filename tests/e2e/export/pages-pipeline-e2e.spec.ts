@@ -290,10 +290,16 @@ test.describe("Pages Bundle - Browser Validation", () => {
       : [];
     const context = await playwright[browserName].launchPersistentContext(
       testInfo.outputPath("opfs-profile"),
-      { headless: true, args },
+      {
+        headless: true,
+        args,
+        // Setting a locale makes Playwright replace WebKit's initial page.
+        locale: undefined,
+      },
     );
     try {
-      const page = await context.newPage();
+      // MiniBrowser applies command-line features to the initial page.
+      const page = context.pages()[0] ?? (await context.newPage());
       await page.goto(baseURL, { waitUntil: "domcontentloaded" });
 
       await test.step("Check OPFS availability", async () => {
