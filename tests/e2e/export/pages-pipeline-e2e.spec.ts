@@ -163,6 +163,7 @@ test.describe("Pages Bundle - Browser Validation", () => {
     test.skip(!server, "Server not started - pages preview not found");
 
     const consoleErrors: string[] = [];
+    const pageErrors: string[] = [];
     const networkErrors: string[] = [];
 
     page.on("console", (msg) => {
@@ -171,6 +172,7 @@ test.describe("Pages Bundle - Browser Validation", () => {
       }
     });
 
+    page.on("pageerror", (error) => pageErrors.push(error.message));
     page.on("requestfailed", (request) => {
       networkErrors.push(`${request.method()} ${request.url()}: ${request.failure()?.errorText}`);
     });
@@ -189,11 +191,12 @@ test.describe("Pages Bundle - Browser Validation", () => {
     await test.step("Capture error logs", async () => {
       const errorLog = {
         consoleErrors,
+        pageErrors,
         networkErrors,
         timestamp: new Date().toISOString(),
       };
 
-      if (consoleErrors.length > 0 || networkErrors.length > 0) {
+      if (consoleErrors.length > 0 || pageErrors.length > 0 || networkErrors.length > 0) {
         const artifactPath = path.join(ARTIFACT_DIR, "viewer-errors.json");
         writeFileSync(artifactPath, JSON.stringify(errorLog, null, 2));
 
@@ -204,8 +207,9 @@ test.describe("Pages Bundle - Browser Validation", () => {
       }
     });
 
-    // Note: Some errors may be expected (e.g., missing config.json in test fixtures)
-    // We log them but don't fail the test for expected scenarios
+    expect(consoleErrors, "viewer console errors").toEqual([]);
+    expect(pageErrors, "unhandled viewer errors").toEqual([]);
+    expect(networkErrors, "failed viewer requests").toEqual([]);
     console.log(
       JSON.stringify({
         event: "viewer_load_complete",

@@ -5,7 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Encrypted cass Archive</title>
 
-    <!-- CSP: No unsafe-inline, no eval -->
+    <!-- CSP: No unsafe-inline, no eval. Frame restrictions are supplied by
+         the deployment and service-worker response headers. -->
     <meta http-equiv="Content-Security-Policy" content="
         default-src 'self';
         script-src 'self' 'wasm-unsafe-eval';
@@ -14,7 +15,6 @@
         connect-src 'self';
         worker-src 'self' blob:;
         object-src 'none';
-        frame-ancestors 'none';
         form-action 'none';
         base-uri 'none';
     ">
