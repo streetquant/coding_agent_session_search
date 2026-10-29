@@ -31786,6 +31786,13 @@ fn explicit_watch_once_scan_path(
         canonical
     };
 
+    if canonical.is_file() {
+        // Preserve the OMP layout through a symlink without widening the
+        // physical file boundary. Resolving an XDG alias can lose its OMP
+        // marker; expanding it to a sessions root parses every neighbour.
+        return path.to_path_buf();
+    }
+
     // FAD accepts a direct `.omp` transcript as an explicit root, but an XDG
     // transcript path has no `.omp` marker. Retain the nearest `sessions`
     // root so OMP's v18 resolver can recognize and scan it.
@@ -61717,7 +61724,7 @@ c.close()
 
         assert_eq!(
             explicit_watch_once_scan_path(ConnectorKind::Omp, &requested, &canonical),
-            std::fs::canonicalize(real_root).unwrap()
+            requested
         );
     }
 

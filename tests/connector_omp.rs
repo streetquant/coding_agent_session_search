@@ -601,6 +601,114 @@ fn omp_direct_profile_root_preserves_profile_metadata() {
 }
 
 #[test]
+fn explicit_omp_files_do_not_expand_to_neighbours_or_subagents() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let agent = temp.path().join(".omp/profiles/review/agent");
+    let selected = write_omp_session(&agent, "selected-header-id", "Selected session");
+    write_omp_session(&agent, "neighbour-header-id", "Unrequested neighbour");
+    let subagent = write_omp_subagent(&selected, "subagent-header-id");
+    let connector = runtime_connector("omp");
+
+    for (path, id, expected_body) in [
+        (&selected, "selected-header-id", "index OMP"),
+        (&subagent, "subagent-header-id", "OMP sub-agent task"),
+    ] {
+        let ctx = ScanContext::with_roots(
+            temp.path().join("cass-state"),
+            vec![ScanRoot::remote(
+                path.clone(),
+                Origin::remote_with_host("build-host", "build-host.example"),
+                Some(Platform::Linux),
+            )],
+            None,
+        );
+        let sources = connector.discover_source_files(&ctx)?;
+        assert_eq!(sources.len(), 1, "discovery must stay within {path:?}");
+        assert_eq!(sources[0].source_path, *path);
+        assert_eq!(sources[0].origin.source_id, "build-host");
+        assert_eq!(sources[0].platform, Some(Platform::Linux));
+        let conversations = connector.scan(&ctx)?;
+        assert_eq!(conversations.len(), 1, "scan must stay within {path:?}");
+        let conversation = &conversations[0];
+        assert_eq!(conversation.source_path, *path);
+        assert_eq!(conversation.external_id.as_deref(), Some(id));
+        assert_eq!(conversation.metadata["profile"], "review");
+        assert!(
+            conversation
+                .messages
+                .iter()
+                .any(|message| message.content == expected_body),
+            "the selected source must yield its native body"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn watch_once_omp_file_override_keeps_neighbours_out_of_the_archive() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home)?;
+    // An explicit override also supports stores with no conventional OMP
+    // marker. Both discovery and parsing must remain bounded to the file.
+    let agent = home.join("relocated-store");
+    let selected = write_omp_session(&agent, "selected-cli-id", "Selected CLI session");
+    write_omp_session(&agent, "neighbour-cli-id", "Unrequested CLI neighbour");
+    write_omp_subagent(&selected, "subagent-cli-id");
+    let before = fs::read(&selected)?;
+    let data = home.join("cass-state");
+
+    for _ in 0..2 {
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        command
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("CASS_OMP_DATA_ROOT", agent.join("sessions"))
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("RUST_MIN_STACK", "134217728")
+            .current_dir(&home)
+            .args(["index", "--watch-once"])
+            .arg(&selected)
+            .arg("--data-dir")
+            .arg(&data)
+            .arg("--json");
+        let output = assert_cmd::Command::from_std(command)
+            .timeout(std::time::Duration::from_secs(120))
+            .output()?;
+        assert!(
+            output.status.success(),
+            "targeted OMP index failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let storage = coding_agent_search::storage::sqlite::SqliteStorage::open(
+            &data.join("agent_search.db"),
+        )?;
+        let conversations = storage.list_conversations(10, 0)?;
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].agent_slug, "omp");
+        assert_eq!(
+            conversations[0].external_id.as_deref(),
+            Some("selected-cli-id")
+        );
+        assert_eq!(fs::canonicalize(&conversations[0].source_path)?, selected);
+        let messages = storage.fetch_messages(conversations[0].id.unwrap())?;
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content == "index OMP")
+        );
+        storage.close()?;
+        assert_eq!(fs::read(&selected)?, before);
+    }
+    Ok(())
+}
+
+#[test]
 fn direct_pi_sessions_root_is_never_parsed_as_omp() {
     let temp = tempfile::tempdir().expect("tempdir");
     let pi_agent = temp.path().join(".pi/agent");

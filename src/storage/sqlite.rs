@@ -13041,13 +13041,38 @@ impl FrankenStorage {
         let Some(external_id) = external_id else {
             return Ok(false);
         };
+        // Resolve the identity before touching message bodies. A join rooted
+        // at messages can materialize an entire large archive even when this
+        // oversized incoming conversation has never been stored.
+        let agent_id: Option<i64> = self
+            .conn
+            .query_row_map(
+                "SELECT id FROM agents WHERE slug='codex'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .optional()?;
+        let Some(agent_id) = agent_id else {
+            return Ok(false);
+        };
+        let conversation_id: Option<i64> = self
+            .conn
+            .query_row_map(
+                "SELECT id FROM conversations
+                 WHERE source_id=?1 AND agent_id=?2 AND external_id=?3",
+                fparams![source_id, agent_id, external_id],
+                |row| row.get_typed(0),
+            )
+            .optional()?;
+        let Some(conversation_id) = conversation_id else {
+            return Ok(false);
+        };
         let exists: i64 = self.conn.query_row_map(
-            "SELECT EXISTS(SELECT 1 FROM messages m JOIN conversations c ON c.id=m.conversation_id
-             JOIN agents a ON a.id=c.agent_id
-             WHERE a.slug='codex' AND c.source_id=?1 AND c.external_id=?2 AND m.role='tool'
-             AND m.content LIKE '[Tool output: %'
-             AND m.content LIKE '% additional chars from tool output]')",
-            fparams![source_id, external_id],
+            "SELECT EXISTS(SELECT 1 FROM messages
+             WHERE conversation_id=?1 AND role='tool'
+             AND content LIKE '[Tool output: %'
+             AND content LIKE '% additional chars from tool output]')",
+            fparams![conversation_id],
             |row| row.get_typed(0),
         )?;
         Ok(exists != 0)
@@ -25329,6 +25354,60 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    #[test]
+    fn legacy_codex_projection_admission_is_source_and_agent_qualified() -> Result<()> {
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("legacy-admission.db"))?;
+        assert!(!storage.has_legacy_codex_projection("local", Some("shared-id"))?);
+        storage.raw().execute(
+            "INSERT INTO agents(id, slug, name, kind, created_at, updated_at)
+             VALUES(9001, 'codex', 'Codex', 'cli', 1, 1), (9002, 'claude', 'Claude', 'cli', 1, 1)",
+        )?;
+        storage.raw().execute(
+            "INSERT INTO sources(id, kind, created_at, updated_at) VALUES('remote-proof', 'ssh', 1, 1)",
+        )?;
+        for (id, agent, source, external) in [
+            (9003, 9001, "local", "shared-id"),
+            (9004, 9001, "remote-proof", "shared-id"),
+            (9005, 9002, "local", "other-agent-id"),
+        ] {
+            storage.raw().execute_with_params(
+                "INSERT INTO conversations(id, agent_id, source_path, source_id, external_id)
+                 VALUES(?1, ?2, '/proof.jsonl', ?3, ?4)",
+                &[
+                    SqliteValue::Integer(id),
+                    SqliteValue::Integer(agent),
+                    SqliteValue::Text(source.into()),
+                    SqliteValue::Text(external.into()),
+                ],
+            )?;
+            let content = if source == "local" {
+                "[Tool output: retained prefix ... 300 additional chars from tool output]"
+            } else {
+                "complete native tool output"
+            };
+            storage.raw().execute_with_params(
+                "INSERT INTO messages(conversation_id, idx, role, content) VALUES(?1, 0, 'tool', ?2)",
+                &[SqliteValue::Integer(id), SqliteValue::Text(content.into())],
+            )?;
+        }
+        assert!(storage.has_legacy_codex_projection("local", Some("shared-id"))?);
+        assert!(!storage.has_legacy_codex_projection("remote-proof", Some("shared-id"))?);
+        assert!(!storage.has_legacy_codex_projection("local", Some("other-agent-id"))?);
+        assert!(!storage.has_legacy_codex_projection("local", Some("absent-id"))?);
+        assert!(!storage.has_legacy_codex_projection("absent-source", Some("shared-id"))?);
+        assert!(!storage.has_legacy_codex_projection("local", None)?);
+        storage
+            .raw()
+            .execute("UPDATE messages SET role='user' WHERE conversation_id=9003")?;
+        assert!(!storage.has_legacy_codex_projection("local", Some("shared-id"))?);
+        storage.raw().execute(
+            "UPDATE messages SET role='tool', content='[Tool output: complete body' WHERE conversation_id=9003",
+        )?;
+        assert!(!storage.has_legacy_codex_projection("local", Some("shared-id"))?);
+        Ok(())
+    }
 
     fn semantic_source_authority(storage: &FrankenStorage) -> Result<(String, i64)> {
         storage.raw().query_row_map(

@@ -833,14 +833,11 @@ pub(crate) fn promote_transcript_session_ids(conversations: &mut [NormalizedConv
     }
 }
 
-fn unrecognized_direct_session_roots(
-    ctx: &ScanContext,
-    ownership: &PiFamilyOwnership,
-) -> Vec<ScanRoot> {
+fn direct_session_roots(ctx: &ScanContext, ownership: &PiFamilyOwnership) -> Vec<ScanRoot> {
     ctx.scan_roots
         .iter()
         .filter(|root| {
-            !fad_recognizes_explicit_root(&root.path)
+            (root.path.is_file() || !fad_recognizes_explicit_root(&root.path))
                 && ownership.owner(&root.path) == PiFamilyOwner::Omp
         })
         .cloned()
@@ -912,7 +909,17 @@ impl Connector for OmpConnector {
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let ownership = PiFamilyOwnership::live();
-        let mut conversations = self.inner.scan(ctx)?;
+        // FAD's OMP root resolver expands files to their parent directory.
+        // Route explicit files through its wire parser instead, preserving
+        // the requested boundary and the root's origin/platform provenance.
+        let mut directory_ctx = ctx.clone();
+        directory_ctx.scan_roots.retain(|root| !root.path.is_file());
+        let mut conversations =
+            if ctx.use_default_detection() || !directory_ctx.scan_roots.is_empty() {
+                self.inner.scan(&directory_ctx)?
+            } else {
+                Vec::new()
+            };
 
         if ctx.use_default_detection() {
             let fallback = franken_agent_detection::connectors::pi_wire::scan_homes_tagged(
@@ -923,16 +930,22 @@ impl Connector for OmpConnector {
             append_missing_conversations(&mut conversations, fallback);
         }
 
-        let direct_roots = unrecognized_direct_session_roots(ctx, &ownership);
+        let direct_roots = direct_session_roots(ctx, &ownership);
         if !direct_roots.is_empty() {
             let tagged_roots = direct_roots
                 .iter()
-                .map(|root| (root.path.clone(), direct_root_profile(root, &ownership)))
+                .map(|root| (root.clone(), direct_root_profile(root, &ownership)))
                 .collect::<Vec<_>>();
-            let fallback = franken_agent_detection::connectors::pi_wire::scan_homes_tagged(
+            let mut fallback = Vec::new();
+            franken_agent_detection::connectors::pi_wire::scan_roots_with_boundaries(
                 &tagged_roots,
                 ctx,
                 "omp",
+                &mut franken_agent_detection::SourceScanHooks::default(),
+                &mut |conversation| {
+                    fallback.push(conversation);
+                    Ok(())
+                },
             )?;
             append_missing_conversations(&mut conversations, fallback);
         }
@@ -946,7 +959,13 @@ impl Connector for OmpConnector {
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
         let ownership = PiFamilyOwnership::live();
-        let mut sources = self.inner.discover_source_files(ctx)?;
+        let mut directory_ctx = ctx.clone();
+        directory_ctx.scan_roots.retain(|root| !root.path.is_file());
+        let mut sources = if ctx.use_default_detection() || !directory_ctx.scan_roots.is_empty() {
+            self.inner.discover_source_files(&directory_ctx)?
+        } else {
+            Vec::new()
+        };
 
         if ctx.use_default_detection() {
             let roots = ownership
@@ -959,13 +978,13 @@ impl Connector for OmpConnector {
             append_missing_sources(&mut sources, fallback);
         }
 
-        let direct_roots = unrecognized_direct_session_roots(ctx, &ownership);
+        let direct_roots = direct_session_roots(ctx, &ownership);
         if !direct_roots.is_empty() {
-            let fallback = franken_agent_detection::connectors::pi_wire::discover_sources(
+            let fallback = franken_agent_detection::connectors::pi_wire::try_discover_sources(
                 &direct_roots,
                 ctx,
                 "omp",
-            );
+            )?;
             append_missing_sources(&mut sources, fallback);
         }
         sources.retain(|source| ownership.owner(&source.source_path) == PiFamilyOwner::Omp);
