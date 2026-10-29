@@ -2309,8 +2309,11 @@ fn pack_introspect_contract_matrix_is_current() {
         ("source", "option", Some("string")),
         ("sessions-from", "option", Some("string")),
         ("mode", "option", Some("enum")),
+        ("approximate", "flag", None),
         ("freshness-policy", "option", Some("enum")),
         ("freshness-window-seconds", "option", Some("integer")),
+        ("freshness-window", "option", Some("string")),
+        ("redaction", "option", Some("string")),
         ("require-evidence", "flag", None),
         ("explain-selection", "flag", None),
         ("refresh", "flag", None),
@@ -2334,6 +2337,8 @@ fn pack_introspect_contract_matrix_is_current() {
         "omitted",
         "privacy",
         "warnings",
+        "budget",
+        "selection_debug",
     ] {
         assert!(
             pack_schema.get(field).is_some(),

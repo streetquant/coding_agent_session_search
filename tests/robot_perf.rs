@@ -150,6 +150,7 @@ fn answer_pack_perf_plan(
         candidates,
         explain_selection: true,
         include_skill_content: false,
+        redaction_policy: Default::default(),
     })
     .expect("answer pack SLO plan")
 }

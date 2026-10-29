@@ -1675,6 +1675,674 @@ fn pack_contract_field_masks_return_real_cited_evidence() {
 }
 
 #[test]
+fn pack_redaction_duration_and_diagnostics_conform_across_all_formats() -> Result<(), Box<dyn Error>>
+{
+    fn assert_snake_case_keys(value: &Value) {
+        match value {
+            Value::Object(object) => {
+                for (key, value) in object {
+                    assert!(
+                        !key.is_empty()
+                            && key.bytes().all(|byte| {
+                                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                            }),
+                        "non-snake-case pack key: {key}"
+                    );
+                    assert_snake_case_keys(value);
+                }
+            }
+            Value::Array(items) => items.iter().for_each(assert_snake_case_keys),
+            _ => {}
+        }
+    }
+
+    let fixture = TempDir::new()?;
+    let home = fixture.path();
+    let data_dir = home.join("cass_data");
+    let codex_home = home.join(".codex");
+    let filename = "rollout-pack-policy.jsonl";
+    fs::write(
+        home.join(".env"),
+        "PACK_UNINDEXED_SECRET=disposable-unindexed-env-canary\n",
+    )?;
+    // Disposable synthetic values; ingestion redaction is disabled only for
+    // this private fixture so output policies must do their own work.
+    let credential = format!("sk-{}", "01234567890123456789");
+    let entropy = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let message = format!(
+        "packpolicyneedle café 東京 😀 id=abc123\n{credential}\nCookie: session=disposable-fixture-only\nwebhook_secret=disposable-hook-value\n{entropy}\n/home/private-user/project/a.rs build.internal"
+    );
+    util::seed_codex_session(&codex_home, filename, &message, false);
+    util::seed_codex_session(
+        &codex_home,
+        "rollout-pack-policy-control.jsonl",
+        "packpolicyneedle independent scope control",
+        false,
+    );
+    let source_path = codex_home.join("sessions/2026/04/23").join(filename);
+    let original = fs::read(&source_path)?;
+    let golden: Value = serde_json::from_str(include_str!(
+        "golden/robot/pack_policy_contract.json.golden"
+    ))?;
+    let indexed = isolated_cass_cmd(home)
+        .env("CASS_INDEX_REDACTION", "off")
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .timeout(std::time::Duration::from_secs(120))
+        .output()?;
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let report: Value = serde_json::from_slice(&indexed.stdout)?;
+    assert_eq!(report["conversations"], 2);
+    assert_eq!(report["messages"], 2);
+    for surface in ["health", "status"] {
+        let output = isolated_cass_cmd(home)
+            .args([surface, "--json", "--data-dir"])
+            .arg(&data_dir)
+            .output()?;
+        assert!(output.status.success(), "{surface}: {output:?}");
+        let payload: Value = serde_json::from_slice(&output.stdout)?;
+        let state = if surface == "health" {
+            &payload["state"]
+        } else {
+            &payload
+        };
+        assert_eq!(payload["healthy"], true, "{surface}: {payload}");
+        assert_eq!(state["index"]["fresh"], true, "{surface}: {state}");
+        assert_eq!(state["rebuild"]["active"], false, "{surface}: {state}");
+    }
+    let scope_file = home.join("pack-sessions.txt");
+    fs::write(&scope_file, format!("{}\n", source_path.display()))?;
+    let archive_snapshot =
+        || -> Result<std::collections::BTreeMap<PathBuf, String>, Box<dyn Error>> {
+            WalkDir::new(&data_dir)
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    Ok(entry) if entry.file_type().is_file() => Some(Ok(entry)),
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                })
+                .map(|entry| {
+                    let entry = entry?;
+                    Ok((
+                        entry.path().strip_prefix(&data_dir)?.to_path_buf(),
+                        blake3::hash(&fs::read(entry.path())?).to_hex().to_string(),
+                    ))
+                })
+                .collect()
+        };
+    let archive_before = archive_snapshot()?;
+    let unavailable = isolated_cass_cmd(home)
+        .env("CASS_SEMANTIC_EMBEDDER", "hash")
+        .args([
+            "pack",
+            "packpolicyneedle",
+            "--json",
+            "--mode",
+            "semantic",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .output()?;
+    assert_eq!(unavailable.status.code(), Some(15));
+    assert!(unavailable.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&unavailable.stderr)?;
+    assert_eq!(error["error"]["kind"], "semantic-unavailable");
+    assert_eq!(error["error"]["retryable"], false);
+    assert!(error["error"]["hint"].is_string());
+    assert_eq!(archive_snapshot()?, archive_before);
+    let mut evidence_id = None;
+    for policy in ["strict", "balanced", "off"] {
+        let mut canonical_envelope = None;
+        for format in ["json", "compact", "jsonl", "toon", "markdown"] {
+            let mut command = isolated_cass_cmd(home);
+            command
+                .args([
+                    "pack",
+                    "packpolicyneedle",
+                    "--mode",
+                    "lexical",
+                    "--approximate",
+                    "--source",
+                    "local",
+                    "--redaction",
+                    policy,
+                    "--freshness-window",
+                    "30d",
+                    "--explain-selection",
+                    "--require-evidence",
+                    "--max-tokens",
+                    "12000",
+                    "--request-id",
+                    "pack-policy-contract",
+                    "--data-dir",
+                ])
+                .arg(&data_dir);
+            command.args(["--sessions-from"]).arg(&scope_file);
+            command.env("CASS_AUTO_REFRESH", "1");
+            if format == "markdown" {
+                command.args(["--display", "markdown"]);
+            } else {
+                command.args(["--robot-format", format]);
+            }
+            let output = command
+                .timeout(std::time::Duration::from_secs(60))
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{policy}/{format}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let text = std::str::from_utf8(&output.stdout)?;
+            assert!(text.contains("packpolicyneedle"));
+            assert!(text.contains("café 東京 😀"));
+            assert!(!text.contains("/home/private-user"), "{policy}/{format}");
+            assert!(!text.contains("build.internal"), "{policy}/{format}");
+            assert!(!text.contains("disposable-unindexed-env-canary"));
+            assert_eq!(
+                text.contains(&credential),
+                policy == "off",
+                "{policy}/{format}"
+            );
+            assert_eq!(
+                text.contains("disposable-fixture-only"),
+                policy == "off",
+                "{policy}/{format}"
+            );
+            assert_eq!(
+                text.contains("disposable-hook-value"),
+                policy == "off",
+                "{policy}/{format}"
+            );
+            assert_eq!(
+                text.contains(entropy),
+                policy != "strict",
+                "{policy}/{format}"
+            );
+            assert!(text.chars().count().div_ceil(4) <= 12_600);
+            assert_eq!(fs::read(&source_path)?, original);
+            assert_eq!(
+                archive_snapshot()?,
+                archive_before,
+                "pack {policy}/{format} must observe the archive without mutation"
+            );
+            if format == "markdown" {
+                assert!(text.contains("## Evidence"));
+                assert_eq!(text.contains("Sensitive output:"), policy == "off");
+                continue;
+            }
+            let payload: Value = match format {
+                "toon" => Value::from(toon::try_decode(text, None)?),
+                "jsonl" => {
+                    let lines = text
+                        .lines()
+                        .map(serde_json::from_str::<Value>)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    assert_eq!(lines.len(), 5);
+                    serde_json::json!({
+                        "schema_version": lines[0]["schema_version"],
+                        "_meta": lines[0]["_meta"], "selection_debug": lines[0]["selection_debug"],
+                        "evidence": [lines[2]["evidence"]], "privacy": lines[4]["privacy"],
+                    })
+                }
+                _ => serde_json::from_str(text)?,
+            };
+            assert_snake_case_keys(&payload);
+            assert_eq!(payload["_meta"]["request_id"], "pack-policy-contract");
+            assert_eq!(payload["_meta"]["partial"], false);
+            assert_eq!(payload["privacy"]["redaction_policy"], policy);
+            assert_eq!(payload["privacy"]["sensitive_output"], policy == "off");
+            assert_eq!(payload["privacy"]["redaction_applied"], true);
+            let item = &payload["evidence"][0];
+            let projected = serde_json::json!({
+                "schema_version": payload["schema_version"],
+                "excerpt": item["excerpt"].as_str().ok_or("missing golden excerpt")?.replace(&credential, "[SYNTHETIC_CREDENTIAL]"),
+                "citation": {
+                    "agent": item["citation"]["agent"], "source_id": item["citation"]["source_id"],
+                    "message_index": item["citation"]["message_index"], "message_index_base": item["citation"]["message_index_base"],
+                    "line_start": item["citation"]["line_start"], "line_end": item["citation"]["line_end"], "verified": item["citation"]["verified"],
+                },
+                "privacy": {
+                    "redaction_policy": payload["privacy"]["redaction_policy"],
+                    "redaction_applied": payload["privacy"]["redaction_applied"],
+                    "sensitive_output": payload["privacy"]["sensitive_output"],
+                    "skill_content_included": payload["privacy"]["skill_content_included"],
+                },
+            });
+            assert_eq!(
+                toon::JsonValue::from(projected),
+                toon::JsonValue::from(golden[policy].clone()),
+                "reviewed positive contract golden: {policy}/{format}"
+            );
+            assert_eq!(item["rank"].as_f64(), Some(1.0));
+            assert_eq!(item["citation"]["verified"], true);
+            assert_eq!(item["citation"]["message_index"].as_f64(), Some(1.0));
+            assert_eq!(item["citation"]["message_index_base"].as_f64(), Some(1.0));
+            assert_eq!(item["citation"]["line_start"].as_f64(), Some(2.0));
+            assert_eq!(item["citation"]["line_end"].as_f64(), Some(2.0));
+            assert_eq!(
+                item["citation"]["span_hash"],
+                blake3::hash(
+                    original
+                        .split(|byte| *byte == b'\n')
+                        .nth(1)
+                        .ok_or("missing native message line")?
+                )
+                .to_hex()
+                .as_str()
+            );
+            let excerpt = item["excerpt"].as_str().ok_or("missing excerpt")?;
+            assert_eq!(
+                item["estimated_tokens"].as_f64(),
+                Some(excerpt.chars().count().div_ceil(4) as f64)
+            );
+            assert_eq!(
+                item["citation"]["excerpt_sha256"],
+                hex::encode(<sha2::Sha256 as sha2::Digest>::digest(excerpt.as_bytes()))
+            );
+            if let Some(expected) = &evidence_id {
+                assert_eq!(
+                    &item["id"], expected,
+                    "policy/format cannot change source identity"
+                );
+            } else {
+                evidence_id = Some(item["id"].clone());
+            }
+            assert!(
+                payload["selection_debug"]["candidate_fetch_limit"]
+                    .as_f64()
+                    .is_some_and(|limit| limit >= 64.0)
+            );
+            assert_eq!(payload["selection_debug"]["selected"][0]["id"], item["id"]);
+            assert_eq!(
+                payload["selection_debug"]["selected"][0]["selection"],
+                item["selection"]
+            );
+            assert!(payload["selection_debug"]["omitted"].is_array());
+            if format != "jsonl" {
+                assert_eq!(
+                    payload["freshness"]["window_seconds"].as_f64(),
+                    Some(2592000.0)
+                );
+                assert_eq!(payload["realized"]["search_mode"], "lexical");
+                assert_eq!(payload["health"]["healthy"], true);
+                assert_eq!(payload["health"]["index_state"], "ready");
+                assert_eq!(payload["health"]["active_rebuild"], false);
+                assert!(
+                    payload["health"]["source_readiness"][0]
+                        .get("last_sync_at_ms")
+                        .is_some()
+                );
+                assert_eq!(payload["health"]["fallback_mode"], Value::Null);
+                assert_eq!(
+                    payload["health"]["source_readiness"][0]["last_sync_at_ms"],
+                    Value::Null
+                );
+                assert_eq!(
+                    payload["health"]["source_readiness"][0]["last_indexed_at_ms"],
+                    item["citation"]["indexed_at_ms"]
+                );
+                let mut stable = payload.clone();
+                let meta = stable["_meta"].as_object_mut().ok_or("pack metadata")?;
+                for key in ["generated_at_ms", "elapsed_ms", "format"] {
+                    meta.remove(key);
+                }
+                stable["budget"]
+                    .as_object_mut()
+                    .ok_or("pack budget")?
+                    .remove("elapsed_ms");
+                for item in stable["evidence"].as_array_mut().ok_or("pack evidence")? {
+                    item["citation"]
+                        .as_object_mut()
+                        .ok_or("pack citation")?
+                        .remove("freshness_age_seconds");
+                }
+                let stable = toon::JsonValue::from(stable);
+                if let Some(expected) = &canonical_envelope {
+                    assert_eq!(&stable, expected, "complete {policy}/{format} envelope");
+                } else {
+                    canonical_envelope = Some(stable);
+                }
+            }
+        }
+    }
+    let stdin_scoped = isolated_cass_cmd(home)
+        .args([
+            "pack",
+            "packpolicyneedle",
+            "--json",
+            "--mode",
+            "lexical",
+            "--sessions-from",
+            "-",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .write_stdin(format!("{}\n", source_path.display()))
+        .output()?;
+    assert!(stdin_scoped.status.success());
+    let payload: Value = serde_json::from_slice(&stdin_scoped.stdout)?;
+    assert_eq!(
+        payload["evidence"]
+            .as_array()
+            .ok_or("stdin evidence")?
+            .len(),
+        1
+    );
+    assert_eq!(Some(&payload["evidence"][0]["id"]), evidence_id.as_ref());
+    for mask in [
+        "standard",
+        "full",
+        "minimal",
+        "evidence,query,no_such_field",
+        "no_such_field",
+    ] {
+        let output = isolated_cass_cmd(home)
+            .args([
+                "pack",
+                "packpolicyneedle",
+                "--json",
+                "--mode",
+                "lexical",
+                "--explain-selection",
+                "--field-mask",
+                mask,
+                "--sessions-from",
+            ])
+            .arg(&scope_file)
+            .args(["--data-dir"])
+            .arg(&data_dir)
+            .output()?;
+        if mask == "no_such_field" {
+            assert_eq!(output.status.code(), Some(2));
+            assert!(output.stdout.is_empty());
+            let error: Value = serde_json::from_slice(&output.stderr)?;
+            assert_eq!(error["error"]["kind"], "pack-invalid-field");
+            assert_eq!(error["error"]["retryable"], false);
+            continue;
+        }
+        assert!(output.status.success());
+        let payload: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(payload["evidence"][0]["citation"]["verified"], true);
+        assert_eq!(
+            payload["evidence"][0]["citation"]["span_hash"],
+            blake3::hash(
+                original
+                    .split(|byte| *byte == b'\n')
+                    .nth(1)
+                    .ok_or("source line")?
+            )
+            .to_hex()
+            .as_str()
+        );
+        match mask {
+            "full" => assert!(payload["selection_debug"].is_object()),
+            "standard" => {
+                assert!(payload.get("selection_debug").is_none());
+                assert!(payload["budget"].is_object());
+            }
+            "minimal" => {
+                assert_eq!(payload.as_object().ok_or("minimal pack")?.len(), 7);
+                assert!(payload.get("_meta").is_none());
+                assert_eq!(
+                    payload["evidence"][0]
+                        .as_object()
+                        .ok_or("minimal evidence")?
+                        .len(),
+                    2
+                );
+            }
+            _ => assert_eq!(
+                payload["_meta"]["warnings"],
+                serde_json::json!([
+                    "semantic_disabled",
+                    "privacy_redactions_applied",
+                    "unknown_pack_field_mask_ignored:no_such_field"
+                ])
+            ),
+        }
+    }
+    let all = isolated_cass_cmd(home)
+        .args([
+            "pack",
+            "packpolicyneedle",
+            "--json",
+            "--mode",
+            "lexical",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .output()?;
+    assert!(all.status.success());
+    let payload: Value = serde_json::from_slice(&all.stdout)?;
+    assert_eq!(
+        payload["evidence"]
+            .as_array()
+            .ok_or("unscoped evidence")?
+            .len(),
+        2,
+        "scope controls must exclude a real competing record"
+    );
+    let database = data_dir.join("agent_search.db");
+    let filtered = isolated_cass_cmd(home)
+        .args([
+            "pack",
+            "packpolicyneedle",
+            "--json",
+            "--mode",
+            "lexical",
+            "--agent",
+            "codex",
+            "--since",
+            "2020-01-01",
+            "--until",
+            "2030-01-01",
+            "--workspace",
+        ])
+        .arg(&codex_home)
+        .arg("--db")
+        .arg(&database)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()?;
+    assert!(filtered.status.success(), "{filtered:?}");
+    let filtered: Value = serde_json::from_slice(&filtered.stdout)?;
+    let stable_evidence = |pack: &Value| {
+        pack["evidence"]
+            .as_array()
+            .expect("filtered evidence")
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "id": item["id"],
+                    "conversation_id": item["citation"]["conversation_id"],
+                    "message_index": item["citation"]["message_index"],
+                    "excerpt": item["excerpt"],
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(stable_evidence(&filtered), stable_evidence(&payload));
+    assert_eq!(filtered["_meta"]["effective"]["db_path_source"], "--db");
+    for flags in [
+        ["--agent", "claude_code"],
+        ["--workspace", "pack-unindexed-workspace"],
+        ["--since", "2030-01-01"],
+        ["--until", "2020-01-01"],
+    ] {
+        let excluded = isolated_cass_cmd(home)
+            .args(["pack", "packpolicyneedle", "--json", "--mode", "lexical"])
+            .args(flags)
+            .arg("--db")
+            .arg(&database)
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .output()?;
+        assert!(excluded.status.success(), "{flags:?}: {excluded:?}");
+        let excluded: Value = serde_json::from_slice(&excluded.stdout)?;
+        assert!(
+            excluded["evidence"].as_array().is_some_and(Vec::is_empty),
+            "{flags:?}: {excluded}"
+        );
+    }
+    let refreshed = isolated_cass_cmd(home)
+        .args([
+            "pack",
+            "packpolicyneedle",
+            "--json",
+            "--mode",
+            "lexical",
+            "--refresh",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .output()?;
+    assert!(refreshed.status.success());
+    let payload: Value = serde_json::from_slice(&refreshed.stdout)?;
+    assert_eq!(payload["_meta"]["partial"], true);
+    assert_eq!(payload["budget"]["timed_out"], false);
+    assert!(
+        payload["budget"]["skipped_sections"]
+            .as_array()
+            .ok_or("refresh sections")?
+            .iter()
+            .any(|section| section == "refresh")
+    );
+    assert!(
+        payload["budget"]["recommended_next_probe"]
+            .as_str()
+            .ok_or("refresh probe")?
+            .contains(" index --json")
+    );
+    fs::write(&scope_file, "")?;
+    for require in [false, true] {
+        let mut command = isolated_cass_cmd(home);
+        command
+            .args([
+                "pack",
+                "packpolicyneedle",
+                "--json",
+                "--mode",
+                "lexical",
+                "--sessions-from",
+            ])
+            .arg(&scope_file)
+            .args(["--data-dir"])
+            .arg(&data_dir);
+        if require {
+            command.arg("--require-evidence");
+        }
+        let output = command.output()?;
+        if require {
+            assert_eq!(output.status.code(), Some(13));
+            assert!(output.stdout.is_empty());
+            let error: Value = serde_json::from_slice(&output.stderr)?;
+            assert_eq!(error["error"]["kind"], "not-found");
+            assert_eq!(error["error"]["retryable"], false);
+        } else {
+            assert!(output.status.success());
+            let empty: Value = serde_json::from_slice(&output.stdout)?;
+            assert!(
+                empty["evidence"]
+                    .as_array()
+                    .ok_or("empty evidence")?
+                    .is_empty()
+            );
+            assert!(
+                empty["warnings"]
+                    .as_array()
+                    .ok_or("empty warnings")?
+                    .iter()
+                    .any(|warning| warning == "no_evidence_found")
+            );
+        }
+    }
+    fs::write(&scope_file, [0xff])?;
+    for path in [&scope_file, &home.join("missing-pack-scope.txt")] {
+        let output = isolated_cass_cmd(home)
+            .args([
+                "pack",
+                "packpolicyneedle",
+                "--json",
+                "--mode",
+                "lexical",
+                "--sessions-from",
+            ])
+            .arg(path)
+            .args(["--data-dir"])
+            .arg(&data_dir)
+            .output()?;
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&output.stderr)?;
+        assert_eq!(error["error"]["kind"], "sessions-from");
+        assert_eq!(error["error"]["retryable"], false);
+        assert!(error["error"]["hint"].is_string());
+    }
+    assert_eq!(archive_snapshot()?, archive_before);
+    assert_eq!(fs::read(&source_path)?, original);
+    Ok(())
+}
+
+#[test]
+fn pack_invalid_policies_and_durations_use_typed_errors() -> Result<(), Box<dyn Error>> {
+    let data_dir = TempDir::new()?;
+    for (args, kind) in [
+        (
+            vec!["--redaction", "unknown"],
+            "pack-invalid-redaction-policy",
+        ),
+        (vec!["--redaction", "off"], "pack-invalid-redaction-policy"),
+        (
+            vec!["--redaction", "off", "--source", "remote"],
+            "pack-invalid-redaction-policy",
+        ),
+        (
+            vec!["--redaction", "off", "--source", "all"],
+            "pack-invalid-redaction-policy",
+        ),
+        (vec!["--freshness-window", "0d"], "pack-invalid-limit"),
+        (vec!["--freshness-window", "1x"], "pack-invalid-limit"),
+        (vec!["--max-sessions", "0"], "pack-invalid-limit"),
+        (vec!["--max-sessions", "65"], "pack-invalid-limit"),
+        (vec!["--max-evidence", "0"], "pack-invalid-limit"),
+        (vec!["--max-evidence", "257"], "pack-invalid-limit"),
+        (vec!["--context-lines", "41"], "pack-invalid-limit"),
+        (vec!["--max-excerpt-chars", "79"], "pack-invalid-limit"),
+        (vec!["--max-excerpt-chars", "8001"], "pack-invalid-limit"),
+        (vec!["--fields", "no_such_field"], "pack-invalid-field"),
+        (
+            vec!["--robot-format", "sessions"],
+            "pack-unsupported-format",
+        ),
+        (vec!["--display", "table"], "pack-unsupported-format"),
+        (
+            vec!["--freshness-window", "9223372036854775807w"],
+            "pack-invalid-limit",
+        ),
+    ] {
+        let output = base_cmd()
+            .args(["pack", "policynegative", "--json", "--data-dir"])
+            .arg(data_dir.path())
+            .args(&args)
+            .output()?;
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(
+            output.stdout.is_empty(),
+            "invalid policy must emit no evidence"
+        );
+        let error: Value = serde_json::from_slice(&output.stderr)?;
+        assert_eq!(error["error"]["kind"], kind);
+        assert_eq!(error["error"]["code"], 2);
+        assert_eq!(error["error"]["retryable"], false);
+    }
+    Ok(())
+}
+
+#[test]
 fn view_named_path_flag_attaches_to_path_positional() {
     let mut cmd = base_cmd();
     cmd.args([
@@ -6897,7 +7565,7 @@ fn timed_out_robot_pack_returns_bounded_partial_and_names_shed_work() -> Result<
         )
         .into());
     }
-    if !output.status.success() {
+    if output.status.code() != Some(10) {
         return Err(format!(
             "timed-out pack failed: status={:?}; stderr={}",
             output.status,
@@ -6905,6 +7573,9 @@ fn timed_out_robot_pack_returns_bounded_partial_and_names_shed_work() -> Result<
         )
         .into());
     }
+    let error: Value = serde_json::from_slice(&output.stderr)?;
+    assert_eq!(error["error"]["kind"], "timeout");
+    assert_eq!(error["error"]["retryable"], true);
     let payload: Value = serde_json::from_slice(&output.stdout)?;
     let budget = &payload["budget"];
     let skipped = budget["skipped_sections"]
@@ -6971,7 +7642,7 @@ fn timed_out_robot_pack_setup_returns_bounded_partial_before_asset_validation_fi
     if started.elapsed() >= std::time::Duration::from_millis(1500) {
         return Err("pack waited for the simulated two-second search-setup stall".into());
     }
-    if !output.status.success() {
+    if output.status.code() != Some(10) {
         return Err(format!(
             "timed-out pack setup failed: status={:?}; stderr={}",
             output.status,
@@ -7043,7 +7714,7 @@ fn blocking_sessions_file_pack_returns_bounded_partial_without_fabricated_eviden
         .arg(data_dir.path())
         .output()?;
     let wall = started.elapsed();
-    if !output.status.success() {
+    if output.status.code() != Some(10) {
         return Err(format!(
             "FIFO-scoped pack failed (a kill at the harness timeout means pack waited for the blocking sessions FIFO): status={:?}; wall={wall:?}; stderr={}",
             output.status,
@@ -7090,6 +7761,35 @@ fn blocking_sessions_file_pack_returns_bounded_partial_without_fabricated_eviden
             format!("pack FIFO retry lost its session file scope: {recommendation}").into(),
         );
     }
+    // An explicit human timeout must bound the same blocking input. Without
+    // the budgeted-worker path, Markdown waits on this FIFO until the harness
+    // kills it rather than returning the documented timeout.
+    let output = base_cmd()
+        .timeout(std::time::Duration::from_secs(30))
+        .args([
+            "pack",
+            "hello",
+            "--display",
+            "markdown",
+            "--mode",
+            "lexical",
+            "--timeout",
+            "120",
+            "--sessions-from",
+        ])
+        .arg(&sessions_fifo)
+        .arg("--data-dir")
+        .arg(data_dir.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(10), "{output:?}");
+    let error = std::str::from_utf8(&output.stderr)?;
+    assert!(
+        error.contains("pack deadline reached before usable evidence could be emitted"),
+        "{error}"
+    );
+    let markdown = String::from_utf8(output.stdout)?;
+    assert!(markdown.contains("# hello"), "{markdown}");
+    assert!(!markdown.contains("ev_"), "{markdown}");
     Ok(())
 }
 
@@ -7176,7 +7876,7 @@ fn timed_out_robot_pack_renderer_emits_fixed_size_partial_fallback() -> Result<(
         )
         .into());
     }
-    if !output.status.success() {
+    if output.status.code() != Some(10) {
         return Err(format!(
             "timed-out pack renderer failed: status={:?}; stderr={}",
             output.status,
@@ -7261,7 +7961,7 @@ fn timed_out_robot_pack_planner_does_not_fabricate_selection() -> Result<(), Box
         )
         .into());
     }
-    if !output.status.success() {
+    if output.status.code() != Some(10) {
         return Err(format!(
             "timed-out pack planner failed: status={:?}; stderr={}",
             output.status,

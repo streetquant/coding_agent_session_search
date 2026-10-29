@@ -319,6 +319,7 @@ fn pack_bench_plan(candidates: Vec<PackCandidate>, limits: PackPlannerLimits) ->
         candidates,
         explain_selection: true,
         include_skill_content: false,
+        redaction_policy: Default::default(),
     })
     .expect("answer pack benchmark plan")
 }

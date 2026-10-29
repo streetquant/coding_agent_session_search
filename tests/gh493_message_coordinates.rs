@@ -2538,7 +2538,12 @@ mod native_anchor_journey {
             ])
             .arg(&corpus.data);
         let started = std::time::Instant::now();
-        let partial = decode(output(delayed));
+        let delayed = output(delayed);
+        assert_eq!(delayed.status.code(), Some(10));
+        let error: Value = serde_json::from_slice(&delayed.stderr).unwrap();
+        assert_eq!(error["error"]["kind"], "timeout");
+        assert_eq!(error["error"]["retryable"], true);
+        let partial: Value = serde_json::from_slice(&delayed.stdout).unwrap();
         assert!(started.elapsed() < Duration::from_secs(30));
         assert_eq!(partial["budget"]["timed_out"], true);
         assert_eq!(partial["realized"]["semantic_joined"], false);

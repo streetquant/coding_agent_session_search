@@ -1,0 +1,20 @@
+{
+  "strict": {
+    "schema_version": "cass.pack.v2",
+    "excerpt": "packpolicyneedle café 東京 😀 id=abc123\n[REDACTED]\n[REDACTED]\n[REDACTED]\n[REDACTED]\n[REDACTED_PATH]/a.rs [REDACTED_REMOTE_HOST]",
+    "citation": {"agent": "codex", "source_id": "local", "message_index": 1, "message_index_base": 1, "line_start": 2, "line_end": 2, "verified": true},
+    "privacy": {"redaction_policy": "strict", "redaction_applied": true, "sensitive_output": false, "skill_content_included": false}
+  },
+  "balanced": {
+    "schema_version": "cass.pack.v2",
+    "excerpt": "packpolicyneedle café 東京 😀 id=abc123\n[REDACTED]\n[REDACTED]\n[REDACTED]\nABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/\n[REDACTED_PATH]/a.rs [REDACTED_REMOTE_HOST]",
+    "citation": {"agent": "codex", "source_id": "local", "message_index": 1, "message_index_base": 1, "line_start": 2, "line_end": 2, "verified": true},
+    "privacy": {"redaction_policy": "balanced", "redaction_applied": true, "sensitive_output": false, "skill_content_included": false}
+  },
+  "off": {
+    "schema_version": "cass.pack.v2",
+    "excerpt": "packpolicyneedle café 東京 😀 id=abc123\n[SYNTHETIC_CREDENTIAL]\nCookie: session=disposable-fixture-only\nwebhook_secret=disposable-hook-value\nABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/\n[REDACTED_PATH]/a.rs [REDACTED_REMOTE_HOST]",
+    "citation": {"agent": "codex", "source_id": "local", "message_index": 1, "message_index_base": 1, "line_start": 2, "line_end": 2, "verified": true},
+    "privacy": {"redaction_policy": "off", "redaction_applied": true, "sensitive_output": true, "skill_content_included": false}
+  }
+}

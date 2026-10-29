@@ -1091,6 +1091,17 @@
           ]
         },
         {
+          "name": "approximate",
+          "description": "Use approximate semantic search when a compatible ANN index is available",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "freshness-policy",
           "description": "Freshness policy for evidence selection",
           "arg_type": "option",
@@ -1112,8 +1123,23 @@
           "default": "2592000"
         },
         {
+          "name": "freshness-window",
+          "description": "Evidence freshness duration: m (minutes), h, d, or w",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "redaction",
+          "description": "Excerpt redaction: strict, balanced, or off (requires --source local). Private citation coordinates remain protected in every policy",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "default": "strict"
+        },
+        {
           "name": "include-skill-content",
-          "description": "Include skill payload excerpts. Credentials remain redacted",
+          "description": "Include skill payload excerpts (excluded by default)",
           "arg_type": "flag",
           "required": false,
           "default": "false",

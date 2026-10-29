@@ -9499,6 +9499,7 @@ schemas: (auto-generated from contract)
       - window_seconds: integer
     - health: object
       - active_rebuild: boolean
+      - fallback_mode: ?
       - healthy: boolean
       - index_generation: ?
       - index_state: string
@@ -9544,6 +9545,10 @@ schemas: (auto-generated from contract)
       - selected_session_count: integer
       - semantic_joined: boolean
     - schema_version: string
+    - selection_debug: object
+      - candidate_fetch_limit: integer
+      - omitted: array
+      - selected: array
     - warnings: array
   search:
     - _meta: object

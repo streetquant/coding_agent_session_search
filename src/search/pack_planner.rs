@@ -55,6 +55,17 @@ static PRIVATE_HOST_LABEL_RE: Lazy<Regex> = Lazy::new(|| {
     .expect("private host label redaction regex")
 });
 
+static PACK_CREDENTIAL_HEADER_RE: Lazy<Regex> = Lazy::new(|| {
+    // ubs:ignore -- Compile-time literal, exercised by the credential policy tests; no external pattern can reach this initialization.
+    Regex::new(r#"(?im)\b(?:cookie|set-cookie|authorization|[a-z0-9_]*webhook[_-]?secret|[a-z0-9_]*api[_-]?key|[a-z0-9_]*password)\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\r\n]+)"#)
+        .expect("pack credential header regex")
+});
+
+static PACK_ENTROPY_TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
+    // ubs:ignore -- Compile-time literal, exercised by the entropy boundary tests; no external pattern can reach this initialization.
+    Regex::new(r"[A-Za-z0-9+/_=-]{33,}").expect("pack entropy token regex")
+});
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackPlannerLimits {
     pub max_tokens: usize,
@@ -120,6 +131,25 @@ pub enum PackFreshnessPolicy {
     PreferRecent,
     Strict,
     AllowStale,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PackRedactionPolicy {
+    #[default]
+    Strict,
+    Balanced,
+    Off,
+}
+
+impl PackRedactionPolicy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Balanced => "balanced",
+            Self::Off => "off",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -392,6 +422,8 @@ pub struct PackPlanRequest {
     pub candidates: Vec<PackCandidate>,
     pub explain_selection: bool,
     pub include_skill_content: bool,
+    #[serde(default)]
+    pub redaction_policy: PackRedactionPolicy,
 }
 
 impl Default for PackPlanRequest {
@@ -404,6 +436,7 @@ impl Default for PackPlanRequest {
             candidates: Vec::new(),
             explain_selection: false,
             include_skill_content: false,
+            redaction_policy: PackRedactionPolicy::Strict,
         }
     }
 }
@@ -661,6 +694,8 @@ struct RenderedAnswerPack {
     omitted: RenderedOmitted,
     privacy: RenderedPrivacy,
     warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selection_debug: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -712,6 +747,7 @@ struct RenderedHealth {
     index_generation: Option<String>,
     lexical_readiness: &'static str,
     semantic_state: &'static str,
+    fallback_mode: Option<String>,
     active_rebuild: bool,
     lock_state: Option<String>,
     missing_database: bool,
@@ -726,6 +762,9 @@ struct RenderedSourceReadiness {
     readiness: &'static str,
     healthy: bool,
     evidence_count: usize,
+    last_sync_at_ms: Option<i64>,
+    last_indexed_at_ms: Option<i64>,
+    recommended_action: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1013,7 +1052,16 @@ pub fn plan_answer_pack(
                 return (String::new(), false, Vec::new());
             }
             let mut redactions = Vec::new();
-            let redacted = redact_pack_output_text(&candidate.excerpt, &mut redactions);
+            let policy = if request.redaction_policy == PackRedactionPolicy::Off
+                && candidate.origin_kind == "local"
+            {
+                PackRedactionPolicy::Off
+            } else if request.redaction_policy == PackRedactionPolicy::Off {
+                PackRedactionPolicy::Strict
+            } else {
+                request.redaction_policy
+            };
+            let redacted = redact_pack_excerpt(&candidate.excerpt, policy, &mut redactions);
             let (excerpt, truncated) =
                 truncate_excerpt(&redacted, request.limits.max_excerpt_chars);
             (excerpt, truncated, redactions)
@@ -1046,7 +1094,7 @@ pub fn plan_answer_pack(
             }
 
             let (excerpt, excerpt_truncated, _) = &prepared_excerpts[candidate_index];
-            if excerpt.trim().is_empty() {
+            if !pack_excerpt_has_meaningful_text(excerpt) {
                 let score = score_candidate(
                     candidate,
                     &request,
@@ -2162,6 +2210,17 @@ fn rendered_answer_pack_with_correlation(
         warnings.push("privacy_redactions_applied".to_string());
     }
 
+    let selection_debug = request.explain_selection.then(|| {
+        serde_json::json!({
+            "candidate_fetch_limit": plan.diagnostics.candidate_fetch_limit,
+            "selected": evidence.iter().map(|item| serde_json::json!({
+                "id": item.id,
+                "selection": item.selection,
+            })).collect::<Vec<_>>(),
+            "omitted": &omitted_items,
+        })
+    });
+
     RenderedAnswerPack {
         schema_version: "cass.pack.v2",
         query: RenderedQuery {
@@ -2204,6 +2263,7 @@ fn rendered_answer_pack_with_correlation(
             index_generation,
             lexical_readiness: lexical_readiness_label(request.readiness.lexical_readiness),
             semantic_state: semantic_readiness_label(semantic_readiness),
+            fallback_mode: request.fallback_mode.clone(),
             active_rebuild: request.readiness.active_rebuild,
             lock_state,
             missing_database: request.readiness.missing_database,
@@ -2245,6 +2305,7 @@ fn rendered_answer_pack_with_correlation(
             redaction_counts,
         },
         warnings,
+        selection_debug,
     }
 }
 
@@ -2401,6 +2462,14 @@ fn pack_title(request: &PackRenderRequest) -> String {
 }
 
 fn redact_pack_output_text(input: &str, redactions: &mut Vec<RenderedRedaction>) -> String {
+    redact_pack_excerpt(input, PackRedactionPolicy::Strict, redactions)
+}
+
+fn redact_pack_excerpt(
+    input: &str,
+    policy: PackRedactionPolicy,
+    redactions: &mut Vec<RenderedRedaction>,
+) -> String {
     let mut output = input.to_string();
 
     let encrypted_redacted = ENCRYPTED_PAYLOAD_RE.replace_all(&output, |_: &Captures<'_>| {
@@ -2416,9 +2485,43 @@ fn redact_pack_output_text(input: &str, redactions: &mut Vec<RenderedRedaction>)
         output = redacted;
     }
 
-    if let Cow::Owned(redacted) = redact_text(&output) {
+    if policy != PackRedactionPolicy::Off
+        && let Cow::Owned(redacted) = redact_text(&output)
+    {
         push_full_redaction(redactions, "secret", &output, REDACTED_VALUE_MARKER);
         output = redacted;
+    }
+
+    if policy != PackRedactionPolicy::Off {
+        let header_redacted = PACK_CREDENTIAL_HEADER_RE.replace_all(&output, REDACTED_VALUE_MARKER);
+        if let Cow::Owned(redacted) = header_redacted {
+            push_full_redaction(
+                redactions,
+                "credential_header",
+                &output,
+                REDACTED_VALUE_MARKER,
+            );
+            output = redacted;
+        }
+    }
+
+    if policy == PackRedactionPolicy::Strict {
+        let entropy_redacted =
+            PACK_ENTROPY_TOKEN_RE.replace_all(&output, |captures: &Captures<'_>| {
+                let Some(matched) = captures.get(0) else {
+                    return REDACTED_VALUE_MARKER.to_string();
+                };
+                let token = matched.as_str();
+                if pack_token_has_high_entropy(token) {
+                    REDACTED_VALUE_MARKER.to_string()
+                } else {
+                    token.to_string()
+                }
+            });
+        if entropy_redacted != output {
+            push_full_redaction(redactions, "high_entropy", &output, REDACTED_VALUE_MARKER);
+            output = entropy_redacted.into_owned();
+        }
     }
 
     let host_redacted =
@@ -2447,6 +2550,39 @@ fn redact_pack_output_text(input: &str, redactions: &mut Vec<RenderedRedaction>)
     }
 
     output
+}
+
+fn pack_token_has_high_entropy(token: &str) -> bool {
+    if token.len() <= 32 {
+        return false;
+    }
+    let mut counts = [0usize; 256];
+    for byte in token.bytes() {
+        if let Some(count) = counts.get_mut(usize::from(byte)) {
+            *count += 1;
+        }
+    }
+    let entropy: f64 = counts
+        .iter()
+        .filter(|count| **count > 0)
+        .map(|count| {
+            let probability = *count as f64 / token.len() as f64;
+            -probability * probability.log2()
+        })
+        .sum();
+    entropy
+        >= if token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            3.0
+        } else {
+            4.5
+        }
+}
+
+fn pack_excerpt_has_meaningful_text(excerpt: &str) -> bool {
+    let without_markers = excerpt
+        .replace(REDACTED_VALUE_MARKER, "")
+        .replace(REDACTED_ENCRYPTED_PAYLOAD_MARKER, "");
+    !without_markers.trim().is_empty()
 }
 
 /// Redacts every string in a JSON value; keys are schema names and are kept.
@@ -2835,6 +2971,19 @@ fn rendered_source_readiness(evidence: &[RenderedEvidence]) -> Vec<RenderedSourc
     sources
         .into_iter()
         .map(|((source_id, _), source)| RenderedSourceReadiness {
+            // Search hits do not carry source synchronization timestamps.
+            // Unknown is explicit rather than inferred from message age.
+            last_sync_at_ms: None,
+            last_indexed_at_ms: evidence
+                .iter()
+                .filter(|item| {
+                    item.citation.source_id == source_id
+                        && item.citation.origin_kind == source.origin_kind
+                })
+                .filter_map(|item| item.citation.indexed_at_ms)
+                .max(),
+            recommended_action: (!source.healthy)
+                .then_some("inspect cass status --json and the cited source"),
             source_id,
             origin_kind: source.origin_kind,
             readiness: source_readiness_label(source.worst_readiness),
@@ -2964,14 +3113,15 @@ fn render_answer_pack_jsonl(
     request: &PackRenderRequest,
 ) -> Result<String, PackRenderError> {
     let mut lines = Vec::with_capacity(envelope.evidence.len() + 4);
-    lines.push(json_line(
-        serde_json::json!({
-            "_meta": &envelope.meta,
-            "schema_version": envelope.schema_version,
-            "budget": &envelope.budget,
-        }),
-        request,
-    )?);
+    let mut header = serde_json::json!({
+        "_meta": &envelope.meta,
+        "schema_version": envelope.schema_version,
+        "budget": &envelope.budget,
+    });
+    if let (Some(debug), Some(object)) = (&envelope.selection_debug, header.as_object_mut()) {
+        object.insert("selection_debug".to_string(), debug.clone());
+    }
+    lines.push(json_line(header, request)?);
     lines.push(json_line(
         serde_json::json!({ "pack": &envelope.pack }),
         request,
@@ -3004,6 +3154,9 @@ fn render_answer_pack_markdown(envelope: &RenderedAnswerPack) -> String {
     let mut out = String::new();
     out.push_str("# ");
     out.push_str(&markdown_literal_line(&envelope.pack.title));
+    if envelope.privacy.sensitive_output {
+        out.push_str("\n\n**Sensitive output: excerpt redaction is off.**\n");
+    }
     if !envelope.warnings.is_empty() {
         out.push_str("\n\n## Warnings\n");
         for warning in &envelope.warnings {
@@ -3356,6 +3509,7 @@ mod tests {
             candidates,
             explain_selection: false,
             include_skill_content: false,
+            redaction_policy: PackRedactionPolicy::Strict,
         }
     }
 
@@ -4194,13 +4348,16 @@ mod tests {
 
     #[test]
     fn render_budget_timeout_is_partial_across_structured_formats() -> Result<(), String> {
-        let plan = plan_answer_pack(request(vec![candidate(
+        let mut input = request(vec![candidate(
             "budget-timeout",
             "local",
             "/s/budget-timeout.jsonl",
             10.0,
-        )]))
-        .map_err(|err| format!("{err:?}"))?;
+        )]);
+        // Exercise deadline status with room for the full citation envelope;
+        // the separate output-boundary tests cover exhausted token budgets.
+        input.limits.max_tokens = 2_048;
+        let plan = plan_answer_pack(input).map_err(|err| format!("{err:?}"))?;
         let expected_budget = serde_json::json!({
             "elapsed_ms": 125,
             "budget_ms": 100,
@@ -4211,9 +4368,13 @@ mod tests {
 
         for format in [PackRenderFormat::Json, PackRenderFormat::CompactJson] {
             let mut req = render_request(format);
+            req.limits.max_tokens = 2_048;
             req.budget = timed_out_budget();
 
-            let rendered = render_answer_pack(&plan, &req)
+            // The deadline writer uses the supplied, bounded correlation
+            // snapshot. Compare against that same context, without loading
+            // live workspace history from this test's working directory.
+            let rendered = render_answer_pack_without_trust_correlation(&plan, &req)
                 .map_err(|err| format!("{} render failed: {}", err.format, err.message))?;
             let value: serde_json::Value =
                 serde_json::from_str(&rendered).map_err(|err| err.to_string())?;
@@ -4224,6 +4385,27 @@ mod tests {
                 .as_array()
                 .ok_or_else(|| "structured pack evidence must be an array".to_string())?;
             assert_eq!(evidence.len(), 1);
+
+            let encoded = crate::render_cli_pack_with_output_budget(
+                plan.clone(),
+                req,
+                None,
+                true,
+                std::time::Instant::now(),
+                &crate::search::trust_correlation::CorrelationIndex::default(),
+            )
+            .map_err(|error| error.message)?;
+            let mut stdout = Vec::new();
+            let error = crate::write_cli_pack_output(&encoded, &mut stdout).unwrap_err();
+            assert_eq!(error.code, 8);
+            assert_eq!(error.kind, "partial-result");
+            assert!(error.retryable);
+            assert!(error.hint.is_some());
+            let emitted: serde_json::Value =
+                serde_json::from_slice(&stdout).map_err(|error| error.to_string())?;
+            assert_eq!(emitted["evidence"], value["evidence"]);
+            assert_eq!(emitted["budget"], expected_budget);
+            assert_eq!(emitted["_meta"]["partial"], true);
         }
 
         let mut jsonl_req = render_request(PackRenderFormat::Jsonl);
@@ -4849,6 +5031,133 @@ mod tests {
                 "privacy_redactions_applied"
             ])
         );
+    }
+
+    #[test]
+    fn pack_policy_changes_excerpts_without_unmasking_coordinates_or_identity() {
+        let credential = format!("sk-{}", "01234567890123456789");
+        let mut item = candidate("policy", "local", "/home/alice/private/session.jsonl", 9.0);
+        item.excerpt = credential.clone();
+        for policy in [
+            PackRedactionPolicy::Strict,
+            PackRedactionPolicy::Balanced,
+            PackRedactionPolicy::Off,
+        ] {
+            let mut request = request(vec![item.clone()]);
+            request.redaction_policy = policy;
+            let plan = plan_answer_pack(request).unwrap();
+            if policy != PackRedactionPolicy::Off {
+                assert!(plan.evidence.is_empty());
+                assert_eq!(plan.omitted.len(), 1);
+                assert_eq!(plan.omitted[0].reason, PackOmittedReason::RedactedToEmpty);
+                continue;
+            }
+            assert_eq!(plan.evidence.len(), 1);
+            assert_eq!(plan.evidence[0].excerpt, credential);
+            assert_eq!(plan.evidence[0].candidate, item);
+            let mut render = render_request(PackRenderFormat::Json);
+            render.redaction_policy = policy.label().to_string();
+            render.sensitive_output = true;
+            let value = render_answer_pack_value(&plan, &render).unwrap();
+            assert_eq!(
+                value["evidence"][0]["citation"]["source_path"],
+                "[REDACTED_PATH]/session.jsonl"
+            );
+            assert_eq!(value["evidence"][0]["citation"]["line_start"], 10);
+            assert_eq!(value["evidence"][0]["citation"]["line_end"], 12);
+            assert_eq!(
+                value["evidence"][0]["citation"]["followup_unavailable_reason"],
+                "redacted-source-coordinates"
+            );
+            assert_eq!(value["privacy"]["sensitive_output"], true);
+            assert!(value.get("selection_debug").is_none());
+        }
+    }
+
+    #[test]
+    fn pack_off_policy_cannot_unmask_remote_excerpt_credentials() {
+        for origin in ["ssh", "remote", "custom", ""] {
+            let mut item = candidate("remote-policy", "ssh:fixture", "/s/session.jsonl", 9.0);
+            item.origin_kind = origin.to_string();
+            item.excerpt = format!("context sk-{}", "01234567890123456789");
+            let mut request = request(vec![item]);
+            request.redaction_policy = PackRedactionPolicy::Off;
+            let plan = plan_answer_pack(request).unwrap();
+            assert_eq!(plan.evidence.len(), 1);
+            assert_eq!(plan.evidence[0].excerpt, "context [REDACTED]", "{origin}");
+        }
+    }
+
+    #[test]
+    fn pack_protected_policies_cover_credentials_headers_keys_and_assignments() {
+        let github = format!("ghp_{}", "a".repeat(36));
+        let openai = format!("sk-{}", "a".repeat(24));
+        let cases = [
+            github,
+            openai,
+            "Bearer disposable-token-value".to_string(),
+            "Cookie: session=disposable-cookie".to_string(),
+            "Authorization: Basic ZGlzcG9zYWJsZS1maXh0dXJl".to_string(),
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmaXh0dXJlIn0.c3ludGhldGljc2lnbmF0dXJl".to_string(),
+            "DATABASE_URL=postgres://fixture:disposable@localhost/example".to_string(),
+            "WEBHOOK_SECRET=disposable-hook-value".to_string(),
+            "SERVICE_PASSWORD=disposable-password".to_string(),
+            concat!(
+                "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+                "disposable-fixture-only\n",
+                "-----END OPENSSH PRIVATE KEY-----"
+            )
+            .to_string(),
+        ];
+        for policy in [PackRedactionPolicy::Strict, PackRedactionPolicy::Balanced] {
+            for input in &cases {
+                let expected = if input.starts_with("DATABASE_URL=") {
+                    "safe café 東京 😀\nDATABASE_URL=[REDACTED]"
+                } else {
+                    "safe café 東京 😀\n[REDACTED]"
+                };
+                let input = format!("safe café 東京 😀\n{input}");
+                let mut redactions = Vec::new();
+                let output = redact_pack_excerpt(&input, policy, &mut redactions);
+                assert_eq!(output, expected, "{policy:?}");
+                assert!(!redactions.is_empty());
+                for event in redactions {
+                    assert!(!event.kind.is_empty());
+                    assert_eq!(event.start_char, 0);
+                    assert!(event.end_char > 0);
+                    assert!(!event.replacement.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pack_entropy_policy_keeps_short_identifiers_and_masks_long_random_tokens() {
+        let short = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
+        let long = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefg";
+        assert_eq!(short.len(), 32);
+        assert_eq!(long.len(), 33);
+        for policy in [PackRedactionPolicy::Strict, PackRedactionPolicy::Balanced] {
+            let mut redactions = Vec::new();
+            assert_eq!(redact_pack_excerpt(short, policy, &mut redactions), short);
+            assert!(redactions.is_empty());
+            assert_eq!(
+                redact_pack_excerpt(long, policy, &mut redactions),
+                if policy == PackRedactionPolicy::Strict {
+                    "[REDACTED]"
+                } else {
+                    long
+                }
+            );
+            assert_eq!(
+                redactions.is_empty(),
+                policy == PackRedactionPolicy::Balanced
+            );
+            assert_eq!(
+                redact_pack_excerpt(&"a".repeat(100), policy, &mut Vec::new()),
+                "a".repeat(100)
+            );
+        }
     }
 
     #[test]
@@ -5585,6 +5894,79 @@ mod tests {
 
         assert_eq!(left.evidence[0].candidate.source_path, "/a.jsonl");
         assert_eq!(right.evidence[0].candidate.source_path, "/a.jsonl");
+    }
+
+    #[test]
+    fn pack_tie_breaks_resolve_every_identity_coordinate_before_content_hash() {
+        for field in 0..9 {
+            let mut preferred = candidate("preferred", "local", "/s/same.jsonl", 1.0);
+            let mut other = candidate("other", "local", "/s/same.jsonl", 1.0);
+            // The last tie-break favors the other record. Each earlier
+            // coordinate must independently overcome that ordering.
+            preferred.content_hash = "z-content".to_string();
+            other.content_hash = "a-content".to_string();
+            match field {
+                0 => preferred.lexical_score = Some(2.0),
+                1 => preferred.created_at_ms = Some(1_000_001),
+                2 => {
+                    preferred.source_id = "a-source".to_string();
+                    other.source_id = "z-source".to_string();
+                }
+                3 => preferred.source_path = "/s/earlier.jsonl".to_string(),
+                4 => {
+                    preferred.conversation_id = Some(1);
+                    other.conversation_id = Some(2);
+                }
+                5 => preferred.agent = "agy".to_string(),
+                6 => {
+                    preferred.message_index = Some(1);
+                    other.message_index = Some(2);
+                }
+                7 => {
+                    other.line_start = Some(20);
+                    other.line_end = Some(22);
+                }
+                8 => {
+                    preferred.content_hash = "a-content".to_string();
+                    other.content_hash = "z-content".to_string();
+                }
+                _ => unreachable!(),
+            }
+            for candidates in [
+                vec![preferred.clone(), other.clone()],
+                vec![other.clone(), preferred.clone()],
+            ] {
+                let mut request = request(candidates);
+                request.limits.max_evidence = 1;
+                let plan = plan_answer_pack(request).unwrap();
+                assert_eq!(plan.evidence.len(), 1);
+                assert_eq!(
+                    plan.evidence[0].candidate.candidate_id, "preferred",
+                    "tie-break coordinate {field}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pack_score_weights_match_independent_contract_examples() {
+        for (field, expected) in [(0, 0.985), (1, 0.97), (2, 0.8875), (3, 0.8)] {
+            let mut item = candidate("weighted", "local", "/s/weighted.jsonl", 1.0);
+            match field {
+                0 => item.role = PackEvidenceRole::UserRequirement,
+                1 => item.source_readiness = PackSourceReadiness::IncompleteMetadata,
+                2 => item.created_at_ms = None,
+                3 => item.matched_terms.clear(),
+                _ => unreachable!(),
+            }
+            let plan = plan_answer_pack(request(vec![item])).unwrap();
+            assert_eq!(plan.evidence.len(), 1);
+            assert!(
+                (plan.evidence[0].selection.score - expected).abs() < 1e-12,
+                "contract example {field}: {:?}",
+                plan.evidence[0].selection
+            );
+        }
     }
 
     #[test]

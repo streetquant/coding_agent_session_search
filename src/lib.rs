@@ -783,13 +783,23 @@ pub enum Commands {
         /// Search mode: hybrid-preferred (default), lexical, or semantic.
         #[arg(long, value_enum)]
         mode: Option<crate::search::query::SearchMode>,
+        /// Use approximate semantic search when a compatible ANN index is available.
+        #[arg(long, default_value_t = false)]
+        approximate: bool,
         /// Freshness policy for evidence selection.
         #[arg(long, value_parser = ["prefer-recent", "strict", "allow-stale"], default_value = "prefer-recent")]
         freshness_policy: String,
         /// Evidence freshness window in seconds.
         #[arg(long, default_value_t = DEFAULT_PACK_FRESHNESS_WINDOW_SECONDS)]
         freshness_window_seconds: i64,
-        /// Include skill payload excerpts. Credentials remain redacted.
+        /// Evidence freshness duration: m (minutes), h, d, or w.
+        #[arg(long, conflicts_with = "freshness_window_seconds")]
+        freshness_window: Option<String>,
+        /// Excerpt redaction: strict, balanced, or off (requires --source local).
+        /// Private citation coordinates remain protected in every policy.
+        #[arg(long, default_value = "strict")]
+        redaction: String,
+        /// Include skill payload excerpts (excluded by default).
         #[arg(long, default_value_t = false)]
         include_skill_content: bool,
         /// Return an error instead of an empty successful pack.
@@ -4362,6 +4372,16 @@ fn assignment_option_for_command(command: &str, key: &str) -> Option<AssignmentO
                 aliases: &["--freshness-window-seconds"],
                 repeatable: false,
             }),
+            "freshness-window" | "freshness_window" => Some(AssignmentOption {
+                flag: "--freshness-window",
+                aliases: &["--freshness-window"],
+                repeatable: false,
+            }),
+            "redaction" => Some(AssignmentOption {
+                flag: "--redaction",
+                aliases: &["--redaction"],
+                repeatable: false,
+            }),
             "timeout" => Some(AssignmentOption {
                 flag: "--timeout",
                 aliases: &["--timeout"],
@@ -4791,6 +4811,9 @@ fn search_like_option_value_count(command: &str, arg: &str) -> Option<usize> {
                 | "freshness_policy"
                 | "freshness-window-seconds"
                 | "freshness_window_seconds"
+                | "freshness-window"
+                | "freshness_window"
+                | "redaction"
         )
     );
 
@@ -5254,6 +5277,8 @@ fn arg_marks_implicit_pack_intent(arg: &str) -> bool {
                 | "max-excerpt-chars"
                 | "freshness-policy"
                 | "freshness-window-seconds"
+                | "freshness-window"
+                | "redaction"
                 | "include-skill-content"
                 | "require-evidence"
                 | "explain-selection"
@@ -5280,6 +5305,9 @@ fn arg_marks_implicit_pack_intent(arg: &str) -> bool {
             | "freshness_policy"
             | "freshness-window-seconds"
             | "freshness_window_seconds"
+            | "freshness-window"
+            | "freshness_window"
+            | "redaction"
     )
 }
 
@@ -8040,8 +8068,11 @@ async fn execute_cli(
                     source,
                     sessions_from,
                     mode,
+                    approximate,
                     freshness_policy,
                     freshness_window_seconds,
+                    freshness_window,
+                    redaction,
                     include_skill_content,
                     require_evidence,
                     explain_selection,
@@ -8081,8 +8112,14 @@ async fn execute_cli(
                         source,
                         sessions_from,
                         eff_mode,
+                        approximate,
                         &freshness_policy,
-                        freshness_window_seconds,
+                        freshness_window
+                            .as_deref()
+                            .map(parse_pack_freshness_window)
+                            .transpose()?
+                            .unwrap_or(freshness_window_seconds),
+                        &redaction,
                         include_skill_content,
                         require_evidence,
                         explain_selection,
@@ -34792,8 +34829,10 @@ fn pack_retry_command(
     source: Option<&str>,
     sessions_from: Option<&str>,
     mode: Option<crate::search::query::SearchMode>,
+    approximate: bool,
     freshness_policy: crate::search::pack_planner::PackFreshnessPolicy,
     freshness_window_seconds: i64,
+    redaction_policy: crate::search::pack_planner::PackRedactionPolicy,
     include_skill_content: bool,
     require_evidence: bool,
     explain_selection: bool,
@@ -34864,6 +34903,13 @@ fn pack_retry_command(
     );
     args.push("--freshness-window-seconds".to_string());
     args.push(freshness_window_seconds.to_string());
+    args.extend([
+        "--redaction".to_string(),
+        redaction_policy.label().to_string(),
+    ]);
+    if approximate {
+        args.push("--approximate".to_string());
+    }
     if include_skill_content {
         args.push("--include-skill-content".to_string());
     }
@@ -34912,8 +34958,10 @@ fn run_cli_pack(
     source: Option<String>,
     sessions_from: Option<String>,
     mode: Option<crate::search::query::SearchMode>,
+    approximate: bool,
     freshness_policy: &str,
     freshness_window_seconds: i64,
+    redaction: &str,
     include_skill_content: bool,
     require_evidence: bool,
     explain_selection: bool,
@@ -34947,8 +34995,9 @@ fn run_cli_pack(
     }
     let render_format = resolve_pack_render_format(robot_format, display_format)?;
     let structured_pack = !matches!(render_format, PackRenderFormat::Markdown);
+    let budgeted_pack = structured_pack || timeout_ms.is_some();
     let pack_budget = crate::robot_budget_envelope::RobotBudget::with_start(
-        if structured_pack || timeout_ms.is_some() {
+        if budgeted_pack {
             pack_budget_ms(timeout_ms)
         } else {
             u64::MAX
@@ -34959,6 +35008,7 @@ fn run_cli_pack(
     let mut hard_deadline_reached = false;
     let mut session_scope_empty = false;
     let freshness_policy = parse_pack_freshness_policy(freshness_policy)?;
+    let redaction_policy = parse_pack_redaction_policy(redaction, source.as_deref())?;
     if freshness_window_seconds <= 0 {
         return Err(CliError {
             code: 2,
@@ -34986,13 +35036,8 @@ fn run_cli_pack(
     let db_path = db_override
         .clone()
         .unwrap_or_else(|| data_dir.join("agent_search.db"));
-    // Human pack retains stale-on-read catch-up. Structured pack is a bounded,
-    // mutation-free probe and routes refresh to an explicit index command.
-    if !structured_pack
-        && let Some(outcome) = maybe_auto_refresh_index_after_read(&data_dir, &db_path, None)
-    {
-        tracing::debug!(?outcome, "pack: auto-refresh evaluated");
-    }
+    // Pack observes the current archive. Only an explicit human --refresh
+    // opts into the existing incremental writer; robot output defers it.
 
     let mut filters = SearchFilters {
         agents: normalized_agents.into_iter().collect(),
@@ -35008,7 +35053,7 @@ fn run_cli_pack(
     }
     validate_pack_fields(fields.as_ref())?;
 
-    if refresh && !structured_pack && pack_budget.is_healthy() {
+    if refresh && !budgeted_pack && pack_budget.is_healthy() {
         refresh_index_inline(db_override.clone(), data_dir_override.clone());
     } else if refresh {
         skipped_sections.push("refresh".to_string());
@@ -35023,7 +35068,7 @@ fn run_cli_pack(
     if cass_not_initialized(
         db_path.exists(),
         crate::search::tantivy::searchable_index_exists(&index_path),
-        probe_index_run_lock(&data_dir, &db_path, !structured_pack).active,
+        probe_index_run_lock(&data_dir, &db_path, false).active,
     ) {
         return Err(CliError {
             code: 3,
@@ -35040,7 +35085,7 @@ fn run_cli_pack(
     if let Some(ref sessions_from_arg) = sessions_from {
         match read_session_paths_bounded(
             sessions_from_arg,
-            structured_pack.then(|| pack_budget.remaining_ms()),
+            budgeted_pack.then(|| pack_budget.remaining_ms()),
         )? {
             BoundedSessionPaths::Complete(session_paths) => {
                 session_scope_empty = session_paths.is_empty();
@@ -35071,7 +35116,7 @@ fn run_cli_pack(
         None,
     );
 
-    let setup = if structured_pack && !hard_deadline_reached {
+    let setup = if budgeted_pack && !hard_deadline_reached {
         let worker_data_dir = data_dir.clone();
         let worker_db_path = db_path.clone();
         let worker_index_path = index_path.clone();
@@ -35089,18 +35134,26 @@ fn run_cli_pack(
             .map_err(|mut error| {
                 if error.kind == "maintenance-required" {
                     error.hint = Some(format!(
-                        "Run `cass --db {} index --full --json --data-dir {}` in a mutating workflow, then retry this pack. Structured pack output does not repair archive assets.",
+                        "Run `cass --db {} index --full --json --data-dir {}` in a mutating workflow, then retry this pack. Pack output does not repair archive assets.",
                         shell_quote_arg(&worker_db_path.display().to_string()),
                         shell_quote_arg(&worker_data_dir.display().to_string()),
                     ));
                 }
                 error
             })
+            .map(|setup| {
+                let state = state_meta_json_for_strict_read(
+                    &worker_data_dir,
+                    &worker_db_path,
+                    DEFAULT_STALE_THRESHOLD_SECS,
+                );
+                (setup, state)
+            })
         })?
-    } else if structured_pack {
+    } else if budgeted_pack {
         None
     } else {
-        Some(open_cli_search_setup(
+        let setup = open_cli_search_setup(
             &data_dir,
             &db_path,
             &index_path,
@@ -35109,15 +35162,29 @@ fn run_cli_pack(
             start_time,
             true,
             false,
-        )?)
+        )?;
+        let state =
+            state_meta_json_for_strict_read(&data_dir, &db_path, DEFAULT_STALE_THRESHOLD_SECS);
+        Some((setup, state))
     };
-    let (search_self_heal, client, rebuild_active) = if let Some(CliSearchSetup {
-        self_heal,
-        client,
-        rebuild_active,
-    }) = setup
+    let (search_self_heal, client, rebuild_active, lexical_readiness) = if let Some((
+        CliSearchSetup {
+            self_heal,
+            client,
+            rebuild_active,
+        },
+        state,
+    )) = setup
     {
-        (self_heal, Some(client), rebuild_active)
+        use crate::search::readiness::LexicalReadinessState;
+        let lexical_readiness = match lexical_readiness_from_state(&state, false) {
+            LexicalReadinessState::Ready => PackLexicalReadiness::Ready,
+            LexicalReadinessState::StaleButSearchable => PackLexicalReadiness::Stale,
+            LexicalReadinessState::Repairing => PackLexicalReadiness::Rebuilding,
+            LexicalReadinessState::Missing => PackLexicalReadiness::Missing,
+            LexicalReadinessState::CorruptQuarantined => PackLexicalReadiness::Unknown,
+        };
+        (self_heal, Some(client), rebuild_active, lexical_readiness)
     } else {
         hard_deadline_reached = true;
         if !skipped_sections
@@ -35126,7 +35193,12 @@ fn run_cli_pack(
         {
             skipped_sections.push("search_setup".to_string());
         }
-        (SearchLexicalSelfHeal::skipped(), None, false)
+        (
+            SearchLexicalSelfHeal::skipped(),
+            None,
+            false,
+            PackLexicalReadiness::Unknown,
+        )
     };
     if search_self_heal.action != "skipped" {
         tracing::info!(
@@ -35137,23 +35209,6 @@ fn run_cli_pack(
         );
     }
 
-    let timeout_duration = timeout_ms.map(Duration::from_millis);
-    if !structured_pack
-        && let Some(timeout) = timeout_duration
-        && start_time.elapsed() >= timeout
-    {
-        return Err(CliError {
-            code: 10,
-            kind: CliErrorKind::Timeout.kind_str(),
-            message: format!(
-                "Operation timed out after {}ms (before pack search started)",
-                timeout.as_millis()
-            ),
-            hint: Some("Increase --timeout value or simplify query".to_string()),
-            retryable: true,
-        });
-    }
-
     let candidate_limit = if limit == 0 {
         pack_candidate_fetch_limit(&limits).map_err(pack_invalid_limit_error)?
     } else {
@@ -35162,7 +35217,7 @@ fn run_cli_pack(
     let search_sparse_threshold = sparse_threshold_for_visible_limit(3, candidate_limit, false);
     let (result, realized_mode_meta) = if session_scope_empty {
         (empty_search_result(), mode_meta.clone())
-    } else if structured_pack && (hard_deadline_reached || pack_budget.is_exhausted()) {
+    } else if budgeted_pack && (hard_deadline_reached || pack_budget.is_exhausted()) {
         hard_deadline_reached = true;
         if !skipped_sections.iter().any(|section| section == "search") {
             skipped_sections.push("search".to_string());
@@ -35178,7 +35233,10 @@ fn run_cli_pack(
             cass_dataset_command(&data_dir, &db_path, &["index", "--full", "--json"]);
         let search_task = move || {
             maybe_test_pack_delay();
-            let semantic_opts = SemanticSearchOptions::default();
+            let semantic_opts = SemanticSearchOptions {
+                approximate,
+                ..SemanticSearchOptions::default()
+            };
             let worker_mode_meta =
                 if worker_mode_meta.realized == crate::search::query::SearchMode::Lexical {
                     worker_mode_meta
@@ -35209,7 +35267,7 @@ fn run_cli_pack(
             completed_mode_meta.semantic_work_completed = true;
             Ok((result, completed_mode_meta))
         };
-        if structured_pack {
+        if budgeted_pack {
             match run_read_only_search_worker(pack_budget.remaining_ms(), search_task)? {
                 Some(result) => result,
                 None => {
@@ -35258,9 +35316,10 @@ fn run_cli_pack(
         candidates,
         explain_selection: realized_explain_selection,
         include_skill_content,
+        redaction_policy,
     };
     let candidate_count = plan_request.candidates.len();
-    let mut plan = if structured_pack {
+    let mut plan = if budgeted_pack {
         if pack_budget.is_exhausted() {
             hard_deadline_reached = true;
             skipped_sections.push("pack_planning".to_string());
@@ -35367,8 +35426,10 @@ fn run_cli_pack(
                 source.as_deref(),
                 sessions_from.as_deref(),
                 mode,
+                approximate,
                 freshness_policy,
                 freshness_window_seconds,
+                redaction_policy,
                 include_skill_content,
                 require_evidence,
                 explain_selection,
@@ -35401,18 +35462,14 @@ fn run_cli_pack(
         semantic_joined: mode_meta.semantic_refinement(),
         freshness_policy,
         freshness_window_seconds,
-        redaction_policy: "strict".to_string(),
-        sensitive_output: false,
+        redaction_policy: redaction_policy.label().to_string(),
+        sensitive_output: redaction_policy == crate::search::pack_planner::PackRedactionPolicy::Off,
         explain_selection: realized_explain_selection,
         readiness: PackReadinessSnapshot {
             index_generation: search_self_heal
                 .indexed_docs
                 .map(|count| format!("indexed_docs:{count}")),
-            lexical_readiness: if rebuild_active {
-                PackLexicalReadiness::Rebuilding
-            } else {
-                PackLexicalReadiness::Ready
-            },
+            lexical_readiness,
             semantic_readiness: if mode_meta.fell_back_to_lexical() {
                 PackSemanticReadiness::FallbackLexical
             } else if mode_meta.semantic_refinement() {
@@ -35430,7 +35487,7 @@ fn run_cli_pack(
         },
     };
 
-    if !structured_pack {
+    if !budgeted_pack {
         let correlation = crate::search::trust_correlation::build_for_cwd();
         let rendered = render_cli_pack_with_output_budget(
             plan,
@@ -35440,7 +35497,7 @@ fn run_cli_pack(
             start_time,
             &correlation,
         )?;
-        return write_cli_pack_output(&rendered);
+        return write_cli_pack_output(&rendered, &mut std::io::stdout().lock());
     }
 
     let render_with_correlation = {
@@ -35546,7 +35603,14 @@ fn run_cli_pack(
     if fields.is_some() && matches!(render_format, PackRenderFormat::Jsonl) {
         eprintln!("Warning: --fields is ignored for pack JSONL output.");
     }
-    write_cli_pack_output(&rendered)
+    write_cli_pack_output(&rendered, &mut std::io::stdout().lock())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PackRenderedOutput {
+    text: String,
+    evidence_count: usize,
+    timed_out: bool,
 }
 
 fn render_cli_pack_with_output_budget(
@@ -35556,7 +35620,7 @@ fn render_cli_pack_with_output_budget(
     require_evidence: bool,
     start_time: Instant,
     correlation: &crate::search::trust_correlation::CorrelationIndex,
-) -> CliResult<String> {
+) -> CliResult<PackRenderedOutput> {
     use crate::search::pack_planner::{
         PackRenderFormat, render_answer_pack_value_with_correlation,
         render_answer_pack_with_correlation,
@@ -35578,6 +35642,7 @@ fn render_cli_pack_with_output_budget(
         if !request.budget.timed_out {
             request.elapsed_ms = start_time.elapsed().as_millis() as u64;
             request.budget.elapsed_ms = request.elapsed_ms;
+            request.budget.timed_out = request.elapsed_ms >= request.budget.budget_ms;
         }
         let mut output = match request.format {
             PackRenderFormat::Json | PackRenderFormat::CompactJson | PackRenderFormat::Toon => {
@@ -35601,7 +35666,11 @@ fn render_cli_pack_with_output_budget(
         }
         let output_tokens = output.chars().count().div_ceil(4);
         if output_tokens <= token_limit {
-            return Ok(output);
+            return Ok(PackRenderedOutput {
+                text: output,
+                evidence_count: plan.evidence.len(),
+                timed_out: request.budget.timed_out,
+            });
         }
         if !plan.reduce_for_output_budget(output_tokens - token_limit, require_evidence) {
             return Err(CliError {
@@ -35628,10 +35697,11 @@ fn render_cli_pack_with_output_budget(
     }
 }
 
-fn write_cli_pack_output(output: &str) -> CliResult<()> {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    out.write_all(output.as_bytes())
+fn write_cli_pack_output(
+    output: &PackRenderedOutput,
+    out: &mut impl std::io::Write,
+) -> CliResult<()> {
+    out.write_all(output.text.as_bytes())
         .and_then(|()| out.flush())
         .map_err(|error| CliError {
             code: 9,
@@ -35639,7 +35709,29 @@ fn write_cli_pack_output(output: &str) -> CliResult<()> {
             message: format!("failed to write answer pack: {error}"),
             hint: None,
             retryable: false,
-        })
+        })?;
+    if output.timed_out {
+        let usable = output.evidence_count > 0;
+        return Err(CliError {
+            code: if usable { 8 } else { 10 },
+            kind: if usable {
+                CliErrorKind::PartialResult.kind_str()
+            } else {
+                CliErrorKind::Timeout.kind_str()
+            },
+            message: if usable {
+                "pack deadline reached after producing partial evidence"
+            } else {
+                "pack deadline reached before usable evidence could be emitted"
+            }
+            .to_string(),
+            hint: Some(
+                "Inspect the emitted pack budget and retry with a larger --timeout.".to_string(),
+            ),
+            retryable: true,
+        });
+    }
+    Ok(())
 }
 
 fn resolve_pack_render_format(
@@ -35679,7 +35771,19 @@ fn resolve_pack_render_format(
             ),
             retryable: false,
         }),
-        None => Ok(PackRenderFormat::Markdown),
+        None if matches!(display_format, Some(DisplayFormat::Markdown)) => {
+            Ok(PackRenderFormat::Markdown)
+        }
+        None => Err(CliError {
+            code: 2,
+            kind: CliErrorKind::PackUnsupportedFormat.kind_str(),
+            message: "cass pack requires an explicit output format".to_string(),
+            hint: Some(
+                "Use --display markdown, --json/--robot, or --robot-format json|compact|jsonl|toon."
+                    .to_string(),
+            ),
+            retryable: false,
+        }),
     }
 }
 
@@ -35713,6 +35817,56 @@ fn parse_pack_freshness_policy(
     }
 }
 
+fn parse_pack_freshness_window(value: &str) -> CliResult<i64> {
+    let invalid = || CliError {
+        code: 2,
+        kind: CliErrorKind::PackInvalidLimit.kind_str(),
+        message: "invalid pack freshness duration".to_string(),
+        hint: Some(
+            "Use a positive integer followed by m, h, d, or w, for example 30d.".to_string(),
+        ),
+        retryable: false,
+    };
+    let value = value.trim();
+    let (amount, unit) = value.split_at(
+        value
+            .find(|ch: char| !ch.is_ascii_digit())
+            .unwrap_or(value.len()),
+    );
+    let multiplier = match unit {
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        "w" => 604_800,
+        _ => return Err(invalid()),
+    };
+    amount
+        .parse::<i64>()
+        .ok()
+        .filter(|amount| *amount > 0)
+        .and_then(|amount| amount.checked_mul(multiplier))
+        .ok_or_else(invalid)
+}
+
+fn parse_pack_redaction_policy(
+    value: &str,
+    source: Option<&str>,
+) -> CliResult<crate::search::pack_planner::PackRedactionPolicy> {
+    use crate::search::pack_planner::PackRedactionPolicy;
+    match value {
+        "strict" => Ok(PackRedactionPolicy::Strict),
+        "balanced" => Ok(PackRedactionPolicy::Balanced),
+        "off" if source == Some("local") => Ok(PackRedactionPolicy::Off),
+        _ => Err(CliError {
+            code: 2,
+            kind: CliErrorKind::PackInvalidRedactionPolicy.kind_str(),
+            message: "invalid or non-local pack redaction policy".to_string(),
+            hint: Some("Use strict or balanced. Local operators may explicitly use --redaction off --source local; private coordinates remain protected.".to_string()),
+            retryable: false,
+        }),
+    }
+}
+
 fn pack_query_term_count(query: &str) -> usize {
     query
         .split_whitespace()
@@ -35739,7 +35893,9 @@ fn filter_pack_fields(
     for field in field_mask.fields {
         if pack_field_projects(&value, &field) {
             matched_fields.push(field);
-        } else {
+        } else if field != "selection_debug" {
+            // Full includes this optional field only when selection
+            // explanations were requested. Its absence is not an unknown mask.
             ignored_fields.push(field);
         }
     }
@@ -35792,7 +35948,16 @@ fn expand_pack_field_mask(fields: &[String]) -> CliResult<Option<PackFieldMask>>
         requested_fields.push(field.to_string());
         match field {
             "*" | "all" => return Ok(None),
-            "standard" | "full" => {
+            "standard" => {
+                set.extend(
+                    PACK_TOP_LEVEL_FIELDS
+                        .iter()
+                        .copied()
+                        .filter(|field| *field != "selection_debug")
+                        .map(str::to_string),
+                );
+            }
+            "full" => {
                 set.extend(PACK_TOP_LEVEL_FIELDS.iter().copied().map(str::to_string));
             }
             "minimal" => {
@@ -35824,7 +35989,8 @@ fn expand_pack_field_mask(fields: &[String]) -> CliResult<Option<PackFieldMask>>
                 set.insert("_meta".to_string());
             }
             field @ ("schema_version" | "_meta" | "query" | "limits" | "realized" | "health"
-            | "freshness" | "pack" | "evidence" | "omitted" | "privacy" | "warnings") => {
+            | "freshness" | "pack" | "evidence" | "omitted" | "privacy" | "warnings"
+            | "budget" | "selection_debug") => {
                 set.insert(field.to_string());
             }
             field
@@ -35866,6 +36032,8 @@ const PACK_TOP_LEVEL_FIELDS: &[&str] = &[
     "omitted",
     "privacy",
     "warnings",
+    "budget",
+    "selection_debug",
 ];
 
 fn pack_invalid_field_error(field: &str) -> CliError {
@@ -36036,6 +36204,39 @@ mod pack_field_mask_tests {
     use super::*;
 
     #[test]
+    fn pack_requires_robot_output_or_explicit_markdown_display() {
+        use crate::search::pack_planner::PackRenderFormat;
+        let error = resolve_pack_render_format(None, None).unwrap_err();
+        assert_eq!(error.kind, "pack-unsupported-format");
+        assert_eq!(error.code, 2);
+        assert!(!error.retryable);
+        assert_eq!(
+            resolve_pack_render_format(None, Some(DisplayFormat::Markdown)).unwrap(),
+            PackRenderFormat::Markdown
+        );
+        for display in [DisplayFormat::Table, DisplayFormat::Lines] {
+            assert_eq!(
+                resolve_pack_render_format(None, Some(display))
+                    .unwrap_err()
+                    .kind,
+                "pack-unsupported-format"
+            );
+        }
+    }
+
+    #[test]
+    fn pack_freshness_durations_validate_units_and_overflow() {
+        for (value, seconds) in [("1m", 60), ("2h", 7200), ("30d", 2592000), ("2w", 1209600)] {
+            assert_eq!(parse_pack_freshness_window(value).unwrap(), seconds);
+        }
+        for value in ["", "0d", "-1h", "1.5d", "30", "2x", "9223372036854775807w"] {
+            let error = parse_pack_freshness_window(value).unwrap_err();
+            assert_eq!(error.kind, "pack-invalid-limit");
+            assert_eq!(error.code, 2);
+        }
+    }
+
+    #[test]
     fn pack_output_budget_measures_final_encoding_and_newline_at_the_boundary() {
         use crate::search::pack_planner::{PackPlanRequest, PackRenderFormat, PackRenderRequest};
         let correlation = crate::search::trust_correlation::CorrelationIndex::default();
@@ -36064,7 +36265,7 @@ mod pack_field_mask_tests {
                 &correlation,
             )
             .unwrap();
-            let tokens = output.chars().count().div_ceil(4);
+            let tokens = output.text.chars().count().div_ceil(4);
             let mut boundary = plan;
             boundary.diagnostics.budget.max_output_tokens_with_overflow = tokens;
             let exact = render_cli_pack_with_output_budget(
@@ -36123,10 +36324,10 @@ mod pack_field_mask_tests {
             &correlation,
         )
         .unwrap();
-        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output.text).unwrap();
         assert_eq!(value.as_object().unwrap().len(), 1);
         assert!(value["limits"].is_object());
-        assert!(!output.contains("large hidden"));
+        assert!(!output.text.contains("large hidden"));
     }
 
     fn sample_pack_value() -> serde_json::Value {
@@ -36144,6 +36345,13 @@ mod pack_field_mask_tests {
                 "partial": false,
                 "format": "json",
                 "warnings": []
+            },
+            "budget": {
+                "elapsed_ms": 2,
+                "budget_ms": 10000,
+                "timed_out": false,
+                "skipped_sections": [],
+                "recommended_next_probe": null
             },
             "limits": {
                 "max_tokens": 12000,
@@ -107090,6 +107298,7 @@ fn response_schema_pack() -> serde_json::Value {
                     "index_generation": { "type": ["string", "null"] },
                     "lexical_readiness": { "type": "string" },
                     "semantic_state": { "type": "string" },
+                    "fallback_mode": { "type": ["string", "null"] },
                     "active_rebuild": { "type": "boolean" },
                     "lock_state": { "type": ["string", "null"] },
                     "missing_database": { "type": "boolean" },
@@ -107116,7 +107325,10 @@ fn response_schema_pack() -> serde_json::Value {
                                 "origin_kind": { "type": "string" },
                                 "readiness": { "type": "string" },
                                 "healthy": { "type": "boolean" },
-                                "evidence_count": { "type": "integer" }
+                                "evidence_count": { "type": "integer" },
+                                "last_sync_at_ms": { "type": ["integer", "null"] },
+                                "last_indexed_at_ms": { "type": ["integer", "null"] },
+                                "recommended_action": { "type": ["string", "null"] }
                             }
                         }
                     }
@@ -107229,6 +107441,18 @@ fn response_schema_pack() -> serde_json::Value {
             serde_json::json!({
                 "type": "array",
                 "items": { "type": "string" }
+            }),
+        ),
+        (
+            "selection_debug",
+            serde_json::json!({
+                "type": "object",
+                "description": "Present only when selection explanations completed; includes scores and redacted omission diagnostics.",
+                "properties": {
+                    "candidate_fetch_limit": { "type": "integer" },
+                    "selected": { "type": "array", "items": { "type": "object" } },
+                    "omitted": { "type": "array", "items": { "type": "object" } }
+                }
             }),
         ),
     ])
