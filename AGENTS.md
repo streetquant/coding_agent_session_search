@@ -269,7 +269,7 @@ The strict family guard requires uniform 0.4.12 registry versions.
 |------------|-------------|----------|
 | `asupersync` | crates.io `=0.5.0` | `test-internals`, `tls-native-roots` |
 | `franken-agent-detection` | git `https://github.com/Dicklesworthstone/franken_agent_detection` rev `6b337ba434b72c65c6c5a748b7ec47885f840ac0` (crate 0.3.10) | `connectors`, `cursor`, `chatgpt`, `opencode`, `crush`, `goose`, `hermes`, `devin`, `shelley`, `grok-bot`, `openclaw-sqlite`, `copilot-vscdb`, `codebuff`, `codex-zstd`, `pi-durable`, `pi-sqlite` |
-| `frankensearch` | crates.io `=0.7.1` | `hash`, `cass-compat`, `quill`, `ann`, `native` |
+| `frankensearch` | git `https://github.com/Dicklesworthstone/frankensearch` rev `5ee999fcaba6f85d19c0e3f00883f1d5d4918887` (crate 0.7.1) | `hash`, `cass-compat`, `quill`, `ann`, `native` |
 | `frankensqlite` (`fsqlite`) | crates.io `=0.4.12` | `fts5`, `async-api` |
 | `fsqlite-types` | crates.io `=0.4.12` |  |
 | `ftui` | crates.io `=0.5.0` |  |

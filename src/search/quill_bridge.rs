@@ -1302,6 +1302,33 @@ impl QuillCassIndex {
         }
     }
 
+    /// Recheck retained bytes on their existing mappings before publication.
+    ///
+    /// Upstream 5ee999 reuses unchanged verified backings instead of mapping
+    /// the whole proposed manifest a second time. CASS keeps its full-byte
+    /// maintenance policy: `verify` recomputes every section checksum and the
+    /// file-prefix witness, independently of lazy caches and file stamps.
+    /// New or changed bindings are still verified by the engine preflight.
+    fn with_verified_publication<T>(&self, op: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.with_engine_liveness(|| {
+            {
+                let snapshot = self.index.snapshot()?;
+                for segment in snapshot.segments() {
+                    segment.verify().map_err(|error| {
+                        let diagnostic = format!(
+                            "verifying retained Quill segment {} before publication: {error}",
+                            segment.path().display()
+                        );
+                        anyhow::Error::new(error).context(diagnostic)
+                    })?;
+                }
+                // Release the snapshot before publication; keep no extra
+                // reader or mapping alive across the successor installation.
+            }
+            op()
+        })
+    }
+
     /// Index one batch of CASS documents.
     ///
     /// # Errors
@@ -1355,7 +1382,7 @@ impl QuillCassIndex {
             .iter()
             .map(QuillCassDocument::to_schema_document)
             .collect();
-        self.with_engine_liveness(|| {
+        self.with_verified_publication(|| {
             drive(|cx| {
                 let projected = &projected;
                 let index = &self.index;
@@ -1380,7 +1407,7 @@ impl QuillCassIndex {
         }
         self.commit()?;
         let ids: Vec<&str> = document_ids.iter().map(String::as_str).collect();
-        self.with_engine_liveness(|| {
+        self.with_verified_publication(|| {
             drive(|cx| {
                 let index = &self.index;
                 let ids = &ids;
@@ -1398,7 +1425,7 @@ impl QuillCassIndex {
         }
         let identities: Vec<&str> = document_ids.iter().map(String::as_str).collect();
         let deleted = self
-            .with_engine_liveness(|| {
+            .with_verified_publication(|| {
                 drive(|cx| {
                     let identities = &identities;
                     let index = &self.index;
@@ -1416,7 +1443,7 @@ impl QuillCassIndex {
     ///
     /// Returns an error when publication fails.
     pub fn commit(&mut self) -> Result<()> {
-        self.with_engine_liveness(|| {
+        self.with_verified_publication(|| {
             drive(|cx| {
                 let index = &self.index;
                 async move { index.commit(&cx).await }
@@ -1434,9 +1461,11 @@ impl QuillCassIndex {
     ///
     /// Returns an error when the successor cannot be published.
     pub fn delete_all(&mut self) -> Result<()> {
-        drive(|cx| {
-            let index = &self.index;
-            async move { index.delete_all(&cx).await }
+        self.with_verified_publication(|| {
+            drive(|cx| {
+                let index = &self.index;
+                async move { index.delete_all(&cx).await }
+            })
         })
         .map_err(|error| anyhow!("clearing the Quill CASS index: {error}"))
     }
@@ -1812,7 +1841,7 @@ impl QuillCassIndex {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX))
             .unwrap_or(0);
-        self.with_engine_liveness(|| {
+        self.with_verified_publication(|| {
             drive(|cx| {
                 let index = &self.index;
                 async move {
@@ -1837,7 +1866,7 @@ impl QuillCassIndex {
     /// Density-driven tombstone compaction; a no-op on an append-only index.
     fn compact_tombstones(&mut self) -> Result<bool> {
         let changed = self
-            .with_engine_liveness(|| {
+            .with_verified_publication(|| {
                 drive(|cx| {
                     let index = &self.index;
                     async move {
@@ -2995,6 +3024,112 @@ mod tests {
             index.reader().expect("reader").doc_count().expect("count"),
             2
         );
+    }
+
+    /// Publication must not map the same retained file again while the old
+    /// snapshot is alive: those aliases doubled resident file pages at scale.
+    #[test]
+    fn publication_reuses_retained_segment_mapping() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open");
+        index
+            .add_cass_documents(&[sample("alpha", 0, "first retained document")])
+            .expect("first batch");
+        index.commit().expect("first commit");
+        let before = index.index.snapshot().expect("first snapshot");
+        assert_eq!(before.segments().len(), 1);
+        let retained = &before.segments()[0];
+
+        index
+            .add_cass_documents(&[sample("beta", 1, "second published document")])
+            .expect("second batch");
+        index.commit().expect("second commit");
+        let after = index.index.snapshot().expect("second snapshot");
+        assert_eq!(after.segments().len(), 2);
+        let successor = after
+            .segments()
+            .iter()
+            .find(|segment| segment.path() == retained.path())
+            .expect("retained segment remains published");
+        assert_eq!(successor.manifest(), retained.manifest());
+        assert_eq!(
+            successor.source_bytes().as_ptr(),
+            retained.source_bytes().as_ptr(),
+            "publication remapped a retained segment while its old mapping was live"
+        );
+        assert_eq!(index.doc_count().expect("published count"), 2);
+        assert_eq!(
+            index
+                .reader()
+                .expect("strict reader")
+                .doc_count()
+                .expect("count"),
+            2
+        );
+    }
+
+    /// A writer already holding a verified snapshot must detect later byte
+    /// corruption before any maintenance operation publishes its successor.
+    #[test]
+    fn publication_rechecks_corrupt_retained_segment_before_mutation() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        for action in ["commit", "upsert", "delete", "clear", "merge", "compact"] {
+            let directory = tempfile::tempdir().expect("bridge index directory");
+            let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open");
+            index
+                .add_cass_documents(&[sample("alpha", 0, "retained integrity document")])
+                .expect("first batch");
+            index.commit().expect("first commit");
+            let snapshot = index.index.snapshot().expect("verified snapshot");
+            let segment = &snapshot.segments()[0];
+            let manifest_before =
+                std::fs::read(directory.path().join(QUILL_INDEX_MARKER)).expect("manifest");
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(segment.path())
+                .expect("open disposable segment");
+            let metadata = file.metadata().expect("segment metadata");
+            let offset = metadata.len() / 2;
+            file.seek(SeekFrom::Start(offset)).expect("seek payload");
+            let mut byte = [0];
+            file.read_exact(&mut byte).expect("read payload");
+            file.seek(SeekFrom::Start(offset)).expect("seek payload");
+            file.write_all(&[byte[0] ^ 0x80]).expect("corrupt payload");
+            file.sync_all().expect("persist corruption");
+            file.set_times(
+                std::fs::FileTimes::new().set_modified(metadata.modified().expect("mtime")),
+            )
+            .expect("restore mtime");
+            assert_eq!(file.metadata().expect("metadata").len(), metadata.len());
+            drop(file);
+
+            let result = match action {
+                "commit" => {
+                    index
+                        .add_cass_documents(&[sample("beta", 1, "pending successor")])
+                        .expect("stage successor");
+                    index.commit()
+                }
+                "upsert" => index.upsert_cass_documents(&[sample("alpha", 0, "replacement")]),
+                "delete" => index.delete_document_ids(&["missing".into()]).map(|_| ()),
+                "clear" => index.delete_all(),
+                "merge" => index.force_merge(),
+                "compact" => index.compact_tombstones().map(|_| ()),
+                _ => unreachable!("listed action"),
+            };
+            let error = result.expect_err("corrupt retained bytes must refuse publication");
+            assert!(
+                format!("{error:#}").contains("verifying retained Quill segment"),
+                "{action}: {error:#}"
+            );
+            assert_eq!(
+                std::fs::read(directory.path().join(QUILL_INDEX_MARKER)).expect("manifest"),
+                manifest_before,
+                "{action} published despite retained corruption"
+            );
+        }
     }
 
     /// A reentrant bridge call must not re-enter `block_on` on one runtime.

@@ -3979,7 +3979,7 @@ archive.
 The build guard enforces the reviewed
 uniform SQLite 0.4.12 versions, a single resolution per package, and registry sources.
 
-`cass` pins its contract-critical ecosystem dependencies with exact registry requirements in [`Cargo.toml`](Cargo.toml); other direct dependencies use normal semver requirements, and `Cargo.lock` freezes the complete resolved graph. `franken-agent-detection` and `portable-pty` resolve from exact upstream git revisions (below). Optional sibling-path overrides stay commented out by default and must never be committed active.
+`cass` pins its contract-critical ecosystem dependencies with exact requirements in [`Cargo.toml`](Cargo.toml); other direct dependencies use normal semver requirements, and `Cargo.lock` freezes the complete resolved graph. `frankensearch`, `franken-agent-detection` and `portable-pty` resolve from exact upstream git revisions (below). The search revision carries the completed Quill retained-mapping repair; CASS still verifies retained segment bytes before publication. CASS explicitly enables `cass-compat` for the `lexical-tantivy` compatibility feature alongside the active `quill` backend. SQLite remains uniformly registry-pinned. Optional sibling-path overrides stay commented out by default and must never be committed active.
 
 <!-- BEGIN GENERATED DEPENDENCY PINS -->
 11 exact or git-pinned direct dependencies (generated from `[dependencies]` in `Cargo.toml`):
@@ -3988,7 +3988,7 @@ uniform SQLite 0.4.12 versions, a single resolution per package, and registry so
 |------------|-------------|----------|
 | `asupersync` | crates.io `=0.5.0` | `test-internals`, `tls-native-roots` |
 | `franken-agent-detection` | git `https://github.com/Dicklesworthstone/franken_agent_detection` rev `6b337ba434b72c65c6c5a748b7ec47885f840ac0` (crate 0.3.10) | `connectors`, `cursor`, `chatgpt`, `opencode`, `crush`, `goose`, `hermes`, `devin`, `shelley`, `grok-bot`, `openclaw-sqlite`, `copilot-vscdb`, `codebuff`, `codex-zstd`, `pi-durable`, `pi-sqlite` |
-| `frankensearch` | crates.io `=0.7.1` | `hash`, `cass-compat`, `quill`, `ann`, `native` |
+| `frankensearch` | git `https://github.com/Dicklesworthstone/frankensearch` rev `5ee999fcaba6f85d19c0e3f00883f1d5d4918887` (crate 0.7.1) | `hash`, `cass-compat`, `quill`, `ann`, `native` |
 | `frankensqlite` (`fsqlite`) | crates.io `=0.4.12` | `fts5`, `async-api` |
 | `fsqlite-types` | crates.io `=0.4.12` |  |
 | `ftui` | crates.io `=0.5.0` |  |
@@ -4000,7 +4000,7 @@ uniform SQLite 0.4.12 versions, a single resolution per package, and registry so
 <!-- END GENERATED DEPENDENCY PINS -->
 
 **Build-time validation**
-- `build.rs` validates every named dependency contract against its exact registry requirement, package name, enabled features, and `default-features` policy. It also rejects git/revision fields for these registry-only contracts.
+- `build.rs` validates every named dependency contract against its exact version and source, package name, enabled features, and `default-features` policy. It rejects git/revision fields for registry-only contracts and requires the exact reviewed revision for upstream Git contracts.
 - The fsqlite-family gate additionally checks `Cargo.lock` for exactly one registry resolution per package at `0.4.12` and rejects every `[patch.crates-io]` redirect for the family, including the facade.
 - Enable optional sibling-manifest validation with `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target cargo check --features strict-path-dep-validation` or `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target CASS_STRICT_PATH_DEP_VALIDATION=1 cargo check`. For sibling checkouts that are present, this verifies package names, versions, and required features before you switch to local path overrides; registry-only contracts do not require a particular sibling branch or clean worktree.
 - Use `cass swarm dependency-drift --json` for a fast read-only preflight. It reports each manifest pin, optional sibling checkout HEAD/dirty state, upstream status as `not_checked`, and the exact strict-validation commands to run; it never fetches remotes or mutates files.

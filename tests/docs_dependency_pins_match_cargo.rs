@@ -128,16 +128,16 @@ fn readme_and_agents_dependency_pins_match_cargo_toml() {
 #[test]
 fn a_stale_registry_pin_row_is_reported() {
     let pins = exact_pins(&read("Cargo.toml"));
-    let current = &pins["frankensearch"].version;
+    let current = &pins["asupersync"].version;
     let stale = read("README.md").replace(
-        &format!("| `frankensearch` | crates.io `={current}`"),
-        "| `frankensearch` | crates.io `=0.0.1`",
+        &format!("| `asupersync` | crates.io `={current}`"),
+        "| `asupersync` | crates.io `=0.0.1`",
     );
     let (mismatches, _) = pin_mismatches(&stale, &pins);
     assert_eq!(
         mismatches,
         vec![format!(
-            "frankensearch: documented `=0.0.1`, Cargo.toml pins `={current}`"
+            "asupersync: documented `=0.0.1`, Cargo.toml pins `={current}`"
         )]
     );
 }

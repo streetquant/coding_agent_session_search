@@ -2900,7 +2900,9 @@ mod gothf8_tokenizer_contract {
     use coding_agent_search::search::fastembed_reranker::FastEmbedReranker;
     use coding_agent_search::search::reranker::RerankerError;
     use sha2::{Digest, Sha256};
-    use tokenizers::{NormalizedString, Normalizer, Tokenizer, TruncationParams};
+    use tokenizers::{
+        NormalizedString, Normalizer, Tokenizer, TruncationDirection, TruncationParams,
+    };
 
     // The complete, pinned MS MARCO tokenizer, rather than the 249-byte loader
     // fixture. Freeze this contract on the incumbent before changing its source.
@@ -3042,7 +3044,50 @@ mod gothf8_tokenizer_contract {
         assert_eq!(long.get_ids(), expected);
         assert_eq!(long.get_offsets()[510], (3054, 3059));
         assert_eq!(long.get_overflowing().len(), 1);
-        assert_eq!(long.get_overflowing()[0].get_ids().len(), 92);
+        // tokenizers 0.23.2 stops tokenizing after max_length raw tokens;
+        // reserving CLS/SEP then leaves two raw tokens in this overflow.
+        let overflow = &long.get_overflowing()[0];
+        assert_eq!(overflow.get_ids(), &[101, 7592, 7592, 102]);
+        assert_eq!(
+            overflow.get_offsets(),
+            &[(0, 0), (3060, 3065), (3066, 3071), (0, 0)]
+        );
+        assert_eq!(overflow.get_special_tokens_mask(), &[1, 0, 0, 1]);
+        assert_eq!(overflow.get_attention_mask(), &[1; 4]);
+        assert_eq!(overflow.get_type_ids(), &[0; 4]);
+
+        // Freeze the complete-tokenization path independently, including the
+        // 90 remaining words and their two special tokens. Both paths must
+        // produce exactly the same primary input to the native model.
+        tokenizer
+            .with_truncation(None)
+            .expect("disable early truncation for the full reference");
+        let mut complete = tokenizer
+            .encode("hello ".repeat(600), false)
+            .expect("complete repeated prose");
+        assert_eq!(complete.get_ids(), &[7592; 600]);
+        assert_eq!(complete.get_offsets()[599], (3594, 3599));
+        complete.truncate(510, 0, TruncationDirection::Right);
+        let reference = tokenizer
+            .post_process(complete, None, true)
+            .expect("complete overflow with special tokens");
+        assert_eq!(reference.get_ids(), long.get_ids());
+        assert_eq!(reference.get_offsets(), long.get_offsets());
+        assert_eq!(reference.get_type_ids(), long.get_type_ids());
+        assert_eq!(reference.get_attention_mask(), long.get_attention_mask());
+        assert_eq!(
+            reference.get_special_tokens_mask(),
+            long.get_special_tokens_mask()
+        );
+        assert_eq!(reference.get_overflowing().len(), 1);
+        let full_overflow = &reference.get_overflowing()[0];
+        let mut expected_overflow = vec![101];
+        expected_overflow.extend([7592; 90]);
+        expected_overflow.push(102);
+        assert_eq!(full_overflow.get_ids(), expected_overflow);
+        assert_eq!(full_overflow.get_ids().len(), 92);
+        assert_eq!(full_overflow.get_offsets()[1], (3060, 3065));
+        assert_eq!(full_overflow.get_offsets()[90], (3594, 3599));
     }
 
     #[test]

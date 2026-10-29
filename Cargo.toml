@@ -166,7 +166,9 @@ bytemuck = "1.25.0"
 # concurrent segment verification on open (GH #501), snippets only for
 # returned hits, and a read-only refresh that skips the reopen when nothing
 # was published.
-frankensearch = { version = "=0.7.1", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
+# Completed upstream Quill retained-mapping repair; CASS rechecks retained
+# segment bytes before publication (2l1b0.72). SQLite stays registry-pinned.
+frankensearch = { version = "=0.7.1", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "5ee999fcaba6f85d19c0e3f00883f1d5d4918887", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
 # Native OpenClaw transcripts and legacy VS Code Copilot sessions require SQLite.
 # Keep both readers unconditional, including --no-default-features builds.
 # codex-zstd reads Codex rollouts compressed to .jsonl.zst (GH #513).
@@ -356,7 +358,7 @@ debug = "line-tables-only"
 strip = false
 
 # The dependency graph is pinned to the asupersync 0.5.x line (0.5.0). Keep
-# the frankensqlite, frankensearch, and franken-agent-detection registry pins
+# the frankensqlite registry pins and exact upstream search/detection revisions
 # aligned so Cargo.lock does not reintroduce an older parallel runtime stack.
 #
 # If you need to build against a local checkout of asupersync (sibling
