@@ -2,7 +2,7 @@
 
 **Spec:** `docs/planning/ANSWER_PACKS_CONTRACT.md`
 **Bead:** `coding_agent_session_search-2l1b0.20` (original map: `uuwye.6`)
-**Status:** Source qualified; committed release and installed readback pending
+**Status:** Source, committed release and installed local acceptance passed; shared search required a documented retry
 **Date:** 2026-10-29 UTC (original coverage map: 2026-05-08)
 
 This matrix turns the answer-pack contract into testable requirements. It is not
@@ -76,9 +76,38 @@ production controls passed. Every named `STAGE` receipt exited 0; the gate
 and wrapper reported success. This paragraph is the post-gate documentation
 delta; runtime and test inputs remain identical to the qualified cohort.
 
+The normal committed release, main `787a3b9d8ea4f661f05cb0033912c2cdac9c3a1d`,
+passed RCH `30085555156942855` on the same Arch host and was installed at
+2026-10-29 06:46 UTC. The immutable CASS ELF SHA-256 is
+`1569b3ebe7b3c39b7c8c19c0cee4891839756a188f272c3df8a0fd231aafc81e`.
+Its two native release-coordinate journeys passed before installation.
+The installed ELF passed all 15 privacy-policy/format combinations, malformed
+input and required-evidence refusals, bounded FIFO timeout, explicit-refresh
+deferral, and unchanged source/archive checks. All 92 CASS/EE retrieval and
+build-identity checks passed across 23 installed agent environments.
+
+The first shared-archive search reached its five-second setup deadline and
+returned an honest incomplete response. That failure is retained. The CLI's
+recommended ten-second retry passed with the same one-hit and source-anchor
+assertions; its measured search budget elapsed time was 3,873 ms. The shared
+pack returned one evidence item from one session, the missing-session negative
+returned typed exit 2, and the original OMP EE import remained idempotent with
+zero new spans or index jobs. The current native Codex consumer returned
+`CASS_OK EE_OK`. This establishes the ten-second retry, not reliable
+five-second search latency or fresh capture from every harness.
+
+Installed receipts are under
+`/warp/codex/artifacts/cass-acceptance-finish-20261029-Q1n9uY/pack-installed/`:
+`deployment.json`, `installed-policy-acceptance.json`,
+`installed-agent-readback.json`, and
+`shared-live-10s-retry/installed-live-journey.json`.
+The parent `pack-installed-terminal.json` explicitly records the failed
+initial controller and successful reviewed retry. This paragraph is a
+documentation-only follow-up; the installed runtime remains the qualified
+commit above.
+
 These local fixtures do not qualify the full owner archive, ANN, native
 relevance, memory limits or the unavailable original GH470 reporter corpus.
-Committed release-binary and installed-consumer qualification remain separate.
 
 ## Historical Coverage Accounting (2026-09-05)
 
