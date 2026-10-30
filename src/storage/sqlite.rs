@@ -5530,6 +5530,7 @@ fn lexical_content_truncation_boundary(content: &str, cap: usize) -> usize {
 /// Marker error a lexical-rebuild row callback raises to stop a stream early;
 /// never surfaced to callers.
 const LEXICAL_REBUILD_STREAM_STOPPED: &str = "cass lexical rebuild stream stopped by caller";
+const LEXICAL_REBUILD_FOOTPRINT_PAGE_ROWS: usize = 2048;
 
 /// One lexical-rebuild projection row (`id, idx, role, author, created_at,
 /// capped content, source byte length`) as a [`Message`] whose text is bounded
@@ -13342,36 +13343,53 @@ impl FrankenStorage {
         conversation_id: i64,
     ) -> Result<Vec<(i64, usize)>> {
         let cap = lexical_max_message_content_bytes().min(i32::MAX as usize);
-        let sql = |hinted: bool| {
+        let sql = |hinted: bool, after: Option<i64>| {
             format!(
                 "SELECT idx, COALESCE(octet_length(content), 0) FROM messages{} \
-                 WHERE conversation_id = ?1 ORDER BY idx",
+                 WHERE conversation_id = ?1{} ORDER BY idx \
+                 LIMIT {LEXICAL_REBUILD_FOOTPRINT_PAGE_ROWS}",
                 if hinted {
                     " INDEXED BY sqlite_autoindex_messages_1"
                 } else {
                     ""
-                }
+                },
+                if after.is_some() { " AND idx > ?2" } else { "" }
             )
         };
-        let params = [SqliteValue::from(conversation_id)];
-        let read = |sql: &str| -> Result<Vec<(i64, usize)>> {
+        let read = |hinted: bool| -> Result<Vec<(i64, usize)>> {
             let mut footprints = Vec::new();
-            self.conn
-                .query_with_params_for_each(sql, &params, |row| {
-                    let bytes = usize::try_from(row.get_typed::<i64>(1)?.max(0))
-                        .unwrap_or(usize::MAX)
-                        .min(cap);
-                    footprints.push((row.get_typed::<i64>(0)?, bytes));
-                    Ok(())
-                })
-                .with_context(|| {
-                    format!("reading lexical footprints for conversation {conversation_id}")
-                })?;
+            let mut after = None;
+            loop {
+                let mut params = vec![SqliteValue::from(conversation_id)];
+                if let Some(last_idx) = after {
+                    params.push(SqliteValue::from(last_idx));
+                }
+                let before = footprints.len();
+                // Even a numeric row callback can retain a giant scan's
+                // engine working set. Finish bounded statements between
+                // pages; keep only the small footprint pairs across them.
+                self.conn
+                    .query_with_params_for_each(&sql(hinted, after), &params, |row| {
+                        let idx = row.get_typed::<i64>(0)?;
+                        let bytes = usize::try_from(row.get_typed::<i64>(1)?.max(0))
+                            .unwrap_or(usize::MAX)
+                            .min(cap);
+                        footprints.push((idx, bytes));
+                        after = Some(idx);
+                        Ok(())
+                    })
+                    .with_context(|| {
+                        format!("reading lexical footprints for conversation {conversation_id}")
+                    })?;
+                if footprints.len() - before < LEXICAL_REBUILD_FOOTPRINT_PAGE_ROWS {
+                    break;
+                }
+            }
             Ok(footprints)
         };
-        read(&sql(true)).or_else(|err| {
+        read(true).or_else(|err| {
             if format!("{err:#}").contains("no such index: sqlite_autoindex_messages_1") {
-                return read(&sql(false));
+                return read(false);
             }
             Err(err)
         })
@@ -22858,26 +22876,32 @@ impl FrankenStorage {
                         // A stale cursor over existing rows would replay additive
                         // rollups even when metric INSERT OR IGNORE skips them.
                         let mut empty = true;
-                        for table in [
-                            "message_metrics",
-                            "usage_hourly",
-                            "usage_daily",
-                            "usage_models_daily",
+                        for (query, context) in [
+                            (
+                                "SELECT 1 FROM message_metrics LIMIT 1",
+                                "validating initial analytics cursor against message_metrics",
+                            ),
+                            (
+                                "SELECT 1 FROM usage_hourly LIMIT 1",
+                                "validating initial analytics cursor against usage_hourly",
+                            ),
+                            (
+                                "SELECT 1 FROM usage_daily LIMIT 1",
+                                "validating initial analytics cursor against usage_daily",
+                            ),
+                            (
+                                "SELECT 1 FROM usage_models_daily LIMIT 1",
+                                "validating initial analytics cursor against usage_models_daily",
+                            ),
                         ] {
                             if let Some(control) = control {
                                 control()?;
                             }
                             let row: Option<i64> = self
                                 .conn
-                                .query_row_map(
-                                    &format!("SELECT 1 FROM {table} LIMIT 1"),
-                                    fparams![],
-                                    |row| row.get_typed(0),
-                                )
+                                .query_row_map(query, fparams![], |row| row.get_typed(0))
                                 .optional()
-                                .with_context(|| {
-                                    format!("validating initial analytics cursor against {table}")
-                                })?;
+                                .context(context)?;
                             if row.is_some() {
                                 empty = false;
                                 break;
@@ -37112,6 +37136,103 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             .unwrap();
         assert!(missing.is_empty());
         assert_eq!(rows.get(), observed.len(), "no rows means no callback");
+    }
+
+    #[test]
+    fn lexical_rebuild_message_footprints_pages_preserve_gaps_and_integer_boundaries() {
+        const CHILD_ENV: &str = "CASS_TEST_FOOTPRINT_BOUNDARY_CHILD";
+        if !matches!(dotenvy::var(CHILD_ENV).as_deref(), Ok("1")) {
+            // Scope the tiny cap to a real child. Serializing this test alone
+            // cannot protect parallel readers of the process environment.
+            let test = "storage::sqlite::tests::lexical_rebuild_message_footprints_pages_preserve_gaps_and_integer_boundaries";
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                .env(CHILD_ENV, "1")
+                .env("CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES", "5")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "footprint child: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(stdout.contains("FOOTPRINT_BOUNDARY_CONTROL=passed"));
+            return;
+        }
+        assert_eq!(lexical_max_message_content_bytes(), 5);
+        for indexed in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let db_path = dir.path().join("footprints.db");
+            let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            conn.execute(if indexed {
+                "CREATE TABLE messages (conversation_id INTEGER, idx INTEGER, content TEXT, \
+                 UNIQUE(conversation_id, idx))"
+            } else {
+                "CREATE TABLE messages (conversation_id INTEGER, idx INTEGER, content TEXT)"
+            })
+            .unwrap();
+            let storage = FrankenStorage::new(conn, db_path);
+            let mut indices = vec![i64::MIN];
+            indices.extend((0..4094).map(|idx| idx * 3 - 1000));
+            indices.push(i64::MAX);
+            storage.conn.execute("BEGIN").unwrap();
+            for idx in &indices {
+                storage
+                    .conn
+                    .execute_with_params(
+                        "INSERT INTO messages (conversation_id, idx, content) VALUES (7, ?1, ?2)",
+                        &[SqliteValue::from(*idx), SqliteValue::from("ééé")],
+                    )
+                    .unwrap();
+            }
+            storage
+                .conn
+                .execute(
+                    "INSERT INTO messages (conversation_id, idx, content) VALUES (8, 0, 'other')",
+                )
+                .unwrap();
+            storage.conn.execute("COMMIT").unwrap();
+            let mut expected: Vec<_> = indices.into_iter().map(|idx| (idx, 5)).collect();
+            assert_eq!(
+                storage.lexical_rebuild_message_footprints(7).unwrap(),
+                expected,
+                "exactly full pages preserve every sparse idx, including MIN/MAX; indexed={indexed}"
+            );
+            storage
+                .conn
+                .execute_with_params(
+                    "INSERT INTO messages (conversation_id, idx, content) VALUES (7, ?1, NULL)",
+                    &[SqliteValue::from(i64::MAX - 1)],
+                )
+                .unwrap();
+            expected.insert(expected.len() - 1, (i64::MAX - 1, 0));
+            assert_eq!(
+                storage.lexical_rebuild_message_footprints(7).unwrap(),
+                expected,
+                "a partial final page and NULL content survive the hinted or fallback scan"
+            );
+            assert!(
+                storage
+                    .lexical_rebuild_message_footprints(999)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        println!("FOOTPRINT_BOUNDARY_CONTROL=passed");
+    }
+
+    #[test]
+    fn lexical_rebuild_message_footprints_propagates_schema_errors() {
+        let conn = FrankenConnection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE messages (conversation_id INTEGER, idx INTEGER)")
+            .unwrap();
+        let storage = FrankenStorage::new(conn, PathBuf::from(":memory:"));
+        let error = storage
+            .lexical_rebuild_message_footprints(7)
+            .expect_err("missing content must not turn into an empty successful page");
+        let detail = format!("{error:#}");
+        assert!(detail.contains("content"), "unexpected error: {detail}");
     }
 
     #[test]

@@ -4626,6 +4626,10 @@
       "description": "ionice class `cass index --background` applies to itself on Linux (3 = idle)."
     },
     {
+      "name": "CASS_BACKGROUND_IONICE_PRIORITY",
+      "description": "Explicit ionice priority (0..=7) for classes 1 and 2 on Linux. Unset preserves the class default; invalid values or class combinations refuse the I/O priority change."
+    },
+    {
       "name": "CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS",
       "default": "0",
       "description": "Require this many seconds of console idle time (macOS HIDIdleTime) before scheduled semantic backfill / nightly schedule jobs run; 0 disables, unknown idle fails open."

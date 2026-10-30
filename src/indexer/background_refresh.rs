@@ -943,15 +943,29 @@ pub fn apply_background_priority() -> BackgroundPriority {
         .and_then(|v| v.trim().parse::<u32>().ok())
         .map(|c| c.min(3))
         .unwrap_or(DEFAULT_BACKGROUND_IONICE_CLASS);
+    let ionice_priority = match dotenvy::var("CASS_BACKGROUND_IONICE_PRIORITY") {
+        Ok(value) => value.trim().parse::<u32>().map(Some).map_err(|_| ()),
+        Err(dotenvy::Error::EnvVar(std::env::VarError::NotPresent)) => Ok(None),
+        Err(_) => Err(()),
+    };
     #[cfg(unix)]
     {
         let monitor = crate::daemon::resource::ResourceMonitor::new();
         let nice_applied = monitor.apply_nice(nice);
-        let ionice_applied = monitor.apply_ionice(ionice_class);
+        let (ionice_priority, ionice_applied) = match ionice_priority {
+            Ok(priority) => (priority, monitor.apply_ionice(ionice_class, priority)),
+            Err(()) => {
+                warn!(
+                    "Refusing invalid CASS_BACKGROUND_IONICE_PRIORITY; expected an integer from 0 to 7 for classes 1 and 2"
+                );
+                (None, false)
+            }
+        };
         BackgroundPriority {
             nice,
             nice_applied,
             ionice_class,
+            ionice_priority,
             ionice_applied,
         }
     }
@@ -961,6 +975,7 @@ pub fn apply_background_priority() -> BackgroundPriority {
             nice,
             nice_applied: false,
             ionice_class,
+            ionice_priority: ionice_priority.ok().flatten(),
             ionice_applied: false,
         }
     }
@@ -971,6 +986,7 @@ pub struct BackgroundPriority {
     pub nice: i32,
     pub nice_applied: bool,
     pub ionice_class: u32,
+    pub ionice_priority: Option<u32>,
     pub ionice_applied: bool,
 }
 
@@ -986,6 +1002,187 @@ mod admission_policy_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exercise the real kernel priority through disposable child processes.
+    /// Keeping this isolated also leaves the test runner's scheduling alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn background_priority_preserves_explicit_io_priority_in_real_children() {
+        const CASE_ENV: &str = "CASS_TEST_BACKGROUND_PRIORITY_CASE";
+        if let Ok(case) = dotenvy::var(CASE_ENV) {
+            let readback = |arguments: &[&str]| {
+                let output = Command::new("ionice")
+                    .args(arguments)
+                    .env("LC_ALL", "C")
+                    .output()
+                    .expect("priority readback command");
+                assert!(output.status.success(), "ionice: {output:?}");
+                String::from_utf8_lossy(&output.stdout).trim().to_owned()
+            };
+            let pid = std::process::id().to_string();
+            let read_cpu = || {
+                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .expect("kernel CPU priority readback");
+                let (_, fields) = stat.rsplit_once(')').expect("kernel stat comm delimiter");
+                let fields: Vec<_> = fields.split_whitespace().collect();
+                let nice = fields[16].parse::<i32>().expect("kernel nice value");
+                let policy = fields[38].parse::<u32>().expect("kernel CPU policy");
+                (nice, policy)
+            };
+            let before_io = readback(&["-p", &pid]);
+            let before_cpu = read_cpu();
+            assert_eq!(before_io, "best-effort: prio 7", "{case}");
+            assert_eq!(before_cpu, (19, 5), "nice19 and SCHED_IDLE");
+
+            let applied = apply_background_priority();
+            let after_io = readback(&["-p", &pid]);
+            let after_cpu = read_cpu();
+            assert_eq!(after_cpu, before_cpu, "CPU/nice changed in {case}");
+            assert!(applied.nice_applied, "{case}: {applied:?}");
+            assert_eq!(applied.nice, 19);
+            assert_eq!(
+                applied.ionice_applied,
+                dotenvy::var("CASS_TEST_BACKGROUND_PRIORITY_APPLIED").expect("expected result")
+                    == "1",
+                "{case}: {applied:?}"
+            );
+            assert_eq!(
+                after_io,
+                dotenvy::var("CASS_TEST_BACKGROUND_PRIORITY_READBACK").expect("expected readback"),
+                "{case}: {applied:?}"
+            );
+            if case == "explicit-seven" {
+                assert_eq!(applied.ionice_class, 2);
+                assert_eq!(applied.ionice_priority, Some(7));
+            }
+            println!(
+                "PRIORITY_CONTROL case={case} before={before_io:?} after={after_io:?} cpu={after_cpu:?} applied={applied:?}"
+            );
+            return;
+        }
+
+        let executable = std::env::current_exe().expect("test executable");
+        let test = "indexer::background_refresh::tests::background_priority_preserves_explicit_io_priority_in_real_children";
+        for (case, class, priority, applied, readback) in [
+            (
+                "explicit-seven",
+                Some("2"),
+                Some("7"),
+                true,
+                "best-effort: prio 7",
+            ),
+            (
+                "explicit-zero",
+                Some("2"),
+                Some("0"),
+                true,
+                "best-effort: prio 0",
+            ),
+            (
+                "trimmed-seven",
+                Some("2"),
+                Some(" 7 "),
+                true,
+                "best-effort: prio 7",
+            ),
+            (
+                "unset-priority",
+                Some("2"),
+                None,
+                true,
+                "best-effort: prio 4",
+            ),
+            ("defaults", None, None, true, "idle"),
+            ("idle-default", Some("3"), None, true, "idle"),
+            (
+                "out-of-range",
+                Some("2"),
+                Some("8"),
+                false,
+                "best-effort: prio 7",
+            ),
+            (
+                "negative",
+                Some("2"),
+                Some("-1"),
+                false,
+                "best-effort: prio 7",
+            ),
+            ("empty", Some("2"), Some(""), false, "best-effort: prio 7"),
+            (
+                "malformed",
+                Some("2"),
+                Some("seven"),
+                false,
+                "best-effort: prio 7",
+            ),
+            (
+                "overflow",
+                Some("2"),
+                Some("4294967296"),
+                false,
+                "best-effort: prio 7",
+            ),
+            (
+                "idle-with-priority",
+                Some("3"),
+                Some("7"),
+                false,
+                "best-effort: prio 7",
+            ),
+            (
+                "none-with-priority",
+                Some("0"),
+                Some("7"),
+                false,
+                "best-effort: prio 7",
+            ),
+            (
+                "realtime-invalid",
+                Some("1"),
+                Some("8"),
+                false,
+                "best-effort: prio 7",
+            ),
+        ] {
+            let mut command = Command::new("timeout");
+            command
+                .args([
+                    "20s", "chrt", "--idle", "0", "ionice", "-c", "2", "-n", "7", "nice", "-n",
+                    "19",
+                ])
+                .arg(&executable)
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                .current_dir("/")
+                .env(CASE_ENV, case)
+                .env("CASS_BACKGROUND_NICE", "19")
+                .env(
+                    "CASS_TEST_BACKGROUND_PRIORITY_APPLIED",
+                    if applied { "1" } else { "0" },
+                )
+                .env("CASS_TEST_BACKGROUND_PRIORITY_READBACK", readback)
+                .env_remove("CASS_BACKGROUND_IONICE_CLASS")
+                .env_remove("CASS_BACKGROUND_IONICE_PRIORITY");
+            if let Some(class) = class {
+                command.env("CASS_BACKGROUND_IONICE_CLASS", class);
+            }
+            if let Some(priority) = priority {
+                command.env("CASS_BACKGROUND_IONICE_PRIORITY", priority);
+            }
+            let output = command.output().expect("disposable priority control");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{case}: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                stdout.contains("PRIORITY_CONTROL case="),
+                "child did not execute its control: {stdout}"
+            );
+            print!("{stdout}");
+        }
+    }
 
     #[test]
     fn auto_refresh_is_enabled_by_default() {

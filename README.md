@@ -399,7 +399,7 @@ cass export-html session.jsonl --json
 
 ### 🔗 Universal Connectors
 <!-- BEGIN GENERATED CONNECTORS -->
-The runtime registry registers 37 connectors (`cass capabilities --json | jq .connectors`):
+The runtime registry registers 38 connectors (`cass capabilities --json | jq .connectors`):
 
 | Connector | Connector | Connector |
 |-----------|-----------|-----------|
@@ -415,7 +415,7 @@ The runtime registry registers 37 connectors (`cass capabilities --json | jq .co
 | `devin` | `grok_bot` | `codebuff` |
 | `goose` | `crush` | `hermes` |
 | `shelley` | `kilo` | `cloudmcp` |
-| `openwebui` |  |  |
+| `openwebui` | `dsh` |  |
 <!-- END GENERATED CONNECTORS -->
 
 Every session is normalized into the unified `Conversation -> Message -> Snippet` model.
@@ -1385,7 +1385,7 @@ Errors are structured, actionable, and include recovery hints. A real sample fro
 ```
 
 **Kind names** are kebab-case (e.g. `missing-index`, `missing-db`, `semantic-unavailable`, `embedder-unavailable`, `ambiguous-source`, `timeout`, `config`, `lock-busy`). Agents that branch on `err.kind` should treat them as stable identifiers. <!-- BEGIN GENERATED ERROR KINDS -->
-The registry defines 96 `err.kind` values; branch on the kind, not the numeric code, for codes >= 10.
+The registry defines 98 `err.kind` values; branch on the kind, not the numeric code, for codes >= 10.
 
 | Kind |
 |------|
@@ -1448,10 +1448,12 @@ The registry defines 96 `err.kind` values; branch on the kind, not the numeric c
 | `pack-empty-query` |
 | `pack-invalid-field` |
 | `pack-invalid-limit` |
+| `pack-invalid-redaction-policy` |
 | `pack-no-evidence` |
 | `pack-unsupported-format` |
 | `pages` |
 | `parse-error` |
+| `partial-result` |
 | `password-read-error` |
 | `password-required` |
 | `rebuild-error` |
@@ -3783,7 +3785,7 @@ Update check state is stored in `update_state.json` in the data directory:
 ### Complete Environment Variable Reference
 
 <!-- BEGIN GENERATED ENV VARS -->
-Generated from the env-var registry (`cass capabilities --json | jq .env_vars`). 133 variables:
+Generated from the env-var registry (`cass capabilities --json | jq .env_vars`). 134 variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -3794,6 +3796,7 @@ Generated from the env-var registry (`cass capabilities --json | jq .env_vars`).
 | `CASS_AUTO_REFRESH_COOLDOWN_SECS` | 300 | Minimum seconds between two auto-spawned catch-up index runs per data dir. |
 | `CASS_AUTO_REFRESH_SOURCE_SCAN_SECS` | 300 | Successful source-scan age that requests an incremental catch-up on read, independently of health's 30 min stale threshold and the spawn cooldown. Foreground, scheduled, and no-op source scans reset this age. Set `0` to disable age-triggered source scans; stale/partial/pending-session repair triggers remain enabled. Reads inspect metadata without traversing source files. |
 | `CASS_BACKGROUND_IONICE_CLASS` | 3 | ionice class `cass index --background` applies to itself on Linux (3 = idle). |
+| `CASS_BACKGROUND_IONICE_PRIORITY` | unset | Explicit ionice priority (0..=7) for classes 1 and 2 on Linux. Unset preserves the class default; invalid values or class combinations refuse the I/O priority change. |
 | `CASS_BACKGROUND_NICE` | 15 | nice value `cass index --background` applies to itself (0..=19). |
 | `CASS_CACHE_BYTE_CAP` | available memory / 128, clamped to 64 MiB-2 GiB | Search-hit cache byte limit; `0` disables the byte guard |
 | `CASS_CACHE_EVICTION_POLICY` | lru | Cache eviction policy: `lru` or `s3-fifo` |
@@ -3805,24 +3808,6 @@ Generated from the env-var registry (`cass capabilities --json | jq .env_vars`).
 | `CASS_DB_PATH` | unset | Override the SQLite database path. |
 | `CASS_DEBUG_CACHE_METRICS` | unset | Enable cache hit/miss logging |
 | `CASS_DEFER_ANALYTICS_UPDATES` | 0 | Set to 1 to defer derived analytics writes during indexing. A legacy OMP identity migration keeps its analytics phase and durable cursor pending until a later index run with this unset. |
-| `CASS_QUILL_QUERY_FUEL_BUDGET` | Quill default (10000000) | Escape hatch for Quill's deterministic per-query work ceiling (GH #441). Zero or unparseable values keep the engine default. When fuel runs out on a hybrid query the lexical leg is dropped, the semantic leg still answers, and `_meta.lexical_degrade_reason` reports `query_fuel_exhausted`; lexical-only queries return an actionable hint. The durable fix for fuel exhaustion is a consolidated index (an incremental `cass index` folds fragmented generations in its maintenance pass; `--full` rebuilds from scratch), and cass now publishes Quill snapshots only on its own commits (no per-second visibility seals), which is what let segment counts grow into the hundreds on append-only archives |
-| `CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES` | 1073741824 (1 GiB) | Maximum estimated output per lexical merge run, including the covered document-ID range. Oversized singleton segments remain unmerged. This is a merge-planning limit, not a total-process RSS ceiling. Positive byte values accept underscores; zero or invalid values keep the default. Independently of this cap, a merge run never holds more than 4,194,304 documents (Quill's per-term posting limit), and Quill's own tier merge is disabled, so archives with several million messages rebuild into several segments (GH #498). |
-| `CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES` | 8388608 (8 MiB) | Most text of any one message that the lexical index holds; the rest of that message (typically a pasted image or base64 blob) is not searchable. It never limits a conversation: every message of a long session is indexed, and rebuilds and incremental updates read long sessions in bounded chunks. Zero or invalid values keep the default. |
-| `CASS_INDEX_SKIP_DISK_HEADROOM_CHECK` | unset | Skips the free-space preflight that `cass index --full` / `--force-rebuild` runs before starting, and the rebuild's free-space floor. The requirement is `max(512 MiB, lexical_rebuild_basis_bytes * 9 / 4 - rebuild_staging_bytes + db_bundle_bytes / 16 + migration_copy_bytes)`: the basis is the live published index (a rebuild wrote 2.12x of it in measurement, the new generation plus the fold into one segment), or the database bundle when no live index exists to size the rebuild by; the database is charged a 1/16 growth allowance, and a whole copy only while the engine's one-time migration repair is pending (`migration_copy_bytes`). Merge-retired segments, retained publish backups and failed-rebuild quarantine bundles are reported but not charged, and a failed rebuild's leftover `.rebuild-staging` generation is credited against the lexical charge, because the next rebuild resumes into it or clears it first. A refusal names the rule's terms and what `cass index --gc`, `cass doctor cleanup` and `cass lexical-quarantine --plan` would reclaim. While running, a rebuild stops (exit 14, kind `storage`, retryable) once free space where it writes falls below 512 MiB, keeping what it committed so the rerun resumes, and it skips the final fold into one segment when there is no room for it. Query the requirement before a run with `cass doctor --json \| jq .storage_pressure.full_rebuild_readiness`, which shows `required_bytes`, `available_bytes`, `shortfall_bytes` and each input (GH #496). Set to `1` only when you know the disk can hold the rebuild. |
-| `CASS_SEARCH_EXACT_TOTAL_COUNT_MAX_DOCS` | 5000000 (50000 in v0.9.0 and earlier) | Largest index (in documents) for which a full result page still reports an exact `total_matches`; above it the count is `limit + 1`, a lower bound (`_meta.cursor_manifest.count_precision` says which). `0` disables exact counting. See *Match Counts: Exact or Lower Bound* |
-| `CASS_SEARCH_BUDGET_MS` | 120000 | Default robot-mode search budget when `--timeout` is not given. A search that runs out of it exits 0 with `budget.timed_out: true`, which means "no complete answer", not "no matches" |
-| `CASS_SEARCH_ACTIVE_REBUILD_WAIT_MS` | 30000 | How long a human-mode search, or a robot search whose index is still readable, waits for an active lexical rebuild before returning exit 7 `index-busy`. With `--timeout`, the wait also stops at nine tenths of the time remaining. A robot search with no searchable generation does not wait |
-| `CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES` | 1073741824 (1 GiB) | Largest archive (database plus WAL) that a search may repair inline; plain `cass index` compares the database file alone against the same value to decide whether to defer the authoritative lexical repair to `--full`. Over it, search refuses with `maintenance-required` and starts a detached `cass index --full --background` (see *When the Index Is Missing*) |
-| **Semantic Search** | | |
-| `CASS_SEMANTIC_EMBEDDER` | auto | Force embedder: `hash`, `minilm`, or explicit `multilingual-minilm` |
-| `CASS_SEMANTIC_PROGRESS_JSONL` | unset | Absolute path to a JSONL file the semantic backfill appends one event per transition to (`selection_*`, `packet_replay_*`, `embed_batch_*`, `staging_write_*`, `checkpoint_save_*`, `publish_*`, `error`, `cancelled`, `complete`). Each line carries timestamp, phase + sub-phase, batch/row counters, byte counts, elapsed-since-start, and a cheap RSS estimate. Silent when unset. Best-effort writes — failures log at debug and never crash a backfill. See [cass#257](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/257). |
-| `CASS_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS` | 30000 | Warn when one embedder batch takes more than 30s. Derived from cass#257 boxed quality-corpus telemetry: 60 MiniLM batches averaged ~5.95s, so the default is about 5x the observed healthy batch. Set `0` to disable warnings. |
-| `CASS_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS` | 300000 | Abort a semantic backfill batch after a single embedder batch returns if it exceeded 5 minutes. Derived as a conservative ~50x multiple of the cass#257 healthy 128-doc MiniLM batch average. Set `0` to disable failure. |
-| `CASS_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT` | 10000 | Soft cap for `cass models backfill`: checkpoint after a whole-conversation prefix near 10k selected messages. Derived from cass#257 high-volume proof (7,618 docs in ~6 minutes) plus the original 10k-message workaround. Set `0` for no message cap. |
-| `CASS_SEMANTIC_MAX_BYTES_PER_CHECKPOINT` | 8388608 | Soft cap for `cass models backfill`: checkpoint after a whole-conversation prefix near 8 MiB selected content. Derived from cass#257 high-volume proof (4.3 MiB selected bytes) with about 2x headroom. Set `0` for no byte cap. |
-| **TUI** | | |
-| `TUI_HEADLESS` | unset | Disable interactive features |
-| `CASS_ALLOW_DUMB_TERM` | unset | Allow TUI startup even when `TERM=dumb` |
 | `CASS_DISABLE_ANIMATIONS` | unset | Disable UI animations |
 | `CASS_DOCTOR_BUDGET_MS` | 8000 | Structured doctor reporting budget in milliseconds. Reports whose elapsed time exceeds it set budget.timed_out. |
 | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY` | unset | Set to `1` to hash every raw-mirror descriptor/chunk during a read-only doctor run, overriding the default bounded verification limits |

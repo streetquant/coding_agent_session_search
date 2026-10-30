@@ -27898,6 +27898,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_AUTO_REFRESH_COOLDOWN_SECS=<N>      min seconds between auto-spawned catch-up runs (default 300)".to_string(),
             "  CASS_BACKGROUND_NICE=<N>                 nice value for `cass index --background` (default 15)".to_string(),
             "  CASS_BACKGROUND_IONICE_CLASS=<N>         ionice class for `cass index --background` on Linux (default 3 = idle)".to_string(),
+            "  CASS_BACKGROUND_IONICE_PRIORITY=<N>      explicit ionice priority 0..7 for classes 1 and 2 (default unset; invalid settings refuse the I/O change)".to_string(),
             "  CASS_DAEMON_INDEX_INTERVAL_SECS=<N>      resident daemon spawns an incremental background index every N s (default 0 = off)".to_string(),
             "  CASS_SCHEDULE_MAX_BACKFILL_BATCHES=<N>   cap on semantic backfill batches per nightly `cass schedule run` (default 200)".to_string(),
             "  CASS_SCHEDULE_MAX_LOAD_DEFERRAL_SECS=<N> longest severe load may skip scheduled incremental runs since the last completed one (default 10800; 0 = no limit)".to_string(),
@@ -101194,6 +101195,11 @@ pub fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "ionice class `cass index --background` applies to itself on Linux (3 = idle).",
         ),
         env_var_capability(
+            "CASS_BACKGROUND_IONICE_PRIORITY",
+            None,
+            "Explicit ionice priority (0..=7) for classes 1 and 2 on Linux. Unset preserves the class default; invalid values or class combinations refuse the I/O priority change.",
+        ),
+        env_var_capability(
             "CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS",
             Some("0"),
             "Require this many seconds of console idle time (macOS HIDIdleTime) before scheduled semantic backfill / nightly schedule jobs run; 0 disables, unknown idle fails open.",
@@ -115261,6 +115267,7 @@ fn run_index_with_data(
             nice = applied.nice,
             nice_applied = applied.nice_applied,
             ionice_class = applied.ionice_class,
+            ionice_priority = ?applied.ionice_priority,
             ionice_applied = applied.ionice_applied,
             "cass index --background: lowered process priority"
         );
