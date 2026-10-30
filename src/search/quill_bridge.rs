@@ -30,7 +30,9 @@ use frankensearch::quill::cass::{
     CassMergeStatus,
 };
 use frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA;
-use frankensearch::quill::{QuillConfig, QuillIndex, QuillSearchIndex, SchemaDocument};
+use frankensearch::quill::{
+    QuillConfig, QuillIndex, QuillSearchIndex, RecoveredSegment, SchemaDocument,
+};
 
 /// Quill's tier concat merge caps positions for one term at 2^24. The shared
 /// CASS corpus has enough repeated terms that an automatic merge can exceed
@@ -1212,6 +1214,165 @@ fn process_io_bytes() -> Option<u64> {
     None
 }
 
+/// Bind an exact retained read-only mapping to the descriptor being verified.
+///
+/// The engine does not expose its backing descriptor. Linux's kernel map table
+/// supplies its physical identity without touching the mapped pages. Owned
+/// images, unavailable map tables, and other platforms retain eager verification
+/// of the held bytes instead of assuming that a reopened path is that backing.
+#[cfg(target_os = "linux")]
+fn retained_file_binding(segment: &RecoveredSegment, metadata: &std::fs::Metadata) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let bytes = segment.source_bytes();
+    let start = bytes.as_ptr().addr();
+    let end = start.checked_add(bytes.len())?;
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    for line in maps.lines() {
+        let mut fields = line.split_whitespace();
+        let (lo, hi) = fields.next()?.split_once('-')?;
+        let lo = usize::from_str_radix(lo, 16).ok()?;
+        let hi = usize::from_str_radix(hi, 16).ok()?;
+        if lo > start || end > hi {
+            continue;
+        }
+        let permissions = fields.next()?.as_bytes();
+        let offset = u64::from_str_radix(fields.next()?, 16).ok()?;
+        let (major, minor) = fields.next()?.split_once(':')?;
+        let major = u32::from_str_radix(major, 16).ok()?;
+        let minor = u32::from_str_radix(minor, 16).ok()?;
+        let inode: u64 = fields.next()?.parse().ok()?;
+        if inode == 0 || permissions.first() != Some(&b'r') || permissions.get(1) != Some(&b'-') {
+            return None;
+        }
+        return Some(
+            start == lo
+                && offset == 0
+                && libc::makedev(major, minor) == metadata.dev()
+                && inode == metadata.ino(),
+        );
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn retained_file_binding(
+    _segment: &RecoveredSegment,
+    _metadata: &std::fs::Metadata,
+) -> Option<bool> {
+    None
+}
+
+fn verify_retained_backing(
+    segment: &RecoveredSegment,
+    binding: Option<bool>,
+) -> std::result::Result<(), frankensearch::quill::QuillError> {
+    match binding {
+        Some(true) => Ok(()),
+        Some(false) => Err(frankensearch::quill::QuillError::IndexCorrupted {
+            path: segment.path().to_path_buf(),
+            detail: "retained mapped backing and current file identity differ".into(),
+        }),
+        None => segment.verify(),
+    }
+}
+
+/// Revalidate the admitted file without faulting its entire retained mapping in.
+///
+/// The immutable MANIFEST and section table were admitted by Quill. Recompute
+/// their witnesses from the current file, including unknown optional sections
+/// and padding, rather than trusting a lazy checksum or a matching file stamp.
+/// The prefix witness also binds the previously validated header and layout.
+fn verify_retained_segment_file(segment: &RecoveredSegment) -> Result<()> {
+    use std::io::Read;
+    use xxhash_rust::xxh3::Xxh3;
+
+    const TRAILER_BYTES: usize = 12;
+    const READ_BYTES: usize = 1024 * 1024;
+    let manifest = segment.manifest();
+    let corrupt = |detail: String| {
+        anyhow::Error::new(frankensearch::quill::QuillError::IndexCorrupted {
+            path: segment.path().to_path_buf(),
+            detail,
+        })
+    };
+    let mut file = std::fs::File::open(segment.path())?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != manifest.file_len {
+        return Err(corrupt(
+            "retained segment file type or length changed".into(),
+        ));
+    }
+    verify_retained_backing(segment, retained_file_binding(segment, &metadata))?;
+    let prefix_len = manifest
+        .file_len
+        .checked_sub(TRAILER_BYTES as u64)
+        .ok_or_else(|| corrupt("retained segment is shorter than its trailer".into()))?;
+    let mut sections = Vec::with_capacity(segment.section_entries().len());
+    for entry in segment.section_entries() {
+        let end = entry
+            .offset
+            .checked_add(entry.len)
+            .filter(|end| *end <= prefix_len)
+            .ok_or_else(|| corrupt("retained section range exceeds its prefix".into()))?;
+        sections.push((*entry, end, Xxh3::new()));
+    }
+    let mut prefix_hash = Xxh3::new();
+    let mut buffer = vec![0; READ_BYTES];
+    let mut offset = 0;
+    while offset < prefix_len {
+        let count = usize::try_from((prefix_len - offset).min(READ_BYTES as u64))?;
+        let bytes = buffer
+            .get_mut(..count)
+            .ok_or_else(|| corrupt("retained read exceeds its fixed buffer".into()))?;
+        file.read_exact(bytes)?;
+        prefix_hash.update(bytes);
+        let next = offset + count as u64;
+        for (entry, end, hash) in &mut sections {
+            let start = offset.max(entry.offset);
+            let stop = next.min(*end);
+            if start < stop {
+                let start = usize::try_from(start - offset)?;
+                let stop = usize::try_from(stop - offset)?;
+                let section_bytes = bytes
+                    .get(start..stop)
+                    .ok_or_else(|| corrupt("retained section exceeds its read buffer".into()))?;
+                hash.update(section_bytes);
+            }
+        }
+        offset = next;
+    }
+    if let Some((entry, _, _)) = sections
+        .into_iter()
+        .find(|(entry, _, hash)| hash.digest() != entry.xxh3)
+    {
+        return Err(corrupt(format!(
+            "retained section {:?} checksum mismatch",
+            entry.kind
+        )));
+    }
+    let mut trailer_hash = [0; 8];
+    let mut trailer_crc = [0; 4];
+    file.read_exact(&mut trailer_hash)?;
+    file.read_exact(&mut trailer_crc)?;
+    let expected_hash = manifest.file_xxh3.to_le_bytes();
+    if prefix_hash.digest() != manifest.file_xxh3
+        || trailer_hash != expected_hash
+        || trailer_crc != crc32fast::hash(&expected_hash).to_le_bytes()
+    {
+        return Err(corrupt(
+            "retained file-prefix or trailer checksum mismatch".into(),
+        ));
+    }
+    let mut extra = [0];
+    if file.read(&mut extra)? != 0 || file.metadata()?.len() != manifest.file_len {
+        return Err(corrupt(
+            "retained segment length changed during verification".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl QuillCassIndex {
     /// Open an existing CASS-schema index, creating it when absent.
     ///
@@ -1302,24 +1463,26 @@ impl QuillCassIndex {
         }
     }
 
-    /// Recheck retained bytes on their existing mappings before publication.
+    /// Recheck every retained file byte before publication.
     ///
     /// Upstream 5ee999 reuses unchanged verified backings instead of mapping
     /// the whole proposed manifest a second time. CASS keeps its full-byte
-    /// maintenance policy: `verify` recomputes every section checksum and the
-    /// file-prefix witness, independently of lazy caches and file stamps.
+    /// maintenance policy: streamed reads recompute every section checksum and
+    /// the file-prefix/trailer witnesses, independently of lazy caches and file
+    /// stamps. A proven Linux mapping identity avoids making the full archive's
+    /// retained mappings resident; other backings also verify their held bytes.
     /// New or changed bindings are still verified by the engine preflight.
     fn with_verified_publication<T>(&self, op: impl FnOnce() -> Result<T>) -> Result<T> {
         self.with_engine_liveness(|| {
             {
                 let snapshot = self.index.snapshot()?;
                 for segment in snapshot.segments() {
-                    segment.verify().map_err(|error| {
+                    verify_retained_segment_file(segment).map_err(|error| {
                         let diagnostic = format!(
                             "verifying retained Quill segment {} before publication: {error}",
                             segment.path().display()
                         );
-                        anyhow::Error::new(error).context(diagnostic)
+                        error.context(diagnostic)
                     })?;
                 }
                 // Release the snapshot before publication; keep no extra
@@ -3066,6 +3229,226 @@ mod tests {
                 .expect("count"),
             2
         );
+    }
+
+    #[test]
+    fn streamed_retained_verification_crosses_buffer_boundaries() {
+        let directory = tempfile::tempdir().expect("streamed verification directory");
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open");
+        let documents: Vec<_> = (0..32)
+            .map(|row| {
+                let content = (0..4096)
+                    .map(|term| format!("streamrow{row}term{term} "))
+                    .collect::<String>();
+                sample(&format!("stream-{row}"), row, &content)
+            })
+            .collect();
+        index
+            .add_cass_documents(&documents)
+            .expect("stage documents");
+        index.commit().expect("publish documents");
+        drop(index);
+        let index = QuillCassIndex::open_or_create(directory.path()).expect("reopen held mappings");
+        let snapshot = index.index.snapshot().expect("published snapshot");
+        assert!(
+            snapshot
+                .segments()
+                .iter()
+                .any(|segment| segment.manifest().file_len > 1024 * 1024),
+            "the native fixture must cross a streamed read boundary"
+        );
+        for segment in snapshot.segments() {
+            #[cfg(target_os = "linux")]
+            assert_eq!(
+                retained_file_binding(
+                    segment,
+                    &std::fs::metadata(segment.path()).expect("mapped file metadata")
+                ),
+                Some(true),
+                "ordinary mapped segments must use the bounded streaming path"
+            );
+            verify_retained_segment_file(segment).expect("streamed integrity");
+            verify_retained_backing(segment, None).expect("conservative held-byte fallback");
+            segment.verify().expect("independent engine integrity");
+        }
+        assert_eq!(index.doc_count().expect("published population"), 32);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publication_rejects_replaced_path_and_corrupt_detached_backing() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::os::unix::fs::MetadataExt;
+
+        for corrupt_old in [false, true] {
+            for action in ["commit", "upsert", "delete", "clear", "merge", "compact"] {
+                let directory = tempfile::tempdir().expect("replacement control directory");
+                let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open");
+                index
+                    .add_cass_documents(&[sample("alpha", 0, "retained replacement control")])
+                    .expect("stage original");
+                index.commit().expect("publish original");
+                drop(index);
+                let mut index =
+                    QuillCassIndex::open_or_create(directory.path()).expect("reopen mapping");
+                let snapshot = index.index.snapshot().expect("held snapshot");
+                let segment = &snapshot.segments()[0];
+                let manifest_before =
+                    std::fs::read(directory.path().join(QUILL_INDEX_MARKER)).expect("manifest");
+                let mut old_file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(segment.path())
+                    .expect("old mapped inode");
+                let original = old_file.metadata().expect("original metadata");
+                assert_eq!(retained_file_binding(segment, &original), Some(true));
+                verify_retained_segment_file(segment).expect("ordinary mapped control");
+                verify_retained_backing(segment, None).expect("ordinary fallback control");
+
+                let detached = directory.path().join("detached-original.fslx");
+                std::fs::rename(segment.path(), &detached).expect("retain original inode");
+                std::fs::copy(&detached, segment.path()).expect("valid replacement file");
+                let replacement = std::fs::File::options()
+                    .read(true)
+                    .write(true)
+                    .open(segment.path())
+                    .expect("replacement descriptor");
+                replacement
+                    .set_times(
+                        std::fs::FileTimes::new()
+                            .set_modified(original.modified().expect("original mtime")),
+                    )
+                    .expect("preserve replacement mtime");
+                replacement.sync_all().expect("persist valid replacement");
+                let replaced = replacement.metadata().expect("replacement metadata");
+                assert_eq!(replaced.len(), original.len());
+                assert_eq!(
+                    replaced.modified().expect("replacement mtime"),
+                    original.modified().expect("original mtime")
+                );
+                assert_ne!(replaced.ino(), original.ino());
+                assert_eq!(retained_file_binding(segment, &replaced), Some(false));
+
+                if corrupt_old {
+                    let offset = original.len() / 2;
+                    old_file
+                        .seek(SeekFrom::Start(offset))
+                        .expect("seek old bytes");
+                    let mut byte = [0];
+                    old_file.read_exact(&mut byte).expect("read old bytes");
+                    old_file
+                        .seek(SeekFrom::Start(offset))
+                        .expect("seek old bytes");
+                    old_file
+                        .write_all(&[byte[0] ^ 0x80])
+                        .expect("corrupt detached mapped inode");
+                    old_file.sync_all().expect("persist detached corruption");
+                    old_file
+                        .set_times(
+                            std::fs::FileTimes::new()
+                                .set_modified(original.modified().expect("original mtime")),
+                        )
+                        .expect("preserve detached mtime");
+                    let error = verify_retained_backing(segment, None)
+                        .expect_err("fallback must examine exact detached held bytes");
+                    assert!(matches!(
+                        error,
+                        frankensearch::quill::QuillError::IndexCorrupted { .. }
+                    ));
+                } else {
+                    verify_retained_backing(segment, None)
+                        .expect("valid detached held-byte fallback control");
+                }
+
+                let replacement_index =
+                    open_cass_reader(directory.path()).expect("valid replacement opens");
+                assert_eq!(replacement_index.doc_count().expect("replacement count"), 1);
+                assert_eq!(
+                    replacement_index
+                        .segment_count()
+                        .expect("replacement segment"),
+                    1
+                );
+                let result = match action {
+                    "commit" => {
+                        index
+                            .add_cass_documents(&[sample("beta", 1, "pending successor")])
+                            .expect("stage successor");
+                        index.commit()
+                    }
+                    "upsert" => index.upsert_cass_documents(&[sample("alpha", 0, "replacement")]),
+                    "delete" => index.delete_document_ids(&["missing".into()]).map(|_| ()),
+                    "clear" => index.delete_all(),
+                    "merge" => index.force_merge(),
+                    "compact" => index.compact_tombstones().map(|_| ()),
+                    _ => unreachable!("declared actions"),
+                };
+                let error = result.expect_err("replacement must refuse retained publication");
+                assert!(format!("{error:#}").contains("current file identity differ"));
+                assert_eq!(
+                    std::fs::read(directory.path().join(QUILL_INDEX_MARKER)).expect("manifest"),
+                    manifest_before,
+                    "{action}, corrupt_old={corrupt_old}: replacement changed publication"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_retained_verification_rejects_header_trailer_and_length_changes() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        for mutation in ["header", "trailer", "truncate", "append"] {
+            let directory = tempfile::tempdir().expect("streamed corruption directory");
+            let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open");
+            index
+                .add_cass_documents(&[sample("streamed", 0, "integrity control")])
+                .expect("stage control");
+            index.commit().expect("publish control");
+            let snapshot = index.index.snapshot().expect("admitted snapshot");
+            let segment = &snapshot.segments()[0];
+            verify_retained_segment_file(segment).expect("unmodified streamed control");
+            segment.verify().expect("unmodified engine control");
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(segment.path())
+                .expect("open disposable segment");
+            let metadata = file.metadata().expect("original metadata");
+            match mutation {
+                "header" | "trailer" => {
+                    let offset = if mutation == "header" {
+                        16
+                    } else {
+                        metadata.len() - 1
+                    };
+                    file.seek(SeekFrom::Start(offset)).expect("seek witness");
+                    let mut byte = [0];
+                    file.read_exact(&mut byte).expect("read witness");
+                    file.seek(SeekFrom::Start(offset)).expect("seek witness");
+                    file.write_all(&[byte[0] ^ 0x80]).expect("alter witness");
+                }
+                "truncate" => file.set_len(metadata.len() - 1).expect("truncate control"),
+                "append" => {
+                    file.seek(SeekFrom::End(0)).expect("seek end");
+                    file.write_all(&[0]).expect("append control");
+                }
+                _ => unreachable!("declared mutations"),
+            }
+            file.sync_all().expect("persist mutation");
+            file.set_times(
+                std::fs::FileTimes::new().set_modified(metadata.modified().expect("mtime")),
+            )
+            .expect("restore original mtime");
+            let error = verify_retained_segment_file(segment).expect_err(mutation);
+            assert!(
+                matches!(
+                    error.downcast_ref::<frankensearch::quill::QuillError>(),
+                    Some(frankensearch::quill::QuillError::IndexCorrupted { .. })
+                ),
+                "{mutation} must retain the typed corruption cause: {error:#}"
+            );
+        }
     }
 
     /// A writer already holding a verified snapshot must detect later byte
