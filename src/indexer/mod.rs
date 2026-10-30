@@ -13075,6 +13075,83 @@ fn scan_with_durable_source_boundaries(
     Ok(())
 }
 
+/// Watch scans must parse the selected sources, but use the same dependency
+/// observations as streaming ingestion before certifying their final batch.
+fn scan_watch_with_source_boundaries(
+    connector: &dyn Connector,
+    ctx: &ScanContext,
+    connector_name: &str,
+    conversations: &mut Vec<NormalizedConversation>,
+    completions: &mut BTreeMap<PathBuf, crate::storage::sqlite::SourceIngestLedgerEntry>,
+) -> Result<()> {
+    if !connector.supports_source_boundaries() {
+        return connector.scan_with_callback(ctx, &mut |conversation| {
+            conversations.push(conversation);
+            Ok(())
+        });
+    }
+    let dependencies_before =
+        if crate::connectors::source_dependencies::source_dependency_policy(connector_name)
+            .observes_parent_directory()
+        {
+            crate::connectors::source_dependencies::observation::DependencyObservations::capture(
+                connector
+                    .discover_source_files(ctx)?
+                    .into_iter()
+                    .map(|source| source.source_path),
+            )
+        } else {
+            Default::default()
+        };
+    let primary_before = std::cell::RefCell::new(None);
+    let parent_before = std::cell::RefCell::new(None);
+    let mut should_scan = |source: &DiscoveredSourceFile| {
+        *primary_before.borrow_mut() = source_file_observation(&source.source_path);
+        *parent_before.borrow_mut() = dependencies_before.parent_for(&source.source_path).cloned();
+        tracing::debug!(connector=%source.provider_slug, skipped=false, "source_ingest_observation");
+        true
+    };
+    let mut complete = |completion: &franken_agent_detection::connectors::SourceCompletion| {
+        if completion.conversations_emitted == 0
+            || completion.source.fs_metadata_changed()
+            || completion
+                .required_sidecars
+                .iter()
+                .any(DiscoveredSourceFile::fs_metadata_changed)
+        {
+            return Ok(());
+        }
+        let Some((primary, dependencies)) = source_observations_after_scan(
+            &completion.source,
+            &completion.required_sidecars,
+            primary_before.borrow().as_ref(),
+            parent_before.borrow().as_ref(),
+            &dependencies_before.files,
+        ) else {
+            return Ok(());
+        };
+        completions.insert(
+            completion.source.source_path.clone(),
+            crate::storage::sqlite::SourceIngestLedgerEntry {
+                key: source_ledger_key(&completion.source, ctx),
+                observation: serde_json::json!({"primary":primary,"dependencies":dependencies,
+                    "producer_contract":crate::connectors::ingest_contract::provider_contract(
+                        &completion.source.provider_slug)})
+                .to_string(),
+            },
+        );
+        Ok(())
+    };
+    let mut hooks = franken_agent_detection::connectors::SourceScanHooks {
+        should_scan_source: Some(&mut should_scan),
+        on_source_complete: Some(&mut complete),
+    };
+    connector.scan_with_source_boundaries(ctx, &mut hooks, &mut |conversation| {
+        conversations.push(conversation);
+        Ok(())
+    })
+}
+
 impl<'a> StreamingBatchSender<'a> {
     fn new(
         tx: &'a Sender<IndexMessage>,
@@ -26982,6 +27059,7 @@ fn ingest_batch_with_semantic_delta(
     lexical_strategy: LexicalPopulationStrategy,
     defer_checkpoints: bool,
     semantic_delta: Option<&mut WatchSemanticDelta>,
+    completion: Option<&crate::storage::sqlite::SourceIngestLedgerEntry>,
 ) -> Result<persist::PersistBatchOutcome> {
     let trace_span = robot_trace_ingest_start(
         "ingest_batch_with_semantic_delta",
@@ -27003,6 +27081,7 @@ fn ingest_batch_with_semantic_delta(
             lexical_strategy,
             defer_checkpoints,
             heartbeat,
+            completion,
         )
     } else {
         persist::persist_conversations_batched_with_raw_mirror_links(
@@ -27013,6 +27092,7 @@ fn ingest_batch_with_semantic_delta(
             lexical_strategy,
             defer_checkpoints,
             heartbeat,
+            completion,
         )
     };
     drop(_persist_in_progress);
@@ -27048,6 +27128,7 @@ fn ingest_batch_with_semantic_delta(
 #[derive(Debug, Default)]
 struct WatchIngestBatchOutcome {
     batch_outcome: persist::PersistBatchOutcome,
+    source_completion_written: bool,
     processed_conversations: usize,
     quarantined_conversations: usize,
     /// Conversations skipped this pass by the #298 plausibility gate (bounded
@@ -27061,6 +27142,7 @@ struct WatchIngestBatchOutcome {
 impl WatchIngestBatchOutcome {
     fn merge(&mut self, other: Self) {
         self.batch_outcome.merge(other.batch_outcome);
+        self.source_completion_written |= other.source_completion_written;
         self.processed_conversations = self
             .processed_conversations
             .saturating_add(other.processed_conversations);
@@ -27137,6 +27219,7 @@ fn ingest_watch_batch_with_oom_split(
         capture_semantic_delta,
         WatchOomIngestMode::Standard,
         false,
+        None,
     )
 }
 
@@ -27151,6 +27234,7 @@ fn ingest_watch_batch_with_oom_split_inner(
     capture_semantic_delta: bool,
     mode: WatchOomIngestMode,
     replay_canonical: bool,
+    completion: Option<&crate::storage::sqlite::SourceIngestLedgerEntry>,
 ) -> Result<WatchIngestBatchOutcome> {
     debug_assert!(!convs.is_empty());
 
@@ -27181,6 +27265,7 @@ fn ingest_watch_batch_with_oom_split_inner(
             },
             defer_checkpoints,
             capture_semantic_delta.then_some(&mut semantic_delta),
+            completion,
         )
     };
 
@@ -27195,6 +27280,9 @@ fn ingest_watch_batch_with_oom_split_inner(
                 .then(|| conversations_payload_watermark_ms(convs))
                 .flatten();
             Ok(WatchIngestBatchOutcome {
+                source_completion_written: completion.is_some()
+                    && !batch_outcome.canonical_conversation_ids.is_empty()
+                    && batch_outcome.incomplete_sources.is_empty(),
                 batch_outcome,
                 processed_conversations: convs.len(),
                 quarantined_conversations: 0,
@@ -27221,6 +27309,7 @@ fn ingest_watch_batch_with_oom_split_inner(
                 capture_semantic_delta,
                 mode,
                 replay_canonical,
+                None,
             )?;
             let right = ingest_watch_batch_with_oom_split_inner(
                 storage,
@@ -27232,6 +27321,7 @@ fn ingest_watch_batch_with_oom_split_inner(
                 capture_semantic_delta,
                 mode,
                 replay_canonical,
+                None,
             )?;
             merged.merge(right);
             Ok(merged)
@@ -27280,6 +27370,7 @@ fn ingest_watch_batch_with_oom_split_inner(
                     capture_semantic_delta,
                     WatchOomIngestMode::SoloIsolatedRetry,
                     replay_canonical,
+                    None,
                 )
             };
 
@@ -27364,6 +27455,7 @@ fn ingest_watch_batch_with_oom_split_inner(
                         }
                         return Ok(WatchIngestBatchOutcome {
                             batch_outcome: persist::PersistBatchOutcome::default(),
+                            source_completion_written: false,
                             processed_conversations: 1,
                             quarantined_conversations: 0,
                             deferred_conversations: 1,
@@ -27420,6 +27512,7 @@ fn quarantine_single_watch_conversation(
     );
     Ok(WatchIngestBatchOutcome {
         batch_outcome: persist::PersistBatchOutcome::default(),
+        source_completion_written: false,
         processed_conversations: 1,
         quarantined_conversations: 1,
         deferred_conversations: 0,
@@ -30369,10 +30462,14 @@ fn reindex_paths_with_semantic_delta(
         // SCAN PHASE: IO-heavy, no locks held
         let scan_start = Instant::now();
         let mut convs = Vec::new();
-        let scan_error = match conn.scan_with_callback(&ctx, &mut |conversation| {
-            convs.push(conversation);
-            Ok(())
-        }) {
+        let mut source_completions = BTreeMap::new();
+        let scan_error = match scan_watch_with_source_boundaries(
+            conn.as_ref(),
+            &ctx,
+            kind.slug(),
+            &mut convs,
+            &mut source_completions,
+        ) {
             Ok(()) => None,
             Err(error) => {
                 ingest_diagnostics.observe_connector_scan_error(&root.path, &error);
@@ -30443,6 +30540,7 @@ fn reindex_paths_with_semantic_delta(
         convs.retain(|conv| {
             !should_skip_subagent(conv) && !should_skip_excluded_source(&conv.source_path)
         });
+        let all_sources_retained = convs.len() == pre_active_filter_count;
 
         for conversation in &mut convs {
             ingest_diagnostics.observe_conversation(conversation);
@@ -30450,7 +30548,9 @@ fn reindex_paths_with_semantic_delta(
         record_connector_ingest_report(opts.progress.as_ref(), ingest_diagnostics.finish());
 
         // Provenance injection and path rewriting
+        let mut prepared_source_completions = BTreeMap::new();
         for conv in &mut convs {
+            let completion = source_completions.remove_entry(&conv.source_path);
             prepare_conversation_for_ingest(
                 &opts.data_dir,
                 kind.slug(),
@@ -30458,6 +30558,14 @@ fn reindex_paths_with_semantic_delta(
                 Some(&root),
                 conv,
             );
+            if let Some((mut source_path, completion)) = completion {
+                // Move the existing owned key; refresh its buffer only when
+                // provenance rewriting changed the conversation's path.
+                if source_path != conv.source_path {
+                    source_path.clone_from(&conv.source_path);
+                }
+                prepared_source_completions.insert(source_path, completion);
+            }
         }
         // Watermark order for live watch; a total order (watermark, path,
         // external id) for every batch, so canonical ids never depend on the
@@ -30478,6 +30586,14 @@ fn reindex_paths_with_semantic_delta(
                 FrankenStorage::now_millis(),
             )
         };
+        if preserve_this_watch_watermark || !all_sources_retained || nomem_backoff_held > 0 {
+            prepared_source_completions.clear();
+        }
+        let final_source_positions: BTreeMap<_, _> = convs
+            .iter()
+            .enumerate()
+            .map(|(position, conv)| (&conv.source_path, position))
+            .collect();
 
         // Update total and phase to indexing
         if let Some(p) = &opts.progress {
@@ -30554,7 +30670,30 @@ fn reindex_paths_with_semantic_delta(
                 watch_ingest_chunk_size()
             };
             let capture_semantic_delta = semantic_delta.is_some();
-            for chunk in convs.chunks(ingest_chunk_size) {
+            let mut chunk_start = 0;
+            while chunk_start < convs.len() {
+                // Keep watermark order, but finish a batch at each source's
+                // final conversation so its marker shares the final canonical
+                // transaction. Interleaved earlier conversations remain
+                // covered, and any prior deferral withholds later markers.
+                let chunk_limit = chunk_start
+                    .saturating_add(ingest_chunk_size)
+                    .min(convs.len());
+                let completed_source = (chunk_start..chunk_limit).find_map(|position| {
+                    let path = &convs.get(position)?.source_path;
+                    (prepared_source_completions.contains_key(path)
+                        && final_source_positions.get(path) == Some(&position))
+                    .then_some((position, path))
+                });
+                let chunk_end = completed_source
+                    .map_or(chunk_limit, |(position, _)| position.saturating_add(1));
+                let chunk = convs.get(chunk_start..chunk_end).context(
+                    "watch source-completion batch is outside the scanned conversations",
+                )?;
+                chunk_start = chunk_end;
+                let completion = completed_source
+                    .filter(|_| quarantined_conversations == 0 && deferred_conversations == 0)
+                    .and_then(|(_, path)| prepared_source_completions.get(path));
                 if let Some(pending) = load_lexical_rebuild_state(index_path)?
                     && pending.is_incomplete()
                     // ubs:ignore -- This checks the persisted rebuild checkpoint format version.
@@ -30600,6 +30739,7 @@ fn reindex_paths_with_semantic_delta(
                         capture_semantic_delta,
                         WatchOomIngestMode::Standard,
                         replay_canonical,
+                        completion,
                     )?
                 };
                 if persist::defer_lexical_updates_enabled() {
@@ -30676,13 +30816,26 @@ fn reindex_paths_with_semantic_delta(
                         "dropping uncommitted watch Tantivy writer after deferred lexical update"
                     );
                     *t_index_guard = None;
-                } else {
+                } else if chunk_outcome.batch_outcome.lexical_write_attempted
+                    || replay_canonical
+                    || chunk_outcome.batch_outcome.workspace_changes > 0
+                {
+                    // No engine call is needed when this callback attempted
+                    // no lexical mutation. Actual writes, recovery debt and
+                    // workspace repair retain the full publication preflight.
                     #[cfg(test)]
                     inject_watch_lexical_test_failure(WatchLexicalTestFault::Commit)?;
                     t_index_guard
                         .as_mut()
                         .expect("watch Tantivy writer must still be open before commit")
                         .commit()?;
+                }
+                if chunk_outcome.source_completion_written {
+                    tracing::info!(
+                        connector = kind.slug(),
+                        conversations = chunk.len(),
+                        "source_ingest_committed"
+                    );
                 }
 
                 // Keep last_indexed_at current so `cass status` doesn't report stale during watch mode.
@@ -33388,6 +33541,9 @@ pub mod persist {
         pub workspace_changes: usize,
         pub semantic_delta_max_message_id: Option<i64>,
         pub semantic_delta_inputs: Vec<EmbeddingInput>,
+        /// Sticky across slices/split retries, including writes that failed.
+        /// Canonical row counts alone do not cover native snapshot retirement.
+        pub lexical_write_attempted: bool,
         pub lexical_update_deferred: bool,
         pub lexical_update_error: Option<String>,
         pub incomplete_sources: BTreeSet<PathBuf>,
@@ -33445,6 +33601,7 @@ pub mod persist {
         }
 
         pub(super) fn merge(&mut self, other: Self) {
+            self.lexical_write_attempted |= other.lexical_write_attempted;
             self.canonical_conversation_ids
                 .extend(other.canonical_conversation_ids);
             self.incomplete_sources.extend(other.incomplete_sources);
@@ -34640,6 +34797,7 @@ pub mod persist {
             && !defer_lexical_updates
             && lexical_strategy == LexicalPopulationStrategy::InlineRebuildFromScan;
         if rebuild_inline {
+            batch_outcome.lexical_write_attempted = true;
             // Quill resolves replacement identities against published state.
             // Publish any preceding incremental additions once at this batch
             // boundary, rather than sealing every canonical conversation.
@@ -34677,6 +34835,7 @@ pub mod persist {
                         &outcome.updated_indices,
                     ) =>
                 {
+                    batch_outcome.lexical_write_attempted = true;
                     let result = persist_native_projection_lexical(
                         storage,
                         t_index
@@ -34723,6 +34882,7 @@ pub mod persist {
                         )?;
                         let positional = positional_indices_for_inserted(&packet, &changed_indices);
                         if !positional.is_empty() {
+                            batch_outcome.lexical_write_attempted = true;
                             let add_result = if should_inject_incremental_lexical_update_oom() {
                                 Err(anyhow::anyhow!("out of memory"))
                             } else {
@@ -35282,6 +35442,7 @@ pub mod persist {
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
         heartbeat: PersistHeartbeat<'_>,
+        completion: Option<&crate::storage::sqlite::SourceIngestLedgerEntry>,
     ) -> Result<PersistBatchOutcome> {
         persist_conversations_batched_inner(
             storage,
@@ -35292,7 +35453,7 @@ pub mod persist {
             false,
             Some(data_dir),
             heartbeat,
-            None,
+            completion,
         )
     }
 
@@ -35307,6 +35468,7 @@ pub mod persist {
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
         heartbeat: PersistHeartbeat<'_>,
+        completion: Option<&crate::storage::sqlite::SourceIngestLedgerEntry>,
     ) -> Result<PersistBatchOutcome> {
         persist_conversations_batched_inner(
             storage,
@@ -35317,7 +35479,7 @@ pub mod persist {
             true,
             Some(data_dir),
             heartbeat,
-            None,
+            completion,
         )
     }
 
@@ -35984,6 +36146,7 @@ pub mod persist {
             let rebuild_inline = !outcomes.is_empty()
                 && lexical_strategy == LexicalPopulationStrategy::InlineRebuildFromScan;
             if rebuild_inline {
+                batch_outcome.lexical_write_attempted = true;
                 // A prior direct or batched incremental call may still have
                 // staged identities. Establish the published batch boundary
                 // before Quill resolves canonical replacements.
@@ -36016,6 +36179,7 @@ pub mod persist {
                             &outcome.updated_indices,
                         ) =>
                     {
+                        batch_outcome.lexical_write_attempted = true;
                         let result = persist_native_projection_lexical(
                             storage,
                             t_index
@@ -36061,6 +36225,7 @@ pub mod persist {
                             let positional =
                                 positional_indices_for_inserted(&packet, &changed_indices);
                             if !positional.is_empty() {
+                                batch_outcome.lexical_write_attempted = true;
                                 let add_result = if should_inject_incremental_lexical_update_oom() {
                                     Err(anyhow::anyhow!("out of memory"))
                                 } else {
@@ -45090,6 +45255,7 @@ mod tests {
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             false,
             persist::PersistHeartbeat::NONE,
+            None,
         )
         .unwrap();
         assert_eq!(outcome.workspace_changes, 1);
@@ -45158,6 +45324,7 @@ mod tests {
                 LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
                 false,
                 persist::PersistHeartbeat::NONE,
+                None,
             )
             .is_err()
         );
@@ -61783,7 +61950,7 @@ c.close()
     }
 
     #[test]
-    fn classify_paths_keeps_omp_xdg_sessions_root_for_watch_once() {
+    fn classify_paths_keeps_explicit_omp_xdg_file_for_watch_once() {
         let tmp = tempfile::tempdir().unwrap();
         let sessions_root = tmp.path().join("share/omp/sessions");
         let session = sessions_root
@@ -61793,21 +61960,24 @@ c.close()
         std::fs::write(&session, b"{}\n").unwrap();
         let roots = vec![(ConnectorKind::Omp, ScanRoot::local(sessions_root.clone()))];
 
-        let classified = classify_paths(vec![session], &roots, true);
-
-        assert_eq!(classified.len(), 1);
-        assert_eq!(classified[0].0, ConnectorKind::Omp);
-        assert_eq!(
-            classified[0].1.path,
-            dunce::canonicalize(sessions_root).unwrap()
-        );
-        assert!(classified[0].2.is_some());
-        assert!(classified[0].3.is_some());
+        // GH350: only an explicit directory request may scan that directory.
+        // A file request must not admit unrequested neighbouring sessions.
+        for requested in [&session, &sessions_root] {
+            let classified = classify_paths(vec![requested.clone()], &roots, true);
+            assert_eq!(classified.len(), 1);
+            assert_eq!(classified[0].0, ConnectorKind::Omp);
+            assert_eq!(
+                classified[0].1.path,
+                dunce::canonicalize(requested).unwrap()
+            );
+            assert!(classified[0].2.is_some());
+            assert!(classified[0].3.is_some());
+        }
     }
 
     #[test]
     #[serial]
-    fn classify_paths_keeps_custom_omp_session_override_for_watch_once() {
+    fn classify_paths_keeps_custom_omp_file_override_for_watch_once() {
         let tmp = tempfile::tempdir().unwrap();
         let sessions_root = tmp.path().join("launch-sessions");
         let session = sessions_root
@@ -61820,16 +61990,18 @@ c.close()
             sessions_root.to_string_lossy(),
         );
 
-        let classified = classify_paths(vec![session], &[], true);
-
-        assert_eq!(classified.len(), 1);
-        assert_eq!(classified[0].0, ConnectorKind::Omp);
-        assert_eq!(
-            classified[0].1.path,
-            dunce::canonicalize(sessions_root).unwrap()
-        );
-        assert!(classified[0].2.is_some());
-        assert!(classified[0].3.is_some());
+        // Keep both supported requests distinct under an unconventional root.
+        for requested in [&session, &sessions_root] {
+            let classified = classify_paths(vec![requested.clone()], &[], true);
+            assert_eq!(classified.len(), 1);
+            assert_eq!(classified[0].0, ConnectorKind::Omp);
+            assert_eq!(
+                classified[0].1.path,
+                dunce::canonicalize(requested).unwrap()
+            );
+            assert!(classified[0].2.is_some());
+            assert!(classified[0].3.is_some());
+        }
     }
 
     #[test]
@@ -64526,6 +64698,233 @@ c.close()
             &index_dir(&opts.data_dir)?,
             false,
         )
+    }
+
+    #[test]
+    #[serial]
+    fn watch_source_completion_reparse_skips_only_unmutated_lexical_commit() {
+        let temp = TempDir::new().unwrap();
+        let sessions = temp.path().join(".codex/sessions");
+        let data_dir = temp.path().join("cass");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+        for (name, marker) in [
+            ("first", "watchfirstneedle"),
+            ("second", "watchsecondneedle"),
+        ] {
+            write_semantic_watch_once_codex_session(
+                &sessions.join(format!("rollout-{name}.jsonl")),
+                name,
+                marker,
+            )
+            .unwrap();
+        }
+        let mut opts = watch_lexical_options(&data_dir);
+        opts.watch_once_paths = Some(vec![sessions.clone()]);
+        let storage = Mutex::new(FrankenStorage::open(&opts.db_path).unwrap());
+        let index_path = index_dir(&data_dir).unwrap();
+        let index = Mutex::new(None);
+        let roots = [(ConnectorKind::Codex, ScanRoot::local(sessions.clone()))];
+        let state = Mutex::new(HashMap::new());
+        let run = || {
+            reindex_paths(
+                &opts,
+                vec![sessions.clone()],
+                &roots,
+                &state,
+                &storage,
+                &index,
+                &index_path,
+                true,
+            )
+        };
+        assert_eq!(run().unwrap(), 2);
+        let ledger = storage
+            .lock()
+            .unwrap()
+            .source_ingest_ledger_entries()
+            .unwrap();
+        assert_eq!(ledger.len(), 2);
+        let canonical = watch_lexical_canonical_rows(&storage.lock().unwrap());
+        assert_eq!(canonical.len(), 4);
+        let manifest = fs::read(index_path.join("MANIFEST")).unwrap();
+        {
+            let _fault = WatchLexicalFaultGuard::set(WatchLexicalTestFault::Commit);
+            // Force actual parsing: this cannot pass via last_indexed_at or
+            // ledger reuse. The no-op must not enter the commit fault point.
+            assert_eq!(run().unwrap(), 2);
+        }
+        assert_eq!(
+            storage
+                .lock()
+                .unwrap()
+                .source_ingest_ledger_entries()
+                .unwrap(),
+            ledger
+        );
+        assert_eq!(
+            watch_lexical_canonical_rows(&storage.lock().unwrap()),
+            canonical
+        );
+        assert_eq!(fs::read(index_path.join("MANIFEST")).unwrap(), manifest);
+        assert_eq!(
+            watch_lexical_search_ids(&index_path, "watchfirstneedle").len(),
+            2
+        );
+        assert_eq!(
+            watch_lexical_search_ids(&index_path, "watchsecondneedle").len(),
+            2
+        );
+
+        write_semantic_watch_once_codex_session(
+            &sessions.join("rollout-third.jsonl"),
+            "third",
+            "watchthirdneedle",
+        )
+        .unwrap();
+        {
+            let _fault = WatchLexicalFaultGuard::set(WatchLexicalTestFault::Commit);
+            assert!(run().is_err(), "actual additions must still commit");
+        }
+        assert_eq!(fs::read(index_path.join("MANIFEST")).unwrap(), manifest);
+        assert!(
+            !watch_lexical_replay_debt_for_root(
+                &storage.lock().unwrap(),
+                ConnectorKind::Codex,
+                &roots[0].1,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(run().unwrap(), 3);
+        assert_eq!(
+            storage
+                .lock()
+                .unwrap()
+                .source_ingest_ledger_entries()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            watch_lexical_search_ids(&index_path, "watchthirdneedle").len(),
+            2
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn watch_source_completion_preserves_old_marker_on_canonical_conflict() {
+        let temp = TempDir::new().unwrap();
+        let sessions = temp.path().join(".codex/sessions");
+        let data_dir = temp.path().join("cass");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+        let source = sessions.join("rollout-conflict.jsonl");
+        write_semantic_watch_once_codex_session(&source, "conflict", "watchretainedneedle")
+            .unwrap();
+        let mut opts = watch_lexical_options(&data_dir);
+        opts.watch_once_paths = Some(vec![source.clone()]);
+        let storage = Mutex::new(FrankenStorage::open(&opts.db_path).unwrap());
+        let index_path = index_dir(&data_dir).unwrap();
+        let index = Mutex::new(None);
+        let roots = [(ConnectorKind::Codex, ScanRoot::local(source.clone()))];
+        let state = Mutex::new(HashMap::new());
+        let run = || {
+            reindex_paths(
+                &opts,
+                vec![source.clone()],
+                &roots,
+                &state,
+                &storage,
+                &index,
+                &index_path,
+                true,
+            )
+        };
+        assert_eq!(run().unwrap(), 1);
+        let ledger = storage
+            .lock()
+            .unwrap()
+            .source_ingest_ledger_entries()
+            .unwrap();
+        assert_eq!(ledger.len(), 1);
+        let canonical = watch_lexical_canonical_rows(&storage.lock().unwrap());
+        write_semantic_watch_once_codex_session(&source, "conflict", "watchconflictingneedle")
+            .unwrap();
+        assert_eq!(run().unwrap(), 1);
+        assert_eq!(
+            storage
+                .lock()
+                .unwrap()
+                .source_ingest_ledger_entries()
+                .unwrap(),
+            ledger
+        );
+        assert_eq!(
+            watch_lexical_canonical_rows(&storage.lock().unwrap()),
+            canonical
+        );
+        assert!(watch_lexical_search_ids(&index_path, "watchconflictingneedle").is_empty());
+        assert_eq!(
+            watch_lexical_search_ids(&index_path, "watchretainedneedle").len(),
+            2
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn watch_source_completion_oom_retry_does_not_certify_source() {
+        let temp = TempDir::new().unwrap();
+        let sessions = temp.path().join(".codex/sessions");
+        let data_dir = temp.path().join("cass");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+        let source = sessions.join("rollout-oom.jsonl");
+        write_semantic_watch_once_codex_session(&source, "oom", "watchoomneedle").unwrap();
+        let mut opts = watch_lexical_options(&data_dir);
+        opts.watch_once_paths = Some(vec![source.clone()]);
+        let storage = Mutex::new(FrankenStorage::open(&opts.db_path).unwrap());
+        let index_path = index_dir(&data_dir).unwrap();
+        let index = Mutex::new(None);
+        let roots = [(ConnectorKind::Codex, ScanRoot::local(source.clone()))];
+        let state = Mutex::new(HashMap::new());
+        {
+            // A real solo recovery follows this typed OOM. Its canonical
+            // rows and lexical documents may succeed, but only a fresh
+            // complete source attempt can publish the completion marker.
+            let _oom = set_env("CASS_TEST_WATCH_INGEST_OOM_MIN_CONVS", "1");
+            assert_eq!(
+                reindex_paths(
+                    &opts,
+                    vec![source.clone()],
+                    &roots,
+                    &state,
+                    &storage,
+                    &index,
+                    &index_path,
+                    true,
+                )
+                .unwrap(),
+                1
+            );
+        }
+        assert!(
+            storage
+                .lock()
+                .unwrap()
+                .source_ingest_ledger_entries()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            watch_lexical_canonical_rows(&storage.lock().unwrap()).len(),
+            2
+        );
+        assert_eq!(
+            watch_lexical_search_ids(&index_path, "watchoomneedle").len(),
+            2
+        );
     }
 
     #[test]
