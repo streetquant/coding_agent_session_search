@@ -11064,7 +11064,9 @@ pub(crate) fn lexical_storage_fingerprint_for_db_strict(db_path: &Path) -> Resul
 /// never hits on the path that matters most.
 pub(crate) const ARCHIVE_FINGERPRINT_CACHE_FILE: &str = ".archive-fingerprint-cache.json";
 
-const ARCHIVE_FINGERPRINT_CACHE_SCHEMA_VERSION: u32 = 1;
+// Version 1 could bind an older completed checkpoint to newer archive bytes.
+// Recompute those sidecars before trusting their fingerprint again.
+const ARCHIVE_FINGERPRINT_CACHE_SCHEMA_VERSION: u32 = 2;
 
 /// Physical identity of a canonical archive for fingerprint memoization: the
 /// size and mtime of the main database file and of its WAL sidecar. Any
@@ -11156,17 +11158,6 @@ fn write_archive_fingerprint_cache_for_identity(
     }
 }
 
-pub(crate) fn write_archive_fingerprint_cache_best_effort(
-    db_path: &Path,
-    cache_dir: &Path,
-    fingerprint: &str,
-) {
-    let Some(identity) = lexical_storage_physical_identity(db_path) else {
-        return;
-    };
-    write_archive_fingerprint_cache_for_identity(&identity, cache_dir, fingerprint);
-}
-
 pub(crate) fn prime_archive_fingerprint_cache_from_completed_checkpoint(
     db_path: &Path,
     index_path: &Path,
@@ -11175,11 +11166,22 @@ pub(crate) fn prime_archive_fingerprint_cache_from_completed_checkpoint(
         return;
     };
     if checkpoint.completed && crate::stored_path_identity_matches(&checkpoint.db_path, db_path) {
-        write_archive_fingerprint_cache_best_effort(
-            db_path,
-            index_path,
-            &checkpoint.storage_fingerprint,
-        );
+        // The checkpoint describes the indexed snapshot. Canonical rows can
+        // advance during a no-op run, so bind the actual strict-read fingerprint
+        // to the archive identity observed before opening the reader.
+        let Some(identity) = lexical_storage_physical_identity(db_path) else {
+            return;
+        };
+        match lexical_storage_fingerprint_for_db_strict(db_path) {
+            Ok(fingerprint) => {
+                write_archive_fingerprint_cache_for_identity(&identity, index_path, &fingerprint);
+            }
+            Err(err) => tracing::debug!(
+                error = %err,
+                db_path = %db_path.display(),
+                "archive fingerprint cache priming skipped"
+            ),
+        }
     }
 }
 
@@ -71465,6 +71467,140 @@ c.close()
         storage
             .insert_conversations_batched(&[(agent_id, None, &conversation)])
             .unwrap();
+    }
+
+    #[test]
+    fn checkpoint_primed_archive_cache_preserves_new_canonical_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        storage.run_migrations().unwrap();
+        seed_archive_conversation(&storage, "first");
+
+        let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+        let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let mut conversation = norm_conv(Some("first"), vec![norm_msg(0, 1_700_000_000_050)]);
+        conversation.agent_slug = "tester".into();
+        conversation.workspace = Some(PathBuf::from("/tmp/workspace"));
+        conversation.source_path = PathBuf::from("/tmp/first.jsonl");
+        conversation.messages[0].content = "fingerprint cache seed first".into();
+        index
+            .add_messages_with_conversation_id(&conversation, &conversation.messages, Some(1))
+            .unwrap();
+        index.commit().unwrap();
+        drop(index);
+        assert_eq!(live_tantivy_doc_count(&index_path).unwrap(), Some(1));
+
+        let mut state = LexicalRebuildState::new(
+            lexical_rebuild_db_state(&storage, &db_path).unwrap(),
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+        state.processed_conversations = 1;
+        state.indexed_docs = 1;
+        state.committed_offset = 1;
+        state.committed_conversation_id = Some(1);
+        state.mark_completed(index_meta_fingerprint(&index_path).unwrap());
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+        let completed_fingerprint = state.db.storage_fingerprint.clone();
+        storage.close_without_checkpoint().unwrap();
+
+        prime_archive_fingerprint_cache_from_completed_checkpoint(&db_path, &index_path);
+        assert_eq!(
+            lexical_storage_fingerprint_for_db_cached_readonly(&db_path, &index_path),
+            Some(completed_fingerprint.clone()),
+            "an unchanged completed archive can still prime its current fingerprint"
+        );
+
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        seed_archive_conversation(&storage, "second");
+        storage.close_without_checkpoint().unwrap();
+        let current = lexical_storage_fingerprint_for_db_strict(&db_path).unwrap();
+        assert_ne!(current, completed_fingerprint);
+        let current_identity = lexical_storage_physical_identity(&db_path).unwrap();
+        write_archive_fingerprint_cache_for_identity(&current_identity, &index_path, &current);
+
+        prime_archive_fingerprint_cache_from_completed_checkpoint(&db_path, &index_path);
+        assert_eq!(
+            lexical_storage_fingerprint_for_db_cached_readonly(&db_path, &index_path),
+            Some(current.clone()),
+            "a no-op index run must not replace the current archive fingerprint with an older checkpoint"
+        );
+        assert_eq!(
+            load_lexical_rebuild_checkpoint(&index_path)
+                .unwrap()
+                .unwrap()
+                .storage_fingerprint,
+            completed_fingerprint,
+            "cache priming must preserve the genuinely older index checkpoint"
+        );
+        assert_eq!(live_tantivy_doc_count(&index_path).unwrap(), Some(1));
+        let snapshot = crate::search::asset_state::inspect_search_assets(
+            crate::search::asset_state::InspectSearchAssetsInput {
+                data_dir: &data_dir,
+                db_path: &db_path,
+                stale_threshold: 3600,
+                last_indexed_at_ms: Some(FrankenStorage::now_millis()),
+                now_ms: FrankenStorage::now_millis(),
+                maintenance: crate::search::asset_state::SearchMaintenanceSnapshot::default(),
+                semantic_preference: crate::search::asset_state::SemanticPreference::HashFallback,
+                db_available: true,
+                compute_lexical_fingerprint: false,
+                inspect_semantic: false,
+                probe_semantic_ann: crate::search::asset_state::SemanticAnnProbeMode::Bounded,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.lexical.fingerprint.current_db_fingerprint,
+            Some(current)
+        );
+        assert_eq!(
+            snapshot.lexical.fingerprint.matches_current_db_fingerprint,
+            Some(false)
+        );
+        assert_eq!(snapshot.lexical.status, "stale");
+    }
+
+    #[test]
+    fn legacy_checkpoint_primed_archive_cache_is_not_trusted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("db.sqlite");
+        let cache_dir = tmp.path().join("index");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        storage.run_migrations().unwrap();
+        seed_archive_conversation(&storage, "first");
+        let old_fingerprint = lexical_storage_fingerprint_for_storage(&storage).unwrap();
+        seed_archive_conversation(&storage, "second");
+        storage.close_without_checkpoint().unwrap();
+        let current = lexical_storage_fingerprint_for_db_strict(&db_path).unwrap();
+        assert_ne!(current, old_fingerprint);
+        let identity = lexical_storage_physical_identity(&db_path).unwrap();
+        let legacy = ArchiveFingerprintCache {
+            schema_version: 1,
+            identity: identity.clone(),
+            fingerprint: old_fingerprint,
+            computed_at_ms: FrankenStorage::now_millis(),
+        };
+        let cache_path = cache_dir.join(ARCHIVE_FINGERPRINT_CACHE_FILE); // ubs:ignore -- Fixed cache basename in the legacy sidecar fixture.
+        std::fs::write(&cache_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        assert_eq!(
+            lexical_storage_fingerprint_for_db_cached_readonly(&db_path, &cache_dir),
+            None,
+            "legacy checkpoint-primed sidecars must not survive the corrected producer as current evidence"
+        );
+        assert_eq!(
+            lexical_storage_fingerprint_for_db_disk_cached(&db_path, &identity, &cache_dir)
+                .unwrap(),
+            current
+        );
+        assert_eq!(
+            lexical_storage_fingerprint_for_db_cached_readonly(&db_path, &cache_dir),
+            Some(current)
+        );
     }
 
     /// The on-disk archive fingerprint sidecar is served while the archive's
