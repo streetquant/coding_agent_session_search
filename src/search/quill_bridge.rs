@@ -1796,14 +1796,29 @@ impl QuillCassIndex {
 
     /// Live segment count in the published snapshot.
     ///
-    /// Returns 0 when nothing is published yet, which is what the caller's
-    /// merge policy treats as "nothing to merge".
+    /// Read the writer's authoritative snapshot rather than opening another
+    /// reader over all its retained files. Streaming maintenance polls this
+    /// before deciding whether to merge; overlapping complete mappings made
+    /// that check itself exceed the archive's RSS budget.
+    ///
+    /// If publication authority refuses the process-local view, retain the
+    /// fresh-reader fallback. Returns 0 when neither view can be read.
     #[must_use]
     pub fn segment_count(&self) -> usize {
-        self.reader()
-            .ok()
-            .and_then(|reader| reader.segment_count().ok())
-            .unwrap_or(0)
+        match self.index.snapshot() {
+            Ok(snapshot) => snapshot.segments().len(),
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    path = %self.directory.display(),
+                    "writer snapshot unavailable for segment count; opening a reader"
+                );
+                self.reader()
+                    .ok()
+                    .and_then(|reader| reader.segment_count().ok())
+                    .unwrap_or(0)
+            }
+        }
     }
 
     /// Compact when the segment count and cooldown say it is worth doing.
@@ -3186,6 +3201,45 @@ mod tests {
         assert_eq!(
             index.reader().expect("reader").doc_count().expect("count"),
             2
+        );
+    }
+
+    /// Maintenance polls the segment count while the writer retains its
+    /// mappings. A separate reader would map and authenticate the whole
+    /// generation again, so even deciding whether to merge inflated RSS.
+    #[test]
+    fn writer_segment_count_tracks_publication_without_opening_a_reader() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open");
+        let opens = reader_open_count();
+        assert_eq!(index.segment_count(), 0);
+
+        index
+            .add_cass_documents(&[sample("alpha", 0, "first retained document")])
+            .expect("first batch");
+        assert_eq!(index.segment_count(), 0, "staged rows are not published");
+        index.commit().expect("first commit");
+        assert_eq!(index.segment_count(), 1);
+        index
+            .add_cass_documents(&[sample("beta", 1, "second published document")])
+            .expect("second batch");
+        assert_eq!(index.segment_count(), 1);
+        index.commit().expect("second commit");
+        assert_eq!(index.segment_count(), 2);
+
+        index.force_merge().expect("merge published segments");
+        assert_eq!(index.segment_count(), 1);
+        assert_eq!(index.doc_count().expect("merged document count"), 2);
+        index.delete_all().expect("publish empty successor");
+        assert_eq!(index.segment_count(), 0);
+        assert_eq!(reader_open_count(), opens, "maintenance opened a reader");
+        assert_eq!(
+            index
+                .reader()
+                .expect("independent published reader")
+                .segment_count()
+                .expect("independent segment count"),
+            0
         );
     }
 
