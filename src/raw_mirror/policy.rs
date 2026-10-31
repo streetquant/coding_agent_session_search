@@ -97,7 +97,21 @@ fn measured_usage_until(root: &Path, limit: u64) -> Result<u64> {
     loop {
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
-            anyhow::bail!("cannot budget a symlinked raw-mirror subtree");
+            // Classify the blob directory namespace lexically, without
+            // following the symlink to inspect its target. Early admission
+            // preserves the existing directory versus blob-path diagnostics.
+            let blobs = root.join("blobs");
+            let algorithm = blobs.join(RAW_MIRROR_HASH_ALGORITHM);
+            if path == blobs || path == algorithm || path.parent() == Some(algorithm.as_path()) {
+                anyhow::bail!(
+                    "refusing to use symlink raw mirror dir {}",
+                    path.display()
+                );
+            }
+            anyhow::bail!(
+                "raw mirror inventory path {} contains a symlink",
+                path.display()
+            );
         }
         if metadata.is_dir() {
             directories.push(fs::read_dir(&path)?);
@@ -136,6 +150,30 @@ struct Budget<'a> {
 }
 
 impl Budget<'_> {
+    fn inventory(&mut self) -> Result<()> {
+        if !self.inventoried {
+            self.used = measured_usage_until(self.root, self.policy.max_bytes)?;
+            self.inventoried = true;
+        }
+        Ok(())
+    }
+
+    fn check_uncached_capture(&mut self) -> Result<()> {
+        self.inventory()?;
+        if self.used > self.policy.max_bytes {
+            return Err(RawMirrorCapturePaused {
+                used_bytes: self.used,
+                used_bytes_is_lower_bound: true,
+                max_bytes: self.policy.max_bytes,
+                available_bytes: fs2::available_space(self.root)?,
+                min_free_bytes: self.policy.min_free_bytes,
+                requested_bytes: 0,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     fn reserve_with_available(&mut self, bytes: u64, available: u64) -> Result<()> {
         // Include one allocation block per new file in admission. Filesystem
         // free space is checked independently; the mirror cap is file bytes.
@@ -163,10 +201,7 @@ impl Budget<'_> {
 
     fn reserve(&mut self, bytes: u64) -> Result<()> {
         // A cache hit that makes no writes must not rescan the entire mirror.
-        if !self.inventoried {
-            self.used = measured_usage_until(self.root, self.policy.max_bytes)?;
-            self.inventoried = true;
-        }
+        self.inventory()?;
         self.reserve_with_available(bytes, fs2::available_space(self.root)?)
     }
 }
@@ -479,6 +514,13 @@ pub(crate) fn capture(
     let key = raw_mirror_blob_cache_key(&input, &metadata, threshold, chunk_size);
     let cached = cached_record(&root, &key);
     let was_cached = cached.is_some();
+    if !was_cached {
+        // Refuse before opening or hashing uncached content when the retained
+        // mirror already exceeds its cap. Verified no-write cache hits remain
+        // usable, and later reservations reuse this inventory without charging
+        // an allocation block for content we have not prepared.
+        budget.check_uncached_capture()?;
+    }
     let mut staging = Staging::new(&root)?;
     let prepared = match cached {
         Some(record) => PreparedRawMirrorContent {

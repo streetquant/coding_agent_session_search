@@ -100,6 +100,60 @@ fn over_cap_capture_refuses_after_a_sufficient_inventory_lower_bound() {
     assert_eq!(storage_summary(&data).manifest_count, 0);
 }
 
+#[cfg(unix)]
+#[test]
+fn over_cap_uncached_capture_refuses_before_opening_source_content() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let source = temp.path().join("session.jsonl");
+    let original = transcript(0, 32 * 1024);
+    fs::write(&source, &original).unwrap();
+    let root = ensure_raw_mirror_root(&data).unwrap();
+    fs::write(root.join("retained-first"), [1; 4096]).unwrap();
+    fs::write(root.join("retained-second"), [2; 4096]).unwrap();
+    let before = measured_usage(&root).unwrap();
+    assert_eq!(before, 8192);
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(File::open(&source).is_err(), "the real source must be unreadable for this control");
+
+    let error = capture(input(&data, &source), 1, CHUNK, policy(4096)).unwrap_err();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+    let paused = error.downcast_ref::<RawMirrorCapturePaused>()
+        .expect("over-cap admission must refuse before opening uncached source content");
+    assert!(paused.used_bytes > paused.max_bytes);
+    assert!(paused.used_bytes_is_lower_bound);
+    assert_eq!(paused.requested_bytes, 0);
+    assert_eq!(fs::read(&source).unwrap(), original);
+    assert_eq!(fs::read(root.join("retained-first")).unwrap(), [1; 4096]);
+    assert_eq!(fs::read(root.join("retained-second")).unwrap(), [2; 4096]);
+    assert_eq!(measured_usage(&root).unwrap(), before);
+    assert_staging_empty(&data);
+    assert_eq!(storage_summary(&data).manifest_count, 0);
+    assert_eq!(storage_summary(&data).unique_blob_count, 0);
+}
+
+#[test]
+fn verified_cached_capture_above_cap_preserves_the_existing_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let source = temp.path().join("session.jsonl");
+    let original = transcript(0, 32 * 1024);
+    fs::write(&source, &original).unwrap();
+    let first = capture(input(&data, &source), CHUNK as u64, CHUNK, policy(1024 * 1024)).unwrap();
+    let before = measured_usage(&raw_mirror_root(&data)).unwrap();
+    assert!(before > 0);
+
+    let again = capture(input(&data, &source), CHUNK as u64, CHUNK, policy(0)).unwrap();
+    assert!(again.already_present);
+    assert_eq!(again.manifest_id, first.manifest_id);
+    assert_eq!(contents(&data, &again), original);
+    assert_eq!(contents(&data, &first), original);
+    assert_eq!(measured_usage(&raw_mirror_root(&data)).unwrap(), before);
+    assert_staging_empty(&data);
+}
+
 #[test]
 fn admission_accounts_for_the_complete_inventory_at_the_byte_boundary() {
     let temp = tempfile::tempdir().unwrap();
