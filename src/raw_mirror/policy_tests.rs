@@ -72,6 +72,59 @@ fn partial_staging_is_removed_when_the_next_chunk_cannot_fit() {
 }
 
 #[test]
+fn over_cap_capture_refuses_after_a_sufficient_inventory_lower_bound() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let source = temp.path().join("session.jsonl");
+    let source_bytes = transcript(0, 1024);
+    fs::write(&source, &source_bytes).unwrap();
+    let root = ensure_raw_mirror_root(&data).unwrap();
+    for number in 0_u8..16 {
+        fs::write(root.join(format!("retained-{number}")), [number; 4096]).unwrap();
+    }
+    let exact_before = measured_usage(&root).unwrap();
+    assert_eq!(exact_before, 16 * 4096);
+
+    let error = capture(input(&data, &source), 1, CHUNK, policy(4096)).unwrap_err();
+    let paused = error.downcast_ref::<RawMirrorCapturePaused>().unwrap();
+    assert!(paused.used_bytes > paused.max_bytes);
+    assert!(paused.used_bytes < exact_before, "a refusal must not inventory the remaining files");
+    assert!(paused.to_string().contains("used_at_least="));
+    assert_eq!(fs::read(&source).unwrap(), source_bytes);
+    for number in 0_u8..16 {
+        assert_eq!(fs::read(root.join(format!("retained-{number}"))).unwrap(), [number; 4096]);
+    }
+    assert_eq!(measured_usage(&root).unwrap(), exact_before);
+    assert_staging_empty(&data);
+    assert_eq!(storage_summary(&data).unique_blob_count, 0);
+    assert_eq!(storage_summary(&data).manifest_count, 0);
+}
+
+#[test]
+fn admission_accounts_for_the_complete_inventory_at_the_byte_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("first"), [1; 4096]).unwrap();
+    fs::write(temp.path().join("second"), [2; 4096]).unwrap();
+    let exact = measured_usage(temp.path()).unwrap();
+    assert_eq!(exact, 8192);
+    let mut budget = Budget {
+        root: temp.path(), policy: policy(exact + 4096 + 1), used: 0, inventoried: false,
+    };
+    budget.reserve(1).unwrap();
+    assert_eq!(budget.used, exact + 4096 + 1);
+
+    let mut insufficient = Budget {
+        root: temp.path(), policy: policy(exact + 4096), used: 0, inventoried: false,
+    };
+    let error = insufficient.reserve(1).unwrap_err();
+    let paused = error.downcast_ref::<RawMirrorCapturePaused>().unwrap();
+    assert_eq!(paused.used_bytes, exact);
+    assert!(paused.to_string().contains("used="));
+    assert!(!paused.to_string().contains("used_at_least="));
+    assert_eq!(measured_usage(temp.path()).unwrap(), exact);
+}
+
+#[test]
 fn an_unchanged_capture_at_the_cap_is_not_an_outage() {
     let temp = tempfile::tempdir().unwrap();
     let data = temp.path().join("data");

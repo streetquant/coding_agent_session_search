@@ -31,6 +31,7 @@ fn byte_setting(name: &str, default: u64) -> Result<u64> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawMirrorCapturePaused {
     pub used_bytes: u64,
+    pub used_bytes_is_lower_bound: bool,
     pub max_bytes: u64,
     pub available_bytes: u64,
     pub min_free_bytes: u64,
@@ -39,12 +40,18 @@ pub struct RawMirrorCapturePaused {
 
 impl std::fmt::Display for RawMirrorCapturePaused {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let usage_label = if self.used_bytes_is_lower_bound {
+            "used_at_least"
+        } else {
+            "used"
+        };
         write!(
             out,
-            "raw_mirror_capture_paused: used={} max={} available={} reserve={} requested={} bytes; \
+            "raw_mirror_capture_paused: {}={} max={} available={} reserve={} requested={} bytes; \
              indexing can continue without a new raw copy. Free space or review `cass mirror prune` \
              (dry-run first); configure CASS_RAW_MIRROR_MAX_BYTES / CASS_RAW_MIRROR_MIN_FREE_BYTES. \
              Existing recovery evidence is retained",
+            usage_label,
             self.used_bytes,
             self.max_bytes,
             self.available_bytes,
@@ -80,6 +87,47 @@ fn measured_usage(root: &Path) -> Result<u64> {
     Ok(total)
 }
 
+/// A sufficient lower bound can only refuse admission. Visit entries lazily
+/// so proving the cap is exceeded does not enumerate the remaining subtree.
+/// Retention keeps the complete inventory above.
+fn measured_usage_until(root: &Path, limit: u64) -> Result<u64> {
+    let mut total = 0_u64;
+    let mut path = root.to_path_buf();
+    let mut directories: Vec<fs::ReadDir> = Vec::new();
+    loop {
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("cannot budget a symlinked raw-mirror subtree");
+        }
+        if metadata.is_dir() {
+            directories.push(fs::read_dir(&path)?);
+        } else if metadata.is_file() {
+            total = total
+                .checked_add(metadata.len())
+                .ok_or_else(|| anyhow!("raw-mirror byte inventory overflow"))?;
+            if total > limit {
+                return Ok(total);
+            }
+        } else {
+            anyhow::bail!("cannot budget a non-regular raw-mirror entry");
+        }
+        loop {
+            let Some(entries) = directories.last_mut() else {
+                return Ok(total);
+            };
+            match entries.next() {
+                Some(entry) => {
+                    path = entry?.path();
+                    break;
+                }
+                None => {
+                    directories.pop();
+                }
+            }
+        }
+    }
+}
+
 struct Budget<'a> {
     root: &'a Path,
     policy: RawMirrorRetentionPolicy,
@@ -101,6 +149,7 @@ impl Budget<'_> {
         {
             return Err(RawMirrorCapturePaused {
                 used_bytes: self.used,
+                used_bytes_is_lower_bound: self.used > self.policy.max_bytes,
                 max_bytes: self.policy.max_bytes,
                 available_bytes: available,
                 min_free_bytes: self.policy.min_free_bytes,
@@ -115,7 +164,7 @@ impl Budget<'_> {
     fn reserve(&mut self, bytes: u64) -> Result<()> {
         // A cache hit that makes no writes must not rescan the entire mirror.
         if !self.inventoried {
-            self.used = measured_usage(self.root)?;
+            self.used = measured_usage_until(self.root, self.policy.max_bytes)?;
             self.inventoried = true;
         }
         self.reserve_with_available(bytes, fs2::available_space(self.root)?)
