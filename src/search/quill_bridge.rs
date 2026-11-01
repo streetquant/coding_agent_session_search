@@ -1277,6 +1277,52 @@ fn verify_retained_backing(
     }
 }
 
+/// Release resident pages without relinquishing an immutable file mapping.
+///
+/// Sealing and identity lookups can populate pages that remain mapped for the
+/// whole rebuild. Streamed verification alone does not release those pages.
+/// Only an exact read-only file binding permits this operation: anonymous and
+/// owned images must keep their bytes, and unsupported platforms do nothing.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn release_retained_mapping_pages(
+    segment: &RecoveredSegment,
+    metadata: &std::fs::Metadata,
+) -> Result<bool> {
+    if retained_file_binding(segment, metadata) != Some(true) {
+        return Ok(false);
+    }
+    let bytes = segment.source_bytes();
+    // SAFETY: the live segment owns this immutable mapping throughout the
+    // call. The kernel map-table proof above establishes a page-aligned start,
+    // the complete range inside one read-only file VMA, offset zero, and the
+    // exact device/inode. MADV_DONTNEED changes residency, not the mapping or
+    // published file bytes; subsequent access reloads that same immutable
+    // file. Never apply it to an owned/anonymous image: that would lose data.
+    let result = unsafe {
+        libc::madvise(
+            bytes.as_ptr().cast_mut().cast(),
+            bytes.len(),
+            libc::MADV_DONTNEED,
+        )
+    };
+    if result != 0 {
+        return Err(anyhow!(
+            "releasing resident Quill mapping pages: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn release_retained_mapping_pages(
+    _segment: &RecoveredSegment,
+    _metadata: &std::fs::Metadata,
+) -> Result<bool> {
+    Ok(false)
+}
+
 /// Revalidate the admitted file without faulting its entire retained mapping in.
 ///
 /// The immutable MANIFEST and section table were admitted by Quill. Recompute
@@ -1370,6 +1416,7 @@ fn verify_retained_segment_file(segment: &RecoveredSegment) -> Result<()> {
             "retained segment length changed during verification".into(),
         ));
     }
+    release_retained_mapping_pages(segment, &metadata)?;
     Ok(())
 }
 
@@ -3308,6 +3355,42 @@ mod tests {
 
     #[test]
     fn streamed_retained_verification_crosses_buffer_boundaries() {
+        fn reader_snapshot(
+            reader: &QuillSearchIndex,
+        ) -> Arc<frankensearch::quill::QuillSearchSnapshot> {
+            let batch = drive(|cx| async move {
+                frankensearch::LexicalRead::search_candidates(reader, &cx, "", 0).await
+            })
+            .expect("pin the real search reader snapshot");
+            let context = batch
+                .context()
+                .filter(|context| context.backend() == frankensearch::quill::QUILL_LEXICAL_BACKEND)
+                .expect("Quill search reader provenance");
+            Arc::clone(
+                context
+                    .downcast_ref::<Arc<frankensearch::quill::QuillSearchSnapshot>>()
+                    .expect("typed search reader snapshot"),
+            )
+        }
+
+        #[cfg(target_os = "linux")]
+        fn mapped_rss_bytes(segment: &RecoveredSegment) -> usize {
+            let start = format!("{:x}-", segment.source_bytes().as_ptr().addr());
+            let smaps =
+                std::fs::read_to_string("/proc/self/smaps").expect("kernel mapping residency");
+            let mut lines = smaps.lines().skip_while(|line| !line.starts_with(&start));
+            assert!(lines.next().is_some(), "held segment mapping absent");
+            let rss = lines
+                .find_map(|line| line.strip_prefix("Rss:"))
+                .expect("mapping RSS row");
+            rss.split_whitespace()
+                .next()
+                .expect("mapping RSS value")
+                .parse::<usize>()
+                .expect("numeric mapping RSS")
+                * 1024
+        }
+
         let directory = tempfile::tempdir().expect("streamed verification directory");
         let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open");
         let documents: Vec<_> = (0..32)
@@ -3324,7 +3407,9 @@ mod tests {
         index.commit().expect("publish documents");
         drop(index);
         let index = QuillCassIndex::open_or_create(directory.path()).expect("reopen held mappings");
-        let snapshot = index.index.snapshot().expect("published snapshot");
+        let reader = index.reader().expect("reader holding the tested mappings");
+        let search_snapshot = reader_snapshot(&reader);
+        let snapshot = search_snapshot.keeper_snapshot();
         assert!(
             snapshot
                 .segments()
@@ -3333,6 +3418,17 @@ mod tests {
             "the native fixture must cross a streamed read boundary"
         );
         for segment in snapshot.segments() {
+            #[cfg(target_os = "linux")]
+            let (address, before_rss, before_hash) = {
+                segment
+                    .verify()
+                    .expect("fault in the complete immutable image");
+                (
+                    segment.source_bytes().as_ptr(),
+                    mapped_rss_bytes(segment),
+                    xxhash_rust::xxh3::xxh3_64(segment.source_bytes()),
+                )
+            };
             #[cfg(target_os = "linux")]
             assert_eq!(
                 retained_file_binding(
@@ -3343,10 +3439,138 @@ mod tests {
                 "ordinary mapped segments must use the bounded streaming path"
             );
             verify_retained_segment_file(segment).expect("streamed integrity");
+            #[cfg(target_os = "linux")]
+            {
+                let after_rss = mapped_rss_bytes(segment);
+                assert!(before_rss > 0, "control did not populate the held mapping");
+                assert_eq!(after_rss, 0, "verified file pages remained resident");
+                assert_eq!(segment.source_bytes().as_ptr(), address, "mapping moved");
+                assert_eq!(
+                    xxhash_rust::xxh3::xxh3_64(segment.source_bytes()),
+                    before_hash,
+                    "re-faulting the held mapping changed its exact bytes"
+                );
+                eprintln!(
+                    "RETAINED_RESIDENCY_CONTROL case=refault before_rss={before_rss} after_rss={after_rss} bytes_unchanged=true"
+                );
+            }
             verify_retained_backing(segment, None).expect("conservative held-byte fallback");
             segment.verify().expect("independent engine integrity");
         }
         assert_eq!(index.doc_count().expect("published population"), 32);
+        #[cfg(target_os = "linux")]
+        {
+            let parser = frankensearch::quill::query::CassQueryParser::new(CASS_SEMANTIC_SCHEMA)
+                .expect("concurrent CASS query parser");
+            let parsed = parser.parse(
+                "streamrow0term2048",
+                &frankensearch::quill::query::CassQueryFilters::default(),
+            );
+            let expected = search_paginated(&reader, &parsed.query, 32, 0, true)
+                .expect("baseline real search");
+            assert_eq!(expected.hits.len(), 1);
+            assert_eq!(expected.total_count, Some(1));
+            assert_eq!(expected.doc_count, 32);
+            let hashes: Vec<_> = snapshot
+                .segments()
+                .iter()
+                .map(|segment| xxhash_rust::xxh3::xxh3_64(segment.source_bytes()))
+                .collect();
+            let (start_tx, start_rx) = std::sync::mpsc::sync_channel(0);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let reader = &reader;
+                let expected = &expected;
+                let query = &parsed.query;
+                let hashes = &hashes;
+                let searches = scope.spawn(move || {
+                    let held_snapshot = reader_snapshot(reader);
+                    let held = held_snapshot.keeper_snapshot();
+                    for (segment, original) in held.segments().iter().zip(snapshot.segments()) {
+                        assert_eq!(
+                            segment.source_bytes().as_ptr(),
+                            original.source_bytes().as_ptr(),
+                            "the concurrent search must use the advised mapping"
+                        );
+                    }
+                    for round in 0..32 {
+                        assert_eq!(
+                            start_rx.recv_timeout(Duration::from_secs(30)),
+                            Ok(round),
+                            "residency release thread stopped before the search"
+                        );
+                        let page = search_paginated(reader, query, 32, 0, true)
+                            .expect("real search concurrent with residency release");
+                        assert_eq!(&page, expected);
+                        for (segment, hash) in held.segments().iter().zip(hashes) {
+                            assert_eq!(xxhash_rust::xxh3::xxh3_64(segment.source_bytes()), *hash);
+                        }
+                        done_tx.send(round).expect("search completion receiver");
+                        eprintln!(
+                            "RETAINED_RESIDENCY_CONTROL case=concurrent_search round={round} hits=1 total=1 docs=32 bytes_unchanged=true"
+                        );
+                    }
+                });
+                for round in 0..32 {
+                    start_tx.send(round).expect("concurrent search receiver");
+                    for segment in snapshot.segments() {
+                        verify_retained_segment_file(segment)
+                            .expect("verified release concurrent with real search");
+                    }
+                    assert_eq!(
+                        done_rx.recv_timeout(Duration::from_secs(30)),
+                        Ok(round),
+                        "concurrent search stopped during residency release"
+                    );
+                }
+                searches.join().expect("concurrent search thread");
+            });
+            assert_eq!(
+                search_paginated(&reader, &parsed.query, 32, 0, true)
+                    .expect("search after concurrent releases"),
+                expected
+            );
+            assert_eq!(
+                index
+                    .doc_count()
+                    .expect("population after concurrent releases"),
+                32
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_residency_release_preserves_owned_engine_images() {
+        let index = QuillIndex::in_memory(cass_quill_config()).expect("owned engine");
+        let document = frankensearch::IndexableDocument::new(
+            "owned-image",
+            "owned image residency control ".repeat(4096),
+        );
+        drive(|cx| {
+            let index = &index;
+            let document = &document;
+            async move {
+                index.index_document(&cx, document).await?;
+                index.commit(&cx).await
+            }
+        })
+        .expect("publish owned engine image");
+        let snapshot = index.snapshot().expect("owned snapshot");
+        assert_eq!(snapshot.segments().len(), 1);
+        let file = tempfile::NamedTempFile::new().expect("unrelated file identity");
+        let metadata = file.as_file().metadata().expect("file metadata");
+        for segment in snapshot.segments() {
+            let before = segment.source_bytes().to_vec();
+            assert_eq!(retained_file_binding(segment, &metadata), None);
+            assert!(
+                !release_retained_mapping_pages(segment, &metadata)
+                    .expect("owned image must not be advised")
+            );
+            assert_eq!(segment.source_bytes(), before);
+            segment.verify().expect("owned integrity after no-op");
+        }
+        assert_eq!(index.doc_count().expect("owned document count"), 1);
     }
 
     #[cfg(target_os = "linux")]
