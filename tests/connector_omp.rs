@@ -645,6 +645,146 @@ fn explicit_omp_files_do_not_expand_to_neighbours_or_subagents() -> anyhow::Resu
 }
 
 #[test]
+fn omp_streaming_forwards_ordered_source_boundaries_without_collapsing_native_ids()
+-> anyhow::Result<()> {
+    use franken_agent_detection::{DiscoveredSourceFile, SourceCompletion, SourceScanHooks};
+    use std::cell::RefCell;
+
+    let temp = tempfile::tempdir()?;
+    let agent = temp.path().join(".omp/profiles/review/agent");
+    let selected = write_omp_session(&agent, "shared-native-id", "First original");
+    let other = selected.with_file_name("2026-08-23T12-00-01_other-original.jsonl");
+    fs::copy(&selected, &other)?;
+    let ctx = ScanContext::with_roots(
+        temp.path().join("cass-state"),
+        vec![
+            ScanRoot::local(agent.clone()),
+            ScanRoot::local(agent.join("sessions")),
+            ScanRoot::local(selected),
+        ],
+        None,
+    );
+    let connector = runtime_connector("omp");
+    assert!(connector.supports_streaming_scan());
+    assert!(connector.supports_source_boundaries());
+    let events = RefCell::new(Vec::new());
+    let mut before = |source: &DiscoveredSourceFile| {
+        events
+            .borrow_mut()
+            .push(("before", source.source_path.clone()));
+        true
+    };
+    let mut complete = |completion: &SourceCompletion| {
+        assert_eq!(completion.conversations_emitted, 1);
+        events
+            .borrow_mut()
+            .push(("complete", completion.source.source_path.clone()));
+        Ok(())
+    };
+    connector.scan_with_source_boundaries(
+        &ctx,
+        &mut SourceScanHooks {
+            should_scan_source: Some(&mut before),
+            on_source_complete: Some(&mut complete),
+        },
+        &mut |conversation| {
+            assert_eq!(
+                conversation.external_id.as_deref(),
+                Some("shared-native-id")
+            );
+            assert_eq!(conversation.metadata["profile"], "review");
+            events
+                .borrow_mut()
+                .push(("deliver", conversation.source_path));
+            Ok(())
+        },
+    )?;
+    let events = events.into_inner();
+    assert_eq!(
+        events.len(),
+        6,
+        "aliased roots must not parse or complete a file twice"
+    );
+    for source in events.as_chunks::<3>().0 {
+        assert_eq!(
+            source.iter().map(|(step, _)| *step).collect::<Vec<_>>(),
+            ["before", "deliver", "complete"]
+        );
+        assert_eq!(source[0].1, source[1].1);
+        assert_eq!(source[1].1, source[2].1);
+    }
+    assert_ne!(events[0].1, events[3].1, "both original files must survive");
+    eprintln!(
+        "{}",
+        json!({"step":"omp_streaming_boundaries","sources":2,"events":6,"status":"passed"})
+    );
+    Ok(())
+}
+
+#[test]
+fn omp_streaming_rejection_and_consumer_failure_never_certify_unpersisted_sources()
+-> anyhow::Result<()> {
+    use franken_agent_detection::{DiscoveredSourceFile, SourceCompletion, SourceScanHooks};
+    use std::cell::Cell;
+
+    let temp = tempfile::tempdir()?;
+    let agent = temp.path().join(".omp/agent");
+    write_omp_session(&agent, "one-native-id", "First source");
+    write_omp_session(&agent, "two-native-id", "Second source");
+    let ctx = ScanContext::with_roots(
+        temp.path().join("cass-state"),
+        vec![ScanRoot::local(agent)],
+        None,
+    );
+    let connector = runtime_connector("omp");
+    for reject_all in [true, false] {
+        let opened = Cell::new(0);
+        let delivered = Cell::new(0);
+        let completed = Cell::new(0);
+        let mut before = |_: &DiscoveredSourceFile| {
+            opened.set(opened.get() + 1);
+            !reject_all
+        };
+        let mut complete = |_: &SourceCompletion| {
+            completed.set(completed.get() + 1);
+            Ok(())
+        };
+        let result = connector.scan_with_source_boundaries(
+            &ctx,
+            &mut SourceScanHooks {
+                should_scan_source: Some(&mut before),
+                on_source_complete: Some(&mut complete),
+            },
+            &mut |_| {
+                delivered.set(delivered.get() + 1);
+                anyhow::bail!("durable consumer rejected this source")
+            },
+        );
+        assert_eq!(completed.get(), 0);
+        if reject_all {
+            result?;
+            assert_eq!(opened.get(), 2);
+            assert_eq!(delivered.get(), 0);
+        } else {
+            assert!(
+                result
+                    .expect_err("failed persistence must stop parsing")
+                    .to_string()
+                    .contains("durable consumer rejected")
+            );
+            assert_eq!(opened.get(), 1, "the next source must remain unopened");
+            assert_eq!(delivered.get(), 1);
+        }
+        eprintln!(
+            "{}",
+            json!({"step":"omp_streaming_negative_control","reject_all":reject_all,
+            "admission_checks":opened.get(),"delivered":delivered.get(),"completed":completed.get(),"status":"passed"})
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn watch_once_omp_file_override_keeps_neighbours_out_of_the_archive() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
     let home = temp.path().join("home");

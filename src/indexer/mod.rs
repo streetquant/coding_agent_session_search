@@ -13077,20 +13077,93 @@ fn scan_with_durable_source_boundaries(
     Ok(())
 }
 
-/// Watch scans must parse the selected sources, but use the same dependency
-/// observations as streaming ingestion before certifying their final batch.
+struct WatchScanBatch {
+    conversations: Vec<NormalizedConversation>,
+    completions: BTreeMap<PathBuf, crate::storage::sqlite::SourceIngestLedgerEntry>,
+    scan_error: Option<anyhow::Error>,
+    scan_ms: u64,
+    final_batch: bool,
+}
+
+struct WatchScanBuffer<'a> {
+    conversations: Vec<NormalizedConversation>,
+    completions: BTreeMap<PathBuf, crate::storage::sqlite::SourceIngestLedgerEntry>,
+    retained_bytes: usize,
+    messages: usize,
+    scan_started: Instant,
+    consumer_error: Option<anyhow::Error>,
+    on_batch: &'a mut dyn FnMut(WatchScanBatch) -> Result<()>,
+}
+
+impl WatchScanBuffer<'_> {
+    fn flush(&mut self, final_batch: bool, scan_error: Option<anyhow::Error>) -> Result<()> {
+        let batch = WatchScanBatch {
+            conversations: std::mem::take(&mut self.conversations),
+            completions: std::mem::take(&mut self.completions),
+            scan_error,
+            scan_ms: self.scan_started.elapsed().as_millis() as u64,
+            final_batch,
+        };
+        self.retained_bytes = 0;
+        self.messages = 0;
+        let result = (self.on_batch)(batch);
+        // Time spent persisting a batch is ingest time, not source scan time.
+        self.scan_started = Instant::now();
+        if let Err(error) = result {
+            self.consumer_error = Some(error);
+            anyhow::bail!("watch batch persistence failed");
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, conversation: NormalizedConversation) -> Result<()> {
+        let footprint = conversation_batch_footprint(&conversation);
+        if !self.conversations.is_empty()
+            && (self.conversations.len() >= DEFAULT_STREAMING_BATCH_LIMITS.max_conversations
+                || self.messages.saturating_add(footprint.message_count)
+                    > DEFAULT_STREAMING_BATCH_LIMITS.max_messages
+                || self.retained_bytes.saturating_add(footprint.retained_bytes)
+                    > DEFAULT_STREAMING_BATCH_LIMITS.max_chars)
+        {
+            self.flush(false, None)?;
+        }
+        // One indivisible source can exceed a batch budget; never multiply
+        // that exception by retaining the rest of the root alongside it.
+        self.retained_bytes = self.retained_bytes.saturating_add(footprint.retained_bytes);
+        self.messages = self.messages.saturating_add(footprint.message_count);
+        self.conversations.push(conversation);
+        Ok(())
+    }
+}
+
+/// Deliver bounded watch batches synchronously, so persistence applies
+/// backpressure to the parser. Source completions stay with their final
+/// conversation; a failed consumer aborts parsing and is never a scan error.
 fn scan_watch_with_source_boundaries(
     connector: &dyn Connector,
     ctx: &ScanContext,
     connector_name: &str,
-    conversations: &mut Vec<NormalizedConversation>,
-    completions: &mut BTreeMap<PathBuf, crate::storage::sqlite::SourceIngestLedgerEntry>,
+    on_batch: &mut dyn FnMut(WatchScanBatch) -> Result<()>,
 ) -> Result<()> {
+    let buffer = std::cell::RefCell::new(WatchScanBuffer {
+        conversations: Vec::new(),
+        completions: BTreeMap::new(),
+        retained_bytes: 0,
+        messages: 0,
+        scan_started: Instant::now(),
+        consumer_error: None,
+        on_batch,
+    });
     if !connector.supports_source_boundaries() {
-        return connector.scan_with_callback(ctx, &mut |conversation| {
-            conversations.push(conversation);
-            Ok(())
+        let result = connector.scan_with_callback(ctx, &mut |conversation| {
+            buffer.borrow_mut().push(conversation)
         });
+        let mut buffer = buffer.into_inner();
+        if let Some(error) = buffer.consumer_error.take() {
+            return Err(error);
+        }
+        let terminal = buffer.flush(true, result.err());
+        return buffer.consumer_error.take().map_or(terminal, Err);
     }
     let dependencies_before =
         if crate::connectors::source_dependencies::source_dependency_policy(connector_name)
@@ -13132,7 +13205,7 @@ fn scan_watch_with_source_boundaries(
         ) else {
             return Ok(());
         };
-        completions.insert(
+        buffer.borrow_mut().completions.insert(
             completion.source.source_path.clone(),
             crate::storage::sqlite::SourceIngestLedgerEntry {
                 key: source_ledger_key(&completion.source, ctx),
@@ -13148,10 +13221,15 @@ fn scan_watch_with_source_boundaries(
         should_scan_source: Some(&mut should_scan),
         on_source_complete: Some(&mut complete),
     };
-    connector.scan_with_source_boundaries(ctx, &mut hooks, &mut |conversation| {
-        conversations.push(conversation);
-        Ok(())
-    })
+    let result = connector.scan_with_source_boundaries(ctx, &mut hooks, &mut |conversation| {
+        buffer.borrow_mut().push(conversation)
+    });
+    let mut buffer = buffer.into_inner();
+    if let Some(error) = buffer.consumer_error.take() {
+        return Err(error);
+    }
+    let terminal = buffer.flush(true, result.err());
+    buffer.consumer_error.take().map_or(terminal, Err)
 }
 
 impl<'a> StreamingBatchSender<'a> {
@@ -30461,242 +30539,252 @@ fn reindex_paths_with_semantic_delta(
                 active_source_filter,
             );
 
-        // SCAN PHASE: IO-heavy, no locks held
-        let scan_start = Instant::now();
-        let mut convs = Vec::new();
-        let mut source_completions = BTreeMap::new();
-        let scan_error = match scan_watch_with_source_boundaries(
+        // Persist bounded parser batches before admitting more source data.
+        // A later source can still fail, so only a clean terminal batch may
+        // publish root-wide currentness, watermarks, or recovery completion.
+        let mut earlier_batches = false;
+        let mut root_incomplete = false;
+        let batch_result = scan_watch_with_source_boundaries(
             conn.as_ref(),
             &ctx,
             kind.slug(),
-            &mut convs,
-            &mut source_completions,
-        ) {
-            Ok(()) => None,
-            Err(error) => {
-                ingest_diagnostics.observe_connector_scan_error(&root.path, &error);
-                // ubs:ignore[rust.perf.string-alloc-in-loop] -- Failed scans retain an owned diagnostic in progress statistics; successful roots skip it.
-                let message = format!("{error:#}");
-                tracing::warn!(
-                    ?kind,
-                    scan_root = %root.path.display(),
-                    "watch scan failed: {message}"
-                );
-                first_source_scan_error.get_or_insert(error);
-                Some(message)
-            }
-        };
-        let scan_ms = scan_start.elapsed().as_millis() as u64;
-        // Publish the source error before persistence can fail for a separate
-        // reason, including the all-bad case that has no ingest phase below.
-        let failed_stats_index = if let Some(error) = &scan_error
-            && let Some(progress) = &opts.progress
-            && let Ok(mut stats) = progress.stats.lock()
-        {
-            stats.scan_had_errors = true;
-            stats.scan_ms = stats.scan_ms.saturating_add(scan_ms);
-            let index = stats.connectors.len();
-            stats.connectors.push(ConnectorStats {
-                // ubs:ignore[rust.perf.string-alloc-in-loop] -- This newly appended error-statistics record owns its connector name.
-                name: kind.slug().to_string(),
-                conversations: 0,
-                messages: 0,
-                scan_ms,
-                error: Some(error.clone()),
-            });
-            if !stats
-                .agents_discovered
-                .iter()
-                .any(|name| name == kind.slug())
-            {
-                // ubs:ignore[rust.perf.string-alloc-in-loop] -- The membership check above allocates a discovered connector name at most once.
-                stats.agents_discovered.push(kind.slug().to_string());
-            }
-            Some(index)
-        } else {
-            None
-        };
-
-        let pre_active_filter_count = convs.len();
-        convs.retain(|conv| {
-            !should_skip_active_session_source(
-                active_source_filter,
-                root.origin.kind,
-                &conv.source_path,
-            )
-        });
-        let active_sources_skipped = pre_active_filter_count.saturating_sub(convs.len());
-        if active_sources_skipped > 0 {
-            tracing::debug!(
-                ?kind,
-                scan_root = %root.path.display(),
-                active_sources_skipped,
-                "skipped active watch sources and preserved watermarks for retry"
-            );
-        }
-        let preserve_this_watch_watermark = preserve_watch_watermark
-            || preparse_active_source_skipped
-            || active_sources_skipped > 0
-            || scan_error.is_some();
-
-        convs.retain(|conv| {
-            !should_skip_subagent(conv) && !should_skip_excluded_source(&conv.source_path)
-        });
-        let all_sources_retained = convs.len() == pre_active_filter_count;
-
-        for conversation in &mut convs {
-            ingest_diagnostics.observe_conversation(conversation);
-        }
-        record_connector_ingest_report(opts.progress.as_ref(), ingest_diagnostics.finish());
-
-        // Provenance injection and path rewriting
-        let mut prepared_source_completions = BTreeMap::new();
-        for conv in &mut convs {
-            let completion = source_completions.remove_entry(&conv.source_path);
-            prepare_conversation_for_ingest(
-                &opts.data_dir,
-                kind.slug(),
-                &root.origin,
-                Some(&root),
-                conv,
-            );
-            if let Some((mut source_path, completion)) = completion {
-                // Move the existing owned key; refresh its buffer only when
-                // provenance rewriting changed the conversation's path.
-                if source_path != conv.source_path {
-                    source_path.clone_from(&conv.source_path);
-                }
-                prepared_source_completions.insert(source_path, completion);
-            }
-        }
-        // Watermark order for live watch; a total order (watermark, path,
-        // external id) for every batch, so canonical ids never depend on the
-        // filesystem's directory order (connectors walk unsorted).
-        sort_watch_conversations_for_watermark(&mut convs);
-
-        // GH#510: a conversation whose bounded-guard NoMem keeps recurring
-        // waits out its deferral backoff instead of re-running the split, solo
-        // retry and deferral on every tick. It counts as deferred so the
-        // watermark stays held for it. An explicit --watch-once is an
-        // operator's retry and is never held back.
-        let nomem_backoff_held = if explicit_watch_once {
-            0
-        } else {
-            retain_watch_conversations_past_nomem_backoff(
-                &opts.data_dir,
-                &mut convs,
-                FrankenStorage::now_millis(),
-            )
-        };
-        if preserve_this_watch_watermark || !all_sources_retained || nomem_backoff_held > 0 {
-            prepared_source_completions.clear();
-        }
-        let final_source_positions: BTreeMap<_, _> = convs
-            .iter()
-            .enumerate()
-            .map(|(position, conv)| (&conv.source_path, position))
-            .collect();
-
-        // Update total and phase to indexing
-        if let Some(p) = &opts.progress {
-            p.total.fetch_add(convs.len(), Ordering::Relaxed);
-            // Watch batches accumulate the total as sessions arrive; it is
-            // never a stable denominator.
-            p.total_is_final.store(false, Ordering::Relaxed);
-            p.phase.store(2, Ordering::Relaxed);
-            p.tick_activity();
-        }
-
-        let conv_count = convs.len();
-        if explicit_watch_once {
-            tracing::warn!(
-                ?kind,
-                scan_root = %root.path.display(),
-                conversations = conv_count,
-                since_ts,
-                "watch_once_scan"
-            );
-        } else {
-            tracing::info!(?kind, conversations = conv_count, since_ts, "watch_scan");
-        }
-
-        // Skip empty incremental scans entirely: an empty batch has nothing
-        // to ingest, must not produce a Tantivy segment, must not bump
-        // `last_indexed_at`, and must not trigger downstream optimize/merge.
-        // See issue #194.
-        if conv_count == 0 {
-            if scan_error.is_some() {
-                // A later successful sibling may advance the shared provider
-                // watermark. Keep this source eligible for an unfiltered retry
-                // even when it had no valid conversation to publish today.
-                let storage = storage
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
-                persist_watch_lexical_replay_debt(
-                    &storage,
-                    &WatchLexicalReplayDebt::for_root(kind, &root),
-                )?;
-            }
-            continue;
-        }
-
-        // INGEST PHASE: Acquire locks briefly. Live watch mode persists in
-        // bounded chunks so a large backlog can make durable forward progress
-        // instead of retrying the same oversized transaction forever.
-        let index_start = Instant::now();
-        let mut inserted_messages = 0usize;
-        let mut processed_conversations = 0usize;
-        let mut quarantined_conversations = 0usize;
-        let mut deferred_conversations = nomem_backoff_held;
-        let mut lexical_replay_deferred = false;
-        {
-            let storage = storage
-                .lock()
-                .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
-            let mut t_index_guard = t_index
-                .lock()
-                .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
-            // Establish recovery debt BEFORE any canonical transaction. It
-            // covers the whole selected source, including earlier successful
-            // additions lost when a later addition discards this writer.
-            let current_debt = WatchLexicalReplayDebt::for_root(kind, &root);
-            persist_watch_lexical_replay_debt(&storage, &current_debt)?;
-            if replay_canonical {
-                // A prior failed callback may still own uncommitted additions.
-                // Reconciliation must start from the published generation.
-                *t_index_guard = None;
-            }
-            let ingest_chunk_size = if explicit_watch_once {
-                conv_count.max(1)
-            } else {
-                watch_ingest_chunk_size()
-            };
-            let capture_semantic_delta = semantic_delta.is_some();
-            let mut chunk_start = 0;
-            while chunk_start < convs.len() {
-                // Keep watermark order, but finish a batch at each source's
-                // final conversation so its marker shares the final canonical
-                // transaction. Interleaved earlier conversations remain
-                // covered, and any prior deferral withholds later markers.
-                let chunk_limit = chunk_start
-                    .saturating_add(ingest_chunk_size)
-                    .min(convs.len());
-                let completed_source = (chunk_start..chunk_limit).find_map(|position| {
-                    let path = &convs.get(position)?.source_path;
-                    (prepared_source_completions.contains_key(path)
-                        && final_source_positions.get(path) == Some(&position))
-                    .then_some((position, path))
+            &mut |batch| {
+                let WatchScanBatch {
+                    conversations: mut convs,
+                    completions: mut source_completions,
+                    scan_error,
+                    scan_ms,
+                    final_batch,
+                } = batch;
+                earlier_batches |= !final_batch;
+                let scan_error = scan_error.map(|error| {
+                    ingest_diagnostics.observe_connector_scan_error(&root.path, &error);
+                    // ubs:ignore[rust.perf.string-alloc-in-loop] -- Failed scans retain an owned diagnostic in progress statistics; successful roots skip it.
+                    let message = format!("{error:#}");
+                    tracing::warn!(
+                        ?kind,
+                        scan_root = %root.path.display(),
+                        "watch scan failed: {message}"
+                    );
+                    first_source_scan_error.get_or_insert(error);
+                    message
                 });
-                let chunk_end = completed_source
-                    .map_or(chunk_limit, |(position, _)| position.saturating_add(1));
-                let chunk = convs.get(chunk_start..chunk_end).context(
-                    "watch source-completion batch is outside the scanned conversations",
-                )?;
-                chunk_start = chunk_end;
-                let completion = completed_source
-                    .filter(|_| quarantined_conversations == 0 && deferred_conversations == 0)
-                    .and_then(|(_, path)| prepared_source_completions.get(path));
-                if let Some(pending) = load_lexical_rebuild_state(index_path)?
+                // Publish the source error before persistence can fail for a separate
+                // reason, including the all-bad case that has no ingest phase below.
+                let failed_stats_index = if let Some(error) = &scan_error
+                    && let Some(progress) = &opts.progress
+                    && let Ok(mut stats) = progress.stats.lock()
+                {
+                    stats.scan_had_errors = true;
+                    stats.scan_ms = stats.scan_ms.saturating_add(scan_ms);
+                    let index = stats.connectors.len();
+                    stats.connectors.push(ConnectorStats {
+                        // ubs:ignore[rust.perf.string-alloc-in-loop] -- This newly appended error-statistics record owns its connector name.
+                        name: kind.slug().to_string(),
+                        conversations: 0,
+                        messages: 0,
+                        scan_ms,
+                        error: Some(error.clone()),
+                    });
+                    if !stats
+                        .agents_discovered
+                        .iter()
+                        .any(|name| name == kind.slug())
+                    {
+                        // ubs:ignore[rust.perf.string-alloc-in-loop] -- The membership check above allocates a discovered connector name at most once.
+                        stats.agents_discovered.push(kind.slug().to_string());
+                    }
+                    Some(index)
+                } else {
+                    None
+                };
+
+                let pre_active_filter_count = convs.len();
+                convs.retain(|conv| {
+                    !should_skip_active_session_source(
+                        active_source_filter,
+                        root.origin.kind,
+                        &conv.source_path,
+                    )
+                });
+                let active_sources_skipped = pre_active_filter_count.saturating_sub(convs.len());
+                if active_sources_skipped > 0 {
+                    tracing::debug!(
+                        ?kind,
+                        scan_root = %root.path.display(),
+                        active_sources_skipped,
+                        "skipped active watch sources and preserved watermarks for retry"
+                    );
+                }
+                let preserve_this_watch_watermark = preserve_watch_watermark
+                    || root_incomplete
+                    || preparse_active_source_skipped
+                    || active_sources_skipped > 0
+                    || scan_error.is_some();
+
+                convs.retain(|conv| {
+                    !should_skip_subagent(conv) && !should_skip_excluded_source(&conv.source_path)
+                });
+                let all_sources_retained = convs.len() == pre_active_filter_count;
+
+                for conversation in &mut convs {
+                    ingest_diagnostics.observe_conversation(conversation);
+                }
+
+                // Provenance injection and path rewriting
+                let mut prepared_source_completions = BTreeMap::new();
+                for conv in &mut convs {
+                    let completion = source_completions.remove_entry(&conv.source_path);
+                    prepare_conversation_for_ingest(
+                        &opts.data_dir,
+                        kind.slug(),
+                        &root.origin,
+                        Some(&root),
+                        conv,
+                    );
+                    if let Some((mut source_path, completion)) = completion {
+                        // Move the existing owned key; refresh its buffer only when
+                        // provenance rewriting changed the conversation's path.
+                        if source_path != conv.source_path {
+                            source_path.clone_from(&conv.source_path);
+                        }
+                        prepared_source_completions.insert(source_path, completion);
+                    }
+                }
+                // Order each bounded batch by (watermark, path, external id). A root
+                // split across batches withholds partial provider watermarks because
+                // the next source can contain older messages.
+                sort_watch_conversations_for_watermark(&mut convs);
+
+                // GH#510: a conversation whose bounded-guard NoMem keeps recurring
+                // waits out its deferral backoff instead of re-running the split, solo
+                // retry and deferral on every tick. It counts as deferred so the
+                // watermark stays held for it. An explicit --watch-once is an
+                // operator's retry and is never held back.
+                let nomem_backoff_held = if explicit_watch_once {
+                    0
+                } else {
+                    retain_watch_conversations_past_nomem_backoff(
+                        &opts.data_dir,
+                        &mut convs,
+                        FrankenStorage::now_millis(),
+                    )
+                };
+                if preserve_this_watch_watermark || !all_sources_retained || nomem_backoff_held > 0
+                {
+                    prepared_source_completions.clear();
+                }
+                let final_source_positions: BTreeMap<_, _> = convs
+                    .iter()
+                    .enumerate()
+                    .map(|(position, conv)| (&conv.source_path, position))
+                    .collect();
+
+                // Update total and phase to indexing
+                if let Some(p) = &opts.progress {
+                    p.total.fetch_add(convs.len(), Ordering::Relaxed);
+                    // Watch batches accumulate the total as sessions arrive; it is
+                    // never a stable denominator.
+                    p.total_is_final.store(false, Ordering::Relaxed);
+                    p.phase.store(2, Ordering::Relaxed);
+                    p.tick_activity();
+                }
+
+                let conv_count = convs.len();
+                root_incomplete |= preserve_this_watch_watermark
+                    || !all_sources_retained
+                    || nomem_backoff_held > 0;
+                if explicit_watch_once {
+                    tracing::warn!(
+                        ?kind,
+                        scan_root = %root.path.display(),
+                        conversations = conv_count,
+                        since_ts,
+                        "watch_once_scan"
+                    );
+                } else {
+                    tracing::info!(?kind, conversations = conv_count, since_ts, "watch_scan");
+                }
+
+                // Skip empty incremental scans entirely: an empty batch has nothing
+                // to ingest, must not produce a Tantivy segment, must not bump
+                // `last_indexed_at`, and must not trigger downstream optimize/merge.
+                // See issue #194.
+                if conv_count == 0 {
+                    if scan_error.is_some() {
+                        // A later successful sibling may advance the shared provider
+                        // watermark. Keep this source eligible for an unfiltered retry
+                        // even when it had no valid conversation to publish today.
+                        let storage = storage
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+                        persist_watch_lexical_replay_debt(
+                            &storage,
+                            &WatchLexicalReplayDebt::for_root(kind, &root),
+                        )?;
+                    }
+                    return Ok(());
+                }
+
+                // INGEST PHASE: Acquire locks briefly. Live watch mode persists in
+                // bounded chunks so a large backlog can make durable forward progress
+                // instead of retrying the same oversized transaction forever.
+                let index_start = Instant::now();
+                let mut inserted_messages = 0usize;
+                let mut processed_conversations = 0usize;
+                let mut quarantined_conversations = 0usize;
+                let mut deferred_conversations = nomem_backoff_held;
+                let mut lexical_replay_deferred = false;
+                {
+                    let storage = storage
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+                    let mut t_index_guard = t_index
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
+                    // Establish recovery debt BEFORE any canonical transaction. It
+                    // covers the whole selected source, including earlier successful
+                    // additions lost when a later addition discards this writer.
+                    let current_debt = WatchLexicalReplayDebt::for_root(kind, &root);
+                    persist_watch_lexical_replay_debt(&storage, &current_debt)?;
+                    if replay_canonical {
+                        // A prior failed callback may still own uncommitted additions.
+                        // Reconciliation must start from the published generation.
+                        *t_index_guard = None;
+                    }
+                    let ingest_chunk_size = if explicit_watch_once {
+                        conv_count.max(1)
+                    } else {
+                        watch_ingest_chunk_size()
+                    };
+                    let capture_semantic_delta = semantic_delta.is_some();
+                    let mut chunk_start = 0;
+                    while chunk_start < convs.len() {
+                        // Keep watermark order, but finish a batch at each source's
+                        // final conversation so its marker shares the final canonical
+                        // transaction. Interleaved earlier conversations remain
+                        // covered, and any prior deferral withholds later markers.
+                        let chunk_limit = chunk_start
+                            .saturating_add(ingest_chunk_size)
+                            .min(convs.len());
+                        let completed_source = (chunk_start..chunk_limit).find_map(|position| {
+                            let path = &convs.get(position)?.source_path;
+                            (prepared_source_completions.contains_key(path)
+                                && final_source_positions.get(path) == Some(&position))
+                            .then_some((position, path))
+                        });
+                        let chunk_end = completed_source
+                            .map_or(chunk_limit, |(position, _)| position.saturating_add(1));
+                        let chunk = convs.get(chunk_start..chunk_end).context(
+                            "watch source-completion batch is outside the scanned conversations",
+                        )?;
+                        chunk_start = chunk_end;
+                        let completion = completed_source
+                            .filter(|_| {
+                                quarantined_conversations == 0 && deferred_conversations == 0
+                            })
+                            .and_then(|(_, path)| prepared_source_completions.get(path));
+                        if let Some(pending) = load_lexical_rebuild_state(index_path)?
                     && pending.is_incomplete()
                     // ubs:ignore -- This checks the persisted rebuild checkpoint format version.
                     && pending.version == LEXICAL_REBUILD_STATE_VERSION
@@ -30706,295 +30794,298 @@ fn reindex_paths_with_semantic_delta(
                     && lexical_rebuild_db_paths_match(
                         &pending.db.db_path,
                         &crate::normalize_path_identity(&opts.db_path).to_string_lossy(),
-                    )
-                {
-                    // A previous metadata transaction may already have landed.
-                    // Its repeated packet then has zero mutations; the durable
-                    // debt, rather than this packet's counts, requires repair.
-                    *t_index_guard = None;
-                    rebuild_tantivy_from_db_deferred_startup_with_options(
-                        &opts.db_path,
-                        &opts.data_dir,
-                        count_total_conversations_exact(&storage)?,
-                        opts.progress.clone(),
-                        None,
-                    )?;
-                }
-                if t_index_guard.is_none() {
-                    tracing::info!(
-                        index_path = %index_path.display(),
-                        "opening Tantivy lazily for watch ingest"
-                    );
-                    *t_index_guard = Some(TantivyIndex::open_or_create(index_path)?);
-                }
-                let mut chunk_outcome = {
-                    let t_index = t_index_guard
-                        .as_mut()
-                        .expect("lazy watch index must be open before ingest");
-                    ingest_watch_batch_with_oom_split_inner(
-                        &storage,
-                        t_index,
-                        &opts.data_dir,
-                        chunk,
-                        &opts.progress,
-                        !opts.watch,
-                        capture_semantic_delta,
-                        WatchOomIngestMode::Standard,
-                        replay_canonical,
-                        completion,
-                    )?
-                };
-                if persist::defer_lexical_updates_enabled() {
-                    chunk_outcome
-                        .batch_outcome
-                        .record_deferred_lexical_update(&anyhow::anyhow!(
-                            "watch lexical publication is disabled by configuration"
-                        ));
-                } else if replay_canonical {
-                    // Reconcile once after the splitter has combined all IDs.
-                    // Overlapping packets must not stage the same replacement
-                    // twice against Quill's still-uncommitted snapshot.
-                    let replay = chunk_outcome
-                        .batch_outcome
-                        .canonical_conversation_ids
-                        .iter()
-                        .try_for_each(|id| {
-                            persist::replay_watch_canonical_conversation(
+                    ) {
+                            // A previous metadata transaction may already have landed.
+                            // Its repeated packet then has zero mutations; the durable
+                            // debt, rather than this packet's counts, requires repair.
+                            *t_index_guard = None;
+                            rebuild_tantivy_from_db_deferred_startup_with_options(
+                                &opts.db_path,
+                                &opts.data_dir,
+                                count_total_conversations_exact(&storage)?,
+                                opts.progress.clone(),
+                                None,
+                            )?;
+                        }
+                        if t_index_guard.is_none() {
+                            tracing::info!(
+                                index_path = %index_path.display(),
+                                "opening Tantivy lazily for watch ingest"
+                            );
+                            *t_index_guard = Some(TantivyIndex::open_or_create(index_path)?);
+                        }
+                        let mut chunk_outcome = {
+                            let t_index = t_index_guard
+                                .as_mut()
+                                .expect("lazy watch index must be open before ingest");
+                            ingest_watch_batch_with_oom_split_inner(
                                 &storage,
-                                t_index_guard
-                                    .as_mut()
-                                    .context("watch replay requires an open lexical writer")?,
-                                *id,
-                            )
-                        });
-                    if let Err(error) = replay {
-                        if error_is_out_of_memory(&error) {
-                            chunk_outcome
+                                t_index,
+                                &opts.data_dir,
+                                chunk,
+                                &opts.progress,
+                                !opts.watch,
+                                capture_semantic_delta,
+                                WatchOomIngestMode::Standard,
+                                replay_canonical,
+                                completion,
+                            )?
+                        };
+                        if persist::defer_lexical_updates_enabled() {
+                            chunk_outcome.batch_outcome.record_deferred_lexical_update(
+                                &anyhow::anyhow!(
+                                    "watch lexical publication is disabled by configuration"
+                                ),
+                            );
+                        } else if replay_canonical {
+                            // Reconcile once after the splitter has combined all IDs.
+                            // Overlapping packets must not stage the same replacement
+                            // twice against Quill's still-uncommitted snapshot.
+                            let replay = chunk_outcome
                                 .batch_outcome
-                                .record_deferred_lexical_update(&error);
-                        } else {
-                            return Err(error);
+                                .canonical_conversation_ids
+                                .iter()
+                                .try_for_each(|id| {
+                                    persist::replay_watch_canonical_conversation(
+                                        &storage,
+                                        t_index_guard.as_mut().context(
+                                            "watch replay requires an open lexical writer",
+                                        )?,
+                                        *id,
+                                    )
+                                });
+                            if let Err(error) = replay {
+                                if error_is_out_of_memory(&error) {
+                                    chunk_outcome
+                                        .batch_outcome
+                                        .record_deferred_lexical_update(&error);
+                                } else {
+                                    return Err(error);
+                                }
+                            }
+                        }
+                        inserted_messages = inserted_messages
+                            .saturating_add(chunk_outcome.batch_outcome.inserted_messages);
+                        processed_conversations = processed_conversations
+                            .saturating_add(chunk_outcome.processed_conversations);
+                        quarantined_conversations = quarantined_conversations
+                            .saturating_add(chunk_outcome.quarantined_conversations);
+                        deferred_conversations = deferred_conversations
+                            .saturating_add(chunk_outcome.deferred_conversations);
+                        if let Some(delta) = semantic_delta.as_deref_mut() {
+                            delta.extend_from_batch(
+                                chunk_outcome.batch_outcome.semantic_delta_inputs,
+                                chunk_outcome.batch_outcome.semantic_delta_max_message_id,
+                            );
+                        }
+
+                        // Commit each successful chunk before advancing the partial
+                        // watch watermark. A crash after this point replays at worst
+                        // the next unfinished chunk, not the entire backlog.
+                        let mut lexical_update_deferred =
+                            chunk_outcome.batch_outcome.lexical_update_deferred;
+                        if chunk_outcome.batch_outcome.workspace_changes > 0 {
+                            // Do not leave a live watcher serving old workspace filters.
+                            // The pre-mutation checkpoint remains pending if this fails.
+                            *t_index_guard = None;
+                            rebuild_tantivy_from_db_deferred_startup_with_options(
+                                &opts.db_path,
+                                &opts.data_dir,
+                                count_total_conversations_exact(&storage)?,
+                                opts.progress.clone(),
+                                None,
+                            )?;
+                            *t_index_guard = Some(TantivyIndex::open_or_create(index_path)?);
+                            lexical_update_deferred = false;
+                        }
+                        if lexical_update_deferred {
+                            lexical_replay_deferred = true;
+                            tracing::warn!(
+                                error = ?chunk_outcome.batch_outcome.lexical_update_error,
+                                "dropping uncommitted watch Tantivy writer after deferred lexical update"
+                            );
+                            *t_index_guard = None;
+                        } else if chunk_outcome.batch_outcome.lexical_write_attempted
+                            || replay_canonical
+                            || chunk_outcome.batch_outcome.workspace_changes > 0
+                        {
+                            // No engine call is needed when this callback attempted
+                            // no lexical mutation. Actual writes, recovery debt and
+                            // workspace repair retain the full publication preflight.
+                            #[cfg(test)]
+                            inject_watch_lexical_test_failure(WatchLexicalTestFault::Commit)?;
+                            t_index_guard
+                                .as_mut()
+                                .expect("watch Tantivy writer must still be open before commit")
+                                .commit()?;
+                        }
+                        if chunk_outcome.source_completion_written {
+                            tracing::info!(
+                                connector = kind.slug(),
+                                conversations = chunk.len(),
+                                "source_ingest_committed"
+                            );
+                        }
+
+                        // Conversations are sorted by watermark, so a clean later
+                        // chunk must not advance past an earlier (or backed-off)
+                        // deferred one, which would drop it from every later scan:
+                        // the cumulative deferral count gates this. Quarantined
+                        // conversations keep the per-chunk gate: they have no backoff,
+                        // so holding the watermark for them would re-attempt them on
+                        // every tick.
+                        if !explicit_watch_once
+                            && final_batch
+                            && !earlier_batches
+                            && !preserve_this_watch_watermark
+                            && !lexical_replay_deferred
+                            && chunk_outcome.quarantined_conversations == 0
+                            && deferred_conversations == 0
+                            && let Some(ts_val) = chunk_outcome.max_payload_watermark_ms
+                        {
+                            save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
+                        } else if chunk_outcome.quarantined_conversations > 0
+                            || chunk_outcome.deferred_conversations > 0
+                        {
+                            tracing::info!(
+                                ?kind,
+                                quarantined_conversations = chunk_outcome.quarantined_conversations,
+                                deferred_conversations = chunk_outcome.deferred_conversations,
+                                "preserving partial watch watermark so quarantined/deferred source can be retried"
+                            );
+                        } else if preserve_this_watch_watermark {
+                            tracing::debug!(
+                                ?kind,
+                                active_sources_skipped,
+                                "preserving partial watch watermark because a source failed or was excluded"
+                            );
                         }
                     }
+                    if !lexical_replay_deferred
+                        && final_batch
+                        && !root_incomplete
+                        && quarantined_conversations == 0
+                        && deferred_conversations == 0
+                        && !preserve_this_watch_watermark
+                    {
+                        // A child-only retry must not discharge a failed parent's
+                        // sibling work. Broader repair checkpoints are never touched.
+                        let selected_path = crate::normalize_path_identity(&root.path);
+                        for debt in pending_lexical_debt
+                            .iter()
+                            .chain(std::iter::once(&current_debt))
+                            .filter(|debt| debt.path.starts_with(&selected_path))
+                        {
+                            clear_watch_lexical_replay_debt(&storage, debt)?;
+                        }
+                        // A later source or chunk can still fail after an earlier
+                        // commit. Publish root-wide currentness only after every
+                        // batch and lexical recovery checkpoint has completed.
+                        persist::with_ephemeral_writer(
+                            &storage,
+                            false,
+                            "updating completed watch last_indexed_at",
+                            |writer| writer.set_last_indexed_at(FrankenStorage::now_millis()),
+                        )?;
+                    }
                 }
-                inserted_messages =
-                    inserted_messages.saturating_add(chunk_outcome.batch_outcome.inserted_messages);
-                processed_conversations =
-                    processed_conversations.saturating_add(chunk_outcome.processed_conversations);
-                quarantined_conversations = quarantined_conversations
-                    .saturating_add(chunk_outcome.quarantined_conversations);
-                deferred_conversations =
-                    deferred_conversations.saturating_add(chunk_outcome.deferred_conversations);
-                if let Some(delta) = semantic_delta.as_deref_mut() {
-                    delta.extend_from_batch(
-                        chunk_outcome.batch_outcome.semantic_delta_inputs,
-                        chunk_outcome.batch_outcome.semantic_delta_max_message_id,
-                    );
-                }
+                let index_ms = index_start.elapsed().as_millis() as u64;
 
-                // Commit each successful chunk before advancing the partial
-                // watch watermark. A crash after this point replays at worst
-                // the next unfinished chunk, not the entire backlog.
-                let mut lexical_update_deferred =
-                    chunk_outcome.batch_outcome.lexical_update_deferred;
-                if chunk_outcome.batch_outcome.workspace_changes > 0 {
-                    // Do not leave a live watcher serving old workspace filters.
-                    // The pre-mutation checkpoint remains pending if this fails.
-                    *t_index_guard = None;
-                    rebuild_tantivy_from_db_deferred_startup_with_options(
-                        &opts.db_path,
-                        &opts.data_dir,
-                        count_total_conversations_exact(&storage)?,
-                        opts.progress.clone(),
-                        None,
-                    )?;
-                    *t_index_guard = Some(TantivyIndex::open_or_create(index_path)?);
-                    lexical_update_deferred = false;
-                }
-                if lexical_update_deferred {
-                    lexical_replay_deferred = true;
-                    tracing::warn!(
-                        error = ?chunk_outcome.batch_outcome.lexical_update_error,
-                        "dropping uncommitted watch Tantivy writer after deferred lexical update"
-                    );
-                    *t_index_guard = None;
-                } else if chunk_outcome.batch_outcome.lexical_write_attempted
-                    || replay_canonical
-                    || chunk_outcome.batch_outcome.workspace_changes > 0
+                if let Some(p) = &opts.progress
+                    && let Ok(mut stats) = p.stats.lock()
                 {
-                    // No engine call is needed when this callback attempted
-                    // no lexical mutation. Actual writes, recovery debt and
-                    // workspace repair retain the full publication preflight.
-                    #[cfg(test)]
-                    inject_watch_lexical_test_failure(WatchLexicalTestFault::Commit)?;
-                    t_index_guard
-                        .as_mut()
-                        .expect("watch Tantivy writer must still be open before commit")
-                        .commit()?;
+                    let connector_name = convs
+                        .first()
+                        .map(|conv| conv.agent_slug.clone())
+                        .unwrap_or_else(|| format!("{kind:?}").to_ascii_lowercase());
+                    if failed_stats_index.is_none() {
+                        stats.scan_ms = stats.scan_ms.saturating_add(scan_ms);
+                    }
+                    stats.index_ms = stats.index_ms.saturating_add(index_ms);
+                    stats.total_conversations =
+                        stats.total_conversations.saturating_add(conv_count);
+                    stats.total_messages = stats.total_messages.saturating_add(inserted_messages);
+                    let connector_stats = ConnectorStats {
+                        name: connector_name.clone(),
+                        conversations: conv_count,
+                        messages: inserted_messages,
+                        scan_ms,
+                        error: scan_error,
+                    };
+                    if let Some(index) = failed_stats_index {
+                        *stats.connectors.get_mut(index).context(
+                            "watch scan lost its earlier connector failure statistics",
+                        )? = connector_stats;
+                    } else {
+                        stats.connectors.push(connector_stats);
+                    }
+                    if !stats
+                        .agents_discovered
+                        .iter()
+                        // ubs:ignore -- Connector names are deduplicated in discovery statistics.
+                        .any(|name| name == &connector_name)
+                    {
+                        stats.agents_discovered.push(connector_name);
+                    }
                 }
-                if chunk_outcome.source_completion_written {
-                    tracing::info!(
-                        connector = kind.slug(),
-                        conversations = chunk.len(),
-                        "source_ingest_committed"
+
+                if quarantined_conversations > 0 {
+                    tracing::warn!(
+                        ?kind,
+                        quarantined_conversations,
+                        "watch ingest skipped poison conversations after OOM bisection"
                     );
                 }
 
-                // Keep last_indexed_at current so `cass status` doesn't report stale during watch mode.
-                if lexical_replay_deferred {
-                    tracing::warn!(
-                        "skipping watch last_indexed_at update after deferred lexical update so health/status report stale lexical assets"
-                    );
-                } else if scan_error.is_some() {
-                    tracing::warn!(
-                        "skipping watch last_indexed_at update after incomplete source scan"
-                    );
-                } else {
-                    persist::with_ephemeral_writer(
-                        &storage,
-                        false,
-                        "updating watch last_indexed_at",
-                        |writer| writer.set_last_indexed_at(FrankenStorage::now_millis()),
-                    )?;
-                }
+                // Track total processed for stale detection. This intentionally
+                // follows the old return shape (scanned conversations, not newly
+                // inserted rows) while including quarantined single-conversation OOMs
+                // as forward progress so watch mode does not wedge on a poison file.
+                total_indexed = total_indexed.saturating_add(processed_conversations);
+                root_incomplete |= quarantined_conversations > 0
+                    || deferred_conversations > 0
+                    || lexical_replay_deferred;
 
-                // Conversations are sorted by watermark, so a clean later
-                // chunk must not advance past an earlier (or backed-off)
-                // deferred one, which would drop it from every later scan:
-                // the cumulative deferral count gates this. Quarantined
-                // conversations keep the per-chunk gate: they have no backoff,
-                // so holding the watermark for them would re-attempt them on
-                // every tick.
+                // Explicit watch-once imports are one-shot recovery/replay work, not
+                // live daemon watch progress. Do not let them advance the persistent
+                // watch_state high-water marks that steady-state watch mode consumes.
                 if !explicit_watch_once
+                    && final_batch
+                    && !root_incomplete
+                    && conv_count > 0
                     && !preserve_this_watch_watermark
-                    && !lexical_replay_deferred
-                    && chunk_outcome.quarantined_conversations == 0
+                    && quarantined_conversations == 0
                     && deferred_conversations == 0
-                    && let Some(ts_val) = chunk_outcome.max_payload_watermark_ms
+                    && !lexical_replay_deferred
+                    && let Some(ts_val) = max_ts
                 {
+                    // Once every chunk for this trigger has persisted without poison
+                    // quarantine, advance to the filesystem event high-water mark.
+                    // Partial per-chunk updates above deliberately use payload
+                    // timestamps so an unexpected later failure cannot hide
+                    // unprocessed conversations that share the same source file.
                     save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
-                } else if chunk_outcome.quarantined_conversations > 0
-                    || chunk_outcome.deferred_conversations > 0
+                } else if !explicit_watch_once
+                    && (quarantined_conversations > 0 || deferred_conversations > 0)
                 {
                     tracing::info!(
                         ?kind,
-                        quarantined_conversations = chunk_outcome.quarantined_conversations,
-                        deferred_conversations = chunk_outcome.deferred_conversations,
-                        "preserving partial watch watermark so quarantined/deferred source can be retried"
+                        quarantined_conversations,
+                        deferred_conversations,
+                        "preserving final watch watermark so quarantined/deferred source can be retried"
                     );
-                } else if preserve_this_watch_watermark {
-                    tracing::debug!(
+                } else if !explicit_watch_once && conv_count > 0 && preserve_this_watch_watermark {
+                    tracing::info!(
                         ?kind,
                         active_sources_skipped,
-                        "preserving partial watch watermark because a source failed or was excluded"
+                        "preserving final watch watermark because a source failed or was excluded"
                     );
                 }
-            }
-            if !lexical_replay_deferred
-                && quarantined_conversations == 0
-                && deferred_conversations == 0
-                && !preserve_this_watch_watermark
-            {
-                // A child-only retry must not discharge a failed parent's
-                // sibling work. Broader repair checkpoints are never touched.
-                let selected_path = crate::normalize_path_identity(&root.path);
-                for debt in pending_lexical_debt
-                    .iter()
-                    .chain(std::iter::once(&current_debt))
-                    .filter(|debt| debt.path.starts_with(&selected_path))
-                {
-                    clear_watch_lexical_replay_debt(&storage, debt)?;
-                }
-            }
-        }
-        let index_ms = index_start.elapsed().as_millis() as u64;
-
-        if let Some(p) = &opts.progress
-            && let Ok(mut stats) = p.stats.lock()
-        {
-            let connector_name = convs
-                .first()
-                .map(|conv| conv.agent_slug.clone())
-                .unwrap_or_else(|| format!("{kind:?}").to_ascii_lowercase());
-            if failed_stats_index.is_none() {
-                stats.scan_ms = stats.scan_ms.saturating_add(scan_ms);
-            }
-            stats.index_ms = stats.index_ms.saturating_add(index_ms);
-            stats.total_conversations = stats.total_conversations.saturating_add(conv_count);
-            stats.total_messages = stats.total_messages.saturating_add(inserted_messages);
-            let connector_stats = ConnectorStats {
-                name: connector_name.clone(),
-                conversations: conv_count,
-                messages: inserted_messages,
-                scan_ms,
-                error: scan_error,
-            };
-            if let Some(index) = failed_stats_index {
-                *stats
-                    .connectors
-                    .get_mut(index)
-                    .context("watch scan lost its earlier connector failure statistics")? =
-                    connector_stats;
-            } else {
-                stats.connectors.push(connector_stats);
-            }
-            if !stats
-                .agents_discovered
-                .iter()
-                // ubs:ignore -- Connector names are deduplicated in discovery statistics.
-                .any(|name| name == &connector_name)
-            {
-                stats.agents_discovered.push(connector_name);
-            }
-        }
-
-        if quarantined_conversations > 0 {
-            tracing::warn!(
-                ?kind,
-                quarantined_conversations,
-                "watch ingest skipped poison conversations after OOM bisection"
-            );
-        }
-
-        // Track total processed for stale detection. This intentionally
-        // follows the old return shape (scanned conversations, not newly
-        // inserted rows) while including quarantined single-conversation OOMs
-        // as forward progress so watch mode does not wedge on a poison file.
-        total_indexed = total_indexed.saturating_add(processed_conversations);
-
-        // Explicit watch-once imports are one-shot recovery/replay work, not
-        // live daemon watch progress. Do not let them advance the persistent
-        // watch_state high-water marks that steady-state watch mode consumes.
-        if !explicit_watch_once
-            && conv_count > 0
-            && !preserve_this_watch_watermark
-            && quarantined_conversations == 0
-            && deferred_conversations == 0
-            && !lexical_replay_deferred
-            && let Some(ts_val) = max_ts
-        {
-            // Once every chunk for this trigger has persisted without poison
-            // quarantine, advance to the filesystem event high-water mark.
-            // Partial per-chunk updates above deliberately use payload
-            // timestamps so an unexpected later failure cannot hide
-            // unprocessed conversations that share the same source file.
-            save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
-        } else if !explicit_watch_once
-            && (quarantined_conversations > 0 || deferred_conversations > 0)
-        {
-            tracing::info!(
-                ?kind,
-                quarantined_conversations,
-                deferred_conversations,
-                "preserving final watch watermark so quarantined/deferred source can be retried"
-            );
-        } else if !explicit_watch_once && conv_count > 0 && preserve_this_watch_watermark {
-            tracing::info!(
-                ?kind,
-                active_sources_skipped,
-                "preserving final watch watermark because a source failed or was excluded"
-            );
-        }
+                Ok(())
+            },
+        );
+        record_connector_ingest_report(opts.progress.as_ref(), ingest_diagnostics.finish());
+        batch_result?;
     }
 
     // Reset phase to idle if progress exists
@@ -64700,6 +64791,225 @@ c.close()
             &index_dir(&opts.data_dir)?,
             false,
         )
+    }
+
+    #[test]
+    #[serial]
+    fn watch_scan_batches_bound_real_omp_sources_and_preserve_completion_order() -> Result<()> {
+        let temp = TempDir::new()?;
+        let sessions = temp.path().join(".omp/agent/sessions/project");
+        fs::create_dir_all(&sessions)?;
+        let count = DEFAULT_STREAMING_BATCH_LIMITS.max_conversations * 2 + 1;
+        for index in 0..count {
+            fs::write(
+                sessions.join(format!("2026-08-24T12-00-00_{index:04}.jsonl")),
+                format!(
+                    "{}\n{}\n",
+                    serde_json::json!({"type":"session","id":format!("bounded-omp-{index}"),
+                        "timestamp":"2026-08-24T12:00:00Z","cwd":"/project"}),
+                    serde_json::json!({"type":"message","timestamp":"2026-08-24T12:00:01Z",
+                        "message":{"role":"user","content":format!("original body {index}")}}),
+                ),
+            )?;
+        }
+        let ctx = ScanContext::with_roots(
+            temp.path().join("cass"),
+            vec![ScanRoot::local(sessions)],
+            None,
+        );
+        let connector = crate::connectors::omp::OmpConnector::new();
+        let mut paths = HashSet::new();
+        let mut batches = Vec::new();
+        scan_watch_with_source_boundaries(&connector, &ctx, "omp", &mut |batch| {
+            assert!(batch.scan_error.is_none());
+            assert!(!batch.conversations.is_empty());
+            assert!(batch.conversations.len() <= DEFAULT_STREAMING_BATCH_LIMITS.max_conversations);
+            assert_eq!(batch.completions.len(), batch.conversations.len());
+            for conversation in &batch.conversations {
+                assert!(paths.insert(conversation.source_path.clone()));
+                assert!(batch.completions.contains_key(&conversation.source_path));
+                assert!(
+                    conversation
+                        .external_id
+                        .as_deref()
+                        .unwrap()
+                        .starts_with("bounded-omp-")
+                );
+            }
+            batches.push((batch.conversations.len(), batch.final_batch));
+            Ok(())
+        })?;
+        assert_eq!(
+            paths.len(),
+            count,
+            "every original must be delivered exactly once"
+        );
+        assert_eq!(batches, [(64, false), (64, false), (1, true)]);
+
+        let mut admitted = 0;
+        let failure = scan_watch_with_source_boundaries(&connector, &ctx, "omp", &mut |batch| {
+            admitted += batch.conversations.len();
+            assert!(!batch.final_batch);
+            anyhow::bail!("real watch consumer refused persistence")
+        })
+        .expect_err("consumer failure must abort the scan");
+        assert!(
+            failure
+                .to_string()
+                .contains("real watch consumer refused persistence")
+        );
+        assert_eq!(
+            admitted, 64,
+            "do not deliver later batches after persistence failed"
+        );
+        let single_ctx = ScanContext::with_roots(
+            temp.path().join("cass"),
+            vec![ScanRoot::local(paths.iter().next().unwrap().clone())],
+            None,
+        );
+        let terminal_failure =
+            scan_watch_with_source_boundaries(&connector, &single_ctx, "omp", &mut |batch| {
+                assert!(batch.final_batch);
+                assert_eq!(batch.conversations.len(), 1);
+                anyhow::bail!("terminal persistence failure retains its original cause")
+            })
+            .expect_err("terminal batch persistence failure must be returned");
+        assert!(
+            terminal_failure
+                .to_string()
+                .contains("terminal persistence failure retains its original cause")
+        );
+        eprintln!(
+            "{}",
+            serde_json::json!({"step":"bounded_native_omp_watch_scan",
+            "original_sources":count,"batches":batches,"consumer_failure_preserved":true,"status":"passed"})
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn watch_scan_batches_charge_retained_metadata_before_admitting_another_source() -> Result<()> {
+        let temp = TempDir::new()?;
+        let sessions = temp.path().join(".omp/agent/sessions/project");
+        fs::create_dir_all(&sessions)?;
+        for index in 0..3 {
+            fs::write(
+                sessions.join(format!("2026-08-24T12-00-00_{index}.jsonl")),
+                format!(
+                    "{}\n{}\n",
+                    serde_json::json!({"type":"session","id":format!("metadata-omp-{index}"),
+                    "timestamp":"2026-08-24T12:00:00Z","cwd":"/project"}),
+                    serde_json::json!({"type":"message","timestamp":"2026-08-24T12:00:01Z",
+                    "message":{"role":"user","content":"tiny body",
+                        "large_retained_metadata":"x".repeat(DEFAULT_STREAMING_BATCH_LIMITS.max_chars)}}),
+                ),
+            )?;
+        }
+        let ctx = ScanContext::with_roots(
+            temp.path().join("cass"),
+            vec![ScanRoot::local(sessions)],
+            None,
+        );
+        let mut delivered = 0;
+        scan_watch_with_source_boundaries(
+            &crate::connectors::omp::OmpConnector::new(),
+            &ctx,
+            "omp",
+            &mut |batch| {
+                assert!(batch.scan_error.is_none());
+                assert_eq!(
+                    batch.conversations.len(),
+                    1,
+                    "metadata-heavy originals must not multiply beyond the batch budget"
+                );
+                let footprint = conversation_batch_footprint(&batch.conversations[0]);
+                assert!(footprint.retained_bytes > DEFAULT_STREAMING_BATCH_LIMITS.max_chars);
+                assert!(footprint.content_bytes < 100);
+                assert_eq!(batch.completions.len(), 1);
+                delivered += 1;
+                Ok(())
+            },
+        )?;
+        assert_eq!(delivered, 3);
+        eprintln!(
+            "{}",
+            serde_json::json!({"step":"bounded_watch_retained_metadata",
+            "original_sources":3,"tiny_bodies":true,"status":"passed"})
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn watch_scan_batches_publish_currentness_only_after_all_source_commits() {
+        let temp = TempDir::new().unwrap();
+        let data_dir = temp.path().join("cass");
+        let selected = temp.path().join("selected/amp");
+        write_watch_lexical_source(
+            &selected.join("thread-first.json"),
+            "thread-first",
+            "firstcurrentnessneedle",
+        );
+        write_watch_lexical_source(
+            &selected.join("thread-second.json"),
+            "thread-second",
+            "secondcurrentnessneedle",
+        );
+        let opts = watch_lexical_options(&data_dir);
+        let storage = Mutex::new(FrankenStorage::open(&opts.db_path).unwrap());
+        let index_path = index_dir(&data_dir).unwrap();
+        let index = Mutex::new(Some(TantivyIndex::open_or_create(&index_path).unwrap()));
+        assert_eq!(storage.lock().unwrap().get_last_indexed_at().unwrap(), None);
+        {
+            let _fault = WatchLexicalFaultGuard::set(WatchLexicalTestFault::PublicationAfter(1));
+            assert_eq!(
+                run_watch_lexical_selection(&opts, &selected, &storage, &index).unwrap(),
+                2
+            );
+        }
+        assert_eq!(
+            watch_lexical_canonical_rows(&storage.lock().unwrap()).len(),
+            2
+        );
+        assert_eq!(
+            storage.lock().unwrap().get_last_indexed_at().unwrap(),
+            None,
+            "an earlier source commit must not mark an incomplete selected root current"
+        );
+        let root = ScanRoot::local(selected.clone());
+        assert_eq!(
+            watch_lexical_replay_debt_for_root(&storage.lock().unwrap(), ConnectorKind::Amp, &root)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            run_watch_lexical_selection(&opts, &selected, &storage, &index).unwrap(),
+            2
+        );
+        assert!(
+            storage
+                .lock()
+                .unwrap()
+                .get_last_indexed_at()
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            watch_lexical_replay_debt_for_root(&storage.lock().unwrap(), ConnectorKind::Amp, &root)
+                .unwrap()
+                .is_empty()
+        );
+        for marker in ["firstcurrentnessneedle", "secondcurrentnessneedle"] {
+            assert_eq!(watch_lexical_search_ids(&index_path, marker).len(), 1);
+        }
+        eprintln!(
+            "{}",
+            serde_json::json!({"step":"watch_root_currentness_after_all_commits",
+                "original_sources":2,"failed_publication_kept_stale":true,
+                "real_canonical_and_lexical_retry":true,"status":"passed"})
+        );
     }
 
     #[test]
