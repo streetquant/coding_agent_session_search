@@ -1472,19 +1472,40 @@ impl QuillCassIndex {
     /// stamps. A proven Linux mapping identity avoids making the full archive's
     /// retained mappings resident; other backings also verify their held bytes.
     /// New or changed bindings are still verified by the engine preflight.
+    /// Disjoint retained segments use at most four scoped CPU workers, each
+    /// with the same fixed-size streaming buffer. Every worker finishes before
+    /// the snapshot is released and the publication is allowed to start.
     fn with_verified_publication<T>(&self, op: impl FnOnce() -> Result<T>) -> Result<T> {
         self.with_engine_liveness(|| {
             {
                 let snapshot = self.index.snapshot()?;
-                for segment in snapshot.segments() {
-                    verify_retained_segment_file(segment).map_err(|error| {
-                        let diagnostic = format!(
-                            "verifying retained Quill segment {} before publication: {error}",
-                            segment.path().display()
-                        );
-                        error.context(diagnostic)
-                    })?;
-                }
+                let workers = std::thread::available_parallelism()
+                    .map_or(1, std::num::NonZeroUsize::get)
+                    .min(4);
+                let chunk_size = snapshot.segments().len().div_ceil(workers).max(1);
+                std::thread::scope(|scope| -> Result<()> {
+                    let mut handles = Vec::new();
+                    for chunk in snapshot.segments().chunks(chunk_size) {
+                        handles.push(scope.spawn(move || -> Result<()> {
+                            for segment in chunk {
+                                verify_retained_segment_file(segment).map_err(|error| {
+                                    let diagnostic = format!(
+                                        "verifying retained Quill segment {} before publication: {error}",
+                                        segment.path().display()
+                                    );
+                                    error.context(diagnostic)
+                                })?;
+                            }
+                            Ok(())
+                        }));
+                    }
+                    for handle in handles {
+                        handle
+                            .join()
+                            .map_err(|_| anyhow!("retained Quill verification worker panicked"))??;
+                    }
+                    Ok(())
+                })?;
                 // Release the snapshot before publication; keep no extra
                 // reader or mapping alive across the successor installation.
             }
@@ -3331,6 +3352,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn publication_rejects_replaced_path_and_corrupt_detached_backing() {
+        publication_replacement_controls(1);
+        publication_replacement_controls(5);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn publication_replacement_controls(segment_count: usize) {
         use std::io::{Read, Seek, SeekFrom, Write};
         use std::os::unix::fs::MetadataExt;
 
@@ -3342,11 +3369,25 @@ mod tests {
                     .add_cass_documents(&[sample("alpha", 0, "retained replacement control")])
                     .expect("stage original");
                 index.commit().expect("publish original");
+                for row in 1..segment_count {
+                    index
+                        .add_cass_documents(&[sample(
+                            &format!("retained-{row}"),
+                            row as u64,
+                            "additional retained worker control",
+                        )])
+                        .expect("stage additional retained segment");
+                    index.commit().expect("publish additional retained segment");
+                }
                 drop(index);
                 let mut index =
                     QuillCassIndex::open_or_create(directory.path()).expect("reopen mapping");
+                index
+                    .commit()
+                    .expect("ordinary retained publication control");
                 let snapshot = index.index.snapshot().expect("held snapshot");
-                let segment = &snapshot.segments()[0];
+                assert_eq!(snapshot.segments().len(), segment_count);
+                let segment = snapshot.segments().last().expect("last retained segment");
                 let manifest_before =
                     std::fs::read(directory.path().join(QUILL_INDEX_MARKER)).expect("manifest");
                 let mut old_file = std::fs::OpenOptions::new()
@@ -3416,12 +3457,15 @@ mod tests {
 
                 let replacement_index =
                     open_cass_reader(directory.path()).expect("valid replacement opens");
-                assert_eq!(replacement_index.doc_count().expect("replacement count"), 1);
+                assert_eq!(
+                    replacement_index.doc_count().expect("replacement count"),
+                    segment_count as u64
+                );
                 assert_eq!(
                     replacement_index
                         .segment_count()
                         .expect("replacement segment"),
-                    1
+                    segment_count
                 );
                 let result = match action {
                     "commit" => {
