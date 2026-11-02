@@ -1071,6 +1071,8 @@ struct NonWatchIngestOutcome {
     canonical_mutations: CanonicalMutationCounts,
     quarantined_conversations: usize,
     lexical_update_deferred: bool,
+    /// Conservative across split retries, including a partially failed write.
+    lexical_write_attempted: bool,
     scanned_connectors: BTreeSet<String>,
     scan_had_errors: bool,
     deferred_sources: BTreeSet<PathBuf>,
@@ -1094,6 +1096,7 @@ impl NonWatchIngestOutcome {
                 .quarantined_conversations
                 .saturating_add(other.quarantined_conversations),
             lexical_update_deferred: self.lexical_update_deferred || other.lexical_update_deferred,
+            lexical_write_attempted: self.lexical_write_attempted || other.lexical_write_attempted,
             scanned_connectors,
             scan_had_errors: self.scan_had_errors || other.scan_had_errors,
             deferred_sources,
@@ -14145,6 +14148,7 @@ struct StreamingCommitPacer {
     last_commit: std::time::Instant,
     last_commit_cost: Duration,
     last_fold_attempt: Option<std::time::Instant>,
+    lexical_dirty: bool,
 }
 
 impl StreamingCommitPacer {
@@ -14153,7 +14157,14 @@ impl StreamingCommitPacer {
             last_commit: std::time::Instant::now(),
             last_commit_cost: Duration::ZERO,
             last_fold_attempt: None,
+            // The caller may supply a writer with earlier staged additions.
+            // Establish a successful flush before skipping any paced commit.
+            lexical_dirty: true,
         }
+    }
+
+    fn note_lexical_write(&mut self, attempted: bool) {
+        self.lexical_dirty |= attempted;
     }
 
     /// Whether enough ingest time has passed since the last commit ended.
@@ -14167,22 +14178,33 @@ impl StreamingCommitPacer {
 
     /// Commit, then fold small segments when due, then restart the interval.
     /// The fold is a publish too, so its time counts toward the pacing cost.
-    fn commit(&mut self, t_index: Option<&mut TantivyIndex>) {
+    fn commit(&mut self, t_index: Option<&mut TantivyIndex>) -> Result<()> {
+        let mut result = Ok(());
         if let Some(t_index) = t_index {
             let started = std::time::Instant::now();
-            match t_index.commit() {
-                Ok(()) => {
-                    tracing::debug!(
-                        commit_ms = started.elapsed().as_millis() as u64,
-                        "incremental commit completed"
-                    );
-                    self.fold_small_segments(t_index);
+            if self.lexical_dirty {
+                match t_index.commit() {
+                    Ok(()) => {
+                        self.lexical_dirty = false;
+                        tracing::debug!(
+                            commit_ms = started.elapsed().as_millis() as u64,
+                            "incremental commit completed"
+                        );
+                        self.fold_small_segments(t_index);
+                    }
+                    Err(error) => result = Err(error),
                 }
-                Err(error) => tracing::warn!(%error, "incremental commit failed"),
+                self.last_commit_cost = started.elapsed();
+            } else {
+                // Unchanged source replay has nothing to publish. Retain the
+                // independent bounded fold and its cost-based backpressure.
+                // Mandatory final and interrupt commits remain unconditional.
+                self.fold_small_segments(t_index);
+                self.last_commit_cost = self.last_commit_cost.max(started.elapsed());
             }
-            self.last_commit_cost = started.elapsed();
         }
         self.last_commit = std::time::Instant::now();
+        result
     }
 
     /// Fold the small segment tail during a long streaming run.
@@ -14212,10 +14234,15 @@ impl StreamingCommitPacer {
                 "folded lexical segments during streaming ingest"
             ),
             Ok(false) => {}
-            Err(error) => tracing::warn!(
-                error = %format!("{error:#}"),
-                "segment merge during streaming ingest failed; continuing with the unmerged generation"
-            ),
+            Err(error) => {
+                // A failed publication may retain a retry proposal. Preserve
+                // the next paced commit even if subsequent source rows match.
+                self.lexical_dirty = true;
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "segment merge during streaming ingest failed; continuing with the unmerged generation"
+                );
+            }
         }
     }
 }
@@ -14523,7 +14550,9 @@ fn run_streaming_consumer(
                 });
                 drop(combined_conversations);
                 flow_limiter.release(combined_byte_reservation);
-                ingest_outcome = ingest_outcome.accumulate(batch_outcome?);
+                let batch_outcome = batch_outcome?;
+                commit_pacer.note_lexical_write(batch_outcome.lexical_write_attempted);
+                ingest_outcome = ingest_outcome.accumulate(batch_outcome);
 
                 // For tracing parity with the per-message path, use the
                 // first batch's connector_name + the combined totals.
@@ -14538,7 +14567,9 @@ fn run_streaming_consumer(
                 // the pipeline. It never drops below a multiple of what the
                 // last commit cost (see `paced_streaming_commit_interval`).
                 if commit_pacer.due() {
-                    commit_pacer.commit(t_index.as_deref_mut());
+                    if let Err(error) = commit_pacer.commit(t_index.as_deref_mut()) {
+                        tracing::warn!(%error, "incremental commit failed");
+                    }
                     // Do not advance the legacy global `last_scan_ts` from a
                     // partial streaming run: a later connector scan error would
                     // make that global watermark unsafe for legacy fallback.
@@ -14584,6 +14615,8 @@ fn run_streaming_consumer(
                     p.tick_activity();
                 }
                 let mut completion_written = !failed_scan_connectors.contains(connector_name);
+                let possible_partial_lexical_write = t_index.is_some()
+                    && lexical_population_strategy_requires_inline_tantivy(lexical_strategy);
                 let first = if should_inject_non_watch_ingest_test_oom(&conversations) {
                     Err(anyhow::Error::new(
                         crate::franken_sync::FrankenError::OutOfMemory,
@@ -14616,6 +14649,10 @@ fn run_streaming_consumer(
                             progress_bump,
                             error,
                         )
+                        .map(|mut outcome| {
+                            outcome.lexical_write_attempted |= possible_partial_lexical_write;
+                            outcome
+                        })
                     }
                     result => result,
                 };
@@ -14637,7 +14674,9 @@ fn run_streaming_consumer(
                 }
                 drop(conversations);
                 flow_limiter.release(byte_reservation);
-                ingest_outcome = ingest_outcome.accumulate(result?);
+                let result = result?;
+                commit_pacer.note_lexical_write(result.lexical_write_attempted);
+                ingest_outcome = ingest_outcome.accumulate(result);
                 total_conversations += count;
                 total_messages += messages;
                 remember_discovered_connector(&mut discovered_names, connector_name);
@@ -14649,8 +14688,10 @@ fn run_streaming_consumer(
                     });
                 stats.conversations += count;
                 stats.messages += messages;
-                if commit_pacer.due() {
-                    commit_pacer.commit(t_index.as_deref_mut());
+                if commit_pacer.due()
+                    && let Err(error) = commit_pacer.commit(t_index.as_deref_mut())
+                {
+                    tracing::warn!(%error, "incremental commit failed");
                 }
                 if completion_written {
                     tracing::info!(
@@ -26854,6 +26895,7 @@ fn ingest_batch_detailed_with_source_completion(
         },
         quarantined_conversations: 0,
         lexical_update_deferred: batch_outcome.lexical_update_deferred,
+        lexical_write_attempted: batch_outcome.lexical_write_attempted,
         scanned_connectors: BTreeSet::new(),
         scan_had_errors: !batch_outcome.incomplete_sources.is_empty(),
         deferred_sources: batch_outcome.incomplete_sources.clone(),
@@ -26903,6 +26945,8 @@ fn ingest_non_watch_batch_with_oom_split(
         return Ok(merged);
     }
 
+    let possible_partial_lexical_write =
+        t_index.is_some() && lexical_population_strategy_requires_inline_tantivy(lexical_strategy);
     let first_attempt = ingest_non_watch_batch_once(
         storage,
         t_index,
@@ -26916,16 +26960,20 @@ fn ingest_non_watch_batch_with_oom_split(
 
     let outcome = match first_attempt {
         Ok(outcome) => Ok(outcome),
-        Err(error) if error_is_out_of_memory(&error) => ingest_non_watch_oom_retry_or_quarantine(
-            storage,
-            data_dir,
-            convs,
-            progress,
-            lexical_strategy,
-            defer_checkpoints,
-            progress_bump,
-            error,
-        ),
+        Err(error) if error_is_out_of_memory(&error) => {
+            let mut outcome = ingest_non_watch_oom_retry_or_quarantine(
+                storage,
+                data_dir,
+                convs,
+                progress,
+                lexical_strategy,
+                defer_checkpoints,
+                progress_bump,
+                error,
+            )?;
+            outcome.lexical_write_attempted |= possible_partial_lexical_write;
+            Ok(outcome)
+        }
         Err(error) => Err(error),
     }?;
     if let Some(progress) = progress {
@@ -27089,6 +27137,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
             canonical_mutations: CanonicalMutationCounts::default(),
             quarantined_conversations: 0,
             lexical_update_deferred: true,
+            lexical_write_attempted: false,
             scanned_connectors: BTreeSet::new(),
             scan_had_errors: true,
             deferred_sources: BTreeSet::from([conv.source_path.clone()]),
@@ -27122,6 +27171,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         canonical_mutations: CanonicalMutationCounts::default(),
         quarantined_conversations: 1,
         lexical_update_deferred: true,
+        lexical_write_attempted: false,
         scanned_connectors: BTreeSet::new(),
         scan_had_errors: true,
         deferred_sources: BTreeSet::from([conv.source_path.clone()]),
@@ -54897,6 +54947,148 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial]
+    fn streaming_clean_replay_skips_only_paced_commit_and_retries_dirty_failure() -> Result<()> {
+        let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "0");
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("archive.db"))?;
+        let index_path = crate::search::tantivy::expected_index_dir(dir.path());
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        let original = norm_conv(Some("paced-original"), vec![norm_msg(0, 100)]);
+        let ingest = |index: &mut TantivyIndex, conversation: &NormalizedConversation| {
+            ingest_non_watch_batch_with_oom_split(
+                &storage,
+                Some(index),
+                dir.path(),
+                std::slice::from_ref(conversation),
+                &None,
+                LexicalPopulationStrategy::IncrementalInline,
+                false,
+                None,
+            )
+        };
+        let first = ingest(&mut index, &original)?;
+        assert!(first.lexical_write_attempted);
+        let mut pacer = StreamingCommitPacer::new();
+        pacer.note_lexical_write(first.lexical_write_attempted);
+        pacer.commit(Some(&mut index))?;
+        assert!(!pacer.lexical_dirty);
+        let manifest = fs::read(index_path.join("MANIFEST"))?;
+        let segment = fs::read_dir(&index_path)?
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "fslx"))
+            .context("published fixture segment")?;
+        let bytes = fs::read(&segment)?;
+        let mut corrupt = bytes.clone();
+        corrupt[0] ^= 0xff;
+
+        let replay = ingest(&mut index, &original)?;
+        assert!(!replay.lexical_write_attempted);
+        assert!(!replay.canonical_mutations.changed());
+        pacer.note_lexical_write(replay.lexical_write_attempted);
+        let completion = crate::storage::sqlite::SourceIngestLedgerEntry {
+            key: "source_ingest_v1:paced-clean-replay".into(),
+            observation: "unchanged fixture observation".into(),
+        };
+        let completed = ingest_batch_detailed_with_source_completion(
+            &storage,
+            Some(&mut index),
+            dir.path(),
+            std::slice::from_ref(&original),
+            &None,
+            LexicalPopulationStrategy::IncrementalInline,
+            false,
+            None,
+            Some(&completion),
+        )?;
+        assert!(!completed.lexical_write_attempted);
+        assert_eq!(
+            storage.source_ingest_ledger_entries()?.get(&completion.key),
+            Some(&completion.observation)
+        );
+        pacer.note_lexical_write(completed.lexical_write_attempted);
+        fs::write(&segment, &corrupt)?;
+        // A known-clean paced tick must not invoke publication. The unchanged
+        // mandatory final commit still detects the actual on-disk corruption.
+        pacer.commit(Some(&mut index))?;
+        assert_eq!(fs::read(index_path.join("MANIFEST"))?, manifest);
+        assert!(index.commit().is_err());
+        fs::write(&segment, &bytes)?;
+
+        let appended = norm_conv(Some("paced-appended"), vec![norm_msg(0, 200)]);
+        let changed = ingest(&mut index, &appended)?;
+        assert!(changed.lexical_write_attempted);
+        pacer.note_lexical_write(changed.lexical_write_attempted);
+        fs::write(&segment, &corrupt)?;
+        assert!(pacer.commit(Some(&mut index)).is_err());
+        assert!(
+            pacer.lexical_dirty,
+            "failed publication must remain pending"
+        );
+        assert_eq!(fs::read(index_path.join("MANIFEST"))?, manifest);
+        fs::write(&segment, &bytes)?;
+        pacer.commit(Some(&mut index))?;
+        assert!(!pacer.lexical_dirty);
+        assert_eq!(index.reader()?.doc_count()?, 2);
+        assert_eq!(count_total_conversations_exact(&storage)?, 2);
+        assert_eq!(count_total_messages_exact(&storage)?, 2);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn streaming_split_oom_preserves_dirty_before_unchanged_tail() -> Result<()> {
+        let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "0");
+        let _chunk = set_env("CASS_NON_WATCH_INGEST_CHUNK_SIZE", "2");
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("archive.db"))?;
+        let index_path = crate::search::tantivy::expected_index_dir(dir.path());
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        let unchanged = norm_conv(Some("paced-unchanged-tail"), vec![norm_msg(0, 100)]);
+        ingest_non_watch_batch_with_oom_split(
+            &storage,
+            Some(&mut index),
+            dir.path(),
+            std::slice::from_ref(&unchanged),
+            &None,
+            LexicalPopulationStrategy::IncrementalInline,
+            false,
+            None,
+        )?;
+        let mut pacer = StreamingCommitPacer::new();
+        pacer.commit(Some(&mut index))?;
+        assert!(!pacer.lexical_dirty);
+        let conversations = [
+            norm_conv(Some("paced-split-first"), vec![norm_msg(0, 200)]),
+            norm_conv(Some("paced-split-second"), vec![norm_msg(0, 300)]),
+            unchanged,
+        ];
+        let _oom = inject_non_watch_ingest_test_oom(2);
+        let outcome = ingest_non_watch_batch_with_oom_split(
+            &storage,
+            Some(&mut index),
+            dir.path(),
+            &conversations,
+            &None,
+            LexicalPopulationStrategy::IncrementalInline,
+            false,
+            None,
+        )?;
+        assert_eq!(outcome.inserted_messages, 2);
+        assert!(outcome.lexical_update_deferred);
+        assert!(outcome.lexical_write_attempted);
+        pacer.note_lexical_write(outcome.lexical_write_attempted);
+        assert!(pacer.lexical_dirty);
+        assert_eq!(count_total_conversations_exact(&storage)?, 3);
+        assert_eq!(count_total_messages_exact(&storage)?, 3);
+        // Deferred rows still require the existing authoritative rebuild.
+        assert_eq!(index.reader()?.doc_count()?, 1);
+        Ok(())
+    }
+
     /// A long streaming catch-up used to fold segments only after the run
     /// ended, so every periodic publish re-verified an ever-growing pile. The
     /// consumer's commit now folds the small tail too, at most once per
@@ -54915,7 +55107,7 @@ mod tests {
 
         let mut pacer = StreamingCommitPacer::new();
         pacer.last_fold_attempt = Some(std::time::Instant::now());
-        pacer.commit(Some(&mut t_index));
+        pacer.commit(Some(&mut t_index)).expect("paced commit");
         assert_eq!(
             t_index.segment_count(),
             planted_segments,
@@ -54923,7 +55115,7 @@ mod tests {
         );
 
         pacer.last_fold_attempt = None;
-        pacer.commit(Some(&mut t_index));
+        pacer.commit(Some(&mut t_index)).expect("clean paced fold");
         assert!(
             pacer.last_fold_attempt.is_some(),
             "the attempt must be recorded"
