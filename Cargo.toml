@@ -102,12 +102,15 @@ notify = "8.2.0"
 # rowids it reserved (bd-gwoit), reading a WAL a stock writer truncated to zero
 # bytes as empty (bd-yxqs9, cass GH#519), and index seeks for IN lists and
 # k = ? ORDER BY id (GH#497/#498).
-# All family packages use 0.4.12 and build.rs checks each resolved package
+# 0.4.13 includes the durable-freelist integrity repair (58ddae0de, svhcf):
+# read-only BEGIN no longer reports valid backup pages as unused. Qualification
+# still uses CASS's existing archive tests and stock SQLite as the file oracle.
+# All family packages use 0.4.13 and build.rs checks each resolved package
 # exactly.
-frankensqlite = { version = "=0.4.12", package = "fsqlite", features = ["fts5", "async-api"] }
+frankensqlite = { version = "=0.4.13", package = "fsqlite", features = ["fts5", "async-api"] }
 # The production storage-integrity probe calls FrankenSQLite's public VFS API
 # directly so it can inspect native writer locks without opening the pager.
-fsqlite-types = { version = "=0.4.12", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.4.13", package = "fsqlite-types" }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
@@ -290,7 +293,7 @@ tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-
 rusqlite = { version = "0.40.2", features = ["bundled", "modern_sqlite"] }
 # The manifest-policy build gate requires this explicit dev entry for compat
 # fixture assertions, even though production also uses the same pinned crate.
-fsqlite-types = { version = "=0.4.12", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.4.13", package = "fsqlite-types" }
 
 # The fsqlite family resolves from exact reviewed registry versions for every
 # direct and transitive consumer. build.rs rejects duplicates and mixed sources.

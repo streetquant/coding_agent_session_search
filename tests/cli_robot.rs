@@ -125,7 +125,7 @@ fn safe_fixture_destination(dst_root: &Path, rel: &Path) -> Result<PathBuf, Box<
     Ok(dst)
 }
 
-fn isolated_search_demo_data() -> Result<TempDir, Box<dyn Error>> {
+fn copy_search_demo_data() -> Result<TempDir, Box<dyn Error>> {
     let tmp = TempDir::new()?;
     let src = Path::new(SEARCH_DEMO_DATA_DIR);
 
@@ -186,6 +186,55 @@ fn isolated_search_demo_data() -> Result<TempDir, Box<dyn Error>> {
         }
     }
     Ok(tmp)
+}
+
+fn isolated_search_demo_data() -> Result<TempDir, Box<dyn Error>> {
+    let copy = copy_search_demo_data()?;
+    util::admit_copied_search_fixture(copy.path(), &copy)?;
+    Ok(copy)
+}
+
+#[test]
+fn copied_fixture_repair_stays_inside_its_owned_temporary_directory() -> Result<(), Box<dyn Error>>
+{
+    let checkout = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let owner = tempfile::tempdir_in(checkout)?;
+    let data = owner.path().join("data");
+    fs::create_dir(&data)?;
+    let database = data.join("agent_search.db");
+    fs::write(&database, b"disposable fixture path control")?;
+    assert_eq!(
+        util::copied_search_fixture_db(&data, owner.path())?,
+        database.canonicalize()?,
+        "an owned temporary directory may live inside the checkout"
+    );
+
+    let other = TempDir::new()?;
+    assert!(util::copied_search_fixture_db(&data, other.path()).is_err());
+    let committed = checkout
+        .join("tests")
+        .join("fixtures")
+        .join("search_demo_data");
+    assert!(util::copied_search_fixture_db(&committed, owner.path()).is_err());
+    assert!(util::copied_search_fixture_db(&data, checkout).is_err());
+    assert!(util::copied_search_fixture_db(&committed, &committed).is_err());
+
+    let directory_database = owner.path().join("directory-database");
+    fs::create_dir(&directory_database)?;
+    fs::create_dir(directory_database.join("agent_search.db"))?;
+    assert!(util::copied_search_fixture_db(&directory_database, owner.path()).is_err());
+
+    #[cfg(unix)]
+    {
+        let escaped = owner.path().join("escaped-database");
+        fs::create_dir(&escaped)?;
+        std::os::unix::fs::symlink(
+            committed.join("agent_search.db"),
+            escaped.join("agent_search.db"),
+        )?;
+        assert!(util::copied_search_fixture_db(&escaped, owner.path()).is_err());
+    }
+    Ok(())
 }
 
 fn isolated_search_demo_data_for_current_workspace() -> Result<TempDir, Box<dyn Error>> {
@@ -394,7 +443,7 @@ fn hold_lexical_rebuild_lock_only(data_dir: &Path, db_path: &Path) -> fs::File {
 
 #[test]
 fn isolated_search_demo_data_excludes_runtime_lock_namespace() -> Result<(), Box<dyn Error>> {
-    let fixture = isolated_search_demo_data()?;
+    let fixture = copy_search_demo_data()?;
 
     let leaked_locks: Vec<PathBuf> = WalkDir::new(fixture.path())
         .into_iter()

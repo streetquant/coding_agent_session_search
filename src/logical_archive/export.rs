@@ -1109,6 +1109,16 @@ mod ordering_tests {
         let connection = open_source(&database)?;
         let descriptors = tables(&connection)?;
         for name in names {
+            let primary_key_positions = connection
+                .query(&format!("PRAGMA table_info({})", quoted(name)?))?
+                .iter()
+                .map(|row| Ok((row.get_typed::<String>(1)?, row.get_typed::<i64>(5)?)))
+                .collect::<Result<Vec<_>>>()?;
+            assert_eq!(
+                primary_key_positions,
+                vec![("k".into(), 1), ("body".into(), 0)],
+                "collation expressions must preserve primary-key positions for {name}"
+            );
             let table = descriptors.iter().find(|table| table.name == name).unwrap();
             let sql = ordered_scan_sql(&connection, table)?;
             assert!(
@@ -1214,9 +1224,10 @@ mod ordering_tests {
             snapshot(&connection, "private-key-failure".into(), &mut complete)?;
             let mut offset = 0;
             let mut failure_offset = None;
+            // ubs:ignore[rust.security.constant-time-compare] -- Byte delimiter in a test snapshot buffer.
             for line in complete.split_inclusive(|byte| *byte == b'\n') {
                 if let Record::Row { values } = serde_json::from_slice(line)?
-                    && values[0] == Cell::Text("PRIVATE-KEY-TWO".into())
+                    && /* ubs:ignore[rust.security.constant-time-compare] -- Synthetic row label selects this test's partial-write boundary. */ values[0] == Cell::Text("PRIVATE-KEY-TWO".into())
                 {
                     failure_offset = Some(offset + line.len() / 2);
                     break;

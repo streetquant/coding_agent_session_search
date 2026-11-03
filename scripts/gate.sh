@@ -1472,8 +1472,6 @@ if [ "$RUN_INTEGRATION" = 1 ] && [ "$RUN_BIN" = 1 ]; then
     fi
     BIN_SKIPS=(
         search_service::
-        logical_archive::import::publication_tests::publication_materializes_wal_rows_without_borrowing_replay_sidecars # svhcf
-        logical_archive::export::ordering_tests::explicit_or_unattested_collations_keep_binary_order_and_verify # p94yt
     )
     printf -v bin_skip_args ' --skip %q' "${BIN_SKIPS[@]}"
     # As for lib-tests, the timeout bounds the test run, not the compile.

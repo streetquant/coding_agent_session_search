@@ -12583,10 +12583,7 @@ impl FrankenStorage {
              ORDER BY conversation_id ASC",
         )
         .or_else(|err| {
-            if err
-                .to_string()
-                .contains("no such index: idx_messages_conv_idx")
-            {
+            if format!("{err:#}").contains("no such index: idx_messages_conv_idx") {
                 return self.raise_lexical_rebuild_footprints_from_grouped_max_idx(
                     footprints,
                     &positions_by_conversation,
@@ -12765,10 +12762,7 @@ impl FrankenStorage {
              ORDER BY conversation_id ASC",
         )
         .or_else(|err| {
-            if err
-                .to_string()
-                .contains("no such index: idx_messages_conv_idx")
-            {
+            if format!("{err:#}").contains("no such index: idx_messages_conv_idx") {
                 return self.fill_missing_lexical_rebuild_footprint_tails_from_grouped_messages(
                     footprints,
                     missing_tail_positions,
@@ -16325,6 +16319,24 @@ impl FrankenStorage {
         self.conn
             .query_row_map(FTS_INDEXABLE_MESSAGE_COUNT_SQL, fparams![], |row| {
                 row.get_typed::<i64>(0)
+            })
+            .or_else(|error| {
+                if error
+                    .to_string()
+                    .contains("no such index: sqlite_autoindex_messages_1")
+                {
+                    // Historical salvage preserves every canonical row in a
+                    // schema without the modern uniqueness index. Keep the
+                    // same parent membership rule and count duplicates exactly;
+                    // current archives retain the fused covering-index path.
+                    return self.conn.query_row_map(
+                        "SELECT COUNT(*) FROM messages \
+                         WHERE conversation_id IN (SELECT rowid FROM conversations)",
+                        fparams![],
+                        |row| row.get_typed::<i64>(0),
+                    );
+                }
+                Err(error)
             })
             .with_context(|| "counting exact canonical FTS messages by parent index runs")
     }
@@ -26143,6 +26155,48 @@ mod tests {
         // embedding watermark; a watermark at max must read back intact.
         storage.set_last_embedded_message_id(max).unwrap();
         assert_eq!(storage.get_last_embedded_message_id().unwrap(), Some(max));
+    }
+
+    #[test]
+    fn fts_indexable_count_preserves_legacy_duplicates_without_the_modern_index() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("legacy-count.db");
+        let conn = FrankenConnection::open(db_path.to_string_lossy()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversations(id INTEGER PRIMARY KEY);
+             CREATE TABLE messages(id INTEGER PRIMARY KEY, conversation_id INTEGER, idx INTEGER);
+             INSERT INTO conversations VALUES(1), (2);
+             INSERT INTO messages VALUES
+                 (1, 1, 0), (2, 1, 0), (3, 2, NULL), (4, 999, 0), (5, NULL, 0);",
+        )
+        .unwrap();
+        let storage = FrankenStorage::new(conn, db_path);
+        assert_eq!(storage.count_fts_indexable_messages().unwrap(), 3);
+        assert_eq!(
+            storage.count_fts_indexable_messages().unwrap(),
+            reference_indexable_message_count(&storage),
+            "duplicate positions and null positions are rows; orphan parents are excluded"
+        );
+        storage
+            .raw()
+            .execute("DELETE FROM conversations WHERE id = 1")
+            .unwrap();
+        assert_eq!(storage.count_fts_indexable_messages().unwrap(), 1);
+        assert_eq!(
+            storage
+                .raw()
+                .query_row("SELECT COUNT(*) FROM messages")
+                .unwrap()
+                .get_typed::<i64>(0)
+                .unwrap(),
+            5,
+            "counting must not discard legacy rows"
+        );
+        storage.raw().execute("DROP TABLE conversations").unwrap();
+        assert!(
+            storage.count_fts_indexable_messages().is_err(),
+            "other schema errors must propagate"
+        );
     }
 
     #[test]
@@ -36609,6 +36663,16 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             );
         }
 
+        let before = std::fs::read(&staged_db).unwrap();
+        let error = match FrankenStorage::open_readonly(&staged_db) {
+            Ok(_) => panic!("the legacy duplicate catalog must require explicit repair"), // ubs:ignore -- Negative control for the doctor-only repair boundary.
+            Err(error) => error,
+        };
+        assert!(conflicting_fts_schema_repair_required_from_error(&error).is_some());
+        assert_eq!(before, std::fs::read(&staged_db).unwrap());
+        // This planner test explicitly admits its private copy through the
+        // same catalog repair used by doctor. Ordinary reads remain inert.
+        repair_conflicting_fts_schema_rows_via_sqlite3(&staged_db).unwrap();
         let storage = FrankenStorage::open_readonly(&staged_db).unwrap();
 
         let footprints = storage

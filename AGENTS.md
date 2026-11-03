@@ -260,7 +260,16 @@ WAL index (0853f5e8e). 0.4.9 refuses that index promptly again (48c6cf6b2) and
 lets the first write after stock SQLite opened the archive read-only
 establish the WAL generation instead of failing `BusyRecovery` on every later
 commit (frankensqlite GH#443, 4b48c95d8; cass GH#509/#508).
-The strict family guard requires uniform 0.4.12 registry versions.
+The strict family guard requires uniform 0.4.13 registry versions.
+
+Current family pin (2026-11-03): Cargo.toml, Cargo.lock, and build.rs use the
+published uniform 0.4.13 family. Upstream commit
+58ddae0debad1fe58e372c91bb0bdbd5c60f150b repairs the integrity-check false
+positive `page N is never used` on valid `backup_exact_to` images containing
+published WAL rows (svhcf). Release inclusion is source provenance; CASS
+acceptance still requires its named WAL-row publication test and agreement with
+stock SQLite, and does not satisfy the independent owner-archive gates.
+
 
 <!-- BEGIN GENERATED DEPENDENCY PINS -->
 11 exact or git-pinned direct dependencies (generated from `[dependencies]` in `Cargo.toml`):
@@ -270,8 +279,8 @@ The strict family guard requires uniform 0.4.12 registry versions.
 | `asupersync` | crates.io `=0.5.0` | `test-internals`, `tls-native-roots` |
 | `franken-agent-detection` | git `https://github.com/Dicklesworthstone/franken_agent_detection` rev `6b337ba434b72c65c6c5a748b7ec47885f840ac0` (crate 0.3.10) | `connectors`, `cursor`, `chatgpt`, `opencode`, `crush`, `goose`, `hermes`, `devin`, `shelley`, `grok-bot`, `openclaw-sqlite`, `copilot-vscdb`, `codebuff`, `codex-zstd`, `pi-durable`, `pi-sqlite` |
 | `frankensearch` | git `https://github.com/Dicklesworthstone/frankensearch` rev `5ee999fcaba6f85d19c0e3f00883f1d5d4918887` (crate 0.7.1) | `hash`, `cass-compat`, `quill`, `ann`, `native` |
-| `frankensqlite` (`fsqlite`) | crates.io `=0.4.12` | `fts5`, `async-api` |
-| `fsqlite-types` | crates.io `=0.4.12` |  |
+| `frankensqlite` (`fsqlite`) | crates.io `=0.4.13` | `fts5`, `async-api` |
+| `fsqlite-types` | crates.io `=0.4.13` |  |
 | `ftui` | crates.io `=0.5.0` |  |
 | `ftui-extras` | crates.io `=0.5.0` | `markdown`, `syntax`, `charts`, `canvas`, `theme`, `clipboard`, `clipboard-fallback`, `export`, `visual-fx`, `forms`, `validation`, `help` |
 | `ftui-runtime` | crates.io `=0.5.0` | `native-backend`, `crossterm-compat` |

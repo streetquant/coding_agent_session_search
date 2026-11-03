@@ -37,6 +37,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use walkdir::WalkDir;
 
+mod util;
+
 /// Build a `cass` binary invocation with the env knobs required for
 /// deterministic test output (no update check, no ambient data-dir or CWD
 /// connector-discovery surprise).
@@ -298,12 +300,12 @@ fn safe_fixture_destination(dst_root: &Path, rel: &Path) -> io::Result<PathBuf> 
     Ok(dst)
 }
 
-fn isolated_search_demo_data(test_home: &Path) -> Result<PathBuf, Box<dyn Error>> {
+fn isolated_search_demo_data(test_home: &tempfile::TempDir) -> Result<PathBuf, Box<dyn Error>> {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
         .join("search_demo_data");
-    let dst_root = test_home.join("search_demo_data");
+    let dst_root = test_home.path().join("search_demo_data");
     for entry in WalkDir::new(&src) {
         let entry = entry?;
         // Machine-local frankensqlite namespace lock sidecars (created by
@@ -330,6 +332,7 @@ fn isolated_search_demo_data(test_home: &Path) -> Result<PathBuf, Box<dyn Error>
             fs::copy(entry.path(), &dst)?;
         }
     }
+    util::admit_copied_search_fixture(&dst_root, test_home)?;
     Ok(dst_root)
 }
 
@@ -1983,7 +1986,7 @@ fn stats_json_happy_path_matches_golden() -> Result<(), Box<dyn Error>> {
     // known conversation/message count), invokes `cass stats --json`,
     // and freezes the scrubbed envelope.
     let test_home = tempfile::tempdir().expect("create temp home");
-    let data_dir = isolated_search_demo_data(test_home.path())?;
+    let data_dir = isolated_search_demo_data(&test_home)?;
     let out = cass_cmd(test_home.path())
         .args([
             "stats",
@@ -2016,7 +2019,7 @@ fn stats_json_happy_path_shape_matches_golden() -> Result<(), Box<dyn Error>> {
     // mask structural regressions. json_value_schema diff tolerates
     // value changes; keys + types must hold.
     let test_home = tempfile::tempdir().expect("create temp home");
-    let data_dir = isolated_search_demo_data(test_home.path())?;
+    let data_dir = isolated_search_demo_data(&test_home)?;
     let out = cass_cmd(test_home.path())
         .args([
             "stats",
@@ -2350,7 +2353,7 @@ fn pack_introspect_contract_matrix_is_current() {
 #[test]
 fn search_robot_json_matches_golden() -> Result<(), Box<dyn Error>> {
     let test_home = tempfile::tempdir().expect("create temp home");
-    let data_dir = isolated_search_demo_data(test_home.path())?;
+    let data_dir = isolated_search_demo_data(&test_home)?;
     let output = cass_cmd(test_home.path())
         .args([
             "search",
@@ -2382,7 +2385,7 @@ fn search_robot_json_matches_golden() -> Result<(), Box<dyn Error>> {
 #[test]
 fn search_robot_shape_matches_golden() -> Result<(), Box<dyn Error>> {
     let test_home = tempfile::tempdir().expect("create temp home");
-    let data_dir = isolated_search_demo_data(test_home.path())?;
+    let data_dir = isolated_search_demo_data(&test_home)?;
     let output = cass_cmd(test_home.path())
         .args([
             "search",

@@ -30,6 +30,157 @@ pub fn cass_bin() -> String {
         .unwrap_or_else(|| env!("CARGO_BIN_EXE_cass").to_string())
 }
 
+/// Explicitly repair a disposable copy of the historical demo archive.
+/// Ordinary reads must refuse its duplicate FTS catalog without changing it.
+/// Keep every canonical table byte-for-byte equal in a stock-SQLite row dump;
+/// the only admitted changes remove derived catalog debris and free its leaked
+/// page through doctor's separately inspected, backed-up repair surface.
+#[allow(dead_code)]
+pub fn admit_copied_search_fixture(
+    data_dir: &std::path::Path,
+    owner: &tempfile::TempDir,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use serde_json::Value;
+    use std::io::Error;
+
+    let db = copied_search_fixture_db(data_dir, owner.path())?;
+    let data_dir = data_dir.canonicalize()?;
+    let sqlite = |sql: &str| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let output = assert_cmd::Command::new("sqlite3")
+            .args(["-readonly", "-json", "-cmd", "PRAGMA writable_schema=ON;"])
+            .arg(&db)
+            .arg(sql)
+            .timeout(std::time::Duration::from_secs(10))
+            .output()?;
+        if !output.status.success() {
+            return Err(Error::other(format!(
+                "stock SQLite fixture oracle failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+            .into());
+        }
+        Ok(output.stdout)
+    };
+    let tables: Vec<Value> = serde_json::from_slice(&sqlite(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'fts_messages%' ORDER BY name",
+    )?)?;
+    let mut canonical_sql = String::new();
+    for table in tables {
+        let name = table["name"].as_str().ok_or("fixture table lacks a name")?;
+        canonical_sql.push_str(&format!(
+            "SELECT * FROM \"{}\" ORDER BY rowid;",
+            name.replace('"', "\"\"")
+        ));
+    }
+    let canonical_before = sqlite(&canonical_sql)?;
+    let db_before = std::fs::read(&db)?;
+    let home = tempfile::TempDir::new()?;
+    let run = |args: &[&str]| -> Result<std::process::Output, Box<dyn std::error::Error>> {
+        Ok(assert_cmd::Command::new(cass_bin())
+            .current_dir(home.path())
+            .env("HOME", home.path())
+            .env("XDG_DATA_HOME", home.path().join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env_remove("CASS_DB_PATH")
+            .env_remove("CASS_DATA_DIR")
+            .env_remove("CASS_OUTPUT_FORMAT")
+            .args(args)
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .timeout(std::time::Duration::from_secs(90))
+            .output()?)
+    };
+    let first = run(&["stats", "--json"])?;
+    assert_eq!(
+        db_before,
+        std::fs::read(&db)?,
+        "fixture read must preserve database bytes"
+    );
+    let error: Value = serde_json::from_slice(&first.stderr)?;
+    assert_eq!(first.status.code(), Some(7), "{error}");
+    assert_eq!(error["error"]["kind"], "schema-repair-required", "{error}");
+    let fix = run(&["doctor", "--fix", "--json"])?;
+    let report: Value = serde_json::from_slice(&fix.stdout)?;
+    // This first repair is intentionally partial: the removed catalog row
+    // leaves a leaked page, so overall exit 5 is never called healthy.
+    assert_eq!(fix.status.code(), Some(5), "{report}");
+    let repair = report["checks"]
+        .as_array()
+        .ok_or("doctor checks missing")?
+        .iter()
+        .find(|check| check["name"] == "conflicting_fts_schema_rows")
+        .ok_or("doctor did not report the requested catalog repair")?;
+    assert_eq!(repair["status"], "pass", "{report}");
+    assert_eq!(repair["fix_applied"], true, "{report}");
+    let dry_run = run(&["doctor", "--repair-leaked-pages", "--dry-run", "--json"])?;
+    let plan: Value = serde_json::from_slice(&dry_run.stdout)?;
+    assert!(dry_run.status.success(), "{plan}");
+    assert_eq!(plan["inspection"]["status"], "leaked_pages", "{plan}");
+    assert_eq!(plan["inspection"]["first_leaked_page"], 27, "{plan}");
+    assert_eq!(plan["inspection"]["conversations"], 2, "{plan}");
+    assert_eq!(plan["inspection"]["messages"], 6, "{plan}");
+    let apply = run(&["doctor", "--repair-leaked-pages", "--yes", "--json"])?;
+    let repaired: Value = serde_json::from_slice(&apply.stdout)?;
+    assert!(apply.status.success(), "{repaired}");
+    assert_eq!(repaired["status"], "repaired", "{repaired}");
+    assert_eq!(repaired["freed_pages"], 1, "{repaired}");
+    assert_eq!(repaired["canonical_rows_modified"], false, "{repaired}");
+    assert_eq!(
+        repaired["inspection_after"]["status"], "clean",
+        "{repaired}"
+    );
+    assert_eq!(
+        canonical_before,
+        sqlite(&canonical_sql)?,
+        "fixture repair changed canonical rows"
+    );
+    let integrity: Value = serde_json::from_slice(&sqlite("PRAGMA integrity_check;")?)?;
+    assert_eq!(integrity, serde_json::json!([{"integrity_check": "ok"}]));
+    let stats = run(&["stats", "--json"])?;
+    let stats_json: Value = serde_json::from_slice(&stats.stdout)?;
+    assert!(stats.status.success(), "{stats_json}");
+    assert_eq!(stats_json["conversations"], 2);
+    assert_eq!(stats_json["messages"], 6);
+    Ok(())
+}
+
+/// Validate repair ownership separately from invoking the CLI, so path escape
+/// controls never need to run a mutating command. RCH may put an owned TempDir
+/// inside the checkout; only overlap with the committed fixture is forbidden.
+#[allow(dead_code)]
+pub fn copied_search_fixture_db(
+    data_dir: &std::path::Path,
+    owner: &std::path::Path,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Error;
+
+    let owner = owner.canonicalize()?;
+    let data_dir = data_dir.canonicalize()?;
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/search_demo_data")
+        .canonicalize()?;
+    if !data_dir.starts_with(&owner)
+        || owner.starts_with(&source)
+        || source.starts_with(&owner)
+        || data_dir.starts_with(&source)
+        || source.starts_with(&data_dir)
+    {
+        return Err(Error::other(
+            "fixture repair requires an owned temporary directory separate from the committed fixture",
+        ));
+    }
+    let db = data_dir.join("agent_search.db").canonicalize()?;
+    if !db.starts_with(&data_dir) || !db.starts_with(&owner) || !db.is_file() {
+        return Err(Error::other(
+            "fixture database must be a regular file inside its owned temporary directory",
+        ));
+    }
+    Ok(db)
+}
+
 /// Admit a copied archive through the real CLI before a read-only pack probe.
 /// Checkpoints identify the database path, so copying bytes alone does not
 /// produce a valid relocated lexical generation. Keep repair out of timed runs.

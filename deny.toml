@@ -86,49 +86,49 @@ license-files = [{ path = "Cargo.toml", hash = 0x8848c14d }]
 name = "frankensearch"
 version = "=0.7.1"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = [{ path = "../LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "frankensearch-core"
 version = "=0.4.0"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "frankensearch-embed"
 version = "=0.4.0"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "frankensearch-fusion"
 version = "=0.4.0"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "frankensearch-index"
-version = "=0.4.2"
+version = "=0.4.0"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "frankensearch-lexical"
 version = "=0.4.0"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "frankensearch-quill"
-version = "=0.4.1"
+version = "=0.4.0"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "frankensearch-rerank"
 version = "=0.5.0"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "frankentorch-api"
@@ -168,73 +168,73 @@ license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "fsqlite"
-version = "=0.4.12"
+version = "=0.4.13"
 expression = "MIT"
 license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "fsqlite-ast"
-version = "=0.4.12"
+version = "=0.4.13"
 expression = "MIT"
 license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "fsqlite-btree"
-version = "=0.4.12"
+version = "=0.4.13"
 expression = "MIT"
 license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "fsqlite-core"
-version = "=0.4.12"
+version = "=0.4.13"
 expression = "MIT"
 license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "fsqlite-error"
-version = "=0.4.12"
+version = "=0.4.13"
 expression = "MIT"
 license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "fsqlite-mvcc"
-version = "=0.4.12"
+version = "=0.4.13"
 expression = "MIT"
 license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "fsqlite-pager"
-version = "=0.4.12"
+version = "=0.4.13"
 expression = "MIT"
 license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "fsqlite-parser"
-version = "=0.4.12"
+version = "=0.4.13"
 expression = "MIT"
 license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "fsqlite-planner"
-version = "=0.4.12"
+version = "=0.4.13"
 expression = "MIT"
 license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "fsqlite-vdbe"
-version = "=0.4.12"
+version = "=0.4.13"
 expression = "MIT"
 license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "fsqlite-vfs"
-version = "=0.4.12"
+version = "=0.4.13"
 expression = "MIT"
 license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "fsqlite-wal"
-version = "=0.4.12"
+version = "=0.4.13"
 expression = "MIT"
 license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
 
@@ -264,49 +264,49 @@ license-files = [{ path = "Cargo.toml", hash = 0xe9b0a3d9 }]
 
 [[licenses.clarify]]
 name = "fsqlite-ext-fts5"
-version = "=0.4.12"
+version = "=0.4.13"
 expression = "MIT"
 license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "fsqlite-ext-icu"
-version = "=0.4.12"
+version = "=0.4.13"
 expression = "MIT"
 license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "fsqlite-ext-json"
-version = "=0.4.12"
+version = "=0.4.13"
 expression = "MIT"
 license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "fsqlite-ext-misc"
-version = "=0.4.12"
+version = "=0.4.13"
 expression = "MIT"
 license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "fsqlite-ext-rtree"
-version = "=0.4.12"
+version = "=0.4.13"
 expression = "MIT"
 license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "fsqlite-func"
-version = "=0.4.12"
+version = "=0.4.13"
 expression = "MIT"
 license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "fsqlite-observability"
-version = "=0.4.12"
+version = "=0.4.13"
 expression = "MIT"
 license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
 
 [[licenses.clarify]]
 name = "fsqlite-types"
-version = "=0.4.12"
+version = "=0.4.13"
 expression = "MIT"
 license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
 
