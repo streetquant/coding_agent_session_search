@@ -1207,7 +1207,7 @@ fn run_job_with_gate(
             index_environment,
             log.as_mut(),
         );
-        let index_busy = soften_busy_index_step(&mut index_step);
+        let index_busy = soften_busy_index_step(&mut index_step, &cfg.data_dir);
         steps.push(index_step);
         let prerequisites_ok = steps.iter().all(|step| step.ok);
 
@@ -1439,48 +1439,69 @@ pub fn soften_model_unavailable_backfill_step(step: &mut StepReport) -> bool {
 /// Annotate exit-7 (`index-busy`) as a deferred step without claiming that
 /// indexing succeeded. The next timer firing retries, but callers and saved
 /// receipts must distinguish that retryable deferral from completed work.
-pub fn soften_busy_index_step(step: &mut StepReport) -> bool {
+pub fn soften_busy_index_step(step: &mut StepReport, data_dir: &Path) -> bool {
     if step.exit_code != Some(7) {
         return false;
     }
     step.ok = false;
     // Exit 7 covers several causes; name the one the child reported. Only a
-    // child that saw another index run holding the lock is contention
+    // child that saw another index run holding a still-held lock is contention
     // (GH #509: a database stuck in WAL-index recovery was reported as a
     // held lock, so a permanently failing schedule read as a benign skip).
     let message = step_error_field(step, "/error/message").unwrap_or_default();
-    step.skipped_reason = Some(
-        if step_error_field(step, "/error/kind").as_deref() == Some("migration-repair-pending") {
-            "the archive still needs its one-time storage migration repair; run `cass index --full` in the foreground".to_string()
-        } else if message.contains("another 'cass index' run is already active")
-            || message.contains("another cass index process already holds")
-        {
-            "another index run already holds the index lock; skipped this cycle".to_string()
-        } else if message.contains("canonical database is busy/locked") {
-            format!(
-                "the index run failed: the canonical database stayed busy and no other index run held the lock: {}",
-                bounded_reason(&message)
-            )
-        } else if message.is_empty() {
-            "the index run exited 7 (busy) without an error message; see stderr_tail".to_string()
-        } else {
-            format!(
-                "the index run exited 7 (busy): {}",
-                bounded_reason(&message)
-            )
-        },
-    );
+    let kind = step_error_field(step, "/error/kind").unwrap_or_else(|| "unknown".to_string());
+    let child_reported_lock = message.contains("another 'cass index' run is already active")
+        || message.contains("another cass index process already holds");
+    step.skipped_reason = Some(if kind == "migration-repair-pending" {
+        "the archive still needs its one-time storage migration repair; run `cass index --full` in the foreground".to_string()
+    } else if child_reported_lock
+        && crate::search::asset_state::read_search_maintenance_snapshot(data_dir).active
+    {
+        "another index run already holds the index lock; skipped this cycle".to_string()
+    } else if child_reported_lock {
+        format!(
+            "the index run failed ({kind}); the child reported contention but the index lock is no longer held: {}",
+            bounded_reason(&message)
+        )
+    } else if message.contains("canonical database is busy/locked") {
+        format!(
+            "the index run failed ({kind}): the canonical database stayed busy; the child did not report an index lock holder: {}",
+            bounded_reason(&message)
+        )
+    } else if message.is_empty() {
+        format!("the index run exited 7 ({kind}) without an error message; see stderr_tail")
+    } else {
+        format!(
+            "the index run exited 7 ({kind}): {}",
+            bounded_reason(&message)
+        )
+    });
     true
 }
 
-/// A field from the last JSON error envelope a step wrote to stderr.
+/// A field from a child's native index report or generic CLI error envelope.
 pub(crate) fn step_error_field(step: &StepReport, pointer: &str) -> Option<String> {
+    let extract = |document: &serde_json::Value| {
+        document
+            .pointer(pointer)
+            .or_else(|| match pointer {
+                "/error/kind" => document.get("kind"),
+                "/error/message" => document
+                    .get("error")
+                    .filter(|value| value.is_string())
+                    .or_else(|| document.get("message")),
+                _ => None,
+            })
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    if let Some(value) = step.result.as_ref().and_then(extract) {
+        return Some(value);
+    }
     step.stderr_tail.as_deref()?.lines().rev().find_map(|line| {
         serde_json::from_str::<serde_json::Value>(line.trim())
-            .ok()?
-            .pointer(pointer)?
-            .as_str()
-            .map(str::to_owned)
+            .ok()
+            .and_then(|document| extract(&document))
     })
 }
 
@@ -2220,6 +2241,10 @@ mod tests {
 
     #[test]
     fn busy_index_step_is_deferred_without_claiming_success() {
+        use fs2::FileExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path();
         let step = |exit: Option<i32>, ok: bool| StepReport {
             name: "index".into(),
             argv: vec![],
@@ -2231,13 +2256,13 @@ mod tests {
             stderr_tail: None,
         };
         let mut busy = step(Some(7), false);
-        assert!(soften_busy_index_step(&mut busy));
+        assert!(soften_busy_index_step(&mut busy, data_dir));
         assert!(!busy.ok);
         assert!(busy.skipped_reason.is_some());
         let mut fine = step(Some(0), true);
-        assert!(!soften_busy_index_step(&mut fine));
+        assert!(!soften_busy_index_step(&mut fine, data_dir));
         let mut failed = step(Some(3), false);
-        assert!(!soften_busy_index_step(&mut failed));
+        assert!(!soften_busy_index_step(&mut failed, data_dir));
         assert!(!failed.ok);
 
         // GH #450: exit 7 from a deferred migration repair names that cause;
@@ -2249,33 +2274,76 @@ mod tests {
         let mut deferred = with_stderr(
             "note: something\n{\"error\":{\"code\":7,\"kind\":\"migration-repair-pending\",\"retryable\":false}}",
         );
-        assert!(soften_busy_index_step(&mut deferred));
+        assert!(soften_busy_index_step(&mut deferred, data_dir));
         assert!(!deferred.ok);
         let reason = deferred.skipped_reason.unwrap();
         assert!(reason.contains("migration repair"), "{reason}");
         assert!(reason.contains("cass index --full"), "{reason}");
+        let lock = File::create(data_dir.join("index-run.lock")).unwrap();
+        lock.try_lock_exclusive().unwrap();
         let mut locked = with_stderr(
             "{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"message\":\"another 'cass index' run is already active for data dir /d (pid 42)\",\"retryable\":true}}",
         );
-        assert!(soften_busy_index_step(&mut locked));
+        assert!(soften_busy_index_step(&mut locked, data_dir));
         assert!(locked.skipped_reason.unwrap().contains("index lock"));
         let mut held = with_stderr(
             "{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"message\":\"index failed: another cass index process already holds /d/index-run.lock\",\"retryable\":true}}",
         );
-        assert!(soften_busy_index_step(&mut held));
+        assert!(soften_busy_index_step(&mut held, data_dir));
         assert!(held.skipped_reason.unwrap().contains("index lock"));
+
+        // The actual `index --json` failure report uses root-level fields,
+        // while generic CLI failures use the nested envelope above.
+        let mut native_locked = step(Some(7), false);
+        native_locked.result = Some(serde_json::json!({
+            "success": false,
+            "error": "another 'cass index' run is already active for data dir /d (pid 42)",
+            "kind": "index-busy"
+        }));
+        assert!(soften_busy_index_step(&mut native_locked, data_dir));
+        assert!(
+            native_locked
+                .skipped_reason
+                .unwrap()
+                .contains("already holds the index lock")
+        );
+        drop(lock);
+
+        let mut native_busy = step(Some(7), false);
+        native_busy.result = Some(serde_json::json!({
+            "success": false,
+            "error": "index failed because the canonical database is busy/locked: final WAL checkpoint after index run did not complete: blocked (busy=1, log_frames=0, checkpointed_frames=0)",
+            "kind": "index-busy"
+        }));
+        assert!(soften_busy_index_step(&mut native_busy, data_dir));
+        let reason = native_busy.skipped_reason.unwrap();
+        assert!(reason.contains("index-busy"), "{reason}");
+        assert!(
+            reason.contains("did not report an index lock holder"),
+            "{reason}"
+        );
+        assert!(!reason.contains("already holds the index lock"), "{reason}");
+
+        let mut no_holder = with_stderr(
+            "{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"message\":\"another 'cass index' run is already active for data dir /d (pid 42)\"}}",
+        );
+        assert!(soften_busy_index_step(&mut no_holder, data_dir));
+        let reason = no_holder.skipped_reason.unwrap();
+        assert!(reason.contains("index-busy"), "{reason}");
+        assert!(reason.contains("no longer held"), "{reason}");
+        assert!(!reason.contains("already holds the index lock"), "{reason}");
 
         // GH #509: the same exit 7 and kind from a database stuck in
         // WAL-index recovery is not lock contention, and says what failed.
         let mut stuck = with_stderr(
             "ERROR group-commit callback failed\n{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"message\":\"index failed because the canonical database is busy/locked: ephemeral writer preflight write failed for serial batched indexing | database is busy (recovery in progress)\",\"retryable\":true}}",
         );
-        assert!(soften_busy_index_step(&mut stuck));
+        assert!(soften_busy_index_step(&mut stuck, data_dir));
         assert!(!stuck.ok);
         let reason = stuck.skipped_reason.unwrap();
-        assert!(!reason.contains("index lock"), "{reason}");
+        assert!(reason.contains("index-busy"), "{reason}");
         assert!(
-            reason.contains("no other index run held the lock"),
+            reason.contains("did not report an index lock holder"),
             "{reason}"
         );
         assert!(reason.contains("recovery in progress"), "{reason}");
@@ -2283,7 +2351,7 @@ mod tests {
         // Without a message the step claims no cause at all.
         let mut bare =
             with_stderr("{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"retryable\":true}}");
-        assert!(soften_busy_index_step(&mut bare));
+        assert!(soften_busy_index_step(&mut bare, data_dir));
         let reason = bare.skipped_reason.unwrap();
         assert!(!reason.contains("index lock"), "{reason}");
         assert!(reason.contains("stderr_tail"), "{reason}");

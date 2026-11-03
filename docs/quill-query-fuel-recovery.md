@@ -2,9 +2,10 @@
 
 Issue: [#518](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/518).
 
-**Status:** investigation and benchmark tooling, not a landed runtime fix.
-The driver tests described below do not build fragmented Quill indexes, execute
-CASS, or establish a latency improvement. Keep #518 open until those checks pass.
+**Status:** the engine accounting correction and optional-retry recovery are
+landed on main. Release shipment and the reporter's archive latency remain
+unverified. Keep #518 open until its remaining acceptance evidence is available.
+The Python driver tests below establish measurement-tool behavior only.
 
 **Update 2026-10-11 (cass bead 7hvlg):** the reporter's engine version is
 settled. cass 0.10.0 ships frankensearch-quill 0.3.4, which still charged a
@@ -14,7 +15,75 @@ so the charge grew with the square of the segment count. The test
 builds 120 one-document segments and runs `git fixture` under a 40,000-unit
 budget. On v0.10.0 it fails with `fuel exhausted after 40000/40000 units
 (segments=42, dictionary_blocks=39794, posting_blocks=164)`. On main, which
-pins Quill 0.4.0, it passes. The fix reaches users with the next cass release.
+includes the fix from Quill 0.4.0 (currently pinned at 0.4.1), it passes.
+The fix reaches users with the next cass release.
+
+## Current native coverage and limits
+
+The landed `search_with_fallback` path preserves the exact page when its
+optional wildcard retry exhausts fuel, reporting
+`_meta.wildcard_fallback_skipped="query_fuel_exhausted"`. A larger optional
+deduplication fetch can retain its filtered native page with an unknown total
+and `lexical_degrade_reason="dedup_retry_query_fuel_exhausted"`. Unrelated
+errors and a required primary fetch with no retained page still fail.
+
+`cass serve --lexical-fallback --db <archive>` separately opts into supervised
+FrankenSQLite recovery. `--db` alone does not grant that consent. Its tests in
+`tests/quill_fuel_fallback.rs` exercise genuine engine refusals, canonical result
+identities, disabled recovery, oversized/corrupt archives, authoritative empty
+native results, and a 206-segment service fixture. That service fixture uses an
+explicit 80,000-unit budget; it is not ordinary CLI evidence at the default
+budget.
+
+The same integration target now contains
+`gh518_ordinary_cli_answers_both_queries_and_no_match_on_206_sparse_segments`.
+It builds 206 actual live segments containing 3,296 synthetic documents, half
+with continuous commits and half with reopened writers. It invokes ordinary
+`cass search` at the published default budget for both reported queries, a
+no-match control, and a following request. A separate one-unit primary refusal
+checks the error's recovery guidance. The child deadline fails the test rather
+than accepting a deadline-shaped empty response. Its elapsed values include CLI
+startup and index opening; they are fixture observations, not a reporter-archive
+benchmark or a measured improvement.
+
+For exact Linux release qualification, that ordinary CLI test accepts
+`CASS_TEST_CANDIDATE_BIN` together with `CASS_TEST_CANDIDATE_SHA256`. A missing,
+invalid or mismatched supplied identity fails before fixture creation; it never
+substitutes Cargo's binary. The test hashes the selected executable before and
+after its CLI requests and emits `GH518_BINARY` / `GH518_BINARY_AFTER` receipts.
+The other five service tests still use Cargo's binary. This harness extension
+awaits its own qualification; it does not turn the earlier R27B result into
+release evidence.
+
+**Linux functional qualification, R27B (2026-10-23):** all six tests in
+`quill_fuel_fallback` passed on `cass-linux-192-168-68-50`; the complete target
+finished in 13.93 seconds. Its terminal receipts are
+`TEST_COUNT=test-quill_fuel_fallback PASSED=6 BINARIES=1` and
+`STAGE=test-quill_fuel_fallback EXIT=0`. The tested source-content SHA256 is
+`1e7c9064bd1ae4ff976bafb2179f83e6bf1f49b86961455bca8f83127ada351a`;
+the test file SHA256 is
+`c0fd61855b10194beac889d3dc396ddd8ef8860bb0e9b9abbc76c1b7f9bacb9f`.
+The retained receipt is
+`/cyber-b/cass-finish-01a16542-r27b-parallel-ready.log`. The operator pause
+subsequently interrupted the gate; unrelated clippy and library failures had
+already made it red, and UBS/goldens did not run. This is a passing integration
+target on that source, not a full-gate or release qualification.
+
+Do not infer actual charge from the engine's private work upper bound, or infer
+that upper bound from a successful execution. Those are different quantities.
+The reporter's 110-second query still has no verified explanation. Fuel counters
+are admission accounting, not measured physical reads or a wall-clock deadline.
+
+The ordinary pre-parsed CASS query API meters each call independently, returns
+no successful-consumption receipt, and accepts no public request-scoped
+checkpoint. Quill's optional `profile-internals` diagnostic feature can record
+admitted work for its string-query entry point; CASS does not enable that
+feature, and it does not extend the ordinary CASS result or budget contract.
+Ordinary search can issue additional count/refinement calls. The existing
+changes therefore do not establish a shared request-wide fuel ceiling. A
+reporter-archive reproduction, the requested latency/work comparison, and
+release qualification remain open; synthetic fixtures cannot discharge those
+requirements.
 
 ## What the inspected code establishes
 
@@ -191,5 +260,6 @@ reported queries, no-match controls, supported/unsupported fallback queries,
 forced low-fuel refusal, unavailable/corrupt fallback, filters, pagination,
 deletions, and post-rebuild result identity. Benchmark small and 206-segment
 fixtures with the same logical documents, separate opening from warm execution,
-and record work counters alongside latency. No such native results are claimed
-by this change.
+and record work counters alongside latency. The native qualification above
+covers only the functional cases it lists; the remaining benchmark and recovery
+matrix is not established by that receipt.

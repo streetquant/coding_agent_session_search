@@ -525,6 +525,129 @@ mod tests {
         assert!(is_pty_eof_error(&pipe));
     }
 
+    #[cfg(target_os = "linux")]
+    mod pty_contract {
+        use super::super::is_pty_eof_error;
+        use anyhow::{Result, bail, ensure};
+        use portable_pty::{Child, CommandBuilder, ExitStatus, PtySize, native_pty_system};
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+
+        const EXIT_BUDGET: Duration = Duration::from_secs(5);
+
+        fn wait_for_exit(child: &mut dyn Child, budget: Duration) -> Result<ExitStatus> {
+            let started = Instant::now();
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(status);
+                }
+                if started.elapsed() >= budget {
+                    bail!("PTY child did not exit within {budget:?}");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        struct ReapOnDrop(Box<dyn Child + Send + Sync>);
+
+        impl Drop for ReapOnDrop {
+            fn drop(&mut self) {
+                if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                    let _ = self.0.kill();
+                    let _ = wait_for_exit(self.0.as_mut(), EXIT_BUDGET);
+                }
+            }
+        }
+
+        #[test]
+        fn pty_roundtrip_observes_resize_and_nonzero_exit() -> Result<()> {
+            let pair = native_pty_system().openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })?;
+            let mut reader: Box<dyn Read + Send> = pair.master.try_clone_reader()?;
+            let mut writer: Box<dyn Write + Send> = pair.master.take_writer()?;
+            let mut command = CommandBuilder::new("/bin/sh");
+            command.args([
+                "-c",
+                "IFS= read -r line; printf 'size:'; stty size; printf 'reply:%s\\n' \"$line\"; exit 7",
+            ]);
+            let mut child = ReapOnDrop(pair.slave.spawn_command(command)?);
+            drop(pair.slave);
+
+            pair.master.resize(PtySize {
+                rows: 37,
+                cols: 113,
+                pixel_width: 0,
+                pixel_height: 0,
+            })?;
+            writer.write_all(b"cass-pty-roundtrip\n")?;
+            writer.flush()?;
+
+            let status = wait_for_exit(child.0.as_mut(), EXIT_BUDGET)?;
+            ensure!(!status.success(), "exit 7 must not be reported as success");
+            ensure!(status.exit_code() == 7, "unexpected PTY exit: {status}");
+            drop(writer);
+
+            let mut output = Vec::new();
+            let mut buffer = [0_u8; 256];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(len) => {
+                        ensure!(output.len() + len <= 4096, "PTY output exceeded budget");
+                        output.extend_from_slice(&buffer[..len]);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) if is_pty_eof_error(&error) => break,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let output = std::str::from_utf8(&output)?;
+            ensure!(
+                output.lines().any(|line| line.trim() == "size:37 113"),
+                "child did not observe the resized terminal: {output:?}"
+            );
+            ensure!(
+                output
+                    .lines()
+                    .any(|line| line.trim() == "reply:cass-pty-roundtrip"),
+                "PTY input did not reach the child: {output:?}"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn pty_timeout_kills_and_reaps_a_live_child() -> Result<()> {
+            let pair = native_pty_system().openpty(PtySize::default())?;
+            let _writer = pair.master.take_writer()?;
+            let mut command = CommandBuilder::new("/bin/sh");
+            command.args(["-c", "IFS= read -r line; exit 0"]);
+            let mut child = ReapOnDrop(pair.slave.spawn_command(command)?);
+            drop(pair.slave);
+
+            let timeout = Duration::from_millis(150);
+            let started = Instant::now();
+            while started.elapsed() < timeout {
+                ensure!(
+                    child.0.try_wait()?.is_none(),
+                    "PTY child exited before its input timeout"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            child.0.kill()?;
+            let status = wait_for_exit(child.0.as_mut(), EXIT_BUDGET)?;
+            ensure!(!status.success(), "terminated PTY child reported success");
+            ensure!(
+                child.0.try_wait()?.is_some(),
+                "terminated PTY child was not reaped"
+            );
+            Ok(())
+        }
+    }
+
     #[test]
     fn creates_asciicast_parent_and_new_output() {
         let tmp = tempfile::TempDir::new().expect("tempdir");

@@ -4,6 +4,24 @@
 
 ---
 
+## GPU HOST SAFETY (production Qwen)
+
+This host's four RTX 3090s serve the production `qwen-lan` deployment. CASS
+benchmarks must not run as detached or orphaned CUDA jobs.
+
+- Never launch GPU work with `nohup`, `&`, `disown`, or a shell that outlives the
+  agent session. Use the harness's tracked background job, and stop it before
+  the session ends.
+- Any CASS GPU job requires explicit owner approval in the task, a bounded
+  `timeout`, an explicit `CUDA_VISIBLE_DEVICES`, and a recorded PID.
+- `qwen-gpu-guard.service` pauses unregistered CUDA processes after 30 seconds
+  and terminates them after 2 minutes. Qwen `llama-server` PIDs are allowlisted;
+  persistent exceptions are path prefixes in `/etc/qwen-gpu-guard/allow.txt`.
+- Do not stop or bypass the guard to make a benchmark pass. Ask the owner to
+  stop it or allowlist a path before running a real multi-minute GPU workload.
+
+---
+
 ## RULE 0 - THE FUNDAMENTAL OVERRIDE PREROGATIVE
 
 If I tell you to do something, even if it goes against what follows below, YOU MUST LISTEN TO ME. I AM IN CHARGE, NOT YOU.

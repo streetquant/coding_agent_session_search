@@ -36,11 +36,22 @@ fn run(fixture: &Fixture, label: &str, args: &[&str], timeout: Duration) -> Outp
         .env("XDG_DATA_HOME", fixture.home.join("xdg-data"))
         .env("XDG_CONFIG_HOME", fixture.home.join("xdg-config"))
         .env("XDG_CACHE_HOME", fixture.home.join("xdg-cache"))
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        // These native stores have defaults outside HOME. Keep every index
+        // command in this gate inside the fixture's one-session corpus.
+        .env(
+            "CASS_CLOUDMCP_DATA_ROOT",
+            fixture.home.join("cloudmcp-empty"),
+        )
+        .env(
+            "CASS_OPENWEBUI_DATA_ROOT",
+            fixture.home.join("openwebui-empty"),
+        )
+        .env("CLAUDE_CONFIG_DIR", fixture.home.join(".claude"))
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .env("CASS_SEMANTIC_EMBEDDER", "hash")
         .env("CODEX_HOME", &fixture.codex_home)
         .env("NO_COLOR", "1")
-        .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("RUST_LOG");
     spawn_with_timeout_or_diag(cmd, label, Some(&fixture.data_dir), timeout)
 }
@@ -102,6 +113,13 @@ fn semantic_fixture() -> Result<Fixture, String> {
         .is_none_or(|ok| !ok)
     {
         return Err(format!("semantic index did not succeed: {value}"));
+    }
+    if value.get("conversations").and_then(Value::as_u64) != Some(1)
+        || value.get("messages").and_then(Value::as_u64) != Some(2)
+    {
+        return Err(format!(
+            "semantic fixture must index exactly its one conversation and two messages: {value}"
+        ));
     }
     Ok(fixture)
 }

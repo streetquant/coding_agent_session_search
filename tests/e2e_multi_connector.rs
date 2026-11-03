@@ -1309,6 +1309,10 @@ fn grok_bot_fifo_cli_preserves_evicted_and_new_messages() {
                         &conversation_id.to_string(),
                         "--message-index",
                         &hits[0]["line_number"].as_u64().unwrap().to_string(),
+                        "--message-anchor",
+                        hits[0]["message_anchor"]
+                            .as_str()
+                            .expect("full search identity anchor"),
                         "--json",
                     ])
                     .assert()
@@ -1317,6 +1321,16 @@ fn grok_bot_fifo_cli_preserves_evicted_and_new_messages() {
                     .stdout
                     .clone();
                 let value: Value = serde_json::from_slice(&view).unwrap();
+                let target = value["lines"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["is_target"] == true)
+                    .unwrap();
+                assert_eq!(target["message_anchor"], hits[0]["message_anchor"]);
+                assert_eq!(target["conversation_id"], conversation_id);
+                assert_eq!(target["message_index"], hits[0]["line_number"]);
+                assert_eq!(target["content"], hits[0]["content"]);
                 assert!(
                     value.to_string().contains(needle),
                     "canonical view must retain the searched message"

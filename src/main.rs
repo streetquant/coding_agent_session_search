@@ -157,7 +157,154 @@ fn is_robot_mode_args() -> bool {
     env_requests_robot_output()
 }
 
+#[derive(Clone, Copy)]
+struct DoctorErrorContext {
+    surface: &'static str,
+    mode: &'static str,
+    asset_class: &'static str,
+}
+
+fn doctor_error_context(
+    command: Option<&coding_agent_search::Commands>,
+) -> Option<DoctorErrorContext> {
+    use coding_agent_search::Commands;
+
+    let Some(Commands::Doctor {
+        check,
+        fix,
+        repair,
+        cleanup,
+        archive_scan,
+        archive_normalize,
+        backups_list,
+        backups_verify,
+        backups_restore,
+        baseline_save,
+        baseline_diff,
+        baseline_update,
+        support_bundle,
+        support_bundle_verify,
+        archive_export,
+        archive_export_verify,
+        archive_relocate,
+        dry_run,
+        yes,
+        ..
+    }) = command
+    else {
+        return None;
+    };
+    let apply_requested = *yes && !*dry_run;
+    let (surface, mode, asset_class) = if *baseline_save {
+        ("baseline", "baseline-save", "operation_receipt")
+    } else if *baseline_diff {
+        ("baseline-diff", "baseline-diff", "operation_receipt")
+    } else if *baseline_update {
+        ("baseline", "baseline-update", "operation_receipt")
+    } else if *support_bundle_verify {
+        ("support-bundle", "support-bundle-verify", "support_bundle")
+    } else if *support_bundle {
+        ("support-bundle", "support-bundle", "support_bundle")
+    } else if *archive_export_verify {
+        ("archive-export", "archive-export-verify", "unknown")
+    } else if *archive_relocate {
+        ("archive-relocate", "archive-relocate", "unknown")
+    } else if *archive_export {
+        ("archive-export", "archive-export", "unknown")
+    } else if *backups_restore {
+        (
+            "backups",
+            if apply_requested {
+                "restore-apply"
+            } else {
+                "restore-rehearsal"
+            },
+            "backup_bundle",
+        )
+    } else if *backups_verify || *backups_list {
+        ("backups", "read-only-check", "backup_bundle")
+    } else if *archive_scan {
+        ("archive-scan", "read-only-check", "unknown")
+    } else if *archive_normalize {
+        (
+            "archive-normalize",
+            if apply_requested {
+                "archive-normalize-apply"
+            } else {
+                "archive-normalize-dry-run"
+            },
+            "unknown",
+        )
+    } else if *repair {
+        (
+            "repair",
+            if apply_requested {
+                "fingerprint-apply"
+            } else {
+                "repair-dry-run"
+            },
+            "unknown",
+        )
+    } else if *cleanup {
+        (
+            "cleanup",
+            if apply_requested {
+                "cleanup-apply"
+            } else {
+                "cleanup-dry-run"
+            },
+            "unknown",
+        )
+    } else if *fix {
+        ("legacy-doctor", "safe-auto-fix", "unknown")
+    } else if *check {
+        ("check", "read-only-check", "unknown")
+    } else {
+        ("legacy-doctor", "read-only-check", "unknown")
+    };
+    Some(DoctorErrorContext {
+        surface,
+        mode,
+        asset_class,
+    })
+}
+
+fn doctor_error_payload(
+    err: &coding_agent_search::CliError,
+    context: DoctorErrorContext,
+) -> serde_json::Value {
+    // Context comes from the normalized, parsed command. It identifies the
+    // requested operation; a fatal error establishes no risk assessment,
+    // selected authority, completed probe, or durable artifact.
+    serde_json::json!({
+        "err": {
+            "code": err.code,
+            "kind": err.kind,
+            "message": err.message,
+            "hint": err.hint,
+            "retryable": err.retryable,
+            "surface": context.surface,
+            "mode": context.mode,
+            "risk_level": "unknown",
+            "asset_class": context.asset_class,
+            "blocked_reasons": [err.kind],
+            "failure_context_path": null,
+            "event_log_path": null,
+            "artifact_manifest_path": null,
+            "recommended_action": err.hint.as_deref().unwrap_or("cass doctor check --json"),
+            "redaction_status": "not_redacted"
+        }
+    })
+}
+
 fn handle_fatal_error(err: coding_agent_search::CliError) -> ! {
+    handle_fatal_error_with_doctor_context(err, None)
+}
+
+fn handle_fatal_error_with_doctor_context(
+    err: coding_agent_search::CliError,
+    doctor_context: Option<DoctorErrorContext>,
+) -> ! {
     if err.was_already_reported() {
         std::process::exit(err.code);
     }
@@ -169,15 +316,20 @@ fn handle_fatal_error(err: coding_agent_search::CliError) -> ! {
         eprintln!("{}", err.message);
     } else if is_robot_mode_args() {
         // Wrap unstructured error for robot consumers.
-        let payload = serde_json::json!({
-            "error": {
-                "code": err.code,
-                "kind": err.kind,
-                "message": err.message,
-                "hint": err.hint,
-                "retryable": err.retryable,
-            }
-        });
+        let payload = doctor_context.map_or_else(
+            || {
+                serde_json::json!({
+                    "error": {
+                        "code": err.code,
+                        "kind": err.kind,
+                        "message": err.message,
+                        "hint": err.hint,
+                        "retryable": err.retryable,
+                    }
+                })
+            },
+            |context| doctor_error_payload(&err, context),
+        );
         eprintln!("{payload}");
     } else {
         // Human-readable output stays on stderr per Unix convention. The
@@ -403,12 +555,13 @@ fn main() -> anyhow::Result<()> {
         Ok(parsed) => parsed,
         Err(err) => handle_fatal_error(err),
     };
+    let doctor_context = doctor_error_context(parsed.cli.command.as_ref());
 
     let parsed = match coding_agent_search::try_run_with_parsed_fast(parsed) {
         Ok(result) => {
             return match result {
                 Ok(()) => Ok(()),
-                Err(err) => handle_fatal_error(err),
+                Err(err) => handle_fatal_error_with_doctor_context(err, doctor_context),
             };
         }
         Err(parsed) => *parsed,
@@ -436,7 +589,7 @@ fn main() -> anyhow::Result<()> {
 
     match result {
         Ok(()) => Ok(()),
-        Err(err) => handle_fatal_error(err),
+        Err(err) => handle_fatal_error_with_doctor_context(err, doctor_context),
     }
 }
 

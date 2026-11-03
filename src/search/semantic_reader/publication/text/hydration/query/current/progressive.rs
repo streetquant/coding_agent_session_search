@@ -25,13 +25,13 @@ struct Continuation<'request> {
     ranking: FastTierCache,
 }
 
-struct CurrentStream<'request, 'connection, F> {
+struct CurrentStream<'request, F> {
     continuation: Option<Continuation<'request>>,
-    transaction: &'request Transaction<'connection>,
+    transaction: &'request dyn SemanticReadSnapshot,
     retrieve: F,
 }
 
-impl<'request, F, B> Iterator for CurrentStream<'request, '_, F>
+impl<'request, F, B> Iterator for CurrentStream<'request, F>
 where
     F: Fn(
         &CachedProducers<'request>,
@@ -82,7 +82,7 @@ where
     }
 }
 
-impl<'request, F, B> FusedIterator for CurrentStream<'request, '_, F>
+impl<'request, F, B> FusedIterator for CurrentStream<'request, F>
 where
     F: Fn(
         &CachedProducers<'request>,
@@ -157,7 +157,7 @@ impl SemanticGenerationReader {
     pub fn progressive_current_text_in_transaction<'call>(
         &'call self,
         request: CurrentTextQuery<'call>,
-        transaction: &'call Transaction<'_>,
+        transaction: &'call dyn SemanticReadSnapshot,
     ) -> Result<
         impl FusedIterator<Item = Result<CurrentSemanticBatch<SemanticSearchBatch>, CurrentSearchError>>
         + 'call,
@@ -201,7 +201,7 @@ impl SelectedSemanticGeneration {
     pub fn progressive_current_text_in_transaction<'call>(
         &'call self,
         request: CurrentTextQuery<'call>,
-        transaction: &'call Transaction<'_>,
+        transaction: &'call dyn SemanticReadSnapshot,
     ) -> Result<
         impl FusedIterator<
             Item = Result<CurrentSemanticBatch<SelectedSemanticBatch>, CurrentSearchError>,

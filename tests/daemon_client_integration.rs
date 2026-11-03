@@ -927,6 +927,13 @@ mod indexer_process_coexistence {
         stderr: PathBuf,
     }
 
+    fn index_shutdown_trace(path: &Path) -> String {
+        let trace = fs::read_to_string(path).unwrap_or_default();
+        let mut lines = trace.lines().rev().take(80).collect::<Vec<_>>();
+        lines.reverse();
+        lines.join("\n")
+    }
+
     impl OwnedProcess {
         fn diagnostics(&self) -> String {
             format!(
@@ -1332,12 +1339,32 @@ mod indexer_process_coexistence {
         }
 
         fn prepare_v21_schema(&self) -> Result<()> {
-            // V22 adds only this empty table. Remove the actual schema object
-            // as well as its ledger entry so the next open must really migrate.
+            // Remove the actual V23 authority and V22 tombstone schema objects
+            // as well as their ledger entries so the next open must really migrate.
             let connection = Connection::open(self.db.to_string_lossy())?;
             connection.execute_batch(
-                "DROP TABLE forgotten_sources; \
-                 DELETE FROM _schema_migrations WHERE version = 22; \
+                "DROP TRIGGER cass_semantic_source_authority_insert; \
+                 DROP TRIGGER cass_semantic_source_authority_update; \
+                 DROP TRIGGER cass_semantic_source_authority_delete; \
+                 DROP TRIGGER cass_semantic_source_agents_insert; \
+                 DROP TRIGGER cass_semantic_source_agents_update; \
+                 DROP TRIGGER cass_semantic_source_agents_delete; \
+                 DROP TRIGGER cass_semantic_source_workspaces_insert; \
+                 DROP TRIGGER cass_semantic_source_workspaces_update; \
+                 DROP TRIGGER cass_semantic_source_workspaces_delete; \
+                 DROP TRIGGER cass_semantic_source_sources_insert; \
+                 DROP TRIGGER cass_semantic_source_sources_update; \
+                 DROP TRIGGER cass_semantic_source_sources_delete; \
+                 DROP TRIGGER cass_semantic_source_conversations_insert; \
+                 DROP TRIGGER cass_semantic_source_conversations_update; \
+                 DROP TRIGGER cass_semantic_source_conversations_delete; \
+                 DROP TRIGGER cass_semantic_source_messages_insert; \
+                 DROP TRIGGER cass_semantic_source_messages_update; \
+                 DROP TRIGGER cass_semantic_source_messages_delete; \
+                 DROP TABLE semantic_source_certificates_v1; \
+                 DROP TABLE semantic_source_identity_v1; \
+                 DROP TABLE forgotten_sources; \
+                 DELETE FROM _schema_migrations WHERE version IN (22, 23); \
                  UPDATE meta SET value = '21' WHERE key = 'schema_version';",
             )?;
             assert_eq!(
@@ -1953,10 +1980,16 @@ mod indexer_process_coexistence {
         let (mut daemon, client) = fixture.daemon(false)?;
         let ready = fixture.data.join("migration-open-ready.json");
         let release = fixture.data.join("migration-open-release");
+        let trace = fixture.data.join("contended-migration.trace.jsonl");
         let mut command = fixture.index_command(&[]);
         command
             .env("CASS_TEST_INDEX_STORAGE_OPEN_READY", &ready)
-            .env("CASS_TEST_INDEX_STORAGE_OPEN_RELEASE", &release);
+            .env("CASS_TEST_INDEX_STORAGE_OPEN_RELEASE", &release)
+            .env("CASS_TRACE_FILE", &trace)
+            .env(
+                "CASS_TRACE_FILTER",
+                "warn,coding_agent_search=debug,fsqlite::cx=debug",
+            );
         let mut indexer = fixture.spawn("contended-migration", command)?;
         let indexer_pid = indexer.child.id();
         indexer.until(|| {
@@ -1998,14 +2031,20 @@ mod indexer_process_coexistence {
                 .status()?
                 .success()
         );
-        // Storage uses a 5-second native busy timeout. Cancellation must finish
-        // while our writer is still held and before that timeout expires.
-        let status = indexer.wait(Duration::from_secs(3))?;
+        // Storage normally uses a 5-second native busy timeout. A supervised
+        // open must poll cancellation while our writer is still held.
+        // Observe the child's eventual bounded result before applying the
+        // unchanged three-second cooperative-cancellation requirement. A
+        // failure then retains the native-timeout/forced-exit path in its trace.
+        let status = indexer
+            .wait(Duration::from_secs(8))
+            .with_context(|| format!("shutdown trace:\n{}", index_shutdown_trace(&trace)))?;
         let shutdown_elapsed = shutdown_started.elapsed();
         assert!(
             shutdown_elapsed < Duration::from_secs(3),
-            "cooperative index cancellation exceeded 3 seconds ({shutdown_elapsed:?}): {}",
-            indexer.diagnostics()
+            "cooperative index cancellation exceeded 3 seconds ({shutdown_elapsed:?}, {status}): {}\nshutdown trace:\n{}",
+            indexer.diagnostics(),
+            index_shutdown_trace(&trace),
         );
         assert_eq!(status.code(), Some(143), "{}", indexer.diagnostics());
         fixture.assert_lock_released()?;
@@ -2036,25 +2075,94 @@ mod indexer_process_coexistence {
         fixture.shutdown(&mut daemon, &client)
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn gh515_sigterm_bounds_contended_engine_open_and_recovers_with_resident_daemon() -> Result<()>
     {
-        let fixture = Fixture::new()?;
+        use coding_agent_search::franken_sync::{
+            FrankenError,
+            fsqlite_vfs::{NamespaceOpenIntent, PendingNamespaceOpen},
+        };
+
+        let mut fixture = Fixture::new()?;
         fixture.seed(0)?;
         fixture.index("initial", &["--full"])?;
         fixture.prepare_v21_schema()?;
         let (mut daemon, client) = fixture.daemon(false)?;
-        // This writer is acquired before the child's raw engine constructor.
-        // Its bootstrap retry precedes CASS's cancellable migration SQL, so
-        // the existing five-second forced shutdown must bound this stage.
-        let blocker = Connection::open(fixture.db.to_string_lossy())?;
+        // Engine repair state is pathname-scoped. Clone the checkpointed tiny
+        // archive to a fresh basename, preserving its rows without copying the
+        // existing engine marker. The child's ordinary first open must repair.
+        let checkpoint = Connection::open_existing_schema_only(fixture.db.to_string_lossy())?;
+        assert_eq!(
+            checkpoint
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)")?
+                .get_typed::<i64>(0)?,
+            0,
+            "the cloned main image must contain every committed row"
+        );
+        checkpoint.close()?;
+        let unrepaired_db = fixture.db.with_file_name("unrepaired-engine-archive.db");
+        fs::copy(&fixture.db, &unrepaired_db)?;
+        fixture.db = unrepaired_db;
+        let marker = fixture
+            .db
+            .with_file_name("unrepaired-engine-archive.db.fsqlite-migration-state");
+        assert!(!marker.exists(), "the first-open repair must be pending");
+        // Keep a real uncommitted rollback-journal writer. The pinned pager
+        // takes only RESERVED even for BEGIN EXCLUSIVE, so the native admission
+        // lease below supplies actual constructor contention after the child's
+        // read-only safety check.
+        let blocker = Connection::open_existing_schema_only(fixture.db.to_string_lossy())?;
         blocker.execute("PRAGMA fsqlite.concurrent_mode = OFF")?;
-        blocker.execute("BEGIN IMMEDIATE")?;
+        assert_eq!(
+            blocker
+                .query_row("PRAGMA journal_mode = DELETE")?
+                .get_typed::<String>(0)?,
+            "delete",
+            "raw constructor contention requires a rollback journal"
+        );
+        let ready = fixture.data.join("engine-open-ready.json");
+        let release = fixture.data.join("engine-open-release");
+        let trace = fixture.data.join("contended-engine-open.trace.jsonl");
+        let mut command = fixture.index_command(&[]);
+        command
+            .env("CASS_TEST_INDEX_ENGINE_OPEN_READY", &ready)
+            .env("CASS_TEST_INDEX_ENGINE_OPEN_RELEASE", &release)
+            .env("CASS_TRACE_FILE", &trace)
+            .env(
+                "CASS_TRACE_FILTER",
+                "warn,coding_agent_search=debug,fsqlite::cx=debug",
+            );
+        let mut indexer = fixture.spawn("contended-engine-open", command)?;
+        let indexer_pid = indexer.child.id();
+        indexer.until(|| {
+            fs::read(&ready)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|receipt| {
+                    receipt["pid"] == indexer_pid
+                        && receipt["db_path"].as_str() == fixture.db.to_str()
+                })
+        })?;
+        blocker.execute("BEGIN EXCLUSIVE")?;
         blocker.execute(
             "INSERT INTO meta(key, value) VALUES('gh515_bootstrap_uncommitted', 'rollback')",
         )?;
-        let mut indexer = fixture.spawn("contended-engine-open", fixture.index_command(&[]))?;
-        let indexer_pid = indexer.child.id();
+        let native_admission =
+            PendingNamespaceOpen::begin(&fixture.db, NamespaceOpenIntent::ExistingCompanion)?;
+        assert!(
+            native_admission.expected_identity().is_some(),
+            "the fixture must retain the existing archive's native admission gate"
+        );
+        assert!(matches!(
+            PendingNamespaceOpen::begin(&fixture.db, NamespaceOpenIntent::ExistingCompanion),
+            Err(FrankenError::Busy)
+        ));
+        assert!(
+            !marker.exists(),
+            "the independent writer must not complete the child's engine repair"
+        );
+        fs::write(&release, b"continue into raw engine constructor")?;
         fixture.wait_index_owner(
             &mut indexer,
             indexer_pid,
@@ -2076,7 +2184,9 @@ mod indexer_process_coexistence {
                 .status()?
                 .success()
         );
-        let status = indexer.wait(Duration::from_secs(8))?;
+        let status = indexer
+            .wait(Duration::from_secs(8))
+            .with_context(|| format!("shutdown trace:\n{}", index_shutdown_trace(&trace)))?;
         let shutdown_elapsed = shutdown_started.elapsed();
         assert!(
             shutdown_elapsed < Duration::from_secs(8),
@@ -2089,7 +2199,13 @@ mod indexer_process_coexistence {
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .find(|event| event["success"] == false && event["code"] == 143)
-            .with_context(|| format!("forced shutdown envelope: {}", indexer.diagnostics()))?;
+            .with_context(|| {
+                format!(
+                    "forced shutdown envelope: {}\nshutdown trace:\n{}",
+                    indexer.diagnostics(),
+                    index_shutdown_trace(&trace),
+                )
+            })?;
         assert_eq!(error["kind"], "index", "{error}");
         assert_eq!(error["retryable"], true, "{error}");
         assert!(
@@ -2113,6 +2229,7 @@ mod indexer_process_coexistence {
             indexer.diagnostics()
         );
         fixture.assert_lock_released()?;
+        drop(native_admission);
         let exited_metadata = fs::read(fixture.data.join("index-run.lock"))?;
         let heartbeat = || -> Option<u64> {
             let value: serde_json::Value =

@@ -16,14 +16,18 @@ use assert_cmd::Command;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Instant;
 use tempfile::TempDir;
+
+mod util;
+use util::e2e_log::{E2eLogContext, E2eLogger, PhaseTracker};
 
 const LEGACY_V13_FTS_SQL: &str = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, content='', tokenize='porter')";
 const DUPLICATE_FTS_SQL: &str = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
 
-fn cass_cmd(temp_home: &Path) -> Command {
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+fn cass_cmd(tracker: &PhaseTracker, temp_home: &Path) -> Command {
+    let mut cmd = tracker.cass_assert_command();
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
     cmd.env("CASS_IGNORE_SOURCES_CONFIG", "1");
     cmd.env("HOME", temp_home);
@@ -88,6 +92,8 @@ fn fts_messages_catalog_row_count(db_path: &Path) -> i64 {
 /// command, its exit code, the key JSON fields the step inspected, and the
 /// elapsed time (`docs/reference/E2E_LOGGING_SCHEMA.md`).
 fn run_step(step: &str, label: &str, command: &mut Command) -> std::process::Output {
+    static LOGGER: OnceLock<E2eLogger> = OnceLock::new();
+    let logger = LOGGER.get_or_init(|| E2eLogger::new("rust").expect("create E2E step log"));
     let started = Instant::now();
     let output = command.output().expect("run the cass command");
     let duration_ms = started.elapsed().as_millis() as u64;
@@ -112,15 +118,32 @@ fn run_step(step: &str, label: &str, command: &mut Command) -> std::process::Out
         ),
         ("stdout_bytes", Value::from(stdout.len())),
     ];
-    if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(stdout.trim()) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let report = serde_json::from_str::<Value>(stdout.trim()).ok();
+    let error = stderr
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok());
+    if let Some(Value::Object(map)) = report.as_ref().or(error.as_ref()) {
         for key in ["kind", "code", "status"] {
             if let Some(value) = map.get(key) {
                 fields.push((key, value.clone()));
             }
         }
+        if let Some(error) = map.get("error") {
+            fields.push(("error", error.clone()));
+        }
+        if let Some(checks) = map.get("checks") {
+            fields.push(("checks", checks.clone()));
+        }
     }
     let event = serde_json::json!({
-        "event": "e2e_step",
+        "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "event": "log",
+        "run_id": logger.run_id(),
+        "runner": "rust",
+        "level": "INFO",
+        "msg": "schema repair CLI step",
         "step": step,
         "command": label,
         "exit_code": output.status.code(),
@@ -130,6 +153,18 @@ fn run_step(step: &str, label: &str, command: &mut Command) -> std::process::Out
             .map(|(key, value)| (key.to_string(), value))
             .collect::<serde_json::Map<String, Value>>(),
     });
+    logger
+        .log(
+            "INFO",
+            &event.to_string(),
+            Some(E2eLogContext {
+                phase: Some(step.to_string()),
+                command: Some(label.to_string()),
+                test_name: None,
+            }),
+        )
+        .expect("write structured E2E step log");
+    logger.flush().expect("flush structured E2E step log");
     println!("{event}");
     output
 }
@@ -138,6 +173,10 @@ fn run_step(step: &str, label: &str, command: &mut Command) -> std::process::Out
 /// leave the archive byte-identical.
 #[test]
 fn health_and_status_report_the_repair_and_leave_the_archive_untouched() {
+    let tracker = PhaseTracker::new(
+        "e2e_schema_repair_required",
+        "health_and_status_report_the_repair_and_leave_the_archive_untouched",
+    );
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
     let data_dir = home.join("data");
@@ -146,7 +185,7 @@ fn health_and_status_report_the_repair_and_leave_the_archive_untouched() {
     let before = fs::read(&db_path).unwrap();
 
     for surface in ["health", "status"] {
-        let mut command = cass_cmd(&home);
+        let mut command = cass_cmd(&tracker, &home);
         command
             .arg(surface)
             .arg("--json")
@@ -162,10 +201,9 @@ fn health_and_status_report_the_repair_and_leave_the_archive_untouched() {
             stdout.contains("doctor --fix"),
             "{surface} must report the required repair: {stdout}"
         );
-        // The negative case for the old contract: before 2l1b0.65 the
-        // dedicated-owner read-only open repaired the catalog through the
-        // external `sqlite3` CLI, so the read surface rewrote the archive
-        // behind the operator's back. On 71759163 this assertion fails.
+        // The truth probes must preserve the archive even when its derived
+        // catalog needs repair. Ordinary canonical reads and strict content
+        // hydration have separate refusal controls in e2e_search_index.
         assert_eq!(
             fs::read(&db_path).unwrap(),
             before,
@@ -177,6 +215,7 @@ fn health_and_status_report_the_repair_and_leave_the_archive_untouched() {
             "{surface} must not remove any sqlite_master row"
         );
     }
+    tracker.complete();
 }
 
 /// 2l1b0.65: `cass doctor --fix` is the one surface that repairs the
@@ -187,13 +226,17 @@ fn doctor_fix_repairs_the_conflicting_catalog() {
         eprintln!("SKIPPED doctor_fix_repairs_the_conflicting_catalog: sqlite3 is not installed");
         return;
     }
+    let tracker = PhaseTracker::new(
+        "e2e_schema_repair_required",
+        "doctor_fix_repairs_the_conflicting_catalog",
+    );
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
     let data_dir = home.join("data");
     fs::create_dir_all(&data_dir).unwrap();
     let db_path = build_archive_with_duplicate_fts_rows(&data_dir);
 
-    let mut command = cass_cmd(&home);
+    let mut command = cass_cmd(&tracker, &home);
     command
         .arg("doctor")
         .arg("--fix")
@@ -206,17 +249,22 @@ fn doctor_fix_repairs_the_conflicting_catalog() {
         &mut command,
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("conflicting_fts_schema_rows"),
-        "the doctor report must name the repair it applied: {stdout}"
-    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("parse doctor report");
+    let repair = report["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["name"] == "conflicting_fts_schema_rows")
+        .expect("the doctor report must name the repair it applied");
+    assert_eq!(repair["status"], "pass", "{stdout}");
+    assert_eq!(repair["fix_applied"], true, "{stdout}");
     assert_eq!(
         fts_messages_catalog_row_count(&db_path),
         1,
         "the repair must keep exactly the canonical row"
     );
 
-    let mut health_command = cass_cmd(&home);
+    let mut health_command = cass_cmd(&tracker, &home);
     health_command
         .arg("health")
         .arg("--json")
@@ -232,6 +280,7 @@ fn doctor_fix_repairs_the_conflicting_catalog() {
         !stdout.contains("doctor --fix"),
         "the repaired archive must no longer report a required repair: {stdout}"
     );
+    tracker.complete();
 }
 
 /// 2l1b0.65: a host without the `sqlite3` tool never sees a spawn failure
@@ -239,6 +288,10 @@ fn doctor_fix_repairs_the_conflicting_catalog() {
 /// typed, actionable message.
 #[test]
 fn a_host_without_the_sqlite3_tool_still_gets_a_truthful_answer() {
+    let tracker = PhaseTracker::new(
+        "e2e_schema_repair_required",
+        "a_host_without_the_sqlite3_tool_still_gets_a_truthful_answer",
+    );
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
     let data_dir = home.join("data");
@@ -246,7 +299,7 @@ fn a_host_without_the_sqlite3_tool_still_gets_a_truthful_answer() {
     let db_path = build_archive_with_duplicate_fts_rows(&data_dir);
     let before = fs::read(&db_path).unwrap();
 
-    let mut command = cass_cmd(&home);
+    let mut command = cass_cmd(&tracker, &home);
     command
         .env("PATH", temp.path().join("empty-bin"))
         .arg("status")
@@ -272,4 +325,42 @@ fn a_host_without_the_sqlite3_tool_still_gets_a_truthful_answer() {
         before,
         "the read surface must leave the archive byte-identical"
     );
+
+    let mut doctor = cass_cmd(&tracker, &home);
+    doctor
+        .env("PATH", temp.path().join("empty-bin"))
+        .args(["doctor", "--fix", "--json", "--data-dir"])
+        .arg(&data_dir);
+    let output = run_step(
+        "doctor_without_sqlite3",
+        "cass doctor --fix --json --data-dir <data-dir> (PATH without sqlite3)",
+        &mut doctor,
+    );
+    assert!(
+        !output.status.success(),
+        "doctor must not claim success when the required repair tool is absent"
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("parse doctor report");
+    let repair = report["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["name"] == "conflicting_fts_schema_rows")
+        .expect("doctor must report the blocked catalog repair");
+    assert_eq!(repair["status"], "fail", "{report}");
+    assert_eq!(repair["fix_applied"], false, "{report}");
+    let message = repair["message"].as_str().expect("repair failure message");
+    assert!(
+        message.contains("needs the sqlite3 command-line tool"),
+        "{message}"
+    );
+    assert!(message.contains("install sqlite3 and retry"), "{message}");
+    assert!(!message.contains("No such file or directory"), "{message}");
+    assert_eq!(
+        fs::read(&db_path).unwrap(),
+        before,
+        "a failed doctor repair must leave the archive byte-identical"
+    );
+    assert_eq!(fts_messages_catalog_row_count(&db_path), 2);
+    tracker.complete();
 }

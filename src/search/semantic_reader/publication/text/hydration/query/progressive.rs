@@ -5,15 +5,15 @@
 use super::*;
 use std::iter::FusedIterator;
 
-struct HydratedStream<'snapshot, 'connection, I> {
+struct HydratedStream<'snapshot, I> {
     inner: Option<I>,
     remaining_phases: usize,
-    transaction: &'snapshot Transaction<'connection>,
+    transaction: &'snapshot dyn SemanticReadSnapshot,
     projection: PassageProjection,
     work: Work,
 }
 
-impl<I, B> Iterator for HydratedStream<'_, '_, I>
+impl<I, B> Iterator for HydratedStream<'_, I>
 where
     I: Iterator<Item = SemanticReaderResult<B>>,
     B: BatchSource,
@@ -58,19 +58,19 @@ where
     }
 }
 
-impl<I, B> FusedIterator for HydratedStream<'_, '_, I>
+impl<I, B> FusedIterator for HydratedStream<'_, I>
 where
     I: Iterator<Item = SemanticReaderResult<B>>,
     B: BatchSource,
 {
 }
 
-fn stream<'snapshot, 'connection, I>(
+fn stream<I>(
     inner: I,
-    transaction: &'snapshot Transaction<'connection>,
+    transaction: &dyn SemanticReadSnapshot,
     projection: PassageProjection,
     work: Work,
-) -> Result<HydratedStream<'snapshot, 'connection, I>, HydrationError> {
+) -> Result<HydratedStream<'_, I>, HydrationError> {
     work.check()?;
     Ok(HydratedStream {
         inner: Some(inner),
@@ -94,7 +94,7 @@ impl TextSemanticSearch<'_, '_> {
         &'call self,
         k: usize,
         filter: Option<&'call dyn SearchFilter>,
-        transaction: &'call Transaction<'_>,
+        transaction: &'call dyn SemanticReadSnapshot,
         projection: PassageProjection,
         budget: HydrationBudget,
     ) -> Result<
@@ -117,7 +117,7 @@ impl TextSemanticSearch<'_, '_> {
         k: usize,
         filter: Option<&'call dyn SearchFilter>,
         policy: AnnSearchPolicy,
-        transaction: &'call Transaction<'_>,
+        transaction: &'call dyn SemanticReadSnapshot,
         projection: PassageProjection,
         budget: HydrationBudget,
     ) -> Result<
@@ -143,7 +143,7 @@ impl SelectedTextSemanticSearch<'_, '_> {
         &'call self,
         k: usize,
         filter: Option<&'call dyn SearchFilter>,
-        transaction: &'call Transaction<'_>,
+        transaction: &'call dyn SemanticReadSnapshot,
         projection: PassageProjection,
         budget: HydrationBudget,
     ) -> Result<
@@ -164,7 +164,7 @@ impl SelectedTextSemanticSearch<'_, '_> {
         k: usize,
         filter: Option<&'call dyn SearchFilter>,
         policy: AnnSearchPolicy,
-        transaction: &'call Transaction<'_>,
+        transaction: &'call dyn SemanticReadSnapshot,
         projection: PassageProjection,
         budget: HydrationBudget,
     ) -> Result<

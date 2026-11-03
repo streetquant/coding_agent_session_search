@@ -1,13 +1,34 @@
 //! Integration tests for the bundle builder.
 
+#[path = "util/mod.rs"]
+mod util;
+
 #[cfg(test)]
 mod tests {
-    use anyhow::Result;
+    use crate::util::e2e_log::{
+        E2eError, E2eLogger, E2ePerformanceMetrics, E2ePhase, E2eRunSummary, E2eTestInfo,
+    };
+    use anyhow::{Result, anyhow};
+    use chrono::DateTime;
+    use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+    use coding_agent_search::franken_sync::{Connection, Row as FrankenRow, params as fparams};
     use coding_agent_search::pages::bundle::{BundleBuilder, BundleConfig, IntegrityManifest};
-    use coding_agent_search::pages::encrypt::EncryptionEngine;
+    use coding_agent_search::pages::encrypt::{
+        DecryptionEngine, EncryptionEngine, SlotType, load_config,
+    };
+    use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
+    use coding_agent_search::pages::key_management;
+    use coding_agent_search::pages::qr::RecoverySecret;
+    use coding_agent_search::pages::secret_scan::{
+        SecretScanConfig, SecretSeverity, scan_staged_export_database,
+    };
+    use coding_agent_search::pages::verify::verify_bundle;
+    use sha2::{Digest, Sha256};
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::sync::LazyLock;
+    use std::time::Instant;
     use tempfile::TempDir;
 
     /// Create a test encrypted archive in the given directory
@@ -1692,6 +1713,10 @@ mod tests {
     #[test]
     fn test_index_bootstrap_respects_csp_without_inline_module_script() {
         let index_html = include_str!("../src/pages_assets/index.html");
+        // viewer.init() mounts into this root after decryption. A different
+        // HTML id left real browsers permanently showing "Loading database".
+        assert!(index_html.contains("<main id=\"app-content\""));
+        assert!(index_html.contains("href=\"#app-content\" class=\"skip-link\""));
         assert!(
             index_html.contains("script-src 'self' 'wasm-unsafe-eval';"),
             "pages bundle should keep the strict CSP script policy"
@@ -3339,5 +3364,791 @@ mod tests {
                 && sw_js.contains("await cache.put(url, response);")
                 && sw_js.contains("if (failed) throw failed.reason;")
         );
+    }
+
+    // Reviewed continuation of 7b62a4131 / 272cf90ea for 2l1b0.23.
+    // Each process plants fresh synthetic credentials. Lazy initialization
+    // keeps the producer and independent leak oracles on the same values.
+    fn pages_planted_credential() -> String {
+        format!("sk-ant-api03-{}", RecoverySecret::generate().encoded())
+    }
+
+    static PLANTED_SELECTED_SECRET: LazyLock<String> = LazyLock::new(pages_planted_credential);
+    static PLANTED_OMITTED_AGENT_SECRET: LazyLock<String> = LazyLock::new(pages_planted_credential);
+    static PLANTED_OMITTED_TIME_SECRET: LazyLock<String> = LazyLock::new(pages_planted_credential);
+    static PLANTED_OMITTED_WORKSPACE_SECRET: LazyLock<String> =
+        LazyLock::new(pages_planted_credential);
+    static FIXTURE_PASSWORD: LazyLock<String> =
+        LazyLock::new(|| RecoverySecret::generate().encoded().to_owned());
+    static ROTATED_PASSWORD: LazyLock<String> =
+        LazyLock::new(|| RecoverySecret::generate().encoded().to_owned());
+
+    fn pages_proof(name: &str, run: impl FnOnce(&E2eLogger) -> Result<()>) -> Result<()> {
+        let logger = E2eLogger::new("rust")?;
+        let info = E2eTestInfo::new(name, "pages_privacy", file!(), line!());
+        let phase = E2ePhase {
+            name: name.into(),
+            description: Some("Real Pages engine and filesystem proof".into()),
+        };
+        logger.run_start(None)?;
+        logger.test_start(&info)?;
+        logger.phase_start(&phase)?;
+        let start = Instant::now();
+        let result = run(&logger);
+        let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        logger.phase_end(&phase, elapsed)?;
+        let passed = result.is_ok();
+        if let Err(error) = &result {
+            logger.test_fail(&info, elapsed, None, E2eError::new(format!("{error:#}")))?;
+        } else {
+            logger.test_pass(&info, elapsed, None)?;
+        }
+        logger.run_end(
+            E2eRunSummary {
+                total: 1,
+                passed: u32::from(passed),
+                failed: u32::from(!passed),
+                skipped: 0,
+                flaky: None,
+                duration_ms: elapsed,
+            },
+            i32::from(!passed),
+        )?;
+        eprintln!("PAGES_PROOF_LOG={}", logger.output_path().display());
+        result
+    }
+
+    fn plant_pages_privacy_source(path: &Path, filler_bytes: usize) -> Result<()> {
+        let conn = open_franken_db(path)?;
+        conn.execute("PRAGMA journal_mode = WAL")?;
+        conn.execute("PRAGMA busy_timeout = 5000")?;
+        conn.execute_batch(r#"
+            CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+            CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY, agent_id INTEGER NOT NULL, workspace_id INTEGER,
+                title TEXT, source_path TEXT NOT NULL, started_at INTEGER, ended_at INTEGER,
+                message_count INTEGER, metadata_json TEXT
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY, conversation_id INTEGER NOT NULL, idx INTEGER NOT NULL,
+                role TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER, updated_at INTEGER, model TEXT
+            );
+            CREATE TABLE snippets (
+                id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL, file_path TEXT,
+                start_line INTEGER, end_line INTEGER, language TEXT, snippet_text TEXT NOT NULL
+            );
+            INSERT INTO agents VALUES (1, 'claude'), (2, 'codex');
+            INSERT INTO workspaces VALUES (1, '/w/selected'), (2, '/w/omitted');
+        "#)?;
+        // Each omitted row violates exactly one filter. Removing any single
+        // agent/workspace/time predicate therefore breaks this oracle.
+        for (id, agent, workspace, started, message, title, secret) in [
+            (
+                1,
+                1,
+                1,
+                1_700_000_000_000_i64,
+                1,
+                "selected conversation",
+                PLANTED_SELECTED_SECRET.as_str(),
+            ),
+            (
+                2,
+                2,
+                1,
+                1_700_000_000_000_i64,
+                4,
+                "omitted agent",
+                PLANTED_OMITTED_AGENT_SECRET.as_str(),
+            ),
+            (
+                3,
+                1,
+                1,
+                1_600_000_000_000_i64,
+                5,
+                "omitted time",
+                PLANTED_OMITTED_TIME_SECRET.as_str(),
+            ),
+            (
+                4,
+                1,
+                2,
+                1_700_000_000_000_i64,
+                6,
+                "omitted workspace",
+                PLANTED_OMITTED_WORKSPACE_SECRET.as_str(),
+            ),
+        ] {
+            conn.execute_compat(
+                "INSERT INTO conversations VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                fparams![
+                    id,
+                    agent,
+                    workspace,
+                    title,
+                    format!("/w/session-{id}.jsonl"),
+                    started,
+                    started + 1000,
+                    if id == 1 { 3 } else { 1 },
+                    serde_json::json!({"planted": secret}).to_string()
+                ],
+            )?;
+            conn.execute_compat(
+                "INSERT INTO messages VALUES (?1, ?2, 0, 'user', ?3, ?4, ?4, 'fixture-model')",
+                fparams![
+                    message,
+                    id,
+                    format!("{title} first message {secret}"),
+                    started
+                ],
+            )?;
+            conn.execute_compat(
+                "INSERT INTO snippets (message_id, file_path, start_line, end_line, language, snippet_text) VALUES (?1, '/w/src/planted.rs', 1, 3, 'rust', ?2)",
+                fparams![message, format!("// planted snippet {secret}")],
+            )?;
+        }
+        conn.execute("INSERT INTO messages VALUES (2, 1, 1, 'assistant', 'selected second message', 1700000000500, 1700000000500, 'fixture-model')")?;
+        let mut filler = String::with_capacity(filler_bytes);
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        for _ in 0..filler_bytes {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            filler.push(char::from(b'a' + (state >> 56) as u8 % 26));
+        }
+        conn.execute_compat("INSERT INTO messages VALUES (3, 1, 2, 'user', ?1, 1700000000600, 1700000000600, 'fixture-model')", fparams![filler])?;
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        Ok(())
+    }
+
+    fn pages_privacy_filter() -> ExportFilter {
+        ExportFilter {
+            agents: Some(vec!["claude".into()]),
+            workspaces: Some(vec!["/w/selected".into()]),
+            since: DateTime::from_timestamp_millis(1_650_000_000_000),
+            until: DateTime::from_timestamp_millis(1_750_000_000_000),
+            path_mode: PathMode::Full,
+        }
+    }
+
+    fn open_franken_db(path: &Path) -> Result<Connection> {
+        Ok(Connection::open(path.to_string_lossy().as_ref())?)
+    }
+
+    fn query_i64_list(conn: &Connection, sql: &str) -> Result<Vec<i64>> {
+        Ok(conn.query_map_collect(sql, &[], |row: &FrankenRow| row.get_typed(0))?)
+    }
+
+    fn pages_export_text_haystack(conn: &Connection) -> Result<String> {
+        let tables: Vec<String> = conn.query_map_collect(
+            "SELECT name FROM sqlite_master WHERE type='table'",
+            &[],
+            |row: &FrankenRow| row.get_typed(0),
+        )?;
+        let mut haystack = String::new();
+        for table in tables
+            .into_iter()
+            .filter(|name| !name.starts_with("sqlite_"))
+        {
+            let columns: Vec<String> = conn.query_map_collect(
+                &format!("PRAGMA table_info(\"{table}\")"),
+                &[],
+                |row: &FrankenRow| row.get_typed(1),
+            )?;
+            for column in columns {
+                let cells: Vec<Option<String>> = conn.query_map_collect(
+                    &format!("SELECT CAST(\"{column}\" AS TEXT) FROM \"{table}\""),
+                    &[],
+                    |row: &FrankenRow| row.get_typed(0),
+                )?;
+                for cell in cells.into_iter().flatten() {
+                    haystack.push_str(&cell);
+                    haystack.push('\n');
+                }
+            }
+        }
+        Ok(haystack)
+    }
+
+    fn read_tree_bytes(root: &Path) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in fs::read_dir(&dir)? {
+                let entry = entry?;
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if metadata.is_dir() {
+                    pending.push(entry.path());
+                } else if metadata.is_file() {
+                    bytes.extend_from_slice(&fs::read(entry.path())?);
+                } else {
+                    return Err(anyhow!("unexpected non-regular fixture entry"));
+                }
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+    }
+
+    fn pages_sha256_hex(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    fn assert_published_payload_is_ciphertext(site: &Path) -> Result<()> {
+        let mut chunks = 0;
+        for entry in fs::read_dir(site.join("payload"))? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                assert!(!fs::read(entry.path())?.starts_with(b"SQLite format 3\0"));
+                chunks += 1;
+            }
+        }
+        assert!(chunks > 0, "the ciphertext assertion needs a real payload");
+        Ok(())
+    }
+
+    struct PagesFixtureBundle {
+        export_db: PathBuf,
+        bundle_dir: PathBuf,
+        site_dir: PathBuf,
+        private_dir: PathBuf,
+        recovery: RecoverySecret,
+    }
+
+    fn build_pages_fixture_bundle(root: &Path) -> Result<PagesFixtureBundle> {
+        let source = root.join("source.db");
+        plant_pages_privacy_source(&source, 0)?;
+        let export_db = root.join("export.db");
+        ExportEngine::new(&source, &export_db, pages_privacy_filter()).execute(|_, _| {}, None)?;
+        let encrypted = root.join("encrypted");
+        let mut engine = EncryptionEngine::default();
+        engine.add_password_slot(FIXTURE_PASSWORD.as_str())?;
+        let recovery = RecoverySecret::generate();
+        engine.add_recovery_slot(recovery.as_bytes())?;
+        engine.encrypt_file(&export_db, &encrypted, |_, _| {})?;
+        let bundle_dir = root.join("bundle");
+        let built = BundleBuilder::new()
+            .title("Synthetic Pages privacy proof")
+            .description("Filtered export fixture")
+            .recovery_secret(Some(recovery.as_bytes().to_vec()))
+            .build(&encrypted, &bundle_dir, |_, _| {})?;
+        Ok(PagesFixtureBundle {
+            export_db,
+            bundle_dir,
+            site_dir: built.site_dir,
+            private_dir: built.private_dir,
+            recovery,
+        })
+    }
+
+    #[test]
+    fn pages_real_export_publishes_only_the_selected_rows() -> Result<()> {
+        pages_proof("selected_rows", |log| {
+            let temp = TempDir::new()?;
+            let source = temp.path().join("source.db");
+            plant_pages_privacy_source(&source, 0)?;
+            let export = temp.path().join("export.db");
+            let stats = ExportEngine::new(&source, &export, pages_privacy_filter())
+                .execute(|_, _| {}, None)?;
+            log.metrics(
+                "selected_rows",
+                &E2ePerformanceMetrics::new()
+                    .with_custom("conversations", stats.conversations_processed)
+                    .with_custom("messages", stats.messages_processed),
+            )?;
+            assert_eq!(stats.conversations_processed, 1);
+            assert_eq!(stats.messages_processed, 3);
+            let scan = scan_staged_export_database(
+                &export,
+                &SecretScanConfig::from_inputs_with_env(&[], &[], false)?,
+            )?;
+            assert!(scan.report.summary.total >= 1);
+            assert!(
+                scan.report
+                    .summary
+                    .by_severity
+                    .get(&SecretSeverity::High)
+                    .copied()
+                    .unwrap_or(0)
+                    >= 1
+            );
+            assert!(
+                scan.report
+                    .findings
+                    .iter()
+                    .any(|finding| finding.kind == "anthropic_key")
+            );
+            let conn = open_franken_db(&export)?;
+            assert_eq!(
+                query_i64_list(&conn, "SELECT id FROM conversations ORDER BY id")?,
+                vec![1]
+            );
+            assert_eq!(
+                query_i64_list(&conn, "SELECT id FROM messages ORDER BY id")?,
+                vec![1, 2, 3]
+            );
+            assert_eq!(
+                query_i64_list(&conn, "SELECT message_id FROM snippets ORDER BY message_id")?,
+                vec![1]
+            );
+            let haystack = pages_export_text_haystack(&conn)?;
+            assert!(haystack.contains(PLANTED_SELECTED_SECRET.as_str()));
+            for omitted in [
+                PLANTED_OMITTED_AGENT_SECRET.as_str(),
+                PLANTED_OMITTED_TIME_SECRET.as_str(),
+                PLANTED_OMITTED_WORKSPACE_SECRET.as_str(),
+            ] {
+                assert!(
+                    !haystack.contains(omitted),
+                    "an omitted row survived in an exported table or FTS shadow table"
+                );
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn pages_encrypted_bundle_separates_the_private_tree_from_the_public_artifact() -> Result<()> {
+        pages_proof("public_private_separation", |log| {
+            let temp = TempDir::new()?;
+            // A dedicated acceptance invocation may retain this synthetic
+            // fixture for the real browser. Existing output is never reused.
+            let retained = dotenvy::var("CASS_PAGES_PROOF_OUTPUT")
+                .ok()
+                .map(PathBuf::from);
+            let root = retained.as_deref().unwrap_or(temp.path());
+            if retained.is_some() {
+                assert!(
+                    root.is_absolute(),
+                    "browser fixture output must be absolute"
+                );
+                fs::create_dir(root)?;
+            }
+            let fixture = build_pages_fixture_bundle(root)?;
+            assert!(fixture.site_dir.join("index.html").is_file());
+            let recovery_file = fixture.private_dir.join("recovery-secret.txt");
+            let private_secret = fs::read_to_string(&recovery_file)?;
+            let mut lines = private_secret.lines().map(str::trim);
+            let recovery_key = lines
+                .find(|line| *line == "Secret (base64url):")
+                .and_then(|_| lines.next())
+                .ok_or_else(|| anyhow!("missing private recovery secret"))?;
+            let public_bytes = read_tree_bytes(&fixture.site_dir)?;
+            for secret in [
+                PLANTED_SELECTED_SECRET.as_str(),
+                PLANTED_OMITTED_AGENT_SECRET.as_str(),
+                PLANTED_OMITTED_TIME_SECRET.as_str(),
+                PLANTED_OMITTED_WORKSPACE_SECRET.as_str(),
+                recovery_key,
+            ] {
+                assert!(
+                    !contains_bytes(&public_bytes, secret.as_bytes()),
+                    "private fixture material appeared in a public artifact"
+                );
+            }
+            assert_published_payload_is_ciphertext(&fixture.site_dir)?;
+            assert!(!fixture.site_dir.starts_with(&fixture.private_dir));
+            assert!(!fixture.private_dir.starts_with(&fixture.site_dir));
+            let verified = verify_bundle(&fixture.bundle_dir, false)?;
+            assert_eq!(verified.status, "valid");
+            assert!(verified.checks.all_passed());
+            log.metrics(
+                "public_artifact",
+                &E2ePerformanceMetrics::new()
+                    .with_custom("public_bytes_scanned", public_bytes.len())
+                    .with_custom("private_material_leaks", 0),
+            )?;
+            if retained.is_some() {
+                let manifest = serde_json::json!({
+                    "schema": "cass.pages.browser-fixture.v1",
+                    "test_source_sha256": pages_sha256_hex(include_bytes!("pages_bundle.rs")),
+                    "source_sha256": pages_sha256_hex(&fs::read(root.join("source.db"))?),
+                    "export_sha256": pages_sha256_hex(&fs::read(&fixture.export_db)?),
+                    "integrity_sha256": pages_sha256_hex(&fs::read(fixture.site_dir.join("integrity.json"))?),
+                    "config_sha256": pages_sha256_hex(&fs::read(fixture.site_dir.join("config.json"))?),
+                    "conversations": [1], "messages": [1, 2, 3],
+                    "site": "bundle/site", "password": FIXTURE_PASSWORD.as_str(), "recovery_key": recovery_key,
+                    "search_query": "first", "expected_title": "selected conversation",
+                    "omitted_titles": ["omitted agent", "omitted time", "omitted workspace"]
+                });
+                use std::io::Write as _;
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(root.join("browser-proof.json"))?;
+                file.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
+                file.sync_all()?;
+                eprintln!("PAGES_BROWSER_FIXTURE={}", root.display());
+                eprintln!(
+                    "PAGES_PERF_BINARY={}",
+                    env!("CARGO_BIN_EXE_cass-pages-perf-bundle")
+                );
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn pages_encrypted_payload_and_metadata_are_authenticated() -> Result<()> {
+        pages_proof("authenticated_payload_metadata", |log| {
+            let temp = TempDir::new()?;
+            let fixture = build_pages_fixture_bundle(temp.path())?;
+            let config = load_config(&fixture.site_dir)?;
+            let decrypted = temp.path().join("decrypted.db");
+            DecryptionEngine::unlock_with_password(config.clone(), FIXTURE_PASSWORD.as_str())?
+                .decrypt_to_file(&fixture.site_dir, &decrypted, |_, _| {})?;
+            assert_eq!(fs::read(&decrypted)?, fs::read(&fixture.export_db)?);
+            let integrity: IntegrityManifest =
+                serde_json::from_slice(&fs::read(fixture.site_dir.join("integrity.json"))?)?;
+            let chunk = fixture.site_dir.join("payload/chunk-00000.bin");
+            let bytes = fs::read(&chunk)?;
+            let entry = integrity
+                .files
+                .get("payload/chunk-00000.bin")
+                .ok_or_else(|| anyhow!("payload missing from integrity manifest"))?;
+            assert_eq!(entry.size, bytes.len() as u64);
+            assert_eq!(entry.sha256, pages_sha256_hex(&bytes));
+            let mut flipped = bytes.clone();
+            let first = flipped
+                .first_mut()
+                .ok_or_else(|| anyhow!("empty ciphertext"))?;
+            *first ^= 0xff;
+            fs::write(&chunk, &flipped)?;
+            let rejected = temp.path().join("rejected.db");
+            DecryptionEngine::unlock_with_password(config.clone(), FIXTURE_PASSWORD.as_str())?
+                .decrypt_to_file(&fixture.site_dir, &rejected, |_, _| {})
+                .expect_err("tampered AEAD payload must be refused");
+            assert!(!rejected.exists());
+            fs::write(&chunk, &bytes)?;
+            let mut tampered_key = config.clone();
+            let slot = tampered_key
+                .key_slots
+                .first_mut()
+                .ok_or_else(|| anyhow!("missing key slot"))?;
+            let first = slot
+                .wrapped_dek
+                .chars()
+                .next()
+                .ok_or_else(|| anyhow!("empty wrapped key"))?;
+            slot.wrapped_dek
+                .replace_range(..first.len_utf8(), if first == 'A' { "B" } else { "A" });
+            let error =
+                DecryptionEngine::unlock_with_password(tampered_key, FIXTURE_PASSWORD.as_str())
+                    .err()
+                    .ok_or_else(|| anyhow!("tampered wrapped key unlocked"))?;
+            assert!(error.to_string().contains("incorrect"));
+            let mut tampered_meta = config;
+            tampered_meta.payload.chunk_size = 0;
+            assert!(
+                DecryptionEngine::unlock_with_password(tampered_meta, FIXTURE_PASSWORD.as_str())
+                    .is_err()
+            );
+            log.metrics(
+                "tampering_refused",
+                &E2ePerformanceMetrics::new()
+                    .with_custom("negative_cases", 3)
+                    .with_custom("plaintext_outputs", 0),
+            )?;
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn pages_wrong_credentials_are_refused_without_plaintext() -> Result<()> {
+        pages_proof("wrong_credentials", |log| {
+            let temp = TempDir::new()?;
+            let fixture = build_pages_fixture_bundle(temp.path())?;
+            let config = load_config(&fixture.site_dir)?;
+            let error = DecryptionEngine::unlock_with_password(config.clone(), "not the password")
+                .err()
+                .ok_or_else(|| anyhow!("wrong password unlocked"))?;
+            assert!(error.to_string().contains("incorrect"));
+            assert!(DecryptionEngine::unlock_with_recovery(config, &[0x41; 32]).is_err());
+            assert_published_payload_is_ciphertext(&fixture.site_dir)?;
+            log.metrics(
+                "credentials_refused",
+                &E2ePerformanceMetrics::new().with_custom("negative_cases", 2),
+            )?;
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn pages_rotated_archive_unlocks_only_with_the_rotated_secret() -> Result<()> {
+        pages_proof("key_rotation", |log| {
+            let temp = TempDir::new()?;
+            let fixture = build_pages_fixture_bundle(temp.path())?;
+            let rotated = key_management::key_rotate(
+                &fixture.bundle_dir,
+                FIXTURE_PASSWORD.as_str(),
+                ROTATED_PASSWORD.as_str(),
+                true,
+                |_| {},
+            )?;
+            let recovery = RecoverySecret::from_encoded(
+                &rotated
+                    .recovery_secret
+                    .ok_or_else(|| anyhow!("rotation omitted recovery"))?,
+            )?;
+            let config = load_config(&fixture.site_dir)?;
+            assert!(
+                DecryptionEngine::unlock_with_password(config.clone(), FIXTURE_PASSWORD.as_str())
+                    .is_err()
+            );
+            assert!(
+                DecryptionEngine::unlock_with_recovery(config.clone(), fixture.recovery.as_bytes())
+                    .is_err()
+            );
+            let by_password = temp.path().join("rotated-password.db");
+            DecryptionEngine::unlock_with_password(config.clone(), ROTATED_PASSWORD.as_str())?
+                .decrypt_to_file(&fixture.site_dir, &by_password, |_, _| {})?;
+            let by_recovery = temp.path().join("rotated-recovery.db");
+            DecryptionEngine::unlock_with_recovery(config, recovery.as_bytes())?.decrypt_to_file(
+                &fixture.site_dir,
+                &by_recovery,
+                |_, _| {},
+            )?;
+            assert_eq!(fs::read(by_password)?, fs::read(&fixture.export_db)?);
+            assert_eq!(fs::read(by_recovery)?, fs::read(&fixture.export_db)?);
+            log.metrics(
+                "rotation",
+                &E2ePerformanceMetrics::new()
+                    .with_custom("old_credentials_refused", 2)
+                    .with_custom("new_credentials_decrypted", 2),
+            )?;
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn pages_revoked_key_slot_is_never_reused() -> Result<()> {
+        pages_proof("key_revocation", |log| {
+            let temp = TempDir::new()?;
+            let fixture = build_pages_fixture_bundle(temp.path())?;
+            let config = load_config(&fixture.site_dir)?;
+            let slot = config
+                .key_slots
+                .iter()
+                .find(|slot| slot.slot_type == SlotType::Recovery)
+                .ok_or_else(|| anyhow!("missing recovery slot"))?
+                .id;
+            assert_eq!(
+                key_management::key_revoke(&fixture.bundle_dir, FIXTURE_PASSWORD.as_str(), slot)?
+                    .revoked_slot_id,
+                slot
+            );
+            let config = load_config(&fixture.site_dir)?;
+            assert!(config.key_slots.iter().all(|entry| entry.id != slot));
+            assert!(
+                DecryptionEngine::unlock_with_recovery(config, fixture.recovery.as_bytes())
+                    .is_err()
+            );
+            let added = key_management::key_add_password(
+                &fixture.bundle_dir,
+                FIXTURE_PASSWORD.as_str(),
+                "another fixture password",
+            )?;
+            assert!(added > slot, "revoked slot identity must not be reused");
+            log.metrics(
+                "revocation",
+                &E2ePerformanceMetrics::new()
+                    .with_custom("revoked_slot", slot)
+                    .with_custom("added_slot", added),
+            )?;
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn pages_publication_refuses_a_concurrent_publisher() -> Result<()> {
+        pages_proof("publication_contention", |log| {
+            let temp = TempDir::new()?;
+            let source = temp.path().join("source.db");
+            plant_pages_privacy_source(&source, 0)?;
+            let output = temp.path().join("export.db");
+            let lock_path =
+                fs::canonicalize(temp.path())?.join(".export.db.pages-export-publish.lock");
+            let lock = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(lock_path)?;
+            lock.try_lock()
+                .map_err(|error| anyhow!("fixture lock failed: {error}"))?;
+            let error = ExportEngine::new(&source, &output, pages_privacy_filter())
+                .execute(|_, _| {}, None)
+                .err()
+                .ok_or_else(|| anyhow!("concurrent publisher was not refused"))?;
+            assert!(
+                error
+                    .to_string()
+                    .contains("another Pages export is already publishing")
+            );
+            assert!(!output.exists());
+            drop(lock);
+            let stats = ExportEngine::new(&source, &output, pages_privacy_filter())
+                .execute(|_, _| {}, None)?;
+            assert_eq!(stats.conversations_processed, 1);
+            log.metrics(
+                "arbitration",
+                &E2ePerformanceMetrics::new()
+                    .with_custom("contenders_refused", 1)
+                    .with_custom("published_after_release", 1),
+            )?;
+            Ok(())
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pages_publication_refuses_alias_destinations() -> Result<()> {
+        pages_proof("publication_aliases", |log| {
+            let temp = TempDir::new()?;
+            let source = temp.path().join("source.db");
+            plant_pages_privacy_source(&source, 0)?;
+            let original = fs::read(&source)?;
+            let symlink = temp.path().join("symlink.db");
+            std::os::unix::fs::symlink(&source, &symlink)?;
+            let error = ExportEngine::new(&source, &symlink, pages_privacy_filter())
+                .execute(|_, _| {}, None)
+                .err()
+                .ok_or_else(|| anyhow!("source symlink alias was accepted"))?;
+            assert!(
+                error
+                    .to_string()
+                    .contains("output path must be different from source database path")
+            );
+            let hardlink = temp.path().join("hardlink.db");
+            fs::hard_link(&source, &hardlink)?;
+            let error = ExportEngine::new(&source, &hardlink, pages_privacy_filter())
+                .execute(|_, _| {}, None)
+                .err()
+                .ok_or_else(|| anyhow!("source hardlink alias was accepted"))?;
+            assert!(
+                error
+                    .to_string()
+                    .contains("same filesystem object as the source database")
+            );
+            let outside = temp.path().join("outside.db");
+            fs::write(&outside, b"outside sentinel")?;
+            let link = temp.path().join("outside-link.db");
+            std::os::unix::fs::symlink(&outside, &link)?;
+            let result =
+                ExportEngine::new(&source, &link, pages_privacy_filter()).execute(|_, _| {}, None);
+            assert_eq!(fs::read(&outside)?, b"outside sentinel");
+            if result.is_ok() {
+                assert!(fs::symlink_metadata(link)?.is_file());
+            }
+            assert_eq!(fs::read(source)?, original);
+            log.metrics(
+                "aliases",
+                &E2ePerformanceMetrics::new()
+                    .with_custom("source_aliases_refused", 2)
+                    .with_custom("outside_mutations", 0),
+            )?;
+            Ok(())
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pages_publication_fails_closed_when_the_destination_is_full() -> Result<()> {
+        pages_proof("publication_enospc", |log| {
+            const CHILD: &str = "CASS_TEST_PAGES_ENOSPC_CHILD";
+            if !matches!(dotenvy::var(CHILD).as_deref(), Ok("1")) {
+                // The mount belongs only to this child namespace. Missing
+                // user namespaces is a failed prerequisite, never a pass.
+                let output = Command::new("unshare")
+                    .args([
+                        "--user",
+                        "--map-root-user",
+                        "--mount",
+                        "--propagation",
+                        "private",
+                    ])
+                    .arg(std::env::current_exe()?)
+                    .args([
+                        "--exact",
+                        "tests::pages_publication_fails_closed_when_the_destination_is_full",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .output()?;
+                assert!(
+                    output.status.success(),
+                    "isolated ENOSPC proof failed\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stdout).contains("PAGES_ENOSPC_VERIFIED=1"),
+                    "a zero-test child cannot prove disk-full refusal"
+                );
+                log.metrics(
+                    "enospc_child",
+                    &E2ePerformanceMetrics::new().with_custom("verified_children", 1),
+                )?;
+                return Ok(());
+            }
+            let temp = TempDir::new()?;
+            let source = temp.path().join("source.db");
+            plant_pages_privacy_source(&source, 4 * 1024 * 1024)?;
+            let original = fs::read(&source)?;
+            let capped = temp.path().join("capped");
+            fs::create_dir(&capped)?;
+            let mount = Command::new("mount")
+                .args(["-t", "tmpfs", "-o", "size=1M", "tmpfs"])
+                .arg(&capped)
+                .output()?;
+            assert!(
+                mount.status.success(),
+                "private tmpfs mount failed: {}",
+                String::from_utf8_lossy(&mount.stderr)
+            );
+            let destination = capped.join("export.db");
+            let result = ExportEngine::new(&source, &destination, pages_privacy_filter())
+                .execute(|_, _| {}, None);
+            let absent = !destination.exists();
+            let unchanged = fs::read(&source)? == original;
+            let unmount = Command::new("umount").arg(&capped).output()?;
+            assert!(
+                unmount.status.success(),
+                "private tmpfs unmount failed: {}",
+                String::from_utf8_lossy(&unmount.stderr)
+            );
+            let error = result
+                .err()
+                .ok_or_else(|| anyhow!("full destination unexpectedly published"))?;
+            let rendered = format!("{error:#}").to_lowercase();
+            assert!(
+                error.chain().any(|cause| cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.raw_os_error() == Some(28)))
+                    || rendered.contains("no space left on device")
+                    || rendered.contains("database or disk is full")
+                    || rendered.contains("disk full"),
+                "failure was not disk-full: {error:#}"
+            );
+            assert!(absent, "disk-full publication left a torn destination");
+            assert!(unchanged, "disk-full publication changed the source");
+            log.metrics(
+                "enospc",
+                &E2ePerformanceMetrics::new()
+                    .with_custom("tmpfs_limit_bytes", 1024 * 1024)
+                    .with_custom("destination_published", false)
+                    .with_custom("source_changed", false),
+            )?;
+            println!("PAGES_ENOSPC_VERIFIED=1");
+            Ok(())
+        })
     }
 }

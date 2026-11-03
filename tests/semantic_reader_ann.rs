@@ -313,6 +313,101 @@ fn foreign_generation_receipts_are_rejected_without_losing_exact_search() -> Tes
 }
 
 #[test]
+fn same_count_foreign_owners_cannot_supply_a_selected_shards_graph() -> TestResult {
+    for (case, rows) in [
+        ("wrong_vectors", [(1, 0.125), (2, 0.875)]),
+        ("wrong_documents", [(91, 1.0), (92, 0.5)]),
+    ] {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let space = binding(117, QuantizationFormat::F32);
+        let selected = [
+            shard(&root, "selected.fsvi", &space, &[(1, 1.0), (2, 0.5)]),
+            shard(&root, "native.fsvi", &space, &[(3, 0.75)]),
+        ];
+        let foreign = shard(&root, "foreign.fsvi", &space, &rows);
+        assert_eq!(foreign.binding, selected[0].binding);
+        assert_eq!(
+            foreign.witness.record_count,
+            selected[0].witness.record_count
+        );
+        assert_eq!(foreign.witness.dimension, selected[0].witness.dimension);
+        assert_ne!(
+            foreign.witness.whole_image_sha256,
+            selected[0].witness.whole_image_sha256
+        );
+        if case == "wrong_vectors" {
+            assert_eq!(
+                foreign.witness.ordered_live_docset_digest,
+                selected[0].witness.ordered_live_docset_digest
+            );
+            assert_ne!(
+                foreign.witness.vector_content_digest,
+                selected[0].witness.vector_content_digest
+            );
+        } else {
+            assert_ne!(
+                foreign.witness.ordered_live_docset_digest,
+                selected[0].witness.ordered_live_docset_digest
+            );
+        }
+        let expectations = [
+            Some(graph(&foreign, &root.join("foreign.fshnsw"), 19)),
+            Some(graph(&selected[1], &root.join("native.fshnsw"), 20)),
+        ];
+        let foreign_graph = expectations[0].as_ref().unwrap();
+        let native_graph = expectations[1].as_ref().unwrap();
+        let native_sha256 = &native_graph.receipt.graph_sha256;
+        let foreign_receipt = native_hnsw_generation_receipt_path(&foreign_graph.graph_path)?;
+        let native_receipt = native_hnsw_generation_receipt_path(&native_graph.graph_path)?;
+        let paths = [
+            selected[0].path.as_path(),
+            selected[1].path.as_path(),
+            foreign.path.as_path(),
+            foreign_graph.graph_path.as_path(),
+            foreign_receipt.as_path(),
+            native_graph.graph_path.as_path(),
+            native_receipt.as_path(),
+        ];
+        let before = paths
+            .iter()
+            .map(fs::read)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let reader = SemanticGenerationReader::open(Some(&selected), None)?
+            .with_ann(Some(&expectations), None)?;
+        let queries = TieredQueryEmbeddings::fast_only(query(&space));
+        let active = reader.activate(&queries)?;
+        let exact = active.search(2, None)?;
+        let actual = active.search_with_ann(2, None, full_width())?;
+        assert_eq!(ids(&actual), [1, 3], "{case}");
+        assert_eq!(actual.hits(), exact.hits(), "{case}");
+        assert_eq!(actual.execution().len(), 2);
+        let rejected = &actual.execution()[0];
+        assert_eq!(rejected.engine, SemanticShardEngine::ExactFallback);
+        assert_eq!(
+            rejected.fallback_reason,
+            Some(AnnFallbackReason::InvalidExpectation)
+        );
+        assert_eq!(rejected.ann_windows, 0);
+        assert_eq!(rejected.candidate_rows, 0);
+        assert!(rejected.graph_sha256.is_none());
+        let admitted = &actual.execution()[1];
+        assert_eq!(admitted.engine, SemanticShardEngine::NativeAnn);
+        assert_eq!(admitted.graph_sha256.as_ref(), Some(native_sha256));
+        assert!(admitted.ann_windows > 0);
+        assert_eq!(
+            paths
+                .iter()
+                .map(fs::read)
+                .collect::<std::io::Result<Vec<_>>>()?,
+            before,
+            "search must preserve every source/graph/receipt byte: {case}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn restrictive_filters_widen_then_use_exact_at_the_candidate_cap() -> TestResult {
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;

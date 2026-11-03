@@ -4,6 +4,11 @@ import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+// A real native fixture is required for Pages acceptance. Ordinary HTML
+// setup may create placeholders, so it cannot supply this proof mode.
+const pagesProof = Boolean(process.env.CASS_PAGES_PROOF_FIXTURE);
+const pagesProfile = Boolean(process.env.CASS_PAGES_PROFILE_SITE);
+const pagesAcceptance = pagesProof || pagesProfile;
 
 /**
  * Playwright configuration for HTML export E2E tests.
@@ -15,10 +20,11 @@ export default defineConfig({
   // but are meant to be run separately or are legacy tests
   // Note: accessibility tests previously ignored are now enabled (T4.5)
   testIgnore: ["**/html_export/**", "**/performance/**"],
-  fullyParallel: true,
+  fullyParallel: !pagesAcceptance,
+  grep: pagesAcceptance ? /Pages privacy proof|Pages loading profile/ : undefined,
   forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 2 : 0,
-  workers: process.env.CI ? 1 : undefined,
+  retries: pagesAcceptance ? 0 : process.env.CI ? 2 : 0,
+  workers: pagesAcceptance || process.env.CI ? 1 : undefined,
   reporter: [
     ["list"],
     ["json", { outputFile: "e2e-results.json" }],
@@ -26,14 +32,14 @@ export default defineConfig({
     ["./e2e/reporters/jsonl-reporter.ts"],
   ],
 
-  timeout: 60000,
+  timeout: pagesAcceptance ? 180000 : 60000,
   expect: {
     timeout: 10000,
   },
 
   use: {
     baseURL: "file://",
-    trace: "on-first-retry",
+    trace: pagesAcceptance ? "on" : "on-first-retry",
     screenshot: "only-on-failure",
     video: "retain-on-failure",
     // Use domcontentloaded for faster file:// URL navigation
@@ -100,15 +106,15 @@ export default defineConfig({
     {
       name: "mobile-chrome",
       use: { ...devices["Pixel 5"] },
-      testMatch: /mobile\/.*.spec.ts/,
+      testMatch: pagesAcceptance ? /export\/pages-pipeline-e2e\.spec\.ts/ : /mobile\/.*.spec.ts/,
     },
     {
       name: "mobile-safari",
       use: { ...devices["iPhone 12"] },
-      testMatch: /mobile\/.*.spec.ts/,
+      testMatch: pagesAcceptance ? /export\/pages-pipeline-e2e\.spec\.ts/ : /mobile\/.*.spec.ts/,
     },
   ],
 
-  globalSetup: path.join(__dirname, "e2e/setup/global-setup.ts"),
-  globalTeardown: path.join(__dirname, "e2e/setup/global-teardown.ts"),
+  globalSetup: pagesAcceptance ? undefined : path.join(__dirname, "e2e/setup/global-setup.ts"),
+  globalTeardown: pagesAcceptance ? undefined : path.join(__dirname, "e2e/setup/global-teardown.ts"),
 });

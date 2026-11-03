@@ -774,7 +774,13 @@ fn robot_models_backfill_keeps_archive_and_assets_scoped_to_path_overrides() -> 
             &sample_conversation("ambient", "this archive was not selected"),
         )?;
     }
-    let ambient_before = fs::read(&ambient_db)?;
+    assert_eq!(
+        run_robot_backfill(&ambient, &ambient_db)?["status"],
+        "published"
+    );
+    let ambient_before = canonical_bundle_snapshot(&ambient_db)?;
+    let ambient_vectors_before = vector_files_snapshot(&ambient)?;
+    assert!(!ambient_vectors_before.is_empty());
 
     for (name, explicit_data_dir, explicit_db) in [
         ("data-dir-only", true, false),
@@ -790,34 +796,43 @@ fn robot_models_backfill_keeps_archive_and_assets_scoped_to_path_overrides() -> 
         };
         let db_parent = db_path.parent().ok_or("fixture DB needs a parent")?;
         fs::create_dir_all(db_parent)?;
-        seed_canonical_db(&db_path)?;
+        let expected_docs = seed_distinct_backfill_db(
+            &db_path,
+            [
+                "selected first override document",
+                "selected second override document",
+            ],
+        )?;
         let expected_assets = if explicit_data_dir {
             data_dir.as_path()
         } else {
             db_parent
         };
 
-        let mut command = cargo_bin_cmd!("cass");
-        command.args([
-            "models",
-            "backfill",
-            "--tier",
-            "fast",
-            "--embedder",
-            "hash",
-            "--json",
-        ]);
-        if explicit_data_dir {
-            command.arg("--data-dir").arg(&data_dir);
-        }
-        if explicit_db {
-            command.arg("--db").arg(&db_path);
-        }
-        let output = command
-            .env("CASS_DATA_DIR", &ambient)
-            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-            .timeout(Duration::from_secs(20))
-            .output()?;
+        let command_for = |assets: &Path, archive: &Path| {
+            let mut command = cargo_bin_cmd!("cass");
+            command.args([
+                "models",
+                "backfill",
+                "--tier",
+                "fast",
+                "--embedder",
+                "hash",
+                "--json",
+            ]);
+            if explicit_data_dir {
+                command.arg("--data-dir").arg(assets);
+            }
+            if explicit_db {
+                command.arg("--db").arg(archive);
+            }
+            command
+                .env("CASS_DATA_DIR", &ambient)
+                .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+                .timeout(Duration::from_secs(20));
+            command
+        };
+        let output = command_for(&data_dir, &db_path).output()?;
         assert!(
             output.status.success(),
             "{name}: stdout={} stderr={}",
@@ -828,6 +843,8 @@ fn robot_models_backfill_keeps_archive_and_assets_scoped_to_path_overrides() -> 
         assert_eq!(report["status"], "published", "{name}: {report}");
         assert_eq!(report["total_conversations"], 2, "{name}: {report}");
         assert_eq!(report["embedded_docs"], 2, "{name}: {report}");
+        assert_eq!(report["data_dir"], expected_assets.display().to_string());
+        assert_eq!(report["db_path"], db_path.display().to_string());
         let manifest = SemanticManifest::load(expected_assets)?
             .ok_or("selected data directory should contain the published manifest")?;
         assert_eq!(
@@ -838,8 +855,82 @@ fn robot_models_backfill_keeps_archive_and_assets_scoped_to_path_overrides() -> 
             Some((true, 2)),
             "{name}"
         );
-        assert!(SemanticManifest::load(&ambient)?.is_none(), "{name}");
-        assert_eq!(fs::read(&ambient_db)?, ambient_before, "{name}");
+        let mut published_docs: Vec<_> = ordered_backfill_vectors(expected_assets)?
+            .into_iter()
+            .map(|(identity, _)| identity)
+            .collect();
+        published_docs.sort_by_key(|identity| identity.message_id);
+        assert_eq!(
+            published_docs, expected_docs,
+            "{name}: published document identities must come from the selected archive"
+        );
+        if explicit_data_dir && explicit_db {
+            assert!(!data_dir.join("agent_search.db").exists(), "{name}");
+            assert!(!db_parent.join("vector_index").exists(), "{name}");
+        }
+        if !explicit_data_dir {
+            assert!(!data_dir.exists(), "{name}");
+        }
+
+        // An explicit missing archive must fail without borrowing the healthy
+        // ambient archive or changing an existing selected publication.
+        let selected_before = canonical_bundle_snapshot(&db_path)?;
+        let selected_vectors_before = vector_files_snapshot(expected_assets)?;
+        let missing_assets = root.join("missing-assets");
+        let missing_db = root.join("missing-archive").join("missing.db");
+        let missing_data_dir = if explicit_db {
+            data_dir.as_path()
+        } else {
+            missing_assets.as_path()
+        };
+        let rejected = command_for(missing_data_dir, &missing_db).output()?;
+        assert_eq!(rejected.status.code(), Some(3), "{name}: {rejected:?}");
+        let error: Value = serde_json::from_slice(&rejected.stderr)?;
+        assert_eq!(error["error"]["kind"], "missing-index", "{name}: {error}");
+        let expected_missing_db = if explicit_db {
+            missing_db.clone()
+        } else {
+            missing_assets.join("agent_search.db")
+        };
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .ok_or("missing-archive error must contain a message")?
+                .contains(
+                    expected_missing_db
+                        .to_str()
+                        .ok_or("fixture path must be UTF-8")?
+                ),
+            "{name}: {error}"
+        );
+        assert!(!missing_assets.exists(), "{name}");
+        assert!(
+            !missing_db
+                .parent()
+                .ok_or("missing DB needs a parent")?
+                .exists(),
+            "{name}"
+        );
+        assert_eq!(
+            canonical_bundle_snapshot(&db_path)?,
+            selected_before,
+            "{name}"
+        );
+        assert_eq!(
+            vector_files_snapshot(expected_assets)?,
+            selected_vectors_before,
+            "{name}"
+        );
+        assert_eq!(
+            canonical_bundle_snapshot(&ambient_db)?,
+            ambient_before,
+            "{name}"
+        );
+        assert_eq!(
+            vector_files_snapshot(&ambient)?,
+            ambient_vectors_before,
+            "{name}"
+        );
     }
     Ok(())
 }

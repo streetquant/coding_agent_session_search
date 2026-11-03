@@ -111,5 +111,8 @@ python3 -W error::ResourceWarning -m unittest discover -s scripts \
 
 Those ten tests use fake protocol workers to validate the Python harness and
 its failure handling. They are not native Quill correctness or performance
-results. Native qualification runs in `.github/workflows/lexical-admission.yml`;
-its status and artifacts must be checked separately before claiming success.
+results. Native qualification is agent-run through `rch` and `scripts/gate.sh`;
+GitHub Actions is disabled. Record the exact source and binary identities,
+positive test counts, terminal exits, and `STAGE=<name> EXIT=<code>` receipts
+before claiming qualification. A completed fixture run does not establish
+large-index performance.

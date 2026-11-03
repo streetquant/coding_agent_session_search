@@ -172,6 +172,18 @@ function cacheElements() {
 }
 
 /**
+ * Require a cached node before UI updates and report missing archive markup.
+ * @param {keyof typeof elements} name
+ */
+function requireAuthElement(name) {
+  const element = elements[name];
+  if (!element) {
+    throw new Error(`Required archive authentication element is missing: ${name}`);
+  }
+  return element;
+}
+
+/**
  * Set up event listeners (CSP-safe, no inline handlers)
  */
 function setupEventListeners() {
@@ -763,7 +775,8 @@ async function openQrScanner() {
     return;
   }
   const sessionToken = beginQrScannerSession();
-  elements.qrScanner.classList.remove("hidden");
+  const scannerPanel = requireAuthElement("qrScanner");
+  scannerPanel.classList.remove("hidden");
 
   try {
     await loadQrScannerLibrary();
@@ -814,7 +827,8 @@ async function closeQrScanner() {
   invalidateQrScannerSession();
   const scanner = qrScanner;
   qrScanner = null;
-  elements.qrScanner.classList.add("hidden");
+  const scannerPanel = requireAuthElement("qrScanner");
+  scannerPanel.classList.add("hidden");
   let teardown = finalizeQrScannerClose(scanner);
   teardown = teardown.finally(() => {
     if (qrScannerTeardownPromise === teardown) {
@@ -993,8 +1007,10 @@ async function handleWorkerError(error) {
   disableForm();
   if (hadActiveSession) {
     broadcastAuthLock("lock");
-    elements.appScreen.classList.add("hidden");
-    elements.authScreen.classList.remove("hidden");
+    const appScreen = requireAuthElement("appScreen");
+    appScreen.classList.add("hidden");
+    const authScreen = requireAuthElement("authScreen");
+    authScreen.classList.remove("hidden");
     elements.passwordInput.value = "";
   }
   showError("The decryption worker stopped unexpectedly. Reload this page to try again.");
@@ -1128,8 +1144,10 @@ function handleDecryptFailed(data) {
   } else {
     disableForm();
   }
-  elements.appScreen.classList.add("hidden");
-  elements.authScreen.classList.remove("hidden");
+  const appScreen = requireAuthElement("appScreen");
+  appScreen.classList.add("hidden");
+  const authScreen = requireAuthElement("authScreen");
+  authScreen.classList.remove("hidden");
   clearActiveSessionExpiry();
   clearStoredSession();
   window.cassSession = null;
@@ -1175,8 +1193,10 @@ async function recoverFromAppInitFailure(message, error, initToken = activeAppIn
   } else {
     disableForm();
   }
-  elements.appScreen.classList.add("hidden");
-  elements.authScreen.classList.remove("hidden");
+  const appScreen = requireAuthElement("appScreen");
+  appScreen.classList.add("hidden");
+  const authScreen = requireAuthElement("authScreen");
+  authScreen.classList.remove("hidden");
   showError(
     workerReady
       ? message
@@ -1195,8 +1215,10 @@ function transitionToApp() {
   const appInitToken = beginAppInitAttempt();
   decryptInFlight = true;
   activeDecryptRequestId = allocateWorkerRequestId();
-  elements.authScreen.classList.add("hidden");
-  elements.appScreen.classList.remove("hidden");
+  const authScreen = requireAuthElement("authScreen");
+  authScreen.classList.add("hidden");
+  const appScreen = requireAuthElement("appScreen");
+  appScreen.classList.remove("hidden");
 
   // Start decryption and database loading
   try {
@@ -1227,8 +1249,10 @@ async function transitionToAppUnencrypted() {
   hideError();
   disableForm();
 
-  elements.authScreen.classList.add("hidden");
-  elements.appScreen.classList.remove("hidden");
+  const authScreen = requireAuthElement("authScreen");
+  authScreen.classList.add("hidden");
+  const appScreen = requireAuthElement("appScreen");
+  appScreen.classList.remove("hidden");
 
   try {
     await loadViewerModule(appInitToken);
@@ -1576,8 +1600,10 @@ async function lockArchive(options = {}) {
   await closeLiveDatabase();
 
   // Return to auth screen
-  elements.appScreen.classList.add("hidden");
-  elements.authScreen.classList.remove("hidden");
+  const appScreen = requireAuthElement("appScreen");
+  appScreen.classList.add("hidden");
+  const authScreen = requireAuthElement("authScreen");
+  authScreen.classList.remove("hidden");
 
   // Reset form
   if (workerReady) {
@@ -1795,42 +1821,50 @@ async function loadViewerModule(initToken = activeAppInitToken) {
  * Show error message
  */
 function showError(message) {
-  const errorMsg = elements.authError.querySelector(".error-message");
+  const authError = requireAuthElement("authError");
+  const errorMsg = authError.querySelector(".error-message");
   if (errorMsg) {
     errorMsg.textContent = message;
   }
-  elements.authError.classList.remove("hidden");
+  authError.classList.remove("hidden");
 }
 
 /**
  * Hide error message
  */
 function hideError() {
-  elements.authError.classList.add("hidden");
+  const authError = requireAuthElement("authError");
+  authError.classList.add("hidden");
 }
 
 /**
  * Show progress indicator
  */
 function showProgress(text) {
-  elements.progressText.textContent = text;
-  elements.progressFill.style.width = "0%";
-  elements.authProgress.classList.remove("hidden");
+  const progressText = requireAuthElement("progressText");
+  progressText.textContent = text;
+  const progressFill = requireAuthElement("progressFill");
+  progressFill.style.width = "0%";
+  const authProgress = requireAuthElement("authProgress");
+  authProgress.classList.remove("hidden");
 }
 
 /**
  * Update progress indicator
  */
 function updateProgress(phase, percent) {
-  elements.progressText.textContent = phase;
-  elements.progressFill.style.width = `${percent}%`;
+  const progressText = requireAuthElement("progressText");
+  progressText.textContent = phase;
+  const progressFill = requireAuthElement("progressFill");
+  progressFill.style.width = `${percent}%`;
 }
 
 /**
  * Hide progress indicator
  */
 function hideProgress() {
-  elements.authProgress.classList.add("hidden");
+  const authProgress = requireAuthElement("authProgress");
+  authProgress.classList.add("hidden");
 }
 
 /**

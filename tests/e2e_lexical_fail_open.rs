@@ -22,6 +22,7 @@ use coding_agent_search::franken_sync::compat::{ConnectionExt, ParamValue, RowEx
 use coding_agent_search::indexer::semantic::{
     EmbeddingInput, SemanticIndexer, SemanticShardBuildPlan,
 };
+use coding_agent_search::search::query::message_anchor_for_content;
 use coding_agent_search::search::semantic_manifest::{SemanticShardManifest, TierKind};
 use coding_agent_search::storage::sqlite::FrankenStorage;
 use serde_json::Value;
@@ -1045,6 +1046,87 @@ fn run_lexical_search(home: &Path, data_dir: &Path, query: &str) -> Value {
     })
 }
 
+fn anchored_lexical_hits(home: &Path, data_dir: &Path, query: &str) -> Vec<Value> {
+    let output = cass_cmd(home)
+        .args([
+            "search",
+            query,
+            "--json",
+            "--mode",
+            "lexical",
+            "--no-maintenance",
+            "--fields",
+            "source_path,source_id,conversation_id,line_number,agent,content,message_anchor",
+            "--limit",
+            "40",
+            "--timeout",
+            "30000",
+            "--data-dir",
+        ])
+        .arg(data_dir)
+        .timeout(Duration::from_secs(40))
+        .output()
+        .expect("retrieve complete anchored search hits");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["budget"]["timed_out"], false);
+    let hits = payload["hits"].as_array().unwrap().clone();
+    assert!(!hits.is_empty(), "canonical search evidence must exist");
+    for hit in &hits {
+        let expected = message_anchor_for_content(
+            hit["source_id"].as_str().unwrap(),
+            hit["source_path"].as_str().unwrap(),
+            hit["conversation_id"].as_i64(),
+            hit["line_number"]
+                .as_u64()
+                .map(|number| usize::try_from(number).unwrap()),
+            hit["content"].as_str().unwrap(),
+        )
+        .expect("complete canonical search identity");
+        assert_eq!(hit["message_anchor"], expected);
+    }
+    hits
+}
+
+fn assert_canonical_pack_citation<'a>(item: &Value, hits: &'a [Value]) -> &'a Value {
+    let citation = &item["citation"];
+    let matches: Vec<_> = hits
+        .iter()
+        .filter(|hit| {
+            toon::JsonValue::from(citation["conversation_id"].clone())
+                == toon::JsonValue::from(hit["conversation_id"].clone())
+                && toon::JsonValue::from(citation["message_index"].clone())
+                    == toon::JsonValue::from(hit["line_number"].clone())
+        })
+        .collect();
+    assert_eq!(matches.len(), 1, "citation must name one retrieved message");
+    let hit = matches[0];
+    assert_eq!(citation["verified"], false);
+    assert!(citation["line_start"].is_null());
+    assert!(citation["line_end"].is_null());
+    assert_eq!(citation["span_hash"], citation["content_hash"]);
+    assert_eq!(citation["source_id"], hit["source_id"]);
+    assert_eq!(citation["agent"], hit["agent"]);
+    assert_eq!(citation["message_anchor"], hit["message_anchor"]);
+    assert_eq!(
+        toon::JsonValue::from(citation["message_index_base"].clone()),
+        toon::JsonValue::from(serde_json::json!(1))
+    );
+    if citation["source_path"] == hit["source_path"] {
+        assert!(citation["followup_unavailable_reason"].is_null());
+    } else {
+        assert_eq!(
+            citation["followup_unavailable_reason"],
+            "redacted-source-coordinates"
+        );
+    }
+    hit
+}
+
 #[test]
 fn no_maintenance_lexical_search_is_byte_stable_across_the_real_cli_path() {
     let tmp = TempDir::new().unwrap();
@@ -1181,7 +1263,7 @@ fn bounded_history_recipe_keeps_workspace_dates_citations_and_archive_bytes() ->
             "--robot",
             "--robot-meta",
             "--fields",
-            "minimal",
+            "minimal,message_anchor",
             "--limit",
             "5",
             "--max-tokens",
@@ -1230,6 +1312,12 @@ fn bounded_history_recipe_keeps_workspace_dates_citations_and_archive_bytes() ->
             source,
             "--message-index",
             &message_index.to_string(),
+            "--message-anchor",
+            hit["message_anchor"].as_str().unwrap(),
+            "--source",
+            hit["source_id"].as_str().unwrap(),
+            "--conversation-id",
+            &hit["conversation_id"].as_i64().unwrap().to_string(),
             "-C",
             "3",
             "--json",
@@ -1251,6 +1339,7 @@ fn bounded_history_recipe_keeps_workspace_dates_citations_and_archive_bytes() ->
     assert_eq!(viewed["coordinate_space"], "message_index");
     assert!(viewed["lines"].as_array().unwrap().iter().any(|row| {
         row["is_target"] == true
+            && row["message_anchor"] == hit["message_anchor"]
             && row["content"]
                 .as_str()
                 .is_some_and(|text| text.contains("performance regression"))
@@ -1584,6 +1673,7 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
         serde_json::to_vec(&checkpoint).unwrap(),
     )
     .unwrap();
+    let expected_hits = anchored_lexical_hits(home, &data_dir, "packreadonlyneedle");
     let before = data_tree_snapshot(&data_dir);
     let source_path = codex_home.join("sessions/2026/04/23").join(filename);
     let source = fs::read_to_string(&source_path).unwrap();
@@ -1615,34 +1705,30 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
     assert!(!evidence.is_empty(), "pack must return useful evidence");
     for item in evidence {
         let citation = &item["citation"];
+        let hit = assert_canonical_pack_citation(item, &expected_hits);
         assert_eq!(
             cited_source(home, citation["source_path"].as_str().expect("source path")),
             source_path
         );
-        let line = citation["line_start"].as_u64().expect("citation line") as usize;
-        assert!(line > 0);
-        let cited = source.lines().nth(line - 1).expect("line exists in source");
-        assert!(cited.contains("packreadonlyneedle"));
-        assert_eq!(citation["verified"], true);
-        assert_eq!(citation["line_end"], citation["line_start"]);
-        assert_eq!(
-            citation["span_hash"],
-            blake3::hash(cited.as_bytes()).to_hex().to_string()
+        assert!(
+            hit["content"]
+                .as_str()
+                .unwrap()
+                .contains("packreadonlyneedle")
         );
         // Recompute the v2 identity (#493) independently of the production
         // hasher: a domain tag, then length-prefixed text fields, then tagged
-        // optional coordinates. The line and span hash it binds are the ones
-        // checked against the source file just above.
+        // optional coordinates. Without independently archived native session
+        // provenance, physical coordinates remain null and the fallback span
+        // fingerprint is the canonical search content hash.
         let mut identity = blake3::Hasher::new();
         identity.update(b"cass.pack.evidence.v2\0");
         // Pack binds the stored source path, and prints it redacted under a
         // home directory (a Windows temp dir is under one).
-        let stored_path = native_codex_session_path(&codex_home, filename)
-            .to_string_lossy()
-            .into_owned();
+        let stored_path = hit["source_path"].as_str().unwrap();
         for field in ["source_id", "source_path", "agent", "content_hash"] {
             let text = if field == "source_path" {
-                stored_path.as_str()
+                stored_path
             } else {
                 citation[field].as_str().expect(field)
             };
@@ -1669,10 +1755,9 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
                 }
             }
         }
-        let span_hash = blake3::hash(cited.as_bytes()).to_hex().to_string();
+        let span_hash = citation["span_hash"].as_str().unwrap();
         identity.update(&(span_hash.len() as u64).to_le_bytes());
         identity.update(span_hash.as_bytes());
-        assert_eq!(citation["line_start"], line);
         assert_eq!(citation["source_id"], "local");
         let encoded = item["id"]
             .as_str()
@@ -1701,7 +1786,7 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
         assert_eq!(
             &decoded,
             identity.finalize().as_bytes(),
-            "evidence identity must bind the actual verified source span"
+            "evidence identity must bind canonical coordinates and the fallback fingerprint"
         );
         assert!(citation["message_index"].is_u64());
         assert!(
@@ -1816,7 +1901,7 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
             }
         }
     }
-    let verified_ids = evidence
+    let archived_ids = evidence
         .iter()
         .map(|item| item["id"].as_str().expect("evidence ID").to_string())
         .collect::<Vec<_>>();
@@ -1847,13 +1932,12 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
     let payload: Value = serde_json::from_slice(&output.stdout).expect("archived pack JSON");
     let evidence = payload["evidence"].as_array().expect("archived evidence");
     assert!(!evidence.is_empty());
+    assert_eq!(evidence.len(), archived_ids.len());
     for item in evidence {
-        assert_eq!(item["citation"]["verified"], false);
-        assert!(item["citation"]["line_start"].is_null());
-        assert!(item["citation"]["line_end"].is_null());
+        assert_canonical_pack_citation(item, &expected_hits);
         assert!(
-            !verified_ids.iter().any(|id| item["id"] == *id),
-            "unverified archive evidence must not reuse a verified physical-span ID"
+            archived_ids.iter().any(|id| item["id"] == *id),
+            "source loss must preserve an already canonical evidence identity"
         );
         assert!(item["citation"]["message_index"].is_u64());
         assert!(
@@ -1868,7 +1952,7 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
 }
 
 #[test]
-fn structured_pack_shortens_large_evidence_without_losing_verified_citations() {
+fn structured_pack_shortens_large_evidence_without_losing_canonical_citations() {
     use sha2::Digest as _;
 
     let tmp = TempDir::new().unwrap();
@@ -1885,6 +1969,7 @@ fn structured_pack_shortens_large_evidence_without_losing_verified_citations() {
     );
     seed_codex_session(&codex_home, filename, &body);
     run_fresh_index(home, &data_dir);
+    let expected_hits = anchored_lexical_hits(home, &data_dir, "budgetexcerptneedle");
     let source_path = codex_home.join("sessions/2026/04/23").join(filename);
     let source = fs::read_to_string(&source_path).unwrap();
     let before = data_tree_snapshot(&data_dir);
@@ -1952,7 +2037,8 @@ fn structured_pack_shortens_large_evidence_without_losing_verified_citations() {
     assert_eq!(shortened["estimated_tokens"], evidence_tokens);
     assert_eq!(shortened["selection"]["token_cost"], evidence_tokens);
     assert_eq!(packs[1]["limits"]["estimated_tokens"], evidence_tokens);
-    assert_eq!(shortened["citation"]["verified"], true);
+    let hit = assert_canonical_pack_citation(shortened, &expected_hits);
+    assert_canonical_pack_citation(full, &expected_hits);
     assert_eq!(
         shortened["citation"]["excerpt_sha256"],
         hex::encode(sha2::Sha256::digest(short_excerpt.as_bytes()))
@@ -1966,12 +2052,11 @@ fn structured_pack_shortens_large_evidence_without_losing_verified_citations() {
             assert_eq!(value, &full["citation"][field], "citation field {field}");
         }
     }
-    let line = shortened["citation"]["line_start"].as_u64().unwrap() as usize;
-    let cited = source.lines().nth(line - 1).unwrap();
-    assert!(cited.contains("budgetexcerptneedle"));
-    assert_eq!(
-        shortened["citation"]["span_hash"],
-        blake3::hash(cited.as_bytes()).to_hex().to_string()
+    assert!(
+        hit["content"]
+            .as_str()
+            .unwrap()
+            .contains("budgetexcerptneedle")
     );
     let omitted = packs[1]["omitted"]["items"].as_array().unwrap();
     assert_eq!(omitted.len(), 1);
@@ -1996,6 +2081,7 @@ fn pack_final_output_budget_bounds_all_formats_and_refuses_oversized_metadata() 
         );
     }
     run_fresh_index(home, &data_dir);
+    let expected_hits = anchored_lexical_hits(home, &data_dir, "finalbudgetneedle");
     let archive_before = data_tree_snapshot(&data_dir);
     let sources_before = data_tree_snapshot(&codex_home);
     let budget: usize = 3_600;
@@ -2091,24 +2177,7 @@ fn pack_final_output_budget_bounds_all_formats_and_refuses_oversized_metadata() 
                 reduced_formats += 1;
             }
             for item in evidence {
-                assert_eq!(item["citation"]["verified"], true);
-                let source = fs::read_to_string(cited_source(
-                    home,
-                    item["citation"]["source_path"].as_str().unwrap(),
-                ))
-                .unwrap();
-                let line_index = source
-                    .lines()
-                    .position(|line| {
-                        blake3::hash(line.as_bytes()).to_hex().as_str()
-                            == item["citation"]["span_hash"].as_str().unwrap()
-                    })
-                    .expect("citation hash must identify an original source line");
-                let line = line_index + 1;
-                assert_eq!(
-                    toon::JsonValue::from(item["citation"]["line_start"].clone()),
-                    toon::JsonValue::from(serde_json::json!(line))
-                );
+                assert_canonical_pack_citation(&item, &expected_hits);
             }
         }
         assert_eq!(archive_before, data_tree_snapshot(&data_dir));
@@ -2201,6 +2270,7 @@ fn structured_pack_retains_source_verification_after_slow_planning() {
     let content = "planningdelayneedle verified evidence after a bounded planning delay";
     util::seed_codex_session(&codex_home, "rollout-planning.jsonl", content, false);
     run_fresh_index(home, &data_dir);
+    let expected_hits = anchored_lexical_hits(home, &data_dir, "planningdelayneedle");
     let archive_before = data_tree_snapshot(&data_dir);
     let sources_before = data_tree_snapshot(&codex_home);
 
@@ -2235,29 +2305,23 @@ fn structured_pack_retains_source_verification_after_slow_planning() {
     assert_eq!(value["budget"]["timed_out"], false);
     let elapsed_ms = value["budget"]["elapsed_ms"].as_u64().unwrap();
     assert!(elapsed_ms >= 1200, "the planning delay must actually run");
-    assert!(elapsed_ms < 10000, "the request still has time to verify");
+    assert!(elapsed_ms < 10000, "the request remains within its budget");
     let evidence = value["evidence"].as_array().unwrap();
     assert_eq!(evidence.len(), 1);
     assert_eq!(evidence[0]["excerpt"], content);
     let citation = &evidence[0]["citation"];
-    assert_eq!(
-        citation["verified"], true,
-        "planning must not consume the source phase allowance: budget={} citation={citation}",
-        value["budget"]
-    );
+    // The real connector has no independently archived native session ID.
+    // The planning delay must retain complete canonical evidence without
+    // inventing physical-source verification. This is not a positive probe
+    // of the raw-source phase's separate time allowance.
+    let hit = assert_canonical_pack_citation(&evidence[0], &expected_hits);
+    assert_eq!(hit["content"], content);
     let source_path = codex_home.join("sessions/2026/04/23/rollout-planning.jsonl");
     assert_eq!(
         cited_source(home, citation["source_path"].as_str().expect("source path")),
         source_path
     );
-    assert_eq!(citation["line_start"], 2);
-    let source = fs::read_to_string(source_path).unwrap();
-    assert_eq!(
-        citation["span_hash"],
-        blake3::hash(source.lines().nth(1).unwrap().as_bytes())
-            .to_hex()
-            .as_str()
-    );
+    assert!(source_path.is_file());
 }
 
 #[test]
@@ -2290,6 +2354,7 @@ fn pack_excludes_skill_payloads_without_losing_ordinary_evidence() {
         );
     }
     run_fresh_index(home, &data_dir);
+    let expected_hits = anchored_lexical_hits(home, &data_dir, "skillprivacyneedle");
     let archive_before = data_tree_snapshot(&data_dir);
     let sources_before = data_tree_snapshot(&codex_home);
 
@@ -2362,22 +2427,8 @@ fn pack_excludes_skill_payloads_without_losing_ordinary_evidence() {
             };
             assert_eq!(evidence.len(), 1, "{format}");
             assert_eq!(evidence[0]["excerpt"], ordinary);
-            let citation = &evidence[0]["citation"];
-            assert_eq!(citation["verified"], true);
-            let source = fs::read_to_string(cited_source(
-                home,
-                citation["source_path"].as_str().unwrap(),
-            ))
-            .unwrap();
-            let line = source.lines().nth(1).unwrap();
-            assert_eq!(
-                citation["span_hash"],
-                blake3::hash(line.as_bytes()).to_hex().as_str()
-            );
-            assert_eq!(
-                toon::JsonValue::from(citation["line_start"].clone()),
-                toon::JsonValue::from(serde_json::json!(2))
-            );
+            let hit = assert_canonical_pack_citation(&evidence[0], &expected_hits);
+            assert_eq!(hit["content"], ordinary);
             let omitted = omitted["items"].as_array().unwrap();
             assert_eq!(omitted.len(), 5, "{format}");
             for item in omitted {
@@ -2446,19 +2497,7 @@ fn pack_excludes_skill_payloads_without_losing_ordinary_evidence() {
             assert_eq!(value["privacy"]["redaction_policy"], "strict");
             assert!(value["omitted"]["items"].as_array().unwrap().is_empty());
             for item in evidence {
-                let citation = &item["citation"];
-                assert_eq!(citation["verified"], true, "opt-in {format}");
-                let source = fs::read_to_string(cited_source(
-                    home,
-                    citation["source_path"].as_str().unwrap(),
-                ))
-                .unwrap();
-                assert_eq!(
-                    citation["span_hash"],
-                    blake3::hash(source.lines().nth(1).unwrap().as_bytes())
-                        .to_hex()
-                        .as_str()
-                );
+                assert_canonical_pack_citation(item, &expected_hits);
             }
         }
         assert_eq!(archive_before, data_tree_snapshot(&data_dir));
@@ -2551,6 +2590,7 @@ fn markdown_pack_preserves_json_excerpts_without_interpreting_source_markup() {
         false,
     );
     run_fresh_index(home, &data_dir);
+    let expected_hits = anchored_lexical_hits(home, &data_dir, "markdownpackneedle");
     let archive_before = data_tree_snapshot(&data_dir);
     let sources_before = data_tree_snapshot(&codex_home);
 
@@ -2597,9 +2637,10 @@ fn markdown_pack_preserves_json_excerpts_without_interpreting_source_markup() {
             "both real source records must be selected"
         );
         let mut expected = Vec::new();
-        let mut safe_record_verified = false;
+        let mut safe_record_selected = false;
         let mut secret_record_selected = false;
         for item in evidence {
+            assert_canonical_pack_citation(item, &expected_hits);
             let excerpt = item["excerpt"].as_str().expect("JSON excerpt");
             expected.push(if excerpt.ends_with('\n') {
                 excerpt.to_string()
@@ -2617,9 +2658,7 @@ fn markdown_pack_preserves_json_excerpts_without_interpreting_source_markup() {
             if source.file_name().and_then(|name| name.to_str())
                 == Some("rollout-markdown-safe.jsonl")
             {
-                assert_eq!(item["citation"]["verified"], true);
-                assert_eq!(item["citation"]["line_start"], 2);
-                safe_record_verified = true;
+                safe_record_selected = true;
             } else if source.file_name().and_then(|name| name.to_str())
                 == Some("rollout-markdown-secret.jsonl")
             {
@@ -2634,8 +2673,8 @@ fn markdown_pack_preserves_json_excerpts_without_interpreting_source_markup() {
             }
         }
         assert!(
-            safe_record_verified,
-            "the verifiable source must be selected"
+            safe_record_selected,
+            "the source without credentials must be selected"
         );
         assert!(
             secret_record_selected,

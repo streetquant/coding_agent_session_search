@@ -1,6 +1,6 @@
 # Robot Mode Guide (cass)
 
-Updated: 2026-09-24
+Updated: 2026-10-24
 
 ## TL;DR (copy/paste)
 - First command: `cass triage --json` (follow `next_command` when present)
@@ -15,11 +15,13 @@ Updated: 2026-09-24
 - Default search: hybrid-preferred. Lexical is required; semantic refinement joins when ready.
 - Paginate: use `_meta.next_cursor` → `cass search "query" --robot --cursor <value>`
 - Budget tokens: `--max-tokens 200 --robot-meta`
-- Minimal fields: `--fields minimal` (path,line,agent)
+- Minimal fields: `--fields minimal` (source_path,line_number,agent,source_id,conversation_id)
+- Exact hit followup: request `--fields minimal,message_anchor`, then copy all coordinates and the token unchanged
 - Freshness and fallback hints: `--robot-meta` (adds search mode, semantic refinement, lexical fallback reason, index freshness, the effective interpretation of the request, and warnings)
 - Timeouts: an expired search or pack exits 0 with `hits: []` and `budget.timed_out: true`; always read `budget` before treating an empty result as "no matches"
 - Busy index: exit 7 (`err.kind="index-busy"`) is retryable; cass rebuilds missing or unusable indexes in a detached background process, never inside your search
-- View source: `cass view <path> -n <line> --json`
+- View raw source: `cass view <path> --line <physical_line> --json`
+- View indexed hit: `cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --message-anchor <message_anchor> --json`
 - Health: `cass health --json` or `cass state --json`
 - Incident mining: `cass analytics incidents --limit 10 --json`
 
@@ -51,6 +53,31 @@ Updated: 2026-09-24
 ## Response shapes (robot)
 `cass introspect --json` (`response_schemas`) is the authoritative, golden-pinned
 schema for every shape below; the lists name the fields agents branch on.
+
+### Exact message followups
+
+Search's `line_number` names a one-based canonical message, not a physical file
+line. Use `--message-index` for that ordinal in both `view` and `expand`.
+Requesting `message_anchor` hydrates the complete archived body before display
+truncation; copy its source/path/conversation/ordinal tuple and token together.
+An explicitly requested unavailable token is null; default output omits it.
+
+An old token whose full identity changed fails with `stale-message-anchor`;
+malformed tokens fail with `invalid-message-anchor`. Targeted `--message-index`
+requests require a token; unanchored targeted lookups are refused. Non-target
+archive browsing remains available. Missing or rewritten raw files do not replace
+canonical archived evidence. `--line` always reads physical source lines.
+
+Pack citations retain the full-body token even for shortened excerpts. Physical
+`verified=true` additionally requires independent archived session identity and a
+matching raw record. Otherwise physical coordinates are null and `verified=false`,
+while the token still verifies canonical archived content. Privacy
+redaction can change a displayed path or source label; those citations report
+`followup_unavailable_reason="redacted-source-coordinates"`. Follow them using
+the original search coordinates and the citation's token, not the redacted
+display coordinates.
+
+### Payload fields
 
 - Search:
   - top-level: `query, limit, offset, count, total_matches, hits, max_tokens, request_id, cursor, hits_clamped, budget{elapsed_ms,budget_ms,timed_out,skipped_sections,recommended_next_probe}`
@@ -202,6 +229,7 @@ cass search "panic" --robot --fields minimal --robot-meta \
 - JSON parsing errors → use `--robot-format compact` to avoid pretty whitespace issues
 
 ## Change log (robot-facing)
+- 2026-10-24: Targeted canonical `view`/`expand --message-index` requires the complete-content `--message-anchor`; raw coordinates remain separate, and privacy-redacted pack coordinates report unavailable direct followups.
 - 2026-09-25: `_meta.effective.daemon`; robot searches configure semantics once, inside their budget, and never spawn the daemon.
 - 2026-09-24: Documented `_meta.effective`, the search `budget` envelope and timeout contract, `index-busy` and background rebuild handoffs, `auto_refresh` outcomes, `lexical_degrade_reason`, and the `sessions`/`toon` robot formats.
 - 2026-04-22: Documented hybrid-default search, lexical self-heal expectations, semantic fail-open metadata, and health/status readiness contract.

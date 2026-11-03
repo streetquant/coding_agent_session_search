@@ -1,4 +1,5 @@
-//! GH518: real Quill refusal -> explicitly opted-in, supervised SQLite recovery.
+//! GH518: ordinary CLI queries on a fragmented index, plus explicitly opted-in
+//! supervised SQLite recovery after a real Quill refusal.
 //! No environment mutation in the test process: fuel belongs to each child.
 
 use std::io::Write;
@@ -13,6 +14,7 @@ use coding_agent_search::search::tantivy::{TantivyIndex, expected_index_dir};
 use coding_agent_search::storage::sqlite::FrankenStorage;
 use frankensearch::quill::cass::CassDocument;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use wait_timeout::ChildExt;
 
 struct Child(std::process::Child);
@@ -159,6 +161,283 @@ fn fixture(root: &Path) -> Result<(PathBuf, PathBuf, Vec<i64>)> {
     drop(writer);
     drop(storage);
     Ok((index, archive, identities))
+}
+
+const FRAGMENTED_SEGMENTS: usize = 206;
+const DOCS_PER_SEGMENT: usize = 16;
+
+fn binary_sha256(path: &Path) -> Result<String> {
+    use std::fmt::Write as _;
+    use std::io::Read;
+    let mut binary = std::fs::File::open(path).context("opening selected CLI binary")?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = binary.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    let mut sha256 = String::with_capacity(64);
+    for byte in digest.finalize() {
+        write!(&mut sha256, "{byte:02x}")?;
+    }
+    Ok(sha256)
+}
+
+fn selected_cli_binary() -> Result<(PathBuf, String)> {
+    let optional_env = |name: &str| match dotenvy::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(dotenvy::Error::EnvVar(std::env::VarError::NotPresent)) => Ok(None),
+        Err(error) => Err(anyhow::anyhow!("invalid {name}: {error}")),
+    };
+    let override_path = optional_env("CASS_TEST_CANDIDATE_BIN")?;
+    let expected = optional_env("CASS_TEST_CANDIDATE_SHA256")?;
+    ensure!(
+        override_path.is_some() || expected.is_none(),
+        "CASS_TEST_CANDIDATE_SHA256 requires CASS_TEST_CANDIDATE_BIN"
+    );
+    let path = PathBuf::from(
+        override_path
+            .as_deref()
+            .unwrap_or(env!("CARGO_BIN_EXE_cass")),
+    );
+    ensure!(
+        path.is_file(),
+        "selected CLI binary is not a file: {}",
+        path.display()
+    );
+    let path = path
+        .canonicalize()
+        .context("resolving selected CLI binary")?;
+    let sha256 = binary_sha256(&path)?;
+    if override_path.is_some() {
+        let expected =
+            expected.context("candidate override requires CASS_TEST_CANDIDATE_SHA256")?;
+        ensure!(
+            expected.len() == 64 && expected.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "CASS_TEST_CANDIDATE_SHA256 must contain 64 hexadecimal digits"
+        );
+        ensure!(
+            sha256 == expected.to_ascii_lowercase(),
+            "selected candidate SHA256 mismatch"
+        );
+    }
+    eprintln!(
+        "GH518_BINARY SHA256={sha256} OVERRIDE={} PATH={}",
+        override_path.is_some(),
+        path.display()
+    );
+    Ok((path, sha256))
+}
+
+fn fragmented_index(root: &Path) -> Result<PathBuf> {
+    let index = expected_index_dir(root);
+    let append = |writer: &mut TantivyIndex, segment: usize| -> Result<()> {
+        let documents: Vec<_> = (0..DOCS_PER_SEGMENT)
+            .map(|within_segment| {
+                let ordinal = segment * DOCS_PER_SEGMENT + within_segment;
+                document(
+                    ordinal as i64 + 1,
+                    ordinal,
+                    &format!("git fixture test isolation segment{segment} item{within_segment}"),
+                )
+            })
+            .collect();
+        writer.add_prebuilt_documents_slice(&documents)?;
+        writer.commit()?;
+        Ok(())
+    };
+    let mut writer = TantivyIndex::open_or_create(&index)?;
+    for segment in 0..FRAGMENTED_SEGMENTS / 2 {
+        append(&mut writer, segment)?;
+    }
+    drop(writer);
+    // Reopening writers reserves sparse document-ID ranges. Exercise those
+    // separately from continuous commits without assuming the reporter's layout.
+    for segment in FRAGMENTED_SEGMENTS / 2..FRAGMENTED_SEGMENTS {
+        let mut writer = TantivyIndex::open_or_create(&index)?;
+        append(&mut writer, segment)?;
+    }
+    assert_eq!(
+        live_segment_count(&index),
+        Some(FRAGMENTED_SEGMENTS),
+        "fixture must retain its actual live fragmentation"
+    );
+    Ok(index)
+}
+
+fn ordinary_search(
+    binary: &Path,
+    root: &Path,
+    query: &str,
+    fuel: Option<u64>,
+    timeout_ms: u64,
+    robot: bool,
+) -> assert_cmd::Command {
+    // ubs:ignore[rust.security.command-executable] -- Test-only Cargo executable or explicit SHA256-checked release candidate; archive and query inputs never select this path.
+    let mut command = assert_cmd::Command::new(binary);
+    command
+        .current_dir(root)
+        .env("HOME", root)
+        .env("XDG_DATA_HOME", root.join(".local/share"))
+        .env("XDG_CONFIG_HOME", root.join(".config"))
+        .env("XDG_CACHE_HOME", root.join(".cache"))
+        .env("CODEX_HOME", root.join(".codex"))
+        .env("CASS_DATA_DIR", root)
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env_remove("CASS_QUILL_QUERY_FUEL_BUDGET")
+        .env_remove("CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS")
+        .env_remove("CASS_DB_PATH")
+        .env_remove("CASS_OUTPUT_FORMAT")
+        .env_remove("TOON_DEFAULT_FORMAT")
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", "error")
+        .args([
+            "search",
+            query,
+            "--mode",
+            "lexical",
+            "--limit",
+            "1",
+            "--no-daemon",
+        ])
+        .arg("--timeout")
+        .arg(timeout_ms.to_string())
+        // A deadline here fails the test; it cannot become a successful empty
+        // search response through the CLI's optional request timeout.
+        .timeout(Duration::from_secs(40));
+    if let Some(fuel) = fuel {
+        command.env("CASS_QUILL_QUERY_FUEL_BUDGET", fuel.to_string());
+    }
+    if robot {
+        command.args(["--robot", "--robot-meta"]);
+    }
+    command
+}
+
+#[test]
+fn gh518_ordinary_cli_answers_both_queries_and_no_match_on_206_sparse_segments() -> Result<()> {
+    // A supplied release candidate must match its attested identity. Invalid
+    // overrides fail before fixture creation and never fall back to Cargo's ELF.
+    let (binary, initial_sha256) = selected_cli_binary()?;
+    let temp = tempfile::tempdir()?;
+    // Keep dotenvy from loading configuration outside this disposable fixture.
+    std::fs::write(temp.path().join(".env"), b"")?;
+    let index = fragmented_index(temp.path())?;
+    let mut first_identity = None;
+    for query in ["git fixture", "test isolation", "zzz qqq", "git fixture"] {
+        let started = std::time::Instant::now();
+        let output = ordinary_search(&binary, temp.path(), query, None, 0, true)
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let payload: Value = serde_json::from_slice(&output.stdout)?;
+        let hits = payload["hits"].as_array().context("ordinary CLI hits")?;
+        assert_eq!(hits.len(), usize::from(query != "zzz qqq"), "{payload}");
+        assert_eq!(payload["_meta"]["search_mode"], "lexical", "{payload}");
+        assert_ne!(payload["budget"]["timed_out"], true, "{payload}");
+        assert_eq!(payload["_meta"]["wildcard_fallback"], false, "{payload}");
+        assert!(
+            payload["_meta"]["lexical_degrade_reason"].is_null(),
+            "{payload}"
+        );
+        if query == "git fixture" {
+            let identity = hits[0]["source_path"]
+                .as_str()
+                .context("ordinary CLI result source identity")?;
+            assert!(identity.starts_with("/history/gh518/"), "{payload}");
+            if let Some(first) = &first_identity {
+                assert_eq!(identity, first, "a later request must preserve identity");
+            } else {
+                first_identity = Some(identity.to_string());
+            }
+        }
+        eprintln!(
+            "GH518 ordinary CLI: segments={FRAGMENTED_SEGMENTS} documents={} query={query:?} wall_ms={} hits={}",
+            FRAGMENTED_SEGMENTS * DOCS_PER_SEGMENT,
+            started.elapsed().as_millis(),
+            hits.len()
+        );
+    }
+    assert_eq!(live_segment_count(&index), Some(FRAGMENTED_SEGMENTS));
+
+    // The same ordinary CLI must retain the actionable error when even its
+    // required primary lookup is refused. This is distinct from an optional
+    // wildcard retry, which may return the already successful exact page.
+    let explicit_archive = temp.path().join("explicit archive.db");
+    for (timeout_ms, archive) in [
+        (0, None),
+        (120_000, None),
+        (0, Some(explicit_archive.as_path())),
+    ] {
+        let mut command = ordinary_search(
+            &binary,
+            temp.path(),
+            "git fixture",
+            Some(1),
+            timeout_ms,
+            true,
+        );
+        if let Some(archive) = archive {
+            command.arg("--db").arg(archive);
+        }
+        let output = command.assert().failure().get_output().clone();
+        assert_eq!(output.status.code(), Some(9));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let envelope: Value = serde_json::from_str(
+            stderr
+                .lines()
+                .rfind(|line| !line.trim().is_empty())
+                .context("robot fuel-refusal envelope")?,
+        )?;
+        assert_eq!(envelope["error"]["kind"], "search", "{envelope}");
+        let message = envelope["error"]["message"]
+            .as_str()
+            .context("fuel refusal message")?;
+        assert!(message.contains("query fuel exhausted"), "{envelope}");
+        let hint = envelope["error"]["hint"]
+            .as_str()
+            .context("fuel refusal recovery hint")?;
+        assert!(hint.contains("index --full --json"), "{envelope}");
+        assert!(
+            hint.contains(&temp.path().display().to_string()),
+            "{envelope}"
+        );
+        if let Some(archive) = archive {
+            assert!(hint.contains("cass --db"), "{envelope}");
+            assert!(hint.contains(&archive.display().to_string()), "{envelope}");
+        }
+    }
+    let output = ordinary_search(&binary, temp.path(), "git fixture", Some(1), 0, false)
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert_eq!(output.status.code(), Some(9));
+    let failure = String::from_utf8_lossy(&output.stderr);
+    assert!(failure.contains("query fuel exhausted"), "{failure}");
+    assert!(failure.contains("cass index --full"), "{failure}");
+    assert!(
+        failure.lines().any(|line| line.starts_with("Hint: ")),
+        "{failure}"
+    );
+    assert!(
+        failure.contains(&temp.path().display().to_string()),
+        "{failure}"
+    );
+    let final_sha256 = binary_sha256(&binary)?;
+    assert_eq!(
+        final_sha256, initial_sha256,
+        "selected CLI binary changed during acceptance"
+    );
+    eprintln!("GH518_BINARY_AFTER SHA256={final_sha256}");
+    Ok(())
 }
 
 #[test]

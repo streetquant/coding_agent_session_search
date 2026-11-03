@@ -45,6 +45,9 @@ fn cass_cmd(home: &Path) -> Command {
     cmd.env("TUI_HEADLESS", "1");
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
     cmd.env("CASS_IGNORE_SOURCES_CONFIG", "1");
+    // Absolute capture defaults also need isolation from the shared host.
+    cmd.env("CASS_CLOUDMCP_DATA_ROOT", home.join("cloudmcp-empty"));
+    cmd.env("CASS_OPENWEBUI_DATA_ROOT", home.join("openwebui-empty"));
     // Deterministic gates: never load-gate or idle-gate a test run.
     cmd.env("CASS_RESPONSIVENESS_DISABLE", "1");
     cmd
@@ -234,6 +237,270 @@ fn schedule_run_incremental_force_records_state_and_history() {
     run("second");
     let history = std::fs::read_to_string(&runs_path).expect("runs.jsonl");
     assert_eq!(history.lines().count(), 2, "history is append-only");
+}
+
+#[test]
+fn gh509_schedule_checks_the_actual_index_lock_and_keeps_repeated_failures() {
+    use fs2::FileExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data_dir = tmp.path().join("dd");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let lock = std::fs::File::create(data_dir.join("index-run.lock")).unwrap();
+    lock.try_lock_exclusive().unwrap();
+
+    for attempt in 1..=2 {
+        let output = cass_cmd(&home)
+            .args([
+                "schedule",
+                "run",
+                "--job",
+                "incremental",
+                "--force",
+                "--json",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(9), "attempt {attempt}");
+        let report = parse_single_json_document(&output.stdout);
+        assert_eq!(report["ok"], false);
+        let step = report["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["name"] == "index")
+            .unwrap();
+        assert_eq!(step["ok"], false);
+        assert_eq!(step["exit_code"], 7);
+        assert_eq!(step["result"]["kind"], "index-busy");
+        assert!(
+            step["skipped_reason"]
+                .as_str()
+                .unwrap()
+                .contains("already holds the index lock"),
+            "{step}"
+        );
+    }
+    drop(lock);
+
+    // Stale metadata is not a held lock. A subsequent actual run must work.
+    let output = cass_cmd(&home)
+        .args([
+            "schedule",
+            "run",
+            "--job",
+            "incremental",
+            "--force",
+            "--json",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(parse_single_json_document(&output.stdout)["ok"], true);
+    let history = std::fs::read_to_string(data_dir.join("schedule/runs.jsonl")).unwrap();
+    let outcomes: Vec<bool> = history
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<Value>(line).unwrap()["ok"]
+                .as_bool()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(outcomes, [false, false, true]);
+}
+
+#[test]
+fn gh509_schedule_database_writer_is_not_an_index_lock_holder() {
+    use std::io::{BufRead, Write};
+    use std::process::Stdio;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data_dir = tmp.path().join("dd");
+    std::fs::create_dir_all(&home).unwrap();
+    seed_claude_code_fixture(&home);
+    let seed = cass_cmd(&home)
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .output()
+        .unwrap();
+    assert!(
+        seed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+
+    // A real stock writer holds SQLite's RESERVED lock, while CASS's
+    // index-run.lock is free. Keep its stdin open until both jobs finish.
+    let mut stock = Command::new("sqlite3")
+        .arg("-bail")
+        .arg(data_dir.join("agent_search.db"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("GH509 interop requires the sqlite3 CLI");
+    let mut stock_input = stock.stdin.take().unwrap();
+    writeln!(stock_input, "BEGIN IMMEDIATE;\n.print writer-held").unwrap();
+    stock_input.flush().unwrap();
+    let mut acknowledgement = String::new();
+    std::io::BufReader::new(stock.stdout.take().unwrap())
+        .read_line(&mut acknowledgement)
+        .unwrap();
+    assert_eq!(acknowledgement.trim(), "writer-held");
+
+    for attempt in 1..=2 {
+        let output = cass_cmd(&home)
+            .args([
+                "schedule",
+                "run",
+                "--job",
+                "incremental",
+                "--force",
+                "--json",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(9), "attempt {attempt}");
+        let report = parse_single_json_document(&output.stdout);
+        assert_eq!(report["ok"], false);
+        let step = report["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["name"] == "index")
+            .unwrap();
+        assert_eq!(step["ok"], false);
+        assert!(step["result"]["kind"].is_string(), "{step}");
+        assert!(
+            !step["skipped_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("already holds the index lock"),
+            "{step}"
+        );
+        assert!(
+            !step["stderr_tail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("another 'cass index' run is already active"),
+            "{step}"
+        );
+    }
+    writeln!(stock_input, "ROLLBACK;\n.quit").unwrap();
+    drop(stock_input);
+    assert!(stock.wait().unwrap().success());
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(data_dir.join("schedule/state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["last_incremental"]["ok"], false);
+    assert_eq!(
+        std::fs::read_to_string(data_dir.join("schedule/runs.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn gh509_human_schedule_failures_name_the_child_cause() {
+    use fs2::FileExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data_dir = tmp.path().join("dd");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let lock = std::fs::File::create(data_dir.join("index-run.lock")).unwrap();
+    lock.try_lock_exclusive().unwrap();
+    let run = |json: bool, broken_database: bool| {
+        let mut command = cass_cmd(&home);
+        command.arg("--color=never");
+        if broken_database {
+            command
+                .arg("--db")
+                .arg(home.join("not-a-directory/agent_search.db"));
+        }
+        command
+            .args([
+                "schedule",
+                "run",
+                "--job",
+                "incremental",
+                "--force",
+                "--data-dir",
+            ])
+            .arg(&data_dir);
+        if json {
+            command.arg("--json");
+        }
+        command.output().unwrap()
+    };
+
+    let locked = run(false, false);
+    assert_eq!(locked.status.code(), Some(9));
+    let human = String::from_utf8_lossy(&locked.stdout);
+    assert!(
+        human.contains("failed (another index run already holds the index lock"),
+        "{human}"
+    );
+    assert!(!human.contains("skipped (another index run"), "{human}");
+    let status = || {
+        let output = cass_cmd(&home)
+            .args(["--color=never", "schedule", "status", "--data-dir"])
+            .arg(&data_dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let saved = status();
+    assert!(
+        saved.contains("failed (another index run already holds the index lock"),
+        "{saved}"
+    );
+    assert!(!saved.contains("skipped (another index run"), "{saved}");
+    drop(lock);
+
+    // Resolve the actual child kind from its robot envelope, then require
+    // the same cause in a real human invocation against the same failure.
+    std::fs::write(home.join("not-a-directory"), b"fixture regular file").unwrap();
+    let structured = run(true, true);
+    assert_eq!(structured.status.code(), Some(9));
+    let report = parse_single_json_document(&structured.stdout);
+    let index = report["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["name"] == "index")
+        .unwrap();
+    let kind = index["result"]
+        .get("kind")
+        .or_else(|| index["result"].pointer("/error/kind"))
+        .unwrap()
+        .as_str()
+        .expect("child error kind");
+    let failed = run(false, true);
+    assert_eq!(failed.status.code(), Some(9));
+    let human = String::from_utf8_lossy(&failed.stdout);
+    assert!(human.contains(&format!("({kind})")), "{human}");
+    assert!(human.contains("FAILED"), "{human}");
+    let saved = status();
+    assert!(saved.contains(&format!("({kind})")), "{saved}");
+    assert!(saved.contains("FAILED"), "{saved}");
 }
 
 #[test]

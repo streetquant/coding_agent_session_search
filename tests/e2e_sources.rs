@@ -5,7 +5,7 @@
 //! - sources list
 //! - sources remove
 //! - sources doctor (limited without actual SSH)
-//! - sources sync (dry-run only)
+//! - sources sync (including an explicit local SSH/rsync acceptance fixture)
 //!
 //! Note: Tests that require actual SSH connectivity are marked #[ignore].
 
@@ -1243,6 +1243,64 @@ paths = ["~/.claude/projects"]
         start,
     );
 
+    tracker.complete();
+}
+
+/// The real list command must classify the reporter's 9 GB/83 s durable sync
+/// receipt as healthy, while retaining the slow-small-transfer warning.
+#[test]
+fn sources_list_classifies_bulk_first_sync_without_hiding_slow_transfers() {
+    use coding_agent_search::sources::sync::{SourceSyncInfo, SyncResult, SyncStatus};
+
+    let tracker =
+        tracker_for("sources_list_classifies_bulk_first_sync_without_hiding_slow_transfers");
+    let temp = tempfile::TempDir::new().unwrap();
+    let config = temp.path().join("config");
+    let data = temp.path().join("data");
+    create_sources_config(
+        &config,
+        "[[sources]]\nname = 'bulk'\ntype = 'ssh'\nhost = 'bulk-peer'\npaths = ['/sessions']\nsync_schedule = 'hourly'\n\n[[sources]]\nname = 'slow'\ntype = 'ssh'\nhost = 'slow-peer'\npaths = ['/sessions']\nsync_schedule = 'hourly'\n",
+    );
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let mut status = SyncStatus::default();
+    for (name, bytes) in [("bulk", 9_000_000_000), ("slow", 10 * 1024 * 1024)] {
+        status.sources.insert(
+            name.to_string(),
+            SourceSyncInfo {
+                last_sync: Some(now_ms),
+                last_result: SyncResult::Success,
+                files_synced: 148_673,
+                bytes_transferred: bytes,
+                duration_ms: 83_000,
+                consecutive_failures: 0,
+            },
+        );
+    }
+    status.save(&data).unwrap();
+    let output = tracker
+        .cass_assert_command()
+        .args(["sources", "list", "--json"])
+        .env("XDG_CONFIG_HOME", &config)
+        .env("CASS_DATA_DIR", &data)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    for (name, expected) in [("bulk", "healthy"), ("slow", "high_latency")] {
+        let source = report["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| source["name"] == name)
+            .unwrap();
+        assert_eq!(source["sync_health"]["health"], expected, "{source}");
+    }
     tracker.complete();
 }
 
@@ -5630,4 +5688,228 @@ fn gh520_remote_mirrors_index_structural_agents_end_to_end() {
     );
     assert_eq!(conversation_count(), i64::try_from(first.len()).unwrap());
     tracker.complete();
+}
+
+/// GH531: transfer both real Antigravity layouts over local OpenSSH and rsync,
+/// then index/search through the real CLI. No external host is contacted.
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "requires local sshd, ssh-keygen, rsync and sshd privilege-separation setup"]
+fn sources_sync_antigravity_keeps_session_trees_and_search_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    use coding_agent_search::franken_sync as fsqlite;
+    use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+    use coding_agent_search::sources::sync::path_to_safe_dirname;
+
+    struct SshServer(std::process::Child);
+    impl Drop for SshServer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let tracker = tracker_for("sources_sync_antigravity_keeps_session_trees_and_search_identity");
+    let temp = tempfile::TempDir::new().unwrap();
+    let root = temp.path();
+    let home = root.join("home");
+    let config = root.join("config");
+    let data = root.join("data");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join(".env"), "").unwrap();
+    let uuid = "aaaa1111-bbbb-2222-cccc-333344445555";
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/antigravity");
+    let paths: Vec<_> = ["antigravity", "antigravity-cli"]
+        .map(|name| root.join("remote/.gemini").join(name))
+        .into_iter()
+        .collect();
+    for (store, workspace) in paths.iter().zip(["/work/ide", "/work/cli"]) {
+        let relative = format!("brain/{uuid}/.system_generated/logs/transcript.jsonl");
+        let transcript = store.join(&relative);
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::copy(fixture.join(&relative), &transcript).unwrap();
+        fs::create_dir_all(store.join("conversations")).unwrap();
+        fs::copy(
+            fixture.join(format!("conversations/{uuid}.db")),
+            store.join(format!("conversations/{uuid}.db")),
+        )
+        .unwrap();
+        let db =
+            fsqlite::Connection::open(store.join("conversation_summaries.db").to_str().unwrap())
+                .unwrap();
+        db.execute("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, workspace_uris TEXT NOT NULL)")
+            .unwrap();
+        db.execute_compat(
+            "INSERT INTO conversation_summaries VALUES (?1, ?2)",
+            fsqlite::params![uuid, format!(r#"["file://{workspace}"]"#)],
+        )
+        .unwrap();
+        for noise in ["skills/prompt.md", "cache/blob", "settings.json"] {
+            let path = store.join(noise);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "unread Antigravity state").unwrap();
+        }
+    }
+
+    let key = root.join("client_key");
+    let host_key = root.join("host_key");
+    for path in [&key, &host_key] {
+        let output = std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "ssh-keygen: {output:?}");
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let user = std::process::Command::new("id")
+        .arg("-un")
+        .output()
+        .unwrap();
+    assert!(user.status.success());
+    let user = String::from_utf8(user.stdout)?;
+    let server_config = root.join("sshd_config");
+    fs::write(
+        &server_config,
+        format!(
+            "Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nPidFile {}\nAuthorizedKeysFile {}\nStrictModes no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\nPermitRootLogin yes\n",
+            host_key.display(), root.join("sshd.pid").display(), key.with_extension("pub").display()
+        ),
+    )
+    .unwrap();
+    let sshd = ["/usr/sbin/sshd", "/usr/bin/sshd"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+        .expect("local OpenSSH sshd");
+    let mut server = SshServer(
+        std::process::Command::new(sshd)
+            .args(["-D", "-e", "-f"])
+            .arg(&server_config)
+            .stderr(Stdio::from(
+                fs::File::create(root.join("sshd.log")).unwrap(),
+            ))
+            .spawn()
+            .unwrap(),
+    );
+    let known_hosts = root.join("known_hosts");
+    let host_public = fs::read_to_string(host_key.with_extension("pub")).unwrap();
+    fs::write(&known_hosts, format!("[127.0.0.1]:{port} {host_public}")).unwrap();
+    let ssh_config = root.join("ssh_config");
+    fs::write(
+        &ssh_config,
+        format!(
+            "Host antigravity-fixture\n HostName 127.0.0.1\n Port {port}\n User {}\n IdentityFile {}\n UserKnownHostsFile {}\n IdentitiesOnly yes\n StrictHostKeyChecking yes\n BatchMode yes\n",
+            user.trim(), key.display(), known_hosts.display()
+        ),
+    )
+    .unwrap();
+    let mut ready = false;
+    for _ in 0..40 {
+        let output = std::process::Command::new("ssh")
+            .arg("-F")
+            .arg(&ssh_config)
+            .args(["-o", "ConnectTimeout=1", "antigravity-fixture", "true"])
+            .output()
+            .unwrap();
+        if output.status.success() {
+            ready = true;
+            break;
+        }
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "sshd exited: {}",
+            fs::read_to_string(root.join("sshd.log")).unwrap()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(ready, "local SSH key authentication did not become ready");
+    create_sources_config(
+        &config,
+        &format!(
+            "[[sources]]\nname = 'agy-peer'\ntype = 'ssh'\nhost = 'antigravity-fixture'\npaths = {}\n",
+            serde_json::to_string(&paths).unwrap()
+        ),
+    );
+    let run = |args: &[&str]| -> Value {
+        let mut command = tracker.cass_std_command();
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .args(args)
+            .current_dir(&home)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_DATA_HOME", root.join("xdg"))
+            .env("CASS_DATA_DIR", &data)
+            .env("CASS_SSH_CONFIG", &ssh_config)
+            .env("CASS_SEMANTIC_ENABLED", "false")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("RUST_MIN_STACK", "134217728");
+        tracker.command_environment().apply_to_std(&mut command);
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    for pass in 0..2 {
+        let report = run(&["sources", "sync", "--source", "agy-peer", "--json"]);
+        assert_eq!(report["sources"][0]["status"], "success", "{report}");
+        for path in &paths {
+            let mirrored = data
+                .join("remotes/agy-peer/mirror")
+                .join(path_to_safe_dirname(path.to_str().unwrap()))
+                .join(path.file_name().unwrap());
+            for retained in [
+                format!("brain/{uuid}/.system_generated/logs/transcript.jsonl"),
+                format!("conversations/{uuid}.db"),
+                "conversation_summaries.db".to_string(),
+            ] {
+                assert!(mirrored.join(&retained).is_file(), "missing {retained}");
+            }
+            assert!(!mirrored.join("skills").exists());
+            assert!(!mirrored.join("cache").exists());
+            assert!(!mirrored.join("settings.json").exists());
+            if pass == 0 {
+                fs::write(mirrored.join("retained-local-evidence"), "keep me").unwrap();
+            } else {
+                assert!(mirrored.join("retained-local-evidence").is_file());
+            }
+        }
+        let storage = FrankenStorage::open_readonly(&data.join("agent_search.db")).unwrap();
+        let rows: Vec<(String, String)> = storage.raw().query(
+            "SELECT c.external_id, c.workspace FROM conversations c JOIN agents a ON a.id = c.agent_id WHERE c.source_id = 'agy-peer' AND a.slug = 'antigravity' ORDER BY c.external_id",
+        ).unwrap().into_iter().map(|row| (row.get_typed(0).unwrap(), row.get_typed(1).unwrap())).collect();
+        assert_eq!(
+            rows,
+            [
+                (uuid.to_string(), "/work/cli".to_string()),
+                (format!("ide/{uuid}"), "/work/ide".to_string())
+            ]
+        );
+        drop(storage);
+        let search = run(&[
+            "search",
+            "FLYWHEEL",
+            "--robot",
+            "--mode",
+            "lexical",
+            "--no-daemon",
+            "--limit",
+            "100",
+        ]);
+        let workspaces: std::collections::BTreeSet<_> = search["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["workspace"].as_str().expect("search hit workspace"))
+            .collect();
+        assert_eq!(
+            workspaces,
+            ["/work/cli", "/work/ide"].into_iter().collect(),
+            "{search}"
+        );
+    }
+    tracker.complete();
+    Ok(())
 }

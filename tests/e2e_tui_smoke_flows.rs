@@ -462,6 +462,142 @@ fn make_claude_fixture(root: &Path, workspace_name: &str) {
 // PTY Interactive Flow Tests (ftui runtime)
 // =============================================================================
 
+/// Exercise the real process, raw TTY negotiation, byte parser, and model.
+/// The PTY peer is a terminal fixture; no search or input engine is replaced.
+#[cfg(unix)]
+#[test]
+fn terminal_keys_2l1b0_54_pty_protocol_fallback_and_bulk_enter() {
+    let _guard = tui_flow_guard();
+    let trace = trace_id();
+    let tracker = tracker_for("terminal_keys_2l1b0_54_pty_protocol_fallback_and_bulk_enter");
+    let env = prepare_ftui_pty_env(&trace, &tracker);
+    for (name, setting, mux, reply, expect_query) in [
+        ("kitty", "auto", "", true, true),
+        ("ignores-enable", "auto", "", true, true),
+        ("ignored", "auto", "", false, true),
+        ("disabled", "0", "", false, false),
+        ("tmux", "auto", "tmux", false, false),
+        ("screen", "auto", "screen", false, false),
+    ] {
+        let started = tracker.start(
+            name,
+            Some("cass tui: protocol negotiation, copy, bulk Enter, exit"),
+        );
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 45,
+                cols: 150,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
+        let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let terminal_output = Arc::clone(&captured);
+        let terminal_writer = Arc::clone(&writer);
+        let reader_handle = thread::spawn(move || {
+            let mut answered = false;
+            let mut buffer = [0_u8; 4096];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let mut output = terminal_output.lock().unwrap();
+                        output.extend_from_slice(&buffer[..n]);
+                        if reply && !answered && output.windows(4).any(|w| w == b"\x1b[?u") {
+                            let mut input = terminal_writer.lock().unwrap();
+                            input.write_all(b"\x1b[?0u").unwrap();
+                            input.flush().unwrap();
+                            answered = true;
+                        }
+                    }
+                }
+            }
+        });
+        let mut command = CommandBuilder::new(cass_bin_path());
+        command.arg("tui");
+        apply_ftui_env(&mut command, &env);
+        command.env("CASS_TUI_KITTY_KEYBOARD", setting);
+        command.env_remove("TUI_HEADLESS");
+        command.env_remove("CI");
+        command.env_remove("TMUX");
+        command.env_remove("STY");
+        if mux == "tmux" {
+            command.env("TMUX", "/fixture/tmux,1,0");
+        }
+        if mux == "screen" {
+            command.env("STY", "fixture.screen");
+            command.env("TERM", "screen-256color");
+        }
+        let mut child = pair.slave.spawn_command(command).unwrap();
+        let launched = wait_for_rendered_output(&captured, PTY_STARTUP_TIMEOUT, |screen| {
+            screen.contains("Search")
+        });
+        let send = |bytes: &[u8]| send_key_sequence(&mut **writer.lock().unwrap(), bytes);
+        send(b"\x0chello");
+        let searched = wait_for_rendered_output(
+            &captured,
+            PTY_STARTUP_TIMEOUT,
+            rendered_contains_hello_fixture_content,
+        );
+        send(if reply && name != "ignores-enable" {
+            b"\x1b[99;6u"
+        } else {
+            b"\x1bC"
+        });
+        send(b"\x1bOP");
+        let copy_survived = wait_for_rendered_output(&captured, PTY_STARTUP_TIMEOUT, |screen| {
+            screen.contains("Welcome to CASS")
+        });
+        send(b"\x1bOP");
+        send(b"\x18");
+        send(b"\x1bb");
+        let bulk_open = wait_for_rendered_output(&captured, PTY_STARTUP_TIMEOUT, |screen| {
+            screen.contains("Bulk Actions")
+        });
+        send(b"\x1b[B\x1b[B\x1b[B\r");
+        let bulk_cleared = wait_for_rendered_output(&captured, PTY_STARTUP_TIMEOUT, |screen| {
+            screen.contains("Cleared 1")
+        });
+        send(b"\x0cAb?!");
+        let text_preserved = wait_for_rendered_output(&captured, PTY_STARTUP_TIMEOUT, |screen| {
+            screen.contains("Ab?!")
+        });
+        send(b"\x03");
+        let status = wait_for_child_exit(&mut *child, PTY_EXIT_TIMEOUT).expect("bounded TUI exit");
+        drop(child);
+        drop(pair);
+        // The terminal reader owns a writer; EOF is produced by the closed slave.
+        reader_handle.join().unwrap();
+        let raw = captured.lock().unwrap().clone();
+        let saw_query = raw.windows(4).any(|w| w == b"\x1b[?u");
+        let enabled = raw.windows(6).any(|w| w == b"\x1b[>15u");
+        let text_mode = raw.windows(5).any(|w| w == b"\x1b[=3u");
+        let restored = raw.windows(4).any(|w| w == b"\x1b[<u");
+        let summary = serde_json::json!({"command":"cass tui","exit_code":status.exit_code(),"terminal_stack":name,
+            "duration_ms":started.elapsed().as_millis(),"query":saw_query,"enabled":enabled,"restored":restored,
+            "launched":launched,"searched":searched,"copy_survived":copy_survived,"bulk_open":bulk_open,"bulk_cleared":bulk_cleared,"text_preserved":text_preserved,"text_mode":text_mode});
+        save_artifact(
+            &format!("{name}_keyboard_summary.json"),
+            &trace,
+            serde_json::to_string_pretty(&summary).unwrap().as_bytes(),
+        );
+        save_artifact(&format!("{name}_keyboard.raw"), &trace, &raw);
+        tracker.end(name, Some(&summary.to_string()), started);
+        assert!(status.success(), "{summary}");
+        assert_eq!(saw_query, expect_query, "{summary}");
+        assert_eq!(enabled, reply, "{summary}");
+        assert_eq!(text_mode, reply, "{summary}");
+        assert_eq!(restored, reply, "{summary}");
+        assert!(
+            launched && searched && copy_survived && bulk_open && bulk_cleared && text_preserved,
+            "{summary}"
+        );
+    }
+    tracker.complete();
+}
+
 #[test]
 fn tui_pty_launch_quit_and_terminal_cleanup() {
     let _guard_lock = tui_flow_guard();
