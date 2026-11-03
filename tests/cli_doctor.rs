@@ -4283,14 +4283,124 @@ fn doctor_backups_list_and_verify_candidate_promotion_manifest() {
         verification["prior_live_db_blake3"].as_str(),
         Some(test_file_blake3(&fixture.backup_db_path).as_str())
     );
-    assert!(
-        verification["warnings"]
-            .as_array()
-            .expect("warnings")
-            .iter()
-            .any(|warning| warning.as_str() == Some("frankensqlite read-only probe passed")),
-        "verify should prove the backup DB opens through frankensqlite: {verify_payload:#}"
-    );
+    if verification["sidecar_bundle_status"] == "complete-with-sidecars" {
+        assert_eq!(
+            verification["storage_probe_status"],
+            "requires_private_storage_probe"
+        );
+        assert!(
+            verification["warnings"]
+                .as_array()
+                .expect("warnings")
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|warning| warning.contains("native storage admission is deferred")),
+            "verify must disclose the deferred private probe: {verify_payload:#}"
+        );
+    } else {
+        assert_eq!(verification["storage_probe_status"], "passed");
+        assert!(
+            verification["warnings"]
+                .as_array()
+                .expect("warnings")
+                .iter()
+                .any(|warning| warning.as_str() == Some("frankensqlite read-only probe passed")),
+            "the no-SHM backup should still receive its native probe: {verify_payload:#}"
+        );
+    }
+}
+
+#[test]
+fn doctor_backups_verify_discloses_deferred_probe_without_changing_stored_shm() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    let fixture =
+        write_candidate_promotion_backup_fixture(&data_dir, "promo_verify_shm", "backup-state");
+    let connection = FrankenConnection::open(fixture.backup_db_path.to_string_lossy().into_owned())
+        .expect("open backup fixture");
+    connection.query("PRAGMA journal_mode = WAL;").expect("WAL");
+    connection
+        .execute("PRAGMA wal_autocheckpoint = 0;")
+        .expect("retain WAL frames");
+    connection
+        .execute("INSERT INTO restore_probe(marker) VALUES ('committed-wal-state');")
+        .expect("commit WAL row");
+    connection
+        .close_without_checkpoint()
+        .expect("close without changing backup WAL");
+    let wal = fixture.backup_db_path.with_file_name("agent_search.db-wal");
+    assert!(fs::metadata(&wal).expect("WAL metadata").len() > 32);
+    let shm = fixture.backup_db_path.with_file_name("agent_search.db-shm");
+    fs::write(&shm, [0u8; 32 * 1024]).expect("stale derived SHM");
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(&fixture.manifest_path).expect("read manifest"))
+            .expect("manifest JSON");
+    let artifacts = manifest["artifacts"].as_array_mut().expect("artifacts");
+    for (kind, path) in [
+        ("prior_live_archive_db_backup", &fixture.backup_db_path),
+        ("prior_live_archive_wal_backup", &wal),
+        ("prior_live_archive_shm_backup", &shm),
+    ] {
+        let artifact = json!({
+            "artifact_kind": kind,
+            "backup_path": path,
+            "checksum_blake3": test_file_blake3(path),
+            "size_bytes": fs::metadata(path).expect("artifact metadata").len(),
+        });
+        if let Some(existing) = artifacts
+            .iter_mut()
+            .find(|entry| entry["artifact_kind"] == kind)
+        {
+            *existing = artifact;
+        } else {
+            artifacts.push(artifact);
+        }
+    }
+    fs::write(
+        &fixture.manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("manifest JSON"),
+    )
+    .expect("write matched bundle manifest");
+    let before = doctor_no_write_snapshot(&data_dir);
+
+    for json_output in [true, false] {
+        let mut command = cass_cmd(test_home.path());
+        command.env_remove("CASS_OUTPUT_FORMAT").args([
+            "doctor",
+            "backups",
+            "verify",
+            &fixture.backup_id,
+            "--data-dir",
+            data_dir.to_str().expect("UTF-8 data directory"),
+        ]);
+        if json_output {
+            command.arg("--json");
+        }
+        let output = command.output().expect("verify matched SHM bundle");
+        assert!(output.status.success(), "{output:?}");
+        if json_output {
+            let payload: Value = serde_json::from_slice(&output.stdout).expect("verify JSON");
+            let verification = &payload["backup_verification"];
+            assert_eq!(verification["status"], "verified");
+            assert_eq!(
+                verification["sidecar_bundle_status"],
+                "complete-with-sidecars"
+            );
+            assert_eq!(
+                verification["storage_probe_status"],
+                "requires_private_storage_probe"
+            );
+            assert_eq!(verification["restore_rehearsal_allowed"], true);
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains("requires_private_storage_probe"), "{text}");
+        assert!(
+            text.contains("native storage admission is deferred"),
+            "{text}"
+        );
+        assert!(text.contains("stored SHM unchanged"), "{text}");
+        assert_eq!(doctor_no_write_snapshot(&data_dir), before);
+    }
 }
 
 #[test]

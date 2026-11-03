@@ -108,7 +108,9 @@ const DEPENDENCY_SPECS: &[DependencySpec] = &[
         package: "frankensearch",
         manifest_table: "dependencies",
         manifest_key: "frankensearch",
-        source_kind: "registry",
+        // Cargo.toml pins the exact Git revision carrying the native search
+        // fixes; validate that revision rather than requiring a registry pin.
+        source_kind: "git",
         repo_rel: "../frankensearch",
         required_tests: &[STRICT_CHECK_COMMAND, FULL_CHECK_COMMAND],
     },

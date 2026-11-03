@@ -1087,10 +1087,19 @@ fn map_reqwest_download_error(err: reqwest::Error) -> DownloadError {
 }
 
 fn map_model_response_read_error(err: std::io::Error) -> DownloadError {
-    if err.kind() == std::io::ErrorKind::TimedOut {
+    // Reqwest wraps response-body timeouts in io::ErrorKind::Other. Keep
+    // the typed cause instead of relying on its abbreviated Display text.
+    let body_timeout = err
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<reqwest::Error>())
+        .is_some_and(reqwest::Error::is_timeout);
+    if err.kind() == std::io::ErrorKind::TimedOut || body_timeout {
         DownloadError::Timeout
     } else {
-        DownloadError::NetworkError(format!("reading model artifact response: {err}"))
+        DownloadError::NetworkError(format!(
+            "reading model artifact response: {}",
+            format_download_error_chain(&err)
+        ))
     }
 }
 
@@ -1453,9 +1462,13 @@ impl ModelDownloader {
                 return Err(DownloadError::Timeout);
             }
 
-            let read = response
-                .read(&mut buffer)
-                .map_err(map_model_response_read_error)?;
+            let read = response.read(&mut buffer);
+            // Cancellation can arrive while the blocking body read waits.
+            // Observe it before classifying that read's eventual outcome.
+            if cancelled.load(Ordering::SeqCst) {
+                return Err(DownloadError::Cancelled);
+            }
+            let read = read.map_err(map_model_response_read_error)?;
             if read == 0 {
                 break;
             }
@@ -2753,6 +2766,20 @@ mod tests {
         );
         assert!(download_error_looks_like_tls(&chain.to_ascii_lowercase()));
         assert!(!download_error_looks_like_tls("connection refused"));
+
+        let read_error = map_model_response_read_error(std::io::Error::other(SendErr(TlsCause)));
+        let DownloadError::NetworkError(message) = read_error else {
+            panic!("a non-timeout body failure must remain a network error");
+        };
+        assert!(message.contains("reading model artifact response"));
+        assert!(message.contains("invalid peer certificate: UnknownIssuer"));
+        assert!(matches!(
+            map_model_response_read_error(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "body read timed out"
+            )),
+            DownloadError::Timeout
+        ));
     }
 
     #[test]
@@ -3967,7 +3994,9 @@ mod tests {
             runtime.block_on(async move {
                 let handle = asupersync::runtime::Runtime::current_handle()
                     .context("native TLS acceptance runtime handle unavailable")?;
-                let (sender, receiver) = std::sync::mpsc::channel();
+                let root_cx = asupersync::Cx::current()
+                    .context("native TLS acceptance root context unavailable")?;
+                let (sender, mut receiver) = asupersync::channel::oneshot::channel();
                 handle
                     .try_spawn_with_cx(move |cx| async move {
                         let cancellation = if cancel_in_flight {
@@ -3993,31 +4022,27 @@ mod tests {
                         let cancellation_observed = cancellation
                             .map(|thread| thread.join().unwrap_or(false))
                             .unwrap_or(false);
-                        let _ = sender.send((result, cancellation_observed));
+                        // Completion must be delivered even when the request
+                        // Cx was cancelled; this does not perform network I/O.
+                        let _ = sender.send_blocking((result, cancellation_observed));
                     })
                     .map_err(|error| anyhow::anyhow!("spawning native HTTPS request: {error}"))?;
-                let deadline = Instant::now() + Duration::from_secs(6);
-                loop {
-                    match receiver.try_recv() {
-                        Ok((result, cancellation_observed)) => {
-                            ensure!(
-                                !cancel_in_flight || cancellation_observed,
-                                "native cancellation did not occur after the server received a request"
-                            );
-                            return Ok(result);
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Empty) => {
-                            ensure!(
-                                Instant::now() < deadline,
-                                "native HTTPS request exceeded its six second watchdog"
-                            );
-                            asupersync::runtime::yield_now().await;
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            anyhow::bail!("native HTTPS task exited without a terminal result");
-                        }
-                    }
-                }
+                // A self-waking try_recv/yield loop starves reactor turns on
+                // this current-thread runtime. Park on a wake-driven channel
+                // while preserving the registered child and its original Cx.
+                let (result, cancellation_observed) = asupersync::time::timeout(
+                    root_cx.now(),
+                    Duration::from_secs(6),
+                    std::pin::pin!(receiver.recv(&root_cx)),
+                )
+                .await
+                .context("native HTTPS request exceeded its six second watchdog")?
+                .context("native HTTPS task exited without a terminal result")?;
+                ensure!(
+                    !cancel_in_flight || cancellation_observed,
+                    "native cancellation did not occur after the server received a request"
+                );
+                Ok(result)
             })
         }
 

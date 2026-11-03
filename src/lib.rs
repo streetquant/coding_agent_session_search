@@ -58696,7 +58696,15 @@ fn verify_doctor_backup_record(
             .blocked_reasons
             .push("restore requires a checksum-matched prior-live archive DB backup".to_string());
     }
-    if verification.blocked_reasons.is_empty()
+    if verification.blocked_reasons.is_empty() && shm_matched {
+        // A read-only engine open may initialize an existing SHM index. Keep
+        // the checksum-matched stored bundle immutable; rehearsal and apply
+        // must admit their private copy before either can succeed.
+        verification.storage_probe_status = "requires_private_storage_probe";
+        verification.warnings.push(
+            "manifest checksums and sidecar bundle matched; native storage admission is deferred to a private restore candidate to keep the stored SHM unchanged".to_string(),
+        );
+    } else if verification.blocked_reasons.is_empty()
         && let Some(db_path) = verification.prior_live_db_path.as_ref()
     {
         match open_franken_with_flags(
@@ -59533,6 +59541,23 @@ pub(crate) fn run_doctor_backups_impl(
                         .as_str()
                         .unwrap_or("unknown")
                 );
+                println!(
+                    "  storage probe: {}",
+                    payload
+                        .get("backup_verification")
+                        .and_then(|verification| verification.get("storage_probe_status"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                );
+                if let Some(warnings) = payload
+                    .get("backup_verification")
+                    .and_then(|verification| verification.get("warnings"))
+                    .and_then(serde_json::Value::as_array)
+                {
+                    for warning in warnings.iter().filter_map(serde_json::Value::as_str) {
+                        println!("  warning: {warning}");
+                    }
+                }
             }
             doctor::DoctorBackupCommand::Restore => {
                 println!(

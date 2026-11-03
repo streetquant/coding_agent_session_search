@@ -126,21 +126,55 @@ fn safe_fixture_destination(dst_root: &Path, rel: &Path) -> Result<PathBuf, Box<
 }
 
 fn copy_search_demo_data() -> Result<TempDir, Box<dyn Error>> {
-    let tmp = TempDir::new()?;
-    let src = Path::new(SEARCH_DEMO_DATA_DIR);
+    copy_search_demo_data_from(Path::new(SEARCH_DEMO_DATA_DIR), || {}, || {})
+}
 
-    // Take a shared snapshot lease while copying. Index/self-heal publishers
-    // hold this same data-dir lock exclusively, so a clone cannot observe a
-    // half-published generation or a database being replaced underneath it.
-    // The lease is dropped before the TempDir is returned.
-    let snapshot_lock_path = src.join("index-run.lock");
-    let snapshot_lock = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&snapshot_lock_path)?;
-    snapshot_lock.lock_shared()?;
+fn search_demo_snapshot_lease(
+    src: &Path,
+    on_contention: &impl Fn(),
+) -> std::io::Result<Option<fs::File>> {
+    match fs::File::open(src.join("index-run.lock")) {
+        Ok(lock) => {
+            match FileExt::try_lock_shared(&lock) {
+                Ok(()) => {}
+                Err(error)
+                    if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+                {
+                    on_contention();
+                    FileExt::lock_shared(&lock)?;
+                }
+                Err(error) => return Err(error),
+            }
+            Ok(Some(lock))
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn copy_search_demo_data_from(
+    src: &Path,
+    after_tentative_copy: impl FnOnce(),
+    on_contention: impl Fn(),
+) -> Result<TempDir, Box<dyn Error>> {
+    // Publishers create this persistent lock before changing a generation and
+    // never unlink it. Readers may lease it, but must not create source state.
+    let lease = search_demo_snapshot_lease(src, &on_contention)?;
+    let copy = copy_search_demo_data_tree(src)?;
+    if lease.is_none() {
+        after_tentative_copy();
+        // A publisher may have appeared during the tentative snapshot. Wait
+        // for it, then start a fresh copy under its shared lock; overlaying the
+        // tentative copy could retain files absent from the new generation.
+        if let Some(_lease) = search_demo_snapshot_lease(src, &on_contention)? {
+            return copy_search_demo_data_tree(src);
+        }
+    }
+    Ok(copy)
+}
+
+fn copy_search_demo_data_tree(src: &Path) -> Result<TempDir, Box<dyn Error>> {
+    let tmp = TempDir::new()?;
 
     for entry in WalkDir::new(src) {
         let entry = match entry {
@@ -186,6 +220,100 @@ fn copy_search_demo_data() -> Result<TempDir, Box<dyn Error>> {
         }
     }
     Ok(tmp)
+}
+
+#[test]
+fn fixture_snapshot_without_publisher_does_not_create_source_lock() -> Result<(), Box<dyn Error>> {
+    let source = TempDir::new()?;
+    fs::write(source.path().join("generation"), b"original")?;
+    let before = fs::metadata(source.path())?.modified()?;
+    let copy = copy_search_demo_data_from(source.path(), || {}, || {})?;
+    assert_eq!(fs::read(copy.path().join("generation"))?, b"original");
+    assert_eq!(fs::read(source.path().join("generation"))?, b"original");
+    assert_eq!(fs::read_dir(source.path())?.count(), 1);
+    assert!(!source.path().join("index-run.lock").exists());
+    assert_eq!(fs::metadata(source.path())?.modified()?, before);
+    Ok(())
+}
+
+#[test]
+fn fixture_snapshot_waits_for_existing_publisher() -> Result<(), Box<dyn Error>> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let source = TempDir::new()?;
+    fs::write(source.path().join("generation"), b"before")?;
+    let lock = fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(source.path().join("index-run.lock"))?;
+    FileExt::lock_exclusive(&lock)?;
+    let source_path = source.path().to_owned();
+    let (contended, contention) = mpsc::channel();
+    let (completed, completion) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let result = copy_search_demo_data_from(
+            &source_path,
+            || {},
+            || {
+                contended
+                    .send(())
+                    .expect("report actual shared-lock contention")
+            },
+        )
+        .map_err(|error| error.to_string());
+        completed.send(result).expect("return snapshot result");
+    });
+    contention.recv_timeout(Duration::from_secs(5))?;
+    let held_result = completion.recv_timeout(Duration::from_millis(100));
+    fs::write(source.path().join("generation"), b"published")?;
+    FileExt::unlock(&lock)?;
+    let result = completion.recv_timeout(Duration::from_secs(5));
+    reader.join().expect("snapshot reader panicked");
+    assert!(
+        matches!(held_result, Err(mpsc::RecvTimeoutError::Timeout)),
+        "a snapshot must not finish while the publisher holds its exclusive lease"
+    );
+    let copy = result??;
+    assert_eq!(fs::read(copy.path().join("generation"))?, b"published");
+    assert!(!copy.path().join("index-run.lock").exists());
+    Ok(())
+}
+
+#[test]
+fn fixture_snapshot_retries_fresh_when_publisher_appears() -> Result<(), Box<dyn Error>> {
+    let source = TempDir::new()?;
+    fs::write(source.path().join("generation"), b"before")?;
+    fs::write(source.path().join("obsolete"), b"old-generation-only")?;
+    let copy = copy_search_demo_data_from(
+        source.path(),
+        || {
+            let lock = fs::OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(source.path().join("index-run.lock"))
+                .expect("publisher creates its persistent lock");
+            FileExt::lock_exclusive(&lock).expect("publisher lease");
+            fs::rename(
+                source.path().join("obsolete"),
+                source.path().join("archived"),
+            )
+            .expect("publish replacement generation without deleting source data");
+            fs::write(source.path().join("generation"), b"published").expect("new generation");
+        },
+        || {},
+    )?;
+    assert_eq!(fs::read(copy.path().join("generation"))?, b"published");
+    assert_eq!(
+        fs::read(copy.path().join("archived"))?,
+        b"old-generation-only"
+    );
+    assert!(!copy.path().join("obsolete").exists());
+    assert!(!copy.path().join("index-run.lock").exists());
+    assert!(source.path().join("index-run.lock").exists());
+    Ok(())
 }
 
 fn isolated_search_demo_data() -> Result<TempDir, Box<dyn Error>> {

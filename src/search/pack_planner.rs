@@ -2472,6 +2472,21 @@ fn redact_pack_excerpt(
 ) -> String {
     let mut output = input.to_string();
 
+    // Preserve the complete path boundary before token redactors can replace
+    // a long prefix. The remaining passes still scrub a sensitive basename.
+    let path_redacted = PRIVATE_PATH_RE.replace_all(&output, |captures: &Captures<'_>| {
+        redacted_private_path_marker(&captures[0])
+    });
+    if let Cow::Owned(redacted) = path_redacted {
+        push_full_redaction(
+            redactions,
+            "private_path",
+            &output,
+            &format!("{REDACTED_PATH_PREFIX}/<name>"),
+        );
+        output = redacted;
+    }
+
     let encrypted_redacted = ENCRYPTED_PAYLOAD_RE.replace_all(&output, |_: &Captures<'_>| {
         REDACTED_ENCRYPTED_PAYLOAD_MARKER
     });
@@ -2532,19 +2547,6 @@ fn redact_pack_excerpt(
             "remote_host",
             &output,
             REDACTED_REMOTE_HOST_MARKER,
-        );
-        output = redacted;
-    }
-
-    let path_redacted = PRIVATE_PATH_RE.replace_all(&output, |captures: &Captures<'_>| {
-        redacted_private_path_marker(&captures[0])
-    });
-    if let Cow::Owned(redacted) = path_redacted {
-        push_full_redaction(
-            redactions,
-            "private_path",
-            &output,
-            &format!("{REDACTED_PATH_PREFIX}/<name>"),
         );
         output = redacted;
     }
@@ -5156,6 +5158,114 @@ mod tests {
             assert_eq!(
                 redact_pack_excerpt(&"a".repeat(100), policy, &mut Vec::new()),
                 "a".repeat(100)
+            );
+        }
+    }
+
+    #[test]
+    fn render_pack_redacts_long_private_paths_before_entropy_tokens() {
+        use pulldown_cmark::{Event, Parser};
+
+        let private_root = concat!(
+            "/home/alice/cass-build-fixture/evidence/",
+            "cass-cold-robot-0413-x27qw051/.cold-tmp/.tmpFixture"
+        );
+        let source_path = format!("{private_root}/.codex/sessions/session.jsonl");
+        // Generate 33 distinct ASCII fixture bytes to cross the entropy threshold.
+        let token: String = (b'A'..=b'Z').chain(b'a'..=b'g').map(char::from).collect();
+        let mut item = candidate("long-private-path", "local", &source_path, 10.0);
+        item.excerpt = format!("Read {source_path} token {token}");
+        let plan = plan_answer_pack(request(vec![item])).unwrap();
+        assert_eq!(plan.evidence.len(), 1);
+        assert_eq!(plan.evidence[0].candidate.source_path, source_path);
+        assert!(plan.evidence[0].candidate.citation_verified);
+
+        let mut req = render_request(PackRenderFormat::Json);
+        req.effective = Some(serde_json::json!({
+            "db_path": format!("{private_root}/agent_search.db"),
+        }));
+        let value = render_answer_pack_value(&plan, &req).unwrap();
+        let citation = &value["evidence"][0]["citation"];
+        assert_eq!(citation["source_path"], "[REDACTED_PATH]/session.jsonl");
+        assert_eq!(citation["source_id"], "local");
+        assert_eq!(citation["verified"], true);
+        assert_eq!(citation["content_hash"], "long-private-path_content");
+        assert_eq!(citation["line_start"], 10);
+        assert_eq!(citation["line_end"], 12);
+        assert_eq!(
+            value["_meta"]["effective"]["db_path"],
+            "[REDACTED_PATH]/agent_search.db"
+        );
+        let excerpt = value["evidence"][0]["excerpt"].as_str().unwrap();
+        assert_eq!(
+            excerpt,
+            "Read [REDACTED_PATH]/session.jsonl token [REDACTED]"
+        );
+        assert_eq!(
+            citation["excerpt_sha256"],
+            hex::encode(Sha256::digest(excerpt.as_bytes()))
+        );
+
+        for format in [PackRenderFormat::Json, PackRenderFormat::Markdown] {
+            req.format = format;
+            let rendered = render_answer_pack(&plan, &req).unwrap();
+            for private in [
+                private_root,
+                "x27qw051",
+                ".cold-tmp",
+                ".codex/sessions",
+                token.as_str(),
+            ] {
+                assert!(!rendered.contains(private), "private fragment: {private}");
+            }
+            if format == PackRenderFormat::Markdown {
+                let text = Parser::new(&rendered)
+                    .filter_map(|event| match event {
+                        Event::Text(text) | Event::Code(text) => Some(text),
+                        _ => None,
+                    })
+                    .fold(String::new(), |mut output, text| {
+                        output.push_str(&text);
+                        output
+                    });
+                assert!(text.contains("[REDACTED_PATH]/session.jsonl"));
+            }
+        }
+    }
+
+    #[test]
+    fn private_path_redaction_keeps_secret_basename_checks() {
+        let key = format!("sk-{}", "a".repeat(24));
+        for policy in [PackRedactionPolicy::Strict, PackRedactionPolicy::Balanced] {
+            let path = format!("/home/alice/private/{key}");
+            assert_eq!(
+                redact_pack_excerpt(&path, policy, &mut Vec::new()),
+                "[REDACTED_PATH]/[REDACTED]"
+            );
+        }
+        // Generate the same high-entropy fixture without embedding a credential.
+        let token: String = (b'A'..=b'Z').chain(b'a'..=b'g').map(char::from).collect();
+        let path = format!("/home/alice/private/{token}");
+        let redacted = redact_pack_excerpt(&path, PackRedactionPolicy::Strict, &mut Vec::new());
+        assert!(!redacted.contains(token.as_str()));
+        assert!(!redacted.contains("/home/alice"));
+        assert!(redacted.contains(REDACTED_PATH_PREFIX));
+        assert!(redacted.contains(REDACTED_VALUE_MARKER));
+
+        let encrypted = "encrypted_payload=abcdef0123456789abcdef0123456789";
+        let path = format!("/home/alice/private/{encrypted}");
+        for policy in [
+            PackRedactionPolicy::Strict,
+            PackRedactionPolicy::Balanced,
+            PackRedactionPolicy::Off,
+        ] {
+            assert_eq!(
+                redact_pack_excerpt(&path, policy, &mut Vec::new()),
+                "[REDACTED_PATH]/[REDACTED_ENCRYPTED_PAYLOAD]"
+            );
+            assert_eq!(
+                redact_pack_excerpt(encrypted, policy, &mut Vec::new()),
+                REDACTED_ENCRYPTED_PAYLOAD_MARKER
             );
         }
     }

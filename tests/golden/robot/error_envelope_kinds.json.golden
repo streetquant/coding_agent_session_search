@@ -2,7 +2,7 @@
   "_meta": {
     "description": "Canonical error kind taxonomy for cass robot-mode error envelopes",
     "rule": "All err.kind values MUST be kebab-case per AGENTS.md",
-    "total_kinds": 89,
+    "total_kinds": 90,
     "regenerate": "UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_error_envelope"
   },
   "kinds": {
@@ -280,6 +280,11 @@
       ]
     },
     "pack-invalid-limit": {
+      "exit_codes": [
+        2
+      ]
+    },
+    "pack-invalid-redaction-policy": {
       "exit_codes": [
         2
       ]

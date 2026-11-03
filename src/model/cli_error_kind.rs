@@ -525,15 +525,12 @@ mod tests {
         }
     }
 
-    /// The vocabulary covers every kind currently emitted by
-    /// src/lib.rs at landing time (audited via
-    /// `grep -oE 'kind: \"[a-z_-]+\"' src/lib.rs | sort -u`). A
-    /// regression that added a new kind to lib.rs without adding it
-    /// here would be invisible until a future enum migration site
-    /// hit a missing variant; pinning the count here surfaces the
-    /// drift immediately at CI time.
+    /// Pin the reviewed vocabulary alongside the typed CliErrorKind
+    /// producers in src/lib.rs. Audit new producers and both conversion
+    /// tables before changing this count; literal-only searches no longer
+    /// cover the migrated call sites.
     #[test]
-    fn variant_count_matches_audited_lib_rs_kind_literals() {
+    fn variant_count_matches_audited_cli_error_vocabulary() {
         // 93 unique kinds: GH #450 added `migration-repair-pending` (95), then
         // 2l1b0.58 folded the duplicate spellings `index-missing` into
         // `missing-index` and `io-error` into `io`, and dropped `update-check`,
@@ -541,15 +538,17 @@ mod tests {
         // 2l1b0.65 added `schema-repair-required` (93).
         // dnj94 added `storage-recovery-required` (94). Message-anchor
         // validation added `invalid-message-anchor` and `stale-message-anchor` (96).
+        // Pack privacy/budget commit 787a3b9d added `partial-result` and
+        // `pack-invalid-redaction-policy`, with typed lib.rs producers (98).
         // If lib.rs grows a new kind, bump this count AND add the variant +
         // arms above.
-        const AUDITED_KIND_COUNT: usize = 96;
+        const AUDITED_KIND_COUNT: usize = 98;
         assert_eq!(
             ErrorKind::all_variants().len(),
             AUDITED_KIND_COUNT,
-            "ErrorKind variant count drifted from the audited lib.rs literal set; \
-             re-run `grep -oE 'kind: \"[a-z_-]+\"' src/lib.rs | sort -u | wc -l` and \
-             update the constant + add the missing variant"
+            "ErrorKind variant count drifted from the audited vocabulary; \
+             review the typed CliErrorKind producers in src/lib.rs and both \
+             conversion tables before updating the constant"
         );
     }
 
