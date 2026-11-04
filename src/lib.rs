@@ -49338,9 +49338,16 @@ fn doctor_recommended_action_for_reports(
     if initialized_action.is_some() {
         return initialized_action;
     }
-    if operation_state.active_doctor_repair
-        || operation_state.active_index_maintenance
+    let current_doctor_owns_lock = operation_state.owners.iter().any(|owner| {
+        owner.lock_kind == DoctorOperationLockKind::DoctorRepair
+            && owner.active
+            && owner.owned_by_current_process
+            && owner.owner_confidence == DoctorOperationOwnerConfidence::CurrentProcess
+    });
+    if operation_state.active_index_maintenance
         || operation_state.mutation_blocked_reason.is_some()
+        || !operation_state.mutating_doctor_allowed
+        || (operation_state.active_doctor_repair && !current_doctor_owns_lock)
     {
         return Some(operation_state.next_action.clone());
     }
@@ -74863,6 +74870,61 @@ mod doctor_asset_taxonomy_tests {
     }
 
     #[test]
+    fn recommended_action_distinguishes_acquired_and_external_doctor_locks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = data_dir.join("agent_search.db");
+        let index_path = data_dir.join("index");
+        let staging = DoctorCandidateStagingReport {
+            completed_candidate_count: 1,
+            candidates: vec![DoctorCandidateSummary {
+                lifecycle_status: "completed".to_string(),
+                ..DoctorCandidateSummary::default()
+            }],
+            ..DoctorCandidateStagingReport::default()
+        };
+
+        for acquired in [true, false] {
+            // A matching PID in external metadata is not an acquired lock.
+            let metadata = BTreeMap::from([("pid".to_string(), std::process::id().to_string())]);
+            let path = data_dir.join("doctor/locks/doctor-repair.lock");
+            let observation = if acquired {
+                DoctorMutationLockObservation::Acquired { path, metadata }
+            } else {
+                DoctorMutationLockObservation::Active { path, metadata }
+            };
+            let mut operation = build_doctor_operation_state_report(
+                data_dir,
+                &db_path,
+                &index_path,
+                &crate::search::asset_state::SearchMaintenanceSnapshot::default(),
+                &observation,
+            );
+            assert!(operation.active_doctor_repair);
+            assert_eq!(operation.mutating_doctor_allowed, acquired);
+            let recommend = |operation: &DoctorOperationStateReport| {
+                doctor_recommended_action_for_reports(
+                    None,
+                    operation,
+                    &DoctorCoverageRiskSummary::default(),
+                    &[],
+                    &staging,
+                )
+                .expect("recommendation")
+            };
+            if acquired {
+                assert!(recommend(&operation).contains("'cass doctor repair --dry-run --json'"));
+                // Other maintenance still takes priority over this own lock.
+                operation.active_index_maintenance = true;
+                operation.next_action = "wait for index maintenance".to_string();
+                assert_eq!(recommend(&operation), operation.next_action);
+            } else {
+                assert_eq!(recommend(&operation), operation.next_action);
+            }
+        }
+    }
+
+    #[test]
     fn recommended_action_operation_blocker_precedes_candidate_advice() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
@@ -97673,6 +97735,9 @@ pub(crate) fn run_doctor_impl(
             );
         }
     }
+    // An isolated candidate has its own verified build receipt. Live probes
+    // must reflect actual live/derived repairs, including any earlier repair.
+    let mut live_repair_applied = auto_fix_applied;
     let candidate_staging_started = Instant::now();
     doctor_set_heartbeat_phase("candidate_staging");
     let mut candidate_staging =
@@ -98161,6 +98226,7 @@ pub(crate) fn run_doctor_impl(
             match promotion.status.as_str() {
                 "applied" => {
                     auto_fix_applied = true;
+                    live_repair_applied = true;
                     auto_fix_actions.push(format!(
                         "Promoted verified reconstruct candidate {} into the live archive bundle",
                         promotion.candidate_id
@@ -98444,6 +98510,7 @@ pub(crate) fn run_doctor_impl(
                     needs_rebuild = false;
                     auto_fix_actions.push("Rebuilt search index from database".to_string());
                     auto_fix_applied = true;
+                    live_repair_applied = true;
                     for check in &mut checks {
                         if check.name == "index" || check.name == "index_sync" {
                             check.status = "pass".to_string();
@@ -98526,6 +98593,7 @@ pub(crate) fn run_doctor_impl(
                             component_note
                         ));
                         auto_fix_applied = true;
+                        live_repair_applied = true;
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -98598,6 +98666,7 @@ pub(crate) fn run_doctor_impl(
                         };
                         auto_fix_actions.push(rebuild_note.clone());
                         auto_fix_applied = true;
+                        live_repair_applied = true;
                         for check in &mut checks {
                             if check.name == "index" || check.name == "index_sync" {
                                 check.status = "pass".to_string();
@@ -98767,6 +98836,7 @@ pub(crate) fn run_doctor_impl(
         if result.applied {
             auto_fix_actions.push(cleanup_message);
             auto_fix_applied = true;
+            live_repair_applied = true;
         }
         Some(result)
     } else {
@@ -98793,7 +98863,7 @@ pub(crate) fn run_doctor_impl(
         index_path: &index_path,
         readiness_snapshot: &readiness_snapshot,
         fix_can_mutate,
-        auto_fix_applied,
+        auto_fix_applied: live_repair_applied,
         fs_mutation_receipts: &fs_mutation_receipts,
         cleanup_apply_result: cleanup_apply_result.as_ref(),
     });
@@ -98807,7 +98877,7 @@ pub(crate) fn run_doctor_impl(
         vec![if post_repair_probes.requested {
             "post-repair verification probes ran with receipt correlation".to_string()
         } else {
-            "post-repair verification probes were skipped because no repair mutation ran"
+            "post-repair verification probes were skipped because no live asset repair ran"
                 .to_string()
         }],
     );
