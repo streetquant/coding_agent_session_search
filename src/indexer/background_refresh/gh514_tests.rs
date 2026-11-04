@@ -214,3 +214,41 @@ fn gh514_scan_watermark_refuses_active_doctor_without_waiting_for_repair() {
     );
     fs2::FileExt::unlock(&lock).unwrap();
 }
+
+/// The daemon's periodic index gate (#514) on its own interval: the default
+/// pair keeps the read-path window, a shorter daemon interval keeps its pace,
+/// a disabled read-path cadence does not stop the daemon, and the daemon's
+/// own previous child finishing does not make the next tick look redundant.
+#[test]
+fn gh514_daemon_window_honors_the_daemon_interval() {
+    let read_path = Duration::from_secs(DEFAULT_SOURCE_SCAN_SECS);
+    assert_eq!(
+        daemon_source_scan_freshness_window(Duration::from_secs(900), read_path),
+        read_path
+    );
+    assert_eq!(
+        daemon_source_scan_freshness_window(Duration::from_secs(60), read_path),
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        daemon_source_scan_freshness_window(Duration::from_secs(900), Duration::ZERO),
+        Duration::from_secs(450)
+    );
+
+    let interval = Duration::from_secs(60);
+    let window = daemon_source_scan_freshness_window(interval, read_path);
+    let spawned = 1_800_000_000_000_i64;
+    let own_child_finished = spawned + 20_000;
+    let next_tick = spawned + 60_000;
+    assert!(source_scan_is_due(
+        Some(own_child_finished),
+        next_tick,
+        window
+    ));
+    // Another process's scan 10 s before the tick still makes it redundant.
+    assert!(!source_scan_is_due(
+        Some(next_tick - 10_000),
+        next_tick,
+        window
+    ));
+}

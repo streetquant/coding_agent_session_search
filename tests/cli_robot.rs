@@ -7586,6 +7586,37 @@ fn global_flags_hoisted_from_after_subcommand() {
     );
 }
 
+/// Unknown flags retain the documented envelope and subcommand examples.
+#[test]
+fn parse_error_uses_documented_envelope_and_subcommand_examples() {
+    for (args, prefix) in [
+        (&["models", "install", "--json"][..], "cass models "),
+        (
+            &["stats", "--json", "--nonexistent-flag"][..],
+            "cass stats ",
+        ),
+    ] {
+        let mut cmd = base_cmd();
+        cmd.args(args);
+        let output = cmd.assert().failure().code(2).get_output().clone();
+        assert!(output.stdout.is_empty(), "stdout stays data-only");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let json: Value = serde_json::from_str(stderr.trim()).expect("one JSON error object");
+        assert!(json.get("kind").is_none(), "no top-level kind: {json:#}");
+        let error = &json["error"];
+        assert!(error.is_object(), "error must be an object: {json:#}");
+        assert_eq!(error["code"], 2);
+        assert_eq!(error["kind"], "usage");
+        assert_eq!(error["retryable"], false);
+        assert!(error["hint"].as_str().is_some_and(|h| !h.is_empty()));
+        let examples = error["examples"].as_array().expect("examples array");
+        assert!(!examples.is_empty());
+        for example in examples.iter().filter_map(Value::as_str) {
+            assert!(example.starts_with(prefix), "{args:?} offered {example}");
+        }
+    }
+}
+
 /// Error messages include contextual examples in JSON format
 #[test]
 fn error_messages_include_contextual_examples() {
@@ -7615,7 +7646,13 @@ fn parse_error_intent_ignores_binary_path() {
     let output = cmd.assert().failure().code(2).get_output().clone();
     let stderr = String::from_utf8_lossy(&output.stderr);
     let json: Value = serde_json::from_str(stderr.trim()).expect("valid JSON error");
-    let examples = json["examples"].as_array().expect("examples array");
+    let error = &json["error"];
+    assert_eq!(error["code"], 2, "documented envelope: {json:#}");
+    assert_eq!(error["kind"], "usage", "documented envelope: {json:#}");
+    assert_eq!(error["retryable"], false, "documented envelope: {json:#}");
+    assert!(error["message"].as_str().is_some_and(|m| !m.is_empty()));
+    assert!(error["hint"].as_str().is_some_and(|h| !h.is_empty()));
+    let examples = error["examples"].as_array().expect("examples array");
 
     assert!(
         examples

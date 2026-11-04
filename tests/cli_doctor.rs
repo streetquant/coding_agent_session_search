@@ -4057,10 +4057,11 @@ fn doctor_check_rejects_mutating_or_rebuild_flags() {
     assert!(!out.status.success(), "doctor check must reject --fix");
     let payload = doctor_error_json(&out.stderr);
     assert_eq!(out.status.code(), Some(2));
-    assert_eq!(payload["status"].as_str(), Some("error"));
-    assert_eq!(payload["kind"].as_str(), Some("argument_parsing"));
+    assert_eq!(test_error_code(&payload), Some(2));
+    assert_eq!(payload["error"]["kind"].as_str(), Some("usage"));
+    assert_eq!(payload["error"]["retryable"].as_bool(), Some(false));
     assert!(
-        payload["error"]
+        payload["error"]["detail"]
             .as_str()
             .is_some_and(|message| message.contains("--check") && message.contains("--fix")),
         "parse error should explain the rejected mutating check flags: {payload:#}"
@@ -5063,6 +5064,168 @@ fn doctor_fix_refuses_repeated_repair_when_failure_marker_exists() {
     assert!(
         marker_path.exists(),
         "repeat refusal must preserve the original failure marker"
+    );
+}
+
+/// GH #374: reconstruct from verified raw sources without mutating the broken
+/// archive, promote the candidate, and reindex without duplicating sessions.
+#[test]
+fn doctor_fix_candidate_build_on_unreadable_archive_leaves_promotion_unblocked() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let home = test_home.path();
+    let data_dir = home.join("cass-data");
+    let data = data_dir.to_str().expect("utf8");
+    for (index, keyword) in ["zpalpha", "zpbravo", "zpcharlie"].iter().enumerate() {
+        util::seed_codex_session(
+            &home.join(".codex"),
+            &format!("rollout-zp0fp-{index}.jsonl"),
+            keyword,
+            true,
+        );
+    }
+    let run = |args: &[&str]| {
+        cass_cmd(home)
+            .args(args)
+            .args(["--data-dir", data])
+            .env("CASS_AUTO_REFRESH", "0")
+            .output()
+            .expect("run cass")
+    };
+    let indexed = run(&["index", "--full", "--json"]);
+    assert!(indexed.status.success(), "{indexed:?}");
+    let counts = |output: std::process::Output| {
+        assert!(output.status.success(), "stats failed: {output:?}");
+        let stats: Value = serde_json::from_slice(&output.stdout).expect("stats JSON");
+        let conversations = stats["conversations"].as_u64().expect("conversation count");
+        let messages = stats["messages"].as_u64().expect("message count");
+        (conversations, messages)
+    };
+    let indexed_counts = counts(run(&["stats", "--json"]));
+    assert_eq!(
+        indexed_counts.0, 3,
+        "all three fixture sessions were indexed"
+    );
+    assert!(indexed_counts.1 > 0, "the fixture has indexed messages");
+
+    let db_path = data_dir.join("agent_search.db");
+    let mut damaged = fs::read(&db_path).expect("read archive");
+    damaged[..100].fill(0);
+    fs::write(&db_path, &damaged).expect("damage archive header");
+
+    let checked = run(&["doctor", "check", "--json"]);
+    let checked_payload: Value =
+        serde_json::from_slice(&checked.stdout).expect("doctor check JSON");
+    let check_action = checked_payload["recommended_action"]
+        .as_str()
+        .expect("recommended_action");
+    assert!(
+        check_action.contains("'cass doctor --fix --json'"),
+        "{checked_payload:#}"
+    );
+    assert!(
+        !check_action.contains("process-isolated"),
+        "{checked_payload:#}"
+    );
+
+    let fixed = run(&["doctor", "--json", "--fix"]);
+    let fixed_payload: Value = serde_json::from_slice(&fixed.stdout).expect("doctor --fix JSON");
+    let fix_action = fixed_payload["recommended_action"]
+        .as_str()
+        .expect("recommended_action");
+    assert!(
+        fix_action.contains("'cass doctor repair --dry-run --json'"),
+        "the candidate's next step is its promotion plan: {fixed_payload:#}"
+    );
+    assert!(
+        !fix_action.contains("process-isolated"),
+        "{fixed_payload:#}"
+    );
+    assert!(
+        fixed_payload["auto_fix_actions"]
+            .as_array()
+            .expect("auto_fix_actions")
+            .iter()
+            .any(|action| action
+                .as_str()
+                .is_some_and(|text| text.starts_with("Built isolated reconstruct candidate"))),
+        "an unreadable archive with a verified raw mirror gets a candidate: {fixed_payload:#}"
+    );
+    assert_ne!(
+        fixed_payload["operation_outcome"]["kind"].as_str(),
+        Some("verification-failed"),
+        "building a candidate is not a failed live repair: {fixed_payload:#}"
+    );
+    let markers = data_dir.join("doctor").join("failure-markers");
+    assert!(
+        !markers.exists() || fs::read_dir(&markers).expect("markers").next().is_none(),
+        "no failure marker may block the promotion"
+    );
+    assert_eq!(
+        fs::read(&db_path).expect("reread archive"),
+        damaged,
+        "doctor --fix leaves the live archive untouched"
+    );
+
+    let planned = run(&["doctor", "repair", "--dry-run", "--json"]);
+    let plan = serde_json::from_slice::<Value>(&planned.stdout).expect("repair dry-run JSON")
+        ["repair_plan"]
+        .clone();
+    assert!(
+        plan["planned_actions"]
+            .as_array()
+            .expect("planned actions")
+            .iter()
+            .any(|action| action["action_kind"] == "promote_reconstruct_candidate_archive_bundle"),
+        "{plan:#}"
+    );
+    assert_eq!(plan["blocked_reasons"], json!([]), "{plan:#}");
+    let fingerprint = plan["plan_fingerprint"].as_str().expect("fingerprint");
+    let applied = run(&[
+        "doctor",
+        "repair",
+        "--yes",
+        "--plan-fingerprint",
+        fingerprint,
+        "--json",
+    ]);
+    let applied_payload: Value = serde_json::from_slice(&applied.stdout).expect("repair JSON");
+    assert_ne!(
+        applied_payload["operation_outcome"]["kind"].as_str(),
+        Some("repair-refused"),
+        "{applied_payload:#}"
+    );
+    let health = run(&["health", "--json"]);
+    assert!(health.status.success(), "{health:?}");
+    let search = run(&["search", "zpbravo", "--robot", "--mode", "lexical"]);
+    assert!(search.status.success(), "{search:?}");
+    let hits: Value = serde_json::from_slice(&search.stdout).expect("search JSON");
+    assert!(
+        !hits["hits"].as_array().expect("hits").is_empty(),
+        "the promoted archive answers searches: {hits:#}"
+    );
+    assert_eq!(counts(run(&["stats", "--json"])), indexed_counts);
+    assert!(
+        hits["hits"]
+            .as_array()
+            .expect("hits")
+            .iter()
+            .all(|hit| !hit["title"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("Recovered")),
+        "connector parsing preserves session identity: {hits:#}"
+    );
+    let reindexed = run(&["index", "--json"]);
+    assert!(reindexed.status.success(), "{reindexed:?}");
+    assert_eq!(counts(run(&["stats", "--json"])), indexed_counts);
+
+    // Old db links survive promotion, but their ids may now name other sources.
+    let rechecked = run(&["doctor", "check", "--json"]);
+    let rechecked: Value = serde_json::from_slice(&rechecked.stdout).expect("doctor check JSON");
+    assert_eq!(
+        rechecked["raw_mirror_backfill"]["changed_source_hash_count"], 0,
+        "{:#}",
+        rechecked["raw_mirror_backfill"]
     );
 }
 

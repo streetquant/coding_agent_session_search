@@ -1005,6 +1005,69 @@ mod publication_tests {
         reader.execute("ROLLBACK").unwrap();
         reader.close_without_checkpoint().unwrap();
         require_candidate_without_sidecars(&candidate).unwrap();
+        let candidate_before = fs::read(&candidate).unwrap();
+        let stock_uri = {
+            let mut url = url::Url::from_file_path(&candidate)
+                .map_err(|_| anyhow::anyhow!("cannot build stock sqlite URI"))
+                .unwrap();
+            url.query_pairs_mut()
+                .append_pair("mode", "ro")
+                .append_pair("immutable", "1");
+            url.to_string()
+        };
+        let integrity = std::process::Command::new("sqlite3")
+            .args(["-batch", "-json", &stock_uri, "PRAGMA integrity_check"])
+            .output()
+            .expect("stock sqlite3 must be present");
+        assert!(
+            integrity.status.success(),
+            "stock sqlite3 integrity failed: {}",
+            String::from_utf8_lossy(&integrity.stderr)
+        );
+        let integrity_rows: serde_json::Value =
+            serde_json::from_slice(&integrity.stdout).expect("stock integrity JSON");
+        assert_eq!(integrity_rows.as_array().unwrap().len(), 1);
+        assert_eq!(integrity_rows[0]["integrity_check"].as_str().unwrap(), "ok");
+        let fk = std::process::Command::new("sqlite3")
+            .args(["-batch", "-json", &stock_uri, "PRAGMA foreign_key_check"])
+            .output()
+            .expect("stock sqlite3 must be present");
+        assert!(
+            fk.status.success(),
+            "stock sqlite3 foreign_key_check failed: {}",
+            String::from_utf8_lossy(&fk.stderr)
+        );
+        let fk_text = String::from_utf8_lossy(&fk.stdout);
+        assert!(
+            fk_text.trim().is_empty() || fk_text.trim() == "[]",
+            "stock foreign_key_check must have no violations: {fk_text}"
+        );
+        let rows = std::process::Command::new("sqlite3")
+            .args([
+                "-batch",
+                "-json",
+                &stock_uri,
+                "SELECT id, body FROM messages ORDER BY id",
+            ])
+            .output()
+            .expect("stock sqlite3 must be present");
+        assert!(
+            rows.status.success(),
+            "stock sqlite3 row query failed: {}",
+            String::from_utf8_lossy(&rows.stderr)
+        );
+        let row_rows: serde_json::Value =
+            serde_json::from_slice(&rows.stdout).expect("stock row JSON");
+        let row_array = row_rows.as_array().unwrap();
+        assert_eq!(row_array.len(), 1, "stock row count must be exactly one");
+        assert_eq!(row_array[0]["id"].as_i64().unwrap(), 7);
+        assert_eq!(row_array[0]["body"].as_str().unwrap(), body);
+        assert_eq!(
+            fs::read(&candidate).unwrap(),
+            candidate_before,
+            "stock oracle must not mutate candidate"
+        );
+        require_candidate_without_sidecars(&candidate).unwrap();
         // The writer stays usable; snapshot materialization is not relocation.
         assert_eq!(
             writer

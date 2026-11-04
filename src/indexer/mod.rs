@@ -1,7 +1,6 @@
 pub mod archive_count;
 mod archive_lease;
 pub mod background_refresh;
-#[cfg(test)]
 mod checkpoint_deadline;
 // The GH #379 witness measures Linux resident-set residency (`/proc`), so
 // the module is Linux-only; `crate::daemon` is unix-only too.
@@ -130,6 +129,9 @@ const NON_WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = DEFAULT_STREAMING_BATCH_LIMIT
 const NON_WATCH_INGEST_CHUNK_SIZE_MAX: usize = 128;
 static ROBOT_TRACE_INGEST_ENABLED: AtomicBool = AtomicBool::new(false);
 static ROBOT_TRACE_INGEST_BATCH_N: AtomicU64 = AtomicU64::new(0);
+/// Set only by `cass index --background` without `--semantic`; see
+/// [`set_background_semantic_delta_enabled`].
+static BACKGROUND_SEMANTIC_DELTA_ENABLED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_SESSION_SOURCE_SKIP_OBSERVED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1912,6 +1914,46 @@ pub fn set_robot_trace_ingest_enabled(enabled: bool) -> bool {
     }
     let _ = crate::storage::sqlite::set_message_lookup_trace_enabled(enabled);
     previous
+}
+
+/// Let a background index run extend an existing semantic index by the
+/// messages it just ingested (bead 962e8, GH #458).
+///
+/// Stale-on-read catch-up, the scheduler's incremental job and the daemon
+/// timer all run `cass index --background` without `--semantic`. Every
+/// ingest moves the archive fingerprint past the published semantic index,
+/// and search then refuses semantic results until someone reruns
+/// `cass index --semantic`, so semantic search was off almost all the time
+/// on an active archive. When enabled, a run applies only the existing
+/// one-shot delta path, and only when that path is eligible: never the bulk
+/// re-embed, never an external embedder, and never a failed lexical run.
+/// Returns the previous value so the caller can restore it.
+pub fn set_background_semantic_delta_enabled(enabled: bool) -> bool {
+    BACKGROUND_SEMANTIC_DELTA_ENABLED.swap(enabled, Ordering::Relaxed)
+}
+
+/// The one-shot delta path's own preconditions (see the `--semantic` branch of
+/// `run_index`): the requested embedder's index exists under the current
+/// contract, no identity rebuild is pending, and the embed watermark trails
+/// the newest message. Anything else would need the bulk pass, which a
+/// background run never starts.
+fn background_semantic_delta_eligible(
+    storage: &FrankenStorage,
+    data_dir: &Path,
+    embedder: &str,
+) -> Result<bool> {
+    if storage.semantic_identity_rebuild_required(semantic_identity_tier_for_requested_embedder(
+        embedder,
+    ))? {
+        return Ok(false);
+    }
+    if !semantic_index_has_current_contract(data_dir, embedder) {
+        return Ok(false);
+    }
+    Ok(matches!(
+        (storage.get_last_embedded_message_id()?, storage.max_message_id()?),
+        (Some(watermark), Some(max_id)) if watermark < max_id
+    ))
 }
 
 #[derive(Debug)]
@@ -9576,22 +9618,33 @@ fn expected_appended_lexical_docs(
 ) -> Result<usize> {
     // The per-message cap makes every message's classification independent of
     // every other, so only the rows appended since the memo need classifying:
-    // a rowid-range scan over them, never a JOIN (fsqlite's join path used to
+    // stream them once, never a JOIN (fsqlite's join path used to
     // materialize every message row, content included: 20+ minutes on an
     // 8M-message archive) and never the older text of a touched conversation.
-    let touched: Vec<i64> = storage
-        .raw()
-        .query_map_collect(
-            "SELECT DISTINCT conversation_id FROM messages WHERE id > ?1",
-            &[ParamValue::from(after_message_id)],
-            |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
-        )
-        .context("listing conversations touched since the expected lexical docs memo")?;
+    // GH #539: collect per-conversation counts from that same stream instead
+    // of first issuing a DISTINCT query over messages. Only counters survive
+    // each callback; memory scales with touched conversations, not their text.
+    let mut appended_by_conversation = HashMap::<i64, usize>::new();
+    storage.for_each_lexical_rebuild_message_after_id(
+        after_message_id,
+        |conversation_id, message| {
+            let is_tool_role = matches!(message.role, crate::model::types::MessageRole::Tool);
+            if !is_hard_message_noise(lexical_rebuild_noise_role(is_tool_role), &message.content) {
+                let count = appended_by_conversation.entry(conversation_id).or_default();
+                *count = count.saturating_add(1);
+            }
+            Ok(())
+        },
+    )?;
     // Live conversations only, like the full scan (orphaned rows are never
-    // indexed): one point lookup per touched conversation, resolved before the
-    // row stream so no query runs inside its callback.
-    let mut live_conversations = HashSet::with_capacity(touched.len());
-    for conversation_id in touched.into_iter().filter(|id| include(*id)) {
+    // indexed): one point lookup per included conversation with non-noise
+    // appends. Resolve these AFTER the stream, never from inside its callback
+    // while the owner connection is still executing the message query.
+    let mut expected_docs = 0usize;
+    for (conversation_id, appended_docs) in appended_by_conversation {
+        if !include(conversation_id) {
+            continue;
+        }
         let live: i64 = storage
             .raw()
             .query_row_map(
@@ -9601,25 +9654,9 @@ fn expected_appended_lexical_docs(
             )
             .context("checking a touched conversation for the expected lexical docs memo")?;
         if live != 0 {
-            live_conversations.insert(conversation_id);
+            expected_docs = expected_docs.saturating_add(appended_docs);
         }
     }
-    let mut expected_docs = 0usize;
-    storage.for_each_lexical_rebuild_message_after_id(
-        after_message_id,
-        |conversation_id, message| {
-            let is_tool_role = matches!(message.role, crate::model::types::MessageRole::Tool);
-            if live_conversations.contains(&conversation_id)
-                && !is_hard_message_noise(
-                    lexical_rebuild_noise_role(is_tool_role),
-                    &message.content,
-                )
-            {
-                expected_docs = expected_docs.saturating_add(1);
-            }
-            Ok(())
-        },
-    )?;
     Ok(expected_docs)
 }
 
@@ -14229,10 +14266,15 @@ impl StreamingCommitPacer {
         }
         self.last_fold_attempt = Some(std::time::Instant::now());
         match t_index.fold_largest_small_run() {
-            Ok(true) => tracing::info!(
-                segments = t_index.segment_count(),
-                "folded lexical segments during streaming ingest"
-            ),
+            Ok(true) => match t_index.segment_count() {
+                Ok(segments) => {
+                    tracing::info!(segments, "folded lexical segments during streaming ingest")
+                }
+                Err(error) => tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "streaming segment merge completed but its segment count could not be read"
+                ),
+            },
             Ok(false) => {}
             Err(error) => {
                 // A failed publication may retain a retry proposal. Preserve
@@ -18121,10 +18163,16 @@ fn run_index_with_storage_ownership(
                             progress.tick_activity();
                         }
                         match t_index.optimize_if_idle() {
-                            Ok(true) => tracing::info!(
-                                segments = t_index.segment_count(),
-                                "folded lexical segments after incremental index run (#441)"
-                            ),
+                            Ok(true) => match t_index.segment_count() {
+                                Ok(segments) => tracing::info!(
+                                    segments,
+                                    "folded lexical segments after incremental index run (#441)"
+                                ),
+                                Err(err) => tracing::warn!(
+                                    error = %format!("{err:#}"),
+                                    "lexical segment count unavailable after incremental fold"
+                                ),
+                            },
                             Ok(false) => {}
                             Err(err) => tracing::warn!(
                                 error = %format!("{err:#}"),
@@ -18690,6 +18738,69 @@ fn run_index_with_storage_ownership(
                 vector_count,
                 vector_count,
             );
+        }
+    } else if BACKGROUND_SEMANTIC_DELTA_ENABLED.load(Ordering::Relaxed)
+        && !opts.full
+        && !opts.watch
+        && !targeted_semantic_watch_once
+        && !scan_had_errors
+        && opts.embedder != "external"
+    {
+        // Delta-only and non-fatal (see set_background_semantic_delta_enabled):
+        // the bulk pass under `opts.semantic` is deliberately unreachable here.
+        // `!scan_had_errors` enforces the documented "never a failed lexical
+        // run": a partial scan must not publish a semantic delta that would
+        // certify coverage over ingest the caller reports as incomplete.
+        match background_semantic_delta_eligible(&storage, &opts.data_dir, &opts.embedder) {
+            Ok(true) => {
+                if let Err(err) =
+                    index_run_lock.set_phase(initial_lock_mode, "semantic:background-delta")
+                {
+                    tracing::debug!(
+                        error = %err,
+                        "background semantic delta breadcrumb write failed (continuing)"
+                    );
+                }
+                let delta_started_at_ms = semantic_indexing_now_ms();
+                let storage_cell = Mutex::new(storage);
+                let outcome =
+                    incremental_semantic_embed(&opts.embedder, &opts.data_dir, &storage_cell);
+                storage = storage_cell
+                    .into_inner()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match outcome.and_then(|embedded| {
+                    finalize_one_shot_semantic_delta(
+                        &opts.embedder,
+                        &opts.data_dir,
+                        &storage,
+                        delta_started_at_ms,
+                    )
+                    .map(|doc_count| (embedded, doc_count))
+                }) {
+                    Ok((embedded, doc_count)) => tracing::info!(
+                        embedder = %opts.embedder,
+                        embedded,
+                        doc_count,
+                        "background semantic delta kept the semantic index current"
+                    ),
+                    Err(err) => tracing::warn!(
+                        embedder = %opts.embedder,
+                        error = %err,
+                        "background semantic delta failed; lexical indexing is unaffected \
+                         and `cass index --semantic` retries it"
+                    ),
+                }
+            }
+            Ok(false) => tracing::debug!(
+                embedder = %opts.embedder,
+                "background semantic delta not eligible: no current semantic index with a \
+                 trailing embed watermark"
+            ),
+            Err(err) => tracing::warn!(
+                embedder = %opts.embedder,
+                error = %err,
+                "background semantic delta eligibility check failed; skipping it"
+            ),
         }
     }
 
@@ -20048,12 +20159,11 @@ pub(crate) const CASS_TEST_WAL_CHECKPOINT_PARK_MS_ENV: &str = "CASS_TEST_WAL_CHE
 /// [`checkpoint_wal_truncate`] with a wall-clock deadline (GH #382, bead
 /// g3zyo). On the owner-scale archive with a 200 MB WAL, frankensqlite's
 /// writable open never returns, which turned `cass doctor --fix` into an
-/// infinite hang. The checkpoint runs on the same disposable worker as the
-/// stall-abort checkpoint; if it has not finished by `deadline`, the child is
-/// killed and reaped before the caller receives a timeout and its out-of-band
-/// remedy. No DB/WAL-holding worker survives that deadline, and the caller
-/// receives a truthful terminal state even when the native operation cannot be
-/// cancelled.
+/// infinite hang. The checkpoint stays on the caller thread under its own
+/// canonical archive lease. Its owned timer exits 70 on timeout, preserving
+/// the terminal doctor contract without releasing ownership while database
+/// open, SQL or close could still resume. Return and unwind disarm and join
+/// the timer before releasing the lease.
 pub(crate) fn checkpoint_wal_truncate_with_deadline(
     db_path: &Path,
     context: &str,
@@ -20064,18 +20174,22 @@ pub(crate) fn checkpoint_wal_truncate_with_deadline(
     // be nonblocking here: an index owner may itself be awaiting that doctor
     // lock, so waiting for its archive lease would invert the lock order.
     let _archive_write_lease = acquire_archive_write_lease(db_path)?;
-    match run_bounded_native_wal_checkpoint(db_path.to_path_buf(), deadline, context) {
-        AbortWalCheckpointAttempt::Finished(Ok(outcome)) => {
-            Ok(matches!(outcome, FinalWalCheckpointOutcome::Completed))
-        }
-        AbortWalCheckpointAttempt::Finished(Err(error)) => Err(anyhow::anyhow!("{error}")),
-        AbortWalCheckpointAttempt::TimedOut => Err(anyhow::anyhow!(
-            "WAL checkpoint after {context} timed out; its child was terminated and reaped"
-        )),
-        AbortWalCheckpointAttempt::WorkerUnavailable(error) => Err(anyhow::anyhow!(
-            "WAL checkpoint worker was unavailable after {context}: {error}"
-        )),
-    }
+    let diagnostic = serde_json::json!({
+        "success": false,
+        "code": 70,
+        "kind": "wal-checkpoint-timeout",
+        "retryable": true,
+        "db_path": db_path,
+        "context": context,
+        "deadline_ms": deadline.as_millis().min(u128::from(u64::MAX)) as u64,
+        "message": "WAL checkpoint exceeded its deadline; terminating the process before releasing archive ownership. Committed rows remain in the database/WAL for the next run to recover.",
+    })
+    .to_string();
+    let outcome = checkpoint_deadline::run(deadline, diagnostic, || {
+        run_final_wal_checkpoint(db_path, context)
+    })
+    .with_context(|| format!("WAL checkpoint deadline timer was unavailable after {context}"))??;
+    Ok(matches!(outcome, FinalWalCheckpointOutcome::Completed))
 }
 
 #[doc(hidden)]
@@ -22601,7 +22715,7 @@ pub fn run_lexical_segment_gc(data_dir: &Path) -> Result<LexicalSegmentGcReport>
     // orphans and collects aged garbage before it hands the writer back.
     let index = QuillCassIndex::open_or_create(&index_path)
         .with_context(|| format!("opening the lexical writer at {}", index_path.display()))?;
-    let live_segments = index.segment_count();
+    let live_segments = index.segment_count()?;
     drop(index);
 
     let after = quill_directory_footprint(&index_path).with_context(|| {
@@ -26518,10 +26632,12 @@ fn rebuild_tantivy_from_db_once(
     if let Some(p) = &progress {
         p.tick_activity();
     }
+    let candidate_segments =
+        publication.run("count_candidate_segments", || t_index.segment_count())?;
     let merge_started = Instant::now();
     if lexical_post_run_maintenance_skipped_for_test() {
         tracing::warn!(
-            segments = t_index.segment_count(),
+            segments = candidate_segments,
             "post-rebuild segment merge skipped by CASS_TEST_SKIP_POST_RUN_LEXICAL_MAINTENANCE (test hook)"
         );
     } else if let Some(shortfall) = lexical_rebuild_fold_shortfall(&build_path) {
@@ -26529,17 +26645,21 @@ fn rebuild_tantivy_from_db_once(
         // on disk. Without room for that, publish the unmerged generation, as
         // a failed fold already does, instead of filling the filesystem.
         tracing::warn!(
-            segments = t_index.segment_count(),
+            segments = candidate_segments,
             shortfall = %shortfall,
             "skipping the post-rebuild segment fold for lack of disk space; publishing the unmerged generation (#441)"
         );
     } else {
         match t_index.force_merge() {
-            Ok(()) => tracing::info!(
-                merge_ms = merge_started.elapsed().as_millis() as u64,
-                segments = t_index.segment_count(),
-                "folded the rebuilt lexical generation before publish (#441)"
-            ),
+            Ok(()) => {
+                let segments =
+                    publication.run("count_merged_segments", || t_index.segment_count())?;
+                tracing::info!(
+                    merge_ms = merge_started.elapsed().as_millis() as u64,
+                    segments,
+                    "folded the rebuilt lexical generation before publish (#441)"
+                );
+            }
             Err(err) => tracing::warn!(
                 error = %format!("{err:#}"),
                 "segment merge after lexical rebuild failed; publishing the unmerged generation"
@@ -32650,8 +32770,9 @@ pub fn build_scan_roots(storage: Option<&FrankenStorage>, data_dir: &Path) -> Ve
 /// This adds the `cass.origin` field to the conversation's metadata JSON
 /// so that persistence can extract and store the source_id.
 ///
-/// Part of P2.2 - provenance injection.
-fn inject_provenance(conv: &mut NormalizedConversation, origin: &Origin) {
+/// Part of P2.2 - provenance injection. Doctor's raw-mirror reconstruct
+/// stamps re-parsed sources the same way (zp0fp).
+pub(crate) fn inject_provenance(conv: &mut NormalizedConversation, origin: &Origin) {
     // Ensure metadata is an object
     if !conv.metadata.is_object() {
         conv.metadata = serde_json::json!({});
@@ -54878,7 +54999,7 @@ mod tests {
         let (index_path, mut index) = plant_unmerged_quill_index(data_dir, rounds);
         index.force_merge().expect("force merge");
         assert_eq!(
-            index.segment_count(),
+            index.segment_count().expect("segment count"),
             1,
             "merge must leave one live segment"
         );
@@ -55097,7 +55218,7 @@ mod tests {
     fn streaming_commit_folds_small_segments_at_most_once_per_interval() {
         let data_dir = tempfile::tempdir().expect("data dir");
         let (index_path, planted) = plant_unmerged_quill_index(data_dir.path(), 6);
-        let planted_segments = planted.segment_count();
+        let planted_segments = planted.segment_count().expect("planted segment count");
         drop(planted);
         assert!(
             planted_segments >= 6,
@@ -55109,7 +55230,7 @@ mod tests {
         pacer.last_fold_attempt = Some(std::time::Instant::now());
         pacer.commit(Some(&mut t_index)).expect("paced commit");
         assert_eq!(
-            t_index.segment_count(),
+            t_index.segment_count().expect("segment count"),
             planted_segments,
             "a fold attempted inside the spacing interval must be skipped"
         );
@@ -55121,9 +55242,9 @@ mod tests {
             "the attempt must be recorded"
         );
         assert!(
-            t_index.segment_count() < planted_segments,
+            t_index.segment_count().expect("segment count") < planted_segments,
             "the small segments must be folded, still {} of {planted_segments}",
-            t_index.segment_count()
+            t_index.segment_count().expect("segment count")
         );
         assert_eq!(t_index.doc_count().expect("doc count"), 6);
     }
@@ -57846,6 +57967,74 @@ c.close()
             .unwrap();
         assert_eq!(cached(), full());
         assert_eq!(sidecar().delta_generations, 0, "a deletion must recount");
+    }
+
+    #[test]
+    fn gh539_appended_lexical_docs_count_each_live_message_once() -> Result<()> {
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("gh539-delta.db"))?;
+        seed_lexical_rebuild_fixture(&storage);
+        let conversations: Vec<i64> = storage.raw().query_map_collect(
+            "SELECT id FROM conversations ORDER BY id",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+        let (first, second) = (conversations[0], conversations[1]);
+        let before_docs = expected_live_lexical_doc_count(&storage)?;
+        let after_message_id = storage.max_message_id()?.expect("seed messages");
+        assert_eq!(
+            expected_appended_lexical_docs(&storage, after_message_id, |_| true)?,
+            0,
+            "the row at the watermark and all older rows are excluded"
+        );
+
+        // Interleave conversations in rowid order: the stream must aggregate
+        // every message, not just the first row of each touched conversation.
+        storage.raw().execute("PRAGMA foreign_keys = OFF")?;
+        for (conversation_id, idx, role, content) in [
+            (first, 10, "user", "first appended evidence"),
+            (second, 10, "assistant", "second conversation evidence"),
+            (first, 11, "user", "\u{2003}\n\t"),
+            (first + 1_000_000, 0, "user", "orphaned evidence"),
+            (first, 12, "tool", ""),
+            (first, 13, "assistant", "another appended answer"),
+            (second, 11, "tool", "useful diagnostic output"),
+        ] {
+            storage.raw().execute_compat(
+                "INSERT INTO messages(conversation_id, idx, role, content) VALUES(?1, ?2, ?3, ?4)",
+                &[
+                    ParamValue::from(conversation_id),
+                    ParamValue::from(idx),
+                    ParamValue::from(role),
+                    ParamValue::from(content),
+                ],
+            )?;
+        }
+        let delta = expected_appended_lexical_docs(&storage, after_message_id, |_| true)?;
+        assert_eq!(delta, 4, "noise and orphaned rows cannot certify coverage");
+        assert_eq!(
+            before_docs + delta,
+            expected_live_lexical_doc_count(&storage)?
+        );
+        assert_eq!(
+            expected_appended_lexical_docs(&storage, after_message_id, |id| id <= first)?,
+            2,
+            "a resumed recount adds only appends below its conversation cursor"
+        );
+        assert_eq!(
+            expected_appended_lexical_docs(&storage, after_message_id, |_| false)?,
+            0
+        );
+        assert_eq!(
+            expected_appended_lexical_docs(
+                &storage,
+                storage.max_message_id()?.expect("appended messages"),
+                |_| true,
+            )?,
+            0,
+            "a caught-up watermark has no delta"
+        );
+        Ok(())
     }
 
     /// GH #381 (ntxs1): an interrupted full expected-docs scan resumes from its

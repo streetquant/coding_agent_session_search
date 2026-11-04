@@ -12,9 +12,9 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # These cases exercise the production batched-gate parsers directly. Inputs are
 # terminal-output fixtures, not substitute cargo/ubs executables or live proof.
-if [ "${1:-}" = --batched-only ] || [ "${1:-}" = --formatter-only ]; then
+if [ "${1:-}" = --batched-only ] || [ "${1:-}" = --formatter-only ] || [ "${1:-}" = --source-only ]; then
     proof_dir="$(mktemp -d -t cass-gate-parser.XXXXXX)"
-    gate="$PROJECT_ROOT/scripts/gate.sh"
+    gate="${2:-$PROJECT_ROOT/scripts/gate.sh}"
     pass=0
     fail=0
     check_exit() {
@@ -71,6 +71,70 @@ SH
         [ "$fail" -eq 0 ]
         exit $?
     fi
+
+    # Exercise explicit scanner input identity with real files and retained
+    # broken/directory scratch aliases. Nothing is removed and no scanner or
+    # compiler is replaced. The invalid pin below must still fail in run_ubs.
+    source_root="$proof_dir/scanner-project"
+    mkdir -p "$source_root/scripts" "$source_root/src" "$source_root/.local-state" \
+        "$source_root/.github/workflows"
+    printf 'pub fn selected() {}\n' > "$source_root/src/selected.rs"
+    printf 'pub fn spaced() {}\n' > "$source_root/src/space name.rs"
+    printf 'pub fn newline() {}\n' > "$source_root/src/line
+break.rs"
+    ln -s absent-fixture "$source_root/.local-state/broken"
+    ln -s ../src "$source_root/.local-state/directory-alias"
+    cp "$gate" "$source_root/scripts/gate.sh"
+    cd "$source_root" || exit 1
+    check_exit source-identity-pristine 0 bash "$gate" --verify-ubs-source src/selected.rs
+    before="$(cat "$proof_dir/source-identity-pristine.log")"
+    check_exit source-identity-repeat 0 bash "$gate" --verify-ubs-source src/selected.rs
+    check_exit source-identity-stable 0 cmp -s "$proof_dir/source-identity-pristine.log" "$proof_dir/source-identity-repeat.log"
+    printf '// changed selected input\n' >> src/selected.rs
+    check_exit source-identity-changed 0 bash "$gate" --verify-ubs-source src/selected.rs
+    after="$(cat "$proof_dir/source-identity-changed.log")"
+    check_exit source-identity-detects-bytes 0 test "$before" != "$after"
+    check_exit source-identity-space-newline 0 bash "$gate" --verify-ubs-source 'src/space name.rs' 'src/line
+break.rs'
+    check_exit source-identity-missing 2 bash "$gate" --verify-ubs-source src/missing.rs
+    check_exit source-identity-broken-requested 2 bash "$gate" --verify-ubs-source .local-state/broken
+    check_exit source-identity-directory-requested 2 bash "$gate" --verify-ubs-source .local-state/directory-alias
+    check_exit source-identity-absolute 2 bash "$gate" --verify-ubs-source "$source_root/src/selected.rs"
+    check_exit source-identity-traversal 2 bash "$gate" --verify-ubs-source src/../src/selected.rs
+    check_exit source-identity-empty 2 bash "$gate" --verify-ubs-source
+    cp src/selected.rs src/selected-copy.rs
+    ln -s selected.rs src/selected-alias.rs
+    check_exit source-identity-file-alias 0 bash "$gate" --verify-ubs-source src/selected-alias.rs
+    before="$(cat "$proof_dir/source-identity-file-alias.log")"
+    mv --no-clobber src/selected-alias.rs src/retained-original-alias.rs
+    ln -s selected-copy.rs src/selected-alias.rs
+    check_exit source-identity-rebound-alias 0 bash "$gate" --verify-ubs-source src/selected-alias.rs
+    after="$(cat "$proof_dir/source-identity-rebound-alias.log")"
+    check_exit source-identity-detects-alias 0 test "$before" != "$after"
+    git init --quiet --initial-branch=main
+    git add -- src/selected.rs
+    git -c user.name='CASS gate fixture' -c user.email='cass-gate-fixture@invalid' \
+        -c commit.gpgsign=false commit --quiet -m 'Retained scanner admission fixture'
+    git update-ref refs/remotes/origin/main HEAD
+    printf 'v0.0.0-unreviewed\n' > .github/workflows/ubs-version.txt
+    check_exit scanner-admission-preserves-pin-refusal 1 bash scripts/gate.sh --verify-ubs src/selected.rs
+    check_exit scanner-admission-reaches-pinned-check 0 grep -Fq 'gate: no reviewed UBS runner digest for v0.0.0-unreviewed' \
+        "$proof_dir/scanner-admission-preserves-pin-refusal.log"
+    check_exit scanner-admission-source-identity 0 grep -Fxq 'STAGE=source-identity EXIT=0' \
+        "$proof_dir/scanner-admission-preserves-pin-refusal.log"
+    check_exit scanner-admission-source-stability 0 grep -Fxq 'STAGE=source-stability EXIT=0' \
+        "$proof_dir/scanner-admission-preserves-pin-refusal.log"
+    check_exit scanner-admission-empty 2 bash scripts/gate.sh --verify-ubs
+    check_exit scanner-admission-missing 2 bash scripts/gate.sh --verify-ubs src/missing.rs
+    check_exit scanner-admission-keeps-broken-alias 0 test -L .local-state/broken
+    check_exit scanner-admission-keeps-directory-alias 0 test -L .local-state/directory-alias
+    cd "$PROJECT_ROOT" || exit 1
+    if [ "${1:-}" = --source-only ]; then
+        echo "Scanner source gate: PASS=$pass FAIL=$fail fixtures=$proof_dir"
+        [ "$fail" -eq 0 ]
+        exit $?
+    fi
+
     # Exercise the production transport decoder with real shell execution.
     # Decode failures must not execute even a completely emitted command.
     cat > "$proof_dir/remote-script.sh" <<'REMOTE'

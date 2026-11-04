@@ -1977,6 +1977,23 @@ fn stats_json_missing_db_error_envelope_matches_golden() {
 }
 
 #[test]
+fn parse_error_robot_envelope_matches_golden() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let out = cass_cmd(test_home.path())
+        .args(["stats", "--json", "--nonexistent-flag"])
+        .output()
+        .expect("run cass stats --json --nonexistent-flag");
+    assert_eq!(out.status.code(), Some(2), "parse errors exit 2");
+    assert!(out.stdout.is_empty(), "stdout stays data-only");
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim())
+        .expect("parse error envelope is one JSON object on stderr");
+    let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
+    let scrubbed = scrub_robot_json(&canonical, test_home.path());
+    assert_golden("robot/parse_error_envelope.json.golden", &scrubbed);
+}
+
+#[test]
 fn stats_json_happy_path_matches_golden() -> Result<(), Box<dyn Error>> {
     // `coding_agent_session_search-zefv4`: the error envelope has been
     // pinned (stats_missing_db* goldens) but the success envelope had no
@@ -2654,7 +2671,7 @@ fn models_verify_json_not_acquired_shape_matches_golden() {
 }
 
 #[test]
-fn models_check_update_json_not_installed_shape_matches_golden() {
+fn models_check_update_json_not_installed_shape_matches_golden() -> Result<(), Box<dyn Error>> {
     // Empty data_dir ⇒ `cass models check-update --json` returns
     // `reason=model_not_installed` with current_revision=null +
     // latest_revision=<pinned sha>. Shape golden pins the 4-field
@@ -2671,7 +2688,7 @@ fn models_check_update_json_not_installed_shape_matches_golden() {
         ])
         .output()
         .expect("run cass models check-update --json");
-    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    let stdout = String::from_utf8(out.stdout)?;
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|err| {
         panic!("models check-update stdout is not JSON: {err}\nstdout:\n{stdout}")
     });
@@ -2681,4 +2698,5 @@ fn models_check_update_json_not_installed_shape_matches_golden() {
         "robot/models_check_update_not_installed_shape.json.golden",
         &canonical,
     );
+    Ok(())
 }

@@ -6334,10 +6334,26 @@ fn format_friendly_parse_error(err: clap::Error, raw: &[String], normalized: &[S
     let intent = detect_command_intent(&raw_str);
 
     if is_robot {
+        // Parse failures use the same documented envelope as other robot errors.
+        let detail = err.to_string();
+        let message = detail
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(|line| line.trim_start_matches("error:").trim().to_string())
+            .filter(|line| !line.is_empty())
+            .unwrap_or_else(|| "could not parse arguments".to_string());
+        let hints = get_contextual_hints(&intent, &raw_str);
+        let hint = hints.first().cloned().unwrap_or_else(|| {
+            "Run `cass --help` or `cass robot-docs commands` for valid syntax.".to_string()
+        });
         let mut err_map = serde_json::Map::new();
-        err_map.insert("status".into(), "error".into());
-        err_map.insert("error".into(), err.to_string().into());
-        err_map.insert("kind".into(), "argument_parsing".into());
+        err_map.insert("code".into(), 2.into());
+        err_map.insert("kind".into(), CliErrorKind::Usage.kind_str().into());
+        err_map.insert("message".into(), message.into());
+        err_map.insert("hint".into(), hint.into());
+        err_map.insert("retryable".into(), false.into());
+        err_map.insert("detail".into(), detail.into());
 
         if raw != normalized && normalized.len() > 1 {
             err_map.insert(
@@ -6350,8 +6366,7 @@ fn format_friendly_parse_error(err: clap::Error, raw: &[String], normalized: &[S
         let examples = get_contextual_examples(&intent);
         err_map.insert("examples".into(), serde_json::json!(examples));
 
-        // Context-aware hints
-        let hints = get_contextual_hints(&intent, &raw_str);
+        // The first contextual hint is also the envelope's single `hint`.
         err_map.insert("hints".into(), serde_json::json!(hints));
 
         // Common mistakes for this intent
@@ -6368,7 +6383,8 @@ fn format_friendly_parse_error(err: clap::Error, raw: &[String], normalized: &[S
             }),
         );
 
-        return serde_json::to_string_pretty(&err_map).unwrap_or_else(|_| err.to_string());
+        return serde_json::to_string_pretty(&serde_json::json!({ "error": err_map }))
+            .unwrap_or_else(|_| err.to_string());
     }
 
     // Human-readable format
@@ -6399,13 +6415,34 @@ fn format_friendly_parse_error(err: clap::Error, raw: &[String], normalized: &[S
 }
 
 /// Detect the likely command intent from the raw argument string.
+/// Recognized subcommands take precedence over substring guesses: `models`
+/// contains `ls`, and a robot flag alone does not imply a documentation request.
 fn detect_command_intent(raw_str: &str) -> String {
-    if matches!(
-        raw_str.split_whitespace().next(),
-        Some("index" | "rebuild" | "reindex")
-    ) {
-        "rebuild or manage the search index".to_string()
-    } else if raw_str.contains("search")
+    let intent = match raw_str
+        .split_whitespace()
+        .find(|token| !token.starts_with('-'))
+    {
+        Some("index" | "rebuild" | "reindex" | "idx") => "rebuild or manage the search index",
+        Some("search" | "find" | "query" | "q" | "grep" | "lookup") => {
+            "search for sessions or messages"
+        }
+        Some("sessions" | "session" | "current") => "discover or list session files",
+        Some("robot-docs" | "docs" | "help-robot" | "robotdocs") => "get robot-mode documentation",
+        Some("stats" | "ls" | "list" | "info" | "summary") => "showing statistics",
+        Some("view" | "show" | "get" | "read" | "expand") => "view a specific session",
+        Some("capabilities" | "caps" | "cap" | "introspect" | "inspect" | "intro") => {
+            "discover tool capabilities"
+        }
+        Some("diag" | "diagnose" | "debug" | "doctor") => "run diagnostics",
+        Some("status" | "st" | "state") => "check status",
+        Some("health") => "run health check",
+        Some("models") => "manage semantic models",
+        _ => "",
+    };
+    if !intent.is_empty() {
+        return intent.to_string();
+    }
+    if raw_str.contains("search")
         || raw_str.contains("find")
         || raw_str.contains("query")
         || raw_str.contains("grep")
@@ -6416,7 +6453,7 @@ fn detect_command_intent(raw_str: &str) -> String {
     } else if raw_str.contains("doc") || raw_str.contains("help") || raw_str.contains("robot") {
         "get robot-mode documentation".to_string()
     } else if raw_str.contains("stats") || raw_str.contains("ls") || raw_str.contains("list") {
-        "view statistics or list sessions".to_string()
+        "showing statistics".to_string()
     } else if raw_str.contains("index")
         || raw_str.contains("rebuild")
         || raw_str.contains("reindex")
@@ -6476,6 +6513,12 @@ fn get_contextual_examples(intent: &str) -> Vec<&'static str> {
             "cass stats --robot",
             "cass stats --robot --source local",
             "cass stats --robot --by-source",
+        ]
+    } else if intent.contains("models") {
+        vec![
+            "cass models status --json",
+            "cass models install --yes",
+            "cass models verify --json",
         ]
     } else if intent.contains("capabilities") {
         vec!["cass capabilities --json", "cass introspect --json"]
@@ -6537,7 +6580,32 @@ fn get_contextual_hints(intent: &str, raw_str: &str) -> Vec<String> {
     }
 
     if hints.is_empty() {
-        hints.push(format!("For {intent}, try: cass --robot-help"));
+        const SUBCOMMANDS_WITH_HELP: &[&str] = &[
+            "index",
+            "search",
+            "sessions",
+            "robot-docs",
+            "stats",
+            "view",
+            "expand",
+            "capabilities",
+            "introspect",
+            "diag",
+            "doctor",
+            "status",
+            "health",
+            "models",
+        ];
+        let subcommand = raw_str
+            .split_whitespace()
+            .find(|token| !token.starts_with('-'))
+            .filter(|token| SUBCOMMANDS_WITH_HELP.contains(token));
+        hints.push(match subcommand {
+            Some(sub) => format!(
+                "Run `cass {sub} --help` for the flags `{sub}` accepts, or `cass robot-docs commands` for every command"
+            ),
+            None => format!("For {intent}, try: cass --robot-help"),
+        });
     }
 
     hints
@@ -6719,8 +6787,13 @@ mod canonical_top_level_command_tests {
             let args = ["cass", "index", "--semantic", "--approximate", format].map(str::to_string);
             let error = Cli::try_parse_from(&args).expect_err("query-only flag rejected");
             let output = format_friendly_parse_error(error, &args, &args);
-            let payload: serde_json::Value = serde_json::from_str(&output).expect("error JSON");
-            assert_eq!(payload["kind"], "argument_parsing");
+            let envelope: serde_json::Value = serde_json::from_str(&output).expect("error JSON");
+            let payload = &envelope["error"];
+            assert_eq!(payload["code"], 2);
+            assert_eq!(payload["kind"], "usage");
+            assert_eq!(payload["retryable"], false);
+            assert!(payload["message"].as_str().is_some_and(|m| !m.is_empty()));
+            assert!(payload["hint"].as_str().is_some_and(|h| !h.is_empty()));
             let examples = payload["examples"].as_array().expect("examples");
             assert!(!examples.is_empty());
             for example in examples {
@@ -6741,6 +6814,49 @@ mod canonical_top_level_command_tests {
                 let correct = mistake["correct"].as_str().expect("corrected command");
                 assert!(correct.starts_with("cass index "), "{correct}");
                 assert!(Cli::try_parse_from(correct.split_whitespace()).is_ok());
+            }
+        }
+    }
+
+    /// Parse failures retain their subcommand's examples and documented shape.
+    #[test]
+    fn parse_error_examples_follow_the_failing_subcommand() {
+        for (argv, prefix) in [
+            (&["cass", "models", "install", "--json"][..], "cass models "),
+            (
+                &["cass", "stats", "--json", "--nonexistent-flag"][..],
+                "cass stats ",
+            ),
+            (
+                &["cass", "index", "--json", "--no-such-thing"][..],
+                "cass index ",
+            ),
+        ] {
+            let args: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
+            let error = Cli::try_parse_from(&args).expect_err("unknown flag rejected");
+            let output = format_friendly_parse_error(error, &args, &args);
+            let envelope: serde_json::Value = serde_json::from_str(&output).expect("error JSON");
+            assert!(
+                envelope.get("kind").is_none(),
+                "no top-level kind: {output}"
+            );
+            let payload = &envelope["error"];
+            assert!(payload.is_object(), "error must be an object: {output}");
+            assert_eq!(payload["code"], 2);
+            assert_eq!(payload["kind"], "usage");
+            assert_eq!(payload["retryable"], false);
+            let message = payload["message"].as_str().expect("message");
+            assert!(message.contains("unexpected argument"), "{message}");
+            assert!(payload["hint"].as_str().is_some_and(|h| !h.is_empty()));
+            let examples = payload["examples"].as_array().expect("examples");
+            assert!(!examples.is_empty());
+            for example in examples {
+                let example = example.as_str().expect("example command");
+                assert!(example.starts_with(prefix), "{argv:?} offered {example}");
+                assert!(
+                    Cli::try_parse_from(example.split_whitespace()).is_ok(),
+                    "example must parse: {example}"
+                );
             }
         }
     }
@@ -49217,6 +49333,7 @@ fn doctor_recommended_action_for_reports(
     operation_state: &DoctorOperationStateReport,
     coverage_risk: &DoctorCoverageRiskSummary,
     checks: &[DoctorCheckReport],
+    candidate_staging: &DoctorCandidateStagingReport,
 ) -> Option<String> {
     if initialized_action.is_some() {
         return initialized_action;
@@ -49226,6 +49343,21 @@ fn doctor_recommended_action_for_reports(
         || operation_state.mutation_blocked_reason.is_some()
     {
         return Some(operation_state.next_action.clone());
+    }
+    if doctor_repair_select_completed_candidate_for_promotion(candidate_staging).is_some() {
+        return Some(
+            "A completed isolated reconstruct candidate exists; review the dry-run plan before any promotion: 'cass doctor repair --dry-run --json'."
+                .to_string(),
+        );
+    }
+    if checks
+        .iter()
+        .any(|check| check.name == "candidate_staging" && check.fix_available)
+    {
+        return Some(
+            "Verified candidate-only authority is available; build the isolated candidate with 'cass doctor --fix --json' (it does not replace the live archive)."
+                .to_string(),
+        );
     }
     if coverage_risk.recommended_action != "none" {
         return Some(coverage_risk.recommended_action.clone());
@@ -54376,13 +54508,17 @@ fn doctor_raw_mirror_existing_evidence(
     }
 }
 
+/// A replaced archive can assign a conversation id to a different source.
+/// A db link is evidence only for the conversation at the link's source path;
+/// stale ids fall through to the source-key lookup (zp0fp).
 fn doctor_raw_mirror_existing_evidence_maps(
     raw_mirror: &DoctorRawMirrorReport,
 ) -> (
-    HashMap<i64, DoctorRawMirrorExistingEvidence>,
+    HashMap<(i64, String), DoctorRawMirrorExistingEvidence>,
     HashMap<String, DoctorRawMirrorExistingEvidence>,
 ) {
-    let mut by_conversation_id: HashMap<i64, DoctorRawMirrorExistingEvidence> = HashMap::new();
+    let mut by_conversation_id: HashMap<(i64, String), DoctorRawMirrorExistingEvidence> =
+        HashMap::new();
     let mut by_source_key: HashMap<String, DoctorRawMirrorExistingEvidence> = HashMap::new();
 
     for manifest in raw_mirror
@@ -54393,8 +54529,15 @@ fn doctor_raw_mirror_existing_evidence_maps(
         let linked_evidence = doctor_raw_mirror_existing_evidence(manifest, true);
         for link in &manifest.db_links {
             if let Some(conversation_id) = link.conversation_id {
+                let linked_path = link
+                    .source_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .unwrap_or_else(|| manifest.original_path.trim())
+                    .to_string();
                 by_conversation_id
-                    .entry(conversation_id)
+                    .entry((conversation_id, linked_path))
                     .and_modify(|existing| {
                         if doctor_raw_mirror_evidence_is_newer(&linked_evidence, existing) {
                             *existing = linked_evidence.clone();
@@ -54535,7 +54678,7 @@ fn doctor_raw_mirror_backfill_live_source_changed(
 fn doctor_raw_mirror_backfill_candidate_receipt(
     data_dir: &Path,
     candidate: &DoctorRawMirrorBackfillCandidate,
-    by_conversation_id: &HashMap<i64, DoctorRawMirrorExistingEvidence>,
+    by_conversation_id: &HashMap<(i64, String), DoctorRawMirrorExistingEvidence>,
     by_source_key: &HashMap<String, DoctorRawMirrorExistingEvidence>,
     source_stat_cache: &mut HashMap<PathBuf, DoctorRawMirrorBackfillSourceStatSnapshot>,
     apply: bool,
@@ -54618,7 +54761,9 @@ fn doctor_raw_mirror_backfill_candidate_receipt(
     receipt.source_stat_snapshot = Some(source_stat.clone());
     receipt.source_missing = !source_stat.exists;
 
-    if let Some(evidence) = by_conversation_id.get(&candidate.conversation_id) {
+    if let Some(evidence) =
+        by_conversation_id.get(&(candidate.conversation_id, source_path.clone()))
+    {
         doctor_raw_mirror_backfill_mark_existing_evidence(&mut receipt, evidence);
         receipt.raw_mirror_db_linked = true;
         receipt.parse_loss_unknown = false;
@@ -57093,6 +57238,162 @@ fn doctor_candidate_conversation_from_raw_mirror(
         origin_host,
     }
 }
+/// Re-reads verified raw-mirror sources through their providers' connectors
+/// for one candidate build (zp0fp). It caches each provider's connector and
+/// detected roots and owns the scratch tree the source copies are parsed
+/// from; the tree is removed when the build drops it.
+struct DoctorConnectorReparse {
+    scratch: tempfile::TempDir,
+    providers: HashMap<String, Option<DoctorReparseConnector>>,
+}
+
+/// A provider's connector and the roots it detects on this machine.
+type DoctorReparseConnector = (Box<dyn crate::connectors::Connector + Send>, Vec<PathBuf>);
+
+impl DoctorConnectorReparse {
+    fn new(candidate_dir: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            scratch: tempfile::Builder::new()
+                .prefix(".connector-reparse-")
+                .tempdir_in(candidate_dir)?,
+            providers: HashMap::new(),
+        })
+    }
+
+    /// The source as the indexer would read it at its original path: the
+    /// verified bytes are written under a scratch root at the same path
+    /// relative to the root the provider's connector detects, scanned by
+    /// that connector, and given back their original source path and local
+    /// provenance. The rows then carry the connector's agent, conversation
+    /// identity (`external_id`), titles and roles, so the next `cass index`
+    /// of the untouched source updates them instead of adding a second copy
+    /// of every session. `Err` names why a source does not qualify (not
+    /// local, no registered connector, outside every detected root, or not
+    /// parseable); the caller keeps the lossless line salvage for it.
+    fn conversations(
+        &mut self,
+        manifest: &DoctorRawMirrorManifestReport,
+        bytes: &[u8],
+    ) -> std::result::Result<Vec<crate::connectors::NormalizedConversation>, String> {
+        if manifest.origin_kind != "local" {
+            return Err(format!("its origin is {}, not local", manifest.origin_kind));
+        }
+        let provider = match doctor_normalized_provider_slug(&manifest.provider).as_str() {
+            // The connector registry keys Claude Code as `claude`.
+            "claude_code" => "claude".to_string(),
+            other => other.to_string(),
+        };
+        let entry = self.providers.entry(provider.clone()).or_insert_with(|| {
+            crate::connectors::get_connector_factories()
+                .into_iter()
+                .find(|(name, _)| *name == provider)
+                .map(|(_, factory)| {
+                    let connector = factory();
+                    let roots = connector.detect().root_paths;
+                    (connector, roots)
+                })
+        });
+        let Some((connector, roots)) = entry.as_ref() else {
+            return Err(format!("no connector is registered as {provider}"));
+        };
+        let original = Path::new(&manifest.original_path);
+        let Some((original_root, relative)) = roots
+            .iter()
+            .filter_map(|root| {
+                original
+                    .strip_prefix(root)
+                    .ok()
+                    .filter(|relative| relative.components().next().is_some())
+                    .map(|relative| (root, relative))
+            })
+            .min_by_key(|(_, relative)| relative.components().count())
+        else {
+            return Err(format!(
+                "it is outside every root the {provider} connector detects"
+            ));
+        };
+        let staged_dir = self.scratch.path().join(&manifest.manifest_id);
+        let staged_root = staged_dir.join("root");
+        let staged = staged_root.join(relative);
+        let parent = staged
+            .parent()
+            .ok_or_else(|| "its staged copy has no parent directory".to_string())?;
+        std::fs::create_dir_all(parent)
+            .and_then(|()| std::fs::write(&staged, bytes))
+            .map_err(|err| format!("staging a copy for its connector failed: {err}"))?;
+        let ctx = crate::connectors::ScanContext::with_roots(
+            staged_dir.join("data"),
+            vec![crate::connectors::ScanRoot::local(staged_root.clone())],
+            None,
+        );
+        let mut conversations = connector
+            .scan(&ctx)
+            .map_err(|err| format!("the {provider} connector could not parse it: {err:#}"))?;
+        if conversations.is_empty() {
+            return Err(format!(
+                "the {provider} connector found no conversation in it"
+            ));
+        }
+        let canonical_root = staged_root.canonicalize().ok();
+        for conversation in &mut conversations {
+            let relative = conversation
+                .source_path
+                .strip_prefix(&staged_root)
+                .ok()
+                .or_else(|| {
+                    canonical_root
+                        .as_deref()
+                        .and_then(|root| conversation.source_path.strip_prefix(root).ok())
+                })
+                .map(Path::to_path_buf)
+                .ok_or_else(|| {
+                    format!(
+                        "the {provider} connector returned a conversation from outside the staged source"
+                    )
+                })?;
+            conversation.source_path = original_root.join(relative);
+            crate::indexer::inject_provenance(conversation, &crate::connectors::Origin::local());
+        }
+        Ok(conversations)
+    }
+}
+
+/// zp0fp: a source is re-read by its connector only when it is local, its
+/// provider has a registered connector, and it lies under a root that
+/// connector detects. Otherwise the reason comes back and the build keeps the
+/// line salvage for it.
+#[cfg(test)]
+#[test]
+fn doctor_connector_reparse_reports_why_a_source_keeps_the_line_salvage() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut reparse = DoctorConnectorReparse::new(dir.path()).expect("scratch directory");
+    let mut manifest = doctor_raw_mirror_invalid_manifest_report(
+        dir.path(),
+        &dir.path().join("manifest.json"),
+        String::new(),
+    );
+    manifest.manifest_id = "zp0fp-manifest".to_string();
+    manifest.provider = "codex".to_string();
+    manifest.origin_kind = "ssh".to_string();
+    manifest.original_path = "/zp0fp-nowhere/sessions/rollout-1.jsonl".to_string();
+    let remote = reparse.conversations(&manifest, b"{}").unwrap_err();
+    assert!(remote.contains("its origin is ssh, not local"), "{remote}");
+
+    manifest.origin_kind = "local".to_string();
+    manifest.provider = "zp0fp-unknown-agent".to_string();
+    let unknown = reparse.conversations(&manifest, b"{}").unwrap_err();
+    assert!(
+        unknown.contains("no connector is registered as zp0fp_unknown_agent"),
+        "{unknown}"
+    );
+
+    manifest.provider = "codex".to_string();
+    let outside = reparse.conversations(&manifest, b"{}").unwrap_err();
+    assert!(
+        outside.contains("outside every root the codex connector detects"),
+        "{outside}"
+    );
+}
 
 fn doctor_candidate_copy_raw_mirror_evidence_to_staging(
     context: &DoctorCandidateCopyContext<'_>,
@@ -57237,7 +57538,9 @@ pub(crate) fn reconstruct_archive_from_verified_raw_mirror(
     let mut inserted_messages = 0usize;
     let mut evidence_sources = Vec::new();
     let mut recovered_manifest_indices = Vec::new();
-
+    let scratch_parent = db_path.parent().unwrap_or(data_dir);
+    let mut reparse = DoctorConnectorReparse::new(scratch_parent)
+        .map_err(|err| format!("its connector scratch directory could not be created: {err}"));
     let mut verified_manifests = raw_mirror
         .manifests
         .iter()
@@ -57279,47 +57582,108 @@ pub(crate) fn reconstruct_archive_from_verified_raw_mirror(
                 continue;
             }
         };
-        let conversation =
-            doctor_candidate_conversation_from_raw_mirror(manifest, &bytes, parse_errors);
-        let agent = crate::model::types::Agent {
-            id: None,
-            slug: conversation.agent_slug.clone(),
-            name: conversation.agent_slug.clone(),
-            version: Some("doctor-reconstruct".to_string()),
-            kind: crate::model::types::AgentKind::Cli,
+        let reparsed = match reparse.as_mut() {
+            Ok(reparse) => reparse.conversations(manifest, &bytes),
+            Err(reason) => Err(reason.clone()),
         };
-        let agent_id = storage.ensure_agent(&agent).map_err(|err| {
-            format!(
-                "failed to ensure reconstructed candidate agent {}: {err}",
-                agent.slug
-            )
-        })?;
-        let message_count = conversation.messages.len();
-        let outcome = storage
-            .insert_conversation_tree(agent_id, None, &conversation)
-            .map_err(|err| {
+        // Keep the indexer's transformation and redaction for connector rows.
+        // Unsupported sources retain the existing lossless line salvage.
+        let (conversations, method) = match reparsed {
+            Ok(normalized) => {
+                let mapped = crate::indexer::persist::map_batch_to_internal(
+                    &normalized,
+                    crate::indexer::persist::PersistHeartbeat::NONE,
+                );
+                let workspaces = normalized
+                    .into_iter()
+                    .map(|conversation| conversation.workspace);
+                (
+                    mapped.into_iter().zip(workspaces).collect::<Vec<_>>(),
+                    "connector".to_string(),
+                )
+            }
+            Err(reason) => (
+                vec![(
+                    doctor_candidate_conversation_from_raw_mirror(manifest, &bytes, parse_errors),
+                    None,
+                )],
+                format!("line_salvage ({reason})"),
+            ),
+        };
+        let reparsed = method == "connector";
+        let mut manifest_conversations_inserted = 0usize;
+        let mut manifest_messages = 0usize;
+        let mut last_conversation_id = None;
+        for (mut conversation, workspace) in conversations {
+            if reparsed
+                && let Some(cass) = conversation
+                    .metadata_json
+                    .as_object_mut()
+                    .and_then(|metadata| metadata.get_mut("cass"))
+                    .and_then(serde_json::Value::as_object_mut)
+            {
+                cass.insert(
+                    "doctor_reconstruct".to_string(),
+                    serde_json::json!({
+                        "schema_version": 1,
+                        "source": "verified_raw_mirror",
+                        "method": "connector",
+                        "manifest_id": manifest.manifest_id,
+                        "blob_blake3": manifest.blob_blake3,
+                    }),
+                );
+            }
+            let agent = crate::model::types::Agent {
+                id: None,
+                slug: conversation.agent_slug.clone(),
+                name: conversation.agent_slug.clone(),
+                version: (!reparsed).then(|| "doctor-reconstruct".to_string()),
+                kind: crate::model::types::AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent).map_err(|err| {
                 format!(
-                    "failed to insert raw mirror manifest {} into candidate archive: {err}",
-                    manifest.manifest_id
+                    "failed to ensure reconstructed candidate agent {}: {err}",
+                    agent.slug
                 )
             })?;
-        if !outcome.conversation_inserted && outcome.inserted_indices.is_empty() {
-            seen.insert(key);
+            let workspace_id = workspace
+                .as_deref()
+                .map(|workspace| storage.ensure_workspace(workspace, None))
+                .transpose()
+                .map_err(|err| {
+                    format!("failed to ensure reconstructed candidate workspace: {err}")
+                })?;
+            let message_count = conversation.messages.len();
+            let outcome = storage
+                .insert_conversation_tree(agent_id, workspace_id, &conversation)
+                .map_err(|err| {
+                    format!(
+                        "failed to insert raw mirror manifest {} into candidate archive: {err}",
+                        manifest.manifest_id
+                    )
+                })?;
+            last_conversation_id = Some(outcome.conversation_id);
+            if outcome.conversation_inserted || !outcome.inserted_indices.is_empty() {
+                manifest_conversations_inserted += usize::from(outcome.conversation_inserted);
+                manifest_messages += message_count;
+            }
+        }
+        seen.insert(key);
+        if manifest_conversations_inserted == 0 && manifest_messages == 0 {
             skipped_records.push(serde_json::json!({
                 "manifest_id": manifest.manifest_id,
                 "status": "skipped",
                 "reason": "candidate_storage_reported_duplicate_conversation",
-                "candidate_conversation_id": outcome.conversation_id,
+                "candidate_conversation_id": last_conversation_id,
                 "redacted_manifest_path": manifest.redacted_manifest_path,
                 "raw_content_included": false
             }));
             continue;
         }
-        seen.insert(key);
-        inserted_conversations += usize::from(outcome.conversation_inserted);
-        inserted_messages += message_count;
+        inserted_conversations += manifest_conversations_inserted;
+        inserted_messages += manifest_messages;
         evidence_sources.push(format!(
-            "verified_raw_mirror:manifest_id={}:messages={message_count}:blob={}",
+            "verified_raw_mirror:manifest_id={}:messages={manifest_messages}:blob={}:method={method}",
             manifest.manifest_id, manifest.blob_blake3
         ));
         recovered_manifest_indices.push(manifest_index);
@@ -74353,6 +74717,188 @@ fn existing_path_has_symlink_below_root(path: &Path, root: &Path) -> bool {
 mod doctor_asset_taxonomy_tests {
     use super::*;
 
+    #[test]
+    fn recommended_action_surfaces_candidate_build_when_only_authority_is_proven() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let op = doctor_test_operation_state(
+            data_dir,
+            &data_dir.join("agent_search.db"),
+            &data_dir.join("index"),
+        );
+        let checks = vec![doctor_check_report(
+            "candidate_staging",
+            "pass",
+            "Candidate staging OK",
+            true,
+            false,
+        )];
+        let risk = DoctorCoverageRiskSummary {
+            schema_version: 1,
+            status: "unchecked".to_string(),
+            recommended_action:
+                "Run process-isolated archive coverage probes before archive repair.".to_string(),
+            ..DoctorCoverageRiskSummary::default()
+        };
+        let action = doctor_recommended_action_for_reports(
+            None,
+            &op,
+            &risk,
+            &checks,
+            &DoctorCandidateStagingReport::default(),
+        )
+        .unwrap();
+        assert!(action.contains("'cass doctor --fix --json'"), "{action}");
+    }
+
+    #[test]
+    fn recommended_action_prefers_completed_candidate_plan_without_authorizing_promotion() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let op = doctor_test_operation_state(
+            data_dir,
+            &data_dir.join("agent_search.db"),
+            &data_dir.join("index"),
+        );
+        let checks = vec![doctor_check_report(
+            "candidate_staging",
+            "pass",
+            "candidate ready",
+            false,
+            true,
+        )];
+        let staging = DoctorCandidateStagingReport {
+            completed_candidate_count: 1,
+            candidates: vec![DoctorCandidateSummary {
+                lifecycle_status: "completed".to_string(),
+                ..DoctorCandidateSummary::default()
+            }],
+            ..DoctorCandidateStagingReport::default()
+        };
+        let action = doctor_recommended_action_for_reports(
+            None,
+            &op,
+            &DoctorCoverageRiskSummary::default(),
+            &checks,
+            &staging,
+        )
+        .unwrap();
+        assert!(
+            action.contains("'cass doctor repair --dry-run --json'"),
+            "{action}"
+        );
+        assert!(
+            !action.contains("--yes") && !action.contains("--plan-fingerprint"),
+            "{action}"
+        );
+    }
+
+    #[test]
+    fn recommended_action_retains_process_isolated_when_authority_unproven() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let op = doctor_test_operation_state(
+            data_dir,
+            &data_dir.join("agent_search.db"),
+            &data_dir.join("index"),
+        );
+        let checks = vec![doctor_check_report(
+            "candidate_staging",
+            "warn",
+            "no authority selected",
+            false,
+            false,
+        )];
+        let risk = DoctorCoverageRiskSummary {
+            schema_version: 1,
+            recommended_action:
+                "Run process-isolated archive coverage probes before archive repair.".to_string(),
+            ..DoctorCoverageRiskSummary::default()
+        };
+        let action = doctor_recommended_action_for_reports(
+            None,
+            &op,
+            &risk,
+            &checks,
+            &DoctorCandidateStagingReport::default(),
+        )
+        .unwrap();
+        assert!(action.contains("process-isolated"), "{action}");
+    }
+
+    #[test]
+    fn recommended_action_never_recommends_fresh_build_with_existing_failed_candidate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let op = doctor_test_operation_state(
+            data_dir,
+            &data_dir.join("agent_search.db"),
+            &data_dir.join("index"),
+        );
+        let checks = vec![doctor_check_report(
+            "candidate_staging",
+            "fail",
+            "build blocked",
+            false,
+            false,
+        )];
+        let risk = DoctorCoverageRiskSummary {
+            schema_version: 1,
+            recommended_action:
+                "Run process-isolated archive coverage probes before archive repair.".to_string(),
+            ..DoctorCoverageRiskSummary::default()
+        };
+        let staging = DoctorCandidateStagingReport {
+            interrupted_candidate_count: 1,
+            candidates: vec![DoctorCandidateSummary {
+                lifecycle_status: "interrupted".to_string(),
+                ..DoctorCandidateSummary::default()
+            }],
+            ..DoctorCandidateStagingReport::default()
+        };
+        let action =
+            doctor_recommended_action_for_reports(None, &op, &risk, &checks, &staging).unwrap();
+        assert!(!action.contains("'cass doctor --fix --json'"), "{action}");
+        assert!(action.contains("process-isolated"), "{action}");
+    }
+
+    #[test]
+    fn recommended_action_operation_blocker_precedes_candidate_advice() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let mut op = doctor_test_operation_state(
+            data_dir,
+            &data_dir.join("agent_search.db"),
+            &data_dir.join("index"),
+        );
+        op.active_doctor_repair = true;
+        op.next_action = "wait for the active doctor repair".to_string();
+        let checks = vec![doctor_check_report(
+            "candidate_staging",
+            "pass",
+            "ready",
+            true,
+            false,
+        )];
+        let staging = DoctorCandidateStagingReport {
+            completed_candidate_count: 1,
+            candidates: vec![DoctorCandidateSummary {
+                lifecycle_status: "completed".to_string(),
+                ..DoctorCandidateSummary::default()
+            }],
+            ..DoctorCandidateStagingReport::default()
+        };
+        let action = doctor_recommended_action_for_reports(
+            None,
+            &op,
+            &DoctorCoverageRiskSummary::default(),
+            &checks,
+            &staging,
+        )
+        .unwrap();
+        assert_eq!(action, "wait for the active doctor repair");
+    }
+
     const ALL_DOCTOR_ASSET_CLASSES: &[DoctorAssetClass] = &[
         DoctorAssetClass::SourceSessionLog,
         DoctorAssetClass::RawMirrorBlob,
@@ -84200,7 +84746,7 @@ paths = ["~/.claude/projects"]
         let (by_conversation_id, by_source_key) = doctor_raw_mirror_existing_evidence_maps(&report);
         let expected_source_blake3 = blake3::hash(&second_bytes).to_hex().to_string();
         let linked = by_conversation_id
-            .get(&7)
+            .get(&(7, source_path.display().to_string()))
             .expect("newest conversation-linked evidence");
         assert_eq!(linked.source_content_blake3, expected_source_blake3);
         assert_ne!(
@@ -84289,6 +84835,76 @@ paths = ["~/.claude/projects"]
             &mut receipt,
             linked
         ));
+    }
+
+    /// Reconstruct promotion assigns ids anew. Neither unchanged source may
+    /// be compared with the other source's newer evidence (zp0fp).
+    #[test]
+    fn raw_mirror_backfill_ignores_db_links_whose_id_now_names_another_source() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let capture = |name: &str, bytes: &[u8], old_id: i64, new_id: i64| {
+            let path = temp.path().join(name);
+            std::fs::write(&path, bytes).expect("write source");
+            let links = [old_id, new_id].map(|id| crate::raw_mirror::RawMirrorDbLink {
+                conversation_id: Some(id),
+                message_count: Some(1),
+                source_path: Some(path.display().to_string()),
+                started_at_ms: Some(1_733_000_000_000),
+            });
+            let record = crate::raw_mirror::capture_source_file_with_chunk_policy(
+                crate::raw_mirror::RawMirrorCaptureInput {
+                    data_dir: &data_dir,
+                    provider: "codex",
+                    source_id: "local",
+                    origin_kind: "local",
+                    origin_host: None,
+                    source_path: &path,
+                    db_links: &links,
+                },
+                1 << 20,
+                1 << 16,
+            )
+            .expect("capture source");
+            (path, record.manifest_id)
+        };
+        let (path_a, manifest_a) = capture("a.jsonl", b"alpha source bytes", 1, 2);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let (path_b, manifest_b) = capture("b.jsonl", b"bravo source bytes", 2, 1);
+
+        let report = collect_doctor_raw_mirror_report_with_threshold(&data_dir, u64::MAX);
+        let (by_conversation_id, by_source_key) = doctor_raw_mirror_existing_evidence_maps(&report);
+        for (conversation_id, path, manifest_id) in
+            [(1, &path_b, &manifest_b), (2, &path_a, &manifest_a)]
+        {
+            let candidate = DoctorRawMirrorBackfillCandidate {
+                conversation_id,
+                provider: "codex".to_string(),
+                source_path: Some(path.display().to_string()),
+                source_id: "local".to_string(),
+                origin_host: None,
+                origin_kind: Some("local".to_string()),
+                started_at_ms: Some(1_733_000_000_000),
+                message_count: 1,
+            };
+            let receipt = doctor_raw_mirror_backfill_candidate_receipt(
+                &data_dir,
+                &candidate,
+                &by_conversation_id,
+                &by_source_key,
+                &mut HashMap::new(),
+                false,
+            );
+            assert_eq!(
+                receipt.action, "already_raw_source_captured",
+                "conversation {conversation_id}"
+            );
+            assert_eq!(
+                receipt.raw_mirror_manifest_id.as_deref(),
+                Some(manifest_id.as_str()),
+                "conversation {conversation_id}"
+            );
+        }
     }
 
     #[test]
@@ -98260,6 +98876,7 @@ pub(crate) fn run_doctor_impl(
         &operation_state,
         &coverage_risk,
         &check_reports,
+        &candidate_staging,
     );
     let active_repair = doctor_active_repair_report(&operation_state);
     let check_scope = doctor_check_scope_report(command_surface, execution_mode);
@@ -115539,6 +116156,29 @@ fn run_index_with_data(
     let opts_clone = opts.clone();
     let previous_robot_trace_ingest =
         robot_trace_ingest.then(|| indexer::set_robot_trace_ingest_enabled(true));
+    // Scoped restoration for the background semantic delta flag: the worker
+    // spawn below can fail with `?` before any join runs, which would leave
+    // the global set for the rest of the process. This guard drops at the
+    // end of `run_index_with_data`, restoring the previous value on every
+    // exit path including early `?` returns after spawn. Mirrors the
+    // `LexicalValidationFinalizingGuard` pattern in `src/indexer/mod.rs`.
+    // Note: `previous_robot_trace_ingest` has the same pre-existing leak on
+    // spawn failure; it is left untouched here to stay scoped to the new flag.
+    // The flag is process-global, so the binary integration tests that drive
+    // `cass index --background` as a separate process cannot race it; no
+    // in-process test hides the leak by setting it directly.
+    struct BackgroundSemanticDeltaRestore {
+        previous: bool,
+    }
+    impl Drop for BackgroundSemanticDeltaRestore {
+        fn drop(&mut self) {
+            let _ = indexer::set_background_semantic_delta_enabled(self.previous);
+        }
+    }
+    let _background_semantic_delta_restore =
+        (background && !semantic).then(|| BackgroundSemanticDeltaRestore {
+            previous: indexer::set_background_semantic_delta_enabled(true),
+        });
     let index_handle = index_worker_thread_builder()
         .spawn(move || match mirror_source_ids {
             Some(source_ids) => indexer::run_index_for_mirror_sources(opts_clone, source_ids),

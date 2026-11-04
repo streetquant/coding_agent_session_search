@@ -868,7 +868,7 @@ fn close_first_open_repair_handle(mut conn: FrankenConnection, path: &Path) {
 }
 
 pub(crate) fn index_engine_migration_is_complete(path: &Path) -> bool {
-    // fsqlite-core 0.3.18 migration::MigrationMarker and
+    // fsqlite-core 0.4.13 migration::MigrationMarker and
     // CURRENT_MIGRATION_VERSION. build.rs enforces this exact engine family;
     // review this admission when changing the pin. The engine's marker is
     // pathname-scoped, not an integrity attestation or content fingerprint.
@@ -879,7 +879,13 @@ pub(crate) fn index_engine_migration_is_complete(path: &Path) -> bool {
         last_run_at: u64,
         repairs_applied: Vec<String>,
     }
-    let mut marker_path = path.as_os_str().to_os_string();
+    // The engine resolves existing database paths before migration and writes
+    // the marker beside conn.path(), including through file/directory aliases.
+    // An alias-local marker cannot establish migration of the real database.
+    let Ok(database_path) = fs::canonicalize(path) else {
+        return false;
+    };
+    let mut marker_path = database_path.into_os_string();
     marker_path.push(".fsqlite-migration-state");
     let Ok(file) = fs::File::open(Path::new(&marker_path)) else {
         return false;
@@ -5530,6 +5536,16 @@ fn lexical_content_truncation_boundary(content: &str, cap: usize) -> usize {
 /// Marker error a lexical-rebuild row callback raises to stop a stream early;
 /// never surfaced to callers.
 const LEXICAL_REBUILD_STREAM_STOPPED: &str = "cass lexical rebuild stream stopped by caller";
+
+/// Keep the append stream's executed SQL and its rowid-seek regression on the
+/// same projection. A literal cap also lets the engine bound content reads.
+fn lexical_rebuild_message_after_id_sql(cap: usize) -> String {
+    format!(
+        "SELECT id, idx, role, author, created_at, \
+             substr(content, 1, {cap}), COALESCE(octet_length(content), 0), conversation_id \
+             FROM messages WHERE id > ?1 ORDER BY id"
+    )
+}
 const LEXICAL_REBUILD_FOOTPRINT_PAGE_ROWS: usize = 2048;
 
 /// One lexical-rebuild projection row (`id, idx, role, author, created_at,
@@ -13300,11 +13316,7 @@ impl FrankenStorage {
         F: FnMut(i64, Message) -> Result<()>,
     {
         let cap = lexical_max_message_content_bytes().min(i32::MAX as usize);
-        let sql = format!(
-            "SELECT id, idx, role, author, created_at, \
-                 substr(content, 1, {cap}), COALESCE(octet_length(content), 0), conversation_id \
-                 FROM messages WHERE id > ?1 ORDER BY id"
-        );
+        let sql = lexical_rebuild_message_after_id_sql(cap);
         let mut callback_error = None;
         let outcome = self.conn.query_with_params_for_each(
             &sql,
@@ -38196,6 +38208,74 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
     }
 
     #[test]
+    fn gh539_lexical_append_stream_seeks_past_existing_messages() -> Result<()> {
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("gh539-append-plan.db"))?;
+        storage.raw().execute("PRAGMA foreign_keys = OFF")?;
+        storage.raw().execute(
+            "INSERT INTO messages(id, conversation_id, idx, role, content) VALUES \
+             (1, 10, 0, 'user', 'old evidence'), \
+             (1000, 10, 1, 'assistant', 'watermark evidence'), \
+             (1001, 20, 0, 'user', 'first appended evidence'), \
+             (1003, 10, 2, 'tool', 'second appended evidence')",
+        )?;
+        let after_message_id = 1000_i64;
+        let sql = lexical_rebuild_message_after_id_sql(
+            lexical_max_message_content_bytes().min(i32::MAX as usize),
+        );
+        // Inspect the compiled program rather than the planner's SCAN label:
+        // the message cursor must seek past historical rows on fsqlite 0.4.13.
+        let opcodes: Vec<(String, i64, i64)> = storage.raw().query_map_collect(
+            &format!("EXPLAIN {sql}"),
+            fparams![after_message_id],
+            |row| Ok((row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
+        )?;
+        let rootpage: i64 = storage.raw().query_row_map(
+            "SELECT rootpage FROM sqlite_master WHERE name = 'messages'",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        let cursor = opcodes
+            .iter()
+            .find_map(|(op, p1, p2)| (op == "OpenRead" && *p2 == rootpage).then_some(*p1))
+            .expect("the append stream opens the messages table");
+        assert!(
+            opcodes
+                .iter()
+                .any(|(op, p1, _)| op == "SeekGT" && *p1 == cursor),
+            "the message cursor must seek strictly past the bound: {opcodes:?}"
+        );
+        assert!(
+            !opcodes
+                .iter()
+                .any(|(op, p1, _)| matches!(op.as_str(), "Rewind" | "Last") && *p1 == cursor),
+            "the append stream must not walk historical messages: {opcodes:?}"
+        );
+        assert!(
+            !opcodes.iter().any(|(op, _, _)| matches!(
+                op.as_str(),
+                "SorterOpen" | "OpenEphemeral" | "OpenAutoindex"
+            )),
+            "the append stream must not materialize a sort or DISTINCT table: {opcodes:?}"
+        );
+
+        let mut visited = Vec::new();
+        storage.for_each_lexical_rebuild_message_after_id(after_message_id, |id, message| {
+            visited.push((id, message.id, message.idx, message.content));
+            Ok(())
+        })?;
+        assert_eq!(
+            visited,
+            vec![
+                (20, Some(1001), 0, "first appended evidence".to_string()),
+                (10, Some(1003), 2, "second appended evidence".to_string()),
+            ],
+            "the stream preserves rowid order, holes and conversation identity"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn discover_historical_database_bundles_prefers_larger_archives_first() {
         let dir = TempDir::new().unwrap();
         let canonical_db = dir.path().join("agent_search.db");
@@ -46240,6 +46320,100 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             "new searchable evidence"
         );
         assert_eq!(fs::read(&marker_path).unwrap(), marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh515_engine_migration_marker_uses_the_resolved_database_path() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("archive.db");
+        let alias = dir.path().join("archive-alias.db");
+        fs::write(&path, b"database path fixture").unwrap();
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        fs::write(
+            path.with_file_name("archive.db.fsqlite-migration-state"),
+            r#"{"last_upgrade_version":1,"last_run_at":1,"repairs_applied":[]}"#,
+        )
+        .unwrap();
+
+        assert!(index_engine_migration_is_complete(&path));
+        assert!(index_engine_migration_is_complete(&alias));
+        assert!(
+            !alias
+                .with_file_name("archive-alias.db.fsqlite-migration-state")
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh515_engine_migration_marker_rejects_alias_local_attestations() {
+        for target_marker in [
+            None,
+            Some(r#"{"last_upgrade_version":0,"last_run_at":1,"repairs_applied":[]}"#),
+            Some(r#"{"last_upgrade_version":1}"#),
+            Some("not a migration marker"),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("archive.db");
+            let alias = dir.path().join("archive-alias.db");
+            fs::write(&path, b"database path fixture").unwrap();
+            std::os::unix::fs::symlink(&path, &alias).unwrap();
+            fs::write(
+                alias.with_file_name("archive-alias.db.fsqlite-migration-state"),
+                r#"{"last_upgrade_version":1,"last_run_at":1,"repairs_applied":[]}"#,
+            )
+            .unwrap();
+            if let Some(marker) = target_marker {
+                fs::write(
+                    path.with_file_name("archive.db.fsqlite-migration-state"),
+                    marker,
+                )
+                .unwrap();
+            }
+
+            assert!(!index_engine_migration_is_complete(&path));
+            assert!(!index_engine_migration_is_complete(&alias));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh515_engine_migration_marker_rejects_dangling_database_aliases() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("missing.db");
+        let alias = dir.path().join("missing-alias.db");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        fs::write(
+            alias.with_file_name("missing-alias.db.fsqlite-migration-state"),
+            r#"{"last_upgrade_version":1,"last_run_at":1,"repairs_applied":[]}"#,
+        )
+        .unwrap();
+
+        assert!(!index_engine_migration_is_complete(&path));
+        assert!(!index_engine_migration_is_complete(&alias));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh515_engine_migration_marker_resolves_parent_directory_aliases() {
+        let dir = TempDir::new().unwrap();
+        let target_dir = dir.path().join("archive");
+        let alias_dir = dir.path().join("archive-alias");
+        fs::create_dir(&target_dir).unwrap();
+        std::os::unix::fs::symlink(&target_dir, &alias_dir).unwrap();
+        let path = target_dir.join("archive.db");
+        fs::write(&path, b"database path fixture").unwrap();
+        fs::write(
+            path.with_file_name("archive.db.fsqlite-migration-state"),
+            r#"{"last_upgrade_version":1,"last_run_at":1,"repairs_applied":[]}"#,
+        )
+        .unwrap();
+
+        assert!(index_engine_migration_is_complete(&path));
+        assert!(index_engine_migration_is_complete(
+            &alias_dir.join("archive.db")
+        ));
     }
 
     #[test]

@@ -1522,13 +1522,24 @@ impl TantivyIndex {
         self.inner.reader()
     }
 
-    pub fn segment_count(&self) -> usize {
+    /// Live segments in the validated published snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when publication authority cannot prove the snapshot
+    /// readable, including after a fresh reader admission.
+    pub fn segment_count(&self) -> Result<usize> {
         self.inner.segment_count()
     }
 
-    pub fn merge_status(&self) -> MergeStatus {
-        self.inner
-            .merge_status(self.inner.segment_count(), now_unix_millis())
+    /// Current merge policy status for the validated published snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the published segment count cannot be read.
+    pub fn merge_status(&self) -> Result<MergeStatus> {
+        let segments = self.segment_count()?;
+        Ok(self.inner.merge_status(segments, now_unix_millis()))
     }
 
     /// Attempt to merge segments if idle conditions are met.
@@ -2496,7 +2507,7 @@ mod tests {
     fn merge_status_api_is_exposed() {
         let dir = TempDir::new().expect("temp dir");
         let index = TantivyIndex::open_or_create(dir.path()).expect("create");
-        let status = index.merge_status();
+        let status = index.merge_status().expect("merge status");
         assert_eq!(status.merge_threshold, 4);
     }
 

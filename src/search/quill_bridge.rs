@@ -1864,27 +1864,29 @@ impl QuillCassIndex {
 
     /// Live segment count in the published snapshot.
     ///
-    /// Read the writer's authoritative snapshot rather than opening another
-    /// reader over all its retained files. Streaming maintenance polls this
-    /// before deciding whether to merge; overlapping complete mappings made
-    /// that check itself exceed the archive's RSS budget.
+    /// Reuses the writer's validated snapshot, so observing the count does
+    /// not re-open and hash every live segment. An empty published snapshot
+    /// has zero segments; an unreadable publication is an error.
     ///
-    /// If publication authority refuses the process-local view, retain the
-    /// fresh-reader fallback. Returns 0 when neither view can be read.
-    #[must_use]
-    pub fn segment_count(&self) -> usize {
+    /// # Errors
+    ///
+    /// Returns an error when neither the writer nor a fresh reader can prove
+    /// the published snapshot readable.
+    pub fn segment_count(&self) -> Result<usize> {
         match self.index.snapshot() {
-            Ok(snapshot) => snapshot.segments().len(),
+            Ok(snapshot) => Ok(snapshot.segments().len()),
             Err(error) => {
+                // As with doc_count, a failed publication can leave durable
+                // authority ahead of the process-local view. Keep the full
+                // reader admission for that exceptional reconciliation path.
                 tracing::debug!(
                     error = %error,
                     path = %self.directory.display(),
-                    "writer snapshot unavailable for segment count; opening a reader"
+                    "writer snapshot cannot vouch for the segment count; reopening a reader"
                 );
-                self.reader()
-                    .ok()
-                    .and_then(|reader| reader.segment_count().ok())
-                    .unwrap_or(0)
+                self.reader()?
+                    .segment_count()
+                    .map_err(|error| anyhow!("reading the Quill CASS segment count: {error}"))
             }
         }
     }
@@ -1905,9 +1907,10 @@ impl QuillCassIndex {
     ///
     /// # Errors
     ///
-    /// Returns an error when a merge or compaction itself fails.
+    /// Returns an error when the publication cannot be read, or when a merge
+    /// or compaction fails.
     pub fn optimize_if_idle(&mut self, now_ms: i64) -> Result<bool> {
-        let segments = self.segment_count();
+        let segments = self.segment_count()?;
         if !self.merge_status(segments, now_ms).should_merge() {
             return Ok(false);
         }
@@ -1934,9 +1937,9 @@ impl QuillCassIndex {
     ///
     /// # Errors
     ///
-    /// Returns an error when the merge itself fails.
+    /// Returns an error when the publication cannot be read or the merge fails.
     pub fn fold_largest_small_run(&mut self, now_ms: i64) -> Result<bool> {
-        let segments = self.segment_count();
+        let segments = self.segment_count()?;
         if !self.merge_status(segments, now_ms).should_merge() {
             return Ok(false);
         }
@@ -2497,9 +2500,9 @@ mod tests {
     use super::*;
 
     /// Segments referenced by the published MANIFEST, read through the same
-    /// reader the merge policy consults.
+    /// validated snapshot the merge policy consults.
     fn published_segment_count(index: &QuillCassIndex) -> usize {
-        index.segment_count()
+        index.segment_count().expect("published segment count")
     }
 
     #[test]
@@ -2716,7 +2719,7 @@ mod tests {
             .expect("a CASS commit never runs the engine tier merge");
         let total = index.doc_count().expect("doc count");
         assert!(total > MAX_FOLD_OUTPUT_DOCS);
-        let before = index.segment_count();
+        let before = index.segment_count().expect("segment count before folding");
         index
             .force_merge_with_output_cap(u64::MAX)
             .expect("the fold is planned within the posting limit");
@@ -3227,7 +3230,7 @@ mod tests {
         index.commit().expect("commit");
         assert_eq!(index.doc_count().expect("document count"), 64);
         assert_eq!(
-            index.segment_count(),
+            index.segment_count().expect("segment count"),
             1,
             "serial batches below one accumulator budget must not fan out into per-CPU buffers"
         );
@@ -3280,26 +3283,30 @@ mod tests {
         let directory = tempfile::tempdir().expect("bridge index directory");
         let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open");
         let opens = reader_open_count();
-        assert_eq!(index.segment_count(), 0);
+        assert_eq!(index.segment_count().expect("empty segment count"), 0);
 
         index
             .add_cass_documents(&[sample("alpha", 0, "first retained document")])
             .expect("first batch");
-        assert_eq!(index.segment_count(), 0, "staged rows are not published");
+        assert_eq!(
+            index.segment_count().expect("count before commit"),
+            0,
+            "staged rows are not published"
+        );
         index.commit().expect("first commit");
-        assert_eq!(index.segment_count(), 1);
+        assert_eq!(index.segment_count().expect("count before commit"), 1);
         index
             .add_cass_documents(&[sample("beta", 1, "second published document")])
             .expect("second batch");
-        assert_eq!(index.segment_count(), 1);
+        assert_eq!(index.segment_count().expect("count before commit"), 1);
         index.commit().expect("second commit");
-        assert_eq!(index.segment_count(), 2);
+        assert_eq!(index.segment_count().expect("count after second commit"), 2);
 
         index.force_merge().expect("merge published segments");
-        assert_eq!(index.segment_count(), 1);
+        assert_eq!(index.segment_count().expect("count after merge"), 1);
         assert_eq!(index.doc_count().expect("merged document count"), 2);
         index.delete_all().expect("publish empty successor");
-        assert_eq!(index.segment_count(), 0);
+        assert_eq!(index.segment_count().expect("count after delete"), 0);
         assert_eq!(reader_open_count(), opens, "maintenance opened a reader");
         assert_eq!(
             index
@@ -3308,6 +3315,169 @@ mod tests {
                 .segment_count()
                 .expect("independent segment count"),
             0
+        );
+    }
+
+    /// GH #539: merge-policy and progress observations must not admit a new
+    /// reader (and hash the whole archive) after every incremental commit.
+    #[test]
+    fn writer_segment_count_tracks_commits_without_opening_a_reader() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open or create");
+        let opens = reader_open_count();
+        assert_eq!(index.segment_count().expect("empty segment count"), 0);
+        assert_eq!(index.doc_count().expect("empty document count"), 0);
+
+        for batch in 0..3_u64 {
+            index
+                .add_cass_documents(&[sample(
+                    &format!("batch-{batch}"),
+                    0,
+                    "a committed segment count fixture",
+                )])
+                .expect("index one document");
+            assert_eq!(
+                index.segment_count().expect("count before commit"),
+                usize::try_from(batch).expect("small count"),
+                "uncommitted documents do not add a published segment"
+            );
+            assert_eq!(index.doc_count().expect("count before commit"), batch);
+            index.commit().expect("commit batch");
+            for _ in 0..3 {
+                assert_eq!(
+                    index.segment_count().expect("count after commit"),
+                    usize::try_from(batch + 1).expect("small count")
+                );
+                assert_eq!(index.doc_count().expect("count after commit"), batch + 1);
+            }
+            index.commit().expect("no-op commit");
+            assert_eq!(
+                index.segment_count().expect("count after no-op commit"),
+                usize::try_from(batch + 1).expect("small count"),
+                "a no-op commit does not add a segment"
+            );
+        }
+        assert_eq!(
+            reader_open_count(),
+            opens,
+            "observing committed counts opened a reader"
+        );
+        let reader = index.reader().expect("independent reader");
+        assert_eq!(reader.segment_count().expect("reader segment count"), 3);
+        assert_eq!(reader.doc_count().expect("reader document count"), 3);
+    }
+
+    #[test]
+    fn writer_segment_count_tracks_merge_and_deletion_without_opening_a_reader() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open or create");
+        for batch in 0..5_u64 {
+            index
+                .add_cass_documents(&[sample(
+                    &format!("batch-{batch}"),
+                    0,
+                    "merge and deletion count fixture",
+                )])
+                .expect("index one document");
+            index.commit().expect("commit batch");
+        }
+        let opens = reader_open_count();
+        assert_eq!(index.segment_count().expect("count before merge"), 5);
+        assert!(
+            index
+                .optimize_if_idle(1_700_000_000_000)
+                .expect("merge idle segments")
+        );
+        assert_eq!(index.segment_count().expect("count after merge"), 1);
+        assert_eq!(index.doc_count().expect("document count after merge"), 5);
+        assert!(
+            !index
+                .optimize_if_idle(1_700_000_000_001)
+                .expect("no-op optimization")
+        );
+        assert_eq!(
+            reader_open_count(),
+            opens,
+            "the merge decision or count opened a reader"
+        );
+        {
+            let reader = index.reader().expect("independent merged reader");
+            assert_eq!(reader.segment_count().expect("reader segment count"), 1);
+            assert_eq!(reader.doc_count().expect("reader document count"), 5);
+        }
+
+        let opens = reader_open_count();
+        let removed = sample("batch-0", 0, "merge and deletion count fixture");
+        let removed_id = frankensearch::quill::cass::cass_document_identity(
+            &removed.source_id,
+            frankensearch::quill::cass::CassConversationKey::new(
+                &removed.source_path,
+                removed.conversation_id,
+            ),
+            removed.msg_idx,
+        );
+        index
+            .delete_cass_document_ids(&[removed_id])
+            .expect("delete one document");
+        assert_eq!(index.segment_count().expect("count after deletion"), 1);
+        assert_eq!(index.doc_count().expect("document count after deletion"), 4);
+        assert_eq!(reader_open_count(), opens, "deletion count opened a reader");
+        {
+            let reader = index.reader().expect("independent reader after deletion");
+            assert_eq!(reader.segment_count().expect("reader segment count"), 1);
+            assert_eq!(reader.doc_count().expect("reader document count"), 4);
+        }
+
+        let opens = reader_open_count();
+        index.delete_all().expect("publish empty successor");
+        index.commit().expect("no-op commit after clearing");
+        assert_eq!(index.segment_count().expect("empty segment count"), 0);
+        assert_eq!(index.doc_count().expect("empty document count"), 0);
+        assert_eq!(reader_open_count(), opens, "empty count opened a reader");
+        let reader = index.reader().expect("independent empty reader");
+        assert_eq!(reader.segment_count().expect("reader segment count"), 0);
+        assert_eq!(reader.doc_count().expect("reader document count"), 0);
+    }
+
+    /// Without an admitted writer, the path-only observation keeps reader
+    /// validation and distinguishes an unavailable publication from zero.
+    #[test]
+    fn live_segment_count_requires_a_readable_published_index() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let opens = reader_open_count();
+        assert_eq!(live_segment_count(directory.path()), None);
+        assert_eq!(
+            reader_open_count(),
+            opens,
+            "missing manifest opened a reader"
+        );
+
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open or create");
+        assert_eq!(live_segment_count(directory.path()), Some(0));
+        index
+            .add_cass_documents(&[sample("alpha", 0, "validated segment count")])
+            .expect("index one document");
+        index.commit().expect("commit");
+        drop(index);
+        assert_eq!(live_segment_count(directory.path()), Some(1));
+
+        // Both slots must be corrupt: a valid previous MANIFEST is a
+        // legitimate recovery source, so damaging only the current slot
+        // would not make the publication unreadable.
+        std::fs::write(
+            directory.path().join(QUILL_INDEX_MARKER),
+            b"corrupt manifest",
+        )
+        .expect("corrupt current manifest");
+        std::fs::write(
+            directory.path().join("MANIFEST.prev"),
+            b"corrupt previous manifest",
+        )
+        .expect("corrupt previous manifest");
+        assert_eq!(
+            live_segment_count(directory.path()),
+            None,
+            "unreadable is not an empty index"
         );
     }
 
@@ -4689,7 +4859,10 @@ mod tests {
         assert!(receipt_timestamp > 0);
         assert_eq!(
             index
-                .merge_status(index.segment_count(), receipt_timestamp)
+                .merge_status(
+                    index.segment_count().expect("segment count"),
+                    receipt_timestamp
+                )
                 .last_merge_ts,
             receipt_timestamp
         );
@@ -4698,7 +4871,10 @@ mod tests {
         let reopened = QuillCassIndex::open_or_create(directory.path()).expect("reopen");
         assert_eq!(
             reopened
-                .merge_status(reopened.segment_count(), receipt_timestamp)
+                .merge_status(
+                    reopened.segment_count().expect("segment count"),
+                    receipt_timestamp
+                )
                 .last_merge_ts,
             receipt_timestamp,
             "a new process must retain the merge cooldown evidence"

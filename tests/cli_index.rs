@@ -6611,3 +6611,362 @@ fn index_full_variable_width_corpus_passes_stock_sqlite_verification() {
     altered[1_000].push('!');
     assert_eq!(payload_mismatches(&altered, &stored), (1, 1));
 }
+
+/// Bead 962e8 (GH #458): background maintenance extends an existing semantic
+/// index without starting a bulk embed. Foreground ingestion deliberately
+/// remains lexical-only and must leave semantic admission stale.
+#[test]
+fn background_index_keeps_an_existing_semantic_index_current() {
+    use serde_json::{Value, json};
+    use std::io::Write;
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    fs::write(home.join(".env"), "").unwrap();
+    let project = home.join(".claude/projects/-bg-semantic");
+    fs::create_dir_all(&project).unwrap();
+    let session = project.join("bg-semantic.jsonl");
+    let append = |ordinal: usize, text: &str| {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&session)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "type": "user", "sessionId": "bg-semantic",
+                "uuid": format!("bg-semantic-{ordinal}"),
+                "timestamp": format!("2025-11-12T18:3{ordinal}:18.697Z"),
+                "cwd": home.to_string_lossy(),
+                "message": {"role": "user", "content": text}
+            })
+        )
+        .unwrap();
+    };
+    let cass = |data_dir: &std::path::Path, args: &[&str]| {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        cmd.env_clear();
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        cmd.current_dir(home)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_SEMANTIC_EMBEDDER", "hash")
+            .env("RUST_MIN_STACK", "134217728")
+            .args(args)
+            .arg("--data-dir")
+            .arg(data_dir)
+            .timeout(std::time::Duration::from_secs(180));
+        cmd.output().unwrap()
+    };
+    let index = |data_dir: &std::path::Path, args: &[&str]| {
+        let output = cass(data_dir, args);
+        assert!(
+            output.status.success(),
+            "{args:?} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let semantic_top = |data_dir: &std::path::Path, query: &str| {
+        let output = cass(
+            data_dir,
+            &[
+                "search",
+                query,
+                "--mode",
+                "semantic",
+                "--no-maintenance",
+                "--json",
+                "--limit",
+                "1",
+            ],
+        );
+        if !output.status.success() {
+            return Err(output.status.code());
+        }
+        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+        Ok(payload["hits"][0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string())
+    };
+
+    let data_dir = home.join("data");
+    append(1, "zzbgalpha first durable note about the parser");
+    index(
+        &data_dir,
+        &[
+            "index",
+            "--full",
+            "--semantic",
+            "--embedder",
+            "hash",
+            "--json",
+        ],
+    );
+    let first = semantic_top(&data_dir, "zzbgalpha").expect("semantic search after --semantic");
+    assert!(first.contains("zzbgalpha"), "top hit: {first}");
+
+    append(2, "zzbgomega appended after the semantic index was built");
+    index(&data_dir, &["index", "--embedder", "hash", "--json"]);
+    assert_eq!(
+        semantic_top(&data_dir, "zzbgomega"),
+        Err(Some(15)),
+        "a foreground run must not extend the semantic index"
+    );
+    index(
+        &data_dir,
+        &["index", "--background", "--embedder", "hash", "--json"],
+    );
+    let caught_up =
+        semantic_top(&data_dir, "zzbgomega").expect("semantic search after background run");
+    assert!(caught_up.contains("zzbgomega"), "top hit: {caught_up}");
+    let still = semantic_top(&data_dir, "zzbgalpha").expect("older vectors stay served");
+    assert!(still.contains("zzbgalpha"), "top hit: {still}");
+
+    let lexical_only = home.join("lexical-only");
+    index(&lexical_only, &["index", "--full", "--json"]);
+    index(
+        &lexical_only,
+        &["index", "--background", "--embedder", "hash", "--json"],
+    );
+    let vectors = lexical_only.join("vector_index");
+    let fsvi_files = fs::read_dir(&vectors)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "fsvi"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        fsvi_files, 0,
+        "background run must not bulk-embed an archive"
+    );
+}
+
+/// A partial scan may durably ingest a healthy source but must not certify
+/// semantic coverage: manifest bytes and the real embed watermark stay
+/// unchanged, and both old and new queries refuse stale vectors. Replacing
+/// the invalid UTF-8 JSON source with valid JSON permits the next delta.
+#[test]
+fn background_index_partial_scan_leaves_semantic_publication_unchanged() {
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+    use serde_json::{Value, json};
+    use std::io::Write;
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    fs::write(home.join(".env"), "").unwrap();
+    // Sorted connector paths deliver the good conversation before the bad
+    // .json fails read_to_string. Malformed JSONL lines are silently skipped
+    // by this connector and would not exercise a partial scan.
+    let project = home.join(".claude/projects/-bg-semantic-partial");
+    fs::create_dir_all(&project).unwrap();
+    let good = project.join("a-good.jsonl");
+    let bad = project.join("z-bad.json");
+    let append = |ordinal: usize, text: &str| {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&good)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "type": "user", "sessionId": "bg-semantic-partial",
+                "uuid": format!("bg-semantic-partial-{ordinal}"),
+                "timestamp": format!("2025-11-12T18:4{ordinal}:18.697Z"),
+                "cwd": home.to_string_lossy(),
+                "message": {"role": "user", "content": text}
+            })
+        )
+        .unwrap();
+    };
+    let cass = |data_dir: &std::path::Path, args: &[&str]| {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        cmd.env_clear();
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        cmd.current_dir(home)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_SEMANTIC_EMBEDDER", "hash")
+            .env("RUST_MIN_STACK", "134217728")
+            .args(args)
+            .arg("--data-dir")
+            .arg(data_dir)
+            .timeout(std::time::Duration::from_secs(180));
+        cmd.output().unwrap()
+    };
+    let index_ok = |data_dir: &std::path::Path, args: &[&str]| {
+        let output = cass(data_dir, args);
+        assert!(
+            output.status.success(),
+            "{args:?} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let semantic_top = |data_dir: &std::path::Path, query: &str| {
+        let output = cass(
+            data_dir,
+            &[
+                "search",
+                query,
+                "--mode",
+                "semantic",
+                "--no-maintenance",
+                "--json",
+                "--limit",
+                "1",
+            ],
+        );
+        if !output.status.success() {
+            return Err(output.status.code());
+        }
+        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+        Ok(payload["hits"][0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string())
+    };
+    let read_manifest = |data_dir: &std::path::Path| -> String {
+        fs::read_to_string(data_dir.join("vector_index").join("semantic_manifest.json"))
+            .expect("semantic manifest must exist after --semantic seed")
+    };
+    let read_watermark = |data_dir: &std::path::Path| -> Option<i64> {
+        let storage = FrankenStorage::open_readonly(&data_dir.join("agent_search.db")).unwrap();
+        let watermark = storage.get_last_embedded_message_id().unwrap();
+        storage.close().unwrap();
+        watermark
+    };
+    let read_max_id = |data_dir: &std::path::Path| -> Option<i64> {
+        let storage = FrankenStorage::open_readonly(&data_dir.join("agent_search.db")).unwrap();
+        let max_id = storage.max_message_id().unwrap();
+        storage.close().unwrap();
+        max_id
+    };
+
+    let data_dir = home.join("data");
+    append(1, "zzbgpartial first durable note about the parser");
+    index_ok(
+        &data_dir,
+        &[
+            "index",
+            "--full",
+            "--semantic",
+            "--embedder",
+            "hash",
+            "--json",
+        ],
+    );
+    let first = semantic_top(&data_dir, "zzbgpartial").expect("seed semantic search");
+    assert!(first.contains("zzbgpartial"), "top hit: {first}");
+    let manifest_before = read_manifest(&data_dir);
+    let watermark_seed = read_watermark(&data_dir);
+    assert!(
+        watermark_seed.is_some(),
+        "seed watermark must be Some after --semantic"
+    );
+
+    append(2, "zzbgpartialomega appended with a partial scan");
+    fs::write(&bad, [0x7b, 0x22, 0xff, 0x22, 0x7d]).unwrap();
+    let partial = cass(
+        &data_dir,
+        &["index", "--background", "--embedder", "hash", "--json"],
+    );
+    assert!(
+        !partial.status.success(),
+        "partial scan must not report success: stdout={} stderr={}",
+        String::from_utf8_lossy(&partial.stdout),
+        String::from_utf8_lossy(&partial.stderr)
+    );
+    assert_eq!(partial.status.code(), Some(9), "partial scan must exit 9");
+    let partial_payload: Value =
+        serde_json::from_slice(&partial.stdout).unwrap_or(serde_json::json!({}));
+    assert_eq!(
+        partial_payload["code"], 9,
+        "expected flat code 9 envelope: {partial_payload}"
+    );
+    assert_eq!(
+        partial_payload["partial"], true,
+        "expected flat partial refusal envelope: {partial_payload}"
+    );
+    assert_eq!(
+        partial_payload["coverage_status"], "incomplete",
+        "expected incomplete coverage: {partial_payload}"
+    );
+    assert_eq!(
+        partial_payload["scan_had_errors"], true,
+        "expected scan_had_errors: {partial_payload}"
+    );
+    assert_eq!(
+        read_manifest(&data_dir),
+        manifest_before,
+        "partial scan must not republish the semantic manifest"
+    );
+    assert_eq!(
+        read_watermark(&data_dir),
+        watermark_seed,
+        "partial scan must not advance the embed watermark"
+    );
+    let max_after_partial = read_max_id(&data_dir);
+    assert!(
+        matches!((watermark_seed, max_after_partial), (Some(watermark), Some(max_id)) if max_id > watermark),
+        "good row must be durable past the frozen watermark: watermark={watermark_seed:?} max={max_after_partial:?}"
+    );
+    assert_eq!(
+        semantic_top(&data_dir, "zzbgpartial"),
+        Err(Some(15)),
+        "partial scan must leave the seed query refusing (global stale)"
+    );
+    assert_eq!(
+        semantic_top(&data_dir, "zzbgpartialomega"),
+        Err(Some(15)),
+        "partial scan must leave semantic search refusing the appended message"
+    );
+
+    fs::write(&bad, r#"{"messages":[]}"#).unwrap();
+    index_ok(
+        &data_dir,
+        &["index", "--background", "--embedder", "hash", "--json"],
+    );
+    let watermark_recovered = read_watermark(&data_dir);
+    assert!(
+        matches!((watermark_seed, watermark_recovered), (Some(seed), Some(recovered)) if recovered > seed),
+        "recovery must advance the watermark: seed={watermark_seed:?} recovered={watermark_recovered:?}"
+    );
+    let still = semantic_top(&data_dir, "zzbgpartial").expect("seed vectors after recovery");
+    assert!(still.contains("zzbgpartial"), "top hit: {still}");
+    let caught_up =
+        semantic_top(&data_dir, "zzbgpartialomega").expect("appended vectors after recovery");
+    assert!(
+        caught_up.contains("zzbgpartialomega"),
+        "top hit: {caught_up}"
+    );
+}

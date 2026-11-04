@@ -175,6 +175,34 @@ run_encoded_remote_script() (
     bash -c "$decoded_script"
 )
 
+# A scanner-only invocation has explicit inputs. Bind their names, symlink
+# identities and bytes without discovering unrelated untracked scratch trees.
+# The ordinary build gate retains its complete source inventory below.
+ubs_source_digest() (
+    set -o pipefail
+    if [ "$#" -eq 0 ]; then
+        echo "gate: --verify-ubs requires at least one source file" >&2
+        return 2
+    fi
+    local path
+    {
+        for path in "$@"; do
+            if [[ "$path" = /* || "$path" = .. || "$path" = ../* || "$path" = */../* ]] || [ ! -f "$path" ]; then
+                echo "gate: UBS source must be an existing repository-relative file: ${path}" >&2
+                exit 2
+            fi
+            printf '%s\0' "$path"
+            if [ -L "$path" ]; then
+                printf 'symlink\0'
+                readlink --zero -- "$path" || exit 1
+            else
+                printf 'regular\0'
+            fi
+            sha256sum --zero -- "$path" || exit 1
+        done
+    } | sha256sum | cut -d' ' -f1
+)
+
 # Exercise the exact receipt parser without admitting a build or substituting
 # tools. The shell regression suite feeds it recorded terminal-output shapes.
 if [ "${1:-}" = --verify-receipt ]; then
@@ -199,6 +227,11 @@ if [ "${1:-}" = --verify-remote-payload ]; then
     run_encoded_remote_script "$2"
     exit $?
 fi
+if [ "${1:-}" = --verify-ubs-source ]; then
+    shift
+    ubs_source_digest "$@"
+    exit $?
+fi
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)" || exit 1
 cd "$PROJECT_ROOT" || exit 1
@@ -212,6 +245,7 @@ LOCAL=0
 REGEN_GOLDENS=0
 RUN_DOCS_TRUTH=0
 UBS_FILES=()
+VERIFY_UBS=0
 VERIFY_UBS_FILES=()
 # Each entry is `<test-binary>` or `<test-binary>:<filter words>`; the filter
 # is passed after `--` so one admission can run only the tests a change touches.
@@ -233,7 +267,7 @@ while [ $# -gt 0 ]; do
         # pinned runner, delta baseline and negative control the admission
         # runs. The stage itself is dispatched after its functions are
         # defined.
-        --verify-ubs) shift; VERIFY_UBS_FILES=("$@"); break ;;
+        --verify-ubs) VERIFY_UBS=1; shift; VERIFY_UBS_FILES=("$@"); break ;;
         --integration) IFS=',' read -r -a INTEGRATION_TESTS <<<"$2"; shift 2 ;;
         # Regenerate goldens (UPDATE_GOLDENS=1) before verifying them. The
         # verify stage still runs, and every resulting diff under tests/golden
@@ -273,70 +307,72 @@ if [[ ! "$UBS_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
     echo "gate: GATE_UBS_TIMEOUT_SECS must be a positive integer" >&2
     exit 2
 fi
-SOURCE_HEAD="$(git rev-parse HEAD)" || exit 1
-if [ "${#UBS_FILES[@]}" -eq 0 ]; then
-    # The branch's own changes are measured against the upstream base this
-    # branch merged, not against a remote-tracking ref that is thousands of
-    # commits behind. The delta baseline in ubs_delta_gate uses the same
-    # commit, so the scanned set and the baseline always agree.
-    UBS_BASE="${GATE_BASE:-$(git merge-base "$SOURCE_HEAD" upstream/main 2>/dev/null || git merge-base origin/main "$SOURCE_HEAD")}" || exit 1
-    while IFS= read -r -d '' path; do
-        [ -f "$path" ] && UBS_FILES+=("$path")
-    done < <({
-        git diff --name-only -z "$UBS_BASE" -- '*.rs' '*.py' '*.sh' '*.js' '*.ts' '*.tsx' '*.jsx'
-        git ls-files --others --exclude-standard -z -- '*.rs' '*.py' '*.sh' '*.js' '*.ts' '*.tsx' '*.jsx'
-    } | sort -zu)
-fi
-# Honour .ubsignore. The pinned runner scans every file it is named, even one
-# its own .ubsignore, --ignore-file or --exclude covers, so the config-level
-# suppression AGENTS.md prescribes only takes effect if the gate drops those
-# paths before naming them. Each skipped path is printed in the receipt.
-if [ -f .ubsignore ] && [ "${#UBS_FILES[@]}" -gt 0 ]; then
-    declare -A ubs_ignored=()
-    while IFS= read -r -d '' path; do
-        ubs_ignored["$path"]=1
-    done < <(git ls-files -z -c -o -i --exclude-from=.ubsignore -- "${UBS_FILES[@]}")
-    ubs_kept=()
-    for path in "${UBS_FILES[@]}"; do
-        if [ -n "${ubs_ignored[${path#./}]:-}" ]; then
-            echo "gate: UBS skips .ubsignore path ${path}"
-        else
-            ubs_kept+=("$path")
-        fi
-    done
-    UBS_FILES=("${ubs_kept[@]}")
-fi
-UBS_FILES_ARG=""
-if [ "${#UBS_FILES[@]}" -gt 0 ]; then
-    for path in "${UBS_FILES[@]}"; do
-        if [[ "$path" = /* || "$path" = .. || "$path" = ../* || "$path" = */../* ]] || [ ! -f "$path" ]; then
-            echo "gate: UBS source must be an existing repository-relative file: ${path}" >&2
-            exit 2
-        fi
-        printf -v quoted_path ' %q' "./${path}"
-        UBS_FILES_ARG+="$quoted_path"
-    done
-fi
-source_digest() {
-    {
-        git diff --binary HEAD
-        git ls-files --others --exclude-standard -z | xargs -0 -r sha256sum
-    } | sha256sum | cut -d' ' -f1
+prepare_gate_source() {
+    SOURCE_HEAD="$(git rev-parse HEAD)" || return 1
+    if [ "${#UBS_FILES[@]}" -eq 0 ]; then
+        # The branch's own changes are measured against the upstream base this
+        # branch merged, not against a remote-tracking ref that is thousands of
+        # commits behind. The delta baseline in ubs_delta_gate uses the same
+        # commit, so the scanned set and the baseline always agree.
+        UBS_BASE="${GATE_BASE:-$(git merge-base "$SOURCE_HEAD" upstream/main 2>/dev/null || git merge-base origin/main "$SOURCE_HEAD")}" || exit 1
+        while IFS= read -r -d '' path; do
+            [ -f "$path" ] && UBS_FILES+=("$path")
+        done < <({
+            git diff --name-only -z "$UBS_BASE" -- '*.rs' '*.py' '*.sh' '*.js' '*.ts' '*.tsx' '*.jsx'
+            git ls-files --others --exclude-standard -z -- '*.rs' '*.py' '*.sh' '*.js' '*.ts' '*.tsx' '*.jsx'
+        } | sort -zu)
+    fi
+    # Honour .ubsignore. The pinned runner scans every file it is named, even one
+    # its own .ubsignore, --ignore-file or --exclude covers, so the config-level
+    # suppression AGENTS.md prescribes only takes effect if the gate drops those
+    # paths before naming them. Each skipped path is printed in the receipt.
+    if [ -f .ubsignore ] && [ "${#UBS_FILES[@]}" -gt 0 ]; then
+        declare -A ubs_ignored=()
+        while IFS= read -r -d '' path; do
+            ubs_ignored["$path"]=1
+        done < <(git ls-files -z -c -o -i --exclude-from=.ubsignore -- "${UBS_FILES[@]}")
+        ubs_kept=()
+        for path in "${UBS_FILES[@]}"; do
+            if [ -n "${ubs_ignored[${path#./}]:-}" ]; then
+                echo "gate: UBS skips .ubsignore path ${path}"
+            else
+                ubs_kept+=("$path")
+            fi
+        done
+        UBS_FILES=("${ubs_kept[@]}")
+    fi
+    UBS_FILES_ARG=""
+    if [ "${#UBS_FILES[@]}" -gt 0 ]; then
+        for path in "${UBS_FILES[@]}"; do
+            if [[ "$path" = /* || "$path" = .. || "$path" = ../* || "$path" = */../* ]] || [ ! -f "$path" ]; then
+                echo "gate: UBS source must be an existing repository-relative file: ${path}" >&2
+                exit 2
+            fi
+            printf -v quoted_path ' %q' "./${path}"
+            UBS_FILES_ARG+="$quoted_path"
+        done
+    fi
+    source_digest() {
+        {
+            git diff --binary HEAD
+            git ls-files --others --exclude-standard -z | xargs -0 -r sha256sum
+        } | sha256sum | cut -d' ' -f1
+    }
+    SOURCE_DIFF="$(source_digest)" || exit 1
+    # RCH 1.0.63 does not combine --job with clean-overlay/content-receipt.
+    # Verify the transferred inputs ourselves before running any stage.
+    # rch's global transfer excludes drop every `.beads/` directory, so tracked
+    # files such as tests/.beads/* never reach the worker. Hashing them made the
+    # identity verdict depend on stale leftovers of whichever worker was chosen
+    # (green on one worker, red on another for the same tree). No build or test
+    # reads them, so they are not inputs this gate can or needs to verify.
+    SOURCE_PATHS="$(git ls-files --cached --others --exclude-standard -z -- \
+        Cargo.toml Cargo.lock rust-toolchain.toml build.rs src tests benches scripts \
+        .cargo .github README.md ':(exclude,glob)**/.beads/**' | \
+        sort -zu | gzip -c | base64 -w0)" || exit 1
+    SOURCE_CONTENT="$(printf '%s' "$SOURCE_PATHS" | base64 -d | gzip -d | \
+        xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1)" || exit 1
 }
-SOURCE_DIFF="$(source_digest)" || exit 1
-# RCH 1.0.63 does not combine --job with clean-overlay/content-receipt.
-# Verify the transferred inputs ourselves before running any stage.
-# rch's global transfer excludes drop every `.beads/` directory, so tracked
-# files such as tests/.beads/* never reach the worker. Hashing them made the
-# identity verdict depend on stale leftovers of whichever worker was chosen
-# (green on one worker, red on another for the same tree). No build or test
-# reads them, so they are not inputs this gate can or needs to verify.
-SOURCE_PATHS="$(git ls-files --cached --others --exclude-standard -z -- \
-    Cargo.toml Cargo.lock rust-toolchain.toml build.rs src tests benches scripts \
-    .cargo .github README.md ':(exclude,glob)**/.beads/**' | \
-    sort -zu | gzip -c | base64 -w0)" || exit 1
-SOURCE_CONTENT="$(printf '%s' "$SOURCE_PATHS" | base64 -d | gzip -d | \
-    xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1)" || exit 1
 
 # Keep complete terminal output and require a positive test count. Cargo exits
 # zero when a misspelled filter selects no tests; that is not validation.
@@ -1388,10 +1424,22 @@ PYSUM
     return "$filter_rc"
 }
 
-if [ "${#VERIFY_UBS_FILES[@]}" -gt 0 ]; then
+if [ "$VERIFY_UBS" -eq 1 ]; then
     cd "$PROJECT_ROOT" || exit 1
-    run_ubs "${VERIFY_UBS_FILES[@]}"
-    exit $?
+    SOURCE_HEAD="$(git rev-parse HEAD)" || exit 1
+    before="$(ubs_source_digest "${VERIFY_UBS_FILES[@]}")" || exit $?
+    echo "SOURCE_HEAD=${SOURCE_HEAD} UBS_SOURCE_CONTENT_SHA256=${before}"
+    echo "STAGE=source-identity EXIT=0"
+    ubs_rc=0
+    run_ubs "${VERIFY_UBS_FILES[@]}" || ubs_rc=$?
+    echo "STAGE=ubs EXIT=${ubs_rc}"
+    after="$(ubs_source_digest "${VERIFY_UBS_FILES[@]}")" || exit 1
+    if [ "$(git rev-parse HEAD)" != "$SOURCE_HEAD" ] || [ "$after" != "$before" ]; then
+        echo "STAGE=source-stability EXIT=1 (scanner inputs changed during verification)"
+        exit 1
+    fi
+    echo "STAGE=source-stability EXIT=0"
+    exit "$ubs_rc"
 fi
 
 # Every stage records its own exit code and preserves complete test output.
@@ -1502,6 +1550,8 @@ if [ \"\$build_rc\" -eq 0 ]; then
 fi;"
     EXPECTED_STAGES+=(docs-build docs-binary-identity docs-truth)
 fi
+
+prepare_gate_source || exit 1
 
 REMOTE_SCRIPT="$(declare -f test_log_counts run_tests run_fmt run_ubs ubs_delta_gate prepare_compile_inputs)
 set -o pipefail
