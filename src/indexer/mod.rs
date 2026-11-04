@@ -18744,6 +18744,7 @@ fn run_index_with_storage_ownership(
         && !opts.watch
         && !targeted_semantic_watch_once
         && !scan_had_errors
+        // Public embedder ID. ubs:ignore[rust.security.constant-time-compare]
         && opts.embedder != "external"
     {
         // Delta-only and non-fatal (see set_background_semantic_delta_enabled):
