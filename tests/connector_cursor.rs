@@ -1,5 +1,5 @@
 use coding_agent_search::connectors::cursor::CursorConnector;
-use coding_agent_search::connectors::{Connector, NormalizedConversation, ScanContext};
+use coding_agent_search::connectors::{Connector, NormalizedConversation, ScanContext, ScanRoot};
 use coding_agent_search::franken_sync::Connection as FrankenConnection;
 use coding_agent_search::franken_sync::compat::ConnectionExt;
 use serde::Deserialize;
@@ -415,7 +415,11 @@ fn scan_finds_workspace_storage_dbs() {
 fn scan_empty_dir_returns_empty() {
     let tmp = TempDir::new().unwrap();
     let connector = CursorConnector::new();
-    let ctx = ScanContext::local_default(tmp.path().to_path_buf(), None);
+    let ctx = ScanContext::with_roots(
+        tmp.path().to_path_buf(),
+        vec![ScanRoot::local(tmp.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert!(convs.is_empty());
 }
