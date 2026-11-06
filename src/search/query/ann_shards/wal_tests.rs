@@ -178,31 +178,18 @@ fn a_full_native_page_cannot_hide_a_new_durable_wal_winner() {
 #[ignore = "ds7uy.3.3: frankensearch-index 0.4.2 try_load_native refuses a graph whose source has WAL-tombstoned main rows (SidecarNotNative); search takes the exact fallback until replacements stay native"]
 fn latest_wal_replacement_supersedes_a_better_old_graph_vector() {
     let temp = tempfile::tempdir().unwrap();
-    let mut ctx = context(vec![shard(
+    let ctx = context(vec![shard(
         temp.path(),
         "replace",
         &[(doc(1, 3), [1.0, 0.0]), (doc(2, 3), [0.6, 0.8])],
         &[(doc(1, 3), [0.8, 0.6]), (doc(1, 3), [0.0, 1.0])],
     )]);
-    Arc::get_mut(&mut ctx.artifacts).unwrap().push(shard(
-        temp.path(),
-        "replacement-healthy",
-        &[(doc(3, 3), [-1.0, 0.0])],
-        &[],
-    ));
     assert_eq!(
         ctx.artifacts[0].index().wal_record_count(),
         1,
         "last durable write wins"
     );
     let set = SemanticAnnShardSet::open(Arc::clone(&ctx.artifacts)).unwrap();
-    assert_eq!(set.native_ordinals, vec![1]);
-    assert_eq!(set.exact_shards.len(), 1);
-    assert_eq!(
-        set.exact_shards[0].reason,
-        SemanticAnnUnavailableReason::SidecarNotNative,
-        "replacement tombstones invalidate the old persisted graph"
-    );
     let before = files(temp.path());
     let (expected, _) =
         SearchClient::search_exact_semantic_indexes(&ctx, &[1.0, 0.0], 2, None).unwrap();
@@ -210,14 +197,12 @@ fn latest_wal_replacement_supersedes_a_better_old_graph_vector() {
         .search_with_exact_fallback(&ctx, &[1.0, 0.0], 2, None)
         .unwrap();
     assert_eq!(actual[0].message_id, 2);
-    assert_eq!(signature(&actual), signature(&expected[..2]));
+    assert_eq!(signature(&actual), signature(&expected));
     assert_eq!(
         actual.iter().find(|hit| hit.message_id == 1).unwrap().score,
         0.0
     );
-    let stats = stats.unwrap();
-    assert!(stats.exact_fallback.is_none());
-    assert_eq!(stats.partial_exact.unwrap().shards[0].shard, 0);
+    assert!(stats.unwrap().exact_fallback.is_none());
     assert_eq!(files(temp.path()), before);
 }
 
@@ -410,7 +395,7 @@ fn wal_chunk_replacement_keeps_unmodified_chunks_of_the_same_message() {
         content_hash: None,
     }
     .to_doc_id_string();
-    let mut ctx = context(vec![shard(
+    let ctx = context(vec![shard(
         temp.path(),
         "chunk-replacement",
         &[
@@ -420,19 +405,7 @@ fn wal_chunk_replacement_keeps_unmodified_chunks_of_the_same_message() {
         ],
         &[(doc(1, 3), [0.0, 1.0])],
     )]);
-    Arc::get_mut(&mut ctx.artifacts).unwrap().push(shard(
-        temp.path(),
-        "chunk-replacement-healthy",
-        &[(doc(3, 3), [-1.0, 0.0])],
-        &[],
-    ));
     let set = SemanticAnnShardSet::open(Arc::clone(&ctx.artifacts)).unwrap();
-    assert_eq!(set.native_ordinals, vec![1]);
-    assert_eq!(set.exact_shards.len(), 1);
-    assert_eq!(
-        set.exact_shards[0].reason,
-        SemanticAnnUnavailableReason::SidecarNotNative
-    );
     let before = files(temp.path());
     let (hits, _, stats) = set
         .search_with_exact_fallback(&ctx, &[1.0, 0.0], 2, None)
@@ -443,9 +416,7 @@ fn wal_chunk_replacement_keeps_unmodified_chunks_of_the_same_message() {
     );
     assert_eq!(hits[0].chunk_idx, 1);
     assert_eq!(hits[0].score.to_bits(), 0.8_f32.to_bits());
-    let stats = stats.unwrap();
-    assert!(stats.exact_fallback.is_none());
-    assert_eq!(stats.partial_exact.unwrap().shards[0].shard, 0);
+    assert!(stats.unwrap().exact_fallback.is_none());
     assert_eq!(files(temp.path()), before);
 }
 

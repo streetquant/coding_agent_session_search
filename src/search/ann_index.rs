@@ -10,76 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use frankensearch::index::{HnswConfig, HnswIndex, VectorIndex};
 
-use crate::search::vector_index::{SemanticAnnUnavailableReason, VECTOR_INDEX_DIR};
-
-/// Bounded ANN readiness for one selected exact FSVI cohort.
-///
-/// This is the single readiness vocabulary shared by the status, health,
-/// doctor, TUI and query-diagnostic surfaces. `Absent` and
-/// `PresentUnverified` come from cheap inspection that never deserializes a
-/// graph. `NativeReady` requires exact native admission of the paired sidecar
-/// against the retained exact owner; nothing else may report it. `Rejected`
-/// carries the same stable reason code the serving path reports when it
-/// falls back to exact search.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SemanticAnnReadiness {
-    /// No ANN artifact is paired with the selected exact artifact.
-    Absent,
-    /// A bounded inspection found an ANN artifact but did not admit it.
-    ///
-    /// The sidecar exists; nothing about its graph integrity, completeness or
-    /// source identity has been proven yet.
-    PresentUnverified,
-    /// Exact native admission against the retained exact owner succeeded.
-    NativeReady,
-    /// Native admission was attempted and refused for a stable reason.
-    Rejected(SemanticAnnUnavailableReason),
-}
-
-impl SemanticAnnReadiness {
-    /// Stable state token projected by every readiness surface.
-    #[must_use]
-    pub const fn state(self) -> &'static str {
-        match self {
-            Self::Absent => "absent",
-            Self::PresentUnverified => "present_unverified",
-            Self::NativeReady => "native_ready",
-            Self::Rejected(_) => "rejected",
-        }
-    }
-
-    /// True only after exact native admission against the retained owner.
-    #[must_use]
-    pub const fn is_ready(self) -> bool {
-        matches!(self, Self::NativeReady)
-    }
-
-    /// The stable reason code, when this readiness has one.
-    ///
-    /// An absent cohort reports the same `ann_sidecar_missing` code the
-    /// serving path reports when it has no paired sidecar, so a bounded
-    /// surface and a real search never disagree about the reason.
-    #[must_use]
-    pub const fn reason_code(self) -> Option<&'static str> {
-        match self {
-            Self::Absent => Some(SemanticAnnUnavailableReason::SidecarMissing.code()),
-            Self::PresentUnverified => None,
-            Self::NativeReady => None,
-            Self::Rejected(reason) => Some(reason.code()),
-        }
-    }
-
-    /// The stable reason, when this readiness has one.
-    #[must_use]
-    pub const fn reason(self) -> Option<SemanticAnnUnavailableReason> {
-        match self {
-            Self::Absent => Some(SemanticAnnUnavailableReason::SidecarMissing),
-            Self::PresentUnverified => None,
-            Self::NativeReady => None,
-            Self::Rejected(reason) => Some(reason),
-        }
-    }
-}
+use crate::search::vector_index::VECTOR_INDEX_DIR;
 
 /// Why native retrieval was replaced by the complete exact cohort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -381,69 +312,6 @@ mod tests {
     fn hnsw_index_path_uses_expected_layout() {
         let p = hnsw_index_path(Path::new("/tmp/cass"), "minilm-384");
         assert!(p.ends_with("vector_index/hnsw-minilm-384.chsw"));
-    }
-
-    #[test]
-    fn ann_readiness_projects_stable_tokens_for_every_state() {
-        use crate::search::vector_index::SemanticAnnUnavailableReason;
-
-        // An absent cohort reports the same reason code the serving path
-        // reports when it has no paired sidecar, so a bounded surface and a
-        // real search never disagree about the reason.
-        let absent = SemanticAnnReadiness::Absent;
-        assert_eq!(absent.state(), "absent");
-        assert!(!absent.is_ready());
-        assert_eq!(absent.reason_code(), Some("ann_sidecar_missing"));
-        assert_eq!(
-            absent.reason(),
-            Some(SemanticAnnUnavailableReason::SidecarMissing)
-        );
-
-        // Presence proves nothing: an unprobed sidecar is never ready and
-        // never invents a reason.
-        let present = SemanticAnnReadiness::PresentUnverified;
-        assert_eq!(present.state(), "present_unverified");
-        assert!(!present.is_ready());
-        assert_eq!(present.reason_code(), None);
-        assert_eq!(present.reason(), None);
-
-        // Native readiness is the only state that may report readiness, and
-        // it never carries a fallback reason.
-        let native = SemanticAnnReadiness::NativeReady;
-        assert_eq!(native.state(), "native_ready");
-        assert!(native.is_ready());
-        assert_eq!(native.reason_code(), None);
-        assert_eq!(native.reason(), None);
-
-        // Every refusal keeps the exact serving-path reason code.
-        for reason in [
-            SemanticAnnUnavailableReason::SessionScopeRequiresExact,
-            SemanticAnnUnavailableReason::MultipleExactShards,
-            SemanticAnnUnavailableReason::SidecarMissing,
-            SemanticAnnUnavailableReason::SidecarOpenFailed,
-            SemanticAnnUnavailableReason::SidecarNotNative,
-        ] {
-            let rejected = SemanticAnnReadiness::Rejected(reason);
-            assert_eq!(rejected.state(), "rejected");
-            assert!(!rejected.is_ready());
-            assert_eq!(rejected.reason_code(), Some(reason.code()));
-            assert_eq!(rejected.reason(), Some(reason));
-        }
-
-        // The invariant the whole surface rests on: only exact native
-        // admission may report readiness.
-        assert!(
-            [
-                SemanticAnnReadiness::Absent,
-                SemanticAnnReadiness::PresentUnverified,
-                SemanticAnnReadiness::NativeReady,
-                SemanticAnnReadiness::Rejected(SemanticAnnUnavailableReason::SidecarNotNative),
-            ]
-            .iter()
-            .filter(|state| state.is_ready())
-            .count()
-                == 1
-        );
     }
 
     #[test]

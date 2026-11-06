@@ -49,8 +49,8 @@ fn rusqlite_is_dev_dependency_only() {
 /// silently bifurcate the engine family.
 #[test]
 fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
-    const FACADE_REQUIREMENT: &str = "=0.4.13";
-    const TYPES_REQUIREMENT: &str = "=0.4.13";
+    const FACADE_REQUIREMENT: &str = "=0.4.12";
+    const TYPES_REQUIREMENT: &str = "=0.4.12";
     const EXPECTED_FACADE_FEATURES: &[&str] = &["fts5", "async-api"];
 
     let manifest: toml::Table =
@@ -154,7 +154,7 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
     let mut seen_names = std::collections::BTreeSet::new();
     for package in resolved_fsqlite {
         let name = package["name"].as_str().expect("locked package name");
-        let expected_version = "0.4.13";
+        let expected_version = "0.4.12";
         assert!(
             seen_names.insert(name.to_string()),
             "Cargo.lock resolves more than one version of {name}"
@@ -162,7 +162,7 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
         assert_eq!(
             package.get("version").and_then(toml::Value::as_str),
             Some(expected_version),
-            "{name} resolved at a different version than the published 0.4.13 family contract"
+            "{name} resolved at a different version than the published 0.4.12 family contract"
         );
         let source = package
             .get("source")
@@ -176,8 +176,7 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
 
     let build_contract = include_str!("../build.rs");
     assert!(
-        build_contract.contains("expected_version: \"0.4.13\"")
-            && !build_contract.contains("expected_version: \"0.4.12\"")
+        build_contract.contains("expected_version: \"0.4.12\"")
             && !build_contract.contains("expected_version: \"0.4.9\"")
             && !build_contract.contains("expected_version: \"0.4.7\"")
             && !build_contract.contains("expected_version: \"0.4.6\"")
@@ -1178,20 +1177,23 @@ fn gh509_cass_writer_commits_after_a_stock_readonly_query() {
 
     // The trigger: one stock read-only query.
     {
-        let stock = std::process::Command::new("sqlite3")
-            .arg("-readonly")
-            .arg(&db_path)
-            .arg("PRAGMA journal_mode; SELECT count(*) FROM meta WHERE key = 'gh509_seed';")
-            .output()
-            .expect("stock SQLite interop gate requires the sqlite3 CLI");
-        assert!(stock.status.success(), "stock read failed: {stock:?}");
-        assert_eq!(
-            String::from_utf8_lossy(&stock.stdout)
-                .lines()
-                .collect::<Vec<_>>(),
-            ["wal", "1"],
-            "the stock reader must observe WAL mode and the seed row"
-        );
+        let stock = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("stock read-only open");
+        let journal: String = stock
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("stock journal mode");
+        assert_eq!(journal, "wal", "precondition: the archive is in WAL mode");
+        let seeded: i64 = stock
+            .query_row(
+                "SELECT count(*) FROM meta WHERE key = 'gh509_seed'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("stock read");
+        assert_eq!(seeded, 1);
     }
     assert!(
         shm_path.exists(),
@@ -1213,14 +1215,15 @@ fn gh509_cass_writer_commits_after_a_stock_readonly_query() {
     storage.close().expect("close");
 
     // Both engines see every row.
-    let stock = std::process::Command::new("sqlite3")
-        .arg("-readonly")
-        .arg(&db_path)
-        .arg("SELECT count(*) FROM meta WHERE key LIKE 'gh509_%';")
-        .output()
-        .expect("stock SQLite interop gate requires the sqlite3 CLI");
-    assert!(stock.status.success(), "stock count failed: {stock:?}");
-    assert_eq!(String::from_utf8_lossy(&stock.stdout).trim(), "4");
+    let stock = rusqlite::Connection::open(&db_path).expect("stock open");
+    let rows: i64 = stock
+        .query_row(
+            "SELECT count(*) FROM meta WHERE key LIKE 'gh509_%'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("stock count");
+    assert_eq!(rows, 4);
     let franken = Connection::open(db_path.to_str().expect("utf-8 path")).expect("fsqlite open");
     let rows = franken
         .query("SELECT count(*) FROM meta WHERE key LIKE 'gh509_%'")

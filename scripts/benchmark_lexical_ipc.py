@@ -16,7 +16,6 @@ import platform
 import resource
 import selectors
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -63,13 +62,8 @@ def successful(response, reused, reference=None, mode=None, full=False):
 
 
 def cleanup(process):
-    # Every process passed here owns a fresh session. Keep its leader unreaped
-    # until signalling the group so a failed owner cannot strand its worker.
-    if process.returncode is None:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+    if process.poll() is None:
+        process.kill()
     process.wait(timeout=5)
     for stream in (process.stdin, process.stdout, process.stderr):
         if stream is not None and not stream.closed:
@@ -80,8 +74,7 @@ def run_client(command, timeout):
     """Include client startup/exit CPU, and bound both output pipes."""
     cpu_before, start = children_cpu_ms(), time.monotonic()
     process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               start_new_session=True)
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     output, errors = bytearray(), bytearray()
     deadline = start + timeout
     try:
@@ -119,17 +112,12 @@ def run_client(command, timeout):
 
 
 def start_native(cass, index, timeout):
-    process = subprocess.Popen(  # ubs:ignore[python.lifecycle.popen_handle] Callers finish or clean up this worker; setup failures also kill and wait below.
+    process = subprocess.Popen(
         [cass, "serve", "--stdio", "--index", str(index),
          "--request-timeout-ms", str(int(timeout * 1000))],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        start_new_session=True)
-    try:
-        os.set_blocking(process.stdin.fileno(), False)
-        os.set_blocking(process.stdout.fileno(), False)
-    except BaseException:
-        cleanup(process)
-        raise
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    os.set_blocking(process.stdin.fileno(), False)
+    os.set_blocking(process.stdout.fileno(), False)
     return process
 
 
@@ -192,8 +180,7 @@ def ipc_clients(args, reference):
             [sys.executable, "-S", str(SCRIPT), "serve", "--cass", args.cass,
              "--index", str(args.index), "--socket", str(endpoint),
              "--timeout", str(args.timeout), "--idle-seconds", "300"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True)
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             deadline = start + args.timeout
             while not endpoint.exists() or endpoint.stat().st_mode & 0o777 != 0o600:

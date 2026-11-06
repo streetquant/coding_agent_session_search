@@ -44,8 +44,6 @@ fn command(home: &Path, streaming: &str) -> Command {
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"))
         .env("CASS_DATA_DIR", home.join("data"))
-        .env("CASS_CLOUDMCP_DATA_ROOT", home.join("cloudmcp-empty"))
-        .env("CASS_OPENWEBUI_DATA_ROOT", home.join("openwebui-empty"))
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         .env("CASS_STREAMING_INDEX", streaming)
         .env("CASS_AUTO_REFRESH", "0")
@@ -89,34 +87,25 @@ fn source_observations(log: &str) -> Vec<bool> {
         .collect()
 }
 
-fn verify_completed_summary(output: &[u8], conversations: usize, sources: usize, context: &str) {
+fn verify_completed_summary(output: &[u8], conversations: usize, sources: usize) {
     let summary: Value = serde_json::from_slice(output).expect("completed index JSON");
-    assert_eq!(summary["success"], true, "{context}: {summary}");
-    assert_eq!(
-        summary["conversations"], conversations,
-        "{context}: {summary}"
-    );
-    assert_eq!(
-        summary["messages"],
-        conversations * 32,
-        "{context}: {summary}"
-    );
+    assert_eq!(summary["success"], true, "{summary}");
+    assert_eq!(summary["conversations"], conversations, "{summary}");
+    assert_eq!(summary["messages"], conversations * 32, "{summary}");
     assert_eq!(
         summary["indexing_stats"]["total_conversations"], conversations,
-        "{context}: {summary}"
+        "{summary}"
     );
     assert_eq!(
         summary["indexing_stats"]["total_messages"],
         conversations * 32,
-        "{context}: {summary}"
+        "{summary}"
     );
-    // Admitted source outcomes include ledger reuse. A connector cutoff can
-    // withhold already-covered sources before admission, so the trace supplies
-    // this run's actual source population; the checks below still require its
-    // exact number of parses and the complete canonical archive.
+    // Source outcomes include unchanged ledger-reused sources, while the
+    // conversation and message counters above describe this scan's delta.
     assert_eq!(
         summary["indexing_stats"]["connector_summary"]["claude"]["indexed"], sources,
-        "{context}: {summary}"
+        "{summary}"
     );
 }
 
@@ -215,16 +204,12 @@ fn gh426_bounded_stop_resumes_only_uncommitted_sources_in_both_modes() {
         // database before its scan, and after that repair the run's counters
         // describe the archive (GH #457). Which sources this run parsed is
         // asserted from the trace below.
+        verify_completed_summary(&resumed, 8, 8);
         let log = fs::read_to_string(&resumed_trace).unwrap();
         let observations = source_observations(&log);
-        verify_completed_summary(
-            &resumed,
-            8,
-            observations.len(),
-            &format!("streaming={streaming}, initial resume"),
-        );
-        assert!(
-            observations.iter().filter(|&&skipped| skipped).count() <= if reusable { 2 } else { 0 },
+        assert_eq!(
+            observations.iter().filter(|&&skipped| skipped).count(),
+            if reusable { 2 } else { 0 },
             "{log}"
         );
         assert_eq!(
@@ -290,23 +275,22 @@ fn gh426_bounded_stop_resumes_only_uncommitted_sources_in_both_modes() {
                 .get_output()
                 .stdout
                 .clone();
+        verify_completed_summary(&upgraded, if reusable { 2 } else { 8 }, 8);
         let log = fs::read_to_string(&upgraded_trace).unwrap();
         let observations = source_observations(&log);
-        verify_completed_summary(
-            &upgraded,
-            if reusable { 2 } else { 8 },
-            observations.len(),
-            &format!("streaming={streaming}, producer contract upgrade"),
-        );
-        assert_eq!(
-            observations.iter().filter(|&&skipped| !skipped).count(),
-            if reusable { 2 } else { 8 },
-            "{log}"
-        );
-        assert!(
-            observations.iter().filter(|&&skipped| skipped).count() <= if reusable { 6 } else { 0 },
-            "{log}"
-        );
+        for (skipped, expected) in [
+            (false, if reusable { 2 } else { 8 }),
+            (true, if reusable { 6 } else { 0 }),
+        ] {
+            assert_eq!(
+                observations
+                    .iter()
+                    .filter(|&&observed| observed == skipped)
+                    .count(),
+                expected,
+                "{log}"
+            );
+        }
         verify_archive(home.path(), 8);
         let storage =
             SqliteStorage::open_readonly(&home.path().join("data/agent_search.db")).unwrap();
@@ -328,57 +312,16 @@ fn gh426_bounded_stop_resumes_only_uncommitted_sources_in_both_modes() {
                 .get_output()
                 .stdout
                 .clone();
+        verify_completed_summary(&replay, if reusable { 1 } else { 8 }, 8);
         let log = fs::read_to_string(&replay_trace).unwrap();
         let observations = source_observations(&log);
-        verify_completed_summary(
-            &replay,
-            if reusable { 1 } else { 8 },
-            observations.len(),
-            &format!("streaming={streaming}, changed source replay"),
-        );
         assert_eq!(
             observations.iter().filter(|&&skipped| !skipped).count(),
             if reusable { 1 } else { 8 },
             "{log}"
         );
-        assert!(
-            observations.iter().filter(|&&skipped| skipped).count() <= if reusable { 7 } else { 0 },
-            "{log}"
-        );
         verify_archive(home.path(), 8);
     }
-}
-
-#[test]
-fn gh426_archive_oracle_rejects_a_missing_lexical_message() {
-    let home = tempfile::tempdir().unwrap();
-    seed(home.path(), 1);
-    let path = home.path().join(".claude/projects/resume/session-0.jsonl");
-    let original = fs::read_to_string(&path).unwrap();
-    assert_eq!(original.matches("exactresume0message31").count(), 1);
-    fs::write(
-        &path,
-        original.replace("exactresume0message31", "deliberatelymissingtoken31"),
-    )
-    .unwrap();
-    let trace = home.path().join("negative-trace.jsonl");
-    assert_cmd::Command::from_std(index_command(home.path(), "1", &trace))
-        .timeout(Duration::from_secs(120))
-        .assert()
-        .success();
-    // Counts alone still look complete: the same oracle must independently
-    // reject the missing expected message token after the admission correction.
-    let failure = std::panic::catch_unwind(|| verify_archive(home.path(), 1))
-        .expect_err("a missing lexical message must fail the archive oracle");
-    let message = failure
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| failure.downcast_ref::<&str>().copied())
-        .expect("the archive assertion supplies a diagnostic");
-    assert!(
-        message.contains("missing or duplicated lexical message 0/31"),
-        "the negative must fail the message oracle: {message}"
-    );
 }
 
 #[cfg(unix)]

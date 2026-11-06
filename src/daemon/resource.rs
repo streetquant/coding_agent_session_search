@@ -155,11 +155,8 @@ impl ResourceMonitor {
     /// - 2: Best-effort (normal priority)
     /// - 3: Idle (lowest priority)
     ///
-    /// An explicit priority must be 0..=7 and is supported only by the
-    /// realtime and best-effort classes. `None` preserves ionice's defaults.
-    /// Invalid combinations are refused before changing the process.
     /// Returns true if successful.
-    pub fn apply_ionice(&self, class: u32, priority: Option<u32>) -> bool {
+    pub fn apply_ionice(&self, class: u32) -> bool {
         #[cfg(target_os = "linux")]
         {
             if class > 3 {
@@ -169,26 +166,16 @@ impl ResourceMonitor {
                 );
                 return false;
             }
-            if priority.is_some_and(|priority| priority > 7 || !matches!(class, 1 | 2)) {
-                warn!(
-                    class,
-                    priority = ?priority,
-                    "Refusing ionice priority (valid range: 0..=7 for classes 1 and 2)"
-                );
-                return false;
-            }
             let class_str = class.to_string();
 
-            let mut command = Command::new("ionice");
-            command.args(["-c", &class_str]);
-            if let Some(priority) = priority {
-                command.args(["-n", &priority.to_string()]);
-            }
-            command.args(["-p", &self.pid.to_string()]);
-            match command.output() {
+            // Use ionice command to set I/O scheduling class
+            match Command::new("ionice")
+                .args(["-c", &class_str, "-p", &self.pid.to_string()])
+                .output()
+            {
                 Ok(output) => {
                     if output.status.success() {
-                        debug!(class, priority = ?priority, pid = self.pid, "Applied ionice class");
+                        debug!(class = class, pid = self.pid, "Applied ionice class");
                         true
                     } else {
                         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -209,7 +196,7 @@ impl ResourceMonitor {
 
         #[cfg(not(target_os = "linux"))]
         {
-            debug!(class, priority = ?priority, "ionice not supported on this platform");
+            debug!(class = class, "ionice not supported on this platform");
             let _ = class;
             false
         }
@@ -311,18 +298,18 @@ mod tests {
         #[cfg(target_os = "linux")]
         {
             // Best-effort class (2) should work
-            let result = monitor.apply_ionice(2, None);
+            let result = monitor.apply_ionice(2);
             // May fail if ionice isn't available
             let _ = result;
 
             // Idle class (3) should work too
-            let result = monitor.apply_ionice(3, None);
+            let result = monitor.apply_ionice(3);
             let _ = result;
         }
 
         #[cfg(not(target_os = "linux"))]
         {
-            assert!(!monitor.apply_ionice(2, None));
+            assert!(!monitor.apply_ionice(2));
         }
     }
 
@@ -346,14 +333,6 @@ mod tests {
     #[test]
     fn test_apply_ionice_rejects_invalid_class() {
         let monitor = ResourceMonitor::new();
-        assert!(!monitor.apply_ionice(4, None));
-    }
-
-    #[test]
-    fn test_apply_ionice_rejects_invalid_priority_combinations() {
-        let monitor = ResourceMonitor::new();
-        for (class, priority) in [(0, 7), (3, 7), (1, 8), (2, 8), (2, u32::MAX)] {
-            assert!(!monitor.apply_ionice(class, Some(priority)));
-        }
+        assert!(!monitor.apply_ionice(4));
     }
 }

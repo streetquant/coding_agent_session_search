@@ -7,7 +7,7 @@
 //! 2. Connector detection round-trip works correctly
 //! 3. Probe script generation uses FAD paths dynamically
 //! 4. Agent counts are consistent across all APIs
-//! 5. Detection-only connectors (windsurf) are properly handled
+//! 5. Detection-only connectors (continue, windsurf) are properly handled
 
 use coding_agent_search::indexer::get_connector_factories;
 use std::collections::HashSet;
@@ -51,23 +51,17 @@ fn probe_slugs() -> HashSet<String> {
 
 /// Detection-only connectors: have probe paths and detection entries but
 /// no parser implementation (no entry in `get_connector_factories()`).
-const DETECTION_ONLY: &[&str] = &["windsurf"];
-
-// Native CASS readers are not part of the pinned FAD remote probe registry.
-// In particular, a live Kilo SQLite/WAL must not be rsync-copied as though it
-// were an immutable transcript. Local detection and explicit exported roots
-// are supported; automatic SSH discovery is not advertised for these readers.
-const CASS_NATIVE: &[&str] = &["kilo", "cloudmcp", "openwebui", "dsh"];
+const DETECTION_ONLY: &[&str] = &["continue", "windsurf"];
 
 /// Extract a function body from source code, including the braces.
 fn extract_function_body(source: &str, fn_prefix: &str) -> String {
     let start = source
         .find(fn_prefix)
-        .unwrap_or_else(|| panic!("function not found: {fn_prefix}")); // ubs:ignore -- Test fixture must fail when the named source function is absent.
+        .unwrap_or_else(|| panic!("function not found: {fn_prefix}"));
     let after = &source[start..];
     let open = after
         .find('{')
-        .unwrap_or_else(|| panic!("no opening brace for: {fn_prefix}")); // ubs:ignore -- Test fixture must fail when source extraction cannot start.
+        .unwrap_or_else(|| panic!("no opening brace for: {fn_prefix}"));
     let mut depth = 0usize;
     let mut end_idx = None;
     for (i, ch) in after[open..].char_indices() {
@@ -83,7 +77,7 @@ fn extract_function_body(source: &str, fn_prefix: &str) -> String {
             _ => {}
         }
     }
-    let end = end_idx.unwrap_or_else(|| panic!("no closing brace for: {fn_prefix}")); // ubs:ignore -- Test fixture must fail on an incomplete function body.
+    let end = end_idx.unwrap_or_else(|| panic!("no closing brace for: {fn_prefix}"));
     after[open..end].to_string()
 }
 
@@ -172,17 +166,7 @@ fn feature_gated_connectors_available() {
              Check Cargo.toml enables the feature for franken-agent-detection"
         );
     }
-    assert_eq!(
-        slugs.len(),
-        franken_agent_detection::get_connector_factories().len() + CASS_NATIVE.len(),
-        "Expected every FAD and native CASS factory"
-    );
-    for native in CASS_NATIVE {
-        assert!(
-            slugs.contains(*native),
-            "Native CASS connector {native} missing"
-        );
-    }
+    assert_eq!(slugs.len(), 33, "Expected 33 connector factories");
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +184,6 @@ fn probe_paths_cover_all_factory_connectors() {
     // Note: "copilot" factory slug maps to "github-copilot" in KNOWN_CONNECTORS.
     let factory_mapped: HashSet<String> = factory
         .iter()
-        .filter(|s| !CASS_NATIVE.contains(&s.as_str()))
         .map(|s| match s.as_str() {
             "copilot" => "github-copilot".to_string(),
             other => other.to_string(),
@@ -360,7 +343,6 @@ fn agent_counts_consistent_across_apis() {
     // Factory must be a strict subset of detection (after slug mapping)
     let factory_mapped: HashSet<String> = factory
         .iter()
-        .filter(|s| !CASS_NATIVE.contains(&s.as_str()))
         .map(|s| match s.as_str() {
             "copilot" => "github-copilot".to_string(),
             other => other.to_string(),
@@ -518,8 +500,6 @@ mod prime_ingestion {
             .env("PATH", "")
             .env("XDG_DATA_HOME", home.join(".local/share"))
             .env("XDG_CONFIG_HOME", home.join(".config"))
-            .env("CASS_CLOUDMCP_DATA_ROOT", home.join("cloudmcp"))
-            .env("CASS_OPENWEBUI_DATA_ROOT", home.join("openwebui"))
             .env("CASS_IGNORE_SOURCES_CONFIG", "1")
             .env("CASS_DATA_DIR", data)
             .env("CASS_AUTO_REFRESH", "0")
@@ -788,8 +768,6 @@ mod prime_ingestion {
                 .env("PATH", "")
                 .env("XDG_DATA_HOME", home.path().join(".local/share"))
                 .env("XDG_CONFIG_HOME", home.path().join(".config"))
-                .env("CASS_CLOUDMCP_DATA_ROOT", home.path().join("cloudmcp"))
-                .env("CASS_OPENWEBUI_DATA_ROOT", home.path().join("openwebui"))
                 .env("CASS_IGNORE_SOURCES_CONFIG", "1")
                 .env("CASS_AUTO_REFRESH", "0")
                 .env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0")
@@ -865,32 +843,7 @@ mod devin_ingestion {
     use coding_agent_search::franken_sync::{Connection, params};
     use serde_json::{Value, json};
     use std::fs;
-    use std::io::{Read, Seek, SeekFrom};
     use std::time::Duration;
-
-    fn bounded_watch_log(path: &Path) -> String {
-        const MAX_TAIL_BYTES: u64 = 8 * 1024;
-        let Ok(mut file) = fs::File::open(path) else {
-            return String::new();
-        };
-        let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
-            return String::new();
-        };
-        let start = length.saturating_sub(MAX_TAIL_BYTES);
-        if file.seek(SeekFrom::Start(start)).is_err() {
-            return String::new();
-        }
-        let mut tail = Vec::with_capacity((length - start) as usize);
-        if file.read_to_end(&mut tail).is_err() {
-            return String::new();
-        }
-        let prefix = if start > 0 {
-            format!("[first {start} bytes omitted]\n")
-        } else {
-            String::new()
-        };
-        format!("{prefix}{}", String::from_utf8_lossy(&tail))
-    }
 
     fn seed_store(path: &Path) {
         let conn = Connection::open(path.to_string_lossy().as_ref()).expect("create Devin store");
@@ -1000,8 +953,6 @@ mod devin_ingestion {
             .env("XDG_DATA_HOME", home.join(".local/share"))
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("CASS_DEVIN_DATA_ROOT", home.join("sessions.db"))
-            .env("CASS_CLOUDMCP_DATA_ROOT", home.join("cloudmcp"))
-            .env("CASS_OPENWEBUI_DATA_ROOT", home.join("openwebui"))
             .env("CASS_IGNORE_SOURCES_CONFIG", "1")
             .env("CASS_AUTO_REFRESH", "0")
             .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
@@ -1148,7 +1099,7 @@ mod devin_ingestion {
     }
 
     #[test]
-    fn devin_same_second_and_delayed_wal_commits_replay_without_duplicates() {
+    fn devin_same_second_wal_append_and_replay_preserve_five_messages() {
         use coding_agent_search::storage::sqlite::SqliteStorage;
 
         const SECOND: i64 = 1_700_001_000;
@@ -1199,7 +1150,7 @@ mod devin_ingestion {
                     "INSERT INTO sessions VALUES ('prior', 'prior second', NULL, NULL, NULL, ?1, ?1, 9, 0)",
                     params![SECOND - 1],
                 )
-                .expect("insert delayed commit with older provider activity");
+                .expect("insert eligible older negative control");
             writer
                 .execute_compat(
                     "INSERT INTO message_nodes VALUES (9, 'prior', NULL, ?1, ?2)",
@@ -1229,9 +1180,8 @@ mod devin_ingestion {
                 factory().scan(&ctx).expect("both visible controls").len(),
                 2
             );
-            // The provider honors an explicit cutoff. The CLI deliberately
-            // omits it for Devin: a newly committed WAL row can have provider
-            // activity older than the filesystem scan watermark.
+            // This is the cutoff selected from SECOND*1000+500 by the
+            // production watermark map, independently covered by its unit test.
             ctx.since_ts = Some(SECOND * 1000);
             let eligible = factory().scan(&ctx).expect("native boundary cutoff");
             assert_eq!(eligible.len(), 1, "prior second must remain excluded");
@@ -1250,7 +1200,7 @@ mod devin_ingestion {
                     .args(["index", "--json"])
                     .assert()
                     .success();
-                for (query, expected) in [("devinneedle", 5), ("priorsecondneedle", 1)] {
+                for (query, expected) in [("devinneedle", 5), ("priorsecondneedle", 0)] {
                     let output = cass(home.path(), &data)
                         .args([
                             "search", query, "--mode", "lexical", "--agent", "devin", "--json",
@@ -1265,7 +1215,7 @@ mod devin_ingestion {
                     assert_eq!(
                         result["budget"]["timed_out"].as_bool(),
                         Some(false),
-                        "a timed-out search cannot prove delayed-commit recovery: {result}"
+                        "a timed-out search cannot prove prior-second exclusion: {result}"
                     );
                     assert_eq!(
                         result["hits"].as_array().expect("hits").len(),
@@ -1315,25 +1265,22 @@ mod devin_ingestion {
         let watch_logs = || {
             format!(
                 "stdout:\n{}\nstderr:\n{}",
-                bounded_watch_log(&stdout_path),
-                bounded_watch_log(&stderr_path),
+                fs::read_to_string(&stdout_path).unwrap_or_default(),
+                fs::read_to_string(&stderr_path).unwrap_or_default(),
             )
         };
         let mut watch = WatchChild(
             cass_command(home.path(), &data)
-                // Human mode honors RUST_LOG=info, so the readiness signal is
-                // visible without enabling dependency DEBUG log floods.
-                .args(["index", "--watch", "--watch-interval", "1"])
+                // JSON mode suppresses the INFO readiness signal unless requested.
+                .arg("--verbose")
+                .args(["index", "--watch", "--watch-interval", "1", "--json"])
                 .env("RUST_LOG", "info")
                 .stdout(Stdio::from(fs::File::create(&stdout_path).unwrap()))
                 .stderr(Stdio::from(fs::File::create(&stderr_path).unwrap()))
                 .spawn()
                 .expect("start real Devin watcher"),
         );
-        // This is a test hang guard, not a watcher deadline. The isolated cold
-        // index can take nearly a minute, and sibling integration tests contend
-        // for the same host resources when this target runs concurrently.
-        let deadline = Instant::now() + Duration::from_secs(180);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let logs = watch_logs();
             if logs.contains("watch mode: minimum interval between scan cycles") {

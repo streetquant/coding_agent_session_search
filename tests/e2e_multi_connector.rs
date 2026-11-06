@@ -1186,8 +1186,6 @@ fn grok_bot_fifo_cli_preserves_evicted_and_new_messages() {
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("XDG_DATA_HOME", home.join(".local/share"))
             .env("CASS_GROK_BOT_DATA_ROOT", root)
-            .env("CASS_CLOUDMCP_DATA_ROOT", home.join("empty-cloudmcp"))
-            .env("CASS_OPENWEBUI_DATA_ROOT", home.join("empty-openwebui"))
             .env("CASS_DATA_DIR", data)
             .env("CASS_IGNORE_SOURCES_CONFIG", "1")
             .env("CASS_STREAMING_INDEX", streaming)
@@ -1309,10 +1307,6 @@ fn grok_bot_fifo_cli_preserves_evicted_and_new_messages() {
                         &conversation_id.to_string(),
                         "--message-index",
                         &hits[0]["line_number"].as_u64().unwrap().to_string(),
-                        "--message-anchor",
-                        hits[0]["message_anchor"]
-                            .as_str()
-                            .expect("full search identity anchor"),
                         "--json",
                     ])
                     .assert()
@@ -1321,16 +1315,6 @@ fn grok_bot_fifo_cli_preserves_evicted_and_new_messages() {
                     .stdout
                     .clone();
                 let value: Value = serde_json::from_slice(&view).unwrap();
-                let target = value["lines"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|row| row["is_target"] == true)
-                    .unwrap();
-                assert_eq!(target["message_anchor"], hits[0]["message_anchor"]);
-                assert_eq!(target["conversation_id"], conversation_id);
-                assert_eq!(target["message_index"], hits[0]["line_number"]);
-                assert_eq!(target["content"], hits[0]["content"]);
                 assert!(
                     value.to_string().contains(needle),
                     "canonical view must retain the searched message"

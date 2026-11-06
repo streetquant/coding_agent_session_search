@@ -172,7 +172,7 @@ class ProcessTests(unittest.TestCase):
                     "--data-dir", str(root), "--db", str(root / "archive.db"),
                     "--output", str(output), "--disposable-copy", "--repetitions", "1"]
             env = dict(os.environ, CASS_QUILL_QUERY_FUEL_BUDGET="999999999")
-            completed = subprocess.run(argv, env=env, capture_output=True, timeout=10)  # ubs:ignore[python.taint.command] Fixed interpreter/script argv; env sentinel is deliberate test input.
+            completed = subprocess.run(argv, env=env, capture_output=True, timeout=10)
             self.assertEqual(completed.returncode, 0, completed.stderr.decode())
             report = json.loads(output.read_text())
             self.assertEqual([s["query"] for s in report["samples"]], list(bench.QUERIES))
@@ -182,7 +182,7 @@ class ProcessTests(unittest.TestCase):
             self.assertEqual(report["by_query"]["git fixture"]["successful_samples"], 1)
             # A second run cannot replace an earlier receipt.
             previous = output.read_bytes()
-            repeated = subprocess.run(argv, env=env, capture_output=True, timeout=10)  # ubs:ignore[python.taint.command] Fixed interpreter/script argv; env sentinel is deliberate test input.
+            repeated = subprocess.run(argv, env=env, capture_output=True, timeout=10)
             self.assertNotEqual(repeated.returncode, 0)
             self.assertEqual(output.read_bytes(), previous)
 

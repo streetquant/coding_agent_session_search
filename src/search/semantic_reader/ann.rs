@@ -17,8 +17,8 @@ use frankensearch::index::{ValidatedFsviBytes, dot_product_f32_f32};
 use serde::Serialize;
 
 use crate::search::semantic_manifest::{
-    SemanticAnnBaseBindingV1, SemanticArtifactRole, SemanticArtifactSealStateV1,
-    SemanticGenerationArtifact, SemanticGenerationManifestV1,
+    SemanticAnnBaseBindingV1, SemanticArtifactRole, SemanticGenerationArtifact,
+    SemanticGenerationManifestV1,
 };
 
 use super::{SemanticGenerationReader, SemanticReaderError, SemanticReaderResult, TierKind};
@@ -64,8 +64,8 @@ pub enum NativeAnnArtifactError {
 
 /// Describe a graph produced by `ValidatedNativeHnsw::save` for sealing in the
 /// SAME immutable generation as `base`. This does not write or publish anything.
-/// The manifest sealer authenticates the actual graph bytes and adjacent receipt
-/// before publication. Structural graph admission remains a serving check.
+/// The manifest sealer still validates the actual graph bytes before publication.
+/// Preserve the adjacent binary receipt: serving verifies its entire fingerprint.
 pub fn native_ann_artifact(
     base: &SemanticGenerationArtifact,
     receipt: &NativeHnswGenerationReceiptV2,
@@ -77,11 +77,7 @@ pub fn native_ann_artifact(
         SemanticArtifactRole::QualityVector => SemanticArtifactRole::QualityAnn,
         _ => return Err(NativeAnnArtifactError::InvalidBase),
     };
-    if base.artifact_format != "fsvi-v2"
-        || base.fsvi_generation.is_none()
-        || base.ann_base.is_some()
-        || base.seal != (SemanticArtifactSealStateV1::Vector { wal_entry_count: 0 })
-    {
+    if base.artifact_format != "fsvi-v2" || base.ann_base.is_some() || base.wal_entry_count != 0 {
         return Err(NativeAnnArtifactError::InvalidBase);
     }
     if receipt.validate().is_err() || !receipt_matches_base(receipt, base) {
@@ -98,9 +94,6 @@ pub fn native_ann_artifact(
     }
     let mut artifact = base.clone();
     artifact.role = role;
-    artifact.fsvi_generation = None;
-    artifact.seal = SemanticArtifactSealStateV1::Ann {};
-    artifact.validation.seal = SemanticArtifactSealStateV1::Ann {};
     artifact.relative_path = relative_path.to_owned();
     artifact.artifact_format = NATIVE_ANN_ARTIFACT_FORMAT.to_owned();
     artifact.artifact_sha256 = receipt.graph_sha256.clone();
@@ -126,51 +119,13 @@ fn receipt_matches_base(
     receipt: &NativeHnswGenerationReceiptV2,
     base: &SemanticGenerationArtifact,
 ) -> bool {
-    Some(receipt.artifact_generation) == base.fsvi_generation
-        && receipt.fsvi_whole_image_sha256 == base.artifact_sha256
+    receipt.fsvi_whole_image_sha256 == base.artifact_sha256
         && receipt.embedding_identity_fingerprint == base.embedding_identity.fingerprint
         && receipt.vector_storage_fingerprint
             == base.embedding_identity.identity.storage.fingerprint()
         && receipt.fsvi_physical_row_count == base.vector_slot_count
         && receipt.point_count == base.vector_slot_count
         && receipt.ordered_live_docset_digest == base.covered_live_docset_sha256
-}
-
-/// Check the public, parsed receipt against the exact admitted vector owner and
-/// selected descriptors. This does not parse a graph or reopen either artifact.
-pub(crate) fn receipt_matches_manifest_owner(
-    receipt: &NativeHnswGenerationReceiptV2,
-    artifact: &SemanticGenerationArtifact,
-    base: &SemanticGenerationArtifact,
-    owner: &ValidatedFsviBytes,
-) -> bool {
-    let Some(binding) = artifact.ann_base.as_ref() else {
-        return false;
-    };
-    let identity = owner.identity_v2();
-    artifact.artifact_format == NATIVE_ANN_ARTIFACT_FORMAT
-        && binding.algorithm == "native-hnsw"
-        && binding.metric == "cosine"
-        && receipt_matches_base(receipt, base)
-        && receipt.graph_sha256 == artifact.artifact_sha256
-        && receipt.graph_byte_len == artifact.size_bytes
-        && receipt.receipt_sha256 == artifact.artifact_parameters_sha256
-        && Path::new(&artifact.relative_path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            == Some(receipt.graph_basename.as_str())
-        && receipt.artifact_generation == identity.generation
-        && receipt.artifact_generation_fingerprint == hex::encode(identity.generation_fingerprint)
-        && receipt.embedding_identity_fingerprint
-            == hex::encode(identity.identity_bundle_fingerprint)
-        && receipt.embedding_space_fingerprint == hex::encode(identity.space_fingerprint)
-        && receipt.embedding_producer_fingerprint == hex::encode(identity.producer_fingerprint)
-        && receipt.embedding_input_fingerprint == hex::encode(identity.input_fingerprint)
-        && receipt.vector_storage_fingerprint == hex::encode(identity.storage_fingerprint)
-        && receipt.vector_content_digest == hex::encode(identity.vector_content_digest)
-        && receipt.ordered_live_docset_digest == hex::encode(identity.ordered_live_docset_digest)
-        && receipt.fsvi_whole_image_sha256 == hex::encode(owner.witness().whole_image_sha256)
-        && u64::try_from(owner.record_count()).ok() == Some(receipt.fsvi_physical_row_count)
 }
 
 fn graph_bytes_within_budget(
@@ -366,9 +321,12 @@ impl ShardAnn {
         }
         // The upstream loader performs structural and cryptographic admission
         // with this exact owner. Keep that loaded graph: no second graph open.
-        match ValidatedNativeHnsw::load(Arc::clone(&owner), &graph_path) {
+        match ValidatedNativeHnsw::load(owner, &graph_path) {
             Ok((graph, receipt))
-                if receipt_matches_manifest_owner(&receipt, artifact, base, &owner) =>
+                if receipt.graph_sha256 == artifact.artifact_sha256
+                    && receipt.graph_byte_len == artifact.size_bytes
+                    && receipt.receipt_sha256 == artifact.artifact_parameters_sha256
+                    && receipt_matches_base(&receipt, base) =>
             {
                 Self::Ready(Box::new(AdmittedAnn { graph, receipt }))
             }

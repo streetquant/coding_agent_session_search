@@ -2,9 +2,9 @@
 //!
 //! The existing manifest loader supplies selection authority, not a serving
 //! handle. This adapter admits each vector against that manifest's complete
-//! identity, generation and whole-image digest, then RETAINS that same sealed
-//! owner. Admission reads the image only through the upstream no-atime owner;
-//! it never probes the header through an ordinary path open first.
+//! identity and whole-image digest, then RETAINS that same sealed owner. Header
+//! inspection supplies only the full-width generation needed by FSVI admission;
+//! it is untrusted until the admitted image matches the manifest's SHA-256.
 //!
 //! The expected corpus must come from the caller's pinned canonical snapshot.
 //! This module does not derive database identity from counts, filenames or the
@@ -23,7 +23,9 @@ pub mod text;
 
 use frankensearch::core::TieredQueryEmbeddings;
 use frankensearch::core::filter::SearchFilter;
-use frankensearch::index::{FsviAdmissionError, FsviV2IdentityBinding, ValidatedFsviBytes};
+use frankensearch::index::{
+    FsviAdmissionError, FsviInspection, FsviV2IdentityBinding, ValidatedFsviBytes, VectorIndex,
+};
 
 use super::ann::{AnnAdmissionBudget, AnnSearchPolicy, SemanticAnnAdmission};
 
@@ -36,11 +38,8 @@ use crate::search::semantic_manifest::selection::{
 };
 use crate::search::semantic_manifest::{
     SemanticArtifactRole, SemanticCorpusSnapshotIdentity, SemanticCurrentPointerV1,
-    SemanticGenerationError, SemanticGenerationManifestV1, TierKind,
+    SemanticGenerationArtifact, SemanticGenerationError, SemanticGenerationManifestV1, TierKind,
 };
-
-#[cfg(test)]
-use crate::search::semantic_manifest::{SemanticArtifactSealStateV1, SemanticGenerationArtifact};
 
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 use crate::search::semantic_manifest::load_current_semantic_generation;
@@ -65,10 +64,7 @@ impl Default for SemanticSelectionBudget {
 }
 
 impl SemanticSelectionBudget {
-    pub(crate) fn check(
-        self,
-        manifest: &SemanticGenerationManifestV1,
-    ) -> SemanticSelectionResult<()> {
+    fn check(self, manifest: &SemanticGenerationManifestV1) -> SemanticSelectionResult<()> {
         let declared = manifest
             .artifacts
             .iter()
@@ -482,9 +478,14 @@ fn admit_tier(
         // All relative paths were validated by the authoritative loader. No
         // role-keyed lookup: that would silently drop all but one v2 shard.
         let path = selected.generation_dir.join(&artifact.relative_path);
-        let generation = artifact
-            .fsvi_generation
-            .ok_or(SemanticSelectionError::UnsupportedArtifact { role })?;
+        let FsviInspection::V2IdentityComplete(metadata) = VectorIndex::inspect(&path)? else {
+            return Err(SemanticSelectionError::UnsupportedArtifact { role });
+        };
+        let generation = metadata
+            .identity_v2
+            .as_ref()
+            .ok_or(SemanticSelectionError::UnsupportedArtifact { role })?
+            .generation;
         let expected = FsviV2IdentityBinding::new(generation, artifact.embedding_identity.clone())?;
         if let Some(first) = binding.as_ref()
             && first != &expected
@@ -497,12 +498,7 @@ fn admit_tier(
                 source: Box::new(source),
             }
         })?;
-        artifact.validate_fsvi_owner(&owner).map_err(|field| {
-            SemanticSelectionError::ArtifactMismatch {
-                role: artifact.role,
-                field,
-            }
-        })?;
+        check_artifact(artifact, &owner)?;
         live_count = live_count
             .checked_add(owner.witness().live_count)
             .ok_or(SemanticReaderError::CountOverflow)?;
@@ -555,6 +551,41 @@ fn admit_tier(
         shards,
         live_count,
     }))
+}
+
+fn check_artifact(
+    artifact: &SemanticGenerationArtifact,
+    owner: &ValidatedFsviBytes,
+) -> SemanticSelectionResult<()> {
+    let witness = owner.witness();
+    let mismatch = |field| SemanticSelectionError::ArtifactMismatch {
+        role: artifact.role,
+        field,
+    };
+    if hex::encode(witness.whole_image_sha256) != artifact.artifact_sha256 {
+        return Err(mismatch("artifact_sha256"));
+    }
+    if witness.byte_len != artifact.size_bytes {
+        return Err(mismatch("size_bytes"));
+    }
+    if witness.record_count != artifact.vector_slot_count {
+        return Err(mismatch("vector_slot_count"));
+    }
+    if witness.live_count != artifact.live_vector_count
+        || witness.live_count != artifact.covered_document_count
+    {
+        return Err(mismatch("covered_document_count"));
+    }
+    if witness.tombstone_count != artifact.tombstone_vector_count {
+        return Err(mismatch("tombstone_vector_count"));
+    }
+    if hex::encode(witness.ordered_live_docset_digest) != artifact.covered_live_docset_sha256 {
+        return Err(mismatch("covered_live_docset_sha256"));
+    }
+    if !owner.published_wal_absent() || artifact.wal_entry_count != 0 {
+        return Err(SemanticReaderError::NonCanonicalDocuments.into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

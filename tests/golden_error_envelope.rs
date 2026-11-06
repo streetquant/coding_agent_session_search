@@ -184,11 +184,8 @@ fn error_kinds_golden_coverage() {
     if std::env::var("UPDATE_GOLDENS").is_ok() {
         let json = build_golden_json(&source_kinds);
         std::fs::create_dir_all(golden.parent().unwrap()).expect("create golden dir");
-        // Keep the trailing newline the committed golden carries, so a
-        // regeneration is byte-stable instead of stripping it.
-        let mut rendered = serde_json::to_string_pretty(&json).unwrap();
-        rendered.push('\n');
-        std::fs::write(&golden, rendered).expect("write golden");
+        std::fs::write(&golden, serde_json::to_string_pretty(&json).unwrap())
+            .expect("write golden");
         eprintln!("[GOLDEN] Updated: {}", golden.display());
         return;
     }

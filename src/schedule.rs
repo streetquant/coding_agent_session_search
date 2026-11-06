@@ -41,7 +41,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -785,41 +784,7 @@ pub fn load_state(data_dir: &Path) -> ScheduleState {
     outcomes::normalize_state(state)
 }
 
-fn state_lock_path(data_dir: &Path) -> PathBuf {
-    schedule_dir(data_dir).join("state.lock")
-}
-
-/// Serialize updates to the scheduler's state and history.
-///
-/// Incremental and nightly timers can fire concurrently (and a manual
-/// scheduled run can overlap either one). The index lock protects the
-/// expensive index itself, but it does not protect schedule/state.json.
-/// Holding this small per-data-dir lock across the load/modify/publish
-/// sequence prevents one job from overwriting the other job's last report or
-/// racing the shared temporary state file.
-fn with_state_lock<T>(
-    data_dir: &Path,
-    operation: impl FnOnce() -> std::io::Result<T>,
-) -> std::io::Result<T> {
-    let dir = schedule_dir(data_dir);
-    std::fs::create_dir_all(&dir)?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(state_lock_path(data_dir))?;
-    lock.lock_exclusive()?;
-    let result = operation();
-    let unlock = FileExt::unlock(&lock);
-    match (result, unlock) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-    }
-}
-
-fn save_state_unlocked(data_dir: &Path, state: &ScheduleState) -> std::io::Result<()> {
+fn save_state(data_dir: &Path, state: &ScheduleState) -> std::io::Result<()> {
     let path = state_path(data_dir);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -830,11 +795,6 @@ fn save_state_unlocked(data_dir: &Path, state: &ScheduleState) -> std::io::Resul
     file.write_all(&body)?;
     file.sync_all()?;
     std::fs::rename(&tmp, &path)
-}
-
-#[cfg(test)]
-fn save_state(data_dir: &Path, state: &ScheduleState) -> std::io::Result<()> {
-    with_state_lock(data_dir, || save_state_unlocked(data_dir, state))
 }
 
 fn append_run(data_dir: &Path, report: &JobReport) -> std::io::Result<()> {
@@ -863,32 +823,15 @@ pub struct RunConfig {
 }
 
 fn last_json_document(stdout: &str) -> Option<serde_json::Value> {
-    // Steps normally print one document. Warnings can surround a pretty
-    // report, and JSONL steps can print several complete reports.
+    // Steps print exactly one JSON document, but tolerate leading noise by
+    // taking the last line that parses (compact) or the whole buffer (pretty).
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
         return Some(value);
     }
-    let mut remaining = stdout;
-    let mut last = None;
-    while !remaining.is_empty() {
-        let candidate = remaining.trim_start();
-        if candidate.starts_with('{') || candidate.starts_with('[') {
-            let mut documents =
-                serde_json::Deserializer::from_str(candidate).into_iter::<serde_json::Value>();
-            if let Some(Ok(value)) = documents.next() {
-                // Skip the entire document so nested values, such as an
-                // agent string on its own line, cannot replace its report.
-                last = Some(value);
-                remaining = candidate.get(documents.byte_offset()..)?;
-                continue;
-            }
-        }
-        let Some((_, rest)) = candidate.split_once('\n') else {
-            break;
-        };
-        remaining = rest;
-    }
-    last
+    stdout
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
 }
 
 fn run_step(
@@ -930,11 +873,6 @@ fn run_step(
                 let _ = log.write_all(stderr.as_bytes());
             }
             let exit_code = output.status.code();
-            let result = last_json_document(&stdout).or_else(|| {
-                (!output.status.success())
-                    .then(|| last_json_document(&stderr))
-                    .flatten()
-            });
             StepReport {
                 name: name.to_string(),
                 argv,
@@ -942,7 +880,7 @@ fn run_step(
                 ok: output.status.success(),
                 duration_ms,
                 skipped_reason: None,
-                result,
+                result: last_json_document(&stdout),
                 stderr_tail: stderr_tail(&stderr),
             }
         }
@@ -1215,7 +1153,7 @@ fn run_job_with_gate(
             index_environment,
             log.as_mut(),
         );
-        let index_busy = soften_busy_index_step(&mut index_step, &cfg.data_dir);
+        let index_busy = soften_busy_index_step(&mut index_step);
         steps.push(index_step);
         let prerequisites_ok = steps.iter().all(|step| step.ok);
 
@@ -1356,41 +1294,34 @@ fn run_job_with_gate(
 }
 
 fn persist_job_report(cfg: &RunConfig, mut report: JobReport) -> JobReport {
-    let result = with_state_lock(&cfg.data_dir, || {
-        let mut state = load_state(&cfg.data_dir);
-        match report.job {
-            ScheduleJob::Incremental => state.last_incremental = Some(report.clone()),
-            ScheduleJob::Nightly => state.last_nightly = Some(report.clone()),
+    let mut state = load_state(&cfg.data_dir);
+    match report.job {
+        ScheduleJob::Incremental => state.last_incremental = Some(report.clone()),
+        ScheduleJob::Nightly => state.last_nightly = Some(report.clone()),
+    }
+    let state_saved = match save_state(&cfg.data_dir, &state) {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(kind = ?error.kind(), "failed to persist schedule state");
+            record_persistence_failure(&mut report, "schedule_state_write_failed");
+            false
         }
-        let state_saved = match save_state_unlocked(&cfg.data_dir, &state) {
-            Ok(()) => true,
-            Err(error) => {
-                warn!(kind = ?error.kind(), "failed to persist schedule state");
+    };
+    if let Err(error) = append_run(&cfg.data_dir, &report) {
+        warn!(kind = ?error.kind(), "failed to append schedule run history");
+        record_persistence_failure(&mut report, "schedule_history_write_failed");
+        // Do not leave a successful state receipt after history publication
+        // failed. Retry only this bounded correction, still under the lease.
+        if state_saved {
+            match report.job {
+                ScheduleJob::Incremental => state.last_incremental = Some(report.clone()),
+                ScheduleJob::Nightly => state.last_nightly = Some(report.clone()),
+            }
+            if let Err(error) = save_state(&cfg.data_dir, &state) {
+                warn!(kind = ?error.kind(), "failed to persist corrected schedule state");
                 record_persistence_failure(&mut report, "schedule_state_write_failed");
-                false
-            }
-        };
-        if let Err(error) = append_run(&cfg.data_dir, &report) {
-            warn!(kind = ?error.kind(), "failed to append schedule run history");
-            record_persistence_failure(&mut report, "schedule_history_write_failed");
-            // Do not leave a successful state receipt after history publication
-            // failed. Retry only this bounded correction, still under the lease.
-            if state_saved {
-                match report.job {
-                    ScheduleJob::Incremental => state.last_incremental = Some(report.clone()),
-                    ScheduleJob::Nightly => state.last_nightly = Some(report.clone()),
-                }
-                if let Err(error) = save_state_unlocked(&cfg.data_dir, &state) {
-                    warn!(kind = ?error.kind(), "failed to persist corrected schedule state");
-                    record_persistence_failure(&mut report, "schedule_state_write_failed");
-                }
             }
         }
-        Ok(())
-    });
-    if let Err(error) = result {
-        warn!(kind = ?error.kind(), "failed to lock schedule state and run history");
-        record_persistence_failure(&mut report, "schedule_state_lock_failed");
     }
     report
 }
@@ -1447,69 +1378,48 @@ pub fn soften_model_unavailable_backfill_step(step: &mut StepReport) -> bool {
 /// Annotate exit-7 (`index-busy`) as a deferred step without claiming that
 /// indexing succeeded. The next timer firing retries, but callers and saved
 /// receipts must distinguish that retryable deferral from completed work.
-pub fn soften_busy_index_step(step: &mut StepReport, data_dir: &Path) -> bool {
+pub fn soften_busy_index_step(step: &mut StepReport) -> bool {
     if step.exit_code != Some(7) {
         return false;
     }
     step.ok = false;
     // Exit 7 covers several causes; name the one the child reported. Only a
-    // child that saw another index run holding a still-held lock is contention
+    // child that saw another index run holding the lock is contention
     // (GH #509: a database stuck in WAL-index recovery was reported as a
     // held lock, so a permanently failing schedule read as a benign skip).
     let message = step_error_field(step, "/error/message").unwrap_or_default();
-    let kind = step_error_field(step, "/error/kind").unwrap_or_else(|| "unknown".to_string());
-    let child_reported_lock = message.contains("another 'cass index' run is already active")
-        || message.contains("another cass index process already holds");
-    step.skipped_reason = Some(if kind == "migration-repair-pending" {
-        "the archive still needs its one-time storage migration repair; run `cass index --full` in the foreground".to_string()
-    } else if child_reported_lock
-        && crate::search::asset_state::read_search_maintenance_snapshot(data_dir).active
-    {
-        "another index run already holds the index lock; skipped this cycle".to_string()
-    } else if child_reported_lock {
-        format!(
-            "the index run failed ({kind}); the child reported contention but the index lock is no longer held: {}",
-            bounded_reason(&message)
-        )
-    } else if message.contains("canonical database is busy/locked") {
-        format!(
-            "the index run failed ({kind}): the canonical database stayed busy; the child did not report an index lock holder: {}",
-            bounded_reason(&message)
-        )
-    } else if message.is_empty() {
-        format!("the index run exited 7 ({kind}) without an error message; see stderr_tail")
-    } else {
-        format!(
-            "the index run exited 7 ({kind}): {}",
-            bounded_reason(&message)
-        )
-    });
+    step.skipped_reason = Some(
+        if step_error_field(step, "/error/kind").as_deref() == Some("migration-repair-pending") {
+            "the archive still needs its one-time storage migration repair; run `cass index --full` in the foreground".to_string()
+        } else if message.contains("another 'cass index' run is already active")
+            || message.contains("another cass index process already holds")
+        {
+            "another index run already holds the index lock; skipped this cycle".to_string()
+        } else if message.contains("canonical database is busy/locked") {
+            format!(
+                "the index run failed: the canonical database stayed busy and no other index run held the lock: {}",
+                bounded_reason(&message)
+            )
+        } else if message.is_empty() {
+            "the index run exited 7 (busy) without an error message; see stderr_tail".to_string()
+        } else {
+            format!(
+                "the index run exited 7 (busy): {}",
+                bounded_reason(&message)
+            )
+        },
+    );
     true
 }
 
-/// A field from a child's native index report or generic CLI error envelope.
-pub(crate) fn step_error_field(step: &StepReport, pointer: &str) -> Option<String> {
-    let extract = |document: &serde_json::Value| {
-        document
-            .pointer(pointer)
-            .or_else(|| match pointer {
-                "/error/kind" => document.get("kind"),
-                "/error/message" => document
-                    .get("error")
-                    .filter(|value| value.is_string())
-                    .or_else(|| document.get("message")),
-                _ => None,
-            })
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-    };
-    if let Some(value) = step.result.as_ref().and_then(extract) {
-        return Some(value);
-    }
+/// A field from the last JSON error envelope a step wrote to stderr.
+fn step_error_field(step: &StepReport, pointer: &str) -> Option<String> {
     step.stderr_tail.as_deref()?.lines().rev().find_map(|line| {
         serde_json::from_str::<serde_json::Value>(line.trim())
-            .ok()
-            .and_then(|document| extract(&document))
+            .ok()?
+            .pointer(pointer)?
+            .as_str()
+            .map(str::to_owned)
     })
 }
 
@@ -2263,10 +2173,6 @@ mod tests {
 
     #[test]
     fn busy_index_step_is_deferred_without_claiming_success() {
-        use fs2::FileExt;
-
-        let directory = tempfile::tempdir().unwrap();
-        let data_dir = directory.path();
         let step = |exit: Option<i32>, ok: bool| StepReport {
             name: "index".into(),
             argv: vec![],
@@ -2278,13 +2184,13 @@ mod tests {
             stderr_tail: None,
         };
         let mut busy = step(Some(7), false);
-        assert!(soften_busy_index_step(&mut busy, data_dir));
+        assert!(soften_busy_index_step(&mut busy));
         assert!(!busy.ok);
         assert!(busy.skipped_reason.is_some());
         let mut fine = step(Some(0), true);
-        assert!(!soften_busy_index_step(&mut fine, data_dir));
+        assert!(!soften_busy_index_step(&mut fine));
         let mut failed = step(Some(3), false);
-        assert!(!soften_busy_index_step(&mut failed, data_dir));
+        assert!(!soften_busy_index_step(&mut failed));
         assert!(!failed.ok);
 
         // GH #450: exit 7 from a deferred migration repair names that cause;
@@ -2296,76 +2202,33 @@ mod tests {
         let mut deferred = with_stderr(
             "note: something\n{\"error\":{\"code\":7,\"kind\":\"migration-repair-pending\",\"retryable\":false}}",
         );
-        assert!(soften_busy_index_step(&mut deferred, data_dir));
+        assert!(soften_busy_index_step(&mut deferred));
         assert!(!deferred.ok);
         let reason = deferred.skipped_reason.unwrap();
         assert!(reason.contains("migration repair"), "{reason}");
         assert!(reason.contains("cass index --full"), "{reason}");
-        let lock = File::create(data_dir.join("index-run.lock")).unwrap();
-        lock.try_lock_exclusive().unwrap();
         let mut locked = with_stderr(
             "{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"message\":\"another 'cass index' run is already active for data dir /d (pid 42)\",\"retryable\":true}}",
         );
-        assert!(soften_busy_index_step(&mut locked, data_dir));
+        assert!(soften_busy_index_step(&mut locked));
         assert!(locked.skipped_reason.unwrap().contains("index lock"));
         let mut held = with_stderr(
             "{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"message\":\"index failed: another cass index process already holds /d/index-run.lock\",\"retryable\":true}}",
         );
-        assert!(soften_busy_index_step(&mut held, data_dir));
+        assert!(soften_busy_index_step(&mut held));
         assert!(held.skipped_reason.unwrap().contains("index lock"));
-
-        // The actual `index --json` failure report uses root-level fields,
-        // while generic CLI failures use the nested envelope above.
-        let mut native_locked = step(Some(7), false);
-        native_locked.result = Some(serde_json::json!({
-            "success": false,
-            "error": "another 'cass index' run is already active for data dir /d (pid 42)",
-            "kind": "index-busy"
-        }));
-        assert!(soften_busy_index_step(&mut native_locked, data_dir));
-        assert!(
-            native_locked
-                .skipped_reason
-                .unwrap()
-                .contains("already holds the index lock")
-        );
-        drop(lock);
-
-        let mut native_busy = step(Some(7), false);
-        native_busy.result = Some(serde_json::json!({
-            "success": false,
-            "error": "index failed because the canonical database is busy/locked: final WAL checkpoint after index run did not complete: blocked (busy=1, log_frames=0, checkpointed_frames=0)",
-            "kind": "index-busy"
-        }));
-        assert!(soften_busy_index_step(&mut native_busy, data_dir));
-        let reason = native_busy.skipped_reason.unwrap();
-        assert!(reason.contains("index-busy"), "{reason}");
-        assert!(
-            reason.contains("did not report an index lock holder"),
-            "{reason}"
-        );
-        assert!(!reason.contains("already holds the index lock"), "{reason}");
-
-        let mut no_holder = with_stderr(
-            "{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"message\":\"another 'cass index' run is already active for data dir /d (pid 42)\"}}",
-        );
-        assert!(soften_busy_index_step(&mut no_holder, data_dir));
-        let reason = no_holder.skipped_reason.unwrap();
-        assert!(reason.contains("index-busy"), "{reason}");
-        assert!(reason.contains("no longer held"), "{reason}");
-        assert!(!reason.contains("already holds the index lock"), "{reason}");
 
         // GH #509: the same exit 7 and kind from a database stuck in
         // WAL-index recovery is not lock contention, and says what failed.
         let mut stuck = with_stderr(
             "ERROR group-commit callback failed\n{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"message\":\"index failed because the canonical database is busy/locked: ephemeral writer preflight write failed for serial batched indexing | database is busy (recovery in progress)\",\"retryable\":true}}",
         );
-        assert!(soften_busy_index_step(&mut stuck, data_dir));
+        assert!(soften_busy_index_step(&mut stuck));
         assert!(!stuck.ok);
         let reason = stuck.skipped_reason.unwrap();
-        assert!(reason.contains("index-busy"), "{reason}");
+        assert!(!reason.contains("index lock"), "{reason}");
         assert!(
-            reason.contains("did not report an index lock holder"),
+            reason.contains("no other index run held the lock"),
             "{reason}"
         );
         assert!(reason.contains("recovery in progress"), "{reason}");
@@ -2373,7 +2236,7 @@ mod tests {
         // Without a message the step claims no cause at all.
         let mut bare =
             with_stderr("{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"retryable\":true}}");
-        assert!(soften_busy_index_step(&mut bare, data_dir));
+        assert!(soften_busy_index_step(&mut bare));
         let reason = bare.skipped_reason.unwrap();
         assert!(!reason.contains("index lock"), "{reason}");
         assert!(reason.contains("stderr_tail"), "{reason}");
@@ -2386,27 +2249,6 @@ mod tests {
         let noisy = "warning: x\n{\"a\":1}\n{\"a\":2}\n";
         assert_eq!(last_json_document(noisy).unwrap()["a"], 2);
         assert!(last_json_document("nothing").is_none());
-    }
-
-    #[test]
-    fn last_json_document_keeps_noisy_pretty_index_accounting() {
-        let report = serde_json::json!({
-            "success": false,
-            "failed_source_count": 46,
-            "agents": ["codex", "cloudmcp"]
-        });
-        let output = format!(
-            "warning: incomplete sources\n{}\nindexing retained completed work\n",
-            serde_json::to_string_pretty(&report).unwrap()
-        );
-        assert_eq!(last_json_document(&output), Some(report));
-    }
-
-    #[test]
-    fn last_json_document_selects_complete_reports_without_nested_scalars() {
-        let output = "note: starting\n{\n  \"pass\": 1\n}\n{\n  \"pass\": 2,\n  \"agents\": [\n    \"cloudmcp\"\n  ]\n}\nfinished\n";
-        assert_eq!(last_json_document(output).unwrap()["pass"], 2);
-        assert!(last_json_document("warning\n{\n  \"agents\": [\n    \"cloudmcp\"\n").is_none());
     }
 
     #[test]
@@ -2520,87 +2362,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(last_completed_incremental_ms(dir.path()), Some(500));
-    }
-
-    #[test]
-    fn concurrent_job_reports_retain_both_state_slots_and_history() {
-        use std::sync::{Arc, Barrier};
-
-        let dir = tempfile::tempdir().unwrap();
-        let barrier = Arc::new(Barrier::new(2));
-        let make_report = |job, started_ms| JobReport {
-            job,
-            started_ms,
-            finished_ms: started_ms + 1,
-            ok: true,
-            skipped_reason: None,
-            steps: vec![skipped_step("index", "fixture")],
-            pressure: None,
-            user_idle: None,
-        };
-        let make_config = |data_dir: PathBuf| RunConfig {
-            binary: PathBuf::from("unused-fixture-binary"),
-            db_path: data_dir.join("agent_search.db"),
-            data_dir,
-            semantic: false,
-            max_backfill_batches: 1,
-        };
-
-        let incremental_dir = dir.path().to_path_buf();
-        let incremental_barrier = Arc::clone(&barrier);
-        let incremental = std::thread::spawn(move || {
-            incremental_barrier.wait();
-            assert!(
-                persist_job_report(
-                    &make_config(incremental_dir),
-                    make_report(ScheduleJob::Incremental, 1),
-                )
-                .ok
-            );
-        });
-        let nightly_dir = dir.path().to_path_buf();
-        let nightly_barrier = Arc::clone(&barrier);
-        let nightly = std::thread::spawn(move || {
-            nightly_barrier.wait();
-            assert!(
-                persist_job_report(
-                    &make_config(nightly_dir),
-                    make_report(ScheduleJob::Nightly, 2),
-                )
-                .ok
-            );
-        });
-        incremental.join().unwrap();
-        nightly.join().unwrap();
-
-        let state = load_state(dir.path());
-        assert_eq!(
-            state
-                .last_incremental
-                .as_ref()
-                .map(|report| report.started_ms),
-            Some(1)
-        );
-        assert_eq!(
-            state.last_nightly.as_ref().map(|report| report.started_ms),
-            Some(2)
-        );
-        let history = std::fs::read_to_string(runs_log_path(dir.path())).unwrap();
-        let records: Vec<JobReport> = history
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(records.len(), 2);
-        assert!(
-            records
-                .iter()
-                .any(|report| report.job == ScheduleJob::Incremental)
-        );
-        assert!(
-            records
-                .iter()
-                .any(|report| report.job == ScheduleJob::Nightly)
-        );
     }
 
     #[test]

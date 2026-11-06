@@ -1,9 +1,6 @@
 //! Bounded canonical context hydration through the real CLI and archive.
-use coding_agent_search::franken_sync::compat::{
-    ConnectionExt, OpenFlags, RowExt, open_with_flags,
-};
+use coding_agent_search::franken_sync::compat::ConnectionExt;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-use coding_agent_search::search::query::message_anchor_for_content;
 use coding_agent_search::storage::sqlite::FrankenStorage;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -78,30 +75,6 @@ impl Fixture {
     }
 
     fn command(&self, subcommand: &str, number: usize, context: usize) -> Command {
-        // Read only the target's current complete body. Resource and poisoned
-        // role fixtures must not hydrate the surrounding conversation here.
-        let connection =
-            open_with_flags(&self.db.to_string_lossy(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-        let content = connection
-            .query_map_collect(
-                "SELECT content FROM messages WHERE conversation_id = ?1 AND idx = ?2",
-                coding_agent_search::franken_sync::params![
-                    self.conversation_id,
-                    i64::try_from(number.checked_sub(1).unwrap()).unwrap()
-                ],
-                |row| row.get_typed::<String>(0),
-            )
-            .unwrap();
-        assert_eq!(content.len(), 1, "fixture target must be unique");
-        let anchor = message_anchor_for_content(
-            "local",
-            self.source.to_string_lossy().as_ref(),
-            Some(self.conversation_id),
-            Some(number),
-            &content[0],
-        )
-        .unwrap();
-        drop(connection);
         let mut command = Command::new(env!("CARGO_BIN_EXE_cass"));
         command
             .arg("--db")
@@ -111,8 +84,6 @@ impl Fixture {
             .args([
                 "--message-index",
                 &number.to_string(),
-                "--message-anchor",
-                &anchor,
                 "-C",
                 &context.to_string(),
                 "--source",

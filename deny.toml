@@ -39,335 +39,255 @@ allow = [
 confidence-threshold = 0.93
 exceptions = []
 
-# Owner policy override, 2026-10-24: "treat it as plain MIT".
-# These exact package identities receive MIT treatment only in cargo-deny.
-# Their actual upstream custom LicenseRef, full rider, and source metadata
-# remain unchanged; this is not an assertion that their license is plain MIT.
-# Bind the full LICENSE bytes where packaged. Packages that omit LICENSE are
-# bound to their published Cargo.toml custom-license metadata instead.
-# Unknown versions or changed binding bytes require another reviewed override.
+# Sibling Franken-* crates lack a `license = "..."` field in their Cargo.toml.
+# Per the cass README ("license-MIT%2BOpenAI%2FAnthropic%20Rider-green.svg"),
+# the project license is MIT + OpenAI/Anthropic rider. The sibling crates
+# inherit this. Clarify per-crate until the upstream Cargo.toml entries
+# are filled in.
 [[licenses.clarify]]
 name = "coding-agent-search"
-version = "=0.10.0"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "asupersync"
-version = "=0.5.0"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "asupersync-macros"
-version = "=0.5.0"
 expression = "MIT"
-license-files = [{ path = "Cargo.toml", hash = 0x11ecd383 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "franken-decision"
-version = "=0.5.0"
 expression = "MIT"
-license-files = [{ path = "Cargo.toml", hash = 0xdc3f6d11 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "franken-evidence"
-version = "=0.5.0"
 expression = "MIT"
-license-files = [{ path = "Cargo.toml", hash = 0xaf639a9b }]
+license-files = []
 
 [[licenses.clarify]]
 name = "franken-kernel"
-version = "=0.5.0"
 expression = "MIT"
-license-files = [{ path = "Cargo.toml", hash = 0x8848c14d }]
+license-files = []
+
+[[licenses.clarify]]
+name = "franken-agent-detection"
+expression = "MIT"
+license-files = []
 
 [[licenses.clarify]]
 name = "frankensearch"
-version = "=0.7.1"
 expression = "MIT"
-license-files = [{ path = "../LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "frankensearch-core"
-version = "=0.4.0"
 expression = "MIT"
-license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "frankensearch-embed"
-version = "=0.4.0"
 expression = "MIT"
-license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "frankensearch-fusion"
-version = "=0.4.0"
 expression = "MIT"
-license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "frankensearch-index"
-version = "=0.4.0"
 expression = "MIT"
-license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "frankensearch-lexical"
-version = "=0.4.0"
 expression = "MIT"
-license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
-
-[[licenses.clarify]]
-name = "frankensearch-quill"
-version = "=0.4.0"
-expression = "MIT"
-license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "frankensearch-rerank"
-version = "=0.5.0"
 expression = "MIT"
-license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
-
-[[licenses.clarify]]
-name = "frankentorch-api"
-version = "=0.1.0"
-expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
-
-[[licenses.clarify]]
-name = "frankentorch-autograd"
-version = "=0.1.0"
-expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
-
-[[licenses.clarify]]
-name = "frankentorch-core"
-version = "=0.1.0"
-expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
-
-[[licenses.clarify]]
-name = "frankentorch-dispatch"
-version = "=0.1.0"
-expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
-
-[[licenses.clarify]]
-name = "frankentorch-kernel-cpu"
-version = "=0.1.1"
-expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
-
-[[licenses.clarify]]
-name = "frankentorch-runtime"
-version = "=0.1.0"
-expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "fsqlite"
-version = "=0.4.13"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "fsqlite-ast"
-version = "=0.4.13"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "fsqlite-btree"
-version = "=0.4.13"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "fsqlite-core"
-version = "=0.4.13"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "fsqlite-error"
-version = "=0.4.13"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "fsqlite-mvcc"
-version = "=0.4.13"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "fsqlite-pager"
-version = "=0.4.13"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "fsqlite-parser"
-version = "=0.4.13"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "fsqlite-planner"
-version = "=0.4.13"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "fsqlite-vdbe"
-version = "=0.4.13"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "fsqlite-vfs"
-version = "=0.4.13"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "fsqlite-wal"
-version = "=0.4.13"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "ftui"
-version = "=0.5.0"
 expression = "MIT"
-license-files = [{ path = "Cargo.toml", hash = 0x704c1294 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "ftui-extras"
-version = "=0.5.0"
 expression = "MIT"
-license-files = [{ path = "Cargo.toml", hash = 0x4edb41f8 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "ftui-runtime"
-version = "=0.5.0"
 expression = "MIT"
-license-files = [{ path = "Cargo.toml", hash = 0xae7c43c2 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "ftui-tty"
-version = "=0.5.0"
 expression = "MIT"
-license-files = [{ path = "Cargo.toml", hash = 0xe9b0a3d9 }]
+license-files = []
+
+[[licenses.clarify]]
+name = "toon"
+expression = "MIT"
+license-files = []
 
 [[licenses.clarify]]
 name = "fsqlite-ext-fts5"
-version = "=0.4.13"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "fsqlite-ext-icu"
-version = "=0.4.13"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "fsqlite-ext-json"
-version = "=0.4.13"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "fsqlite-ext-misc"
-version = "=0.4.13"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "fsqlite-ext-rtree"
-version = "=0.4.13"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "fsqlite-func"
-version = "=0.4.13"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "fsqlite-observability"
-version = "=0.4.13"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "fsqlite-types"
-version = "=0.4.13"
 expression = "MIT"
-license-files = [{ path = "LICENSE", hash = 0x3e2e0c66 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "ftui-a11y"
-version = "=0.5.0"
 expression = "MIT"
-license-files = [{ path = "Cargo.toml", hash = 0x3881df13 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "ftui-backend"
-version = "=0.5.0"
 expression = "MIT"
-license-files = [{ path = "Cargo.toml", hash = 0xf69611a6 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "ftui-core"
-version = "=0.5.0"
 expression = "MIT"
-license-files = [{ path = "Cargo.toml", hash = 0x7762d08d }]
+license-files = []
 
 [[licenses.clarify]]
 name = "ftui-i18n"
-version = "=0.5.0"
 expression = "MIT"
-license-files = [{ path = "Cargo.toml", hash = 0x84c6b07b }]
+license-files = []
 
 [[licenses.clarify]]
 name = "ftui-layout"
-version = "=0.5.1"
 expression = "MIT"
-license-files = [{ path = "Cargo.toml", hash = 0xcd1d97e2 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "ftui-render"
-version = "=0.5.0"
 expression = "MIT"
-license-files = [{ path = "Cargo.toml", hash = 0x1dff1ace }]
+license-files = []
 
 [[licenses.clarify]]
 name = "ftui-style"
-version = "=0.5.0"
 expression = "MIT"
-license-files = [{ path = "Cargo.toml", hash = 0x82a665cf }]
+license-files = []
 
 [[licenses.clarify]]
 name = "ftui-text"
-version = "=0.5.0"
 expression = "MIT"
-license-files = [{ path = "Cargo.toml", hash = 0x5ea79fc1 }]
+license-files = []
 
 [[licenses.clarify]]
 name = "ftui-widgets"
-version = "=0.5.0"
 expression = "MIT"
-license-files = [{ path = "Cargo.toml", hash = 0x7691f445 }]
+license-files = []
 
 [advisories]
 # Use the latest advisory-db revision (no version pin).
 # Informational warnings escalate to errors by default; ignore the
-# 3 specific unmaintained-crate advisories that block transitively
+# 4 specific unmaintained-crate advisories that block transitively
 # through syntect/reqwest dep chains. These are evaluated each round
 # of the gauntlet — revisit when a viable replacement lands.
 yanked = "deny"
@@ -376,6 +296,8 @@ ignore = [
     "RUSTSEC-2025-0141",
     # paste unmaintained — no functional successor offers drop-in compat
     "RUSTSEC-2024-0436",
+    # rustls-pemfile unmaintained — migration to rustls-pki-types pending
+    "RUSTSEC-2025-0134",
     # yaml-rust unmaintained — via syntect; cannot upgrade syntect without breaking
     "RUSTSEC-2024-0320",
 ]
@@ -404,6 +326,4 @@ allow-git = [
     "https://github.com/Dicklesworthstone/frankentui",
     "https://github.com/Dicklesworthstone/asupersync",
     "https://github.com/Dicklesworthstone/toon",
-    # portable-pty's reviewed nix 0.29 fix is pinned to an exact upstream revision.
-    "https://github.com/wezterm/wezterm",
 ]

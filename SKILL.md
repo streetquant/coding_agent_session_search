@@ -43,10 +43,8 @@ cass search "performance regression" --workspace /path/to/project --days 7 \
 cass view /path/to/session.jsonl -n 42 -C 3 --json --timeout 2000
 ```
 
-`--timeout` is in milliseconds; `--max-tokens` is a soft estimate for the hit
-page, excluding the response envelope and robot metadata. It is not a hard
-output, CPU or memory limit. Check total output size before adding it to a
-prompt. Apply a caller-side wall-clock deadline as well (for
+`--timeout` is in milliseconds; `--max-tokens` is an approximate output budget,
+not a CPU or memory limit. Apply a caller-side wall-clock deadline as well (for
 example, GNU `timeout 10s` before the command). Exit 124 from that wrapper is an
 incomplete attempt; its interrupted stdout may not be valid JSON. In JSON search
 output, inspect `budget.timed_out` even after exit 0: empty timed-out hits do not

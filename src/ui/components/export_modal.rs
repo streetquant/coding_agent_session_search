@@ -407,7 +407,6 @@ mod tests {
             content: "content".to_string(),
             content_hash: 1,
             conversation_id: None,
-            message_anchor: None,
             score: 1.0,
             source_path: "/tmp/session.jsonl".to_string(),
             agent: "codex".to_string(),

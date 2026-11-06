@@ -188,7 +188,7 @@ pub mod connectors {
         # commit), then disallow resolution changes during tests and Clippy.
         metadata = json.loads(subprocess.check_output(
             [cargo, "metadata", "--manifest-path", str(project), "--format-version", "1"],
-            cwd=root, env=env, text=True, timeout=900,
+            cwd=root, env=env, text=True,
         ))
         verify_fad_selection(metadata, lockfile, fad_checkout)
         commands = [
@@ -197,7 +197,7 @@ pub mod connectors {
         ]
         for command in commands:
             print("+ " + " ".join(command), flush=True)
-            subprocess.run(command, cwd=root, env=env, check=True, timeout=1800)  # ubs:ignore[python.taint.command] Fixed Cargo argv with shell=False; env supplies toolchain configuration.
+            subprocess.run(command, cwd=root, env=env, check=True)
         # Each file is checked individually, so do not resolve its children as
         # if that file were a crate root. Never reformat the actual working tree.
         rustfmt = shutil.which("rustfmt")
@@ -209,8 +209,7 @@ pub mod connectors {
             *(str(root / f"tests/{test}.rs") for test in tests),
         ]
         print("+ " + " ".join(command), flush=True)
-        # ubs:ignore[python.taint.command] Fixed rustfmt argv with shell=False; env supplies toolchain configuration.
-        subprocess.run(command, cwd=root, env=env, check=True, timeout=120)
+        subprocess.run(command, cwd=root, env=env, check=True)
 
 
 if __name__ == "__main__":

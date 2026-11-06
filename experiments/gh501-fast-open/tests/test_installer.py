@@ -61,7 +61,7 @@ class InstallerTests(unittest.TestCase):
             root = Path(d); directory = self.make_cass(root)
             query = directory/'query.rs'; query.write_text('fn unknown() {}\n')
             old = (directory/'quill_bridge.rs').read_bytes()
-            result = subprocess.run([sys.executable, str(MODULE), '--cass', str(root), '--write'], capture_output=True, timeout=30)
+            result = subprocess.run([sys.executable, str(MODULE), '--cass', str(root), '--write'], capture_output=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(old, (directory/'quill_bridge.rs').read_bytes())
 

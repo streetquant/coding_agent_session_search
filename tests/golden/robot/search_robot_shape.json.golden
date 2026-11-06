@@ -51,9 +51,6 @@
           "line_number": {
             "type": "integer"
           },
-          "message_anchor": {
-            "type": "string"
-          },
           "match_type": {
             "type": "string"
           },

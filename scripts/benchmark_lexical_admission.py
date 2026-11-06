@@ -53,31 +53,28 @@ class Service:
         self.stderr = tempfile.TemporaryFile()
         self.cpu_before = child_cpu()
         self.started = time.perf_counter()
-        self.timeout = timeout
-        self.sequence = 0
-        self.pending = bytearray()
-        self.closed = False
-        self.selector = None
-        self.proc = None
         try:
-            self.selector = selectors.DefaultSelector()
-            self.proc = subprocess.Popen(  # ubs:ignore[python.lifecycle.popen_handle] Service.close waits or kills this worker; constructor failures now take the same close path.
+            self.proc = subprocess.Popen(
                 [str(binary), 'serve', '--stdio', '--index', str(index),
                  '--request-timeout-ms', str(max(1, min(300_000, int(timeout * 1000))))],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr,
             )
-            assert self.proc.stdout is not None
-            self.selector.register(self.proc.stdout, selectors.EVENT_READ)
+        except BaseException:
+            self.stderr.close()
+            raise
+        self.timeout = timeout
+        self.sequence = 0
+        self.pending = bytearray()
+        self.closed = False
+        self.selector = selectors.DefaultSelector()
+        assert self.proc.stdout is not None
+        self.selector.register(self.proc.stdout, selectors.EVENT_READ)
+        try:
             ready, _ = self.request('status')
             if ready.get('ok') is not True:
                 raise RuntimeError(f'service status failed: {ready}')
         except BaseException:
-            if self.proc is not None:
-                self.close(check=False)
-            else:
-                if self.selector is not None:
-                    self.selector.close()
-                self.stderr.close()
+            self.close(check=False)
             raise
 
     def request(self, op: str, **fields: Any) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -107,10 +104,7 @@ class Service:
         self.pending = bytearray(rest)
         elapsed = time.perf_counter() - started
         after = counters(self.proc.pid)
-        try:
-            response = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise RuntimeError(f'{op} returned malformed service JSON') from error
+        response = json.loads(line)
         if not isinstance(response, dict) or response.get('id') != self.sequence:
             raise RuntimeError(f'response ID mismatch: {response}')
         measurement = {key: after[key] - before[key]
@@ -257,9 +251,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     for arm, binary in binaries.items():
         report['retained'].extend(dict(row, arm=arm) for row in
                                   retained(binary, index, args, queries, reference))
-    if digest(index / 'MANIFEST') != manifest_hash:  # ubs:ignore[python.ctcompare.secret_eq] Public index-integrity digest, not a secret.
+    if digest(index / 'MANIFEST') != manifest_hash:
         raise RuntimeError('index manifest changed during qualification; discard measurements')
-    if any(digest(path) != binary_hashes[arm] for arm, path in binaries.items()):  # ubs:ignore[python.ctcompare.secret_eq] Public binary-integrity digests, not secrets.
+    if any(digest(path) != binary_hashes[arm] for arm, path in binaries.items()):
         raise RuntimeError('a binary changed during qualification; discard measurements')
     report['fresh_medians'] = {
         arm: {key: statistics.median(row[key] for row in report['fresh'] if row['arm'] == arm)

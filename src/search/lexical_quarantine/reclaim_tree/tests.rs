@@ -222,17 +222,11 @@ fn non_utf8_names_are_removed_by_exact_bytes_and_traversal_names_are_refused() {
 
 #[test]
 fn a_replaced_special_file_is_observed_without_opening_its_payload() {
-    use std::os::fd::AsRawFd;
-
     let fixture = Fixture::new();
     let (plan, mut budget) = fixture.capture();
     let path = fixture.target.join("index/nested/z");
     fs::rename(&path, fixture.temp.path().join("saved-payload")).unwrap();
-    // Keep the same long target, but bind through its open parent to fit sun_path.
-    let parent = File::open(path.parent().unwrap()).unwrap();
-    let socket_path = PathBuf::from(format!("/proc/thread-self/fd/{}", parent.as_raw_fd()))
-        .join(path.file_name().unwrap());
-    let _socket = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let _socket = std::os::unix::net::UnixListener::bind(&path).unwrap();
     assert!(fixture.remove(&plan, &mut budget).is_err());
     assert_eq!(budget.removal_entries, 0);
     assert!(fs::symlink_metadata(path).is_ok());

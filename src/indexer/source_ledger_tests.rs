@@ -20,8 +20,7 @@ fn discovered(path: &Path, slug: &str) -> DiscoveredSourceFile {
 fn saved_row(source: &DiscoveredSourceFile, dependencies: Vec<serde_json::Value>) -> String {
     serde_json::json!({
         "primary": source_file_observation(&source.source_path).unwrap(),
-        "producer_contract": crate::connectors::ingest_contract::provider_contract(
-            &source.provider_slug),
+        "producer_contract": env!("CASS_SOURCE_INGEST_CONTRACT"),
         "dependencies": dependencies,
     })
     .to_string()
@@ -517,18 +516,12 @@ fn gh512_benchmark_4159_unchanged_sources_in_10_growing_folders() {
     );
 }
 
-// Pre-fix matcher for the same-invocation benchmark: the pre-fix row shape
-// and the pre-fix observation work, compared against the running contract of
-// the provider that produced the source.
+// Verbatim pre-fix matcher for the same-invocation benchmark.
 fn gh512_incumbent_source_ledger_matches(observation: &str, source: &DiscoveredSourceFile) -> bool {
     let Ok(saved) = serde_json::from_str::<serde_json::Value>(observation) else {
         return false;
     };
-    if saved["producer_contract"].as_str()
-        != Some(crate::connectors::ingest_contract::provider_contract(
-            &source.provider_slug,
-        ))
-    {
+    if saved["producer_contract"].as_str() != Some(env!("CASS_SOURCE_INGEST_CONTRACT")) {
         return false;
     }
     if saved["primary"] != source_file_observation(&source.source_path).unwrap_or_default() {
@@ -632,7 +625,6 @@ fn gh512_real_connectors_complete_during_growth_without_redundant_discovery() ->
             local_since_ts_by_connector: Arc::new(HashMap::new()),
             progress: None,
             active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
-            progress_bump: None,
         };
         let connector = LedgerDiscoveryCounter {
             inner: factory(),
@@ -966,7 +958,6 @@ fn gh512_real_sidecar_appearance_before_admission_cannot_certify_an_untracked_fi
         local_since_ts_by_connector: Arc::new(HashMap::new()),
         progress: None,
         active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
-        progress_bump: None,
     };
     let connector = GrokSummaryAtAdmission {
         summary: directory.join("summary.json"),
@@ -1034,238 +1025,4 @@ fn gh512_real_sidecar_appearance_before_admission_cannot_certify_an_untracked_fi
     );
     assert_eq!(entries.len(), 1);
     Ok(())
-}
-
-#[test]
-fn ingest_contract_change_reparses_sources_older_than_the_connector_cutoff() -> Result<()> {
-    for (name, factory) in crate::connectors::get_connector_factories()
-        .into_iter()
-        .filter(|(name, _)| matches!(*name, "claude" | "codex"))
-    {
-        let temp = TempDir::new()?;
-        let source = if name == "claude" {
-            temp.path().join("claude/projects/contract/session.jsonl")
-        } else {
-            temp.path().join("codex/sessions/rollout-contract.jsonl")
-        };
-        fs::create_dir_all(source.parent().unwrap())?;
-        let transcript = if name == "claude" {
-            concat!(
-                "{\"type\":\"user\",\"sessionId\":\"contract\",\"uuid\":\"contract-message\",",
-                "\"timestamp\":\"2026-08-01T10:00:00Z\",\"cwd\":\"/work/contract\",",
-                "\"message\":{\"role\":\"user\",\"content\":\"old source\"}}\n",
-            )
-        } else {
-            concat!(
-                "{\"timestamp\":\"2026-08-01T10:00:00Z\",\"type\":\"session_meta\",",
-                "\"payload\":{\"id\":\"contract\",\"cwd\":\"/work/contract\"}}\n",
-                "{\"timestamp\":\"2026-08-01T10:00:01Z\",\"type\":\"response_item\",",
-                "\"payload\":{\"type\":\"message\",\"role\":\"user\",",
-                "\"content\":[{\"type\":\"input_text\",\"text\":\"old source\"}]}}\n",
-            )
-        };
-        fs::write(&source, transcript)?;
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&source)?
-            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))?;
-        let data_dir = temp.path().join("data");
-        fs::create_dir(&data_dir)?;
-        let ctx = ScanContext::with_roots(
-            data_dir.clone(),
-            vec![ScanRoot::local(source.clone())],
-            Some(10_000),
-        );
-        let mut config = StreamingProducerConfig {
-            source_ledger: Arc::new(HashMap::new()),
-            flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
-            data_dir,
-            additional_scan_roots: Vec::new(),
-            local_connector_roots: None,
-            since_ts: ctx.since_ts,
-            local_since_ts_by_connector: Arc::new(HashMap::new()),
-            progress: None,
-            active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
-            progress_bump: None,
-        };
-        let connector = factory();
-        let (conversations, mut entries) =
-            collect_ledger_scan(connector.as_ref(), &ctx, &config, name)?;
-        assert_eq!(conversations.len(), 1, "{name}: an unproven source is read");
-        assert_eq!(entries.len(), 1, "{name}");
-        let entry = entries.pop().unwrap();
-        config.source_ledger = Arc::new(HashMap::from([(
-            entry.key.clone(),
-            entry.observation.clone(),
-        )]));
-        let (conversations, _) = collect_ledger_scan(connector.as_ref(), &ctx, &config, name)?;
-        assert_eq!(
-            conversations.len(),
-            usize::from(env!("CASS_SOURCE_INGEST_REUSE") != "true"),
-            "{name}: the same parser reuses its completion only when reuse is enabled"
-        );
-        let mut saved: serde_json::Value = serde_json::from_str(&entry.observation)?;
-        saved["producer_contract"] = serde_json::json!("previous-parser");
-        config.source_ledger = Arc::new(HashMap::from([(entry.key, saved.to_string())]));
-        let (conversations, entries) =
-            collect_ledger_scan(connector.as_ref(), &ctx, &config, name)?;
-        assert_eq!(conversations.len(), 1, "{name}: a changed parser must run");
-        assert_eq!(
-            entries.len(),
-            1,
-            "{name}: the new parser certifies the source"
-        );
-    }
-    Ok(())
-}
-
-/// The connector's own incremental cutoff decides which of the sources it
-/// listed this run actually have to be read. The scan contract's source form
-/// is the exception: a compressed Codex rollout keeps the modification time
-/// of the plain rollout it was compressed from, so its content can be newer
-/// than the cutoff (GH #513) and the connector selects it on its own terms.
-#[test]
-fn lqz28_connector_cutoff_skips_covered_sources_and_keeps_the_contract_form() -> Result<()> {
-    use std::time::{Duration, UNIX_EPOCH};
-
-    let temp = tempfile::tempdir()?;
-    let sessions = temp.path().join("sessions");
-    fs::create_dir_all(&sessions)?;
-    let covered = sessions.join("rollout-covered.jsonl");
-    let contract_form = sessions.join("rollout-contract.jsonl.zst");
-    let fresh = sessions.join("rollout-fresh.jsonl");
-    for path in [&covered, &contract_form, &fresh] {
-        fs::write(path, b"{}\n")?;
-    }
-    let old = UNIX_EPOCH + Duration::from_millis(1_000);
-    let new = UNIX_EPOCH + Duration::from_millis(9_000);
-    for (path, modified) in [(&covered, old), (&contract_form, old), (&fresh, new)] {
-        fs::OpenOptions::new()
-            .write(true)
-            .open(path)?
-            .set_modified(modified)?;
-    }
-    let cutoff = 5_000;
-
-    assert!(
-        source_predates_connector_cutoff(
-            &discovered(&covered, "codex"),
-            source_file_observation(&covered).as_ref(),
-            Some(cutoff)
-        ),
-        "a source the connector's last completed scan covered does not have to be read again"
-    );
-    assert!(
-        !source_predates_connector_cutoff(
-            &discovered(&contract_form, "codex"),
-            source_file_observation(&contract_form).as_ref(),
-            Some(cutoff)
-        ),
-        "the scan contract's source form is selected independently of the cutoff"
-    );
-    assert!(
-        !source_predates_connector_cutoff(
-            &discovered(&fresh, "codex"),
-            source_file_observation(&fresh).as_ref(),
-            Some(cutoff)
-        ),
-        "a source newer than the cutoff is read"
-    );
-    assert!(
-        source_predates_connector_cutoff(
-            &discovered(&contract_form, "claude_code"),
-            source_file_observation(&contract_form).as_ref(),
-            Some(cutoff)
-        ),
-        "the exemption belongs to the connector whose scan contract names the form"
-    );
-    assert!(
-        !source_predates_connector_cutoff(
-            &discovered(&covered, "codex"),
-            source_file_observation(&covered).as_ref(),
-            None
-        ),
-        "a scan without a cutoff reads every source"
-    );
-    // The overlap boundary: a source written in the cutoff's own millisecond
-    // window stays eligible, and one millisecond earlier does not.
-    let boundary = sessions.join("rollout-boundary.jsonl");
-    fs::write(&boundary, b"{}\n")?;
-    for (millis, expected_skip) in [(cutoff - 1_000, false), (cutoff - 1_001, true)] {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&boundary)?
-            .set_modified(UNIX_EPOCH + Duration::from_millis(millis as u64))?;
-        assert_eq!(
-            source_predates_connector_cutoff(
-                &discovered(&boundary, "codex"),
-                source_file_observation(&boundary).as_ref(),
-                Some(cutoff)
-            ),
-            expected_skip,
-            "the cutoff overlap is exactly the millisecond the connector's own filter uses"
-        );
-    }
-    assert!(
-        !source_predates_connector_cutoff(&discovered(&covered, "codex"), None, Some(cutoff)),
-        "a source whose observation cannot be read stays eligible"
-    );
-    Ok(())
-}
-
-/// The contract's source form is exempt from the cutoff because the
-/// connector selects it on its own terms. The exemption comes from the
-/// contract's own declaration, so a connector without that contract keeps
-/// the cutoff for the same file.
-#[test]
-fn lqz28_the_contract_form_exemption_comes_from_the_contract() -> Result<()> {
-    let temp = tempfile::tempdir()?;
-    let compressed = temp.path().join("rollout-2026.jsonl.zst");
-    let plain = temp.path().join("rollout-2026.jsonl");
-    fs::write(&compressed, b"{}\n")?;
-    fs::write(&plain, b"{}\n")?;
-
-    assert!(
-        crate::storage::sqlite::connector_scan_contract_source_form_matches("codex", &compressed),
-        "the contract's source form is the compressed rollout"
-    );
-    assert!(
-        crate::storage::sqlite::connector_scan_contract_source_form_matches("CODEX", &compressed),
-        "the contract is matched case-insensitively, like the watermark key"
-    );
-    assert!(
-        !crate::storage::sqlite::connector_scan_contract_source_form_matches("codex", &plain),
-        "the plain rollout rides the cutoff"
-    );
-    assert!(
-        !crate::storage::sqlite::connector_scan_contract_source_form_matches(
-            "claude_code",
-            &compressed
-        ),
-        "a connector without the contract keeps the cutoff for the same file"
-    );
-    Ok(())
-}
-
-/// The connector's own modification-time cutoff is only the complete
-/// eligibility rule for a connector that reads nothing but its primary
-/// source. A connector that can read a sidecar keeps the durable ledger's
-/// dependency evidence, which is the only thing that notices a newly created
-/// sidecar beside an unchanged primary file.
-#[test]
-fn lqz28_the_cutoff_only_applies_to_a_self_contained_connector() {
-    assert!(
-        connector_cutoff_is_complete("codex"),
-        "codex reads only the rollout, so its own cutoff is complete"
-    );
-    assert!(
-        connector_cutoff_is_complete("claude_code"),
-        "claude code reads only the session file, so its own cutoff is complete"
-    );
-    for connector in ["codebuff", "grok", "a-connector-that-does-not-exist"] {
-        assert!(
-            !connector_cutoff_is_complete(connector),
-            "a connector that can read a sidecar keeps the ledger's dependency evidence"
-        );
-    }
 }

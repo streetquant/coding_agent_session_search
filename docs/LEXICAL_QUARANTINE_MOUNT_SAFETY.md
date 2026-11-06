@@ -24,14 +24,6 @@ Missing, unreadable, malformed, empty, truncated or over-budget mount evidence
 is a refusal, never evidence that no mounts exist. No mount point is opened by
 the parser, and it neither mounts nor unmounts anything.
 
-The mountinfo root field is either an absolute path or, for a pseudo filesystem
-that has no path root, a `<name>:[<inode>]` token. A container host publishes
-the token form for its network-namespace bind mounts, so both forms are
-accepted; every other shape is still a malformed table and is refused as
-such. The root field is not part of the boundary decision: only the mount
-point is compared against the bundle, so accepting the token form does not
-weaken that comparison.
-
 Each snapshot is limited to 1 MiB, and all snapshots in one inventory/recheck
 budget share 16 MiB of read work, plus at most one overflow-detection byte. The
 existing cooperative deadline also applies. Individual filesystem calls remain
@@ -49,10 +41,7 @@ Regression tests cover same-device root/directory/file mounts, sibling and
 ancestor boundaries, escaped/non-UTF-8 paths, malformed tables, read and work
 budgets, pre-walk refusal, real read-only Linux mountinfo inspection, refusals
 before/after the rename, interrupted cleanup retry, and preserved newest
-failure evidence. Fault-injected tests do not create actual bind mounts. The
-pseudo-filesystem root token is covered too: a table carrying it parses, the
-same token with a mount point inside the bundle is still refused, and a root
-that is neither an absolute path nor a well-formed token stays malformed.
+failure evidence. Fault-injected tests do not create actual bind mounts.
 
 ## Bounded, descriptor-relative removal on Linux
 

@@ -598,8 +598,7 @@ pub(crate) fn search_hit_has_identity_hint(hit: &SearchHit) -> bool {
     let snippet = hit.snippet.trim();
     let snippet_prefix = snippet.strip_suffix("...").unwrap_or(snippet).trim();
     let title = hit.title.trim();
-    hit.message_anchor.is_some()
-        || hit.conversation_id.is_some()
+    hit.conversation_id.is_some()
         || hit.line_number.is_some()
         || hit.created_at.is_some()
         || !hit.content.is_empty()
@@ -611,8 +610,7 @@ pub(crate) fn search_hit_has_secondary_identity_hint(hit: &SearchHit) -> bool {
     let snippet = hit.snippet.trim();
     let snippet_prefix = snippet.strip_suffix("...").unwrap_or(snippet).trim();
     let title = hit.title.trim();
-    hit.message_anchor.is_some()
-        || hit.line_number.is_some_and(|line| line > 0)
+    hit.line_number.is_some_and(|line| line > 0)
         || hit.created_at.is_some()
         || !hit.content.is_empty()
         || !snippet_prefix.is_empty()
@@ -651,35 +649,6 @@ pub(crate) fn conversation_view_matches_hit(view: &ConversationView, hit: &Searc
                 != 1)
     {
         return false;
-    }
-    if let Some(expected_anchor) = hit.message_anchor.as_deref() {
-        let Some(number) = hit.line_number else {
-            return false;
-        };
-        let Some(message) = view
-            .messages
-            .iter()
-            .find(|message| canonical_message_number(message.idx) == Some(number))
-        else {
-            return false;
-        };
-        let Some(source_path) = view.convo.source_path.to_str() else {
-            return false;
-        };
-        // Validate the complete archived body, never the hit's display text.
-        // Even an exact conversation/ordinal can now contain a different body.
-        if crate::search::query::message_anchor_for_content(
-            &normalized_hit_source_id,
-            source_path,
-            view.convo.id,
-            Some(number),
-            &message.content,
-        )
-        .as_deref()
-            != Some(expected_anchor)
-        {
-            return false;
-        }
     }
     if let Some(expected_conversation_id) = hit.conversation_id {
         return view.convo.id == Some(expected_conversation_id);
@@ -1808,7 +1777,6 @@ mod tests {
             content: "identical repeated body".into(),
             content_hash: 0,
             conversation_id: Some(1),
-            message_anchor: None,
             score: 1.0,
             agent: "codex".into(),
             source_path: "/gh493/shared.db".into(),
@@ -1878,56 +1846,6 @@ mod tests {
     }
 
     #[test]
-    fn gh493_anchored_hit_rejects_changed_body_even_with_exact_conversation_and_ordinal() {
-        let (_root, storage, mut hit) = gh493_sparse_view_fixture();
-        hit.message_anchor = crate::search::query::message_anchor_for_content(
-            &hit.source_id,
-            &hit.source_path,
-            hit.conversation_id,
-            hit.line_number,
-            &hit.content,
-        );
-        assert!(hit.message_anchor.is_some());
-        let view = load_conversation_for_hit(&storage, &hit).unwrap().unwrap();
-        assert!(conversation_view_matches_hit(&view, &hit));
-
-        let mut truncated_hit = hit.clone();
-        truncated_hit.content = "short display preview".into();
-        truncated_hit.snippet = "another shortened display".into();
-        assert!(conversation_view_matches_hit(&view, &truncated_hit));
-
-        let mut changed_view = view.clone();
-        changed_view.messages[1].content = "rewritten at the same ordinal".into();
-        assert!(!conversation_view_matches_hit(&changed_view, &hit));
-        storage
-            .raw()
-            .execute("UPDATE messages SET content = 'rewritten at the same ordinal' WHERE id = 2")
-            .unwrap();
-        assert!(load_conversation_for_hit(&storage, &hit).unwrap().is_none());
-
-        for (source, conversation, number) in [
-            ("remote", Some(1), Some(17)),
-            ("local", Some(2), Some(17)),
-            ("local", Some(1), Some(90)),
-        ] {
-            let mut foreign = hit.clone();
-            foreign.message_anchor = crate::search::query::message_anchor_for_content(
-                source,
-                &hit.source_path,
-                conversation,
-                number,
-                &hit.content,
-            );
-            assert!(!conversation_view_matches_hit(&view, &foreign));
-        }
-        let mut missing_ordinal = hit;
-        missing_ordinal.line_number = None;
-        assert!(!conversation_view_matches_hit(&view, &missing_ordinal));
-        assert!(search_hit_has_identity_hint(&missing_ordinal));
-        assert!(search_hit_has_secondary_identity_hint(&missing_ordinal));
-    }
-
-    #[test]
     fn gh493_legacy_hit_ambiguity_cannot_be_hidden_by_a_path_cache() {
         let (_root, storage, mut hit) = gh493_sparse_view_fixture();
         // Populate the ordinary path cache before another session appears.
@@ -1994,7 +1912,6 @@ mod tests {
             content_hash: 0,
             score: 0.0,
             conversation_id: None,
-            message_anchor: None,
             source_path: "/shared/session.jsonl".to_string(),
             agent: "claude_code".to_string(),
             workspace: String::new(),
@@ -2048,7 +1965,6 @@ mod tests {
             content_hash: 0,
             score: 0.0,
             conversation_id: None,
-            message_anchor: None,
             source_path: "/shared/session.jsonl".to_string(),
             agent: "claude_code".to_string(),
             workspace: String::new(),
@@ -2102,7 +2018,6 @@ mod tests {
             content_hash: 0,
             score: 0.0,
             conversation_id: Some(999),
-            message_anchor: None,
             source_path: "/shared/session.jsonl".to_string(),
             agent: "claude_code".to_string(),
             workspace: String::new(),
@@ -2162,7 +2077,6 @@ mod tests {
             content_hash: 0,
             score: 0.0,
             conversation_id: Some(999),
-            message_anchor: None,
             source_path: "/shared/session.jsonl".to_string(),
             agent: "claude_code".to_string(),
             workspace: String::new(),
@@ -2327,7 +2241,6 @@ mod tests {
             content: "new conversation body".to_string(),
             content_hash: 0,
             conversation_id: None,
-            message_anchor: None,
             score: 0.0,
             source_path: shared_path.to_string(),
             agent: "cursor".to_string(),
@@ -2377,7 +2290,6 @@ mod tests {
             content: "stale search fragment".to_string(),
             content_hash: 0,
             conversation_id: None,
-            message_anchor: None,
             score: 0.0,
             source_path: shared_path.to_string(),
             agent: "cursor".to_string(),
@@ -2422,7 +2334,6 @@ mod tests {
             content: "db body".to_string(),
             content_hash: 0,
             conversation_id: Some(999),
-            message_anchor: None,
             score: 1.0,
             source_path: "/shared/cursor.sqlite".to_string(),
             agent: "claude_code".to_string(),
@@ -2487,7 +2398,6 @@ mod tests {
             content: String::new(),
             content_hash: 0,
             conversation_id: Some(1),
-            message_anchor: None,
             score: 0.0,
             source_path: shared_path.to_string(),
             agent: "cursor".to_string(),
@@ -2540,7 +2450,6 @@ mod tests {
             content: String::new(),
             content_hash: 0,
             conversation_id: Some(1),
-            message_anchor: None,
             score: 0.0,
             source_path: "/stale/index/path.sqlite".to_string(),
             agent: "cursor".to_string(),
@@ -2599,7 +2508,6 @@ mod tests {
             content: String::new(),
             content_hash: 0,
             conversation_id: Some(1),
-            message_anchor: None,
             score: 0.0,
             source_path: shared_path.to_string(),
             agent: "cursor".to_string(),
@@ -2656,7 +2564,6 @@ mod tests {
             content: "new conversation body".to_string(),
             content_hash: 0,
             conversation_id: None,
-            message_anchor: None,
             score: 0.0,
             source_path: shared_path.to_string(),
             agent: "cursor".to_string(),
@@ -2714,7 +2621,6 @@ mod tests {
             content: String::new(),
             content_hash: 0,
             conversation_id: None,
-            message_anchor: None,
             score: 0.0,
             source_path: shared_path.to_string(),
             agent: "cursor".to_string(),
@@ -2771,7 +2677,6 @@ mod tests {
             content: "missing conversation body".to_string(),
             content_hash: 0,
             conversation_id: None,
-            message_anchor: None,
             score: 0.0,
             source_path: shared_path.to_string(),
             agent: "cursor".to_string(),

@@ -5,7 +5,6 @@ use super::*;
 use crate::search::external_embedder::{CancelCheck, ExternalEmbedder, ExternalEmbeddingConfig};
 use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
 use crate::search::semantic_manifest::{ArtifactRecord, SemanticManifest};
-use crate::storage::sqlite::SemanticIdentityTier;
 
 fn failed(context: impl Into<String>) -> SemanticAvailability {
     SemanticAvailability::LoadFailed {

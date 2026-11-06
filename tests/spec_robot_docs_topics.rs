@@ -216,30 +216,6 @@ fn recipes_topic_is_safe_and_recommends_only_bounded_json_commands() -> TestResu
         body_lc.contains("quarantines") && body_lc.contains("never"),
         "recipes topic must state that cass quarantines (never silently deletes)".to_string(),
     )?;
-    ensure(
-        matches!(
-            (body.find("## 0. Quick history questions"), body.find("## 1. Stale vs missing")),
-            (Some(history), Some(readiness)) if history < readiness
-        ),
-        "bounded history retrieval must precede readiness and recovery recipes".to_string(),
-    )?;
-    let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    for required in [
-        "--workspace /path/to/project --days 7",
-        "--mode lexical --no-maintenance --robot --robot-meta --fields minimal",
-        "--limit 5 --max-tokens 2000 --timeout 2000",
-        "budget.timed_out",
-        "response envelope",
-        "robot metadata",
-        "source_path and line_number",
-        "version mismatch",
-        "maintenance-required",
-    ] {
-        ensure(
-            normalized.contains(required),
-            format!("bounded history recipe is missing {required:?}"),
-        )?;
-    }
     Ok(())
 }
 

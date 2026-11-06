@@ -1,115 +1,21 @@
 # Answer-Pack Conformance Matrix
 
 **Spec:** `docs/planning/ANSWER_PACKS_CONTRACT.md`
-**Bead:** `coding_agent_session_search-2l1b0.20` (original map: `uuwye.6`)
-**Status:** Source, committed release and installed local acceptance passed; shared search required a documented retry
-**Date:** 2026-10-29 UTC (original coverage map: 2026-05-08)
+**Bead:** `coding_agent_session_search-uuwye.6`
+**Status:** Partial implementation evidence; full contract reconciliation remains open
+**Date:** 2026-09-05 UTC (original coverage map: 2026-05-08)
 
 This matrix turns the answer-pack contract into testable requirements. It is not
 evidence of conformance by itself. A row is conformant only when the named test
 exists, passes, and asserts the contract behavior directly instead of relying on
 a proxy signal.
 
-The current map below supersedes the September planning statuses retained later
-in this file. A test name is an assertion locator, not a passing receipt. Only a
-source-bound successful gate qualifies the mapped behavior. Counts of shared
-test-utility tests are not counts of contract requirements.
+`Current Tested` counts rows with full contract-surface coverage. Planner-only
+unit tests are recorded in the row status and evidence ledger, but they do not
+count as pack conformance until the command, renderer, schema, and golden
+surfaces exist.
 
-## Current Assertion Map
-
-There are 88 requirement rows: 13 command, 5 mask, 3 schema, 4 evidence,
-3 citation, 4 pack, 7 selection, 4 omission, 5 budget, 5 health, 11 privacy,
-4 error, 5 format, 9 boundary and 6 verification rows. The grouped ID ranges
-below cover those rows without treating the old 195-clause estimate as an
-executed-test count. Tests live in the existing files named in the middle
-column; planner and field-mask tests are library tests.
-
-| Current IDs | Test file and named assertions | Scope |
-|-------------|--------------------------------|-------|
-| AP-CMD-001..004 | `src/lib.rs`: `pack_requires_robot_output_or_explicit_markdown_display`; `tests/cli_robot.rs`: `pack_invalid_policies_and_durations_use_typed_errors`, `pack_redaction_duration_and_diagnostics_conform_across_all_formats` | Explicit output, four robot encodings, explicit Markdown, rejected sessions/table output. |
-| AP-CMD-005 | `tests/golden_robot_pack.rs`: `pack_empty_query_error_envelope_matches_golden` | Empty query is rejected with the typed pack error. |
-| AP-CMD-006..007 | `tests/cli_robot.rs`: `pack_redaction_duration_and_diagnostics_conform_across_all_formats`, `pack_echoes_the_effective_interpretation`, `blocking_sessions_file_pack_returns_bounded_partial_without_fabricated_evidence` | Positive/negative agent, workspace and time filters; explicit DB, data directory, local source, approximate, lexical/semantic mode, request ID, refresh, timeout; file/stdin/empty/missing/invalid-UTF8/FIFO scope. |
-| AP-CMD-008..011 | `tests/cli_robot.rs`: `pack_invalid_policies_and_durations_use_typed_errors`, `pack_redaction_duration_and_diagnostics_conform_across_all_formats`; `tests/spec_pack_token_budget.rs`: budget specification tests | Limit boundaries, duration overflow, sensitive local off policy, empty/required evidence and selection diagnostics. |
-| AP-CMD-012 | `tests/cli_robot.rs`: `pack_redaction_duration_and_diagnostics_conform_across_all_formats` | Budgeted refresh is explicitly deferred and partial without claiming a timeout; archive bytes remain unchanged. Unbounded explicit Markdown refresh uses the existing incremental writer by source review. |
-| AP-CMD-013 | `tests/cli_robot.rs`: `timed_out_robot_pack_returns_bounded_partial_and_names_shed_work`, `timed_out_robot_pack_setup_returns_bounded_partial_before_asset_validation_finishes`, `timed_out_robot_pack_renderer_emits_fixed_size_partial_fallback`, `timed_out_robot_pack_planner_does_not_fabricate_selection`, `blocking_sessions_file_pack_returns_bounded_partial_without_fabricated_evidence`; planner: `render_budget_timeout_is_partial_across_structured_formats` | Real CLI empty timeout is exit 10; usable partial exit 8 is exercised through the actual root render/write functions with retained evidence. These are distinct proof scopes. |
-| AP-MASK-001..005 | `src/lib.rs`: `pack_standard_and_full_masks_preserve_the_complete_public_envelope`, `pack_minimal_field_mask_projects_documented_dotted_fields`, `pack_field_mask_projection_is_order_and_duplicate_invariant`, `pack_mixed_valid_and_unknown_masks_warn_without_failing`, `pack_all_invalid_field_masks_still_fail`; `tests/cli_robot.rs`: native policy fixture above | Exact presets, dotted arrays, order/duplicate invariance, exact warning set, all-invalid typed refusal and canonical evidence preservation. |
-| AP-SCHEMA-001..003 | `tests/cli_robot.rs`: native policy fixture and `pack_explicit_lexical_mode_is_not_reported_as_a_fallback`; `tests/golden_robot_json.rs`: `pack_introspect_contract_matrix_is_current`, `pack_robot_docs_contract_matrix_is_current` | Recursive snake-case keys; stable full envelopes across encodings; runtime metadata, lexical fallback and explicit semantic refusal. |
-| AP-EV-001..004 | Planner: `evidence_ids_encode_the_full_digest_as_base32`, `pack_budgets_emitted_text_after_redaction_expansion_and_unicode`, `render_compact_json_base_pack_matches_golden_shape`; `tests/cli_robot.rs`: native policy fixture | Independent full-digest ID, one-based rank, UTF-8 excerpt, excerpt SHA-256, token cost, selection/role/term/redaction shape and a reviewed positive golden projection. |
-| AP-CIT-001..003 | Planner: `from_search_hit_uses_robot_match_type_spelling`, `source_citations_require_complete_canonical_identity_and_anchor`, `source_citations_reject_same_text_and_time_from_wrong_session_role_or_ordinal`, `source_citations_do_not_follow_symlinks_or_wait_for_fifo_writers`; `tests/gh493_message_coordinates.rs`: native anchor journey; `tests/e2e_lexical_fail_open.rs`: `structured_pack_preserves_stale_checkpoint_and_returns_real_citations` | Canonical identity, physical local Codex line hashes and source-loss/ambiguity/mismatch negatives. Physical verification is bounded to modern local Codex JSONL: 8 MiB/file, 32 MiB/request and remaining deadline capped at one second. Other sources retain archived evidence with `verified=false` and null physical lines. |
-| AP-PACK-001..004 | Planner: `render_compact_json_base_pack_matches_golden_shape`, `render_markdown_duplicate_omission_matches_golden_text`, `render_source_sync_gap_and_pruned_source_metadata`; `tests/cli_robot.rs`: native policy fixture | Deterministic title/outline/handoff/source summaries and evidence references; no generated model summary. |
-| AP-SEL-001..002 | Planner: `candidate_fetch_limit_matches_contract_formula`, `pack_score_weights_match_independent_contract_examples` | Independent formula and weighted-score examples. |
-| AP-SEL-003..004 | Planner: `pack_tie_breaks_resolve_every_identity_coordinate_before_content_hash`, `null_timestamps_sort_last_when_scores_tie`, `freshness_policy_scores_unknown_timestamps_explicitly`, `strict_freshness_omits_stale_or_unknown_timestamps` | All nine identity tie-break coordinates, null-last ordering and each freshness policy. |
-| AP-SEL-005..007 | Planner: `source_diversity_changes_second_pick`, `duplicate_span_and_overlapping_ranges_are_omitted_once`, `duplicate_content_is_omitted_after_first_selection`; `tests/cli_robot.rs`: native policy fixture; `tests/golden_robot_pack.rs` | Diversity, three duplicate classes and explanation-dependent selection fields. |
-| AP-OMIT-001..004 | Planner: `omitted_reasons_serialize_to_documented_snake_case`, `unavailable_and_redacted_empty_candidates_are_omitted_once`, `duplicate_span_and_overlapping_ranges_are_omitted_once`, `exact_token_budget_boundary_selects_until_budget_exhausted`, `evidence_cap_omits_remaining_candidates_once`, `session_cap_omits_new_sessions_but_allows_existing_session_evidence` | Omission schema/reasons and exactly-once hard, budget, session and evidence-cap exclusions. |
-| AP-BUDGET-001..005 | Planner: `token_budget_reserves_documented_sections`, `pack_budgets_emitted_text_after_redaction_expansion_and_unicode`, `budget_truncation_uses_remaining_tokens_and_preserves_unicode_citations`, `final_output_reduction_preserves_citations_and_reconciles_dropped_evidence`; `src/lib.rs`: `pack_output_budget_measures_final_encoding_and_newline_at_the_boundary`, `pack_output_budget_measures_the_field_projection_not_hidden_metadata`; `tests/e2e_lexical_fail_open.rs`: `pack_final_output_budget_bounds_all_formats_and_refuses_oversized_metadata`; `tests/spec_pack_token_budget.rs` | Independent character/4 estimator, reserved fractions, exact output boundary, final newline, masks, retained citations and all five CLI formats. |
-| AP-HEALTH-001..003 | `tests/cli_robot.rs`: native policy fixture cross-checks real health/status; planner: `render_healthy_readiness_reports_generation_and_ready_states`, `render_stale_lexical_readiness_reports_action`, `render_active_rebuild_marks_pack_not_fresh`, `render_missing_db_reports_reindex_action`, `render_source_sync_gap_and_pruned_source_metadata`; `tests/e2e_lexical_fail_open.rs`: stale checkpoint fixture | Shared passive strict-read classifier; incomplete setup is unknown. Sync time is null when unavailable, indexed time is newest selected evidence, rather than an invented sync timestamp. |
-| AP-HEALTH-004..005 | `tests/cli_robot.rs`: native policy fixture and alias fixtures; `tests/gh493_message_coordinates.rs`: `native_pack_requires_the_selected_semantic_producer_and_reports_unfinished_work`; planner: `render_fallback_reports_the_executor_cause`, `render_pack_policy_fallback_does_not_recommend_a_model_install` | Real missing-model hybrid fallback, truthful executor cause and explicit semantic-unavailable exit 15 without acquisition. |
-| AP-PRIV-001..003 | Planner: `pack_protected_policies_cover_credentials_headers_keys_and_assignments`, `pack_entropy_policy_keeps_short_identifiers_and_masks_long_random_tokens`; `tests/cli_robot.rs`: native policy fixture across 3 policies × 5 formats | Default strict, protected credential classes, strict high-entropy tokens, balanced non-secret identifiers and short hashes. |
-| AP-PRIV-004..007 | Planner: `pack_policy_changes_excerpts_without_unmasking_coordinates_or_identity`, `render_pack_redacts_home_directory_paths_in_evidence_and_omitted_output`, `render_pack_redacts_remote_host_details_from_citation_contract`; `tests/cli_robot.rs`: native policy fixture | Numeric citation coordinates remain invariant. Private paths/hosts remain protected under every policy; redaction event shape, UTF-8 validity and applied counters are asserted. |
-| AP-PRIV-008..010 | Planner: `render_redacted_empty_pack_reports_privacy_counts`, `pack_omits_skill_injections_before_truncation_and_preserves_safe_evidence`, `pack_skill_opt_in_keeps_credentials_redacted_and_reports_retained_evidence`; `tests/e2e_lexical_fail_open.rs`: `pack_excludes_skill_payloads_without_losing_ordinary_evidence`; `tests/cli_robot.rs`: native policy fixture | Marker-only omission, direct `.env` canary exclusion, indexed-secret filtering and independent skill opt-in. |
-| AP-PRIV-011 | Planner: `pack_off_policy_cannot_unmask_remote_excerpt_credentials`; `tests/cli_robot.rs`: native policy fixture and invalid-policy fixture | Explicit local source required for off; all/unscoped/remote refusal and sensitive-output markers including Markdown. |
-| AP-ERR-001..004 | `tests/golden_robot_pack.rs`; `tests/cli_robot.rs`: invalid-policy, native policy and deadline fixtures; `tests/e2e_lexical_fail_open.rs`: final-output budget fixture; planner: usable-partial root writer check | Existing typed kebab-case errors, codes/retryability/hints, default empty success, required-evidence 13, tiny-budget 2, timeout 10 and usable partial 8. |
-| AP-FMT-001..003 | `tests/cli_robot.rs`: native policy fixture; planner: `render_jsonl_empty_pack_matches_golden_line_order`, `render_toon_matches_existing_toon_encoder` | Whole-envelope JSON/compact/TOON equality after only time/format scrubs; exact positive JSONL record order/count and empty JSONL golden. |
-| AP-FMT-004..005 | Planner: `render_markdown_duplicate_omission_matches_golden_text`, `render_markdown_preserves_complete_redacted_excerpts_as_literal_code`; `tests/e2e_lexical_fail_open.rs`: `markdown_pack_preserves_json_excerpts_without_interpreting_source_markup`; native policy positive JSON golden | Evidence IDs, path/range scaffolding and literal hostile source markup; JSON qualified alongside Markdown. |
-| AP-BOUND-001..004 | `tests/cli_robot.rs`: native policy/filter fixture; `tests/gh493_message_coordinates.rs`: native anchor journey; scoped source review | Existing parser, SearchClient/SearchFilters and canonical span helpers; no new SQLite access or rusqlite dependency. |
-| AP-BOUND-005..009 | `tests/cli_robot.rs`: native policy fixture; `tests/e2e_lexical_fail_open.rs`: `structured_pack_refuses_unreadable_lexical_assets_without_repair`, `no_maintenance_search_and_structured_pack_preserve_abandoned_lock`, Markdown fixture and five-format budget fixture | Source/archive byte and path snapshots, including missing models, broken lexical assets and abandoned locks; no model acquisition, hidden repair/cleanup or external LLM. Explicit unbounded Markdown refresh remains the documented writer opt-in. |
-| AP-GATE-001..006 | `scripts/gate.sh` stage receipts; `tests/golden_robot_json.rs`: `golden_regeneration_hints_do_not_use_bare_cargo`, `pack_robot_docs_contract_matrix_is_current` | One RCH admission on `arch@192.168.68.50`: fmt, all-target clippy including compiler check, selected nonzero tests, intentional reviewed golden regeneration plus verification, strict changed-file UBS and unchanged frozen inputs. Warm target reuse is permitted. |
-
-The first October cohort, `cass-pack-acceptance-20261029-JZr2W7dA`, remains a
-failed run. Its fixture and readiness corrections are reviewed in
-`/warp/codex/artifacts/cass-acceptance-finish-20261029-Q1n9uY/pack-gate1-corrections-review.md`.
-The corrected cohort, `cass-pack-recheck-20261029-48ac1bu6`, passed on
-`arch@192.168.68.50` at 2026-10-29 05:58 UTC. RCH job
-`30085555156942854` exited 0. Its 4,367-file frozen manifest SHA-256 is
-`928f5a0efece7b9ee4a318e541ff77a2999735762f2dc4421d2200585f43429d`;
-both complete frozen-file identity checks passed. The gate's compilation-input
-digest is `fd9645b1405e6c0fe7d3f1bc25bf6fdd67337e07d6cb3c060c1856d1c53d634f`.
-Receipts are in that cohort's `.qualification-results/terminal.json`,
-`source-gate.stdout.log` and `gate-stages.receipt`.
-
-Formatting, all-target clippy, 148 selected library tests, 18 real pack CLI
-tests, 64 budget-suite tests (including shared test utilities), two pack
-goldens, 41 message-coordinate tests and eight lexical failure tests passed.
-The 68 robot/documentation goldens passed both reviewed regeneration and a
-separate verification run. Strict changed-file UBS and its clean/planted
-production controls passed. Every named `STAGE` receipt exited 0; the gate
-and wrapper reported success. This paragraph is the post-gate documentation
-delta; runtime and test inputs remain identical to the qualified cohort.
-
-The normal committed release, main `787a3b9d8ea4f661f05cb0033912c2cdac9c3a1d`,
-passed RCH `30085555156942855` on the same Arch host and was installed at
-2026-10-29 06:46 UTC. The immutable CASS ELF SHA-256 is
-`1569b3ebe7b3c39b7c8c19c0cee4891839756a188f272c3df8a0fd231aafc81e`.
-Its two native release-coordinate journeys passed before installation.
-The installed ELF passed all 15 privacy-policy/format combinations, malformed
-input and required-evidence refusals, bounded FIFO timeout, explicit-refresh
-deferral, and unchanged source/archive checks. All 92 CASS/EE retrieval and
-build-identity checks passed across 23 installed agent environments.
-
-The first shared-archive search reached its five-second setup deadline and
-returned an honest incomplete response. That failure is retained. The CLI's
-recommended ten-second retry passed with the same one-hit and source-anchor
-assertions; its measured search budget elapsed time was 3,873 ms. The shared
-pack returned one evidence item from one session, the missing-session negative
-returned typed exit 2, and the original OMP EE import remained idempotent with
-zero new spans or index jobs. The current native Codex consumer returned
-`CASS_OK EE_OK`. This establishes the ten-second retry, not reliable
-five-second search latency or fresh capture from every harness.
-
-Installed receipts are under
-`/warp/codex/artifacts/cass-acceptance-finish-20261029-Q1n9uY/pack-installed/`:
-`deployment.json`, `installed-policy-acceptance.json`,
-`installed-agent-readback.json`, and
-`shared-live-10s-retry/installed-live-journey.json`.
-The parent `pack-installed-terminal.json` explicitly records the failed
-initial controller and successful reviewed retry. This paragraph is a
-documentation-only follow-up; the installed runtime remains the qualified
-commit above.
-
-These local fixtures do not qualify the full owner archive, ANN, native
-relevance, memory limits or the unavailable original GH470 reporter corpus.
-
-## Historical Coverage Accounting (2026-09-05)
+## Coverage Accounting
 
 | Spec Area | MUST Clauses | SHOULD Clauses | Current Tested | Passing | Divergent | Score |
 |-----------|-------------:|---------------:|---------------:|--------:|----------:|-------|
@@ -154,11 +60,7 @@ pass finds a new requirement, it should first extend this matrix or the
 contract, then update `.beads` with `br` only after active metadata reservations
 are clear.
 
-## Historical Requirement Matrix (2026-09-05)
-
-The original wording/statuses below are retained as history. Use the current
-contract and assertion map above for October policy, refresh, timeout, private
-coordinate and batched-verification behavior.
+## Requirement Matrix
 
 | ID | Level | Contract Source | Requirement | Planned Coverage | Status |
 |----|-------|-----------------|-------------|------------------|--------|
@@ -359,7 +261,7 @@ flags, an inherited sixteen-job allocation, then worker pressure prevented
 admission. None is credited as validation. UBS findings remain blocking; no
 suppression, golden regeneration, complete-conformance or performance claim.
 
-## Historical Draft Gaps (2026-09-05)
+## Known Draft Gaps
 
 The full-digest base32 change passed gate Z's 199 selected executions on
 2026-09-05, with formatting and all-target clippy also passing. The receipt is

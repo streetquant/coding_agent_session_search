@@ -80,11 +80,7 @@
     "goose",
     "crush",
     "hermes",
-    "shelley",
-    "kilo",
-    "cloudmcp",
-    "openwebui",
-    "dsh"
+    "shelley"
   ],
   "global_flags": [
     {
@@ -728,7 +724,7 @@
         },
         {
           "name": "timeout",
-          "description": "Timeout in milliseconds; 0 explicitly disables the search deadline. Returns partial results and error if a positive timeout is exceeded",
+          "description": "Timeout in milliseconds. Returns partial results and error if exceeded",
           "arg_type": "option",
           "value_type": "integer",
           "required": false
@@ -1096,17 +1092,6 @@
           ]
         },
         {
-          "name": "approximate",
-          "description": "Use approximate semantic search when a compatible ANN index is available",
-          "arg_type": "flag",
-          "required": false,
-          "default": "false",
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
           "name": "freshness-policy",
           "description": "Freshness policy for evidence selection",
           "arg_type": "option",
@@ -1128,23 +1113,8 @@
           "default": "2592000"
         },
         {
-          "name": "freshness-window",
-          "description": "Evidence freshness duration: m (minutes), h, d, or w",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": false
-        },
-        {
-          "name": "redaction",
-          "description": "Excerpt redaction: strict, balanced, or off (requires --source local). Private citation coordinates remain protected in every policy",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": false,
-          "default": "strict"
-        },
-        {
           "name": "include-skill-content",
-          "description": "Include skill payload excerpts (excluded by default)",
+          "description": "Include skill payload excerpts. Credentials remain redacted",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -1781,13 +1751,6 @@
           "required": false
         },
         {
-          "name": "message-anchor",
-          "description": "Immutable message_anchor from the same search hit or pack citation",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": false
-        },
-        {
           "name": "context",
           "short": "C",
           "description": "Number of context lines before/after",
@@ -1873,17 +1836,6 @@
         {
           "name": "binary-only",
           "description": "Exit code reflects only whether this executable is functional: archive readiness (stale index, active rebuild, uninitialized or degraded archive) is still fully REPORTED in the output but never fails the exit code. Use `cass selftest` instead when the probe must avoid opening the configured archive entirely (#398)",
-          "arg_type": "flag",
-          "required": false,
-          "default": "false",
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
-          "name": "deep",
-          "description": "Deep readiness probe: admit the optional native ANN graph against the selected exact owner so the report can state `ready` or `rejected` with its stable reason code. Off by default: the bounded surface is the documented sub-50ms probe and never loads a graph",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -2024,14 +1976,6 @@
           "repeatable": true
         },
         {
-          "name": "expect-plan-identity",
-          "description": "Bind this apply to the exact plan identity a prior dry run reported, spelled `<step>=<identity>`. Repeat for multiple steps. A mutating step whose adapter publishes a plan identity may only run when the approval matches the identity observed now: a stale plan is refused, never silently re-planned",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": false,
-          "repeatable": true
-        },
-        {
           "name": "confirm-fact",
           "description": "Confirm an operator-context preflight fact as true. Repeatable; the confirmation is recorded in the robot transcript",
           "arg_type": "option",
@@ -2126,17 +2070,6 @@
         {
           "name": "check",
           "description": "Run the bounded read-only doctor truth surface (`cass doctor check --json`)",
-          "arg_type": "flag",
-          "required": false,
-          "default": "false",
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
-          "name": "deep",
-          "description": "Deep readiness probe: admit the optional native ANN graph against the selected exact owner so the report can state `ready` or `rejected` with its stable reason code. Off by default: the bounded surface stays fast and never loads a graph",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -2353,35 +2286,6 @@
             "true",
             "false"
           ]
-        },
-        {
-          "name": "exact-source-id",
-          "description": "Select native identities from this literal stored source ID; requires agent and external ID",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": false
-        },
-        {
-          "name": "exact-agent",
-          "description": "Original stored agent slug for exact native identity selection",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": false
-        },
-        {
-          "name": "exact-external-id",
-          "description": "Native external session ID to select (repeatable, at most 256; ambiguous identities fail)",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": false,
-          "repeatable": true
-        },
-        {
-          "name": "exact-workspace",
-          "description": "Require the exact literal stored workspace; no path normalization or ancestor matching",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": false
         },
         {
           "name": "limit",
@@ -2861,13 +2765,6 @@
           "description": "Exact conversation_id from search (disambiguates shared source paths)",
           "arg_type": "option",
           "value_type": "integer",
-          "required": false
-        },
-        {
-          "name": "message-anchor",
-          "description": "Immutable message_anchor from the same search hit or pack citation",
-          "arg_type": "option",
-          "value_type": "string",
           "required": false
         },
         {
@@ -4229,321 +4126,6 @@
   ],
   "env_vars": [
     {
-      "name": "CASS_ALLOW_DUMB_TERM",
-      "description": "Allow TUI startup even when `TERM=dumb`"
-    },
-    {
-      "name": "CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS",
-      "default": "10000",
-      "description": "Automatic wildcard fallback for sparse results runs only on indexes with at most this many documents; `0` disables it"
-    },
-    {
-      "name": "CASS_AUTO_REFRESH_SOURCE_SCAN_SECS",
-      "default": "300",
-      "description": "Successful source-scan age that requests an incremental catch-up on read, independently of health's 30 min stale threshold and the spawn cooldown. Foreground, scheduled, and no-op source scans reset this age. Set `0` to disable age-triggered source scans; stale/partial/pending-session repair triggers remain enabled. Reads inspect metadata without traversing source files."
-    },
-    {
-      "name": "CASS_CACHE_BYTE_CAP",
-      "default": "available memory / 128, clamped to 64 MiB-2 GiB",
-      "description": "Search-hit cache byte limit; `0` disables the byte guard"
-    },
-    {
-      "name": "CASS_CACHE_EVICTION_POLICY",
-      "default": "lru",
-      "description": "Cache eviction policy: `lru` or `s3-fifo`"
-    },
-    {
-      "name": "CASS_CACHE_SHARD_CAP",
-      "default": "256",
-      "description": "Per-shard LRU cache entries"
-    },
-    {
-      "name": "CASS_CACHE_TOTAL_CAP",
-      "default": "2048",
-      "description": "Total cached search hits"
-    },
-    {
-      "name": "CASS_DEBUG_CACHE_METRICS",
-      "description": "Enable cache hit/miss logging"
-    },
-    {
-      "name": "CASS_DISABLE_ANIMATIONS",
-      "description": "Disable UI animations"
-    },
-    {
-      "name": "CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY",
-      "description": "Set to `1` to hash every raw-mirror descriptor/chunk during a read-only doctor run, overriding the default bounded verification limits"
-    },
-    {
-      "name": "CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_BYTE_LIMIT",
-      "default": "536870912",
-      "description": "Defer full raw-mirror hashing when either physical storage or estimated logical verification work exceeds this byte count; metadata-only amplification diagnostics remain available"
-    },
-    {
-      "name": "CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_MANIFEST_LIMIT",
-      "default": "256",
-      "description": "Defer full raw-mirror hashing above this manifest count while retaining metadata-only amplification diagnostics"
-    },
-    {
-      "name": "CASS_DOCTOR_WAL_CHECKPOINT_TIMEOUT_SECS",
-      "default": "120",
-      "description": "Wall-clock budget for `cass doctor --fix`'s WAL checkpoint (`archive_wal`); on expiry the check reports `fail` with the deadline, #382 and the stock-sqlite remedy instead of never returning; `0` keeps the default"
-    },
-    {
-      "name": "CASS_EXCLUDE_PATHS",
-      "description": "Comma/newline-delimited files or directory prefixes to skip without advancing scan/watch watermarks"
-    },
-    {
-      "name": "CASS_FTS_INLINE_BUDGET_SECS",
-      "default": "300",
-      "description": "Wall-clock one index run may spend writing the `fts_messages` SQL-fallback shadow inline. Past it the rest of the run skips the shadow (canonical rows and the Quill index still land, `last_indexed_at` advances) and the reason is recorded for `doctor`; the shadow is behind until a repair. Exists because fsqlite's FTS5 does O(table) work per statement on a large shadow (GH #413, frankensqlite#405/#406). `0` disables."
-    },
-    {
-      "name": "CASS_FTS_REPAIR_PAGE_BUDGET_SECS",
-      "default": "120",
-      "description": "Per-page budget for the paged shadow repair/rebuild (`index --full`, `doctor --fix`): a page over budget stops the repair truthfully (shadow left Partial, reason recorded) instead of wedging the run. `0` disables."
-    },
-    {
-      "name": "CASS_FTS_SHADOW_MAX_MESSAGES",
-      "default": "100000",
-      "description": "Largest canonical corpus (indexable message count) for which cass keeps the `fts_messages` SQL-fallback shadow at all. fsqlite's FTS5 rebuilds the whole shadow in memory on the first write after every writable open (about 32 KB of RAM per message: a 631k-message archive costs 20 GB and minutes before anything is indexed), so above the bound the index run drops the shadow before its first write (through a deferred-FTS5 connection), records why (`status` `index.fallback_fts_repair`, `doctor` `fts_table`), and does not recreate it until the corpus fits. Quill lexical search is unaffected; the SQL fallback scans `messages`. `0` disables the bound."
-    },
-    {
-      "name": "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
-      "default": "1073741824 (1 GiB)",
-      "description": "Largest archive (database plus WAL) that a search may repair inline; plain `cass index` compares the database file alone against the same value to decide whether to defer the authoritative lexical repair to `--full`. Over it, search refuses with `maintenance-required` and starts a detached `cass index --full --background` (see *When the Index Is Missing*)"
-    },
-    {
-      "name": "CASS_INDEXER_PARALLEL_WAL",
-      "default": "shadow",
-      "description": "DISABLE Card 1 parallel-WAL shadow observer (DEFAULT: shadow). Observer records per-chunk wall-clock; does NOT change commit semantics. `on`/`commit` are reserved for a future revision."
-    },
-    {
-      "name": "CASS_INDEX_FINALIZE_ABORT_SECS",
-      "default": "1800",
-      "description": "Larger abort grace applied while the indexer is inside the finalize WAL-checkpoint / rebuild-tail windows; `0` makes the finalize window report-only"
-    },
-    {
-      "name": "CASS_INDEX_FINAL_WAL_CHECKPOINT_TIMEOUT_SECS",
-      "default": "900",
-      "description": "Wall-clock budget for the index run's final `wal_checkpoint(TRUNCATE)`. If the checkpoint outlives it (an archive whose frankensqlite writable path loops, [#382](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/382)), the run still exits 0 after its publish, leaves the WAL for the next opener, and logs the remedy instead of hanging; `0` keeps the default"
-    },
-    {
-      "name": "CASS_INDEX_REDACTION",
-      "default": "full",
-      "description": "Index-time secret redaction: `full` scrubs API keys/tokens/passwords/private keys from every persisted message, title, snippet, and metadata blob before they reach SQLite or the lexical index; `off` skips redaction for faster ingest. **`off` means raw text is indexed** - the original session files and the cass raw-mirror blobs (`<data_dir>/raw-mirror/v1/`) already contain the same raw text unencrypted on the same disk, so `full` protects the queryable surfaces (search results, exports, robot output), not disk-at-rest secrecy. Unrecognized values warn and behave as `full`."
-    },
-    {
-      "name": "CASS_INDEX_SKIP_DISK_HEADROOM_CHECK",
-      "description": "Skips the free-space preflight that `cass index --full` / `--force-rebuild` runs before starting. The requirement is `max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2 - rebuild_staging_bytes)`, where the lexical figure counts only the live published index. Merge-retired segments and retained publish backups are reported but not doubled, and a failed rebuild's leftover `.rebuild-staging` generation is subtracted, because the next rebuild resumes into it or clears it first. Query it before a run with `cass doctor --json | jq .storage_pressure.full_rebuild_readiness`, which shows `required_bytes`, `available_bytes`, `shortfall_bytes` and each input (GH #496). Set to `1` only when you know the disk can hold the rebuild."
-    },
-    {
-      "name": "CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES",
-      "default": "8388608 (8 MiB)",
-      "description": "Most text of any one message that the lexical index holds; the rest of that message (typically a pasted image or base64 blob) is not searchable. It never limits a conversation: every message of a long session is indexed, and rebuilds and incremental updates read long sessions in bounded chunks. Zero or invalid values keep the default."
-    },
-    {
-      "name": "CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES",
-      "default": "1073741824 (1 GiB)",
-      "description": "Maximum estimated output per lexical merge run, including the covered document-ID range. Oversized singleton segments remain unmerged. This is a merge-planning limit, not a total-process RSS ceiling. Positive byte values accept underscores; zero or invalid values keep the default. Independently of this cap, a merge run never holds more than 4,194,304 documents (Quill's per-term posting limit), and Quill's own tier merge is disabled, so archives with several million messages rebuild into several segments (GH #498)."
-    },
-    {
-      "name": "CASS_QUILL_QUERY_FUEL_BUDGET",
-      "default": "Quill default (10000000)",
-      "description": "Escape hatch for Quill's deterministic per-query work ceiling (GH #441). Zero or unparseable values keep the engine default. When fuel runs out on a hybrid query the lexical leg is dropped, the semantic leg still answers, and `_meta.lexical_degrade_reason` reports `query_fuel_exhausted`; lexical-only queries return an actionable hint. The durable fix for fuel exhaustion is a consolidated index (an incremental `cass index` folds fragmented generations in its maintenance pass; `--full` rebuilds from scratch), and cass now publishes Quill snapshots only on its own commits (no per-second visibility seals), which is what let segment counts grow into the hundreds on append-only archives"
-    },
-    {
-      "name": "CASS_REDACT_MEMO_CAPACITY",
-      "default": "4096",
-      "description": "Entry cap for the per-worker redaction memo cache used during batched persist. Raise on very large, boilerplate-heavy corpora if eviction churn shows up in `cass::redact::memo` debug logs. Only strings the secret prefilter flags as candidate-bearing are memoized, and individual inputs over 64 KiB are never cached (bounds worst-case cache memory)."
-    },
-    {
-      "name": "CASS_REDACT_SECRETS",
-      "default": "1",
-      "description": "Legacy redaction toggle (`0`/`false`/`off`/`no` disables). `CASS_INDEX_REDACTION` takes precedence when both are set."
-    },
-    {
-      "name": "CASS_RESPONSIVENESS_CONFORMAL_ALPHA_PRESSURED",
-      "default": "0.05",
-      "description": "FP rate for the pressured quantile (0 < alpha < 0.5; default 0.05)"
-    },
-    {
-      "name": "CASS_RESPONSIVENESS_CONFORMAL_ALPHA_SEVERE",
-      "default": "0.01",
-      "description": "FP rate for the severe quantile (0 < alpha < pressured alpha; default 0.01)"
-    },
-    {
-      "name": "CASS_RESPONSIVENESS_CONFORMAL_K",
-      "default": "256",
-      "description": "Calibration window size (clamped 16..=4096; default 256)"
-    },
-    {
-      "name": "CASS_RESPONSIVENESS_CONFORMAL_K_MIN",
-      "default": "32",
-      "description": "Minimum samples before the quantile emits (clamped 4..=K; default 32)"
-    },
-    {
-      "name": "CASS_RESPONSIVENESS_DRIFT_DELTA",
-      "default": "0.01",
-      "description": "Page-Hinkley drift tolerance delta (default 0.01)"
-    },
-    {
-      "name": "CASS_RESPONSIVENESS_DRIFT_LAMBDA",
-      "default": "0.5",
-      "description": "Page-Hinkley trigger lambda for calibration reset (default 0.5)"
-    },
-    {
-      "name": "CASS_RESPONSIVENESS_GROWTH_TICKS",
-      "default": "3",
-      "description": "Healthy ticks needed before each 25pp grow step (default 3)"
-    },
-    {
-      "name": "CASS_RESPONSIVENESS_MAX_INFLIGHT_BYTES",
-      "description": "Governor ceiling on in-flight message bytes across indexing (default RAM/32, clamped 512 MiB..16 GiB)"
-    },
-    {
-      "name": "CASS_RESPONSIVENESS_MAX_LOAD_PER_CORE",
-      "default": "1.25",
-      "description": "loadavg/core threshold for step-down (default 1.25; ignored when CASS_RESPONSIVENESS_CALIBRATION=conformal)"
-    },
-    {
-      "name": "CASS_RESPONSIVENESS_MAX_PSI_AVG10",
-      "default": "20.0",
-      "description": "`/proc/pressure/cpu` some-avg10 step-down threshold (default 20.0; ignored when CASS_RESPONSIVENESS_CALIBRATION=conformal)"
-    },
-    {
-      "name": "CASS_RESPONSIVENESS_MAX_WORKERS",
-      "description": "Hard ceiling the load/PSI governor applies to every indexing worker pool, including the lexical rebuild pools"
-    },
-    {
-      "name": "CASS_RESPONSIVENESS_SEVERE_LOAD_PER_CORE",
-      "default": "1.75",
-      "description": "loadavg/core threshold for the floor drop (default 1.75)"
-    },
-    {
-      "name": "CASS_RESPONSIVENESS_SEVERE_PSI_AVG10",
-      "default": "40.0",
-      "description": "PSI severe threshold (default 40.0)"
-    },
-    {
-      "name": "CASS_RESPONSIVENESS_TICK_SECS",
-      "default": "2",
-      "description": "Sampler interval in seconds (default 2)"
-    },
-    {
-      "name": "CASS_SEARCH_ACTIVE_REBUILD_WAIT_MS",
-      "default": "30000",
-      "description": "How long a human-mode search, or a robot search whose index is still readable, waits for an active lexical rebuild before returning exit 7 `index-busy`. With `--timeout`, the wait also stops at nine tenths of the time remaining. A robot search with no searchable generation does not wait"
-    },
-    {
-      "name": "CASS_SEARCH_EXACT_TOTAL_COUNT_MAX_DOCS",
-      "default": "5000000 (50000 in v0.9.0 and earlier)",
-      "description": "Largest index (in documents) for which a full result page still reports an exact `total_matches`; above it the count is `limit + 1`, a lower bound (`_meta.cursor_manifest.count_precision` says which). `0` disables exact counting. See *Match Counts: Exact or Lower Bound*"
-    },
-    {
-      "name": "CASS_SEMANTIC_PREP_PARALLEL",
-      "description": "Set to `1` to opt in to rayon-parallel canonicalize+hash prep (default off: serial is faster on the common cheap-embedder path)"
-    },
-    {
-      "name": "CASS_SEMANTIC_PROGRESS_JSONL",
-      "description": "Absolute path to a JSONL file the semantic backfill appends one event per transition to (`selection_*`, `packet_replay_*`, `embed_batch_*`, `staging_write_*`, `checkpoint_save_*`, `publish_*`, `error`, `cancelled`, `complete`). Each line carries timestamp, phase + sub-phase, batch/row counters, byte counts, elapsed-since-start, and a cheap RSS estimate. Silent when unset. Best-effort writes - failures log at debug and never crash a backfill. See [cass#257](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/257)."
-    },
-    {
-      "name": "CASS_SSH_CONFIG",
-      "description": "SSH config file passed as `ssh -F <path>` for remote sources (cass also sets `BatchMode=yes` and `StrictHostKeyChecking=yes`)"
-    },
-    {
-      "name": "CASS_STREAMING_COMBINE_MAX",
-      "default": "64",
-      "description": "Maximum messages per combined streaming drain (clamped 1..=1024; default 64)"
-    },
-    {
-      "name": "CASS_STREAMING_COMBINE_MAX_BYTES",
-      "description": "Byte cap per combined streaming drain (clamped 1 MiB..streaming maximum; default half the maximum)"
-    },
-    {
-      "name": "CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS",
-      "default": "max(512, writer_threads x 128), capped at the 1024-conversation page",
-      "description": "Conversations per SQL message-fetch chunk (the unit of writer feeding). Lower it to cap peak RSS on archives with very large conversations"
-    },
-    {
-      "name": "CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS",
-      "default": "10000",
-      "description": "Steady-state durable-commit interval in conversations (default 10000)"
-    },
-    {
-      "name": "CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES",
-      "default": "800000",
-      "description": "Steady-state durable-commit interval in messages (default 800000)"
-    },
-    {
-      "name": "CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES",
-      "default": "536870912",
-      "description": "Steady-state durable-commit interval in message bytes (default 536870912)"
-    },
-    {
-      "name": "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
-      "default": "32",
-      "description": "Chunk size for the first durable slice only, so the first restartable checkpoint lands quickly; the rebuild ramps to the steady-state chunk after the first commit"
-    },
-    {
-      "name": "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS",
-      "default": "2048",
-      "description": "Initial durable-commit interval in conversations (default 2048)"
-    },
-    {
-      "name": "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGES",
-      "default": "800000",
-      "description": "Initial durable-commit interval in messages (default 800000)"
-    },
-    {
-      "name": "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGE_BYTES",
-      "default": "134217728",
-      "description": "Initial durable-commit interval in message bytes (default 134217728)"
-    },
-    {
-      "name": "CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS",
-      "default": "ceil(workers / 2), clamped to 2..=8 (1 when workers is 1)",
-      "description": "Threads that fetch and prepare conversation pages ahead of the writers. `1` serializes page prep"
-    },
-    {
-      "name": "CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE",
-      "default": "4",
-      "description": "Prepared pages that may queue between page prep and the writers"
-    },
-    {
-      "name": "CASS_TANTIVY_REBUILD_PIPELINE_MAX_MESSAGE_BYTES_IN_FLIGHT",
-      "default": "fetch-chunk bytes x (channel + 1)",
-      "description": "Cap on message bytes held in flight across the pipeline; the governor's `CASS_RESPONSIVENESS_MAX_INFLIGHT_BYTES` applies on top"
-    },
-    {
-      "name": "CASS_TANTIVY_REBUILD_RESERVED_CORES",
-      "description": "CPU cores reserved outside the lexical rebuild worker pool"
-    },
-    {
-      "name": "CASS_TANTIVY_REBUILD_WORKERS",
-      "default": "cores - reserved, clamped to 1..=64",
-      "description": "Writer/shard-builder threads for the lexical rebuild. Reserved cores default to 0 (1 core), 1 (2-4 cores), 2 (5-15 cores), else `cores/8` clamped to 2..=8; override the reservation with `CASS_TANTIVY_REBUILD_RESERVED_CORES`"
-    },
-    {
-      "name": "CASS_TUI_KITTY_KEYBOARD",
-      "description": "Query enhanced keyboard support (80 ms, no mux); `0` disables"
-    },
-    {
-      "name": "CASS_WARM_DEBOUNCE_MS",
-      "default": "120",
-      "description": "Warm-up search debounce in milliseconds"
-    },
-    {
-      "name": "EDITOR",
-      "description": "External editor command; `$VISUAL` is consulted next and `code` is the final fallback. Line-number flags are chosen per editor"
-    },
-    {
-      "name": "MALLOC_ARENA_MAX",
-      "default": "2 for background children",
-      "description": "glibc allocator arena cap that cass gives each background index child when you have not set it: stale-on-read catch-up, background repair and scheduled job steps. A full lexical rebuild of a 3.7M-message archive peaked at 13.1 and 17.4 GB anonymous RSS in two runs with the cap, versus 19.7 and 19.8 GB with glibc's default, with no consistent difference in wall time. Foreground `cass index` inherits your environment unchanged; set the variable yourself to override either way. Non-glibc allocators ignore it."
-    },
-    {
       "name": "CODING_AGENT_SEARCH_NO_UPDATE_PROMPT",
       "default": "0",
       "description": "Set to 1 to skip update prompts in automation."
@@ -4608,7 +4190,7 @@
     {
       "name": "CASS_SEARCH_BUDGET_MS",
       "default": "120000",
-      "description": "Fallback structured search worker budget in milliseconds only when the search timeout is unspecified; 0 explicitly disables the deadline. Explicit --timeout, CASS_SEARCH_TIMEOUT_MS, and [search].timeout_ms values override this fallback, including 0."
+      "description": "Fallback structured search worker budget in milliseconds when --timeout, CASS_SEARCH_TIMEOUT_MS, and [search].timeout_ms do not supply a positive effective timeout."
     },
     {
       "name": "CASS_TRIAGE_BUDGET_MS",
@@ -4724,10 +4306,6 @@
       "name": "CASS_BACKGROUND_IONICE_CLASS",
       "default": "3",
       "description": "ionice class `cass index --background` applies to itself on Linux (3 = idle)."
-    },
-    {
-      "name": "CASS_BACKGROUND_IONICE_PRIORITY",
-      "description": "Explicit ionice priority (0..=7) for classes 1 and 2 on Linux. Unset preserves the class default; invalid values or class combinations refuse the I/O priority change."
     },
     {
       "name": "CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS",
@@ -4958,10 +4536,10 @@
     {
       "name": "bounded-search",
       "intent": "Search sessions without flooding the caller's token budget.",
-      "first_command": "cass search \"<query>\" --robot --limit 10 --fields summary,provenance,conversation_id,message_anchor --max-content-length 800 --robot-meta",
+      "first_command": "cass search \"<query>\" --robot --limit 10 --fields summary,provenance,conversation_id --max-content-length 800 --robot-meta",
       "follow_up_commands": [
-        "cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --message-anchor <message_anchor> --json",
-        "cass expand <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --message-anchor <message_anchor> -C 3 --json",
+        "cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --json",
+        "cass expand <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> -C 3 --json",
         "cass pack \"<query>\" --robot --max-tokens 4000 --limit 10"
       ],
       "parse_contract": "Parse hits[], _meta.realized_mode, _meta.fallback_mode, cursor, and *_truncated flags.",
@@ -4972,8 +4550,8 @@
       "intent": "Build a deterministic cited handoff bundle for another agent.",
       "first_command": "cass pack \"<question>\" --robot --max-tokens 4000 --max-evidence 8 --max-sessions 3 --require-evidence",
       "follow_up_commands": [
-        "cass search \"<question>\" --robot --limit 10 --fields summary,provenance,conversation_id,message_anchor --robot-meta",
-        "cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --message-anchor <message_anchor> --json"
+        "cass search \"<question>\" --robot --limit 10 --fields summary,provenance,conversation_id --robot-meta",
+        "cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --json"
       ],
       "parse_contract": "Parse evidence[], warnings[], privacy, freshness, health, and omitted[].",
       "note": "Use pack when the downstream consumer needs citations rather than raw search hits."
@@ -4981,14 +4559,14 @@
     {
       "name": "session-drilldown",
       "intent": "Move from a hit to surrounding conversation context.",
-      "first_command": "cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --message-anchor <message_anchor> --json",
+      "first_command": "cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --json",
       "follow_up_commands": [
-        "cass expand <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --message-anchor <message_anchor> -C 5 --json",
+        "cass expand <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> -C 5 --json",
         "cass context <source_path> --json",
         "cass resume <source_path> --shell"
       ],
       "parse_contract": "Parse coordinate_space, message_index, conversation_id, source_id, content, and is_target in the returned messages.",
-      "note": "Pass source_path, source_id, conversation_id, line_number, and message_anchor from the same hit; line_number belongs to --message-index, which requires the matching token, not raw --line."
+      "note": "Pass source_path, source_id, conversation_id, and line_number from the same hit; line_number belongs to --message-index, not raw --line."
     },
     {
       "name": "semantic-models",
@@ -5204,10 +4782,10 @@
       "behavior": "Legacy --line-number/--line_number flags still inspect raw lines; use --message-index for search hits."
     },
     {
-      "wrong": "cass view source_path=session.jsonl source_id=local line_number=42 message_anchor=<message_anchor> --json",
-      "canonical": "cass view session.jsonl --source local --message-index 42 --message-anchor <message_anchor> --json",
+      "wrong": "cass view source_path=session.jsonl source_id=local line_number=42 --json",
+      "canonical": "cass view session.jsonl --source local --message-index 42 --json",
       "accepted": true,
-      "behavior": "Pasted line_number fields require the matching message_anchor to select canonical messages, not raw lines; include conversation_id when a source path contains multiple conversations."
+      "behavior": "Pasted line_number fields select canonical messages, not raw lines; include conversation_id when a source path contains multiple conversations."
     },
     {
       "wrong": "cass search auth --format json",

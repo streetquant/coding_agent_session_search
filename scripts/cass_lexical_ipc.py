@@ -113,16 +113,8 @@ def mount_records(data):
         if len(device) != 2 or not mount_id or mount_id in records:
             raise ValueError("duplicate or invalid mount identifier")
         major, minor = map(kernel_number, device)
-        if not before[4].startswith(b"/"):
+        if not before[3].startswith(b"/") or not before[4].startswith(b"/"):
             raise ValueError("invalid mount root")
-        if not before[3].startswith(b"/"):
-            # Linux nsfs_show_path renders namespace bind roots as net:[123],
-            # not absolute paths. Parse these unrelated mount records without
-            # admitting nsfs itself as supported index storage.
-            kind, separator, inode = before[3].partition(b":[")
-            if (after[0] != b"nsfs" or not separator or not kind.isalpha()
-                    or not inode.endswith(b"]") or not kernel_number(inode[:-1])):
-                raise ValueError("invalid namespace mount root")
         records[mount_id] = (major, minor, after[0], line)
     return records
 
@@ -326,7 +318,7 @@ def validate_response(response, request_id, full_verify=None):
     fields = {"mode", "owner_epoch", "full_verify_requested", "persistent_proof",
               "file_identity_checked", "immutable_generation_certified"}
     if (not isinstance(admission, dict) or set(admission) != fields or
-            type(admission["owner_epoch"]) is not int or  # ubs:ignore[py.comparison.type-equality] JSON integer contract rejects bool, an int subclass.
+            type(admission["owner_epoch"]) is not int or
             not 0 < admission["owner_epoch"] < 2**64 or
             admission["full_verify_requested"] is not full_verify or
             admission["persistent_proof"] is not False or
@@ -393,8 +385,8 @@ def validate(request):
     except UnicodeError:
         valid_query = False
     limit, offset = request.get("limit", 10), request.get("offset", 0)
-    if (not valid_query or type(limit) is not int or not 1 <= limit <= 100 or  # ubs:ignore[py.comparison.type-equality] JSON pagination rejects bool, an int subclass.
-            type(offset) is not int or offset < 0 or offset + limit + 1 > 1024):  # ubs:ignore[py.comparison.type-equality] JSON pagination rejects bool, an int subclass.
+    if (not valid_query or type(limit) is not int or not 1 <= limit <= 100 or
+            type(offset) is not int or offset < 0 or offset + limit + 1 > 1024):
         raise Failure("invalid_request", "Invalid query or pagination budget.")
     if type(request.get("full_verify", False)) is not bool:
         raise Failure("invalid_request", "full_verify must be a boolean.")
@@ -439,7 +431,7 @@ class Owner:
                 # Only this root capability crosses exec; the guard's other
                 # descriptors and the owner's socket/lock remain private.
                 root_fd = self.guard.nodes[0][0]
-                self.process = subprocess.Popen(  # ubs:ignore[python.lifecycle.popen_handle] Owner.search catches failures and Owner.close kills, waits, and closes this retained worker.
+                self.process = subprocess.Popen(
                     [self.cass, "serve", "--stdio", "--index",
                      f"/proc/self/fd/{root_fd}",
                      "--request-timeout-ms", str(int(self.timeout * 1000))],
@@ -452,7 +444,7 @@ class Owner:
                               if key != "full_verify"}
             native_request["id"] = self.sequence
             response = exchange_pipes(self.process, native_request, deadline)
-            response["id"] = request["id"]  # ubs:ignore[py.security.header-injection] Validated uint64 in a bounded Unix-socket JSON body, not an HTTP header.
+            response["id"] = request["id"]
             remaining(deadline)
             if not self.guard.unchanged():
                 raise Failure("index_changed", "Index changed during the query.", True)
@@ -470,7 +462,7 @@ class Owner:
             # survived, and never accept reuse from a newly spawned worker.
             if not native_reused:
                 self.epoch += 1
-            response["admission"] = {  # ubs:ignore[py.security.header-injection] Owner-generated fixed JSON object, not an HTTP header.
+            response["admission"] = {
                 "mode": "retained_guarded" if native_reused else "strict_full",
                 "owner_epoch": self.epoch, "full_verify_requested": full,
                 "persistent_proof": False, "file_identity_checked": True,
@@ -523,7 +515,7 @@ def receive(stream, limit, deadline):
 
 def error_response(request, error):
     return {"schema_version": 1,
-            "id": request.get("id") if type(request.get("id")) is int else None,  # ubs:ignore[py.type-equality] Only echo a JSON integer; bool is an int subclass.
+            "id": request.get("id") if type(request.get("id")) is int else None,
             "ok": False, "error": {"kind": error.kind, "message": str(error),
                                   "retryable": error.retryable}}
 

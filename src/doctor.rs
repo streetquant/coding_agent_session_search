@@ -68,11 +68,6 @@ pub struct DoctorCommandRequest {
     pub verbose: bool,
     pub force_rebuild: bool,
     pub allow_repeated_repair: bool,
-    /// Admit the optional native ANN graph against the selected exact owner.
-    ///
-    /// Off by default: the bounded readiness surface never loads a graph, and
-    /// only the deep probe may report native ANN readiness.
-    pub deep_probe: bool,
     pub repair: bool,
     pub cleanup: bool,
     pub archive_scan: bool,
@@ -291,7 +286,6 @@ impl DoctorCommandRequest {
             verbose,
             force_rebuild,
             allow_repeated_repair,
-            deep_probe: false,
             repair,
             cleanup,
             archive_scan,
@@ -808,7 +802,6 @@ pub(crate) fn execute_doctor_command_with_wrap(
         request.surface,
         request.mode,
         request.plan_fingerprint,
-        request.deep_probe,
         wrap,
     )
 }
@@ -969,7 +962,6 @@ mod tests {
             verbose: false,
             force_rebuild: false,
             allow_repeated_repair: false,
-            deep_probe: false,
             repair: false,
             cleanup: false,
             archive_scan: false,

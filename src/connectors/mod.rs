@@ -4,12 +4,6 @@
 //! This module provides re-export stubs plus the CASS-specific wrappers used by
 //! every connector factory exposed to the indexer.
 
-pub(crate) mod ingest_contract;
-// The scope tables are shared with the build script, which resolves them
-// against the crate tree; the runtime only reads the baked contracts, so the
-// resolution helpers are exercised by the build script and the scope tests.
-#[allow(dead_code)]
-pub(crate) mod ingest_scope;
 pub(crate) mod source_dependencies;
 
 use std::fs;
@@ -122,7 +116,7 @@ pub fn preflight_codex_explicit_file_roots(
             if is_codex_rollout_file(&root.path) {
                 explicit_file_roots = explicit_file_roots.saturating_add(1);
             }
-            scan_roots.push(root.clone()); // ubs:ignore -- Return an owned root while preserving the caller's borrowed source provenance.
+            scan_roots.push(root.clone());
             continue;
         }
 
@@ -133,7 +127,7 @@ pub fn preflight_codex_explicit_file_roots(
             }
             Ok(_) | Err(_) => {
                 fallback_roots = fallback_roots.saturating_add(1);
-                scan_roots.push(root.clone()); // ubs:ignore -- Fallback must preserve the full borrowed root in the owned output.
+                scan_roots.push(root.clone());
             }
         }
     }
@@ -227,7 +221,7 @@ fn collect_codex_rollout_files(sessions: &Path, since_ts: Option<i64>) -> io::Re
             let file_type = entry.file_type()?;
             let path = entry.path();
             if file_type.is_dir() {
-                pending_dirs.push(path); // ubs:ignore -- Read-only DirEntry traversal; no archive extraction or destination write, and symlink directories are not followed.
+                pending_dirs.push(path);
             } else if file_type.is_file()
                 && is_codex_rollout_file(&path)
                 // Match FAD's directory discovery during compression: prefer
@@ -237,7 +231,7 @@ fn collect_codex_rollout_files(sessions: &Path, since_ts: Option<i64>) -> io::Re
                     && path.with_extension("").is_file())
                 && file_modified_since(&path, since_ts)
             {
-                files.push(path); // ubs:ignore -- Collect a read-only rollout source from DirEntry; no archive extraction or destination write.
+                files.push(path);
             }
         }
     }
@@ -273,7 +267,6 @@ pub mod chatgpt;
 pub mod claude_code;
 pub mod clawdbot;
 pub mod cline;
-pub mod cloudmcp;
 pub mod codebuff;
 pub mod codex;
 pub mod continue_dev;
@@ -281,20 +274,17 @@ pub mod copilot;
 pub mod copilot_cli;
 pub mod crush;
 pub mod cursor;
-pub mod dsh;
 pub mod factory;
 pub mod gemini;
 pub mod goose;
 pub mod grok;
 pub mod hermes;
-pub mod kilo;
 pub mod kimi;
 pub mod muse;
 pub mod omp;
 pub mod openclaw;
 pub mod opencode;
 pub mod openhands;
-pub mod openwebui;
 pub mod pi_agent;
 pub mod qwen;
 pub mod vibe;
@@ -309,20 +299,8 @@ fn claude_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(claude_code::ClaudeCodeConnector::new())
 }
 
-fn cline_connector_factory() -> Box<dyn Connector + Send> {
-    Box::new(cline::ClineConnector::new())
-}
-
-fn antigravity_connector_factory() -> Box<dyn Connector + Send> {
-    Box::new(antigravity::AntigravityConnector::new())
-}
-
 fn codex_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(codex::CodexConnector::new())
-}
-
-fn cursor_connector_factory() -> Box<dyn Connector + Send> {
-    Box::new(cursor::CursorConnector::new())
 }
 
 fn codebuff_connector_factory() -> Box<dyn Connector + Send> {
@@ -335,10 +313,6 @@ fn continue_connector_factory() -> Box<dyn Connector + Send> {
 
 fn omp_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(omp::OmpConnector::new())
-}
-
-fn opencode_connector_factory() -> Box<dyn Connector + Send> {
-    Box::new(opencode::OpenCodeConnector::new())
 }
 
 fn pi_agent_connector_factory() -> Box<dyn Connector + Send> {
@@ -356,9 +330,7 @@ fn copilot_connector_factory() -> Box<dyn Connector + Send> {
 /// Return connector factories with CASS-specific wrappers applied.
 ///
 /// Codex passes through CASS's enrichment wrapper so modern `function_call`
-/// arguments reach the production indexer. Cursor passes through the
-/// `.workspace-trusted` authority adapter to preserve local attribution rules.
-/// OMP passes through its profile
+/// arguments reach the production indexer. OMP passes through its profile
 /// provenance adapter, and Pi Agent passes through the OMP identity boundary
 /// that prevents broad explicit roots from indexing the same store twice.
 /// OpenClaw passes through its native-store WAL and state-directory adapter.
@@ -399,14 +371,10 @@ pub(crate) fn get_connector_factories_for_archive(
 pub(crate) fn get_connector_registrations() -> Vec<source_dependencies::ConnectorRegistration> {
     use source_dependencies::ConnectorRegistration;
 
-    let mut registrations: Vec<_> = franken_agent_detection::get_connector_factories()
+    franken_agent_detection::get_connector_factories()
         .into_iter()
         .map(|(name, factory)| {
             let mut registration = match name {
-                "antigravity" => ConnectorRegistration::new(name, antigravity_connector_factory),
-                "cline" => ConnectorRegistration::new(name, cline_connector_factory),
-                "cursor" => ConnectorRegistration::new(name, cursor_connector_factory),
-                "opencode" => ConnectorRegistration::new(name, opencode_connector_factory),
                 "claude" => {
                     ConnectorRegistration::new(name, claude_connector_factory)
                         .with_source_capability::<claude_code::ClaudeCodeConnector>("claude_code")
@@ -425,32 +393,7 @@ pub(crate) fn get_connector_registrations() -> Vec<source_dependencies::Connecto
             registration.factory = openclaw::with_wal_freshness(name, registration.factory);
             registration
         })
-        .collect();
-    registrations.push(ConnectorRegistration::new("kilo", || {
-        Box::new(kilo::KiloConnector::new())
-    }));
-    registrations.push(ConnectorRegistration::new("cloudmcp", || {
-        Box::new(cloudmcp::CloudMcpConnector::new())
-    }));
-    registrations.push(ConnectorRegistration::new("openwebui", || {
-        Box::new(openwebui::OpenWebUiConnector::new())
-    }));
-    registrations.push(ConnectorRegistration::new("dsh", || {
-        Box::new(dsh::DshConnector::new())
-    }));
-    registrations
-}
-
-/// The provider slug a registered connector's conversations carry, which the
-/// raw mirror records as its manifest provider (and hashes into the manifest
-/// id). It is the registry name except where the archive slug differs:
-/// `claude` registers, its conversations are `claude_code`. An unregistered
-/// name maps to itself.
-pub(crate) fn archive_provider_slug(connector_name: &str) -> &str {
-    get_connector_registrations()
-        .into_iter()
-        .find(|registration| registration.name == connector_name)
-        .map_or(connector_name, |registration| registration.source_slug)
+        .collect()
 }
 
 /// The provider slug a registered connector's conversations carry, which the

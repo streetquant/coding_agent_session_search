@@ -44,8 +44,6 @@ fn cass(fixture: &Fixture, args: &[&str], env: &[(&str, &str)]) -> Command {
         .env("XDG_DATA_HOME", fixture.home.join("xdg-data"))
         .env("XDG_CONFIG_HOME", fixture.home.join("xdg-config"))
         .env("XDG_CACHE_HOME", fixture.home.join("xdg-cache"))
-        .env("CASS_CLOUDMCP_DATA_ROOT", fixture.home.join("cloudmcp"))
-        .env("CASS_OPENWEBUI_DATA_ROOT", fixture.home.join("openwebui"))
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .env("CASS_SEMANTIC_EMBEDDER", "hash")
         .env("CODEX_HOME", &fixture.codex_home)
@@ -404,11 +402,6 @@ fn gh470_covered_watermark_rebuilds_old_prefix_and_reuses_current_passages()
             .env("XDG_CONFIG_HOME", fixture.home.join("xdg-config"))
             .env("XDG_DATA_HOME", fixture.home.join("xdg-data"))
             .env("XDG_CACHE_HOME", fixture.home.join("xdg-cache"))
-            // These shared stores live outside HOME. env_clear above also
-            // removes the gate's isolation overrides, so set fixture roots
-            // explicitly before starting the real indexing subprocess.
-            .env("CASS_CLOUDMCP_DATA_ROOT", fixture.home.join("cloudmcp"))
-            .env("CASS_OPENWEBUI_DATA_ROOT", fixture.home.join("openwebui"))
             .env("CLAUDE_CONFIG_DIR", fixture.home.join(".claude"))
             .env("CODEX_HOME", &fixture.codex_home)
             .env("TUI_HEADLESS", "1")

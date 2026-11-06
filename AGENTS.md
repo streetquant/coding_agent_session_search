@@ -10,24 +10,6 @@ Use [DSR (Doodlestein Self-Releaser)](https://github.com/Dicklesworthstone/doodl
 
 ---
 
-## GPU HOST SAFETY (production Qwen)
-
-This host's four RTX 3090s serve the production `qwen-lan` deployment. CASS
-benchmarks must not run as detached or orphaned CUDA jobs.
-
-- Never launch GPU work with `nohup`, `&`, `disown`, or a shell that outlives the
-  agent session. Use the harness's tracked background job, and stop it before
-  the session ends.
-- Any CASS GPU job requires explicit owner approval in the task, a bounded
-  `timeout`, an explicit `CUDA_VISIBLE_DEVICES`, and a recorded PID.
-- `qwen-gpu-guard.service` pauses unregistered CUDA processes after 30 seconds
-  and terminates them after 2 minutes. Qwen `llama-server` PIDs are allowlisted;
-  persistent exceptions are path prefixes in `/etc/qwen-gpu-guard/allow.txt`.
-- Do not stop or bypass the guard to make a benchmark pass. Ask the owner to
-  stop it or allowlist a path before running a real multi-minute GPU workload.
-
----
-
 ## RULE 0 - THE FUNDAMENTAL OVERRIDE PREROGATIVE
 
 If I tell you to do something, even if it goes against what follows below, YOU MUST LISTEN TO ME. I AM IN CHARGE, NOT YOU.
@@ -74,13 +56,20 @@ success** — one line, revert, next lever, no retraction narrative.
 
 ---
 
-## Git Branch: ONLY Use `main`
+## Git Branch: ONLY Use `main`, NEVER `master`
 
-**The default and only supported branch is `main`; this repository has no legacy `master` branch or mirror.**
+**The default branch is `main`. The `master` branch exists only for legacy URL compatibility.**
 
-- **All work happens on `main`** — commits, PRs, and feature branches merge to `main`.
-- **Use `main` on both remotes** — `origin/main` is the upstream ref and `fork/main` is the fork ref; fetch, track, and push `main` only.
-- **Do not create, push, or synchronize a legacy `master` ref.** If an old `master` reference appears in code or docs, replace it with `main`.
+- **All work happens on `main`** — commits, PRs, feature branches all merge to `main`
+- **Never reference `master` in code or docs** — if you see `master` anywhere, it's a bug that needs fixing
+- **The `master` branch must stay synchronized with `main`** — after pushing to `main`, also push to `master`:
+  ```bash
+  git push origin main:master
+  ```
+
+**If you see `master` referenced anywhere:**
+1. Update it to `main`
+2. Ensure `master` is synchronized: `git push origin main:master`
 
 ---
 
@@ -154,47 +143,6 @@ This project uses **asupersync** as its async runtime. It provides `RuntimeBuild
 
 We load all configuration from `.env` via the **dotenvy** crate. NEVER use `std::env::var()` directly.
 
-<!-- BEGIN GENERATED ENV VAR INDEX -->
-134 documented variables (`cass capabilities --json | jq .env_vars`):
-
-| Variable | Variable | Variable | Variable |
-|----------|----------|----------|----------|
-| `CASS_AIDER_DATA_ROOT` | `CASS_ALLOW_DUMB_TERM` | `CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS` | `CASS_AUTO_REFRESH` |
-| `CASS_AUTO_REFRESH_COOLDOWN_SECS` | `CASS_AUTO_REFRESH_SOURCE_SCAN_SECS` | `CASS_BACKGROUND_IONICE_CLASS` | `CASS_BACKGROUND_IONICE_PRIORITY` |
-| `CASS_BACKGROUND_NICE` | `CASS_CACHE_BYTE_CAP` | `CASS_CACHE_EVICTION_POLICY` | `CASS_CACHE_SHARD_CAP` |
-| `CASS_CACHE_TOTAL_CAP` | `CASS_DAEMON_INDEX_INTERVAL_SECS` | `CASS_DAEMON_SOCKET` | `CASS_DATA_DIR` |
-| `CASS_DB_PATH` | `CASS_DEBUG_CACHE_METRICS` | `CASS_DEFER_ANALYTICS_UPDATES` | `CASS_DISABLE_ANIMATIONS` |
-| `CASS_DOCTOR_BUDGET_MS` | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY` | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_BYTE_LIMIT` | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_MANIFEST_LIMIT` |
-| `CASS_DOCTOR_WAL_CHECKPOINT_TIMEOUT_SECS` | `CASS_EXCLUDE_PATHS` | `CASS_FLEET_BUDGET_MS` | `CASS_FLEET_PER_HOST_BUDGET_MS` |
-| `CASS_FTS_DRYRUN_CAP` | `CASS_FTS_INLINE_BUDGET_SECS` | `CASS_FTS_REPAIR_PAGE_BUDGET_SECS` | `CASS_FTS_SHADOW_MAX_MESSAGES` |
-| `CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES` | `CASS_INDEXER_PARALLEL_WAL` | `CASS_INDEX_FINALIZE_ABORT_SECS` | `CASS_INDEX_FINAL_WAL_CHECKPOINT_TIMEOUT_SECS` |
-| `CASS_INDEX_INGEST_WAL_CHECKPOINT_BYTES` | `CASS_INDEX_INGEST_WAL_CHECKPOINT_MODE` | `CASS_INDEX_NO_PROGRESS_EVENTS` | `CASS_INDEX_REDACTION` |
-| `CASS_INDEX_SKIP_DISK_HEADROOM_CHECK` | `CASS_INDEX_STALL_ABORT_ALL_PHASES` | `CASS_INDEX_STALL_ABORT_SECS` | `CASS_INDEX_STALL_DETECT_SECS` |
-| `CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES` | `CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES` | `CASS_NO_COLOR` | `CASS_OMP_DATA_ROOT` |
-| `CASS_OUTPUT_FORMAT` | `CASS_PACK_BUDGET_MS` | `CASS_QUILL_QUERY_FUEL_BUDGET` | `CASS_RAW_MIRROR` |
-| `CASS_REDACT_MEMO_CAPACITY` | `CASS_REDACT_SECRETS` | `CASS_RESPECT_NO_COLOR` | `CASS_RESPONSIVENESS_CALIBRATION` |
-| `CASS_RESPONSIVENESS_CONFORMAL_ALPHA_PRESSURED` | `CASS_RESPONSIVENESS_CONFORMAL_ALPHA_SEVERE` | `CASS_RESPONSIVENESS_CONFORMAL_K` | `CASS_RESPONSIVENESS_CONFORMAL_K_MIN` |
-| `CASS_RESPONSIVENESS_DISABLE` | `CASS_RESPONSIVENESS_DRIFT_DELTA` | `CASS_RESPONSIVENESS_DRIFT_LAMBDA` | `CASS_RESPONSIVENESS_GROWTH_TICKS` |
-| `CASS_RESPONSIVENESS_MAX_INFLIGHT_BYTES` | `CASS_RESPONSIVENESS_MAX_LOAD_PER_CORE` | `CASS_RESPONSIVENESS_MAX_PSI_AVG10` | `CASS_RESPONSIVENESS_MAX_WORKERS` |
-| `CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS` | `CASS_RESPONSIVENESS_SEVERE_LOAD_PER_CORE` | `CASS_RESPONSIVENESS_SEVERE_PSI_AVG10` | `CASS_RESPONSIVENESS_TICK_SECS` |
-| `CASS_SCHEDULE_MAX_BACKFILL_BATCHES` | `CASS_SCHEDULE_MAX_LOAD_DEFERRAL_SECS` | `CASS_SEARCH_ACTIVE_REBUILD_WAIT_MS` | `CASS_SEARCH_BUDGET_MS` |
-| `CASS_SEARCH_EXACT_TOTAL_COUNT_MAX_DOCS` | `CASS_SEARCH_LIMIT` | `CASS_SEARCH_MODE` | `CASS_SEARCH_TIMEOUT_MS` |
-| `CASS_SEMANTIC_BATCH_SIZE` | `CASS_SEMANTIC_EMBEDDER` | `CASS_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS` | `CASS_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS` |
-| `CASS_SEMANTIC_MAX_BYTES_PER_CHECKPOINT` | `CASS_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT` | `CASS_SEMANTIC_PREP_PARALLEL` | `CASS_SEMANTIC_PROGRESS_JSONL` |
-| `CASS_SSH_CONFIG` | `CASS_STATUS_BUDGET_MS` | `CASS_STREAMING_COMBINE_MAX` | `CASS_STREAMING_COMBINE_MAX_BYTES` |
-| `CASS_STREAMING_CONSUMER_COMBINE` | `CASS_STREAMING_CONSUMER_COMMIT_SECS` | `CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS` | `CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS` |
-| `CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES` | `CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES` | `CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS` | `CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS` |
-| `CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGES` | `CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGE_BYTES` | `CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS` | `CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE` |
-| `CASS_TANTIVY_REBUILD_PIPELINE_MAX_MESSAGE_BYTES_IN_FLIGHT` | `CASS_TANTIVY_REBUILD_RESERVED_CORES` | `CASS_TANTIVY_REBUILD_WORKERS` | `CASS_TRACE_FILE` |
-| `CASS_TRACE_FILTER` | `CASS_TRACE_MAX_BYTES` | `CASS_TRACE_MAX_EVENTS` | `CASS_TRIAGE_BUDGET_MS` |
-| `CASS_TUI_KITTY_KEYBOARD` | `CASS_VIEW_BUDGET_MS` | `CASS_WARM_DEBOUNCE_MS` | `CHATGPT_ENCRYPTION_KEY` |
-| `CODEX_HOME` | `CODING_AGENT_SEARCH_NO_UPDATE_PROMPT` | `EDITOR` | `GEMINI_HOME` |
-| `MALLOC_ARENA_MAX` | `NO_COLOR` | `OMP_PROFILE` | `OPENCODE_STORAGE_ROOT` |
-| `PI_CODING_AGENT_DIR` | `PI_CODING_AGENT_SESSION_DIR` | `PI_CONFIG_DIR` | `PI_PROFILE` |
-| `PI_SESSIONS_DIR` | `TOON_DEFAULT_FORMAT` | `TOON_INDENT` | `TOON_KEY_FOLDING` |
-| `TUI_HEADLESS` | `XDG_DATA_HOME` |  |  |
-<!-- END GENERATED ENV VAR INDEX -->
-
 ```rust
 use dotenvy::dotenv;
 use std::env;
@@ -219,7 +167,7 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 | `frankensqlite` (`fsqlite`) | Pure-Rust SQLite reimplementation — primary storage backend |
 | `rusqlite` | Dev-dependency only: C-SQLite interop fixtures in tests. Production never links it (historical salvage uses the external `sqlite3` CLI) |
 | `frankensearch` | Unified search engine: lexical BM25 + semantic + RRF fusion |
-| `franken_agent_detection` | Agent session auto-detection across the runtime connector registry |
+| `franken_agent_detection` | Agent session auto-detection across 34 providers |
 | `frankentorch` (via `frankensearch`) | Pure-Rust native MiniLM embeddings and reranking |
 | `frankenhnsw` (via `frankensearch`) | HNSW approximate nearest neighbors |
 | `half` + `wide` + `memmap2` | f16 quantized vectors, portable SIMD, memory-mapped I/O |
@@ -242,7 +190,7 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 **Optional local sibling checkouts** (under `/data/projects/`, via commented local patches only):
 - `frankensqlite` — Pure-Rust SQLite with BEGIN CONCURRENT (MVCC multi-writer)
 - `frankensearch` — Unified search: BM25 lexical + semantic embeddings + RRF fusion + reranking
-- `franken_agent_detection` — Auto-discovers agent sessions from the runtime connector registry
+- `franken_agent_detection` — Auto-discovers agent sessions from 34 providers
 - `frankentui` (`ftui` + `ftui-extras` + `ftui-runtime` + `ftui-tty`) — Terminal UI framework
 - `asupersync` — Async runtime (multi-thread, fs, spawn_blocking, signals)
 - `toon` — Token-optimized serialization
@@ -284,34 +232,16 @@ WAL index (0853f5e8e). 0.4.9 refuses that index promptly again (48c6cf6b2) and
 lets the first write after stock SQLite opened the archive read-only
 establish the WAL generation instead of failing `BusyRecovery` on every later
 commit (frankensqlite GH#443, 4b48c95d8; cass GH#509/#508).
-The strict family guard requires uniform 0.4.13 registry versions.
+The strict family guard requires uniform 0.4.12 registry versions.
 
-Current family pin (2026-11-03): Cargo.toml, Cargo.lock, and build.rs use the
-published uniform 0.4.13 family. Upstream commit
-58ddae0debad1fe58e372c91bb0bdbd5c60f150b repairs the integrity-check false
-positive `page N is never used` on valid `backup_exact_to` images containing
-published WAL rows (svhcf). Release inclusion is source provenance; CASS
-acceptance still requires its named WAL-row publication test and agreement with
-stock SQLite, and does not satisfy the independent owner-archive gates.
-
-
-<!-- BEGIN GENERATED DEPENDENCY PINS -->
-11 exact or git-pinned direct dependencies (generated from `[dependencies]` in `Cargo.toml`):
-
-| Dependency | Requirement | Features |
-|------------|-------------|----------|
-| `asupersync` | crates.io `=0.5.0` | `test-internals`, `tls-native-roots` |
-| `franken-agent-detection` | git `https://github.com/Dicklesworthstone/franken_agent_detection` rev `6b337ba434b72c65c6c5a748b7ec47885f840ac0` (crate 0.3.10) | `connectors`, `cursor`, `chatgpt`, `opencode`, `crush`, `goose`, `hermes`, `devin`, `shelley`, `grok-bot`, `openclaw-sqlite`, `copilot-vscdb`, `codebuff`, `codex-zstd`, `pi-durable`, `pi-sqlite` |
-| `frankensearch` | git `https://github.com/Dicklesworthstone/frankensearch` rev `5ee999fcaba6f85d19c0e3f00883f1d5d4918887` (crate 0.7.1) | `hash`, `cass-compat`, `quill`, `ann`, `native` |
-| `frankensqlite` (`fsqlite`) | crates.io `=0.4.13` | `fts5`, `async-api` |
-| `fsqlite-types` | crates.io `=0.4.13` |  |
-| `ftui` | crates.io `=0.5.0` |  |
-| `ftui-extras` | crates.io `=0.5.0` | `markdown`, `syntax`, `charts`, `canvas`, `theme`, `clipboard`, `clipboard-fallback`, `export`, `visual-fx`, `forms`, `validation`, `help` |
-| `ftui-runtime` | crates.io `=0.5.0` | `native-backend`, `crossterm-compat` |
-| `ftui-tty` | crates.io `=0.5.0` |  |
-| `portable-pty` | git `https://github.com/wezterm/wezterm` rev `f78f72f2f18bf459561e3681f016365273d3e281` (crate 0.9.0) |  |
-| `toon` (`tru`) | crates.io `=0.2.4` |  |
-<!-- END GENERATED DEPENDENCY PINS -->
+| Dependency | Pinned source |
+|------------|-----------------|
+| `frankensqlite` (`fsqlite`) / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.12` (tag v0.4.12 = `26aa19afcbd5afdb01658a10bb33417ad0b513be`); `build.rs` refuses a mixed family. Carries 0.4.12's bd-obwsy (the 0.4.10 advisory), bd-gwoit, bd-yxqs9 and largest-rowid explicit-write (9308c4bb6) fixes, plus 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477), 0.4.4's durable pending-freelist repairs, 0.4.6's page-referenced-twice (bd-b5vmw) and lost-index-entry (bd-11sz4) fixes, 0.4.7's large multi-row INSERT index fix (bd-2eebi), serialized-DDL race fix (bd-4iaoi), GH#503 shadow-autoindex repair open, bounded published-page plane (5s1la) and first-`sqlite_master` full-file read fix (k2k20), and 0.4.9's prompt stale-WAL-index refusal (48c6cf6b2) and stock-empty-WAL-index first-write fix (4b48c95d8, cass GH#509). CASS runtime qualification of 0.4.12 passed (gi7k7). 0.4.6 included upstream's likely fix (fd8c16a94) for a long-lived connection left refusing every BEGIN (2l1b0.75, frankensqlite GH#429), not yet verified on the owner-archive scenario; the legacy OMP analytics phase keeps its own fresh writer regardless |
+| `franken-agent-detection` | `=0.3.10` at git rev `6b337ba434b72c65c6c5a748b7ec47885f840ac0` (GH#520 remote-mirror source identity, Continue `continue` and Kiro CLI `kiro` connectors, early SQLite connector runtime shutdown and full OpenCode read-error chains, GH#519), features `pi-durable` and `pi-sqlite` (the `pi_durable` connector for Pi's durable-harness stores, FAD#28; `pi_agent_rust` SQLite sessions; Pi compaction/branch provenance, FAD#27) and `codex-zstd` (reads Codex rollouts compressed to `rollout-*.jsonl.zst` by Codex's `local_thread_store_compression`, with the id of their plain form, GH#513; indexes native Codebuff transcripts, whose timestamps are a locale time of day, with each instant taken from the message ID, and keeps indexing a store's other chats when one transcript does not parse, GH#511; indexes OpenCode 2.x sessions from `session_v2`/`session_message`, GH#504; decodes OpenClaw zstd-compressed transcript events; indexes Claude Code prompts typed mid-turn, GH#500; honors `CASS_EXCLUDE_PATHS` in the Codex and Pi-family connectors, GH#486, and resolves `..`, relative and symlink-alias spellings of an entry, 0f1k0; caps session reads while reading, and lets cass set the Codex rollout budget so `CASS_CODEX_MAX_SOURCE_BYTES` above 100 MiB works) |
+| `asupersync` | crates.io `=0.5.0` (the line fsqlite 0.4.x requires) |
+| `frankensearch` | crates.io `=0.7.1` (tag `crates-v0.7.1`), resolving `frankensearch-index 0.4.2` (hotfix, tag `frankensearch-index-v0.4.2`: files are installed with `std::fs::rename`, so on Windows an open reader no longer blocks an install, bead if17v; and the dumped HNSW sidecars are flushed through write handles, so an HNSW build works on Windows, bead ujxiq), `frankensearch-quill 0.4.1` (hotfix, tag `frankensearch-quill-v0.4.1`: opening a writer verifies each segment once instead of four times; bead hfosx), `frankensearch-rerank 0.5.0`, `frankenhnsw 0.3.5` and the `frankentorch-*` family; features `hash`, `cass-compat`, `quill`, `ann`, `native`. Quill 0.4.0 is the first main-branch release after the 0.3.4 hotfix and carries all three of its fixes: the GH#499 live-doc numeric scoring, the standard CASS Boolean grammar (NOT > AND > OR, parentheses; frankensearch#56) and the union seek_danger fix (a disjunction under a conjunction lost matches on concat-merged segments). It also verifies snapshot segments concurrently on open (GH#501; up to 8 threads, the same bytes are still hashed), builds snippets only for returned hits, and skips a read-only reopen when nothing was published. The CASS schema hash is unchanged (`v9-quill`), so the upgrade does not rebuild the lexical index |
+| `frankentui` (`ftui`, `ftui-runtime`, `ftui-tty`, `ftui-extras`) | crates.io `=0.5.0` (2026-08-21; previously git `5f78cfa0` / 0.3.1 — the 0.5 API compiled with zero call-site changes) |
+| `toon` (`tru`) | crates.io `=0.2.4` (2026-08-24; production sources byte-identical to the previously pinned git rev `d7185c78` — registry 0.2.3 was rejected because its tree differs from the rev in real source despite the matching version field) |
 
 ### Release Profile
 
@@ -476,18 +406,9 @@ Use `FrankenConnectionManager` for concurrent access:
 
 - **File format interop:** As of rev `9cedb30b`, frankensqlite databases are
   readable by C SQLite (rusqlite) and vice versa. Historical bundle salvage
-  uses the external `sqlite3` CLI's `.recover` (frankensqlite has no
-  equivalent) and re-imports the recovered rows into a fresh frankensqlite
-  database; `rusqlite` is a dev-dependency only and is never linked into the
-  shipped binary.
-- **`PRAGMA writable_schema`:** Supported for writes since fsqlite 0.4.12
-  (`INSERT`/`DELETE` on `sqlite_master` both work). The one thing it still
-  cannot do is *open* a catalog whose `sqlite_master` carries conflicting
-  virtual-table entries (for example two `fts_messages` rows): the schema
-  load rejects it before any statement runs. Repairing that shape therefore
-  needs the stock `sqlite3` CLI, and cass only ever runs it from
-  `cass doctor --fix` (2l1b0.65). Ordinary opens report the typed
-  `schema-repair-required` condition and never mutate the archive.
+  still uses rusqlite as a proven read bridge for pre-migration databases.
+- **`PRAGMA writable_schema`:** Not supported for write operations (INSERT/UPDATE
+  on sqlite_master). SELECT from sqlite_master works.
 
 ### General Rules
 
@@ -604,7 +525,7 @@ Provides unified full-text and semantic search across all local coding agent ses
 - **Semantic model acquisition is opt-in.** `cass models install` downloads the MiniLM model (~90 MB) on explicit operator request. cass never auto-downloads. Air-gapped installs use `--from-file <dir>`. While the model is absent, `fallback_mode="lexical"` is reported in health/status and queries silently degrade to lexical-only.
 - **Truth surfaces:** `cass health --json`, `cass status --json`, and search `--robot-meta` expose readiness, active rebuilds, realized search mode, fallback tier, and recommended action. Follow those fields instead of hard-coded manual repair rituals.
 - **No silent substitution.** An input that cannot take effect is a typed error (or, only where the contract says so, a typed warning in `_meta.warnings`), never dropped: a bad `--since`, a flag typo on an exact subcommand, and an ignored env override have each run a different query with exit 0. Search `--robot-meta` echoes what actually ran under `_meta.effective` (database path and its source, the resolved time window with the flag behind each bound, parsed filters, argv auto-corrections, the engine's query grouping and recovered parentheses), and `_meta.wildcard_fallback_skipped` says why a sparse result got no automatic wildcard retry; when you add an input that changes what search does, echo it there and extend `tests/search_metamorphic.rs` (2l1b0.68).
-- **Lexical query fuel is bounded.** cass opens Quill with the engine's deterministic per-query work ceiling (64,000,000 units; the engine default is 10,000,000, and CASS ships the higher ceiling because the owner's published snapshot holds 1,157 segments - recorded in bead `coding_agent_session_search-46nwq` and commit `5c9e3c62`. The price is that a pathological query scans up to 6.4x more work before the typed refusal, and the owner-scale re-measurement of the 10,000,000 default is still blocked on `coding_agent_session_search-g3zyo`. `CASS_QUILL_QUERY_FUEL_BUDGET` is an escape hatch, not a tuning knob). If a hybrid search exhausts it, the lexical leg is dropped rather than failing the search and `_meta.lexical_degrade_reason` reports `query_fuel_exhausted`; lexical-only searches get an actionable hint. cass publishes Quill snapshots only on its own commits (`max_visibility_lag_ms` is disabled in `src/search/quill_bridge.rs::cass_quill_config`), which stops the per-second seals that grew append-only archives into hundreds of tiny segments (GH #440/#441); `cass index --full` consolidates an archive that already fragmented.
+- **Lexical query fuel is bounded.** cass opens Quill with the engine's deterministic per-query work ceiling (10,000,000 units; `CASS_QUILL_QUERY_FUEL_BUDGET` is an escape hatch, not a tuning knob). If a hybrid search exhausts it, the lexical leg is dropped rather than failing the search and `_meta.lexical_degrade_reason` reports `query_fuel_exhausted`; lexical-only searches get an actionable hint. cass publishes Quill snapshots only on its own commits (`max_visibility_lag_ms` is disabled in `src/search/quill_bridge.rs::cass_quill_config`), which stops the per-second seals that grew append-only archives into hundreds of tiny segments (GH #440/#441); `cass index --full` consolidates an archive that already fragmented.
 
 ### Keeping the Index Fresh (do not hand-roll cron for this)
 
@@ -741,27 +662,44 @@ cass robot-docs guide         # LLM-optimized docs
 
 ### Supported Providers
 
-<!-- BEGIN GENERATED CONNECTORS -->
-The runtime registry registers 38 connectors (`cass capabilities --json | jq .connectors`):
+| Provider | Connector | Session Format |
+|----------|-----------|----------------|
+| Claude Code | `claude_code.rs` | JSONL |
+| Codex | `codex.rs` | JSONL |
+| Cursor | `cursor.rs` | JSONL / SQLite |
+| Gemini | `gemini.rs` | JSONL |
+| Aider | `aider.rs` | Markdown / JSONL |
+| Amp | `amp.rs` | JSONL |
+| ChatGPT | `chatgpt.rs` | Encrypted JSON |
+| Cline | `cline.rs` | JSONL |
+| OpenCode | `opencode.rs` | JSONL |
+| Pi Agent | `pi_agent.rs` | JSONL |
+| Oh My Pi | `omp.rs` | JSONL |
+| Copilot | `copilot.rs` | JSONL |
+| Copilot CLI | `copilot_cli.rs` | JSONL |
+| OpenClaw | `openclaw.rs` | JSONL |
+| ClawdBot | `clawdbot.rs` | JSONL |
+| Vibe | `vibe.rs` | JSONL |
+| Crush | `crush.rs` | JSONL |
+| Hermes | `hermes.rs` | JSONL |
+| Kimi Code | `kimi.rs` | JSONL |
+| Qwen Code | `qwen.rs` | JSONL |
+| Factory (Droid) | `factory.rs` | JSONL |
+| OpenHands | `openhands.rs` | JSON event stream |
+| Antigravity | `antigravity.rs` | JSONL / SQLite |
+| Grok Build | `grok.rs` | ACP updates JSONL |
+| Goose | `goose.rs` | SQLite (`sessions.db`, v1.20+) / legacy per-session JSONL |
+| Muse Code | `muse.rs` | JSONL |
+| Prime Agent | FAD `prime_agent` | JSONL |
+| Grok Bot | FAD `grok_bot` (feature `grok-bot`) | local rolling chat replica |
+| Codebuff / Freebuff | FAD `codebuff` (feature `codebuff`) | Manicode chat JSON |
+| Devin CLI | FAD `devin` (feature `devin`) | SQLite (`sessions.db`) |
+| Shelley | FAD `shelley` (feature `shelley`) | SQLite |
+| Pi Durable | FAD `pi_durable` (SQLite stores with feature `pi-durable`) | SQLite / JSONL commit log |
+| Kiro CLI | FAD `kiro` | event-log JSONL + JSON snapshot |
+| Continue | FAD `continue` | JSON session snapshots |
 
-| Connector | Connector | Connector |
-|-----------|-----------|-----------|
-| `codex` | `claude_code` | `gemini` |
-| `clawdbot` | `vibe` | `opencode` |
-| `amp` | `cline` | `aider` |
-| `cursor` | `chatgpt` | `pi_agent` |
-| `omp` | `factory` | `openclaw` |
-| `continue` | `antigravity` | `pi_durable` |
-| `prime_agent` | `kimi` | `kiro` |
-| `muse` | `openhands` | `copilot` |
-| `copilot_cli` | `qwen` | `grok` |
-| `devin` | `grok_bot` | `codebuff` |
-| `goose` | `crush` | `hermes` |
-| `shelley` | `kilo` | `cloudmcp` |
-| `openwebui` | `dsh` |  |
-<!-- END GENERATED CONNECTORS -->
-
-Every runtime-registered connector is listed by `cass capabilities --json` under `connectors`.
+All 34 connectors registered at runtime are listed by `cass capabilities --json` under `connectors`.
 
 ### HTML Export (Robot Mode)
 
@@ -855,141 +793,34 @@ Returns in <50ms on a healthy archive (the archive probe is the same strict, mut
 
 ### Exit Codes
 
-<!-- BEGIN GENERATED EXIT CODES -->
-| Code | Meaning | Retryable | Agent action |
-|------|---------|-----------|--------------|
-| `0` | success | no | Read stdout as the command result. |
-| `1` | health check failed | yes | Inspect JSON recommended_action before retrying or indexing. |
-| `2` | usage or parsing error | no | Fix argv syntax; follow the JSON err.hint or examples. |
-| `3` | index or database missing | yes | Run cass index --full when health/status recommends it. |
-| `4` | I/O failure or unsafe operation refused | maybe | Branch on err.kind: fix the path, permissions, or free space for io/output-not-writable; follow err.hint for refused-unsafe. Not a network code: remote sources fail with 12, model downloads with 20-23. |
-| `5` | data corruption | depends | Inspect health/status/doctor JSON and rebuild only derived assets when recommended. |
-| `6` | required input missing | no | Supply the missing input named by err.kind (a password via --password-stdin, or a resume command), then rerun. |
-| `7` | lock or busy | yes | Retry later with bounded backoff; another cass operation owns the lock. |
-| `8` | partial result (sources sync only) | yes | Some sources had path failures: inspect the per-source errors and re-sync the failed sources. Search/pack timeouts exit 0 with budget.timed_out instead. |
-| `9` | unknown error | maybe | Read err.kind, err.message, and trace output before deciding. |
-| `10` | config or timeout | depends | Branch on JSON err.kind; numeric code 10 is intentionally domain-specific. |
-| `11` | config validation | no | Fix the reported configuration field before retrying. |
-| `12` | source or SSH problem | maybe | Inspect source JSON fields and verify the remote host or path. |
-| `13` | mapping or not-found | depends | Branch on err.kind and verify the requested source/session mapping. |
-| `14` | I/O or mapping | maybe | Inspect err.kind and path details; retry only after the path is reachable. |
-| `15` | semantic or embedder unavailable | yes | Install/verify models or continue with lexical fallback when acceptable. |
-| `20-21` | model acquisition failure | maybe | Check err.kind and err.hint; retry download or use --from-file. |
-| `22` | I/O during model handling | maybe | Verify model cache permissions and available disk before retrying. |
-| `23` | download failure | yes | Retry with network available or install from a local model directory. |
-| `24` | I/O during model verify/install | maybe | Fix filesystem permissions or disk space, then retry. |
-| `70` | index stalled and aborted | yes | Read the kind index-stalled envelope on stderr and cass status --json, then rerun cass index; the lock is reaped on the next start. |
-| `130` | interrupted (SIGINT) | yes | Rerun the command; cass sources setup --resume continues an interrupted setup. |
-<!-- END GENERATED EXIT CODES -->
+| Code | Meaning | Retryable |
+|------|---------|-----------|
+| 0 | Success | N/A |
+| 1 | Health check failed | Yes — inspect `recommended_action` |
+| 2 | Usage/parsing error | No — fix syntax |
+| 3 | Index/DB missing | Yes — run `cass index --full` |
+| 4 | I/O failure or unsafe operation refused (not a network code) | Maybe — branch on `err.kind` (`io`, `output-not-writable`, `refused-unsafe`) |
+| 5 | Data corruption | Yes — inspect health/status, then rebuild derived assets if recommended |
+| 6 | Required input missing (password, resume command) | No — supply the input (e.g. `--password-stdin`) |
+| 7 | Lock/busy | Yes — retry later |
+| 8 | Partial result (`sources sync` only: some sources had path failures) | Yes — inspect per-path errors, retry failed sources |
+| 9 | Unknown error | Maybe |
+| 10 | Config / timeout (domain-specific) | Depends on `err.kind` |
+| 11 | Config validation | No — fix config |
+| 12 | Source / SSH problem | Maybe — check remote host |
+| 13 | Mapping / not-found | Depends on `err.kind` |
+| 14 | I/O / mapping | Maybe |
+| 15 | Semantic / embedder unavailable | Yes — install model or fall back to `--mode lexical` |
+| 20-21 | Model acquisition failure | Maybe — check `err.kind`, `err.hint` |
+| 22 | I/O during model handling | Maybe |
+| 23 | Download failure | Yes — retry or use `--from-file` |
+| 24 | I/O during model verify/install | Maybe |
+| 70 | `cass index` stalled and aborted (kind `index-stalled` envelope on stderr) | Yes — inspect `cass status --json`, rerun `cass index` |
+| 130 | Interrupted (SIGINT) | Yes — rerun; `cass sources setup --resume` continues setup |
 
 Search/pack timeouts are not exit 8: on expiry `search` and `pack` exit 0 with `{"hits": [], "budget": {"timed_out": true, "skipped_sections": [...], "recommended_next_probe": "<command>", ...}}`; `--robot-format sessions` instead fails with exit 10, kind `timeout`. Explicit `--mode semantic` also fails with exit 10, kind `timeout`, retryable, when the budget cannot admit semantic setup or dispatch (ds7uy.4.1); hybrid falls back to lexical with `semantic_budget_limited`.
 
-**Codes ≥ 10 are domain-specific.** The numeric code alone is ambiguous (e.g. code 10 covers both `config` and `timeout` kinds). Agents should branch on `err.kind` from the JSON error envelope, not on the numeric code, when handling codes ≥ 10. Kind names are kebab-case (examples: `missing-index`, `missing-db`, `semantic-unavailable`, `embedder-unavailable`, `ambiguous-source`, `timeout`, `config`, `lock-busy`, `model`, `download`, `io`).
-
-<!-- BEGIN GENERATED ERROR KINDS -->
-The registry defines 98 `err.kind` values; branch on the kind, not the numeric code, for codes >= 10.
-
-| Kind |
-|------|
-| `ambiguous-source` |
-| `archive-analytics-rebuild` |
-| `archive-count` |
-| `archive-daily-stats-rebuild` |
-| `archive-fts-rebuild` |
-| `archive-purge` |
-| `archive-token-daily-stats-rebuild` |
-| `config` |
-| `cursor-decode` |
-| `cursor-parse` |
-| `daemon` |
-| `db-error` |
-| `db-open` |
-| `db-query` |
-| `doctor` |
-| `download` |
-| `embedder-unavailable` |
-| `empty-file` |
-| `empty-session` |
-| `encode-json` |
-| `export-failed` |
-| `failed-seed-bundle-file` |
-| `file-create` |
-| `file-not-found` |
-| `file-open` |
-| `file-read` |
-| `file-write` |
-| `health` |
-| `selftest` |
-| `idempotency-mismatch` |
-| `index` |
-| `index-busy` |
-| `indexed-session-required` |
-| `invalid-agent` |
-| `invalid-filename` |
-| `invalid-line` |
-| `invalid-message-anchor` |
-| `stale-message-anchor` |
-| `io` |
-| `lexical-rebuild` |
-| `lexical-generation` |
-| `lexical-shard` |
-| `line-not-found` |
-| `line-out-of-range` |
-| `local` |
-| `mapping` |
-| `migration-repair-pending` |
-| `missing-db` |
-| `missing-index` |
-| `model` |
-| `not-found` |
-| `open-index` |
-| `opencode-parse` |
-| `opencode-sqlite-parse` |
-| `output-not-writable` |
-| `pack-budget-too-small` |
-| `pack-empty-query` |
-| `pack-invalid-field` |
-| `pack-invalid-limit` |
-| `pack-invalid-redaction-policy` |
-| `pack-no-evidence` |
-| `pack-unsupported-format` |
-| `pages` |
-| `parse-error` |
-| `partial-result` |
-| `password-read-error` |
-| `password-required` |
-| `rebuild-error` |
-| `repair-error` |
-| `resume-empty-command` |
-| `resume-exec-failed` |
-| `retained-publish-backup` |
-| `schedule` |
-| `schema-repair-required` |
-| `search` |
-| `semantic-backfill` |
-| `semantic-manifest` |
-| `semantic-unavailable` |
-| `serialize-message` |
-| `session-file-unreadable` |
-| `session-id-not-found` |
-| `session-not-found` |
-| `session-parse` |
-| `sessions-from` |
-| `setup` |
-| `source` |
-| `ssh` |
-| `storage` |
-| `storage-fingerprint` |
-| `storage-recovery-required` |
-| `timeout` |
-| `tui` |
-| `tui-headless-once` |
-| `tui-reset-state` |
-| `unknown` |
-| `unknown-agent` |
-| `usage` |
-| `write-failed` |
-<!-- END GENERATED ERROR KINDS -->
+**Codes ≥ 10 are domain-specific.** The numeric code alone is ambiguous (e.g. code 10 covers both `config` and `timeout` kinds). Agents should branch on `err.kind` from the JSON error envelope, not on the numeric code, when handling codes ≥ 10. Kind names are kebab-case (examples: `missing-index`, `missing-db`, `semantic-unavailable`, `embedder-unavailable`, `ambiguous-source`, `timeout`, `config`, `lock-busy`, `model`, `download`, `io`). The full set (about 90 kinds) lives in `src/model/cli_error_kind.rs`.
 
 ### Multi-Machine Search Setup
 

@@ -239,22 +239,10 @@ fn doctor_backup_restore_keeps_wal_rows_and_recovers_only_private_shm() {
         let verification = fixture.verify();
         assert_eq!(verification.status, "verified", "{verification:#?}");
         assert!(verification.restore_rehearsal_allowed);
-        match shm {
-            ShmFixture::Missing => assert!(matches!(
-                verification.storage_probe_status,
-                "passed" | "requires_private_wal_index_recovery"
-            )),
-            ShmFixture::Stale => {
-                assert_eq!(
-                    verification.storage_probe_status,
-                    "requires_private_storage_probe"
-                );
-                assert!(verification.warnings.iter().any(|warning| {
-                    warning.contains("native storage admission is deferred")
-                        && warning.contains("stored SHM unchanged")
-                }));
-            }
-        }
+        assert!(matches!(
+            verification.storage_probe_status,
+            "passed" | "requires_private_wal_index_recovery"
+        ));
         assert_eq!(tree_hashes(&fixture.backup_dir), backup_before);
         let (plan, fingerprint) = doctor_restore_plan_payload(
             &fixture.data_dir,

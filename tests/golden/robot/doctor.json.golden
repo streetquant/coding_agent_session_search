@@ -777,7 +777,6 @@
     "hnsw_present": false,
     "hnsw_state": "not_inspected",
     "hnsw_ready": false,
-    "hnsw_reason_code": null,
     "progressive_ready": false,
     "progressive_reason_code": null,
     "feature_compiled_in": true,
@@ -869,7 +868,6 @@
       "current_db_matches": null,
       "ready": false,
       "present": null,
-      "reason_code": null,
       "note": "model cache is opt-in; doctor reports state without downloading or deleting model files"
     },
     "vector_index": {
@@ -886,7 +884,6 @@
       "current_db_matches": null,
       "ready": false,
       "present": false,
-      "reason_code": null,
       "note": "semantic/vector indexes are derived from the canonical archive and explicit model policy"
     },
     "hnsw_index": {
@@ -903,7 +900,6 @@
       "current_db_matches": null,
       "ready": false,
       "present": false,
-      "reason_code": null,
       "note": "HNSW/mmap accelerators are optional derived assets and must not block lexical search"
     },
     "memoization_cache": {
@@ -920,7 +916,6 @@
       "current_db_matches": null,
       "ready": null,
       "present": null,
-      "reason_code": null,
       "note": "memoization caches are derived and can be rebuilt or reclaimed only through explicit safe plans"
     },
     "notes": [
@@ -930,7 +925,7 @@
     ]
   },
   "storage_pressure": {
-    "schema_version": 4,
+    "schema_version": 3,
     "status": "ok",
     "data_dir_exists": false,
     "probe_path": "[TEST_HOME]",
@@ -977,13 +972,10 @@
     "safe_cleanup_scope": [],
     "precious_evidence_classes": [],
     "classification_warnings": [],
-    "inventory_complete": true,
-    "inventory_scanned_entries": 0,
     "recommended_action": "No immediate storage-pressure action is needed.",
     "notes": [
       "Available space is above the doctor safety floor.",
       "Storage inventory accounted for 0 bytes: 0 derived-reclaimable bytes and 0 precious evidence bytes.",
-      "Storage inventory inspected 0 entries under the data directory.",
       "A full rebuild (cass index --full / --force-rebuild) needs 536870912 bytes free at [TEST_HOME], and the free space there covers it, so the indexer's headroom preflight would pass."
     ]
   },
@@ -3608,29 +3600,5 @@
     "doctor_execution_mode": "read-only-check",
     "fix_mode": false,
     "allow_repeated_repair": false
-  },
-  "surface": "legacy-doctor",
-  "mode": "read-only-check",
-  "outcome_kind": "no_op",
-  "asset_class": "unknown",
-  "authority_status": "refused",
-  "coverage_delta": {
-    "status": "unknown",
-    "archive_conversation_count": 0,
-    "visible_source_conversation_count": null,
-    "raw_mirror_manifest_count": 0,
-    "db_projection_only_count": 0,
-    "missing_current_source_count": 0,
-    "conversation_delta": null,
-    "message_delta": null,
-    "semantic_vector_delta": null,
-    "derived_asset_delta": null
-  },
-  "blocked_reasons": [],
-  "plan_fingerprint": null,
-  "receipt_path": null,
-  "event_log_path": null,
-  "artifact_manifest_path": null,
-  "redaction_status": "contains_sensitive_paths",
-  "contract_provenance": "runtime"
+  }
 }

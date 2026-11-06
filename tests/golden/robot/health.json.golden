@@ -77,7 +77,6 @@
     "conversations": 0,
     "messages": 0,
     "open_error": null,
-    "open_retryable": false,
     "counts_skipped": false,
     "open_skipped": false
   },
@@ -486,7 +485,6 @@
       "hnsw_present": false,
       "hnsw_state": "not_inspected",
       "hnsw_ready": false,
-      "hnsw_reason_code": null,
       "progressive_ready": false,
       "progressive_reason_code": null,
       "feature_compiled_in": true,

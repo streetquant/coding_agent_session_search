@@ -127,7 +127,7 @@ pub fn shutdown_contract_driver() -> bool { franken_sync::shutdown_driver() }
         env["OPENCLAW_STATE_DIR"] = ""
         metadata = json.loads(subprocess.check_output([
             cargo, "metadata", "--manifest-path", str(project), "--format-version", "1",
-        ], cwd=root, env=env, timeout=900))
+        ], cwd=root, env=env))
         expected = tomllib.loads((root / "Cargo.lock").read_text(encoding="utf-8"))["package"]
         expected = {(p["name"], p["version"], p.get("source")) for p in expected}
         for package in metadata["packages"]:
@@ -143,7 +143,7 @@ pub fn shutdown_contract_driver() -> bool { franken_sync::shutdown_driver() }
             [cargo, "clippy", "--locked", "--manifest-path", str(project), "--all-targets", "--", "-D", "warnings"],
         ]:
             print("+", " ".join(command), flush=True)
-            subprocess.run(command, cwd=root, env=env, check=True, timeout=1800)  # ubs:ignore[python.taint.command] Fixed Cargo argv with shell=False; env supplies toolchain configuration.
+            subprocess.run(command, cwd=root, env=env, check=True)
     if args.candidate_output is not None:
         args.candidate_output.parent.mkdir(parents=True, exist_ok=True)
         args.candidate_output.write_text(manifest, encoding="utf-8")

@@ -296,7 +296,3 @@ fuzz/fuzz/
 # index-run lock metadata sidecar (machine-local runtime state; the committed
 # fixture ships only the empty index-run.lock)
 tests/fixtures/**/index-run.lock.meta
-# Codex workspace identity marker: machine-local and owner-private (0600).
-# Codex refuses to register a workspace whose marker is group/world readable,
-# and git checks tracked files out as 0644, so this must never be committed.
-.codex-workspace-id.json

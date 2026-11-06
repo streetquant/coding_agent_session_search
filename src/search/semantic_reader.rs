@@ -17,11 +17,8 @@
 //! most O(k) candidates per active tier; this is NOT a bound on total index RSS.
 
 pub mod ann;
-mod lease;
 pub mod publication;
 pub mod text;
-
-pub use lease::{SemanticOwnerRow, SemanticOwnerRowSource};
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashSet};
@@ -387,17 +384,6 @@ impl SemanticGenerationReader {
             .shards
             .get(shard)
             .map(|owner| owner.witness())
-    }
-
-    /// Borrow rows and the complete identity of one retained immutable shard.
-    ///
-    /// A missing tier or shard is `None`. The source retains the lease's
-    /// lifetime and never reopens the artifact's publication pathname.
-    pub fn row_source(&self, tier: TierKind, shard: usize) -> Option<SemanticOwnerRowSource<'_>> {
-        self.tier(tier)?
-            .shards
-            .get(shard)
-            .map(|owner| SemanticOwnerRowSource::new(owner))
     }
 
     fn tier(&self, kind: TierKind) -> Option<&AdmittedTier> {
@@ -869,7 +855,5 @@ fn make_batch(
     }
 }
 
-#[cfg(test)]
-mod lease_tests;
 #[cfg(test)]
 mod tests;

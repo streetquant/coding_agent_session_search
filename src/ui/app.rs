@@ -4414,25 +4414,6 @@ fn string_value(value: &serde_json::Value, key: &str, fallback: &str) -> String 
         .to_string()
 }
 
-/// Project the shared ANN readiness token out of a health state snapshot.
-///
-/// The TUI reads the same bounded health envelope the JSON surfaces publish,
-/// so it repeats their vocabulary and their stable reason code instead of
-/// inventing one. An uninspected cohort keeps the "not_inspected" token: the
-/// absence of a verdict is not a verdict.
-fn ann_readiness_from_state(state: &serde_json::Value) -> (String, Option<String>) {
-    let ann_state = state
-        .pointer("/semantic/hnsw_state")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("not_inspected")
-        .to_string();
-    let ann_reason_code = state
-        .pointer("/semantic/hnsw_reason_code")
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned);
-    (ann_state, ann_reason_code)
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DoctorHudSummary {
     pub status: String,
@@ -4448,15 +4429,6 @@ pub struct DoctorHudSummary {
     pub repair_previously_failed: bool,
     pub remote_source_state: Option<String>,
     pub sole_copy_conversation_count: u64,
-    /// Shared ANN readiness token (`absent`, `present_unverified`,
-    /// `native_ready`, `rejected`).
-    ///
-    /// The TUI projects the same vocabulary the JSON and doctor surfaces use,
-    /// so the human views can never claim a readiness the machine surfaces do
-    /// not.
-    pub ann_state: String,
-    /// Stable reason code for a refused ANN cohort.
-    pub ann_reason_code: Option<String>,
 }
 
 impl DoctorHudSummary {
@@ -4496,11 +4468,6 @@ impl DoctorHudSummary {
                 .pointer("/sole_copy_conversation_count")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0),
-            // The runtime summary is a doctor-shaped envelope and carries no
-            // semantic block; the caller fills the ANN readiness from the
-            // health state it already holds.
-            ann_state: "not_inspected".to_string(),
-            ann_reason_code: None,
         })
     }
 
@@ -4520,19 +4487,6 @@ impl DoctorHudSummary {
         }
         if self.coverage_source_status == "stale" {
             return "summary stale".to_string();
-        }
-        // A refused native ANN cohort is worth naming: the exact FSVI still
-        // answers every query, but the accelerator is not serving.
-        if self.ann_state == "rejected" {
-            return match self.ann_reason_code.as_deref() {
-                // ubs:ignore[rust.perf.string-alloc-in-loop] -- An earlier '{' char literal unbalances the detector's loop extent; the footer value is rendered once per frame.
-                Some(code) => format!("ann {}", Self::token(code)),
-                // ubs:ignore[rust.perf.string-alloc-in-loop] -- An earlier '{' char literal unbalances the detector's loop extent; the footer value is rendered once per frame.
-                None => "ann rejected".to_string(),
-            };
-        }
-        if self.ann_state == "native_ready" {
-            return "ann native".to_string();
         }
         if self.sole_copy_conversation_count > 0 {
             return format!("sole-copy {}", self.sole_copy_conversation_count);
@@ -4562,7 +4516,6 @@ impl DoctorHudSummary {
         if self.archive_coverage_state == "not_checked"
             || self.coverage_source_status == "not_checked"
         {
-            // ubs:ignore[rust.perf.string-alloc-in-loop] -- An earlier '{' char literal unbalances the detector's loop extent; the footer value is rendered once per frame.
             return "check needed".to_string();
         }
         "ok".to_string()
@@ -4580,7 +4533,6 @@ impl DoctorHudSummary {
             || self.risk_level == "medium"
             || self.risk_level == "low"
             || self.fallback_mode == "lexical"
-            || self.ann_state == "rejected"
             || self.archive_coverage_state == "not_checked"
             || self.coverage_source_status == "not_checked"
             || self.remote_source_state.as_deref().is_some_and(|state| {
@@ -5611,8 +5563,6 @@ pub struct CassApp {
     pub macro_recorder: Option<MacroRecorder>,
     /// Active macro playback scheduler (when replaying a macro).
     pub macro_playback: Option<MacroPlayback>,
-    /// Input received during the bounded terminal capability query.
-    startup_input: std::collections::VecDeque<super::ftui_adapter::Event>,
     /// Whether to redact absolute paths when saving macros.
     pub macro_redact_paths: bool,
     /// Optional end-to-end latency recorder for live search measurements.
@@ -5840,7 +5790,6 @@ impl Default for CassApp {
             live_search_request: None,
             macro_recorder: None,
             macro_playback: None,
-            startup_input: std::collections::VecDeque::new(),
             macro_redact_paths: false,
             latency_trace: None,
             show_inspector: false,
@@ -6103,13 +6052,7 @@ impl CassApp {
             recommended_action: recommended_action.as_ref(),
             data_dir: &self.data_dir,
         });
-        let mut hud = DoctorHudSummary::from_runtime_summary(&summary)?;
-        // Project the shared ANN readiness token so the TUI can never claim a
-        // readiness the JSON and doctor surfaces do not report.
-        let (ann_state, ann_reason_code) = ann_readiness_from_state(&state);
-        hud.ann_state = ann_state;
-        hud.ann_reason_code = ann_reason_code;
-        Some(hud)
+        DoctorHudSummary::from_runtime_summary(&summary)
     }
 
     fn max_detail_scroll(&self) -> u32 {
@@ -6703,9 +6646,6 @@ impl CassApp {
     /// map to a single `CassMsg`; `OpenUpdateBanner` requires `self` access.
     fn palette_result_to_cmd(&mut self, result: PaletteResult) -> ftui::Cmd<CassMsg> {
         match result {
-            PaletteResult::Keymap(primary) => shortcuts::message_for_shortcut(primary)
-                .map(ftui::Cmd::msg)
-                .unwrap_or_else(ftui::Cmd::none),
             PaletteResult::ToggleTheme => ftui::Cmd::msg(CassMsg::ThemeToggled),
             PaletteResult::CycleDensity => ftui::Cmd::msg(CassMsg::DensityModeCycled),
             PaletteResult::ToggleHelpStrip => ftui::Cmd::msg(CassMsg::HelpPinToggled),
@@ -10132,7 +10072,7 @@ impl CassApp {
                 let msg_hit_rank =
                     msg_line_from_idx.and_then(|line| session_hit_rank.get(&line).copied());
                 let msg_is_current_session_hit =
-                    msg_hit_rank.is_some_and(|rank| rank == current_session_hit_rank && rank > 0); // ubs:ignore[rust.security.constant-time-compare] Public search-result ranks position a TUI highlight; no secret is compared.
+                    msg_hit_rank.is_some_and(|rank| rank == current_session_hit_rank && rank > 0);
                 let role_s = Self::role_style(&msg.role, styles);
                 let gutter_s = Self::role_gutter_style(&msg.role, styles);
                 let prefix = Self::role_prefix(&msg.role);
@@ -12826,44 +12766,236 @@ impl CassApp {
 
         add_section(
             &mut lines,
-            "Terminal keys",
+            "Updates",
             &[
-                "The first binding for each action works with legacy terminal input.".into(),
-                "Ctrl+Shift+letters, Ctrl+Enter and Ctrl+digits require enhanced input.".into(),
-                "Legacy Ctrl+Shift+C is indistinguishable from Ctrl+C: use Alt+Shift+C.".into(),
-                "Every global action is also available in the command palette.".into(),
-                "Type to search; Backspace deletes a character. Click filter chips to edit.".into(),
+                "Checks GitHub releases hourly (offline-friendly, no auto-download)".into(),
+                "When available: banner shows at top with U/N/S/Esc options".into(),
+                "  U - Start upgrade flow (press U twice to confirm)".into(),
+                "  N - Open release notes in browser (Shift+N)".into(),
+                "  S - Skip this version permanently (Shift+S)".into(),
+                "  Esc - Dismiss banner for this session".into(),
             ],
         );
-        let entries: Vec<(String, &str)> = shortcuts::KEYMAP
-            .iter()
-            .map(|entry| (entry.keys.join(" / "), entry.description))
-            .collect();
-        let rows: Vec<(&str, &str)> = entries
-            .iter()
-            .map(|(keys, description)| (keys.as_str(), *description))
-            .collect();
-        add_section_kv(&mut lines, "Keyboard reference", &rows);
-        for (title, map) in [
-            ("Detail messages", shortcuts::DETAIL_KEYMAP),
-            ("Detail Export tab", shortcuts::EXPORT_KEYMAP),
-        ] {
-            let entries: Vec<(String, &str)> = map
-                .iter()
-                .map(|entry| (entry.keys.join(" / "), entry.description))
-                .collect();
-            let rows: Vec<(&str, &str)> = entries
-                .iter()
-                .map(|(keys, description)| (keys.as_str(), *description))
-                .collect();
-            add_section_kv(&mut lines, title, &rows);
-        }
+
+        add_section(
+            &mut lines,
+            "Search",
+            &[
+                format!(
+                    "type to live-search; {} focuses query; {} cycles history",
+                    shortcuts::FOCUS_QUERY,
+                    shortcuts::HISTORY_CYCLE
+                ),
+                "Enter in query bar submits immediately; Enter on selected result opens detail modal (Messages tab)".into(),
+                "Wildcards: foo* (prefix), *foo (suffix), *foo* (contains)".into(),
+                "Auto-fuzzy: searches with few results try *term* fallback".into(),
+                format!("{} refresh index in background", shortcuts::REFRESH),
+                format!(
+                    "/ or {} detail-find in preview; n/N to jump session hits in context",
+                    shortcuts::PANE_FILTER
+                ),
+            ],
+        );
+
+        add_section(
+            &mut lines,
+            "Surfaces",
+            &[
+                format!(
+                    "{} jump directly to Analytics (global shell + metrics views)",
+                    shortcuts::SURFACE_ANALYTICS
+                ),
+                format!(
+                    "{} open Sources manager (sync, doctor, health)",
+                    shortcuts::SOURCES
+                ),
+                "Esc from Analytics/Sources returns to the previous surface".into(),
+                format!(
+                    "{} opens the command palette for all surface commands",
+                    shortcuts::PALETTE
+                ),
+            ],
+        );
+
+        add_section(
+            &mut lines,
+            "Filters",
+            &[
+                format!(
+                    "{} agent | {} workspace | {} from | {} to | {} clear all",
+                    shortcuts::FILTER_AGENT,
+                    shortcuts::FILTER_WORKSPACE,
+                    shortcuts::FILTER_DATE_FROM,
+                    shortcuts::FILTER_DATE_TO,
+                    shortcuts::CLEAR_FILTERS
+                ),
+                format!(
+                    "{} clear agent filter | {} clear all filters | {} cycle time presets (24h/7d/30d/all)",
+                    shortcuts::SCOPE_AGENT,
+                    shortcuts::SCOPE_WORKSPACE,
+                    shortcuts::CYCLE_TIME_PRESETS
+                ),
+                "Chips in search bar; Backspace removes last; Enter (query empty) edits last chip"
+                    .into(),
+            ],
+        );
+
+        add_section(
+            &mut lines,
+            "Sources (Multi-Machine)",
+            &[
+                "F11 cycle source filter: all → local → remote → all".into(),
+                "Shift+F11 opens source filter menu (select specific sources)".into(),
+                "Remote sessions show [source-name] in results list".into(),
+                "Setup: cass sources setup (interactive wizard with SSH discovery)".into(),
+                "Sync: rsync over SSH (delta transfers, additive-only for safety)".into(),
+            ],
+        );
+
+        add_section(
+            &mut lines,
+            "Modes",
+            &[
+                format!(
+                    "{} search mode: Hybrid → Lexical → Semantic",
+                    shortcuts::SEARCH_MODE
+                ),
+                format!(
+                    "{} match mode: standard (default) ⇄ prefix",
+                    shortcuts::MATCH_MODE
+                ),
+                format!(
+                    "{} ranking: recent → balanced → relevance → match-quality → date-newest → date-oldest",
+                    shortcuts::RANKING
+                ),
+                format!(
+                    "{} grouping: agent → conversation → workspace → flat (one list)",
+                    shortcuts::GROUPING
+                ),
+                format!(
+                    "{}/{} cycle 18 themes (Tokyo Night → Daylight → Catppuccin → … → High Contrast) | {} toggle border style",
+                    shortcuts::THEME,
+                    shortcuts::THEME_PREV,
+                    shortcuts::BORDERS
+                ),
+            ],
+        );
+
+        add_section(
+            &mut lines,
+            "Context",
+            &[
+                format!(
+                    "{} cycles S/M/L/XL context window",
+                    shortcuts::CONTEXT_WINDOW
+                ),
+                "Ctrl+Space: peek XL for current hit, tap again to restore".into(),
+            ],
+        );
+
+        add_section_kv(
+            &mut lines,
+            "Navigation",
+            &[
+                ("Tab", "Focus results/detail"),
+                ("Alt+h/j/k/l", "Directional navigation"),
+                ("\u{2191}/\u{2193}", "Move selection"),
+                ("Home/End", "Move query caret to start/end"),
+                ("Ctrl+\u{2190}/\u{2192}", "Jump by word in query"),
+                ("Del", "Delete forward in query"),
+                ("Ctrl+W", "Delete word backward in query"),
+                ("Ctrl+U", "Kill line left of cursor"),
+                ("Ctrl+K", "Kill line right of cursor"),
+                ("Ctrl+L", "Clear entire query"),
+                ("Ctrl+Z", "Undo last query edit"),
+                ("Ctrl+Shift+Z", "Redo"),
+                ("Ctrl+R / Ctrl+N", "History forward (newer)"),
+                ("Ctrl+Shift+N", "History backward (older)"),
+                ("Alt+1..9", "Jump to pane index"),
+                (
+                    "Enter",
+                    "Open detail (Messages tab default; if no selected hit, submit query)",
+                ),
+                ("Esc", "Close/back"),
+                (
+                    "Tab (in detail)",
+                    "Cycle detail tabs (Messages/Snippets/Raw/Json/Analytics/Export)",
+                ),
+                ("{ / }", "Jump messages"),
+                ("[ / ]", "Jump user messages"),
+                ("Ctrl+Enter", "Queue item; Ctrl+O open all queued"),
+            ],
+        );
+
+        add_section(
+            &mut lines,
+            "Actions",
+            &[
+                format!(
+                    "{} opens detail modal (o=open, c=copy, p=path, s=snip, n=nano, Esc=close)",
+                    shortcuts::DETAIL_OPEN
+                ),
+                format!(
+                    "{} open hit in $EDITOR; {} copy snippet | {} copy path | {} copy content",
+                    shortcuts::EDITOR,
+                    shortcuts::COPY,
+                    shortcuts::COPY_PATH,
+                    shortcuts::COPY_CONTENT
+                ),
+                format!(
+                    "{} bookmark the selected hit (`cass bookmarks list` shows them)",
+                    shortcuts::BOOKMARK
+                ),
+                format!(
+                    "{} toggle aggregate results stats bar",
+                    shortcuts::STATS_BAR
+                ),
+                format!(
+                    "{} detail-find within messages; n/N cycle session hits",
+                    shortcuts::PANE_FILTER
+                ),
+                format!(
+                    "{} HTML export modal | {} quick Markdown export",
+                    shortcuts::EXPORT_HTML,
+                    shortcuts::EXPORT_MARKDOWN
+                ),
+                format!(
+                    "{}/Alt+? toggle this help; {} quit (or back from detail)",
+                    shortcuts::HELP,
+                    shortcuts::QUIT
+                ),
+            ],
+        );
+
+        add_section_kv(
+            &mut lines,
+            "Density & Display",
+            &[
+                ("Alt+= / Alt+-", "Increase/decrease pane items"),
+                ("Alt+D", "Toggle detail preview pane"),
+                ("Ctrl+D", "Cycle density mode (compact/cozy/spacious)"),
+                ("F2 / Alt+T", "Next/prev theme"),
+                ("Ctrl+B", "Toggle border style"),
+            ],
+        );
+
+        add_section(
+            &mut lines,
+            "States",
+            &[
+                "UI state persists in tui_state.json (data dir).".into(),
+                format!(
+                    "{} reset UI state or launch with `cass tui --reset-state`",
+                    shortcuts::RESET_STATE
+                ),
+            ],
+        );
 
         // Pinned indicator
         if self.help_pinned {
             lines.push(ftui::text::Line::from_spans(vec![
                 ftui::text::Span::styled("  [PINNED] ", key_style),
-                ftui::text::Span::styled("Palette: Toggle help strip", key_style.bold()),
+                ftui::text::Span::styled("P", key_style.bold()),
                 ftui::text::Span::styled("=unpin  ", muted_style),
                 ftui::text::Span::styled("\u{2191}/\u{2193}", key_style),
                 ftui::text::Span::styled("=scroll  ", muted_style),
@@ -12872,7 +13004,7 @@ impl CassApp {
             ]));
         } else {
             lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("  Palette: Toggle help strip", key_style),
+                ftui::text::Span::styled("  P", key_style),
                 ftui::text::Span::styled("=pin  ", muted_style),
                 ftui::text::Span::styled("\u{2191}/\u{2193}", key_style),
                 ftui::text::Span::styled("=scroll  ", muted_style),
@@ -13296,7 +13428,7 @@ impl CassApp {
 
         // Output directory.
         if y < inner.y + inner.height {
-            let focused = state.focused == ExportField::OutputDir; // ubs:ignore[rust.security.constant-time-compare] ExportField is a public TUI focus enum, not a credential.
+            let focused = state.focused == ExportField::OutputDir;
             let editing = state.output_dir_editing;
             let display_path = if editing {
                 state.output_dir_buffer.as_str()
@@ -13343,7 +13475,7 @@ impl CassApp {
                 break;
             }
             let mark = if checked { "[x]" } else { "[ ]" };
-            let focused = state.focused == field; // ubs:ignore[rust.security.constant-time-compare] These ExportField values select public TUI controls, not secret contents.
+            let focused = state.focused == field;
             let row_style = if focused { accent_style } else { text_style };
             let line = format!(" {mark} {label}");
             Paragraph::new(line)
@@ -13354,7 +13486,7 @@ impl CassApp {
 
         // Password row (only if encrypt is enabled).
         if state.encrypt && y < inner.y + inner.height {
-            let focused = state.focused == ExportField::Password; // ubs:ignore[rust.security.constant-time-compare] This selects the password input field; it does not compare the password.
+            let focused = state.focused == ExportField::Password;
             let display = if state.password_visible {
                 state.password.clone()
             } else {
@@ -13377,7 +13509,7 @@ impl CassApp {
         // Show timestamps checkbox.
         if y < inner.y + inner.height {
             let mark = if state.show_timestamps { "[x]" } else { "[ ]" };
-            let focused = state.focused == ExportField::ShowTimestamps; // ubs:ignore[rust.security.constant-time-compare] ExportField is a public TUI focus enum, not a credential.
+            let focused = state.focused == ExportField::ShowTimestamps;
             let row_style = if focused { accent_style } else { text_style };
             let line = format!(" {mark} Show timestamps");
             Paragraph::new(line)
@@ -13456,7 +13588,6 @@ impl CassApp {
         if footer_y > y {
             let can_export = state.can_export();
             let export_label = if can_export && state.focused == ExportField::ExportButton {
-                // ubs:ignore[rust.security.constant-time-compare] This public focus enum selects the button label, not an authentication secret.
                 " [EXPORT] "
             } else if can_export {
                 " Enter=Export "
@@ -13464,7 +13595,6 @@ impl CassApp {
                 " (set password) "
             };
             let btn_style = if can_export && state.focused == ExportField::ExportButton {
-                // ubs:ignore[rust.security.constant-time-compare] This public focus enum selects TUI styling, not an authentication secret.
                 selected_style
             } else if can_export {
                 accent_style
@@ -14214,7 +14344,7 @@ pub enum CassMsg {
     // -- Keyboard / input -------------------------------------------------
     /// Raw terminal event (key, mouse, resize, paste, tick).
     /// The update() function converts this into more specific messages.
-    TerminalEvent(super::ftui_adapter::Event),
+    TerminalEvent(TerminalEventPayload),
 
     // -- Query & search ---------------------------------------------------
     /// User typed or edited the query string.
@@ -14761,6 +14891,13 @@ enum MouseHitRegion {
     Suggestion { idx: usize },
     /// Click/scroll landed outside any tracked region.
     None,
+}
+
+/// Wrapper for terminal events that will be converted to specific messages.
+#[derive(Debug)]
+pub struct TerminalEventPayload {
+    /// Opaque event data (will be ftui::Event in the runtime).
+    _private: (),
 }
 
 // =========================================================================
@@ -15872,15 +16009,261 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                     return CassMsg::Tick;
                 }
 
-                shortcuts::message_for_key(&key).unwrap_or_else(|| match key.code {
-                    KeyCode::Char(c)
-                        if !key.modifiers.intersects(Modifiers::CTRL | Modifiers::ALT) =>
-                    {
-                        CassMsg::QueryChanged(c.to_string())
+                let ctrl = key.modifiers.contains(Modifiers::CTRL);
+                let alt = key.modifiers.contains(Modifiers::ALT);
+                let shift = key.modifiers.contains(Modifiers::SHIFT);
+
+                match key.code {
+                    // -- Copy content (before force quit) -------------------------
+                    // Ctrl+Shift+C must be matched before the Ctrl+C arm: with
+                    // the quit arm first, the documented "copy content" chord
+                    // quit the TUI on every terminal that reports Shift
+                    // (2l1b0.54). Terminals that report the shifted letter
+                    // send 'C'.
+                    KeyCode::Char('c') if ctrl && shift => CassMsg::CopyContent,
+                    KeyCode::Char('C') if ctrl => CassMsg::CopyContent,
+
+                    // -- Force quit -----------------------------------------------
+                    KeyCode::Char('c') if ctrl => CassMsg::ForceQuit,
+
+                    // -- Escape / quit --------------------------------------------
+                    KeyCode::Escape => CassMsg::QuitRequested,
+                    KeyCode::F(10) => CassMsg::QuitRequested,
+
+                    // -- Help -----------------------------------------------------
+                    KeyCode::F(1) => CassMsg::HelpToggled,
+                    KeyCode::Char('?') if alt => CassMsg::HelpToggled,
+
+                    // -- Theme ----------------------------------------------------
+                    KeyCode::F(2) if shift => CassMsg::ThemePreviousToggled,
+                    KeyCode::Char('t') if alt && shift => CassMsg::ThemePreviousToggled,
+                    KeyCode::Char('T') if alt && shift => CassMsg::ThemePreviousToggled,
+                    KeyCode::F(2) => CassMsg::ThemeToggled,
+                    KeyCode::Char('t') if alt && !shift => CassMsg::ThemeToggled,
+                    KeyCode::Char('T') if alt && !shift => CassMsg::ThemeToggled,
+
+                    // -- Filters --------------------------------------------------
+                    KeyCode::F(3) if shift => CassMsg::FilterAgentSet(HashSet::new()),
+                    KeyCode::Char('g') if alt && shift => CassMsg::FilterAgentSet(HashSet::new()),
+                    KeyCode::Char('G') if alt && shift => CassMsg::FilterAgentSet(HashSet::new()),
+                    KeyCode::F(3) => CassMsg::InputModeEntered(InputMode::Agent),
+                    KeyCode::Char('g') if alt && !shift => {
+                        CassMsg::InputModeEntered(InputMode::Agent)
                     }
+                    KeyCode::Char('G') if alt && !shift => {
+                        CassMsg::InputModeEntered(InputMode::Agent)
+                    }
+
+                    KeyCode::F(4) if shift => CassMsg::FiltersClearAll,
+                    KeyCode::Char('w') if alt && shift => CassMsg::FiltersClearAll,
+                    KeyCode::Char('W') if alt && shift => CassMsg::FiltersClearAll,
+                    KeyCode::F(4) => CassMsg::InputModeEntered(InputMode::Workspace),
+                    KeyCode::Char('w') if alt && !shift => {
+                        CassMsg::InputModeEntered(InputMode::Workspace)
+                    }
+                    KeyCode::Char('W') if alt && !shift => {
+                        CassMsg::InputModeEntered(InputMode::Workspace)
+                    }
+
+                    KeyCode::F(5) if shift => CassMsg::TimePresetCycled,
+                    KeyCode::F(5) => CassMsg::InputModeEntered(InputMode::CreatedFrom),
+                    KeyCode::F(6) => CassMsg::InputModeEntered(InputMode::CreatedTo),
+
+                    // -- Context window -------------------------------------------
+                    KeyCode::F(7) => CassMsg::ContextWindowCycled,
+                    KeyCode::Char('c') if alt => CassMsg::ContextWindowCycled,
+                    KeyCode::Char('C') if alt => CassMsg::ContextWindowCycled,
+
+                    // -- Editor ---------------------------------------------------
+                    KeyCode::F(8) => CassMsg::OpenInEditor,
+                    KeyCode::Char('o') if alt => CassMsg::OpenInEditor,
+                    KeyCode::Char('O') if alt => CassMsg::OpenInEditor,
+
+                    // -- Match mode -----------------------------------------------
+                    KeyCode::F(9) => CassMsg::MatchModeCycled,
+
+                    // -- Source filter ---------------------------------------------
+                    KeyCode::F(11) if shift => CassMsg::SourceFilterMenuToggled,
+                    KeyCode::F(11) => CassMsg::SourceFilterCycled,
+
+                    // -- Ranking --------------------------------------------------
+                    KeyCode::F(12) => CassMsg::RankingModeCycled,
+                    KeyCode::Char('r') if alt => CassMsg::RankingModeCycled,
+                    KeyCode::Char('R') if alt => CassMsg::RankingModeCycled,
+
+                    // -- Search mode (Alt+S) --------------------------------------
+                    KeyCode::Char('s') if ctrl && !shift => CassMsg::StatsBarToggled,
+                    KeyCode::Char('S') if ctrl && !shift => CassMsg::StatsBarToggled,
+                    KeyCode::Char('s') if alt => CassMsg::SearchModeCycled,
+                    KeyCode::Char('S') if alt => CassMsg::SearchModeCycled,
+
+                    // -- Surface switch -------------------------------------------
+                    KeyCode::Char('a') if alt => CassMsg::AnalyticsEntered,
+                    KeyCode::Char('A') if alt => CassMsg::AnalyticsEntered,
+
+                    // -- Macro recording (Alt+M) ----------------------------------
+                    KeyCode::Char('m') if alt => CassMsg::MacroRecordingToggled,
+
+                    // -- Command palette ------------------------------------------
+                    KeyCode::Char('p') if ctrl => CassMsg::PaletteOpened,
+                    KeyCode::Char('p') if alt => CassMsg::PaletteOpened,
+
+                    // -- Result/action shortcuts (Alt+...) ------------------------
+                    // Keep printable characters available for query editing.
+                    KeyCode::Char('/') if alt => CassMsg::PaneFilterOpened,
+                    KeyCode::Char('y') if alt => CassMsg::CopySnippet,
+                    KeyCode::Char('o') if alt => CassMsg::OpenInEditor,
+                    KeyCode::Char('v') if alt => CassMsg::ViewRaw,
+                    KeyCode::Char('J') if alt => CassMsg::ToggleJsonView,
+                    KeyCode::Char('r') if alt => CassMsg::ResultsRefreshed,
+                    KeyCode::Char('b') if alt => CassMsg::BulkActionsOpened,
+                    KeyCode::Char('e') | KeyCode::Char('E') if alt && !ctrl => {
+                        CassMsg::BookmarkSelectedHit
+                    }
+                    KeyCode::Char('f') | KeyCode::Char('F') if alt && !ctrl => {
+                        CassMsg::GroupingCycled
+                    }
+                    KeyCode::Char('[') if alt => CassMsg::TimelineJumped { forward: false },
+                    KeyCode::Char(']') if alt => CassMsg::TimelineJumped { forward: true },
+
+                    // -- History ---------------------------------------------------
+                    KeyCode::Char('r') if ctrl && shift => CassMsg::IndexRefreshRequested,
+                    KeyCode::Char('r') if ctrl => CassMsg::HistoryCycled,
+                    KeyCode::Char('n') if ctrl && shift => {
+                        CassMsg::HistoryNavigated { forward: false }
+                    }
+                    KeyCode::Char('N') if ctrl => CassMsg::HistoryNavigated { forward: false },
+                    KeyCode::Char('n') if ctrl => CassMsg::HistoryNavigated { forward: true },
+
+                    // -- Saved views (Ctrl+1..9 save, Shift+1..9 load) -----------
+                    KeyCode::Char(c @ '1'..='9') if ctrl => CassMsg::ViewSaved(c as u8 - b'0'),
+                    KeyCode::Char(c @ '1'..='9') if shift => CassMsg::ViewLoaded(c as u8 - b'0'),
+
+                    // -- Clear / reset --------------------------------------------
+                    KeyCode::Delete if ctrl && shift => CassMsg::StateResetRequested,
+                    KeyCode::Delete if ctrl => CassMsg::FiltersClearAll,
+
+                    // -- Update banner --------------------------------------------
+                    KeyCode::Char('u') | KeyCode::Char('U') if alt => {
+                        CassMsg::UpdateUpgradeRequested
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') if alt => {
+                        CassMsg::UpdateReleaseNotesRequested
+                    }
+                    KeyCode::Char('i') | KeyCode::Char('I') if alt => CassMsg::UpdateSkipped,
+
+                    // -- Swarm operations -----------------------------------------
+                    // No direct key: `Alt+W` is the documented workspace-filter
+                    // palette (matched above), so an `Alt+W => SwarmEntered` arm
+                    // here was unreachable dead code (reality check 2026-09-01,
+                    // WS-D.4). The swarm cockpit is entered through the surface
+                    // switch (`AppSurface::Swarm`).
+
+                    // -- Sources management -----------------------------------------
+                    KeyCode::Char('s') if ctrl && shift => CassMsg::SourcesEntered,
+                    KeyCode::Char('S') if ctrl && shift => CassMsg::SourcesEntered,
+
+                    // -- Inspector overlay -----------------------------------------
+                    KeyCode::Char('i') if ctrl && shift => CassMsg::InspectorToggled,
+                    KeyCode::Char('I') if ctrl => CassMsg::InspectorToggled,
+
+                    // -- Borders --------------------------------------------------
+                    KeyCode::Char('b') if ctrl => CassMsg::BordersToggled,
+
+                    // -- Undo/redo ------------------------------------------------
+                    KeyCode::Char('z') if ctrl && shift => CassMsg::Redo,
+                    KeyCode::Char('Z') if ctrl => CassMsg::Redo,
+                    KeyCode::Char('z') if ctrl => CassMsg::Undo,
+
+                    // -- Line editing ---------------------------------------------
+                    KeyCode::Char('l') if ctrl => CassMsg::QueryCleared,
+                    KeyCode::Char('u') if ctrl => CassMsg::QueryLineKilled,
+                    KeyCode::Char('k') if ctrl => CassMsg::QueryForwardKilled,
+                    KeyCode::Char('w') if ctrl => CassMsg::QueryWordDeleted,
+                    KeyCode::Char('f') if ctrl => CassMsg::WildcardFallbackToggled,
+
+                    // -- Density --------------------------------------------------
+                    KeyCode::Char('d') if ctrl => CassMsg::DensityModeCycled,
+
+                    // -- Multi-select ---------------------------------------------
+                    KeyCode::Char('x') if ctrl => CassMsg::SelectionToggled,
+                    KeyCode::Char('a') if ctrl => CassMsg::SelectAllToggled,
+                    // Compatibility path: many terminals encode Enter as Ctrl+M / Ctrl+J.
+                    KeyCode::Char('m') if ctrl && !alt && !shift => CassMsg::DetailOpened,
+                    KeyCode::Char('j') if ctrl && !alt && !shift => CassMsg::DetailOpened,
+                    KeyCode::Enter if ctrl => CassMsg::ItemEnqueued,
+                    KeyCode::Char('o') if ctrl => CassMsg::OpenAllQueued,
+
+                    // -- Quick export ---------------------------------------------
+                    KeyCode::Char('e') if ctrl && shift => CassMsg::ExportMarkdownExecuted,
+                    KeyCode::Char('E') if ctrl && shift => CassMsg::ExportMarkdownExecuted,
+                    KeyCode::Char('e') if ctrl => CassMsg::ExportModalOpened,
+
+                    // -- Clipboard ------------------------------------------------
+                    KeyCode::Char('Y') if ctrl => CassMsg::CopyQuery,
+                    KeyCode::Char('y') if ctrl && shift => CassMsg::CopyQuery,
+                    KeyCode::Char('y') if ctrl => CassMsg::CopyPath,
+                    // Ctrl+Shift+C (CopyContent) is matched above the Ctrl+C
+                    // force-quit arm.
+
+                    // -- Peek XL --------------------------------------------------
+                    KeyCode::Char(' ') if ctrl => CassMsg::PeekToggled,
+
+                    // -- Navigation -----------------------------------------------
+                    KeyCode::BackTab => CassMsg::FocusDirectional {
+                        direction: FocusDirection::Left,
+                    },
+                    KeyCode::Tab if shift => CassMsg::FocusDirectional {
+                        direction: FocusDirection::Left,
+                    },
+                    KeyCode::Tab => CassMsg::FocusToggled,
+                    KeyCode::Up | KeyCode::Char('k') if alt => CassMsg::FocusDirectional {
+                        direction: FocusDirection::Up,
+                    },
+                    KeyCode::Down | KeyCode::Char('j') if alt => CassMsg::FocusDirectional {
+                        direction: FocusDirection::Down,
+                    },
+                    KeyCode::Left | KeyCode::Char('h') if alt => CassMsg::FocusDirectional {
+                        direction: FocusDirection::Left,
+                    },
+                    KeyCode::Right | KeyCode::Char('l') if alt => CassMsg::FocusDirectional {
+                        direction: FocusDirection::Right,
+                    },
+                    // -- Cursor movement (query editing) --------------------------
+                    KeyCode::Left if ctrl => CassMsg::CursorWordMoved { forward: false },
+                    KeyCode::Right if ctrl => CassMsg::CursorWordMoved { forward: true },
+                    KeyCode::Left => CassMsg::CursorMoved { delta: -1 },
+                    KeyCode::Right => CassMsg::CursorMoved { delta: 1 },
+                    KeyCode::Delete => CassMsg::DeleteForward,
+
+                    KeyCode::Up => CassMsg::SelectionMoved { delta: -1 },
+                    KeyCode::Down => CassMsg::SelectionMoved { delta: 1 },
+                    KeyCode::Home => CassMsg::CursorJumped { to_end: false },
+                    KeyCode::End => CassMsg::CursorJumped { to_end: true },
+                    KeyCode::PageUp => CassMsg::PageScrolled { delta: -1 },
+                    KeyCode::PageDown => CassMsg::PageScrolled { delta: 1 },
+                    KeyCode::Enter => CassMsg::DetailOpened,
+
+                    // -- Pane sizing (Alt+=, Alt+-) -------------------------------
+                    KeyCode::Char('-') if alt => CassMsg::PaneShrunk,
+                    KeyCode::Char('=') if alt => CassMsg::PaneGrew,
+                    KeyCode::Char('+') if alt => CassMsg::PaneGrew,
+
+                    // -- Detail pane toggle (Alt+D) -------------------------------
+                    KeyCode::Char('d') if alt => CassMsg::DetailPaneToggled,
+                    KeyCode::Char('D') if alt => CassMsg::DetailPaneToggled,
+
+                    // -- Alt+digit pane switch ------------------------------------
+                    KeyCode::Char(c @ '1'..='9') if alt => CassMsg::ActivePaneChanged {
+                        index: (c as u8 - b'1') as usize,
+                    },
+
+                    // -- Default: treat as query input ----------------------------
+                    KeyCode::Char(c) => CassMsg::QueryChanged(c.to_string()),
                     KeyCode::Backspace => CassMsg::QueryChanged(String::new()),
-                    _ => CassMsg::Tick,
-                })
+
+                    _ => CassMsg::Tick, // Unhandled keys become no-op ticks
+                }
             }
 
             Event::Mouse(mouse) => {
@@ -16001,23 +16384,7 @@ impl super::ftui_adapter::Model for CassApp {
     }
 
     fn update(&mut self, msg: CassMsg) -> ftui::Cmd<CassMsg> {
-        let msg = match msg {
-            CassMsg::TerminalEvent(event) => CassMsg::from(event),
-            message => message,
-        };
         let raw_event = take_raw_event();
-        if !self.startup_input.is_empty() {
-            let mut commands: Vec<_> = self
-                .startup_input
-                .drain(..)
-                .map(|event| ftui::Cmd::msg(CassMsg::TerminalEvent(event)))
-                .collect();
-            commands.push(ftui::Cmd::msg(match raw_event {
-                Some(event) => CassMsg::TerminalEvent(event),
-                None => msg,
-            }));
-            return ftui::Cmd::Sequence(commands);
-        }
 
         // Record raw event for model-level macro recording.
         if let Some(ref mut recorder) = self.macro_recorder
@@ -16080,7 +16447,6 @@ impl super::ftui_adapter::Model for CassApp {
                     if text.is_empty() {
                         // Backspace
                         if state.focused == ExportField::Password {
-                            // ubs:ignore[rust.security.constant-time-compare] Public focus enum routes key input; password contents are not compared.
                             state.password_pop();
                         } else if state.focused == ExportField::OutputDir
                             && state.output_dir_editing
@@ -16090,7 +16456,6 @@ impl super::ftui_adapter::Model for CassApp {
                     } else {
                         for c in text.chars() {
                             if state.focused == ExportField::Password {
-                                // ubs:ignore[rust.security.constant-time-compare] Public focus enum routes key input; password contents are not compared.
                                 state.password_push(c);
                             } else if state.focused == ExportField::OutputDir
                                 && state.output_dir_editing
@@ -16121,10 +16486,8 @@ impl super::ftui_adapter::Model for CassApp {
                     // Note: Enter maps to DetailOpened in the key dispatch;
                     // QuerySubmitted is also handled for programmatic sends.
                     if state.focused == ExportField::OutputDir && state.output_dir_editing {
-                        // ubs:ignore[rust.security.constant-time-compare] Public focus enum and edit flag route Enter; no secret is compared.
                         state.toggle_current();
                     } else if state.focused == ExportField::Password {
-                        // ubs:ignore[rust.security.constant-time-compare] Public focus enum routes Enter; password contents are not compared.
                         // Enter in password field = move to next.
                         state.next_field();
                     } else if state.can_export() {
@@ -16413,27 +16776,16 @@ impl super::ftui_adapter::Model for CassApp {
                 }
             } else {
                 // Find bar is NOT active — handle detail-level navigation
-                if let CassMsg::QueryChanged(text) = &msg {
-                    let mut chars = text.chars();
-                    if let Some(c) = chars.next()
-                        && chars.next().is_none()
-                    {
-                        let fallback_key = ftui::KeyEvent::new(ftui::KeyCode::Char(c));
-                        if let Some(message) = shortcuts::message_for_detail(
-                            match raw_event.as_ref() {
-                                Some(ftui::Event::Key(key)) => key,
-                                _ => &fallback_key,
-                            },
-                            self.detail_tab == DetailTab::Export,
-                        ) {
-                            return self.update(message);
-                        }
-                    }
-                }
                 match &msg {
                     // Slash or Ctrl+F starts a fresh local find, even if the
                     // modal was opened with seeded search-highlight terms.
                     CassMsg::PaneFilterOpened | CassMsg::WildcardFallbackToggled => {
+                        self.detail_find = Some(DetailFindState::default());
+                        self.detail_find_matches_cache.borrow_mut().clear();
+                        self.input_mode = InputMode::DetailFind;
+                        return ftui::Cmd::none();
+                    }
+                    CassMsg::QueryChanged(text) if text == "/" => {
                         self.detail_find = Some(DetailFindState::default());
                         self.detail_find_matches_cache.borrow_mut().clear();
                         self.input_mode = InputMode::DetailFind;
@@ -16450,6 +16802,83 @@ impl super::ftui_adapter::Model for CassApp {
                         if self.detail_tab == DetailTab::Export {
                             return self.update(CassMsg::ExportModalOpened);
                         }
+                        return ftui::Cmd::none();
+                    }
+                    // j/k scroll the detail view
+                    CassMsg::QueryChanged(text) if text == "j" => {
+                        return self.update(CassMsg::DetailScrolled { delta: 3 });
+                    }
+                    CassMsg::QueryChanged(text) if text == "k" => {
+                        return self.update(CassMsg::DetailScrolled { delta: -3 });
+                    }
+                    // n/N navigate contextual search hits for this session.
+                    CassMsg::QueryChanged(text) if text == "n" => {
+                        return self.update(CassMsg::DetailSessionHitNavigated { forward: true });
+                    }
+                    CassMsg::QueryChanged(text) if text == "N" => {
+                        return self.update(CassMsg::DetailSessionHitNavigated { forward: false });
+                    }
+                    // w toggles wrap
+                    CassMsg::QueryChanged(text) if text == "w" => {
+                        return self.update(CassMsg::DetailWrapToggled);
+                    }
+                    // e expands all tool/system messages
+                    CassMsg::QueryChanged(text) if text == "e" => {
+                        if self.detail_tab == DetailTab::Export {
+                            return self.update(CassMsg::ExportModalOpened);
+                        }
+                        return self.update(CassMsg::ToolExpandAll);
+                    }
+                    CassMsg::QueryChanged(text)
+                        if self.detail_tab == DetailTab::Export && (text == "h" || text == "H") =>
+                    {
+                        return self.update(CassMsg::ExportModalOpened);
+                    }
+                    CassMsg::QueryChanged(text)
+                        if self.detail_tab == DetailTab::Export && (text == "m" || text == "M") =>
+                    {
+                        return self.update(CassMsg::ExportMarkdownExecuted);
+                    }
+                    // c collapses all tool/system messages
+                    CassMsg::QueryChanged(text) if text == "c" => {
+                        return self.update(CassMsg::ToolCollapseAll);
+                    }
+                    // { / } jump between messages
+                    CassMsg::QueryChanged(text) if text == "{" => {
+                        return self.update(CassMsg::DetailMessageJumped {
+                            forward: false,
+                            user_only: false,
+                        });
+                    }
+                    CassMsg::QueryChanged(text) if text == "}" => {
+                        return self.update(CassMsg::DetailMessageJumped {
+                            forward: true,
+                            user_only: false,
+                        });
+                    }
+                    // [ / ] jump between user messages only
+                    CassMsg::QueryChanged(text) if text == "[" => {
+                        return self.update(CassMsg::DetailMessageJumped {
+                            forward: false,
+                            user_only: true,
+                        });
+                    }
+                    CassMsg::QueryChanged(text) if text == "]" => {
+                        return self.update(CassMsg::DetailMessageJumped {
+                            forward: true,
+                            user_only: true,
+                        });
+                    }
+                    // g / G for top / bottom (vim-style)
+                    CassMsg::QueryChanged(text) if text == "g" => {
+                        self.detail_scroll = 0;
+                        return ftui::Cmd::none();
+                    }
+                    CassMsg::QueryChanged(text) if text == "G" => {
+                        self.detail_scroll = self
+                            .detail_content_lines
+                            .get()
+                            .saturating_sub(self.detail_visible_height.get());
                         return ftui::Cmd::none();
                     }
                     // Up/Down scroll detail
@@ -16864,7 +17293,7 @@ impl super::ftui_adapter::Model for CassApp {
 
         match msg {
             // -- Terminal event passthrough (unused, events come as CassMsg) ---
-            CassMsg::TerminalEvent(event) => self.update(CassMsg::from(event)),
+            CassMsg::TerminalEvent(_) => ftui::Cmd::none(),
 
             // -- Query & search -----------------------------------------------
             CassMsg::QueryChanged(text) => {
@@ -18180,7 +18609,7 @@ impl super::ftui_adapter::Model for CassApp {
                 if let Some(key) = self.active_hit_key() {
                     self.selected.insert(key);
                     self.status = format!(
-                        "Queued ({}) · Alt+Enter add · Ctrl+O open all",
+                        "Queued ({}) · Ctrl+Enter add · Ctrl+O open all",
                         self.selected.len()
                     );
                 }
@@ -18263,10 +18692,7 @@ impl super::ftui_adapter::Model for CassApp {
                                     "origin_kind": h.origin_kind,
                                     "origin_host": h.origin_host,
                                     "source_path": h.source_path,
-                                    "conversation_id": h.conversation_id,
                                     "line_number": h.line_number,
-                                    "message_ordinal": h.line_number,
-                                    "message_anchor": h.message_anchor,
                                     "created_at": h.created_at,
                                     "content_hash": h.content_hash,
                                     "title": h.title,
@@ -18459,7 +18885,7 @@ impl super::ftui_adapter::Model for CassApp {
             }
             CassMsg::OpenAllQueued => {
                 if self.selected.is_empty() {
-                    self.status = "No items queued. Alt+Enter to queue items.".to_string();
+                    self.status = "No items queued. Ctrl+Enter to queue items.".to_string();
                     self.open_confirm_armed = false;
                     return ftui::Cmd::none();
                 }
@@ -23306,49 +23732,6 @@ pub fn run_tui_ftui(
     config.resize_coalescer = coalescer;
     config.evidence_sink = evidence_sink;
 
-    // Query the actual terminal before enabling enhanced input. Mux stacks keep
-    // the legacy keymap; an ignored query times out without enabling a mode.
-    let keyboard_setting = dotenvy::var("CASS_TUI_KITTY_KEYBOARD").ok();
-    let capabilities = ftui::core::terminal_capabilities::TerminalCapabilities::with_overrides();
-    let query_keyboard = shortcuts::keyboard_query_enabled(
-        keyboard_setting.as_deref(),
-        headless,
-        capabilities.in_any_mux(),
-    )
-    .map_err(anyhow::Error::msg)?;
-    let mut keyboard_probe = shortcuts::KeyboardProbe::default();
-    #[cfg(unix)]
-    if query_keyboard {
-        use std::io::IsTerminal;
-        use std::os::unix::fs::OpenOptionsExt;
-        if std::io::stdin().is_terminal()
-            && std::io::stdout().is_terminal()
-            && let Ok(mut tty) = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open("/dev/tty")
-            && let Ok(_raw_mode) = ftui::core::terminal_session::TerminalSession::minimal()
-        {
-            keyboard_probe =
-                shortcuts::query_keyboard_protocol(&mut tty, Duration::from_millis(80));
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = query_keyboard;
-    config.kitty_keyboard = keyboard_probe.supported;
-    #[cfg(unix)]
-    let enhanced_keyboard = keyboard_probe.supported;
-    let _keyboard_override =
-        push_override(CapabilityOverride::new().kitty_keyboard(Some(keyboard_probe.supported)));
-    let mut startup_parser = ftui::core::input_parser::InputParser::new();
-    model
-        .startup_input
-        .extend(startup_parser.parse(&keyboard_probe.pending));
-    if let Some(event) = startup_parser.timeout() {
-        model.startup_input.push_back(event);
-    }
-
     // Load macro playback data into model before program creation.
     if let Some(ref play_path) = macro_config.play_path {
         let macro_data = macro_file::load_macro(play_path)?;
@@ -23371,15 +23754,6 @@ pub fn run_tui_ftui(
         {
             let mut program = ftui::Program::with_native_backend(model, config)
                 .map_err(|e| anyhow::anyhow!("ftui program creation error: {e}"))?;
-            if enhanced_keyboard {
-                use std::io::Write;
-                // Retain disambiguation + release events (flags 1|2), while
-                // ordinary text remains terminal-decoded Unicode. ftui 0.5's
-                // CSI-u decoder discards alternate/shifted text codepoints.
-                let mut terminal = std::io::stdout();
-                terminal.write_all(b"\x1b[=3u")?;
-                terminal.flush()?;
-            }
             if macro_config.record_path.is_some() {
                 program.start_recording("cass-session");
             }
@@ -23493,7 +23867,6 @@ mod macro_file {
                         .get("name")
                         .and_then(|n| n.as_str())
                         .unwrap_or("loaded")
-                        // ubs:ignore[rust.perf.string-alloc-in-loop] -- The name is replaced only by a header event, so the owned string is allocated once per transcript.
                         .to_string();
                     if let (Some(w), Some(h)) = (
                         v.get("terminal_size")
@@ -24426,26 +24799,6 @@ mod tests {
         );
 
         assert!(matches!(CassMsg::from(event), CassMsg::CopyQuery));
-    }
-
-    #[test]
-    fn terminal_keys_2l1b0_54_startup_events_precede_new_input() {
-        use crate::ui::ftui_adapter::{Event, KeyCode, KeyEvent};
-        let mut app = CassApp::default();
-        app.startup_input
-            .push_back(Event::Key(KeyEvent::new(KeyCode::Char('a'))));
-        let command = app.update(CassMsg::from(Event::Key(KeyEvent::new(KeyCode::Char('b')))));
-        let ftui::Cmd::Sequence(commands) = command else {
-            panic!("startup input must precede later terminal input")
-        };
-        for command in commands {
-            let ftui::Cmd::Msg(message) = command else {
-                panic!("expected queued real terminal event")
-            };
-            let _ = app.update(message);
-        }
-        assert_eq!(app.query, "ab");
-        assert!(app.startup_input.is_empty());
     }
 
     /// 2l1b0.54: the documented "copy content" chord used to hit the Ctrl+C
@@ -27015,7 +27368,6 @@ mod tests {
             SearchHit {
                 agent: "claude_code".into(),
                 title: "Session 1".into(),
-                message_anchor: None,
                 snippet: "test".into(),
                 content: "test content".into(),
                 content_hash: 0,
@@ -27034,7 +27386,6 @@ mod tests {
             SearchHit {
                 agent: "codex".into(),
                 title: "Session 2".into(),
-                message_anchor: None,
                 snippet: "test".into(),
                 content: "test content 2".into(),
                 content_hash: 1,
@@ -27053,7 +27404,6 @@ mod tests {
             SearchHit {
                 agent: "claude_code".into(),
                 title: "Session 3".into(),
-                message_anchor: None,
                 snippet: "test".into(),
                 content: "test content 3".into(),
                 content_hash: 2,
@@ -28397,7 +28747,6 @@ mod tests {
     fn result_item_render_item_height_matches_density() {
         let hit = SearchHit {
             title: "Test".into(),
-            message_anchor: None,
             snippet: "snippet".into(),
             content: "content".into(),
             content_hash: 0,
@@ -28457,7 +28806,6 @@ mod tests {
             hits: vec![
                 SearchHit {
                     title: "A".into(),
-                    message_anchor: None,
                     snippet: "".into(),
                     content: "".into(),
                     content_hash: 0,
@@ -28476,7 +28824,6 @@ mod tests {
                 },
                 SearchHit {
                     title: "B".into(),
-                    message_anchor: None,
                     snippet: "".into(),
                     content: "".into(),
                     content_hash: 1,
@@ -28495,7 +28842,6 @@ mod tests {
                 },
                 SearchHit {
                     title: "C".into(),
-                    message_anchor: None,
                     snippet: "".into(),
                     content: "".into(),
                     content_hash: 2,
@@ -28551,7 +28897,6 @@ mod tests {
         }
         let hits = vec![SearchHit {
             title: "New".into(),
-            message_anchor: None,
             snippet: "".into(),
             content: "".into(),
             content_hash: 0,
@@ -28587,7 +28932,6 @@ mod tests {
     #[test]
     fn queued_items_render_with_checkmark() {
         let hit = SearchHit {
-            message_anchor: None,
             title: "Test".into(),
             snippet: "".into(),
             content: "".into(),
@@ -32316,7 +32660,6 @@ not jsonl",
 
     fn make_test_hit() -> SearchHit {
         SearchHit {
-            message_anchor: None,
             title: "Test Conversation".into(),
             snippet: "Hello **world**\nThis is a test".into(),
             content: "# Heading\n\nSome **bold** text\n\n```rust\nfn main() {}\n```".into(),
@@ -35846,7 +36189,6 @@ not jsonl",
     /// Helper: build a test SearchHit with a unique source_path and content_hash.
     fn make_hit(id: u64, path: &str) -> SearchHit {
         SearchHit {
-            message_anchor: None,
             title: format!("Hit {id}"),
             snippet: String::new(),
             content: String::new(),
@@ -35871,7 +36213,6 @@ not jsonl",
         vec![
             SearchHit {
                 title: "Auth regression triage summary".into(),
-                message_anchor: None,
                 snippet: "## Incident summary\n- symptom: OAuth callback loop\n- blast radius: desktop + remote users\n- status: mitigated".into(),
                 content: "## Timeline\n1. 09:12 deploy\n2. 09:17 alert\n3. 09:32 rollback\n\n```rust\nif token.is_expired() { refresh()?; }\n```\n\n[runbook](https://internal.example/auth)".into(),
                 content_hash: 9001,
@@ -35890,7 +36231,6 @@ not jsonl",
             },
             SearchHit {
                 title: "Search ranking tuning notes".into(),
-                message_anchor: None,
                 snippet: "### Candidate signals\n- lexical boost\n- semantic recall\n- recency decay window=30d\n- quality rerank with guardrails".into(),
                 content: "### Experiment matrix\n| mode | ndcg@10 |\n| --- | --- |\n| lexical | 0.61 |\n| hybrid | 0.74 |\n\n```sql\nSELECT source_id, avg(score) FROM hits GROUP BY 1;\n```".into(),
                 content_hash: 9002,
@@ -35909,7 +36249,6 @@ not jsonl",
             },
             SearchHit {
                 title: "Theme audit and contrast findings".into(),
-                message_anchor: None,
                 snippet: "High-contrast preset retains hierarchy; Nord needed low-score tint adjustment to prevent SCORE_MID collision.".into(),
                 content: "## Contrast report\n- pass: text.primary on pane.base\n- pass: pill.active fg/bg\n- follow-up: find-bar border token\n\n```json\n{\"preset\":\"nord\",\"issue\":\"score_low_collision\"}\n```".into(),
                 content_hash: 9003,
@@ -35928,7 +36267,6 @@ not jsonl",
             },
             SearchHit {
                 title: "Multi-agent coordination transcript".into(),
-                message_anchor: None,
                 snippet: "Participants: user, assistant, tool, system, reviewer. Includes dependency routing and escalation policy.".into(),
                 content: "## Roles\n- user: requested visual parity\n- assistant: implemented search-bar affordance\n- tool: generated PTY captures\n- system: enforced quality gates\n\n> Coordination stayed in thread `coding_agent_session_search-2dccg`.".into(),
                 content_hash: 9004,
@@ -35947,7 +36285,6 @@ not jsonl",
             },
             SearchHit {
                 title: "Large-snippet rendering edge case".into(),
-                message_anchor: None,
                 snippet: "The following snippet intentionally exceeds normal row budgets to exercise truncation, striping, selection, and horizontal clipping behavior under compact and spacious densities.".into(),
                 content: "```text\nThis is a deliberately long snippet line that includes repeated context windows, remote provenance markers, and unicode glyphs → λ Δ ✓ to stress wrapping behavior.\n```".into(),
                 content_hash: 9005,
@@ -35966,7 +36303,6 @@ not jsonl",
             },
             SearchHit {
                 title: "JSON payload decode failure".into(),
-                message_anchor: None,
                 snippet: "{\"error\":\"invalid_schema\",\"path\":\"payload.message.parts[2]\",\"hint\":\"expected string\"}".into(),
                 content: "{\n  \"event\": \"decode_failure\",\n  \"severity\": \"warning\",\n  \"retries\": 3,\n  \"module\": \"html_export\"\n}".into(),
                 content_hash: 9006,
@@ -35985,7 +36321,6 @@ not jsonl",
             },
             SearchHit {
                 title: "Legacy migration checklist".into(),
-                message_anchor: None,
                 snippet: "1. Replace ratatui snapshots\n2. Align markdown theme mapping\n3. Verify breadcrumbs + pills + footer lanes".into(),
                 content: "## Checklist\n- [x] mode-aware title\n- [x] query caret emphasis\n- [ ] full visual matrix in 8.6\n\nSee also: `docs/ftui_visual_parity_rubric.md`.".into(),
                 content_hash: 9007,
@@ -36004,7 +36339,6 @@ not jsonl",
             },
             SearchHit {
                 title: "Background telemetry heartbeat".into(),
-                message_anchor: None,
                 snippet: "system event: runtime evidence snapshot refreshed; no user-visible errors".into(),
                 content: "heartbeat ok\nresize regime: stable\nbudget level: full\ndiff mode: unicode".into(),
                 content_hash: 9008,
@@ -39714,7 +40048,6 @@ not jsonl",
         let hits = vec![
             SearchHit {
                 title: "first".into(),
-                message_anchor: None,
                 snippet: String::new(),
                 content: String::new(),
                 content_hash: 1,
@@ -39733,7 +40066,6 @@ not jsonl",
             },
             SearchHit {
                 title: "second".into(),
-                message_anchor: None,
                 snippet: String::new(),
                 content: String::new(),
                 content_hash: 2,
@@ -39752,7 +40084,6 @@ not jsonl",
             },
             SearchHit {
                 title: "other".into(),
-                message_anchor: None,
                 snippet: String::new(),
                 content: String::new(),
                 content_hash: 3,
@@ -40851,26 +41182,23 @@ not jsonl",
                     KeyEvent::new(KeyCode::Char(character))
                         .with_modifiers(Modifiers::CTRL | Modifiers::ALT)
                 )),
-                CassMsg::Tick
+                CassMsg::WildcardFallbackToggled | CassMsg::QueryChanged(_)
             ));
         }
-        for (character, modifiers, clears) in [
-            ('g', Modifiers::ALT, false),
-            ('G', Modifiers::ALT, true),
-            ('g', Modifiers::ALT | Modifiers::SHIFT, true),
-            ('G', Modifiers::ALT | Modifiers::SHIFT, true),
-        ] {
-            let message = CassMsg::from(Event::Key(
-                KeyEvent::new(KeyCode::Char(character)).with_modifiers(modifiers),
+        for character in ['g', 'G'] {
+            assert!(matches!(
+                CassMsg::from(Event::Key(
+                    KeyEvent::new(KeyCode::Char(character)).with_modifiers(Modifiers::ALT)
+                )),
+                CassMsg::InputModeEntered(InputMode::Agent)
             ));
-            if clears {
-                assert!(matches!(message, CassMsg::FilterAgentSet(agents) if agents.is_empty()));
-            } else {
-                assert!(matches!(
-                    message,
-                    CassMsg::InputModeEntered(InputMode::Agent)
-                ));
-            }
+            assert!(matches!(
+                CassMsg::from(Event::Key(
+                    KeyEvent::new(KeyCode::Char(character))
+                        .with_modifiers(Modifiers::ALT | Modifiers::SHIFT)
+                )),
+                CassMsg::FilterAgentSet(agents) if agents.is_empty()
+            ));
         }
         let _ = take_raw_event();
     }
@@ -43258,16 +43586,12 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             "Help text should contain 'Search' section"
         );
         assert!(
-            text.contains("Terminal keys"),
-            "Help text should contain 'Terminal keys' section"
+            text.contains("Navigation"),
+            "Help text should contain 'Navigation' section"
         );
         assert!(
-            text.contains("Keyboard reference"),
-            "Help text should contain the generated keyboard reference"
-        );
-        assert!(
-            text.contains(shortcuts::COPY_CONTENT),
-            "Help text should render the reachable content-copy binding"
+            text.contains("Filters"),
+            "Help text should contain 'Filters' section"
         );
     }
 
@@ -43321,9 +43645,16 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
 
         for section in [
             "Data Locations",
-            "Terminal keys",
-            "Keyboard reference",
-            "Detail messages",
+            "Updates",
+            "Search",
+            "Surfaces",
+            "Filters",
+            "Sources",
+            "Modes",
+            "Context",
+            "Navigation",
+            "Actions",
+            "States",
         ] {
             assert!(
                 text.contains(section),
@@ -43359,18 +43690,10 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         assert!(text.contains(shortcuts::EDITOR), "Should reference F8");
         assert!(text.contains(shortcuts::RANKING), "Should reference F12");
         assert!(text.contains(shortcuts::TAB_FOCUS), "Should reference Tab");
-        for entry in shortcuts::KEYMAP {
-            assert!(
-                text.contains(&entry.keys.join(" / ")),
-                "Missing keys: {:?}",
-                entry.keys
-            );
-            assert!(
-                text.contains(entry.description),
-                "Missing action: {}",
-                entry.description
-            );
-        }
+        assert!(
+            text.contains(shortcuts::VIM_NAV),
+            "Should reference vim nav"
+        );
         assert!(
             text.contains(shortcuts::STATS_BAR),
             "Should reference stats bar shortcut"
@@ -43396,7 +43719,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             "Should reference the bookmark key"
         );
         assert!(
-            text.contains("Clear agent filter"),
+            text.contains("clear agent filter"),
             "Filters section should describe Shift+F3 behavior accurately"
         );
     }
@@ -43672,7 +43995,6 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
     fn detail_closed_pops_trap_and_restores() {
         let mut app = CassApp::default();
         app.results = vec![SearchHit {
-            message_anchor: None,
             title: String::new(),
             snippet: "test".into(),
             content: "test".into(),
@@ -47221,8 +47543,6 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             repair_previously_failed: false,
             remote_source_state: Some("ok".to_string()),
             sole_copy_conversation_count: 0,
-            ann_state: "not_inspected".to_string(),
-            ann_reason_code: None,
         }
     }
 
@@ -47292,64 +47612,6 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
                 );
             }
         }
-    }
-
-    #[test]
-    fn doctor_hud_projects_the_shared_ann_readiness_vocabulary() {
-        use ftui::render::budget::DegradationLevel;
-
-        // The TUI reads the same bounded health envelope the JSON surfaces
-        // publish, so it repeats their token and their stable reason code.
-        let (state, reason) = ann_readiness_from_state(&serde_json::json!({
-            "semantic": {
-                "hnsw_state": "rejected",
-                "hnsw_reason_code": "ann_sidecar_open_failed"
-            }
-        }));
-        assert_eq!(state, "rejected");
-        assert_eq!(reason.as_deref(), Some("ann_sidecar_open_failed"));
-
-        let mut app = search_surface_fixture_app();
-        app.doctor_hud_summary = Some(DoctorHudSummary {
-            ann_state: state,
-            ann_reason_code: reason,
-            ..doctor_hud_summary_fixture()
-        });
-        let text = buffer_to_text(&render_at_degradation(
-            &app,
-            180,
-            24,
-            DegradationLevel::Full,
-        ));
-        assert!(
-            text.contains("ann ann-sidecar-open-failed"),
-            "a refused cohort must name its stable reason code: {text}"
-        );
-
-        // An admitted cohort names the native accelerator.
-        let (state, reason) = ann_readiness_from_state(&serde_json::json!({
-            "semantic": { "hnsw_state": "native_ready" }
-        }));
-        assert_eq!(state, "native_ready");
-        assert_eq!(reason, None);
-        let mut app = search_surface_fixture_app();
-        app.doctor_hud_summary = Some(DoctorHudSummary {
-            ann_state: state,
-            ann_reason_code: reason,
-            ..doctor_hud_summary_fixture()
-        });
-        let text = buffer_to_text(&render_at_degradation(
-            &app,
-            180,
-            24,
-            DegradationLevel::Full,
-        ));
-        assert!(text.contains("ann native"), "{text}");
-
-        // An uninspected cohort stays silent instead of guessing.
-        let (state, reason) = ann_readiness_from_state(&serde_json::json!({}));
-        assert_eq!(state, "not_inspected");
-        assert_eq!(reason, None);
     }
 
     #[test]
@@ -48507,7 +48769,6 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         let mut app = CassApp::default();
         let hits: Vec<SearchHit> = (0..100)
             .map(|i| SearchHit {
-                message_anchor: None,
                 title: format!("Long hit {i} — {}", "x".repeat(200)),
                 snippet: "word ".repeat(500),
                 content: "line\n".repeat(1000),

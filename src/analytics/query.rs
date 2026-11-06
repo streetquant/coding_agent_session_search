@@ -109,13 +109,6 @@ fn normalize_epoch_millis(ts: i64) -> i64 {
         ts
     }
 }
-/// Assistant attribution must not depend on whether the provider parser stored
-/// the canonical role as `agent` (the native CASS role) or `assistant` (some
-/// imported archives). Rollups count both; raw fallbacks must agree.
-fn is_assistant_role(role: &str) -> bool {
-    role == "assistant" || role == "agent"
-}
-
 fn normalized_epoch_millis_sql(expr: &str) -> String {
     format!(
         "CASE WHEN ({expr}) >= 0 AND ({expr}) < 100000000000 THEN ({expr}) * 1000 ELSE ({expr}) END"
@@ -2029,7 +2022,7 @@ fn query_track_a_timeseries_from_raw(
             let mut bucket = UsageBucket {
                 message_count: 1,
                 user_message_count: i64::from(role == "user"),
-                assistant_message_count: i64::from(is_assistant_role(&role)),
+                assistant_message_count: i64::from(role == "assistant"),
                 tool_call_count,
                 plan_message_count: has_plan,
                 api_coverage_message_count: api_covered,
@@ -2039,48 +2032,24 @@ fn query_track_a_timeseries_from_raw(
                 } else {
                     0
                 },
-                content_tokens_est_assistant: if is_assistant_role(&role) {
+                content_tokens_est_assistant: if role == "assistant" {
                     content_tokens_est
                 } else {
                     0
                 },
-                api_input_tokens_total: if api_covered != 0 {
-                    api_input_tokens
-                } else {
-                    0
-                },
-                api_output_tokens_total: if api_covered != 0 {
-                    api_output_tokens
-                } else {
-                    0
-                },
-                api_cache_read_tokens_total: if api_covered != 0 {
-                    api_cache_read_tokens
-                } else {
-                    0
-                },
-                api_cache_creation_tokens_total: if api_covered != 0 {
-                    api_cache_creation_tokens
-                } else {
-                    0
-                },
-                api_thinking_tokens_total: if api_covered != 0 {
-                    api_thinking_tokens
-                } else {
-                    0
-                },
+                api_input_tokens_total: api_input_tokens,
+                api_output_tokens_total: api_output_tokens,
+                api_cache_read_tokens_total: api_cache_read_tokens,
+                api_cache_creation_tokens_total: api_cache_creation_tokens,
+                api_thinking_tokens_total: api_thinking_tokens,
                 plan_content_tokens_est_total: if has_plan != 0 { content_tokens_est } else { 0 },
                 ..Default::default()
             };
-            bucket.api_tokens_total = if api_covered != 0 {
-                api_input_tokens
-                    + api_output_tokens
-                    + api_cache_read_tokens
-                    + api_cache_creation_tokens
-                    + api_thinking_tokens
-            } else {
-                0
-            };
+            bucket.api_tokens_total = api_input_tokens
+                + api_output_tokens
+                + api_cache_read_tokens
+                + api_cache_creation_tokens
+                + api_thinking_tokens;
             if has_plan != 0 && api_covered != 0 {
                 bucket.plan_api_tokens_total = bucket.api_tokens_total;
             }
@@ -2305,7 +2274,7 @@ fn query_cost_timeseries_from_token_usage(
                 UsageBucket {
                     message_count: 1,
                     user_message_count: i64::from(role == "user"),
-                    assistant_message_count: i64::from(is_assistant_role(&role)),
+                    assistant_message_count: i64::from(role == "assistant"),
                     tool_call_count: tool_calls,
                     api_coverage_message_count: 1,
                     content_tokens_est_total: content_chars / 4,
@@ -2649,11 +2618,7 @@ fn query_track_b_breakdown_from_token_usage(
     };
     let tool_calls_sql = sum_or_zero("tu.tool_call_count", has_tool_call_count);
     let user_count_sql = count_role("user");
-    let assistant_count_sql = if has_role {
-        "SUM(CASE WHEN tu.role IN ('assistant', 'agent') THEN 1 ELSE 0 END)".to_string()
-    } else {
-        "SUM(0)".to_string()
-    };
+    let assistant_count_sql = count_role("assistant");
 
     let order_sql = match metric {
         Metric::ApiTotal => total_sql.clone(),
@@ -2975,7 +2940,7 @@ fn query_track_a_breakdown_from_raw(
             let mut bucket = UsageBucket {
                 message_count: 1,
                 user_message_count: i64::from(role == "user"),
-                assistant_message_count: i64::from(is_assistant_role(&role)),
+                assistant_message_count: i64::from(role == "assistant"),
                 tool_call_count,
                 plan_message_count: has_plan,
                 api_coverage_message_count: api_covered,
@@ -2985,47 +2950,23 @@ fn query_track_a_breakdown_from_raw(
                 } else {
                     0
                 },
-                content_tokens_est_assistant: if is_assistant_role(&role) {
+                content_tokens_est_assistant: if role == "assistant" {
                     content_tokens_est
                 } else {
                     0
                 },
-                api_input_tokens_total: if api_covered != 0 {
-                    api_input_tokens
-                } else {
-                    0
-                },
-                api_output_tokens_total: if api_covered != 0 {
-                    api_output_tokens
-                } else {
-                    0
-                },
-                api_cache_read_tokens_total: if api_covered != 0 {
-                    api_cache_read_tokens
-                } else {
-                    0
-                },
-                api_cache_creation_tokens_total: if api_covered != 0 {
-                    api_cache_creation_tokens
-                } else {
-                    0
-                },
-                api_thinking_tokens_total: if api_covered != 0 {
-                    api_thinking_tokens
-                } else {
-                    0
-                },
+                api_input_tokens_total: api_input_tokens,
+                api_output_tokens_total: api_output_tokens,
+                api_cache_read_tokens_total: api_cache_read_tokens,
+                api_cache_creation_tokens_total: api_cache_creation_tokens,
+                api_thinking_tokens_total: api_thinking_tokens,
                 ..Default::default()
             };
-            bucket.api_tokens_total = if api_covered != 0 {
-                api_input_tokens
-                    + api_output_tokens
-                    + api_cache_read_tokens
-                    + api_cache_creation_tokens
-                    + api_thinking_tokens
-            } else {
-                0
-            };
+            bucket.api_tokens_total = api_input_tokens
+                + api_output_tokens
+                + api_cache_read_tokens
+                + api_cache_creation_tokens
+                + api_thinking_tokens;
             Ok((source_id, origin_host, dim_key, bucket))
         })
         .map_err(|e| analytics_query_error("Breakdown query failed", e))?;
@@ -3866,7 +3807,7 @@ pub fn query_tools(
             total_api_tokens: 0,
             source_table: table.into(),
             elapsed_ms: query_start.elapsed().as_millis() as u64,
-            metric_outcome: if table_exists(conn, "messages") {
+            metric_outcome: if table_exists(conn, "message_metrics") {
                 MetricOutcome::RebuildRequired
             } else {
                 MetricOutcome::NoData
@@ -4796,7 +4737,6 @@ mod tests {
                 created_at_ms INTEGER,
                 tool_call_count INTEGER NOT NULL DEFAULT 0,
                 content_tokens_est INTEGER,
-                api_data_source TEXT,
                 api_input_tokens INTEGER,
                 api_output_tokens INTEGER,
                 api_cache_read_tokens INTEGER,
@@ -4861,17 +4801,17 @@ mod tests {
         conn.execute(
             "INSERT INTO message_metrics
              (message_id, created_at_ms, tool_call_count, content_tokens_est,
-              api_data_source, api_input_tokens, api_output_tokens, api_cache_read_tokens,
+              api_input_tokens, api_output_tokens, api_cache_read_tokens,
               api_cache_creation_tokens, api_thinking_tokens)
-             VALUES (11, 1700000000000, 2, 30, 'api', 10, 20, 0, 0, 0)",
+             VALUES (11, 1700000000000, 2, 30, 10, 20, 0, 0, 0)",
         )
         .unwrap();
         conn.execute(
             "INSERT INTO message_metrics
              (message_id, created_at_ms, tool_call_count, content_tokens_est,
-              api_data_source, api_input_tokens, api_output_tokens, api_cache_read_tokens,
+              api_input_tokens, api_output_tokens, api_cache_read_tokens,
               api_cache_creation_tokens, api_thinking_tokens)
-             VALUES (21, 1700000001000, 7, 90, 'api', 30, 70, 0, 0, 0)",
+             VALUES (21, 1700000001000, 7, 90, 30, 70, 0, 0, 0)",
         )
         .unwrap();
 

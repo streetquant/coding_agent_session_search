@@ -1,13 +1,13 @@
-//! Explicit partition metadata for immutable semantic publications.
+//! Schema-v2 partition metadata for immutable semantic publications.
 //!
-//! Purpose-bearing schema v4 explicitly orders every tier's
+//! Schema v1 remains byte/digest compatible. V2 explicitly orders every tier's
 //! nonempty FSVI shards by canonical document ID; ANN entries bind the matching
 //! ordinal, never just the tier name. Range/count checks are structural, not a
 //! substitute for the selected reader's whole-image and live-docset validation.
 
 use super::*;
 
-pub const SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION: u32 = 4;
+pub const SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION: u32 = 2;
 pub(super) const MAX_SHARDS_PER_TIER: usize = 256;
 const MAX_DOCUMENT_ID_BYTES: usize = 4096;
 
@@ -54,13 +54,13 @@ pub(super) fn validate(
             .iter()
             .any(|artifact| artifact.shard.is_some())
         {
-            return invalid("schema v3 cannot carry shard metadata; publish schema v4 explicitly");
+            return invalid("schema v1 cannot carry shard metadata; publish schema v2 explicitly");
         }
         return Ok(());
     }
     for artifact in &manifest.artifacts {
         let Some(shard) = artifact.shard.as_ref() else {
-            return invalid("every schema-v4 artifact requires explicit shard metadata");
+            return invalid("every schema-v2 artifact requires explicit shard metadata");
         };
         if shard.shard_count == 0
             || shard.shard_count as usize > MAX_SHARDS_PER_TIER

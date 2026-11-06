@@ -72,9 +72,7 @@ impl Connector for CodexConnector {
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
         path_policy::ScanExclusions::from_env().validate()?;
-        let mut sources = archives::discover(ctx)?;
-        sources.retain(|source| super::cloudmcp::rollout_header(&source.source_path).is_none());
-        Ok(sources)
+        archives::discover(ctx)
     }
 
     fn scan_with_callback(
@@ -110,17 +108,13 @@ impl Connector for CodexConnector {
             on_source_complete,
         } = hooks;
         let mut before = |source: &DiscoveredSourceFile| {
-            let admitted = super::cloudmcp::rollout_header(&source.source_path).is_none()
-                && should_scan_source
-                    .as_mut()
-                    .is_none_or(|predicate| predicate(source));
+            let admitted = should_scan_source
+                .as_mut()
+                .is_none_or(|predicate| predicate(source));
             *current_source.borrow_mut() = admitted.then(|| source.clone());
             admitted
         };
         let mut deliver = |conversation: NormalizedConversation| {
-            if super::cloudmcp::rollout_header(&conversation.source_path).is_some() {
-                return Ok(());
-            }
             let source = current_source.borrow();
             let source = source
                 .as_ref()

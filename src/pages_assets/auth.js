@@ -30,7 +30,6 @@ let activeUnlockRequestId = null;
 let activeDecryptRequestId = null;
 let nextWorkerRequestId = 1;
 let activeAppInitToken = 0;
-let activeAppInitController = null;
 let qrLibraryLoadPromise = null;
 let qrScannerTeardownPromise = null;
 let activeSessionExpiryTs = 0;
@@ -74,8 +73,6 @@ const elements = {
  * Initialize the authentication module
  */
 async function init() {
-  const initToken = beginAppInitAttempt();
-
   // Cache DOM elements
   cacheElements();
 
@@ -84,22 +81,9 @@ async function init() {
 
   // Load configuration
   try {
-    const loadedConfig = await loadConfig(initToken);
-    if (!isCurrentAppInitToken(initToken)) {
-      return;
-    }
-    config = loadedConfig;
-
-    const initialTofuStatus = await displayFingerprint(initToken);
-    if (!isCurrentAppInitToken(initToken)) {
-      return;
-    }
-    tofuStatus = initialTofuStatus;
+    config = await loadConfig();
+    tofuStatus = await displayFingerprint();
   } catch (error) {
-    if (!isCurrentAppInitToken(initToken)) {
-      return;
-    }
-    invalidateAppInitAttempt();
     showError("Failed to load archive configuration. The archive may be corrupted.");
     console.error("Config load error:", error);
     return;
@@ -169,18 +153,6 @@ function cacheElements() {
   elements.strengthMeter = document.getElementById("strength-meter");
   elements.strengthLabel = document.getElementById("strength-label");
   elements.strengthSuggestions = document.getElementById("strength-suggestions");
-}
-
-/**
- * Require a cached node before UI updates and report missing archive markup.
- * @param {keyof typeof elements} name
- */
-function requireAuthElement(name) {
-  const element = elements[name];
-  if (!element) {
-    throw new Error(`Required archive authentication element is missing: ${name}`);
-  }
-  return element;
 }
 
 /**
@@ -275,10 +247,7 @@ function resetCryptoWorker() {
 }
 
 function beginAppInitAttempt() {
-  const previousController = activeAppInitController;
   activeAppInitToken += 1;
-  activeAppInitController = new AbortController();
-  previousController?.abort();
   return activeAppInitToken;
 }
 
@@ -286,22 +255,8 @@ function isCurrentAppInitToken(token) {
   return token === activeAppInitToken;
 }
 
-function getAppInitSignal(token) {
-  if (
-    !isCurrentAppInitToken(token) ||
-    !activeAppInitController ||
-    activeAppInitController.signal.aborted
-  ) {
-    throw new Error("Archive initialization was cancelled");
-  }
-  return activeAppInitController.signal;
-}
-
 function invalidateAppInitAttempt() {
-  const previousController = activeAppInitController;
-  activeAppInitController = null;
   activeAppInitToken += 1;
-  previousController?.abort();
 }
 
 function beginQrScannerSession() {
@@ -314,7 +269,7 @@ function invalidateQrScannerSession() {
 }
 
 function isCurrentQrScannerSession(sessionToken) {
-  return sessionToken === activeQrScannerSession; // ubs:ignore[javascript.ctcompare.unsafe_secret_compare] Monotonic scanner attempt IDs only cancel stale UI callbacks; they are not authentication tokens.
+  return sessionToken === activeQrScannerSession;
 }
 
 function clearActiveSessionExpiryTimer() {
@@ -409,20 +364,12 @@ function isCurrentWorkerMessage(type, requestId) {
 /**
  * Load config.json from the archive
  */
-async function loadConfig(initToken) {
-  const signal = getAppInitSignal(initToken);
-  const response = await fetch(new URL("config.json", ARCHIVE_SCOPE_URL), { signal });
-  if (!isCurrentAppInitToken(initToken) || signal.aborted) {
-    throw signal.reason ?? new Error("Archive initialization was cancelled");
-  }
+async function loadConfig() {
+  const response = await fetch(new URL("config.json", ARCHIVE_SCOPE_URL));
   if (!response.ok) {
     throw new Error(`Failed to load config: ${response.status}`);
   }
-  const loadedConfig = await response.json();
-  if (!isCurrentAppInitToken(initToken) || signal.aborted) {
-    throw signal.reason ?? new Error("Archive initialization was cancelled");
-  }
-  return loadedConfig;
+  return response.json();
 }
 
 function getSessionKeys() {
@@ -443,41 +390,29 @@ function getTofuKey() {
 /**
  * Display integrity fingerprint with TOFU verification
  */
-async function displayFingerprint(initToken) {
-  const signal = getAppInitSignal(initToken);
+async function displayFingerprint() {
   try {
     // Try to load integrity.json if it exists
-    const response = await fetch(new URL("integrity.json", ARCHIVE_SCOPE_URL), { signal });
-    if (!isCurrentAppInitToken(initToken) || signal.aborted) {
-      throw signal.reason ?? new Error("Archive initialization was cancelled");
-    }
-
-    let fingerprint;
+    const response = await fetch(new URL("integrity.json", ARCHIVE_SCOPE_URL));
     if (response.ok) {
       const integrity = await response.json();
-      if (!isCurrentAppInitToken(initToken) || signal.aborted) {
-        throw signal.reason ?? new Error("Archive initialization was cancelled");
-      }
-      fingerprint = await computeFingerprint(JSON.stringify(integrity));
+      const fingerprint = await computeFingerprint(JSON.stringify(integrity));
+      elements.fingerprintValue.textContent = fingerprint;
+
+      // TOFU verification
+      const result = await verifyTofu(fingerprint, getTofuKey());
+      displayTofuStatus(result);
+      return result;
     } else {
       // Fall back to config fingerprint
-      fingerprint = await computeFingerprint(JSON.stringify(config));
-    }
-    if (!isCurrentAppInitToken(initToken) || signal.aborted) {
-      throw signal.reason ?? new Error("Archive initialization was cancelled");
-    }
+      const fingerprint = await computeFingerprint(JSON.stringify(config));
+      elements.fingerprintValue.textContent = fingerprint;
 
-    elements.fingerprintValue.textContent = fingerprint;
-    const result = await verifyTofu(fingerprint, getTofuKey());
-    if (!isCurrentAppInitToken(initToken) || signal.aborted) {
-      throw signal.reason ?? new Error("Archive initialization was cancelled");
+      const result = await verifyTofu(fingerprint, getTofuKey());
+      displayTofuStatus(result);
+      return result;
     }
-    displayTofuStatus(result);
-    return result;
   } catch (error) {
-    if (!isCurrentAppInitToken(initToken) || signal.aborted) {
-      throw error;
-    }
     // Use export_id as fallback fingerprint
     if (config?.export_id) {
       const bytes = base64ToBytes(config.export_id);
@@ -750,7 +685,7 @@ function togglePasswordVisibility() {
   const input = elements.passwordInput;
   const icon = elements.togglePassword.querySelector(".eye-icon");
 
-  if (input.type === "password") { // ubs:ignore[javascript.ctcompare.unsafe_secret_compare] The public HTML input type controls visibility; no password value is compared.
+  if (input.type === "password") {
     input.type = "text";
     icon.textContent = "🙈";
   } else {
@@ -775,8 +710,7 @@ async function openQrScanner() {
     return;
   }
   const sessionToken = beginQrScannerSession();
-  const scannerPanel = requireAuthElement("qrScanner");
-  scannerPanel.classList.remove("hidden");
+  elements.qrScanner.classList.remove("hidden");
 
   try {
     await loadQrScannerLibrary();
@@ -827,8 +761,7 @@ async function closeQrScanner() {
   invalidateQrScannerSession();
   const scanner = qrScanner;
   qrScanner = null;
-  const scannerPanel = requireAuthElement("qrScanner");
-  scannerPanel.classList.add("hidden");
+  elements.qrScanner.classList.add("hidden");
   let teardown = finalizeQrScannerClose(scanner);
   teardown = teardown.finally(() => {
     if (qrScannerTeardownPromise === teardown) {
@@ -930,7 +863,7 @@ function handleQrError(error) {
  * Handle messages from crypto worker
  */
 function handleWorkerMessage(event) {
-  const payload = event?.data && typeof event.data === "object" ? event.data : null; // ubs:ignore[javascript.ctcompare.unsafe_secret_compare] This compares a JavaScript type tag, not message contents or a secret.
+  const payload = event?.data && typeof event.data === "object" ? event.data : null;
   if (!payload || typeof payload.type !== "string" || payload.type.length === 0) {
     console.warn("Ignoring malformed worker message payload");
     void handleWorkerError(new Error("Malformed worker response"));
@@ -1007,10 +940,8 @@ async function handleWorkerError(error) {
   disableForm();
   if (hadActiveSession) {
     broadcastAuthLock("lock");
-    const appScreen = requireAuthElement("appScreen");
-    appScreen.classList.add("hidden");
-    const authScreen = requireAuthElement("authScreen");
-    authScreen.classList.remove("hidden");
+    elements.appScreen.classList.add("hidden");
+    elements.authScreen.classList.remove("hidden");
     elements.passwordInput.value = "";
   }
   showError("The decryption worker stopped unexpectedly. Reload this page to try again.");
@@ -1144,10 +1075,8 @@ function handleDecryptFailed(data) {
   } else {
     disableForm();
   }
-  const appScreen = requireAuthElement("appScreen");
-  appScreen.classList.add("hidden");
-  const authScreen = requireAuthElement("authScreen");
-  authScreen.classList.remove("hidden");
+  elements.appScreen.classList.add("hidden");
+  elements.authScreen.classList.remove("hidden");
   clearActiveSessionExpiry();
   clearStoredSession();
   window.cassSession = null;
@@ -1193,10 +1122,8 @@ async function recoverFromAppInitFailure(message, error, initToken = activeAppIn
   } else {
     disableForm();
   }
-  const appScreen = requireAuthElement("appScreen");
-  appScreen.classList.add("hidden");
-  const authScreen = requireAuthElement("authScreen");
-  authScreen.classList.remove("hidden");
+  elements.appScreen.classList.add("hidden");
+  elements.authScreen.classList.remove("hidden");
   showError(
     workerReady
       ? message
@@ -1215,10 +1142,8 @@ function transitionToApp() {
   const appInitToken = beginAppInitAttempt();
   decryptInFlight = true;
   activeDecryptRequestId = allocateWorkerRequestId();
-  const authScreen = requireAuthElement("authScreen");
-  authScreen.classList.add("hidden");
-  const appScreen = requireAuthElement("appScreen");
-  appScreen.classList.remove("hidden");
+  elements.authScreen.classList.add("hidden");
+  elements.appScreen.classList.remove("hidden");
 
   // Start decryption and database loading
   try {
@@ -1249,10 +1174,8 @@ async function transitionToAppUnencrypted() {
   hideError();
   disableForm();
 
-  const authScreen = requireAuthElement("authScreen");
-  authScreen.classList.add("hidden");
-  const appScreen = requireAuthElement("appScreen");
-  appScreen.classList.remove("hidden");
+  elements.authScreen.classList.add("hidden");
+  elements.appScreen.classList.remove("hidden");
 
   try {
     await loadViewerModule(appInitToken);
@@ -1273,24 +1196,15 @@ async function transitionToAppUnencrypted() {
 }
 
 async function loadUnencryptedDatabase(initToken = activeAppInitToken) {
-  const signal = getAppInitSignal(initToken);
   const payloadPath = getUnencryptedPayloadPath();
   const expectedSize = getUnencryptedPayloadSize();
-  const response = await fetch(new URL(payloadPath, ARCHIVE_SCOPE_URL), { signal });
-  if (!isCurrentAppInitToken(initToken) || signal.aborted) {
-    throw signal.reason ?? new Error("Archive initialization was cancelled");
-  }
+  const response = await fetch(new URL(payloadPath, ARCHIVE_SCOPE_URL));
   if (response.status !== 200) {
     throw new Error(`Failed to load database: ${response.status}`);
   }
 
-  const dbBytes = await readResponseBytesExact(
-    response,
-    expectedSize,
-    "Unencrypted database",
-    signal,
-  );
-  if (!isCurrentAppInitToken(initToken) || signal.aborted) {
+  const dbBytes = await readResponseBytesExact(response, expectedSize, "Unencrypted database");
+  if (!isCurrentAppInitToken(initToken)) {
     dbBytes.fill(0);
     return false;
   }
@@ -1333,7 +1247,7 @@ function getUnencryptedPayloadSize() {
   return sizeBytes;
 }
 
-async function readResponseBytesExact(response, expectedSize, label, signal = null) {
+async function readResponseBytesExact(response, expectedSize, label) {
   if (!Number.isSafeInteger(expectedSize) || expectedSize <= 0) {
     throw new Error(`${label} has an invalid expected size`);
   }
@@ -1367,83 +1281,15 @@ async function readResponseBytesExact(response, expectedSize, label, signal = nu
   const reader = response.body.getReader();
   let bytes = null;
   let totalLength = 0;
-  let readerCancelled = false;
-
-  function cancelReader(reason) {
-    if (readerCancelled) {
-      return;
-    }
-    readerCancelled = true;
-    try {
-      void Promise.resolve(reader.cancel(reason)).catch(() => {});
-    } catch {
-      // The response stream may already be closed or errored.
-    }
-  }
-
-  async function readChunk() {
-    if (!signal) {
-      return reader.read();
-    }
-    if (signal.aborted) {
-      throw signal.reason ?? new Error("Archive initialization was cancelled");
-    }
-
-    const readPromise = reader.read();
-    void readPromise
-      .then(
-        (result) => {
-          // A read that loses the abort race can still produce plaintext later.
-          if (signal.aborted && result?.value instanceof Uint8Array) {
-            result.value.fill(0);
-          }
-        },
-        () => {},
-      )
-      .catch(() => {});
-
-    let abortHandler;
-    const abortPromise = new Promise((_, reject) => {
-      abortHandler = () => {
-        cancelReader(signal.reason);
-        reject(signal.reason ?? new Error("Archive initialization was cancelled"));
-      };
-      signal.addEventListener("abort", abortHandler, { once: true });
-      if (signal.aborted) {
-        abortHandler();
-      }
-    });
-
-    try {
-      return await Promise.race([readPromise, abortPromise]);
-    } finally {
-      signal.removeEventListener("abort", abortHandler);
-    }
-  }
-
   try {
     bytes = new Uint8Array(expectedSize);
     while (true) {
-      const { done, value } = await readChunk();
-      if (signal?.aborted) {
-        if (value instanceof Uint8Array) {
-          value.fill(0);
-        }
-        throw signal.reason ?? new Error("Archive initialization was cancelled");
-      }
-      if (done) {
-        if (value instanceof Uint8Array) {
-          value.fill(0);
-        }
-        break;
-      }
+      const { done, value } = await reader.read();
+      if (done) break;
       if (!(value instanceof Uint8Array)) {
         throw new Error(`${label} returned an invalid response chunk`);
       }
       try {
-        if (signal?.aborted) {
-          throw signal.reason ?? new Error("Archive initialization was cancelled");
-        }
         const nextLength = totalLength + value.byteLength;
         if (
           !Number.isSafeInteger(nextLength) ||
@@ -1466,7 +1312,11 @@ async function readResponseBytesExact(response, expectedSize, label, signal = nu
     return bytes;
   } catch (error) {
     bytes?.fill(0);
-    cancelReader(error?.message || String(error));
+    try {
+      await reader.cancel(error?.message || String(error));
+    } catch {
+      // The response stream may already be closed or errored.
+    }
     throw error;
   }
 }
@@ -1600,10 +1450,8 @@ async function lockArchive(options = {}) {
   await closeLiveDatabase();
 
   // Return to auth screen
-  const appScreen = requireAuthElement("appScreen");
-  appScreen.classList.add("hidden");
-  const authScreen = requireAuthElement("authScreen");
-  authScreen.classList.remove("hidden");
+  elements.appScreen.classList.add("hidden");
+  elements.authScreen.classList.remove("hidden");
 
   // Reset form
   if (workerReady) {
@@ -1821,50 +1669,42 @@ async function loadViewerModule(initToken = activeAppInitToken) {
  * Show error message
  */
 function showError(message) {
-  const authError = requireAuthElement("authError");
-  const errorMsg = authError.querySelector(".error-message");
+  const errorMsg = elements.authError.querySelector(".error-message");
   if (errorMsg) {
     errorMsg.textContent = message;
   }
-  authError.classList.remove("hidden");
+  elements.authError.classList.remove("hidden");
 }
 
 /**
  * Hide error message
  */
 function hideError() {
-  const authError = requireAuthElement("authError");
-  authError.classList.add("hidden");
+  elements.authError.classList.add("hidden");
 }
 
 /**
  * Show progress indicator
  */
 function showProgress(text) {
-  const progressText = requireAuthElement("progressText");
-  progressText.textContent = text;
-  const progressFill = requireAuthElement("progressFill");
-  progressFill.style.width = "0%";
-  const authProgress = requireAuthElement("authProgress");
-  authProgress.classList.remove("hidden");
+  elements.progressText.textContent = text;
+  elements.progressFill.style.width = "0%";
+  elements.authProgress.classList.remove("hidden");
 }
 
 /**
  * Update progress indicator
  */
 function updateProgress(phase, percent) {
-  const progressText = requireAuthElement("progressText");
-  progressText.textContent = phase;
-  const progressFill = requireAuthElement("progressFill");
-  progressFill.style.width = `${percent}%`;
+  elements.progressText.textContent = phase;
+  elements.progressFill.style.width = `${percent}%`;
 }
 
 /**
  * Hide progress indicator
  */
 function hideProgress() {
-  const authProgress = requireAuthElement("authProgress");
-  authProgress.classList.add("hidden");
+  elements.authProgress.classList.add("hidden");
 }
 
 /**

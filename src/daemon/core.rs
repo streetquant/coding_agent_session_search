@@ -657,7 +657,7 @@ impl ModelDaemon {
                 "Failed to apply configured daemon nice value"
             );
         }
-        if !self.resources.apply_ionice(self.config.ionice_class, None) {
+        if !self.resources.apply_ionice(self.config.ionice_class) {
             warn!(
                 ionice_class = self.config.ionice_class,
                 "Failed to apply configured daemon ionice class"

@@ -47,48 +47,6 @@ use crate::connectors::{
 /// Stable schema version for the connector-ingest diagnostic wire format.
 pub const CONNECTOR_INGEST_DIAGNOSTIC_SCHEMA_VERSION: u32 = 1;
 
-/// A publication whose schema the connector cannot interpret. Keep the actual
-/// source path through anyhow context wrapping; error text alone is not a
-/// reliable schema classifier. No transcript payload or native identity is
-/// copied into this marker.
-#[derive(Debug)]
-pub struct UnsupportedSourceSchema {
-    source_path: PathBuf,
-    schema_family: &'static str,
-    line_or_row: Option<u64>,
-}
-
-impl UnsupportedSourceSchema {
-    pub fn new(source_path: impl Into<PathBuf>, schema_family: &'static str) -> Self {
-        Self {
-            source_path: source_path.into(),
-            schema_family,
-            line_or_row: None,
-        }
-    }
-
-    pub fn with_line(mut self, line: u64) -> Self {
-        self.line_or_row = Some(line);
-        self
-    }
-
-    pub fn source_path(&self) -> &Path {
-        &self.source_path
-    }
-
-    pub const fn line_or_row(&self) -> Option<u64> {
-        self.line_or_row
-    }
-}
-
-impl std::fmt::Display for UnsupportedSourceSchema {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "unsupported {} schema", self.schema_family)
-    }
-}
-
-impl std::error::Error for UnsupportedSourceSchema {}
-
 /// How serious a single ingest finding is. Ordered low→high so a per-source or
 /// per-run rollup can take the worst with `max`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -96,8 +54,8 @@ impl std::error::Error for UnsupportedSourceSchema {}
 pub enum IngestSeverity {
     /// Informational; ingestion proceeded normally.
     Info,
-    /// A known limitation or quarantined source/record. Searchable content may
-    /// be unavailable until the limitation is resolved.
+    /// A limitation or a quarantined record; the rest of the source still
+    /// indexed. Not a hard failure.
     Warning,
     /// The source could not be ingested at all (and it is not merely an absent
     /// or encrypted-but-known limitation).
@@ -141,9 +99,6 @@ pub enum IngestFailureKind {
     FilenameAssumptionViolated,
     /// The source path exists but could not be read (permissions / I/O).
     UnreadableSource,
-    /// Raw source evidence is retained, but this connector cannot interpret its
-    /// schema. Retrying unchanged input cannot make the schema supported.
-    UnsupportedSchema,
     /// The connector failed on content it could not interpret (an unsupported
     /// record shape or value); no I/O error caused it, so permissions and
     /// retries do not help (GH #511).
@@ -151,11 +106,6 @@ pub enum IngestFailureKind {
     /// The source is larger than the connector's per-source read budget, so it
     /// was not indexed; raising the budget admits it on the next run.
     SourceOverReadBudget,
-    /// The source changed while it was being read (it was rewritten, replaced
-    /// or grew between two passes). The bytes were readable; the read raced a
-    /// live writer, so nothing from that source is published and re-indexing
-    /// picks up its current content.
-    SourceChangedDuringRead,
     /// The store uses a layout or format version this build's connector does
     /// not read (a newer Pi durable schema, a Pi Session Store V2 sidecar).
     /// It was not indexed from that store, and the store is left untouched.
@@ -174,10 +124,8 @@ impl IngestFailureKind {
             IngestFailureKind::KeychainUnavailable => "keychain-unavailable",
             IngestFailureKind::FilenameAssumptionViolated => "filename-assumption-violated",
             IngestFailureKind::UnreadableSource => "unreadable-source",
-            IngestFailureKind::UnsupportedSchema => "unsupported-schema",
             IngestFailureKind::UnparseableSource => "unparseable-source",
             IngestFailureKind::SourceOverReadBudget => "source-over-read-budget",
-            IngestFailureKind::SourceChangedDuringRead => "source-changed-during-read",
             IngestFailureKind::UnsupportedStoreFormat => "unsupported-store-format",
         }
     }
@@ -194,8 +142,7 @@ pub enum SourceIngestDisposition {
     Discovered,
     /// Some records indexed, others quarantined/truncated.
     PartiallyIndexed,
-    /// Records or an unsupported source are retained for inspection; normalized
-    /// content may be unavailable.
+    /// One or more records quarantined; the source itself is otherwise indexed.
     Quarantined,
     /// Skipped (filename/path assumption violated, or deliberately excluded).
     Skipped,
@@ -221,15 +168,14 @@ impl SourceIngestDisposition {
     }
 
     /// Whether this disposition reflects an explicit, non-silent limitation
-    /// (locked / unsupported-encrypted / skipped / quarantined) — the thing that
-    /// must never be reported as a successful zero-message import.
+    /// (locked / unsupported-encrypted / skipped) — the thing that must never be
+    /// reported as a successful zero-message import.
     pub const fn is_explicit_limitation(self) -> bool {
         matches!(
             self,
             SourceIngestDisposition::Locked
                 | SourceIngestDisposition::UnsupportedEncrypted
                 | SourceIngestDisposition::Skipped
-                | SourceIngestDisposition::Quarantined
         )
     }
 }
@@ -350,16 +296,6 @@ fn classify_kind(
             SourceIngestDisposition::Skipped,
             format!("{provider} source path could not be read; check permissions, then re-index"),
         ),
-        IngestFailureKind::UnsupportedSchema => (
-            IngestSeverity::Warning,
-            false,
-            SourceIngestDisposition::Quarantined,
-            format!(
-                "{provider} source schema is unsupported; inspect the retained source and any \
-                 available raw-mirror evidence, then use a connector that supports this schema; \
-                 retrying unchanged input cannot resolve this limitation"
-            ),
-        ),
         IngestFailureKind::UnparseableSource => (
             IngestSeverity::Error,
             false, // the same bytes fail the same way
@@ -378,16 +314,6 @@ fn classify_kind(
                 "{provider} session file is larger than the per-source read budget and was not \
                  indexed; raise the budget (Codex: CASS_CODEX_MAX_SOURCE_BYTES, up to 1073741824 \
                  bytes), then re-index"
-            ),
-        ),
-        IngestFailureKind::SourceChangedDuringRead => (
-            IngestSeverity::Error,
-            true, // the next run reads the source's current content
-            SourceIngestDisposition::Skipped,
-            format!(
-                "{provider} source changed while it was being read and was not indexed; the file \
-                 was readable, so this is not a permissions problem — re-index to read its current \
-                 content"
             ),
         ),
         IngestFailureKind::UnsupportedStoreFormat => (
@@ -474,13 +400,6 @@ fn connector_scan_failure_kind(error: &anyhow::Error) -> IngestFailureKind {
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ResourceBusy
         ) {
             IngestFailureKind::SourceLocked
-        } else if io.kind() == std::io::ErrorKind::Interrupted {
-            // The Codex consumer raises Interrupted only for a source that
-            // changed under the read (rewritten, replaced or grown between
-            // two passes). Those bytes were readable: reporting them as an
-            // unreadable source sent operators to check permissions for a
-            // file they could read the whole time.
-            IngestFailureKind::SourceChangedDuringRead
         } else {
             IngestFailureKind::UnreadableSource
         };
@@ -627,31 +546,6 @@ pub struct ConnectorIngestReport {
     pub provider: String,
     pub summary: ProviderIngestSummary,
     pub diagnostics: Vec<ConnectorIngestDiagnostic>,
-    // Keep the final scan disposition until persistence has finished. Older
-    // diagnostics can describe a failure followed by a successful read, so
-    // they cannot establish which summary counter owns a source now.
-    #[serde(skip)]
-    sources: BTreeMap<PathBuf, ObservedSource>,
-}
-
-impl ConnectorIngestReport {
-    /// A readable source is only fully indexed after its messages persist.
-    /// Preserve stronger scan diagnoses and count a source once even when
-    /// several of its chunks conflict with retained canonical history.
-    pub(crate) fn reconcile_persistence_conflicts<'a>(
-        &mut self,
-        conflicts: impl IntoIterator<Item = &'a PathBuf>,
-    ) {
-        for path in conflicts {
-            if let Some(source) = self.sources.get_mut(path)
-                && source.disposition == SourceIngestDisposition::Indexed
-            {
-                source.disposition = SourceIngestDisposition::PartiallyIndexed;
-                self.summary.indexed = self.summary.indexed.saturating_sub(1);
-                self.summary.partially_indexed = self.summary.partially_indexed.saturating_add(1);
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -813,27 +707,11 @@ impl ConnectorIngestRun {
         self.diagnostics.push(diagnostic);
     }
 
-    /// Keep typed publication failures and their actual paths through connector
-    /// scan context wrapping. Other errors retain the cause-based I/O, lock,
-    /// or content classification at the scan scope supplied by the caller.
+    /// Record a failed connector scan. A Codex scan that stopped only because
+    /// rollouts exceeded the per-source read budget is reported per rejected
+    /// file, with the setting that admits it; it used to surface as one
+    /// "unreadable, check permissions" entry naming the cass data directory.
     pub fn observe_connector_scan_error(&mut self, fallback_path: &Path, error: &anyhow::Error) {
-        if let Some(unsupported) = error.downcast_ref::<UnsupportedSourceSchema>() {
-            let mut diagnostic = classify_path(
-                &self.provider,
-                unsupported.source_path(),
-                IngestFailureKind::UnsupportedSchema,
-            );
-            diagnostic.line_or_row = unsupported.line_or_row();
-            self.sources.insert(
-                unsupported.source_path().to_path_buf(),
-                ObservedSource {
-                    disposition: diagnostic.disposition,
-                    malformed: false,
-                },
-            );
-            self.diagnostics.push(diagnostic);
-            return;
-        }
         if let Some(over) = crate::connectors::codex::over_budget_sources(error) {
             for path in &over.sampled_paths {
                 let diagnostic = classify_path(
@@ -842,7 +720,6 @@ impl ConnectorIngestRun {
                     IngestFailureKind::SourceOverReadBudget,
                 );
                 self.sources.insert(
-                    // ubs:ignore[rust.collections.clone-in-loop] -- Retained source diagnostics must own their paths independently of the borrowed scan error.
                     path.clone(),
                     ObservedSource {
                         disposition: diagnostic.disposition,
@@ -918,7 +795,6 @@ impl ConnectorIngestRun {
             provider: self.provider,
             summary,
             diagnostics: self.diagnostics,
-            sources: self.sources,
         }
     }
 
@@ -932,7 +808,6 @@ impl ConnectorIngestRun {
             if !unproductive {
                 continue;
             }
-            // ubs:ignore[rust.collections.clone-in-loop] -- Each connector context owns its data directory while the diagnostic collector retains its configuration.
             let ctx = ScanContext::with_roots(self.scan_data_dir.clone(), vec![root], None);
             for found in connector.store_diagnostics(&ctx) {
                 let kind = match found.code {
@@ -946,7 +821,6 @@ impl ConnectorIngestRun {
                     _ => continue,
                 };
                 let diagnostic = classify_path(&self.provider, &found.path, kind)
-                    // ubs:ignore[rust.perf.string-alloc-in-loop] -- Only failed durable stores produce an owned diagnostic; successful stores are not inspected again.
                     .with_detail(format!("{}: {}", found.code, found.detail));
                 if let Some(source) = self.sources.get_mut(&found.path) {
                     source.disposition = diagnostic.disposition;
@@ -1154,7 +1028,6 @@ mod tests {
     use super::*;
     use crate::connectors::Connector;
     use serde_json::json;
-    use std::collections::BTreeSet;
     use tempfile::tempdir;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1330,10 +1203,8 @@ mod tests {
             IngestFailureKind::KeychainUnavailable,
             IngestFailureKind::FilenameAssumptionViolated,
             IngestFailureKind::UnreadableSource,
-            IngestFailureKind::UnsupportedSchema,
             IngestFailureKind::UnparseableSource,
             IngestFailureKind::SourceOverReadBudget,
-            IngestFailureKind::SourceChangedDuringRead,
             IngestFailureKind::UnsupportedStoreFormat,
         ];
         let destructive = ["rm ", "--delete", "--purge", "reset", "drop ", "rm -rf"];
@@ -1491,9 +1362,7 @@ mod tests {
             IngestFailureKind::UnreadableSource,
             IngestFailureKind::UnparseableSource,
             IngestFailureKind::TruncatedSession,
-            IngestFailureKind::UnsupportedSchema,
             IngestFailureKind::SourceOverReadBudget,
-            IngestFailureKind::SourceChangedDuringRead,
         ];
         verify_eq!(
             serde_json::to_value(failure_kinds)?,
@@ -1507,9 +1376,7 @@ mod tests {
                 "unreadable-source",
                 "unparseable-source",
                 "truncated-session",
-                "unsupported-schema",
-                "source-over-read-budget",
-                "source-changed-during-read"
+                "source-over-read-budget"
             ])
         );
         for (k, w) in [
@@ -1534,14 +1401,9 @@ mod tests {
             (IngestFailureKind::UnreadableSource, "unreadable-source"),
             (IngestFailureKind::UnparseableSource, "unparseable-source"),
             (IngestFailureKind::TruncatedSession, "truncated-session"),
-            (IngestFailureKind::UnsupportedSchema, "unsupported-schema"),
             (
                 IngestFailureKind::SourceOverReadBudget,
                 "source-over-read-budget",
-            ),
-            (
-                IngestFailureKind::SourceChangedDuringRead,
-                "source-changed-during-read",
             ),
         ] {
             verify_eq!(k.as_str(), w);
@@ -1622,11 +1484,8 @@ mod tests {
             messages: Vec::new(),
         };
         run.observe_conversation(&mut conversation);
-        let mut report = run.finish();
-        report.reconcile_persistence_conflicts(&BTreeSet::from([conversation.source_path.clone()]));
-        report.reconcile_persistence_conflicts(&BTreeSet::from([conversation.source_path]));
+        let report = run.finish();
         verify_eq!(report.summary.partially_indexed, 1);
-        verify_eq!(report.summary.indexed, 0);
         verify_eq!(report.diagnostics.len(), 1);
         verify_eq!(report.diagnostics[0].line_or_row, Some(2));
         verify_eq!(
@@ -1739,159 +1598,10 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_schema_is_an_explicit_nonretryable_quarantine() -> TestResult {
-        let diagnostic = classify(
-            "cloudmcp",
-            "/fixture/publication/manifest.json",
-            IngestFailureKind::UnsupportedSchema,
-        );
-        verify_eq!(diagnostic.severity, IngestSeverity::Warning);
-        verify!(!diagnostic.retryable);
-        verify_eq!(diagnostic.disposition, SourceIngestDisposition::Quarantined);
-        verify!(diagnostic.disposition.is_explicit_limitation());
-        let value = serde_json::to_value(&diagnostic)?;
-        verify_eq!(value["failure_kind"], "unsupported-schema");
-        verify_eq!(value["disposition"], "quarantined");
-        let roundtrip: ConnectorIngestDiagnostic = serde_json::from_value(value)?;
-        verify_eq!(roundtrip, diagnostic);
-
-        let mut summary = ProviderIngestSummary::default();
-        summary.record(diagnostic.disposition);
-        verify_eq!(summary.total(), 1);
-        verify_eq!(summary.quarantined, 1);
-        verify_eq!(summary.skipped, 0);
-        verify_eq!(summary.with_content(), 0);
-        Ok(())
-    }
-
-    #[test]
-    fn wrapped_schema_error_keeps_actual_path_and_line_without_lock_heuristics() -> TestResult {
-        let fallback = Path::new("/fixture/cass-data");
-        let publication = Path::new("/fixture/locked/busy/transcript.jsonl");
-        let ctx = ScanContext::with_roots(fallback.to_path_buf(), vec![], None);
-        let mut run = ConnectorIngestRun::begin("cloudmcp", fallback, &ctx, &[]);
-        let error = anyhow::Error::new(
-            UnsupportedSourceSchema::new(publication, "CloudMCP event").with_line(3),
-        )
-        .context("busy publication scan was locked while reporting its schema");
-        run.observe_connector_scan_error(fallback, &error);
-        let report = run.finish();
-        verify_eq!(report.summary.total(), 1);
-        verify_eq!(report.summary.quarantined, 1);
-        verify_eq!(report.summary.locked, 0);
-        verify_eq!(report.summary.skipped, 0);
-        verify_eq!(report.summary.with_content(), 0);
-        verify_eq!(report.diagnostics.len(), 1);
-        let diagnostic = &report.diagnostics[0];
-        verify_eq!(diagnostic.source_path, publication.display().to_string());
-        verify_eq!(diagnostic.line_or_row, Some(3));
-        verify_eq!(
-            diagnostic.failure_kind,
-            IngestFailureKind::UnsupportedSchema
-        );
-        verify!(!diagnostic.retryable);
-        verify_eq!(diagnostic.workspace, None);
-        verify_eq!(diagnostic.external_id, None);
-        verify_eq!(diagnostic.canonical_id, None);
-        Ok(())
-    }
-
-    #[test]
-    fn untyped_schema_text_does_not_invent_a_typed_publication_failure() -> TestResult {
-        let fallback = Path::new("/fixture/cass-data");
-        let ctx = ScanContext::with_roots(fallback.to_path_buf(), vec![], None);
-        let mut run = ConnectorIngestRun::begin("cloudmcp", fallback, &ctx, &[]);
-        let error = anyhow::anyhow!("unsupported CloudMCP manifest schema");
-        run.observe_connector_scan_error(fallback, &error);
-        let report = run.finish();
-        verify_eq!(report.summary.total(), 1);
-        verify_eq!(report.summary.skipped, 1);
-        verify_eq!(report.summary.quarantined, 0);
-        verify_eq!(report.diagnostics.len(), 1);
-        verify_eq!(
-            report.diagnostics[0].failure_kind,
-            IngestFailureKind::UnparseableSource
-        );
-        verify_eq!(
-            report.diagnostics[0].source_path,
-            fallback.display().to_string()
-        );
-        verify!(!report.diagnostics[0].retryable);
-        Ok(())
-    }
-
-    #[test]
-    fn connector_error_observer_preserves_retryable_lock_failures() -> TestResult {
-        let source = Path::new("/fixture/cursor/state.vscdb");
-        let ctx = ScanContext::with_roots(PathBuf::from("/fixture/cass-data"), vec![], None);
-        let mut run = ConnectorIngestRun::begin("cursor", &ctx.data_dir, &ctx, &[]);
-        let error = anyhow::anyhow!("database is locked (SQLITE_BUSY)");
-        run.observe_connector_scan_error(source, &error);
-        let report = run.finish();
-        verify_eq!(report.summary.total(), 1);
-        verify_eq!(report.summary.locked, 1);
-        verify_eq!(report.summary.quarantined, 0);
-        verify_eq!(
-            report.diagnostics[0].failure_kind,
-            IngestFailureKind::SourceLocked
-        );
-        verify_eq!(
-            report.diagnostics[0].source_path,
-            source.display().to_string()
-        );
-        verify!(report.diagnostics[0].retryable);
-        Ok(())
-    }
-
-    #[test]
     fn indexing_stats_robot_shape_exposes_summary_and_diagnostics() -> TestResult {
         let value = serde_json::to_value(crate::indexer::IndexingStats::default())?;
         verify_eq!(value["connector_summary"], json!({}));
         verify_eq!(value["connector_diagnostics"], json!([]));
-        Ok(())
-    }
-
-    #[test]
-    fn persistence_conflicts_use_final_source_dispositions() -> TestResult {
-        let ctx = ScanContext::local_default(PathBuf::from("/fixture/data"), None);
-        let recovered = PathBuf::from("/fixture/recovered.jsonl");
-        let locked = PathBuf::from("/fixture/locked.jsonl");
-        let mut run = ConnectorIngestRun::begin("codex", &ctx.data_dir, &ctx, &[]);
-        run.observe_scan_error(&recovered, "database is locked");
-        let mut conversation = NormalizedConversation {
-            agent_slug: "codex".into(),
-            external_id: Some("recovered".into()),
-            title: None,
-            workspace: None,
-            source_path: recovered.clone(),
-            started_at: None,
-            ended_at: None,
-            metadata: json!({}),
-            messages: Vec::new(),
-        };
-        run.observe_conversation(&mut conversation);
-        conversation.source_path = PathBuf::from("/fixture/healthy.jsonl");
-        run.observe_conversation(&mut conversation);
-        conversation.source_path = locked.clone();
-        run.observe_conversation(&mut conversation);
-        run.observe_scan_error(&locked, "database is locked");
-        let mut report = run.finish();
-        verify_eq!(report.summary.indexed, 2);
-        verify_eq!(report.summary.locked, 1);
-        let conflicts = BTreeSet::from([
-            recovered,
-            locked,
-            PathBuf::from("/fixture/not-in-this-scope.jsonl"),
-        ]);
-        report.reconcile_persistence_conflicts(&conflicts);
-        report.reconcile_persistence_conflicts(&conflicts);
-        verify_eq!(report.summary.indexed, 1);
-        verify_eq!(report.summary.partially_indexed, 1);
-        verify_eq!(report.summary.locked, 1);
-        verify_eq!(report.summary.total(), 3);
-        verify_eq!(report.diagnostics.len(), 2);
-        let serialized = serde_json::to_value(&report)?;
-        verify!(serialized.get("sources").is_none());
         Ok(())
     }
 
@@ -1936,61 +1646,6 @@ mod tests {
             IngestFailureKind::UnreadableSource
         );
         verify_eq!(report.diagnostics[0].source_path, "/data");
-        Ok(())
-    }
-
-    /// A source that changed while it was being read WAS readable: the Codex
-    /// consumer raises Interrupted for exactly that condition (rewritten,
-    /// replaced or grown between two passes). Reporting it as an unreadable
-    /// source sent operators to check permissions on a file they could read
-    /// the whole time, which is the same defect class the over-budget
-    /// diagnostic already fixed.
-    #[test]
-    fn a_source_that_changed_during_the_read_is_not_reported_as_unreadable() -> TestResult {
-        let ctx = ScanContext::local_default(PathBuf::from("/data"), None);
-        let changed = anyhow::Error::new(std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            "Codex source changed across parsing or enrichment; retry this source",
-        ))
-        .context("scanning codex");
-
-        let mut run = ConnectorIngestRun::begin("codex", Path::new("/data"), &ctx, &[]);
-        run.observe_connector_scan_error(Path::new("/data"), &changed);
-        let report = run.finish();
-        verify_eq!(report.diagnostics.len(), 1);
-        let diagnostic = &report.diagnostics[0];
-        verify_eq!(
-            diagnostic.failure_kind,
-            IngestFailureKind::SourceChangedDuringRead
-        );
-        verify_eq!(diagnostic.severity, IngestSeverity::Error);
-        verify!(diagnostic.retryable, "a re-read sees the current content");
-        verify_eq!(diagnostic.disposition, SourceIngestDisposition::Skipped);
-        verify!(
-            !diagnostic.safe_next_action.contains("check permissions"),
-            "a changed source was readable: {}",
-            diagnostic.safe_next_action
-        );
-        verify!(
-            diagnostic.safe_next_action.contains("re-index"),
-            "{}",
-            diagnostic.safe_next_action
-        );
-        verify_eq!(report.summary.skipped, 1);
-
-        // An ordinary I/O failure keeps its unreadable classification.
-        let denied = anyhow::Error::new(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "permission denied",
-        ))
-        .context("scanning codex");
-        let mut run = ConnectorIngestRun::begin("codex", Path::new("/data"), &ctx, &[]);
-        run.observe_connector_scan_error(Path::new("/data"), &denied);
-        let report = run.finish();
-        verify_eq!(
-            report.diagnostics[0].failure_kind,
-            IngestFailureKind::UnreadableSource
-        );
         Ok(())
     }
 

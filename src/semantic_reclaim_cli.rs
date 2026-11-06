@@ -108,8 +108,6 @@ impl Outcome {
                                 candidate.size_bytes,
                                 candidate.path.display()
                             )?;
-                            writeln!(output, "      reason: {}", candidate.reason)?;
-                            writeln!(output, "      ownership: {}", candidate.ownership)?;
                         }
                         writeln!(output, "Plan fingerprint: {}", plan.plan_fingerprint)?;
                         writeln!(

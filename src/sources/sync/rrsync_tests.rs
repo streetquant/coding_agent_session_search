@@ -113,7 +113,7 @@ fn restricted_readonly_transfer() {
         std::fs::create_dir_all(&destination).expect("create destination");
         let destination_str = destination.to_str().expect("UTF-8 destination");
         let transfer = |protection| {
-            run_rsync_command("5", &transport, &remote, destination_str, protection, &[])
+            run_rsync_command("5", &transport, &remote, destination_str, protection)
                 .expect("execute real rsync")
         };
         let rejected = transfer(protection);
@@ -163,79 +163,6 @@ fn restricted_readonly_transfer() {
             b"retain me",
             "fallback must retain additive sync semantics"
         );
-    }
-}
-
-#[cfg(unix)]
-#[test]
-#[ignore = "requires real rsync and rrsync executables on PATH"]
-fn antigravity_filters_keep_siblings_through_restricted_rsync() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let temp = tempfile::TempDir::new().unwrap();
-    let restricted = temp.path().join("restricted");
-    let adapter = temp.path().join("rrsync-transport.sh");
-    std::fs::write(
-        &adapter,
-        concat!(
-            "#!/bin/sh\nset -eu\n",
-            "root=$1\nshift\nshift\n",
-            "export SSH_ORIGINAL_COMMAND=\"$*\"\n",
-            "exec rrsync -ro \"$root\"\n",
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let transport = format!(
-        "sh {} {}",
-        quote_remote_shell_path(adapter.to_str().unwrap()),
-        quote_remote_shell_path(restricted.to_str().unwrap()),
-    );
-    for store in ["antigravity", "antigravity-cli"] {
-        let source = restricted.join(".gemini").join(store);
-        let retained = [
-            "brain/id/.system_generated/logs/transcript.jsonl",
-            "conversations/id.db",
-            "conversations/id.db-wal",
-            "conversation_summaries.db",
-            "conversation_summaries.db-wal",
-            "conversation_summaries.db-shm",
-            "conversation_summaries.db-journal",
-        ];
-        for name in retained
-            .into_iter()
-            .chain(["skills/prompt.md", "cache/blob"])
-        {
-            let path = source.join(name);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, name).unwrap();
-        }
-        for (case, suffix) in ["", "/", "/."].into_iter().enumerate() {
-            let remote_path = format!("/.gemini/{store}{suffix}");
-            let destination = temp.path().join(format!("{store}-{case}"));
-            std::fs::create_dir_all(&destination).unwrap();
-            std::fs::write(destination.join("keep-local-evidence"), "retained").unwrap();
-            let output = run_rsync_command(
-                "5",
-                &transport,
-                &remote_spec_for_rsync("fixture", &remote_path),
-                destination.to_str().unwrap(),
-                RsyncArgProtection::None,
-                antigravity_sync_filters(&remote_path),
-            )
-            .unwrap();
-            assert!(output.status.success(), "{output:?}");
-            let mirrored = destination.join(if suffix.is_empty() { store } else { "" });
-            for name in retained {
-                assert_eq!(
-                    std::fs::read(mirrored.join(name)).unwrap(),
-                    std::fs::read(source.join(name)).unwrap()
-                );
-            }
-            assert!(!mirrored.join("skills").exists());
-            assert!(!mirrored.join("cache").exists());
-            assert!(destination.join("keep-local-evidence").is_file());
-        }
     }
 }
 

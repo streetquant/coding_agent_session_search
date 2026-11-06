@@ -55,17 +55,6 @@ static PRIVATE_HOST_LABEL_RE: Lazy<Regex> = Lazy::new(|| {
     .expect("private host label redaction regex")
 });
 
-static PACK_CREDENTIAL_HEADER_RE: Lazy<Regex> = Lazy::new(|| {
-    // ubs:ignore -- Compile-time literal, exercised by the credential policy tests; no external pattern can reach this initialization.
-    Regex::new(r#"(?im)\b(?:cookie|set-cookie|authorization|[a-z0-9_]*webhook[_-]?secret|[a-z0-9_]*api[_-]?key|[a-z0-9_]*password)\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\r\n]+)"#)
-        .expect("pack credential header regex")
-});
-
-static PACK_ENTROPY_TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
-    // ubs:ignore -- Compile-time literal, exercised by the entropy boundary tests; no external pattern can reach this initialization.
-    Regex::new(r"[A-Za-z0-9+/_=-]{33,}").expect("pack entropy token regex")
-});
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackPlannerLimits {
     pub max_tokens: usize,
@@ -131,25 +120,6 @@ pub enum PackFreshnessPolicy {
     PreferRecent,
     Strict,
     AllowStale,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PackRedactionPolicy {
-    #[default]
-    Strict,
-    Balanced,
-    Off,
-}
-
-impl PackRedactionPolicy {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Strict => "strict",
-            Self::Balanced => "balanced",
-            Self::Off => "off",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,9 +228,6 @@ pub struct PackCandidate {
     /// One-based canonical `messages.idx + 1`, as accepted by --message-index.
     /// Physical source-file coordinates belong only in line_start/line_end.
     pub message_index: Option<usize>,
-    /// Anchor of the complete archived content, retained before excerpt shaping.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message_anchor: Option<String>,
     pub citation_verified: bool,
     pub content_hash: String,
     pub span_hash: String,
@@ -313,7 +280,6 @@ impl PackCandidate {
             line_end: None,
             conversation_id: hit.conversation_id,
             message_index,
-            message_anchor: hit.message_anchor.clone(),
             citation_verified: false,
             content_hash: content_hash.clone(),
             span_hash: content_hash,
@@ -422,8 +388,6 @@ pub struct PackPlanRequest {
     pub candidates: Vec<PackCandidate>,
     pub explain_selection: bool,
     pub include_skill_content: bool,
-    #[serde(default)]
-    pub redaction_policy: PackRedactionPolicy,
 }
 
 impl Default for PackPlanRequest {
@@ -436,7 +400,6 @@ impl Default for PackPlanRequest {
             candidates: Vec::new(),
             explain_selection: false,
             include_skill_content: false,
-            redaction_policy: PackRedactionPolicy::Strict,
         }
     }
 }
@@ -694,8 +657,6 @@ struct RenderedAnswerPack {
     omitted: RenderedOmitted,
     privacy: RenderedPrivacy,
     warnings: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    selection_debug: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -747,7 +708,6 @@ struct RenderedHealth {
     index_generation: Option<String>,
     lexical_readiness: &'static str,
     semantic_state: &'static str,
-    fallback_mode: Option<String>,
     active_rebuild: bool,
     lock_state: Option<String>,
     missing_database: bool,
@@ -762,9 +722,6 @@ struct RenderedSourceReadiness {
     readiness: &'static str,
     healthy: bool,
     evidence_count: usize,
-    last_sync_at_ms: Option<i64>,
-    last_indexed_at_ms: Option<i64>,
-    recommended_action: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -853,10 +810,6 @@ struct RenderedCitation {
     line_end: Option<usize>,
     message_index: Option<usize>,
     message_index_base: u8,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message_anchor: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    followup_unavailable_reason: Option<&'static str>,
     conversation_id: Option<i64>,
     content_hash: String,
     span_hash: String,
@@ -1052,16 +1005,7 @@ pub fn plan_answer_pack(
                 return (String::new(), false, Vec::new());
             }
             let mut redactions = Vec::new();
-            let policy = if request.redaction_policy == PackRedactionPolicy::Off
-                && candidate.origin_kind == "local"
-            {
-                PackRedactionPolicy::Off
-            } else if request.redaction_policy == PackRedactionPolicy::Off {
-                PackRedactionPolicy::Strict
-            } else {
-                request.redaction_policy
-            };
-            let redacted = redact_pack_excerpt(&candidate.excerpt, policy, &mut redactions);
+            let redacted = redact_pack_output_text(&candidate.excerpt, &mut redactions);
             let (excerpt, truncated) =
                 truncate_excerpt(&redacted, request.limits.max_excerpt_chars);
             (excerpt, truncated, redactions)
@@ -1094,7 +1038,7 @@ pub fn plan_answer_pack(
             }
 
             let (excerpt, excerpt_truncated, _) = &prepared_excerpts[candidate_index];
-            if !pack_excerpt_has_meaningful_text(excerpt) {
+            if excerpt.trim().is_empty() {
                 let score = score_candidate(
                     candidate,
                     &request,
@@ -1249,165 +1193,12 @@ pub fn plan_answer_pack(
     })
 }
 
-struct CanonicalPackMessage {
-    session_id: String,
-    role: String,
-    created_at_ms: Option<i64>,
-    message_index: usize,
-}
-
-fn normalized_citation_role(role: &str) -> Option<&'static str> {
-    match role.to_ascii_lowercase().as_str() {
-        "agent" | "assistant" => Some("assistant"),
-        "user" => Some("user"),
-        "tool" => Some("tool"),
-        "system" => Some("system"),
-        _ => None,
-    }
-}
-
-fn canonical_pack_message(
-    storage: &crate::storage::sqlite::FrankenStorage,
-    candidate: &PackCandidate,
-    remaining_content_bytes: &mut usize,
-) -> Option<CanonicalPackMessage> {
-    use crate::franken_sync::compat::{ConnectionExt, RowExt};
-
-    let conversation_id = candidate.conversation_id.filter(|id| *id > 0)?;
-    let message_index = candidate.message_index.filter(|index| *index > 0)?;
-    let idx = i64::try_from(message_index.checked_sub(1)?).ok()?;
-    let expected_anchor = candidate.message_anchor.as_deref()?;
-    // LIMIT 2 also probes ambiguous legacy ordinals. Reserve space for both
-    // bodies before SQL transfers either one; rejected proofs still cost bytes.
-    let max_content_bytes = (*remaining_content_bytes / 2).min(8 * 1024 * 1024);
-    let source_sql = crate::normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
-    let origin_sql =
-        crate::normalized_source_origin_kind_sql_expr("c.source_id", "s.kind", "c.origin_host");
-    let sql = format!(
-        "SELECT m.created_at,
-                CASE WHEN typeof(m.role) = 'text' AND length(CAST(m.role AS BLOB)) <= 1024
-                     THEN m.role ELSE NULL END,
-                typeof(m.content), COALESCE(length(CAST(m.content AS BLOB)), 0),
-                CASE WHEN typeof(m.content) IN ('text', 'null')
-                          AND COALESCE(length(CAST(m.content AS BLOB)), 0) <= ?3
-                     THEN m.content ELSE NULL END,
-                CASE WHEN typeof(c.external_id) = 'text'
-                          AND length(CAST(c.external_id AS BLOB)) BETWEEN 1 AND 4096
-                     THEN c.external_id ELSE NULL END,
-                CASE WHEN (c.metadata_bin IS NULL OR length(c.metadata_bin) = 0)
-                          AND typeof(c.metadata_json) = 'text'
-                          AND length(CAST(c.metadata_json AS BLOB)) <= 65536
-                     THEN c.metadata_json ELSE NULL END,
-                CASE WHEN typeof(c.metadata_bin) = 'blob' AND length(c.metadata_bin) <= 65536
-                     THEN c.metadata_bin ELSE NULL END
-         FROM messages m JOIN conversations c ON c.id = m.conversation_id
-         JOIN agents a ON a.id = c.agent_id
-         LEFT JOIN sources s ON s.id = c.source_id
-         WHERE m.conversation_id = ?1 AND m.idx = ?2
-           AND c.source_path = ?4 AND {source_sql} = ?5
-           AND a.slug = 'codex' AND {origin_sql} = 'local'
-         LIMIT 2"
-    );
-    let rows = storage
-        .raw()
-        .query_map_collect(
-            &sql,
-            crate::franken_sync::params![
-                conversation_id,
-                idx,
-                i64::try_from(max_content_bytes).ok()?,
-                candidate.source_path.as_str(),
-                candidate.source_id.as_str()
-            ],
-            |row| {
-                let content = row.get_typed::<Option<String>>(4);
-                if let Ok(Some(content)) = &content {
-                    *remaining_content_bytes =
-                        remaining_content_bytes.saturating_sub(content.len());
-                }
-                let proof: Result<_, crate::franken_sync::FrankenError> = (|| {
-                    Ok((
-                        row.get_typed::<Option<i64>>(0)?,
-                        row.get_typed::<Option<String>>(1)?,
-                        row.get_typed::<String>(2)?,
-                        row.get_typed::<i64>(3)?,
-                        content?,
-                        row.get_typed::<Option<String>>(5)?,
-                        row.get_typed::<Option<String>>(6)?,
-                        row.get_typed::<Option<Vec<u8>>>(7)?,
-                    ))
-                })();
-                // Keep reading the second bounded row even if another column
-                // is invalid, so its transferred body is charged as well.
-                Ok(proof.ok())
-            },
-        )
-        .ok()?;
-    if rows.len() != 1 {
-        return None;
-    }
-    let (
-        created_at_ms,
-        role,
-        content_type,
-        content_bytes,
-        content,
-        external_id,
-        metadata_json,
-        metadata_bin,
-    ) = rows.into_iter().next()??;
-    let role = normalized_citation_role(role.as_deref()?)?.to_string();
-    let _external_id = external_id.filter(|id| !id.trim().is_empty())?;
-    // Codex external_id is normally a rollout-relative path. It cannot prove
-    // the session_meta ID. Only independently archived native session metadata
-    // can authorize a raw-session match; older rows remain unverified.
-    let metadata: serde_json::Value = match metadata_bin.filter(|bytes| !bytes.is_empty()) {
-        Some(bytes) => rmp_serde::from_slice(&bytes).ok()?,
-        None => serde_json::from_str(metadata_json.as_deref()?).ok()?,
-    };
-    let session_id = metadata
-        .get("native_session_id")?
-        .as_str()
-        .filter(|id| !id.trim().is_empty() && id.len() <= 4096)?
-        .to_string();
-    let content_bytes = usize::try_from(content_bytes).ok()?;
-    if content_bytes > max_content_bytes
-        || !matches!(content_type.as_str(), "text" | "null")
-        || (content_type == "text" && content.is_none())
-    {
-        return None;
-    }
-    let content = content.unwrap_or_default();
-    if content.len() != content_bytes
-        || candidate.excerpt != content
-        || candidate.created_at_ms != created_at_ms
-        || super::query::message_anchor_for_content(
-            &candidate.source_id,
-            &candidate.source_path,
-            Some(conversation_id),
-            Some(message_index),
-            &content,
-        )
-        .as_deref()
-            != Some(expected_anchor)
-    {
-        return None;
-    }
-    Some(CanonicalPackMessage {
-        session_id,
-        role,
-        created_at_ms,
-        message_index,
-    })
-}
-
-/// Verify modern Codex citations against the canonical archive and native records.
+/// Verify modern Codex citations using the same record parser as ingestion.
 /// Unknown formats, remote paths, missing files and ambiguous records keep
 /// their archived excerpts, with no invented source coordinates or verification.
 /// Called inside the CLI's existing bounded planner worker.
 pub(crate) fn verify_pack_source_citations(
     plan: &mut PlannedAnswerPack,
-    db_path: &std::path::Path,
     deadline: std::time::Instant,
 ) {
     use std::io::Read as _;
@@ -1436,44 +1227,9 @@ pub(crate) fn verify_pack_source_citations(
                 .push(index);
         }
     }
-    let mut canonical = BTreeMap::new();
-    if !by_path.is_empty() && db_path.is_file() && std::time::Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if let Ok(storage) =
-            crate::storage::sqlite::FrankenStorage::open_strict_readonly_with_timeout(
-                db_path, remaining,
-            )
-            && storage.raw().execute("BEGIN DEFERRED").is_ok()
-        {
-            let mut remaining_content_bytes = 32 * 1024 * 1024usize;
-            for index in by_path.values().flatten().copied() {
-                if std::time::Instant::now() >= deadline {
-                    break;
-                }
-                let Some(item) = plan.evidence.get(index) else {
-                    continue;
-                };
-                if let Some(message) =
-                    canonical_pack_message(&storage, &item.candidate, &mut remaining_content_bytes)
-                {
-                    canonical.insert(index, message);
-                }
-            }
-            if storage.raw().execute("ROLLBACK").is_err() {
-                canonical.clear();
-            }
-        }
-    }
     'source_files: for (path, indices) in by_path {
         if std::time::Instant::now() >= deadline || remaining_bytes == 0 {
             break;
-        }
-        let indices = indices
-            .into_iter()
-            .filter(|index| canonical.contains_key(index))
-            .collect::<Vec<_>>();
-        if indices.is_empty() {
-            continue;
         }
         let Ok(before) = std::fs::symlink_metadata(&path) else {
             continue;
@@ -1511,47 +1267,24 @@ pub(crate) fn verify_pack_source_citations(
         {
             continue;
         }
-        let mut matches = vec![(0usize, 0usize, None, false); indices.len()];
-        let mut session_id = None;
-        let mut session_metadata_valid = true;
-        let mut message_index = 0usize;
+        let mut matches = vec![(0usize, 0usize, None); indices.len()];
         for (line_index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
             if std::time::Instant::now() >= deadline {
                 break 'source_files;
             }
             let line = line.strip_suffix(b"\r").unwrap_or(line);
-            let Ok(raw) = serde_json::from_slice::<serde_json::Value>(line) else {
+            let Ok(raw) = serde_json::from_slice(line) else {
                 continue;
             };
-            if raw.get("type").and_then(serde_json::Value::as_str) == Some("session_meta") {
-                let id = raw
-                    .get("payload")
-                    .and_then(|payload| payload.get("id"))
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|id| !id.trim().is_empty());
-                if session_id.is_some() || id.is_none() {
-                    session_metadata_valid = false;
-                }
-                session_id = id.map(str::to_string);
-                continue;
-            }
             let Some(message) = crate::connectors::codex::modern_codex_message(&raw) else {
                 continue;
             };
-            message_index = message_index.saturating_add(1);
             let mut redacted_content = None;
             for (slot, evidence_index) in matches.iter_mut().zip(&indices) {
-                let (Some(item), Some(proof)) = (
-                    plan.evidence.get(*evidence_index),
-                    canonical.get(evidence_index),
-                ) else {
-                    continue;
-                };
-                let candidate = &item.candidate;
-                if !session_metadata_valid
-                    || session_id.as_deref() != Some(proof.session_id.as_str())
-                    || message.created_at != proof.created_at_ms
-                    || normalized_citation_role(&message.role) != Some(proof.role.as_str())
+                let candidate = &plan.evidence[*evidence_index].candidate;
+                if candidate
+                    .created_at_ms
+                    .is_some_and(|created| message.created_at != Some(created))
                 {
                     continue;
                 }
@@ -1572,18 +1305,12 @@ pub(crate) fn verify_pack_source_citations(
                     slot.0 += 1;
                     slot.1 = line_index + 1;
                     slot.2 = Some(blake3::hash(line));
-                    slot.3 = message_index == proof.message_index;
                 }
             }
         }
-        for (evidence_index, (count, line, hash, ordinal_matches)) in
-            indices.into_iter().zip(matches)
-        {
-            if session_metadata_valid && count == 1 && ordinal_matches {
-                let Some(item) = plan.evidence.get_mut(evidence_index) else {
-                    continue;
-                };
-                let candidate = &mut item.candidate;
+        for (evidence_index, (count, line, hash)) in indices.into_iter().zip(matches) {
+            if count == 1 {
+                let candidate = &mut plan.evidence[evidence_index].candidate;
                 candidate.line_start = Some(line);
                 candidate.line_end = Some(line);
                 candidate.citation_verified = true;
@@ -2210,17 +1937,6 @@ fn rendered_answer_pack_with_correlation(
         warnings.push("privacy_redactions_applied".to_string());
     }
 
-    let selection_debug = request.explain_selection.then(|| {
-        serde_json::json!({
-            "candidate_fetch_limit": plan.diagnostics.candidate_fetch_limit,
-            "selected": evidence.iter().map(|item| serde_json::json!({
-                "id": item.id,
-                "selection": item.selection,
-            })).collect::<Vec<_>>(),
-            "omitted": &omitted_items,
-        })
-    });
-
     RenderedAnswerPack {
         schema_version: "cass.pack.v2",
         query: RenderedQuery {
@@ -2263,7 +1979,6 @@ fn rendered_answer_pack_with_correlation(
             index_generation,
             lexical_readiness: lexical_readiness_label(request.readiness.lexical_readiness),
             semantic_state: semantic_readiness_label(semantic_readiness),
-            fallback_mode: request.fallback_mode.clone(),
             active_rebuild: request.readiness.active_rebuild,
             lock_state,
             missing_database: request.readiness.missing_database,
@@ -2305,7 +2020,6 @@ fn rendered_answer_pack_with_correlation(
             redaction_counts,
         },
         warnings,
-        selection_debug,
     }
 }
 
@@ -2462,30 +2176,7 @@ fn pack_title(request: &PackRenderRequest) -> String {
 }
 
 fn redact_pack_output_text(input: &str, redactions: &mut Vec<RenderedRedaction>) -> String {
-    redact_pack_excerpt(input, PackRedactionPolicy::Strict, redactions)
-}
-
-fn redact_pack_excerpt(
-    input: &str,
-    policy: PackRedactionPolicy,
-    redactions: &mut Vec<RenderedRedaction>,
-) -> String {
     let mut output = input.to_string();
-
-    // Preserve the complete path boundary before token redactors can replace
-    // a long prefix. The remaining passes still scrub a sensitive basename.
-    let path_redacted = PRIVATE_PATH_RE.replace_all(&output, |captures: &Captures<'_>| {
-        redacted_private_path_marker(&captures[0])
-    });
-    if let Cow::Owned(redacted) = path_redacted {
-        push_full_redaction(
-            redactions,
-            "private_path",
-            &output,
-            &format!("{REDACTED_PATH_PREFIX}/<name>"),
-        );
-        output = redacted;
-    }
 
     let encrypted_redacted = ENCRYPTED_PAYLOAD_RE.replace_all(&output, |_: &Captures<'_>| {
         REDACTED_ENCRYPTED_PAYLOAD_MARKER
@@ -2500,43 +2191,9 @@ fn redact_pack_excerpt(
         output = redacted;
     }
 
-    if policy != PackRedactionPolicy::Off
-        && let Cow::Owned(redacted) = redact_text(&output)
-    {
+    if let Cow::Owned(redacted) = redact_text(&output) {
         push_full_redaction(redactions, "secret", &output, REDACTED_VALUE_MARKER);
         output = redacted;
-    }
-
-    if policy != PackRedactionPolicy::Off {
-        let header_redacted = PACK_CREDENTIAL_HEADER_RE.replace_all(&output, REDACTED_VALUE_MARKER);
-        if let Cow::Owned(redacted) = header_redacted {
-            push_full_redaction(
-                redactions,
-                "credential_header",
-                &output,
-                REDACTED_VALUE_MARKER,
-            );
-            output = redacted;
-        }
-    }
-
-    if policy == PackRedactionPolicy::Strict {
-        let entropy_redacted =
-            PACK_ENTROPY_TOKEN_RE.replace_all(&output, |captures: &Captures<'_>| {
-                let Some(matched) = captures.get(0) else {
-                    return REDACTED_VALUE_MARKER.to_string();
-                };
-                let token = matched.as_str();
-                if pack_token_has_high_entropy(token) {
-                    REDACTED_VALUE_MARKER.to_string()
-                } else {
-                    token.to_string()
-                }
-            });
-        if entropy_redacted != output {
-            push_full_redaction(redactions, "high_entropy", &output, REDACTED_VALUE_MARKER);
-            output = entropy_redacted.into_owned();
-        }
     }
 
     let host_redacted =
@@ -2551,40 +2208,20 @@ fn redact_pack_excerpt(
         output = redacted;
     }
 
+    let path_redacted = PRIVATE_PATH_RE.replace_all(&output, |captures: &Captures<'_>| {
+        redacted_private_path_marker(&captures[0])
+    });
+    if let Cow::Owned(redacted) = path_redacted {
+        push_full_redaction(
+            redactions,
+            "private_path",
+            &output,
+            &format!("{REDACTED_PATH_PREFIX}/<name>"),
+        );
+        output = redacted;
+    }
+
     output
-}
-
-fn pack_token_has_high_entropy(token: &str) -> bool {
-    if token.len() <= 32 {
-        return false;
-    }
-    let mut counts = [0usize; 256];
-    for byte in token.bytes() {
-        if let Some(count) = counts.get_mut(usize::from(byte)) {
-            *count += 1;
-        }
-    }
-    let entropy: f64 = counts
-        .iter()
-        .filter(|count| **count > 0)
-        .map(|count| {
-            let probability = *count as f64 / token.len() as f64;
-            -probability * probability.log2()
-        })
-        .sum();
-    entropy
-        >= if token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            3.0
-        } else {
-            4.5
-        }
-}
-
-fn pack_excerpt_has_meaningful_text(excerpt: &str) -> bool {
-    let without_markers = excerpt
-        .replace(REDACTED_VALUE_MARKER, "")
-        .replace(REDACTED_ENCRYPTED_PAYLOAD_MARKER, "");
-    !without_markers.trim().is_empty()
 }
 
 /// Redacts every string in a JSON value; keys are schema names and are kept.
@@ -2794,9 +2431,6 @@ fn rendered_evidence(
         .as_deref()
         .map(|workspace| redact_pack_output_text(workspace, &mut redactions));
     let origin_host = rendered_origin_host(candidate.origin_host.as_deref(), &mut redactions);
-    let followup_unavailable_reason = (source_id != candidate.source_id
-        || source_path != candidate.source_path)
-        .then_some("redacted-source-coordinates");
     let citation = RenderedCitation {
         source_path,
         source_id,
@@ -2809,8 +2443,6 @@ fn rendered_evidence(
         line_end: candidate.line_end,
         message_index: candidate.message_index,
         message_index_base: 1,
-        message_anchor: candidate.message_anchor.clone(),
-        followup_unavailable_reason,
         conversation_id: candidate.conversation_id,
         content_hash: candidate.content_hash.clone(),
         span_hash: candidate.span_hash.clone(),
@@ -2973,19 +2605,6 @@ fn rendered_source_readiness(evidence: &[RenderedEvidence]) -> Vec<RenderedSourc
     sources
         .into_iter()
         .map(|((source_id, _), source)| RenderedSourceReadiness {
-            // Search hits do not carry source synchronization timestamps.
-            // Unknown is explicit rather than inferred from message age.
-            last_sync_at_ms: None,
-            last_indexed_at_ms: evidence
-                .iter()
-                .filter(|item| {
-                    item.citation.source_id == source_id
-                        && item.citation.origin_kind == source.origin_kind
-                })
-                .filter_map(|item| item.citation.indexed_at_ms)
-                .max(),
-            recommended_action: (!source.healthy)
-                .then_some("inspect cass status --json and the cited source"),
             source_id,
             origin_kind: source.origin_kind,
             readiness: source_readiness_label(source.worst_readiness),
@@ -3115,15 +2734,14 @@ fn render_answer_pack_jsonl(
     request: &PackRenderRequest,
 ) -> Result<String, PackRenderError> {
     let mut lines = Vec::with_capacity(envelope.evidence.len() + 4);
-    let mut header = serde_json::json!({
-        "_meta": &envelope.meta,
-        "schema_version": envelope.schema_version,
-        "budget": &envelope.budget,
-    });
-    if let (Some(debug), Some(object)) = (&envelope.selection_debug, header.as_object_mut()) {
-        object.insert("selection_debug".to_string(), debug.clone());
-    }
-    lines.push(json_line(header, request)?);
+    lines.push(json_line(
+        serde_json::json!({
+            "_meta": &envelope.meta,
+            "schema_version": envelope.schema_version,
+            "budget": &envelope.budget,
+        }),
+        request,
+    )?);
     lines.push(json_line(
         serde_json::json!({ "pack": &envelope.pack }),
         request,
@@ -3156,9 +2774,6 @@ fn render_answer_pack_markdown(envelope: &RenderedAnswerPack) -> String {
     let mut out = String::new();
     out.push_str("# ");
     out.push_str(&markdown_literal_line(&envelope.pack.title));
-    if envelope.privacy.sensitive_output {
-        out.push_str("\n\n**Sensitive output: excerpt redaction is off.**\n");
-    }
     if !envelope.warnings.is_empty() {
         out.push_str("\n\n## Warnings\n");
         for warning in &envelope.warnings {
@@ -3209,14 +2824,6 @@ fn render_answer_pack_markdown(envelope: &RenderedAnswerPack) -> String {
             }
             if let Some(message_index) = item.citation.message_index {
                 out.push_str(&format!(" message_index={message_index} (1-based)"));
-            }
-            if let Some(anchor) = item.citation.message_anchor.as_deref() {
-                out.push_str(" message_anchor=");
-                out.push_str(anchor);
-            }
-            if let Some(reason) = item.citation.followup_unavailable_reason {
-                out.push_str(" followup_unavailable_reason=");
-                out.push_str(reason);
             }
             out.push_str("\n\n");
             // Preserve the complete prepared excerpt, including blank lines.
@@ -3407,55 +3014,6 @@ fn effective_semantic_readiness(request: &PackRenderRequest) -> PackSemanticRead
 mod tests {
     use super::*;
 
-    const CITATION_SESSION_HEADER: &str =
-        r#"{"type":"session_meta","payload":{"id":"pack-native-session"}}"#;
-
-    fn canonical_citation_fixture(
-        root: &std::path::Path,
-        candidate: &mut PackCandidate,
-    ) -> (tempfile::TempDir, std::path::PathBuf) {
-        use crate::franken_sync::compat::ConnectionExt;
-
-        let archive = tempfile::tempdir_in(root).unwrap();
-        let db_path = archive.path().join("canonical.db");
-        let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
-        // These synthetic parser controls model provenance captured from the
-        // original header at initial ingestion. The real Codex connector does
-        // not currently archive this field; native journey tests must not add
-        // it afterward merely to obtain a verified raw citation.
-        let header: serde_json::Value = serde_json::from_str(CITATION_SESSION_HEADER).unwrap();
-        let metadata = serde_json::json!({
-            "source": "rollout",
-            "native_session_id": header["payload"]["id"],
-        })
-        .to_string();
-        storage.raw().execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'codex', 'Codex', 'local', 0, 0)").unwrap();
-        storage.raw().execute_compat(
-            "INSERT INTO conversations (id, agent_id, external_id, source_path, source_id, metadata_json) VALUES (1, 1, 'rollout-provider-path.jsonl', ?1, 'local', ?2)",
-            crate::franken_sync::params![
-                candidate.source_path.as_str(),
-                metadata.as_str()
-            ],
-        )
-        .unwrap();
-        storage.raw().execute_compat(
-            "INSERT INTO messages (id, conversation_id, idx, role, created_at, content) VALUES (1, 1, 0, 'user', ?1, ?2)",
-            crate::franken_sync::params![candidate.created_at_ms, candidate.excerpt.as_str()],
-        )
-        .unwrap();
-        candidate.conversation_id = Some(1);
-        candidate.message_index = Some(1);
-        candidate.message_anchor = super::super::query::message_anchor_for_content(
-            &candidate.source_id,
-            &candidate.source_path,
-            candidate.conversation_id,
-            candidate.message_index,
-            &candidate.excerpt,
-        );
-        drop(storage);
-        (archive, db_path)
-    }
-
     fn candidate(id: &str, source_id: &str, source_path: &str, score: f64) -> PackCandidate {
         PackCandidate {
             candidate_id: id.to_string(),
@@ -3475,7 +3033,6 @@ mod tests {
             line_end: Some(12),
             conversation_id: None,
             message_index: None,
-            message_anchor: None,
             citation_verified: true,
             content_hash: format!("{id}_content"),
             span_hash: format!("{id}_span"),
@@ -3511,7 +3068,6 @@ mod tests {
             candidates,
             explain_selection: false,
             include_skill_content: false,
-            redaction_policy: PackRedactionPolicy::Strict,
         }
     }
 
@@ -3674,7 +3230,6 @@ mod tests {
     fn from_search_hit_uses_robot_match_type_spelling() {
         let hit = SearchHit {
             title: "session".to_string(),
-            message_anchor: None,
             snippet: "fallback".to_string(),
             content: "fallback content".to_string(),
             content_hash: 42,
@@ -3714,18 +3269,17 @@ mod tests {
             }
         })
         .to_string();
-        let source = format!("{CITATION_SESSION_HEADER}\n\ninvalid json\n{raw}\n");
+        let source = format!("{{\"type\":\"session_meta\"}}\n\ninvalid json\n{raw}\n");
         let mut item = candidate("verify", "local", path.to_str().unwrap(), 10.0);
         item.created_at_ms = None;
         item.excerpt = "verifiedneedle".to_string();
         item.message_index = Some(1);
-        let (_archive, db_path) = canonical_citation_fixture(temp.path(), &mut item);
         let base = plan_answer_pack(request(vec![item])).unwrap();
 
         for (contents, expected_line) in [
             (source.clone(), Some(4)),
             (source.replace('\n', "\r\n"), Some(4)),
-            (format!("{CITATION_SESSION_HEADER}\n{raw}\n{raw}\n"), None),
+            (format!("{raw}\n{raw}\n"), None),
             (source.replace("verifiedneedle", "changed source"), None),
             (String::new(), None),
         ] {
@@ -3733,7 +3287,6 @@ mod tests {
             let mut plan = base.clone();
             verify_pack_source_citations(
                 &mut plan,
-                &db_path,
                 std::time::Instant::now() + std::time::Duration::from_secs(1),
             );
             assert_eq!(plan.evidence.len(), 1);
@@ -3762,7 +3315,7 @@ mod tests {
             let mut plan = base.clone();
             plan.evidence[0].candidate.agent = agent.to_string();
             plan.evidence[0].candidate.origin_kind = origin.to_string();
-            verify_pack_source_citations(&mut plan, &db_path, deadline);
+            verify_pack_source_citations(&mut plan, deadline);
             assert!(!plan.evidence[0].candidate.citation_verified);
             assert_eq!(plan.evidence[0].candidate.line_start, None);
             assert_eq!(plan.evidence[0].excerpt, "verifiedneedle");
@@ -3771,7 +3324,6 @@ mod tests {
         let mut missing = base.clone();
         verify_pack_source_citations(
             &mut missing,
-            &db_path,
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         );
         assert!(!missing.evidence[0].candidate.citation_verified);
@@ -3785,236 +3337,11 @@ mod tests {
         let mut oversized = base;
         verify_pack_source_citations(
             &mut oversized,
-            &db_path,
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         );
         assert!(!oversized.evidence[0].candidate.citation_verified);
         assert_eq!(oversized.evidence[0].candidate.line_start, None);
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 8 * 1024 * 1024 + 1);
-    }
-
-    #[test]
-    fn source_citations_reject_same_text_and_time_from_wrong_session_role_or_ordinal() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let path = temp.path().join("rollout-session-proof.jsonl");
-        let timestamp = 1_700_000_000_000_i64;
-        let record = |role: &str, text: &str| {
-            serde_json::json!({
-                "timestamp": timestamp,
-                "type": "response_item",
-                "payload": {
-                    "type": "message",
-                    "role": role,
-                    "content": [{"type": "input_text", "text": text}]
-                }
-            })
-            .to_string()
-        };
-        let raw = record("user", "canonical identity needle");
-        let mut item = candidate("session-proof", "local", path.to_str().unwrap(), 10.0);
-        item.excerpt = "canonical identity needle".to_string();
-        item.created_at_ms = Some(timestamp);
-        let (_archive, db_path) = canonical_citation_fixture(temp.path(), &mut item);
-        let anchor = item.message_anchor.clone();
-        assert!(anchor.is_some());
-        let base = plan_answer_pack(request(vec![item])).unwrap();
-        let metadata = r#"{"type":"event_msg","payload":{"type":"token_count"}}"#;
-        for (source, expected_line) in [
-            (
-                format!("{CITATION_SESSION_HEADER}\n{metadata}\n{raw}\n"),
-                Some(3),
-            ),
-            (
-                format!(
-                    "{}\n{metadata}\n{raw}\n",
-                    CITATION_SESSION_HEADER.replace("pack-native-session", "different-session")
-                ),
-                None,
-            ),
-            (
-                format!(
-                    "{CITATION_SESSION_HEADER}\n{metadata}\n{}\n",
-                    record("assistant", "canonical identity needle")
-                ),
-                None,
-            ),
-            (
-                format!(
-                    "{CITATION_SESSION_HEADER}\n{}\n{raw}\n",
-                    record("user", "a different first message")
-                ),
-                None,
-            ),
-            (format!("{metadata}\n{raw}\n"), None),
-        ] {
-            std::fs::write(&path, &source).unwrap();
-            let mut plan = base.clone();
-            verify_pack_source_citations(
-                &mut plan,
-                &db_path,
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
-            );
-            let evidence = &plan.evidence[0];
-            assert_eq!(
-                evidence.candidate.citation_verified,
-                expected_line.is_some()
-            );
-            assert_eq!(evidence.candidate.line_start, expected_line);
-            assert_eq!(evidence.candidate.line_end, expected_line);
-            assert_eq!(evidence.excerpt, "canonical identity needle");
-            assert_eq!(evidence.candidate.excerpt, "canonical identity needle");
-            assert_eq!(evidence.candidate.message_anchor, anchor);
-            if expected_line.is_some() {
-                assert_eq!(
-                    evidence.candidate.span_hash,
-                    blake3::hash(raw.as_bytes()).to_hex().to_string()
-                );
-            }
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
-        }
-    }
-
-    #[test]
-    fn source_citations_require_complete_canonical_identity_and_anchor() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let path = temp.path().join("rollout-canonical-proof.jsonl");
-        std::fs::write(
-            &path,
-            format!(
-                "{CITATION_SESSION_HEADER}\n{}\n",
-                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"canonical proof needle"}]}}"#,
-            ),
-        )
-        .unwrap();
-        let mut item = candidate("canonical-proof", "local", path.to_str().unwrap(), 10.0);
-        item.created_at_ms = None;
-        item.excerpt = "canonical proof needle".to_string();
-        let (_archive, db_path) = canonical_citation_fixture(temp.path(), &mut item);
-        let base = plan_answer_pack(request(vec![item])).unwrap();
-        for missing in [
-            "database",
-            "conversation",
-            "ordinal",
-            "anchor",
-            "wrong-anchor",
-            "excerpt",
-        ] {
-            let mut plan = base.clone();
-            let candidate = &mut plan.evidence[0].candidate;
-            let missing_db = temp.path().join("absent.db");
-            let selected_db = if missing == "database" {
-                &missing_db
-            } else {
-                &db_path
-            };
-            match missing {
-                "conversation" => candidate.conversation_id = None,
-                "ordinal" => candidate.message_index = None,
-                "anchor" => candidate.message_anchor = None,
-                "wrong-anchor" => candidate.message_anchor = Some(format!("v1:{}", "0".repeat(64))),
-                "excerpt" => candidate.excerpt = "different canonical text".to_string(),
-                _ => {}
-            }
-            let retained_excerpt = candidate.excerpt.clone();
-            let retained_anchor = candidate.message_anchor.clone();
-            verify_pack_source_citations(
-                &mut plan,
-                selected_db,
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
-            );
-            let candidate = &plan.evidence[0].candidate;
-            assert!(!candidate.citation_verified, "missing proof: {missing}");
-            assert_eq!(candidate.line_start, None);
-            assert_eq!(candidate.line_end, None);
-            assert_eq!(candidate.excerpt, retained_excerpt);
-            assert_eq!(candidate.message_anchor, retained_anchor);
-            assert!(
-                !missing_db.exists(),
-                "verification must not create an archive"
-            );
-        }
-
-        let storage =
-            crate::storage::sqlite::FrankenStorage::open_strict_readonly(&db_path).unwrap();
-        let valid = &base.evidence[0].candidate;
-        let mut stale = valid.clone();
-        stale.message_anchor = Some(format!("v1:{}", "0".repeat(64)));
-        let mut remaining_bytes = valid.excerpt.len() * 2;
-        assert!(canonical_pack_message(&storage, &stale, &mut remaining_bytes).is_none());
-        assert!(
-            canonical_pack_message(&storage, valid, &mut remaining_bytes).is_none(),
-            "a rejected stale proof must consume its transferred body budget"
-        );
-
-        let mut empty = valid.clone();
-        empty.excerpt.clear();
-        let (_empty_archive, empty_db) = canonical_citation_fixture(temp.path(), &mut empty);
-        let empty_storage =
-            crate::storage::sqlite::FrankenStorage::open_strict_readonly(&empty_db).unwrap();
-        let mut no_body_bytes = 0;
-        assert!(
-            canonical_pack_message(&empty_storage, &empty, &mut no_body_bytes).is_some(),
-            "complete empty content needs no body transfer budget and retains a valid anchor"
-        );
-    }
-
-    #[test]
-    fn source_citations_require_independent_session_metadata_and_prefer_binary() {
-        use crate::franken_sync::compat::ConnectionExt;
-
-        let temp = tempfile::TempDir::new().unwrap();
-        let path = temp.path().join("rollout-metadata-proof.jsonl");
-        std::fs::write(
-            &path,
-            format!(
-                "{CITATION_SESSION_HEADER}\n{}\n",
-                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"metadata proof needle"}]}}"#,
-            ),
-        )
-        .unwrap();
-        let mut item = candidate("metadata-proof", "local", path.to_str().unwrap(), 10.0);
-        item.created_at_ms = None;
-        item.excerpt = "metadata proof needle".to_string();
-        let (_archive, db_path) = canonical_citation_fixture(temp.path(), &mut item);
-        let anchor = item.message_anchor.clone();
-        let base = plan_answer_pack(request(vec![item])).unwrap();
-        let correct = serde_json::json!({"native_session_id": "pack-native-session"});
-        let wrong = serde_json::json!({"native_session_id": "another-session"});
-        for (json, binary, verified) in [
-            (serde_json::json!({"source": "rollout"}), None, false),
-            (
-                wrong.clone(),
-                Some(rmp_serde::to_vec(&correct).unwrap()),
-                true,
-            ),
-            (
-                correct.clone(),
-                Some(rmp_serde::to_vec(&wrong).unwrap()),
-                false,
-            ),
-            (correct.clone(), Some(vec![0xc1]), false),
-            (correct.clone(), Some(vec![0; 65537]), false),
-            (correct, None, true),
-        ] {
-            let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
-            storage.raw().execute_compat(
-                "UPDATE conversations SET external_id = 'pack-native-session', metadata_json = ?1, metadata_bin = ?2 WHERE id = 1",
-                crate::franken_sync::params![json.to_string(), binary],
-            ).unwrap();
-            drop(storage);
-            let mut plan = base.clone();
-            verify_pack_source_citations(
-                &mut plan,
-                &db_path,
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
-            );
-            let evidence = &plan.evidence[0];
-            assert_eq!(evidence.candidate.citation_verified, verified);
-            assert_eq!(evidence.candidate.line_start, verified.then_some(2));
-            assert_eq!(evidence.candidate.line_end, verified.then_some(2));
-            assert_eq!(evidence.candidate.message_anchor, anchor);
-            assert_eq!(evidence.candidate.excerpt, "metadata proof needle");
-        }
     }
 
     #[test]
@@ -4036,46 +3363,30 @@ mod tests {
         let mut item = candidate("whitespace", "local", path.to_str().unwrap(), 10.0);
         item.created_at_ms = None;
         item.excerpt = excerpt.to_string();
-        let (_archive, db_path) = canonical_citation_fixture(temp.path(), &mut item);
         let base = plan_answer_pack(request(vec![item])).unwrap();
         let raw = record(excerpt);
         for (source, verified) in [
-            (format!("{CITATION_SESSION_HEADER}\n{raw}"), true),
-            (
-                format!("{CITATION_SESSION_HEADER}\n{}", record("verified needle")),
-                true,
-            ),
-            (
-                format!("{CITATION_SESSION_HEADER}\n{}", record("verified  needle")),
-                false,
-            ),
-            (
-                format!(
-                    "{CITATION_SESSION_HEADER}\n{raw}\n{}",
-                    record("verified needle")
-                ),
-                false,
-            ),
+            (raw.clone(), true),
+            (record("verified needle"), true),
+            (record("verified  needle"), false),
+            (format!("{raw}\n{}", record("verified needle")), false),
         ] {
             std::fs::write(&path, &source).unwrap();
             let mut plan = base.clone();
             verify_pack_source_citations(
                 &mut plan,
-                &db_path,
                 std::time::Instant::now() + std::time::Duration::from_secs(1),
             );
             let evidence = &plan.evidence[0];
             assert_eq!(evidence.excerpt, excerpt);
             assert_eq!(evidence.candidate.excerpt, excerpt);
             assert_eq!(evidence.candidate.citation_verified, verified);
-            assert_eq!(evidence.candidate.line_start, verified.then_some(2));
-            assert_eq!(evidence.candidate.line_end, verified.then_some(2));
+            assert_eq!(evidence.candidate.line_start, verified.then_some(1));
+            assert_eq!(evidence.candidate.line_end, verified.then_some(1));
             if verified {
                 assert_eq!(
                     evidence.candidate.span_hash,
-                    blake3::hash(source.split_once('\n').unwrap().1.as_bytes())
-                        .to_hex()
-                        .to_string()
+                    blake3::hash(source.as_bytes()).to_hex().to_string()
                 );
             }
             assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
@@ -4109,23 +3420,20 @@ mod tests {
             (archived, record("different content"), None, false),
             (archived, raw.clone(), Some(1), false),
         ] {
-            let source = format!("{CITATION_SESSION_HEADER}\n{source}");
             std::fs::write(&path, &source).unwrap();
             let mut item = candidate("redacted", "local", path.to_str().unwrap(), 10.0);
             item.excerpt = excerpt.to_string();
             item.created_at_ms = timestamp;
-            let (_archive, db_path) = canonical_citation_fixture(temp.path(), &mut item);
             let mut plan = plan_answer_pack(request(vec![item])).unwrap();
             let prepared = plan.evidence[0].excerpt.clone();
             verify_pack_source_citations(
                 &mut plan,
-                &db_path,
                 std::time::Instant::now() + std::time::Duration::from_secs(1),
             );
             let evidence = &plan.evidence[0];
             assert_eq!(evidence.candidate.citation_verified, verified);
-            assert_eq!(evidence.candidate.line_start, verified.then_some(2));
-            assert_eq!(evidence.candidate.line_end, verified.then_some(2));
+            assert_eq!(evidence.candidate.line_start, verified.then_some(1));
+            assert_eq!(evidence.candidate.line_end, verified.then_some(1));
             assert_eq!(evidence.candidate.excerpt, excerpt);
             assert_eq!(evidence.excerpt, prepared);
             assert_eq!(evidence.id, evidence_id(&evidence.candidate));
@@ -4189,18 +3497,16 @@ mod tests {
         let mut item = candidate("identity", "local", path.to_str().unwrap(), 10.0);
         item.created_at_ms = None;
         item.excerpt = "identity needle".to_string();
-        let (_archive, db_path) = canonical_citation_fixture(temp.path(), &mut item);
         let base = plan_answer_pack(request(vec![item])).unwrap();
         let mut verified_ids = Vec::new();
         for prefix in ["", "\n"] {
-            let source = format!("{prefix}{CITATION_SESSION_HEADER}\n{raw}\n");
+            let source = format!("{prefix}{raw}\n");
             std::fs::write(&path, &source).unwrap();
             let mut plan = base.clone();
-            let expected_line = prefix.len() + 2;
+            let expected_line = prefix.len() + 1;
             for _ in 0..2 {
                 verify_pack_source_citations(
                     &mut plan,
-                    &db_path,
                     std::time::Instant::now() + std::time::Duration::from_secs(1),
                 );
                 let evidence = &plan.evidence[0];
@@ -4219,7 +3525,7 @@ mod tests {
                 if unavailable {
                     plan.evidence[0].candidate.agent = "unsupported".to_string();
                 }
-                verify_pack_source_citations(&mut plan, &db_path, std::time::Instant::now());
+                verify_pack_source_citations(&mut plan, std::time::Instant::now());
                 let evidence = &plan.evidence[0];
                 assert!(!evidence.candidate.citation_verified);
                 assert_eq!(evidence.candidate.line_start, None);
@@ -4240,10 +3546,7 @@ mod tests {
         let source = temp.path().join("source.jsonl");
         std::fs::write(
             &source,
-            format!(
-                "{CITATION_SESSION_HEADER}\n{}",
-                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"verifiedneedle"}]}}"#,
-            ),
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"verifiedneedle"}]}}"#,
         )
         .unwrap();
         let link = temp.path().join("link.jsonl");
@@ -4260,13 +3563,11 @@ mod tests {
             let mut item = candidate("special", "local", path.to_str().unwrap(), 10.0);
             item.created_at_ms = None;
             item.excerpt = "verifiedneedle".to_string();
-            let (_archive, db_path) = canonical_citation_fixture(temp.path(), &mut item);
             let mut plan = plan_answer_pack(request(vec![item])).unwrap();
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
             std::thread::spawn(move || {
                 verify_pack_source_citations(
                     &mut plan,
-                    &db_path,
                     std::time::Instant::now() + std::time::Duration::from_millis(100),
                 );
                 let _ = sender.send(plan);
@@ -4350,16 +3651,13 @@ mod tests {
 
     #[test]
     fn render_budget_timeout_is_partial_across_structured_formats() -> Result<(), String> {
-        let mut input = request(vec![candidate(
+        let plan = plan_answer_pack(request(vec![candidate(
             "budget-timeout",
             "local",
             "/s/budget-timeout.jsonl",
             10.0,
-        )]);
-        // Exercise deadline status with room for the full citation envelope;
-        // the separate output-boundary tests cover exhausted token budgets.
-        input.limits.max_tokens = 2_048;
-        let plan = plan_answer_pack(input).map_err(|err| format!("{err:?}"))?;
+        )]))
+        .map_err(|err| format!("{err:?}"))?;
         let expected_budget = serde_json::json!({
             "elapsed_ms": 125,
             "budget_ms": 100,
@@ -4370,13 +3668,9 @@ mod tests {
 
         for format in [PackRenderFormat::Json, PackRenderFormat::CompactJson] {
             let mut req = render_request(format);
-            req.limits.max_tokens = 2_048;
             req.budget = timed_out_budget();
 
-            // The deadline writer uses the supplied, bounded correlation
-            // snapshot. Compare against that same context, without loading
-            // live workspace history from this test's working directory.
-            let rendered = render_answer_pack_without_trust_correlation(&plan, &req)
+            let rendered = render_answer_pack(&plan, &req)
                 .map_err(|err| format!("{} render failed: {}", err.format, err.message))?;
             let value: serde_json::Value =
                 serde_json::from_str(&rendered).map_err(|err| err.to_string())?;
@@ -4387,27 +3681,6 @@ mod tests {
                 .as_array()
                 .ok_or_else(|| "structured pack evidence must be an array".to_string())?;
             assert_eq!(evidence.len(), 1);
-
-            let encoded = crate::render_cli_pack_with_output_budget(
-                plan.clone(),
-                req,
-                None,
-                true,
-                std::time::Instant::now(),
-                &crate::search::trust_correlation::CorrelationIndex::default(),
-            )
-            .map_err(|error| error.message)?;
-            let mut stdout = Vec::new();
-            let error = crate::write_cli_pack_output(&encoded, &mut stdout).unwrap_err();
-            assert_eq!(error.code, 8);
-            assert_eq!(error.kind, "partial-result");
-            assert!(error.retryable);
-            assert!(error.hint.is_some());
-            let emitted: serde_json::Value =
-                serde_json::from_slice(&stdout).map_err(|error| error.to_string())?;
-            assert_eq!(emitted["evidence"], value["evidence"]);
-            assert_eq!(emitted["budget"], expected_budget);
-            assert_eq!(emitted["_meta"]["partial"], true);
         }
 
         let mut jsonl_req = render_request(PackRenderFormat::Jsonl);
@@ -5033,241 +4306,6 @@ mod tests {
                 "privacy_redactions_applied"
             ])
         );
-    }
-
-    #[test]
-    fn pack_policy_changes_excerpts_without_unmasking_coordinates_or_identity() {
-        let credential = format!("sk-{}", "01234567890123456789");
-        let mut item = candidate("policy", "local", "/home/alice/private/session.jsonl", 9.0);
-        item.excerpt = credential.clone();
-        for policy in [
-            PackRedactionPolicy::Strict,
-            PackRedactionPolicy::Balanced,
-            PackRedactionPolicy::Off,
-        ] {
-            let mut request = request(vec![item.clone()]);
-            request.redaction_policy = policy;
-            let plan = plan_answer_pack(request).unwrap();
-            if policy != PackRedactionPolicy::Off {
-                assert!(plan.evidence.is_empty());
-                assert_eq!(plan.omitted.len(), 1);
-                assert_eq!(plan.omitted[0].reason, PackOmittedReason::RedactedToEmpty);
-                continue;
-            }
-            assert_eq!(plan.evidence.len(), 1);
-            assert_eq!(plan.evidence[0].excerpt, credential);
-            assert_eq!(plan.evidence[0].candidate, item);
-            let mut render = render_request(PackRenderFormat::Json);
-            render.redaction_policy = policy.label().to_string();
-            render.sensitive_output = true;
-            let value = render_answer_pack_value(&plan, &render).unwrap();
-            assert_eq!(
-                value["evidence"][0]["citation"]["source_path"],
-                "[REDACTED_PATH]/session.jsonl"
-            );
-            assert_eq!(value["evidence"][0]["citation"]["line_start"], 10);
-            assert_eq!(value["evidence"][0]["citation"]["line_end"], 12);
-            assert_eq!(
-                value["evidence"][0]["citation"]["followup_unavailable_reason"],
-                "redacted-source-coordinates"
-            );
-            assert_eq!(value["privacy"]["sensitive_output"], true);
-            assert!(value.get("selection_debug").is_none());
-        }
-    }
-
-    #[test]
-    fn pack_off_policy_cannot_unmask_remote_excerpt_credentials() {
-        for origin in ["ssh", "remote", "custom", ""] {
-            let mut item = candidate("remote-policy", "ssh:fixture", "/s/session.jsonl", 9.0);
-            item.origin_kind = origin.to_string();
-            item.excerpt = format!("context sk-{}", "01234567890123456789");
-            let mut request = request(vec![item]);
-            request.redaction_policy = PackRedactionPolicy::Off;
-            let plan = plan_answer_pack(request).unwrap();
-            assert_eq!(plan.evidence.len(), 1);
-            assert_eq!(plan.evidence[0].excerpt, "context [REDACTED]", "{origin}");
-        }
-    }
-
-    #[test]
-    fn pack_protected_policies_cover_credentials_headers_keys_and_assignments() {
-        let github = format!("ghp_{}", "a".repeat(36));
-        let openai = format!("sk-{}", "a".repeat(24));
-        let cases = [
-            github,
-            openai,
-            "Bearer disposable-token-value".to_string(),
-            "Cookie: session=disposable-cookie".to_string(),
-            "Authorization: Basic ZGlzcG9zYWJsZS1maXh0dXJl".to_string(),
-            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmaXh0dXJlIn0.c3ludGhldGljc2lnbmF0dXJl".to_string(),
-            "DATABASE_URL=postgres://fixture:disposable@localhost/example".to_string(),
-            "WEBHOOK_SECRET=disposable-hook-value".to_string(),
-            "SERVICE_PASSWORD=disposable-password".to_string(),
-            concat!(
-                "-----BEGIN OPENSSH PRIVATE KEY-----\n",
-                "disposable-fixture-only\n",
-                "-----END OPENSSH PRIVATE KEY-----"
-            )
-            .to_string(),
-        ];
-        for policy in [PackRedactionPolicy::Strict, PackRedactionPolicy::Balanced] {
-            for input in &cases {
-                let expected = if input.starts_with("DATABASE_URL=") {
-                    "safe café 東京 😀\nDATABASE_URL=[REDACTED]"
-                } else {
-                    "safe café 東京 😀\n[REDACTED]"
-                };
-                let input = format!("safe café 東京 😀\n{input}");
-                let mut redactions = Vec::new();
-                let output = redact_pack_excerpt(&input, policy, &mut redactions);
-                assert_eq!(output, expected, "{policy:?}");
-                assert!(!redactions.is_empty());
-                for event in redactions {
-                    assert!(!event.kind.is_empty());
-                    assert_eq!(event.start_char, 0);
-                    assert!(event.end_char > 0);
-                    assert!(!event.replacement.is_empty());
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn pack_entropy_policy_keeps_short_identifiers_and_masks_long_random_tokens() {
-        let short = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
-        let long = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefg";
-        assert_eq!(short.len(), 32);
-        assert_eq!(long.len(), 33);
-        for policy in [PackRedactionPolicy::Strict, PackRedactionPolicy::Balanced] {
-            let mut redactions = Vec::new();
-            assert_eq!(redact_pack_excerpt(short, policy, &mut redactions), short);
-            assert!(redactions.is_empty());
-            assert_eq!(
-                redact_pack_excerpt(long, policy, &mut redactions),
-                if policy == PackRedactionPolicy::Strict {
-                    "[REDACTED]"
-                } else {
-                    long
-                }
-            );
-            assert_eq!(
-                redactions.is_empty(),
-                policy == PackRedactionPolicy::Balanced
-            );
-            assert_eq!(
-                redact_pack_excerpt(&"a".repeat(100), policy, &mut Vec::new()),
-                "a".repeat(100)
-            );
-        }
-    }
-
-    #[test]
-    fn render_pack_redacts_long_private_paths_before_entropy_tokens() {
-        use pulldown_cmark::{Event, Parser};
-
-        let private_root = concat!(
-            "/home/alice/cass-build-fixture/evidence/",
-            "cass-cold-robot-0413-x27qw051/.cold-tmp/.tmpFixture"
-        );
-        let source_path = format!("{private_root}/.codex/sessions/session.jsonl");
-        // Generate 33 distinct ASCII fixture bytes to cross the entropy threshold.
-        let token: String = (b'A'..=b'Z').chain(b'a'..=b'g').map(char::from).collect();
-        let mut item = candidate("long-private-path", "local", &source_path, 10.0);
-        item.excerpt = format!("Read {source_path} token {token}");
-        let plan = plan_answer_pack(request(vec![item])).unwrap();
-        assert_eq!(plan.evidence.len(), 1);
-        assert_eq!(plan.evidence[0].candidate.source_path, source_path);
-        assert!(plan.evidence[0].candidate.citation_verified);
-
-        let mut req = render_request(PackRenderFormat::Json);
-        req.effective = Some(serde_json::json!({
-            "db_path": format!("{private_root}/agent_search.db"),
-        }));
-        let value = render_answer_pack_value(&plan, &req).unwrap();
-        let citation = &value["evidence"][0]["citation"];
-        assert_eq!(citation["source_path"], "[REDACTED_PATH]/session.jsonl");
-        assert_eq!(citation["source_id"], "local");
-        assert_eq!(citation["verified"], true);
-        assert_eq!(citation["content_hash"], "long-private-path_content");
-        assert_eq!(citation["line_start"], 10);
-        assert_eq!(citation["line_end"], 12);
-        assert_eq!(
-            value["_meta"]["effective"]["db_path"],
-            "[REDACTED_PATH]/agent_search.db"
-        );
-        let excerpt = value["evidence"][0]["excerpt"].as_str().unwrap();
-        assert_eq!(
-            excerpt,
-            "Read [REDACTED_PATH]/session.jsonl token [REDACTED]"
-        );
-        assert_eq!(
-            citation["excerpt_sha256"],
-            hex::encode(Sha256::digest(excerpt.as_bytes()))
-        );
-
-        for format in [PackRenderFormat::Json, PackRenderFormat::Markdown] {
-            req.format = format;
-            let rendered = render_answer_pack(&plan, &req).unwrap();
-            for private in [
-                private_root,
-                "x27qw051",
-                ".cold-tmp",
-                ".codex/sessions",
-                token.as_str(),
-            ] {
-                assert!(!rendered.contains(private), "private fragment: {private}");
-            }
-            if format == PackRenderFormat::Markdown {
-                let text = Parser::new(&rendered)
-                    .filter_map(|event| match event {
-                        Event::Text(text) | Event::Code(text) => Some(text),
-                        _ => None,
-                    })
-                    .fold(String::new(), |mut output, text| {
-                        output.push_str(&text);
-                        output
-                    });
-                assert!(text.contains("[REDACTED_PATH]/session.jsonl"));
-            }
-        }
-    }
-
-    #[test]
-    fn private_path_redaction_keeps_secret_basename_checks() {
-        let key = format!("sk-{}", "a".repeat(24));
-        for policy in [PackRedactionPolicy::Strict, PackRedactionPolicy::Balanced] {
-            let path = format!("/home/alice/private/{key}");
-            assert_eq!(
-                redact_pack_excerpt(&path, policy, &mut Vec::new()),
-                "[REDACTED_PATH]/[REDACTED]"
-            );
-        }
-        // Generate the same high-entropy fixture without embedding a credential.
-        let token: String = (b'A'..=b'Z').chain(b'a'..=b'g').map(char::from).collect();
-        let path = format!("/home/alice/private/{token}");
-        let redacted = redact_pack_excerpt(&path, PackRedactionPolicy::Strict, &mut Vec::new());
-        assert!(!redacted.contains(token.as_str()));
-        assert!(!redacted.contains("/home/alice"));
-        assert!(redacted.contains(REDACTED_PATH_PREFIX));
-        assert!(redacted.contains(REDACTED_VALUE_MARKER));
-
-        let encrypted = "encrypted_payload=abcdef0123456789abcdef0123456789";
-        let path = format!("/home/alice/private/{encrypted}");
-        for policy in [
-            PackRedactionPolicy::Strict,
-            PackRedactionPolicy::Balanced,
-            PackRedactionPolicy::Off,
-        ] {
-            assert_eq!(
-                redact_pack_excerpt(&path, policy, &mut Vec::new()),
-                "[REDACTED_PATH]/[REDACTED_ENCRYPTED_PAYLOAD]"
-            );
-            assert_eq!(
-                redact_pack_excerpt(encrypted, policy, &mut Vec::new()),
-                REDACTED_ENCRYPTED_PAYLOAD_MARKER
-            );
-        }
     }
 
     #[test]
@@ -6004,79 +5042,6 @@ mod tests {
 
         assert_eq!(left.evidence[0].candidate.source_path, "/a.jsonl");
         assert_eq!(right.evidence[0].candidate.source_path, "/a.jsonl");
-    }
-
-    #[test]
-    fn pack_tie_breaks_resolve_every_identity_coordinate_before_content_hash() {
-        for field in 0..9 {
-            let mut preferred = candidate("preferred", "local", "/s/same.jsonl", 1.0);
-            let mut other = candidate("other", "local", "/s/same.jsonl", 1.0);
-            // The last tie-break favors the other record. Each earlier
-            // coordinate must independently overcome that ordering.
-            preferred.content_hash = "z-content".to_string();
-            other.content_hash = "a-content".to_string();
-            match field {
-                0 => preferred.lexical_score = Some(2.0),
-                1 => preferred.created_at_ms = Some(1_000_001),
-                2 => {
-                    preferred.source_id = "a-source".to_string();
-                    other.source_id = "z-source".to_string();
-                }
-                3 => preferred.source_path = "/s/earlier.jsonl".to_string(),
-                4 => {
-                    preferred.conversation_id = Some(1);
-                    other.conversation_id = Some(2);
-                }
-                5 => preferred.agent = "agy".to_string(),
-                6 => {
-                    preferred.message_index = Some(1);
-                    other.message_index = Some(2);
-                }
-                7 => {
-                    other.line_start = Some(20);
-                    other.line_end = Some(22);
-                }
-                8 => {
-                    preferred.content_hash = "a-content".to_string();
-                    other.content_hash = "z-content".to_string();
-                }
-                _ => unreachable!(),
-            }
-            for candidates in [
-                vec![preferred.clone(), other.clone()],
-                vec![other.clone(), preferred.clone()],
-            ] {
-                let mut request = request(candidates);
-                request.limits.max_evidence = 1;
-                let plan = plan_answer_pack(request).unwrap();
-                assert_eq!(plan.evidence.len(), 1);
-                assert_eq!(
-                    plan.evidence[0].candidate.candidate_id, "preferred",
-                    "tie-break coordinate {field}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn pack_score_weights_match_independent_contract_examples() {
-        for (field, expected) in [(0, 0.985), (1, 0.97), (2, 0.8875), (3, 0.8)] {
-            let mut item = candidate("weighted", "local", "/s/weighted.jsonl", 1.0);
-            match field {
-                0 => item.role = PackEvidenceRole::UserRequirement,
-                1 => item.source_readiness = PackSourceReadiness::IncompleteMetadata,
-                2 => item.created_at_ms = None,
-                3 => item.matched_terms.clear(),
-                _ => unreachable!(),
-            }
-            let plan = plan_answer_pack(request(vec![item])).unwrap();
-            assert_eq!(plan.evidence.len(), 1);
-            assert!(
-                (plan.evidence[0].selection.score - expected).abs() < 1e-12,
-                "contract example {field}: {:?}",
-                plan.evidence[0].selection
-            );
-        }
     }
 
     #[test]

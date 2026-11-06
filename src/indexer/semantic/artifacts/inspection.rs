@@ -3,7 +3,6 @@
 //! to report reclaimable scratch. Apply always rediscovers under both locks.
 
 use super::*;
-use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 const PLAN_VERSION: u32 = 1;
@@ -19,11 +18,6 @@ pub struct BackfillArtifactCandidate {
     /// Includes this entry and all children of a scratch directory.
     pub entry_count: u64,
     pub identity_fingerprint: String,
-    /// Why this entry may be removed, in the operator's terms. The reason
-    /// comes from the shared ownership classifier, never from the name.
-    pub reason: &'static str,
-    /// Which lifecycle produced the entry and could still own it.
-    pub ownership: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -97,10 +91,7 @@ fn maintenance_locks(data_dir: &Path) -> Result<(File, BackfillArtifacts)> {
 fn capture_plan(
     artifacts: &BackfillArtifacts,
     durable: bool,
-) -> Result<(
-    BackfillArtifactReclaimPlan,
-    BTreeMap<PathBuf, ReclaimReason>,
-)> {
+) -> Result<(BackfillArtifactReclaimPlan, BTreeSet<PathBuf>)> {
     let discovery = artifacts.discover(None, None, durable)?;
     let mut witness = blake3::Hasher::new();
     witness.update(b"cass-backfill-reclaim-plan-v1\0");
@@ -132,8 +123,8 @@ fn capture_plan(
         checkpoint_missing: discovery.checkpoint_missing,
         plan_fingerprint: String::new(),
     };
-    for (path, reason) in &discovery.candidates {
-        let candidate = snapshot(&artifacts.data_dir, path, *reason, &mut budget)?;
+    for path in &discovery.candidates {
+        let candidate = snapshot(&artifacts.data_dir, path, &mut budget)?;
         plan.reclaimable_files += u64::from(!candidate.directory);
         plan.reclaimable_directories += u64::from(candidate.directory);
         plan.reclaimable_bytes = plan
@@ -202,12 +193,7 @@ fn stamp(path: &Path) -> Result<Option<FileStamp>> {
     }))
 }
 
-fn snapshot(
-    data_dir: &Path,
-    path: &Path,
-    reason: ReclaimReason,
-    budget: &mut usize,
-) -> Result<BackfillArtifactCandidate> {
+fn snapshot(data_dir: &Path, path: &Path, budget: &mut usize) -> Result<BackfillArtifactCandidate> {
     let first = stamp(path)?.context("recovery candidate disappeared")?;
     ensure!(
         matches!(first.kind, "file" | "directory"),
@@ -219,8 +205,6 @@ fn snapshot(
         size_bytes: 0,
         entry_count: 0,
         identity_fingerprint: String::new(),
-        reason: reason.reason(),
-        ownership: reason.ownership(),
     };
     let mut witness = blake3::Hasher::new();
     witness.update(b"cass-backfill-scratch-identity-v1\0");

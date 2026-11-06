@@ -345,15 +345,7 @@ fn inventory_budget_and_nonregular_checkpoint_wal_fail_closed() -> Result<()> {
     let temp = tempfile::tempdir()?;
     publish(temp.path())?;
     let (staging, reuse) = scratch(temp.path())?;
-    assert!(
-        snapshot(
-            temp.path(),
-            &reuse,
-            ReclaimReason::AbandonedReuseScratch,
-            &mut 1
-        )
-        .is_err()
-    );
+    assert!(snapshot(temp.path(), &reuse, &mut 1).is_err());
     let main = temp.path().join("checkpoint.fsvi");
     fs::write(&main, b"checkpoint")?;
     fs::create_dir(wal_path_for(&main))?;

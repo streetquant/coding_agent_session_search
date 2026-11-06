@@ -1,7 +1,7 @@
 //! Tests for the OpenCode connector (JSON file-based storage)
 
 use coding_agent_search::connectors::opencode::OpenCodeConnector;
-use coding_agent_search::connectors::{Connector, Origin, ScanContext, ScanRoot};
+use coding_agent_search::connectors::{Connector, ScanContext};
 use coding_agent_search::franken_sync::Connection;
 use coding_agent_search::franken_sync::compat::ConnectionExt;
 use coding_agent_search::franken_sync::params;
@@ -82,22 +82,6 @@ fn create_test_storage(dir: &std::path::Path, sessions: &[TestSession]) -> std::
     Ok(())
 }
 
-/// Build a fixture-only context so connector tests never fall back to the host's
-/// default OpenCode database. The remote fixture origin suppresses the
-/// connector's intentional local default-database fallback, keeping each test
-/// hermetic even when the runner inherits a populated HOME/XDG profile.
-fn fixture_context(data_dir: PathBuf) -> ScanContext {
-    ScanContext::with_roots(
-        data_dir.clone(),
-        vec![ScanRoot::remote(
-            data_dir,
-            Origin::remote("cass-test-fixture"),
-            None,
-        )],
-        None,
-    )
-}
-
 struct TestSession {
     id: String,
     project_id: String,
@@ -159,7 +143,12 @@ fn create_drizzle_opencode_db(path: &Path) -> Connection {
 fn opencode_parses_json_fixture() {
     let fixture_root = PathBuf::from("tests/fixtures/opencode_json");
     let conn = OpenCodeConnector::new();
-    let ctx = fixture_context(fixture_root.clone());
+    let ctx = ScanContext {
+        data_dir: fixture_root.clone(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
     let convs = conn.scan(&ctx).expect("scan");
     assert_eq!(convs.len(), 1);
     let c = &convs[0];
@@ -218,7 +207,12 @@ fn opencode_parses_drizzle_sqlite_schema() {
     drop(conn);
 
     let connector = OpenCodeConnector::new();
-    let ctx = fixture_context(dir.path().to_path_buf());
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
     let convs = connector
         .scan(&ctx)
         .expect("opencode drizzle sqlite scan should succeed");
@@ -467,7 +461,12 @@ fn opencode_parses_created_storage() {
     .unwrap();
 
     let connector = OpenCodeConnector::new();
-    let ctx = fixture_context(dir.path().to_path_buf());
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -529,7 +528,12 @@ fn opencode_handles_multiple_sessions() {
     .unwrap();
 
     let connector = OpenCodeConnector::new();
-    let ctx = fixture_context(dir.path().to_path_buf());
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 2);
 
@@ -573,7 +577,12 @@ fn opencode_handles_tool_parts() {
     .unwrap();
 
     let connector = OpenCodeConnector::new();
-    let ctx = fixture_context(dir.path().to_path_buf());
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -618,7 +627,12 @@ fn opencode_handles_reasoning_parts() {
     .unwrap();
 
     let connector = OpenCodeConnector::new();
-    let ctx = fixture_context(dir.path().to_path_buf());
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -656,7 +670,12 @@ fn opencode_sets_correct_agent_slug() {
     .unwrap();
 
     let connector = OpenCodeConnector::new();
-    let ctx = fixture_context(dir.path().to_path_buf());
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
     assert_eq!(convs[0].agent_slug, "opencode");
@@ -670,7 +689,12 @@ fn opencode_handles_empty_storage() {
     fs::create_dir_all(dir.path().join("part")).unwrap();
 
     let connector = OpenCodeConnector::new();
-    let ctx = fixture_context(dir.path().to_path_buf());
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
     let convs = connector.scan(&ctx).unwrap();
     assert!(convs.is_empty());
 }
@@ -681,7 +705,12 @@ fn opencode_handles_missing_storage() {
     // Don't create any directories
 
     let connector = OpenCodeConnector::new();
-    let ctx = fixture_context(dir.path().to_path_buf());
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
     let convs = connector.scan(&ctx).unwrap();
     assert!(convs.is_empty());
 }
@@ -738,7 +767,12 @@ fn opencode_orders_messages_by_timestamp() {
     .unwrap();
 
     let connector = OpenCodeConnector::new();
-    let ctx = fixture_context(dir.path().to_path_buf());
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -800,7 +834,12 @@ fn opencode_assigns_sequential_indices() {
     .unwrap();
 
     let connector = OpenCodeConnector::new();
-    let ctx = fixture_context(dir.path().to_path_buf());
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -838,7 +877,12 @@ fn opencode_title_fallback_to_first_message() {
     .unwrap();
 
     let connector = OpenCodeConnector::new();
-    let ctx = fixture_context(dir.path().to_path_buf());
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -890,7 +934,12 @@ fn opencode_computes_started_ended_at() {
     .unwrap();
 
     let connector = OpenCodeConnector::new();
-    let ctx = fixture_context(dir.path().to_path_buf());
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -924,7 +973,12 @@ fn opencode_skips_sessions_without_messages() {
     fs::create_dir_all(dir.path().join("part")).unwrap();
 
     let connector = OpenCodeConnector::new();
-    let ctx = fixture_context(dir.path().to_path_buf());
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
     let convs = connector.scan(&ctx).unwrap();
 
     // Should skip sessions without messages
@@ -959,7 +1013,12 @@ fn opencode_metadata_contains_session_id() {
     .unwrap();
 
     let connector = OpenCodeConnector::new();
-    let ctx = fixture_context(dir.path().to_path_buf());
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -1002,7 +1061,12 @@ fn opencode_external_id_is_session_id() {
     .unwrap();
 
     let connector = OpenCodeConnector::new();
-    let ctx = fixture_context(dir.path().to_path_buf());
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -1031,7 +1095,12 @@ fn opencode_handles_corrupted_session_json() {
     .unwrap();
 
     let connector = OpenCodeConnector::new();
-    let ctx = fixture_context(dir.path().to_path_buf());
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
     // Should not panic, just skip the corrupted file
     let convs = connector.scan(&ctx).unwrap();
     assert!(convs.is_empty());
@@ -1088,7 +1157,12 @@ fn opencode_handles_partial_session_data() {
     .unwrap();
 
     let connector = OpenCodeConnector::new();
-    let ctx = fixture_context(dir.path().to_path_buf());
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -1156,7 +1230,12 @@ fn opencode_handles_unicode_content() {
     .unwrap();
 
     let connector = OpenCodeConnector::new();
-    let ctx = fixture_context(dir.path().to_path_buf());
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -1226,7 +1305,12 @@ fn opencode_handles_very_long_session() {
     .unwrap();
 
     let connector = OpenCodeConnector::new();
-    let ctx = fixture_context(dir.path().to_path_buf());
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
 
     let start = std::time::Instant::now();
     let convs = connector.scan(&ctx).unwrap();
@@ -1285,7 +1369,12 @@ fn opencode_handles_empty_message_parts() {
     .unwrap();
 
     let connector = OpenCodeConnector::new();
-    let ctx = fixture_context(dir.path().to_path_buf());
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -1334,7 +1423,12 @@ fn opencode_handles_null_text_parts() {
     .unwrap();
 
     let connector = OpenCodeConnector::new();
-    let ctx = fixture_context(dir.path().to_path_buf());
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -1396,7 +1490,12 @@ fn opencode_handles_deeply_nested_project_dirs() {
     .unwrap();
 
     let connector = OpenCodeConnector::new();
-    let ctx = fixture_context(dir.path().to_path_buf());
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 

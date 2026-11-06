@@ -23,8 +23,7 @@ include = [
 
 [dependencies]
 # Resident-memory supervision reuses the sysinfo version already in Cargo.lock.
-# Owner directive, 2026-10-24: "Use the three minimum versions".
-sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+sysinfo = { version = "*", default-features = false, features = ["system"] }
 anyhow = "1.0.102"
 thiserror = "2.0.18"
 tracing = "0.1.44"
@@ -103,20 +102,17 @@ notify = "8.2.0"
 # rowids it reserved (bd-gwoit), reading a WAL a stock writer truncated to zero
 # bytes as empty (bd-yxqs9, cass GH#519), and index seeks for IN lists and
 # k = ? ORDER BY id (GH#497/#498).
-# 0.4.13 includes the durable-freelist integrity repair (58ddae0de, svhcf):
-# read-only BEGIN no longer reports valid backup pages as unused. Qualification
-# still uses CASS's existing archive tests and stock SQLite as the file oracle.
-# All family packages use 0.4.13 and build.rs checks each resolved package
+# All family packages use 0.4.12 and build.rs checks each resolved package
 # exactly.
-frankensqlite = { version = "=0.4.13", package = "fsqlite", features = ["fts5", "async-api"] }
+frankensqlite = { version = "=0.4.12", package = "fsqlite", features = ["fts5", "async-api"] }
 # The production storage-integrity probe calls FrankenSQLite's public VFS API
 # directly so it can inspect native writer locks without opening the pager.
-fsqlite-types = { version = "=0.4.13", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.4.12", package = "fsqlite-types" }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
 fs2 = "0.4.3"
-libc = "0.2.189"
+libc = "*"
 same-file = "1.0.6"
 lru = "0.18"
 rustc-hash = "2.1.2"  # Fast non-cryptographic hashing for cache keys (P1 Opt 1.3), replaces unmaintained fxhash
@@ -124,10 +120,7 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }  # Fast content hashin
 itoa = "1.0.18"  # Zero-allocation integer-to-string for hot paths (bead w32k6)
 smallvec = "1.15.1"  # Stack-allocated small vectors for hot paths (Opt 4.4)
 regex = "1.12.3"
-# The published 0.9.0 still uses nix 0.28 / cfg_aliases 0.1.1, which emits
-# future-incompatibility warnings on the pinned nightly. This official upstream
-# fix moves to nix 0.29 while preserving the PTY and Windows ConPTY APIs.
-portable-pty = { version = "=0.9.0", git = "https://github.com/wezterm/wezterm", rev = "f78f72f2f18bf459561e3681f016365273d3e281" }
+portable-pty = "0.9.0"
 # FrankenTUI migration foundation (bead 2noh9.2.1), exact-pinned to the
 # crates.io 0.5.0 release for reproducible CI builds.
 ftui = { version = "=0.5.0" }
@@ -170,9 +163,7 @@ bytemuck = "1.25.0"
 # concurrent segment verification on open (GH #501), snippets only for
 # returned hits, and a read-only refresh that skips the reopen when nothing
 # was published.
-# Completed upstream Quill retained-mapping repair; CASS rechecks retained
-# segment bytes before publication (2l1b0.72). SQLite stays registry-pinned.
-frankensearch = { version = "=0.7.1", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "5ee999fcaba6f85d19c0e3f00883f1d5d4918887", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
+frankensearch = { version = "=0.7.1", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
 # Native OpenClaw transcripts and legacy VS Code Copilot sessions require SQLite.
 # Keep both readers unconditional, including --no-default-features builds.
 # codex-zstd reads Codex rollouts compressed to .jsonl.zst (GH #513).
@@ -214,9 +205,6 @@ qrcode = { version = "0.14.1", optional = true }
 image = { version = "0.25.10", optional = true, default-features = false, features = ["png"] }
 unicode-width = "0.2.2"
 
-# Native DSH journals are compressed; also used by Codex compression fixtures.
-zstd = { version = "0.13", default-features = false }
-
 # macOS keychain access (optional, for ChatGPT decryption)
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7.0"
@@ -231,20 +219,11 @@ socket2 = { version = "0.6.5", features = ["all"] }
 [target.'cfg(not(windows))'.dependencies]
 openssl = { version = "0.10.79", features = ["vendored"] }
 
-# The skewed-ingest memory qualification attributes substantial RSS to
-# freed buffers retained by the system allocator between giant batches.
-[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
-tikv-jemallocator = "=0.7.0"
-
 # Restores the default SIGPIPE disposition at startup (#356): with Rust's
 # ignore-SIGPIPE default plus the release profile's panic=abort, every stdout
 # write to a closed pipe (`cass ... | head`) became a SIGABRT crash report.
 [target.'cfg(unix)'.dependencies]
 sigpipe = "0.1.3"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-# Pages publication uses safe descriptor-relative filesystem operations.
-rustix = { version = "1.1.5", features = ["fs"] }
 
 [features]
 default = ["qr", "encryption"]
@@ -283,18 +262,21 @@ once_cell = "1.21.4"
 serial_test = "4.0.1"
 proptest = "1.11.0"
 arbitrary = { version = "1", features = ["derive"] }
-serde-saphyr = { version = "2.0.0", default-features = false, features = ["deserialize"] }
+serde_yaml = "0.9.34"
 rand = "0.10"
 rand_chacha = "0.10"
+# GH513 writes rollouts the way Codex compresses them; production reads them
+# through franken-agent-detection's codex-zstd feature.
+zstd = { version = "0.13", default-features = false }
 # GH470 measures native model input tokens without padding or silent truncation.
 # Reuse the tokenizer and regex backend already resolved by native MiniLM.
-tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "*", default-features = false, features = ["fancy-regex"] }
 # rusqlite is retained only for C-SQLite interop fixtures in tests; production
 # storage and historical salvage paths use frankensqlite.
 rusqlite = { version = "0.40.2", features = ["bundled", "modern_sqlite"] }
 # The manifest-policy build gate requires this explicit dev entry for compat
 # fixture assertions, even though production also uses the same pinned crate.
-fsqlite-types = { version = "=0.4.13", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.4.12", package = "fsqlite-types" }
 
 # The fsqlite family resolves from exact reviewed registry versions for every
 # direct and transitive consumer. build.rs rejects duplicates and mixed sources.
@@ -307,11 +289,6 @@ test = false
 [[bin]]
 name = "cass-pages-perf-bundle"
 path = "src/bin/cass-pages-perf-bundle.rs"
-test = false
-
-[[bin]]
-name = "cass-docs-tables"
-path = "src/bin/cass-docs-tables.rs"
 test = false
 
 [[bin]]
@@ -362,7 +339,7 @@ debug = "line-tables-only"
 strip = false
 
 # The dependency graph is pinned to the asupersync 0.5.x line (0.5.0). Keep
-# the frankensqlite registry pins and exact upstream search/detection revisions
+# the frankensqlite, frankensearch, and franken-agent-detection registry pins
 # aligned so Cargo.lock does not reintroduce an older parallel runtime stack.
 #
 # If you need to build against a local checkout of asupersync (sibling

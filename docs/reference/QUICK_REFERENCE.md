@@ -9,14 +9,14 @@
 cass health --json || cass index --full
 
 # Search with an exact follow-up anchor (use the same archive for every command)
-cass --db "$ARCHIVE_DB" search "auth error" --robot --limit 5 --fields source_path,source_id,conversation_id,line_number,message_anchor
+cass --db "$ARCHIVE_DB" search "auth error" --robot --limit 5 --fields source_path,source_id,conversation_id,line_number
 
 # Build a cited handoff pack after search narrows the question
 cass pack "auth error root cause" --robot --max-tokens 12000 --limit 40
 
-# Copy all five variables from ONE hit; LINE_NUMBER is one-based, not a file line
-cass --db "$ARCHIVE_DB" view "$SOURCE_PATH" --source "$SOURCE_ID" --conversation-id "$CONVERSATION_ID" --message-index "$LINE_NUMBER" --message-anchor "$MESSAGE_ANCHOR" --json
-cass --db "$ARCHIVE_DB" expand "$SOURCE_PATH" --source "$SOURCE_ID" --conversation-id "$CONVERSATION_ID" --message-index "$LINE_NUMBER" --message-anchor "$MESSAGE_ANCHOR" -C 3 --json
+# Copy all four variables from ONE hit; LINE_NUMBER is one-based, not a file line
+cass --db "$ARCHIVE_DB" view "$SOURCE_PATH" --source "$SOURCE_ID" --conversation-id "$CONVERSATION_ID" --message-index "$LINE_NUMBER" --json
+cass --db "$ARCHIVE_DB" expand "$SOURCE_PATH" --source "$SOURCE_ID" --conversation-id "$CONVERSATION_ID" --message-index "$LINE_NUMBER" -C 3 --json
 
 # Machine-readable help
 cass robot-docs guide
@@ -24,8 +24,7 @@ cass robot-docs schemas
 ```
 
 Search's `line_number` is `messages.idx + 1`. Pass it unchanged to
-`--message-index`, together with the unchanged `message_anchor` from that hit;
-`-n` / `--line` inspect physical file lines and are not
+`--message-index`; `-n` / `--line` inspect physical file lines and are not
 search-hit selectors. Minimal field presets may omit disambiguating identity
 fields. See [message addressing](message-addressing.md) for raw-file
 compatibility, missing-target errors, and the meaning of `is_target`.

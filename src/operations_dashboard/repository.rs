@@ -822,7 +822,6 @@ mod tests {
         let mut bases = vec![std::env::temp_dir()];
         if cfg!(unix) {
             bases.push(PathBuf::from("/tmp"));
-            bases.push(PathBuf::from("/var/tmp"));
         }
         for base in bases {
             if let Ok(base) = base.canonicalize()

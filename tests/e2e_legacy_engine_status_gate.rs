@@ -46,18 +46,6 @@ fn run(fixture: &Fixture, label: &str, args: &[&str], timeout: Duration) -> Outp
         .env("XDG_CACHE_HOME", fixture.home.join("xdg-cache"))
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .env("CASS_SEMANTIC_EMBEDDER", "hash")
-        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
-        // Host defaults for these connectors are absolute paths outside HOME;
-        // pin them into the fixture so a populated host archive cannot turn a
-        // one-session fixture into a multi-minute full scan.
-        .env(
-            "CASS_OPENWEBUI_DATA_ROOT",
-            fixture.home.join(".openwebui-missing"),
-        )
-        .env(
-            "CASS_CLOUDMCP_DATA_ROOT",
-            fixture.home.join(".cloudmcp-missing"),
-        )
         .env("CODEX_HOME", &fixture.codex_home)
         .env("NO_COLOR", "1")
         .env_remove("CLAUDE_CONFIG_DIR");

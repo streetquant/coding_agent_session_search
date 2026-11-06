@@ -455,9 +455,6 @@
         "hnsw_ready": {
           "type": "boolean"
         },
-        "hnsw_reason_code": {
-          "type": "null"
-        },
         "progressive_ready": {
           "type": "boolean"
         },

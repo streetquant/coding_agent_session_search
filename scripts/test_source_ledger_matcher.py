@@ -670,7 +670,6 @@ def main() -> None:
             subprocess.run(
                 ["cargo", "metadata", "--format-version", "1", "--manifest-path", str(work / "Cargo.toml")],
                 cwd=work, env=env, stdout=subprocess.DEVNULL, check=True,
-                timeout=900,
             )
             normalized = (work / "Cargo.lock").read_bytes()
             retained = validate_normalized_lock(tomllib.loads(normalized.decode()), allowed, direct)
@@ -682,10 +681,10 @@ def main() -> None:
             receipt["pruned_packages"] = len(allowed) - len(retained)
             print("GH512_MATCHER_SOURCE=" + json.dumps(receipt, sort_keys=True), flush=True)
             command = ["cargo", "test", "--release", "--locked", "--manifest-path", str(work / "Cargo.toml")]
-            subprocess.run(command + ["--", "--nocapture"], cwd=work, env=env, check=True, timeout=1800)  # ubs:ignore[python.taint.command] Fixed Cargo argv with shell=False; env supplies toolchain configuration.
+            subprocess.run(command + ["--", "--nocapture"], cwd=work, env=env, check=True)
             if args.bench:
                 subprocess.run(command + ["gh512_benchmark_4159", "--", "--ignored", "--nocapture"],
-                               cwd=work, env=env, check=True, timeout=1800)
+                               cwd=work, env=env, check=True)
             if (work / "Cargo.lock").read_bytes() != normalized:
                 raise RuntimeError("matcher dependency pins changed during qualification")
             if (work / "observation.rs").read_bytes() != source_bytes:

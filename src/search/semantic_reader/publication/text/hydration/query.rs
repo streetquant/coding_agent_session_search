@@ -85,7 +85,7 @@ fn prepare(k: usize, phases: usize, budget: HydrationBudget) -> Result<Work, Hyd
 
 fn verified<B: BatchSource>(
     batch: B,
-    transaction: &dyn SemanticReadSnapshot,
+    transaction: &Transaction<'_>,
     projection: PassageProjection,
     work: &mut Work,
 ) -> HydratedSearchResult<B> {
@@ -100,7 +100,7 @@ fn verified<B: BatchSource>(
 }
 
 fn search<B: BatchSource>(
-    transaction: &dyn SemanticReadSnapshot,
+    transaction: &Transaction<'_>,
     projection: PassageProjection,
     mut work: Work,
     retrieve: impl FnOnce() -> SemanticReaderResult<B>,
@@ -118,7 +118,7 @@ impl TextSemanticSearch<'_, '_> {
         &self,
         k: usize,
         filter: Option<&dyn SearchFilter>,
-        transaction: &dyn SemanticReadSnapshot,
+        transaction: &Transaction<'_>,
         projection: PassageProjection,
         budget: HydrationBudget,
     ) -> HydratedSearchResult<SemanticSearchBatch> {
@@ -133,7 +133,7 @@ impl TextSemanticSearch<'_, '_> {
         k: usize,
         filter: Option<&dyn SearchFilter>,
         policy: AnnSearchPolicy,
-        transaction: &dyn SemanticReadSnapshot,
+        transaction: &Transaction<'_>,
         projection: PassageProjection,
         budget: HydrationBudget,
     ) -> HydratedSearchResult<SemanticSearchBatch> {
@@ -152,7 +152,7 @@ impl SelectedTextSemanticSearch<'_, '_> {
         &self,
         k: usize,
         filter: Option<&dyn SearchFilter>,
-        transaction: &dyn SemanticReadSnapshot,
+        transaction: &Transaction<'_>,
         projection: PassageProjection,
         budget: HydrationBudget,
     ) -> HydratedSearchResult<SelectedSemanticBatch> {
@@ -165,7 +165,7 @@ impl SelectedTextSemanticSearch<'_, '_> {
         k: usize,
         filter: Option<&dyn SearchFilter>,
         policy: AnnSearchPolicy,
-        transaction: &dyn SemanticReadSnapshot,
+        transaction: &Transaction<'_>,
         projection: PassageProjection,
         budget: HydrationBudget,
     ) -> HydratedSearchResult<SelectedSemanticBatch> {

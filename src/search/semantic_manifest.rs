@@ -51,26 +51,18 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use frankensearch::core::generation::ArtifactGenerationIdentityV1;
 use frankensearch::core::{
     EMBEDDING_INPUT_CONTRACT_SCHEMA_V1, EMBEDDING_PRODUCER_ATTESTATION_SCHEMA_V1,
     EMBEDDING_SPACE_IDENTITY_SCHEMA_V1, EmbeddingSpaceKindV1, FrozenEmbeddingIdentityBundleV1,
     VECTOR_STORAGE_IDENTITY_SCHEMA_V1,
 };
-use frankensearch::index::native_hnsw::{
-    NativeHnswGenerationReceiptV2, native_hnsw_generation_receipt_path,
-};
-use frankensearch::index::{
-    FsviAdmissionError, FsviV2IdentityBinding, ValidatedFsviBytes, wal_path_for,
-};
+use frankensearch::index::wal_path_for;
 use fs2::FileExt;
 
 use super::policy::{
     CHUNKING_STRATEGY_VERSION, InvalidationAction, SEMANTIC_SCHEMA_VERSION,
     SemanticAssetManifest as PolicyManifest, SemanticPolicy,
 };
-
-pub mod source_snapshot;
 
 // ─── Constants ─────────────────────────────────────────────────────────────
 
@@ -1329,7 +1321,7 @@ impl SemanticManifest {
 // ─── Immutable semantic generation contract ──────────────────────────────
 
 /// Schema version for immutable semantic generation manifests.
-pub const SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION: u32 = 3;
+pub const SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 /// Schema version for the atomic current-generation pointer.
 pub const SEMANTIC_CURRENT_POINTER_SCHEMA_VERSION: u32 = 1;
@@ -1356,10 +1348,6 @@ const MAX_GENERATION_ID_LENGTH: usize = 128;
 const MAX_SEMANTIC_POINTER_BYTES: usize = 16 * 1024;
 const MAX_SEMANTIC_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_SEMANTIC_ARTIFACTS: usize = 4;
-/// Full disk audits admit one immutable vector image at a time. Larger images
-/// must be sharded before this diagnostic can certify them. This bounds the
-/// declared image size, not parser scratch or total process RSS.
-const MAX_AUDITED_VECTOR_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_SEMANTIC_ARTIFACT_PATH_BYTES: usize = 1024;
 const MAX_PRODUCER_FEATURES: usize = 256;
 const MAX_PRODUCER_FEATURE_BYTES: usize = 128;
@@ -1409,17 +1397,6 @@ pub enum SemanticGenerationStatus {
     /// or selectable as an immutable generation.
     Building,
     Sealed,
-}
-
-/// Why this generation exists. This is explicit publication intent, checked
-/// against every actual artifact space; control is never semantic readiness.
-/// EmptyCorpus binds a real empty source and declares no model/vector/ANN.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SemanticGenerationPurpose {
-    Semantic,
-    HashControl,
-    EmptyCorpus,
 }
 
 /// Role of one manifest-declared semantic artifact.
@@ -1502,16 +1479,6 @@ pub struct SemanticProducerAttestation {
     pub binary_elf_sha256: String,
 }
 
-/// Role-specific evidence for an immutable artifact's journal state.
-/// ANN graphs have no FSVI WAL field or journal pathname. Vector publication
-/// still requires both zero declared WAL entries and absence of its sidecar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum SemanticArtifactSealStateV1 {
-    Vector { wal_entry_count: u64 },
-    Ann {},
-}
-
 /// Evidence captured when the producer inspected an artifact before sealing
 /// the immutable generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1526,7 +1493,7 @@ pub struct SemanticArtifactValidationEvidence {
     pub vector_slot_count: u64,
     pub live_vector_count: u64,
     pub tombstone_vector_count: u64,
-    pub seal: SemanticArtifactSealStateV1,
+    pub wal_entry_count: u64,
     pub generation_corpus_sha256: String,
     pub covered_live_docset_sha256: String,
     pub covered_content_sha256: String,
@@ -1537,7 +1504,7 @@ pub struct SemanticArtifactValidationEvidence {
 #[serde(deny_unknown_fields)]
 pub struct SemanticGenerationArtifact {
     pub role: SemanticArtifactRole,
-    /// Explicit ordered partition binding for schema v4; absent in schema v3.
+    /// Explicit ordered partition binding for schema v2; absent in schema v1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard: Option<SemanticArtifactShardV2>,
     /// Manifest-relative path beneath the selected generation directory.
@@ -1546,10 +1513,6 @@ pub struct SemanticGenerationArtifact {
     pub size_bytes: u64,
     /// Exact artifact-container format, for example `fsvi-v2` or `hnsw-v1`.
     pub artifact_format: String,
-    /// Complete generation identity supplied to immutable FSVI v2 admission.
-    /// Legacy vectors and ANN descriptors must omit this vector-only field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fsvi_generation: Option<ArtifactGenerationIdentityV1>,
     /// Digest of all format/layout/build parameters not already represented by
     /// the canonical embedding identity.
     pub artifact_parameters_sha256: String,
@@ -1566,63 +1529,13 @@ pub struct SemanticGenerationArtifact {
     pub vector_slot_count: u64,
     pub live_vector_count: u64,
     pub tombstone_vector_count: u64,
-    pub seal: SemanticArtifactSealStateV1,
+    pub wal_entry_count: u64,
     pub generation_corpus_sha256: String,
     /// Exact ordered identity of the live documents covered by this tier.
     pub covered_live_docset_sha256: String,
     /// Exact content identity of the live documents covered by this tier.
     pub covered_content_sha256: String,
     pub validation: SemanticArtifactValidationEvidence,
-}
-
-impl SemanticGenerationArtifact {
-    /// Compare the descriptor with the SAME owned image used for parsing and
-    /// exact/ANN retrieval. A pathname or an independently hashed byte stream
-    /// is not evidence for these claims. Returned field names are static and
-    /// safe for bounded diagnostics.
-    pub(crate) fn validate_fsvi_owner(
-        &self,
-        owner: &ValidatedFsviBytes,
-    ) -> Result<(), &'static str> {
-        let witness = owner.witness();
-        if !self.role.is_vector() || self.artifact_format != "fsvi-v2" {
-            return Err("artifact_format");
-        }
-        if self.fsvi_generation != Some(witness.generation) {
-            return Err("fsvi_generation");
-        }
-        if owner.identity_v2().identity_bundle_canonical_bytes
-            != self.embedding_identity.canonical_bytes
-        {
-            return Err("embedding_identity");
-        }
-        if hex::encode(witness.whole_image_sha256) != self.artifact_sha256 {
-            return Err("artifact_sha256");
-        }
-        if witness.byte_len != self.size_bytes {
-            return Err("size_bytes");
-        }
-        if witness.record_count != self.vector_slot_count {
-            return Err("vector_slot_count");
-        }
-        if witness.live_count != self.live_vector_count
-            || witness.live_count != self.covered_document_count
-        {
-            return Err("covered_document_count");
-        }
-        if witness.tombstone_count != self.tombstone_vector_count {
-            return Err("tombstone_vector_count");
-        }
-        if hex::encode(witness.ordered_live_docset_digest) != self.covered_live_docset_sha256 {
-            return Err("covered_live_docset_sha256");
-        }
-        if !owner.published_wal_absent()
-            || self.seal != (SemanticArtifactSealStateV1::Vector { wal_entry_count: 0 })
-        {
-            return Err("seal");
-        }
-        Ok(())
-    }
 }
 
 /// One immutable, self-describing semantic generation.
@@ -1641,7 +1554,6 @@ pub struct SemanticGenerationManifestV1 {
     pub requested_topology: SemanticGenerationTopology,
     pub realized_topology: SemanticGenerationTopology,
     pub status: SemanticGenerationStatus,
-    pub purpose: SemanticGenerationPurpose,
     pub corpus: SemanticCorpusSnapshotIdentity,
     pub producer: SemanticProducerAttestation,
     /// Exact selected live-document count; equal to `corpus.document_count`.
@@ -1692,28 +1604,6 @@ impl SemanticExpectedCurrentV1 {
     pub fn exact(pointer: &SemanticCurrentPointerV1) -> Self {
         Self::Exact(pointer.clone())
     }
-
-    /// Capture the actual bounded current-pointer CAS precondition while the
-    /// caller holds its maintenance/artifact lease. This is not a source or
-    /// artifact admission receipt; corrupt prior derived assets may still be
-    /// replaced by an explicit complete canonical rebuild.
-    pub(crate) fn observe(data_dir: &Path) -> Result<Self, SemanticGenerationError> {
-        Ok(match read_current_pointer_for_cas(data_dir)? {
-            Some(pointer) => Self::Exact(pointer),
-            None => Self::Absent,
-        })
-    }
-
-    pub(crate) fn successor_epoch(&self) -> Result<u64, SemanticGenerationError> {
-        match self {
-            Self::Absent => Ok(1),
-            Self::Exact(pointer) => pointer.selection_epoch.checked_add(1).ok_or_else(|| {
-                SemanticGenerationError::InvalidPointer {
-                    reason: "selection epoch is exhausted".into(),
-                }
-            }),
-        }
-    }
 }
 
 /// A current generation whose pointer, manifest, corpus identity, paths, and
@@ -1754,18 +1644,6 @@ pub enum SemanticGenerationDiskStateV1 {
     LegacyUnidentified {
         artifact_count: u64,
     },
-    /// Disk audit succeeded, but no caller-pinned canonical source was checked.
-    /// This state does not authorize serving or certify source currentness.
-    SourceUnknown {
-        generation_id: String,
-        manifest_sha256: String,
-        selection_epoch: u64,
-        selected_at_ms: i64,
-        requested_topology: SemanticGenerationTopology,
-        realized_topology: SemanticGenerationTopology,
-    },
-    /// Disk audit matched a caller-pinned source. Serving still requires the
-    /// retained immutable reader and its producer/hydration checks.
     Ready {
         generation_id: String,
         manifest_sha256: String,
@@ -1773,22 +1651,6 @@ pub enum SemanticGenerationDiskStateV1 {
         selected_at_ms: i64,
         requested_topology: SemanticGenerationTopology,
         realized_topology: SemanticGenerationTopology,
-    },
-    /// An explicitly selected non-semantic control, never semantic readiness.
-    HashControl {
-        generation_id: String,
-        manifest_sha256: String,
-        selection_epoch: u64,
-        selected_at_ms: i64,
-        requested_topology: SemanticGenerationTopology,
-        realized_topology: SemanticGenerationTopology,
-    },
-    /// A certified empty source requires no model, vector owner or ANN graph.
-    EmptyCorpus {
-        generation_id: String,
-        manifest_sha256: String,
-        selection_epoch: u64,
-        selected_at_ms: i64,
     },
 }
 
@@ -1802,9 +1664,7 @@ impl SemanticGenerationDiskStateV1 {
                 Some("semantic_pointer_missing_with_generation_directories")
             }
             Self::LegacyUnidentified { .. } => Some("semantic_generation_legacy_unidentified"),
-            Self::SourceUnknown { .. } => Some("semantic_generation_source_unknown"),
-            Self::HashControl { .. } => Some("semantic_generation_hash_control"),
-            Self::Ready { .. } | Self::EmptyCorpus { .. } => None,
+            Self::Ready { .. } => None,
         }
     }
 
@@ -1819,8 +1679,7 @@ impl SemanticGenerationDiskStateV1 {
             Self::LegacyUnidentified { .. } => {
                 Some(SemanticGenerationRecoveryAction::ReindexRequired)
             }
-            Self::SourceUnknown { .. } => Some(SemanticGenerationRecoveryAction::VerifySource),
-            Self::Ready { .. } | Self::HashControl { .. } | Self::EmptyCorpus { .. } => None,
+            Self::Ready { .. } => None,
         }
     }
 
@@ -1869,11 +1728,6 @@ impl std::fmt::Display for SemanticGenerationDiskStateV1 {
                 formatter,
                 "legacy semantic artifacts without authoritative identity: {artifact_count}"
             ),
-            Self::SourceUnknown { generation_id, .. } => write!(
-                formatter,
-                "semantic generation {} passed disk audit; verify its caller-pinned canonical source before declaring readiness",
-                fingerprint_prefix(generation_id)
-            ),
             Self::Ready {
                 generation_id,
                 requested_topology,
@@ -1882,16 +1736,6 @@ impl std::fmt::Display for SemanticGenerationDiskStateV1 {
             } => write!(
                 formatter,
                 "semantic generation {} is ready ({requested_topology:?} requested, {realized_topology:?} realized)",
-                fingerprint_prefix(generation_id)
-            ),
-            Self::HashControl { generation_id, .. } => write!(
-                formatter,
-                "generation {} is an explicit hash control; it does not attest semantic readiness",
-                fingerprint_prefix(generation_id)
-            ),
-            Self::EmptyCorpus { generation_id, .. } => write!(
-                formatter,
-                "semantic generation {} certifies an empty source; queries return an explicit empty result",
                 fingerprint_prefix(generation_id)
             ),
         }
@@ -1914,7 +1758,6 @@ pub struct SemanticGenerationDiskStateRobotV1 {
 #[serde(rename_all = "snake_case")]
 pub enum SemanticGenerationRecoveryAction {
     ProvisionAndIndex,
-    VerifySource,
     ReindexRequired,
     RollbackOrReindex,
     UpgradeRequired,
@@ -2012,26 +1855,6 @@ pub enum SemanticGenerationError {
         expected: String,
         actual: String,
     },
-    ArtifactAdmission {
-        role: SemanticArtifactRole,
-        source: Box<FsviAdmissionError>,
-    },
-    AnnReceiptAdmission {
-        role: SemanticArtifactRole,
-        source: Box<frankensearch::core::SearchError>,
-    },
-    ArtifactWitnessMismatch {
-        role: SemanticArtifactRole,
-        field: &'static str,
-    },
-    ArtifactAdmissionBudgetExceeded {
-        role: SemanticArtifactRole,
-        declared_bytes: u64,
-        max_bytes: u64,
-    },
-    UnsupportedVectorFormat {
-        role: SemanticArtifactRole,
-    },
     EmbeddingIdentityMismatch {
         role: SemanticArtifactRole,
         expected: String,
@@ -2099,18 +1922,6 @@ impl SemanticGenerationError {
             Self::ArtifactIo { .. } => "semantic_artifact_io",
             Self::ArtifactSizeMismatch { .. } => "semantic_artifact_size_mismatch",
             Self::ArtifactDigestMismatch { .. } => "semantic_artifact_digest_mismatch",
-            Self::ArtifactAdmission { source, .. } => match source.as_ref() {
-                FsviAdmissionError::ReindexRequired(_) => "semantic_artifact_reindex_required",
-                FsviAdmissionError::UpgradeRequired(_) => "semantic_artifact_upgrade_required",
-                FsviAdmissionError::SnapshotRejected(_) => "semantic_artifact_snapshot_rejected",
-                FsviAdmissionError::Index(_) => "semantic_artifact_corrupt",
-            },
-            Self::ArtifactWitnessMismatch { .. } => "semantic_artifact_witness_mismatch",
-            Self::AnnReceiptAdmission { .. } => "semantic_ann_receipt_corrupt",
-            Self::ArtifactAdmissionBudgetExceeded { .. } => {
-                "semantic_artifact_admission_budget_exceeded"
-            }
-            Self::UnsupportedVectorFormat { .. } => "semantic_artifact_format_upgrade_required",
             Self::EmbeddingIdentityMismatch { .. } => "semantic_embedding_identity_mismatch",
             Self::ImmutableManifestConflict { .. } => "semantic_manifest_immutable_conflict",
             Self::ConcurrentPublishConflict { .. } => "semantic_pointer_cas_conflict",
@@ -2124,27 +1935,14 @@ impl SemanticGenerationError {
 
     pub fn recovery_action(&self) -> SemanticGenerationRecoveryAction {
         match self {
-            Self::ArtifactAdmission { source, .. } => match source.as_ref() {
-                FsviAdmissionError::ReindexRequired(_) => {
-                    SemanticGenerationRecoveryAction::ReindexRequired
-                }
-                FsviAdmissionError::UpgradeRequired(_) => {
-                    SemanticGenerationRecoveryAction::UpgradeRequired
-                }
-                FsviAdmissionError::SnapshotRejected(_) | FsviAdmissionError::Index(_) => {
-                    SemanticGenerationRecoveryAction::RollbackOrReindex
-                }
-            },
             Self::UnsupportedPointerSchema { .. }
             | Self::UnsupportedManifestSchema { .. }
-            | Self::UnsupportedEmbeddingIdentitySchema { .. }
-            | Self::UnsupportedVectorFormat { .. } => {
+            | Self::UnsupportedEmbeddingIdentitySchema { .. } => {
                 SemanticGenerationRecoveryAction::UpgradeRequired
             }
             Self::MissingPointer
             | Self::StaleCorpus { .. }
             | Self::LegacyUnidentified { .. }
-            | Self::ArtifactAdmissionBudgetExceeded { .. }
             | Self::ImmutableManifestConflict { .. } => {
                 SemanticGenerationRecoveryAction::ReindexRequired
             }
@@ -2164,8 +1962,6 @@ impl SemanticGenerationError {
             | Self::ArtifactIo { .. }
             | Self::ArtifactSizeMismatch { .. }
             | Self::ArtifactDigestMismatch { .. }
-            | Self::AnnReceiptAdmission { .. }
-            | Self::ArtifactWitnessMismatch { .. }
             | Self::EmbeddingIdentityMismatch { .. } => {
                 SemanticGenerationRecoveryAction::RollbackOrReindex
             }
@@ -2264,37 +2060,6 @@ impl std::fmt::Display for SemanticGenerationError {
                 fingerprint_prefix(expected),
                 fingerprint_prefix(actual)
             ),
-            Self::ArtifactAdmission { role, .. } => write!(
-                f,
-                "semantic {} immutable FSVI admission failed ({})",
-                role.as_str(),
-                self.reason_code()
-            ),
-            Self::ArtifactWitnessMismatch { role, field } => write!(
-                f,
-                "semantic {} artifact disagrees with its immutable owner or receipt: {field}",
-                role.as_str()
-            ),
-            Self::AnnReceiptAdmission { role, .. } => write!(
-                f,
-                "semantic {} native ANN receipt admission failed ({})",
-                role.as_str(),
-                self.reason_code()
-            ),
-            Self::ArtifactAdmissionBudgetExceeded {
-                role,
-                declared_bytes,
-                max_bytes,
-            } => write!(
-                f,
-                "semantic {} vector image declares {declared_bytes} bytes, exceeding the {max_bytes}-byte audit ceiling; rebuild with smaller shards",
-                role.as_str()
-            ),
-            Self::UnsupportedVectorFormat { role } => write!(
-                f,
-                "semantic {} vector format is unsupported; upgrade CASS before using this generation",
-                role.as_str()
-            ),
             Self::EmbeddingIdentityMismatch {
                 role,
                 expected,
@@ -2335,15 +2100,7 @@ impl std::fmt::Display for SemanticGenerationError {
     }
 }
 
-impl std::error::Error for SemanticGenerationError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::ArtifactAdmission { source, .. } => Some(source.as_ref()),
-            Self::AnnReceiptAdmission { source, .. } => Some(source.as_ref()),
-            _ => None,
-        }
-    }
-}
+impl std::error::Error for SemanticGenerationError {}
 
 impl SemanticGenerationManifestV1 {
     /// Deterministic compact JSON used for storage and inspection.
@@ -2368,9 +2125,9 @@ impl SemanticGenerationManifestV1 {
     fn canonical_digest_bytes(&self) -> Vec<u8> {
         let domain: &[u8] =
             if self.schema_version == SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION {
-                b"cass.semantic-generation-manifest.v4"
+                b"cass.semantic-generation-manifest.v2"
             } else {
-                b"cass.semantic-generation-manifest.v3"
+                b"cass.semantic-generation-manifest.v1"
             };
         let mut encoder = SemanticCanonicalEncoder::new(domain);
         encoder.u32(self.schema_version);
@@ -2386,11 +2143,6 @@ impl SemanticGenerationManifestV1 {
         encoder.u8(match self.status {
             SemanticGenerationStatus::Building => 1,
             SemanticGenerationStatus::Sealed => 2,
-        });
-        encoder.u8(match self.purpose {
-            SemanticGenerationPurpose::Semantic => 1,
-            SemanticGenerationPurpose::HashControl => 2,
-            SemanticGenerationPurpose::EmptyCorpus => 3,
         });
         encode_corpus_identity(&mut encoder, &self.corpus);
         encode_producer_attestation(&mut encoder, &self.producer);
@@ -2516,30 +2268,6 @@ impl SemanticGenerationManifestV1 {
                 "manifest and corpus selected-document counts differ",
             );
         }
-        if self.purpose == SemanticGenerationPurpose::EmptyCorpus {
-            let (docset, content) = source_snapshot::empty_source_digests();
-            if self.selected_document_count != 0
-                || !self.artifacts.is_empty()
-                || self.total_vector_slot_count_across_tiers != 0
-                || self.total_live_vector_count_across_tiers != 0
-                || self.total_tombstone_vector_count_across_tiers != 0
-                || self.total_wal_entry_count_across_tiers != 0
-            {
-                return invalid_manifest(
-                    SemanticManifestInvariantClass::Count,
-                    "EmptyCorpus must bind zero selected documents and no vector, ANN or WAL artifacts",
-                );
-            }
-            if self.corpus.ordered_live_docset_sha256 != docset
-                || self.corpus.content_sha256 != content
-            {
-                return invalid_manifest(
-                    SemanticManifestInvariantClass::Identity,
-                    "EmptyCorpus must bind the actual empty document-set and content transcripts",
-                );
-            }
-            return Ok(());
-        }
         if self.selected_document_count == 0 {
             return invalid_manifest(
                 SemanticManifestInvariantClass::Count,
@@ -2568,7 +2296,6 @@ impl SemanticGenerationManifestV1 {
         let mut paths = BTreeSet::new();
         let mut portable_paths = BTreeSet::new();
         let mut previous_role = None;
-        let mut has_hash_control = false;
         for artifact in &self.artifacts {
             let key = (
                 artifact.role,
@@ -2608,21 +2335,6 @@ impl SemanticGenerationManifestV1 {
                 self.completed_at_ms,
                 self.sealed_at_ms,
             )?;
-            let hash_control = artifact.embedding_identity.identity.space.kind
-                == EmbeddingSpaceKindV1::HashControl;
-            has_hash_control |= hash_control;
-            if hash_control && self.purpose == SemanticGenerationPurpose::Semantic {
-                return invalid_manifest(
-                    SemanticManifestInvariantClass::Identity,
-                    "semantic purpose cannot contain a hash-control artifact",
-                );
-            }
-        }
-        if self.purpose == SemanticGenerationPurpose::HashControl && !has_hash_control {
-            return invalid_manifest(
-                SemanticManifestInvariantClass::Identity,
-                "HashControl purpose requires an actual hash-control artifact",
-            );
         }
 
         shards::validate(self)?;
@@ -2729,16 +2441,7 @@ impl SemanticGenerationManifestV1 {
                         artifact.tombstone_vector_count,
                         "tombstone vector count",
                     )?,
-                    checked_sum(
-                        totals.3,
-                        match artifact.seal {
-                            SemanticArtifactSealStateV1::Vector { wal_entry_count } => {
-                                wal_entry_count
-                            }
-                            SemanticArtifactSealStateV1::Ann {} => 0,
-                        },
-                        "WAL entry count",
-                    )?,
+                    checked_sum(totals.3, artifact.wal_entry_count, "WAL entry count")?,
                 ))
             })?;
         if (
@@ -2804,7 +2507,6 @@ impl SemanticGenerationManifestV1 {
         let generation_dir = self.generation_dir(data_dir)?;
         prepare_generation_directory(data_dir, &generation_dir)?;
         self.validate_artifacts_on_disk(data_dir, true)?;
-        self.validate_publishable_vector_formats()?;
         after_checkpoint(ManifestSealCheckpoint::ArtifactDurabilityEstablished)?;
         let manifest_path = generation_dir.join(SEMANTIC_GENERATION_MANIFEST_FILENAME);
         reject_symlink_entry(&manifest_path, "generation manifest")?;
@@ -2902,33 +2604,6 @@ impl SemanticGenerationManifestV1 {
         Ok(digest)
     }
 
-    /// Legacy images can be audited for recovery, but a successful hash check
-    /// cannot authorize sealing or selecting an image we cannot admit.
-    fn validate_publishable_vector_formats(&self) -> Result<(), SemanticGenerationError> {
-        let mut legacy_count = 0_u64;
-        for artifact in self
-            .artifacts
-            .iter()
-            .filter(|artifact| artifact.role.is_vector())
-        {
-            match artifact.artifact_format.as_str() {
-                "fsvi-v2" => {}
-                "fsvi-v1" => legacy_count = legacy_count.saturating_add(1),
-                _ => {
-                    return Err(SemanticGenerationError::UnsupportedVectorFormat {
-                        role: artifact.role,
-                    });
-                }
-            }
-        }
-        if legacy_count != 0 {
-            return Err(SemanticGenerationError::LegacyUnidentified {
-                artifact_count: legacy_count,
-            });
-        }
-        Ok(())
-    }
-
     fn validate_artifacts_on_disk(
         &self,
         data_dir: &Path,
@@ -2949,16 +2624,6 @@ impl SemanticGenerationManifestV1 {
         let mut resolved = BTreeMap::new();
 
         for artifact in &self.artifacts {
-            if artifact.role.is_vector()
-                && artifact.artifact_format == "fsvi-v2"
-                && artifact.size_bytes > MAX_AUDITED_VECTOR_IMAGE_BYTES
-            {
-                return Err(SemanticGenerationError::ArtifactAdmissionBudgetExceeded {
-                    role: artifact.role,
-                    declared_bytes: artifact.size_bytes,
-                    max_bytes: MAX_AUDITED_VECTOR_IMAGE_BYTES,
-                });
-            }
             let relative =
                 normalized_manifest_relative_path(&artifact.relative_path).map_err(|reason| {
                     SemanticGenerationError::InvalidManifest {
@@ -2991,25 +2656,14 @@ impl SemanticGenerationManifestV1 {
                     }
                 }
             }
-            let mut options = OpenOptions::new();
-            options.read(true).write(sync_for_seal);
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-
-                // Hashing is inspection, including during sealing. Never
-                // update artifact access time or follow a final symlink that
-                // appeared after the path checks. If NOATIME is denied, fail
-                // closed rather than retrying with an ordinary read.
-                options.custom_flags(libc::O_NOATIME | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-            }
-            let file =
-                options
-                    .open(&joined)
-                    .map_err(|error| SemanticGenerationError::ArtifactIo {
-                        role: artifact.role,
-                        source: error.to_string(),
-                    })?;
+            let file = OpenOptions::new()
+                .read(true)
+                .write(sync_for_seal)
+                .open(&joined)
+                .map_err(|error| SemanticGenerationError::ArtifactIo {
+                    role: artifact.role,
+                    source: error.to_string(),
+                })?;
             let metadata =
                 file.metadata()
                     .map_err(|error| SemanticGenerationError::ArtifactIo {
@@ -3086,64 +2740,6 @@ impl SemanticGenerationManifestV1 {
                     expected: artifact.artifact_sha256.clone(),
                     actual: actual_digest,
                 });
-            }
-            if artifact.role.is_vector() && artifact.artifact_format == "fsvi-v2" {
-                let generation = artifact.fsvi_generation.ok_or_else(|| {
-                    SemanticGenerationError::InvalidManifest {
-                        class: SemanticManifestInvariantClass::Identity,
-                        reason: "FSVI v2 descriptor lacks its generation binding".to_owned(),
-                    }
-                })?;
-                let binding =
-                    // ubs:ignore[rust.collections.clone-in-loop] -- The binding owns the identity it authenticates.
-                    FsviV2IdentityBinding::new(generation, artifact.embedding_identity.clone())
-                        .map_err(|error| SemanticGenerationError::InvalidManifest {
-                            class: SemanticManifestInvariantClass::Identity,
-                            reason: format!("canonical FSVI v2 binding rejected: {error}"),
-                        })?;
-                // This one owner authenticates structure, complete identity,
-                // counts and the very bytes whose digest is compared below.
-                // Drop it after this diagnostic; serving uses a retained owner
-                // from SelectedSemanticGeneration, never artifact_paths.
-                let owner =
-                    ValidatedFsviBytes::open_published(&joined, &binding).map_err(|source| {
-                        SemanticGenerationError::ArtifactAdmission {
-                            role: artifact.role,
-                            source: Box::new(source),
-                        }
-                    })?;
-                artifact.validate_fsvi_owner(&owner).map_err(|field| {
-                    SemanticGenerationError::ArtifactWitnessMismatch {
-                        role: artifact.role,
-                        field,
-                    }
-                })?;
-                // The public native graph loader currently reopens graph and
-                // receipt paths with ordinary reads. Audit only the bounded
-                // public receipt here, preserving access times; serving still
-                // performs full structural graph admission with this owner.
-                for ann in self.artifacts.iter().filter(|candidate| {
-                    candidate.role.base_vector_role() == Some(artifact.role)
-                        && candidate.shard == artifact.shard
-                        && candidate.artifact_format
-                            == super::semantic_reader::ann::NATIVE_ANN_ARTIFACT_FORMAT
-                }) {
-                    let graph_path = generation_dir.join(&ann.relative_path);
-                    let receipt = read_native_ann_receipt(
-                        &generation_dir,
-                        &graph_path,
-                        ann.role,
-                        sync_for_seal,
-                    )?;
-                    if !super::semantic_reader::ann::receipt_matches_manifest_owner(
-                        &receipt, ann, artifact, &owner,
-                    ) {
-                        return Err(SemanticGenerationError::ArtifactWitnessMismatch {
-                            role: ann.role,
-                            field: "native ANN receipt binding",
-                        });
-                    }
-                }
             }
             if sync_for_seal {
                 file.sync_all()
@@ -3344,7 +2940,6 @@ impl SemanticCurrentPointerV1 {
         loaded
             .manifest
             .validate_artifacts_on_disk(data_dir, false)?;
-        loaded.manifest.validate_publishable_vector_formats()?;
         let pointer_path = Self::path(data_dir);
         reject_symlink_entry(&pointer_path, "semantic current pointer")?;
         let bytes = self.canonical_bytes()?;
@@ -3475,12 +3070,7 @@ pub fn load_current_semantic_generation(
 /// Resolve the coarse authoritative semantic state without guessing artifact
 /// identity from legacy filenames.
 ///
-/// A selected pointer receives the full fail-closed load path. Only an
-/// explicit caller-pinned source match can yield `Ready`; a successful disk
-/// audit without that witness yields `SourceUnknown`. Legacy vector formats
-/// remain `LegacyUnidentified`; unknown formats require an upgrade. Hash-only
-/// legacy inspection never certifies readiness. Neither disk state
-/// substitutes for admitting a retained searchable owner. Without a
+/// A selected pointer receives the full fail-closed load path. Without a
 /// pointer, orphaned private pointer-publication tempfiles are reported as
 /// `InterruptedPublish`, staging directories as `Building`, unselected
 /// generation directories as `PointerMissingWithGenerationDirectories`, and
@@ -3490,60 +3080,11 @@ pub fn load_current_semantic_generation(
 /// legacy/unidentified rather than receiving the private-file classification.
 pub fn resolve_semantic_generation_disk_state(
     data_dir: &Path,
-    expected_corpus: Option<&SemanticCorpusSnapshotIdentity>,
 ) -> Result<SemanticGenerationDiskStateV1, SemanticGenerationError> {
     let pointer_path = SemanticCurrentPointerV1::path(data_dir);
     match fs::symlink_metadata(&pointer_path) {
         Ok(_) => {
-            let loaded = load_current_semantic_generation(data_dir, expected_corpus)?;
-            let mut legacy_vector_count = 0_u64;
-            for artifact in &loaded.manifest.artifacts {
-                if !artifact.role.is_vector() {
-                    continue;
-                }
-                match artifact.artifact_format.as_str() {
-                    "fsvi-v2" => {}
-                    "fsvi-v1" => legacy_vector_count = legacy_vector_count.saturating_add(1),
-                    _ => {
-                        return Err(SemanticGenerationError::UnsupportedVectorFormat {
-                            role: artifact.role,
-                        });
-                    }
-                }
-            }
-            if legacy_vector_count != 0 {
-                return Ok(SemanticGenerationDiskStateV1::LegacyUnidentified {
-                    artifact_count: legacy_vector_count,
-                });
-            }
-            if expected_corpus.is_none() {
-                return Ok(SemanticGenerationDiskStateV1::SourceUnknown {
-                    generation_id: loaded.pointer.generation_id,
-                    manifest_sha256: loaded.pointer.manifest_sha256,
-                    selection_epoch: loaded.pointer.selection_epoch,
-                    selected_at_ms: loaded.pointer.selected_at_ms,
-                    requested_topology: loaded.manifest.requested_topology,
-                    realized_topology: loaded.manifest.realized_topology,
-                });
-            }
-            if loaded.manifest.purpose == SemanticGenerationPurpose::EmptyCorpus {
-                return Ok(SemanticGenerationDiskStateV1::EmptyCorpus {
-                    generation_id: loaded.pointer.generation_id,
-                    manifest_sha256: loaded.pointer.manifest_sha256,
-                    selection_epoch: loaded.pointer.selection_epoch,
-                    selected_at_ms: loaded.pointer.selected_at_ms,
-                });
-            }
-            if loaded.manifest.purpose == SemanticGenerationPurpose::HashControl {
-                return Ok(SemanticGenerationDiskStateV1::HashControl {
-                    generation_id: loaded.pointer.generation_id,
-                    manifest_sha256: loaded.pointer.manifest_sha256,
-                    selection_epoch: loaded.pointer.selection_epoch,
-                    selected_at_ms: loaded.pointer.selected_at_ms,
-                    requested_topology: loaded.manifest.requested_topology,
-                    realized_topology: loaded.manifest.realized_topology,
-                });
-            }
+            let loaded = load_current_semantic_generation(data_dir, None)?;
             return Ok(SemanticGenerationDiskStateV1::Ready {
                 generation_id: loaded.pointer.generation_id,
                 manifest_sha256: loaded.pointer.manifest_sha256,
@@ -4086,6 +3627,12 @@ fn validate_corpus_identity(
             }
         })?;
     }
+    if corpus.document_count == 0 {
+        return invalid_manifest(
+            SemanticManifestInvariantClass::Count,
+            "corpus document_count must be positive",
+        );
+    }
     Ok(())
 }
 
@@ -4211,6 +3758,12 @@ fn validate_generation_artifact(
             reason: format!("canonical Frankensearch embedding identity rejected: {error}"),
         }
     })?;
+    if artifact.embedding_identity.identity.space.kind != EmbeddingSpaceKindV1::Semantic {
+        return invalid_manifest(
+            SemanticManifestInvariantClass::Identity,
+            "semantic generations reject explicit hash-control embedding identities",
+        );
+    }
     let dimension = artifact.embedding_identity.identity.space.dimension;
     if dimension == 0 || dimension > MAX_EMBEDDING_DIMENSION {
         return invalid_manifest(
@@ -4231,34 +3784,6 @@ fn validate_generation_artifact(
                 "vector artifact format must equal canonical Frankensearch storage identity",
             );
         }
-        match (&artifact.fsvi_generation, artifact.artifact_format.as_str()) {
-            (Some(generation), "fsvi-v2") => {
-                generation.validate().map_err(|error| {
-                    SemanticGenerationError::InvalidManifest {
-                        class: SemanticManifestInvariantClass::Identity,
-                        reason: format!("canonical FSVI generation identity rejected: {error}"),
-                    }
-                })?;
-            }
-            (None, "fsvi-v2") => {
-                return invalid_manifest(
-                    SemanticManifestInvariantClass::Identity,
-                    "FSVI v2 vector descriptors require their complete generation identity",
-                );
-            }
-            (Some(_), _) => {
-                return invalid_manifest(
-                    SemanticManifestInvariantClass::Identity,
-                    "legacy vector descriptors must not claim an FSVI v2 generation",
-                );
-            }
-            (None, _) => {}
-        }
-    } else if artifact.fsvi_generation.is_some() {
-        return invalid_manifest(
-            SemanticManifestInvariantClass::AnnBinding,
-            "ANN descriptors must not carry an FSVI generation field",
-        );
     } else if artifact.ann_base.is_none() {
         return invalid_manifest(
             SemanticManifestInvariantClass::AnnBinding,
@@ -4299,21 +3824,11 @@ fn validate_generation_artifact(
             "artifact live plus tombstone counts must equal physical vector-slot count",
         );
     }
-    match (artifact.role.is_vector(), artifact.seal) {
-        (true, SemanticArtifactSealStateV1::Vector { wal_entry_count: 0 })
-        | (false, SemanticArtifactSealStateV1::Ann {}) => {}
-        (true, SemanticArtifactSealStateV1::Vector { .. }) => {
-            return invalid_manifest(
-                SemanticManifestInvariantClass::SealState,
-                "immutable vector artifacts must be compacted and carry zero live WAL entries",
-            );
-        }
-        _ => {
-            return invalid_manifest(
-                SemanticManifestInvariantClass::AnnBinding,
-                "artifact seal kind must match its vector or ANN role",
-            );
-        }
+    if artifact.wal_entry_count != 0 {
+        return invalid_manifest(
+            SemanticManifestInvariantClass::SealState,
+            "immutable generation artifacts must be compacted and carry zero live WAL entries",
+        );
     }
     if artifact.generation_corpus_sha256 != corpus.corpus_sha256 {
         return invalid_manifest(
@@ -4403,7 +3918,7 @@ fn validate_generation_artifact(
         || evidence.vector_slot_count != artifact.vector_slot_count
         || evidence.live_vector_count != artifact.live_vector_count
         || evidence.tombstone_vector_count != artifact.tombstone_vector_count
-        || evidence.seal != artifact.seal
+        || evidence.wal_entry_count != artifact.wal_entry_count
         || evidence.generation_corpus_sha256 != artifact.generation_corpus_sha256
         || evidence.covered_live_docset_sha256 != artifact.covered_live_docset_sha256
         || evidence.covered_content_sha256 != artifact.covered_content_sha256
@@ -4623,7 +4138,7 @@ fn encode_generation_artifact(
     encoder.u64(artifact.vector_slot_count);
     encoder.u64(artifact.live_vector_count);
     encoder.u64(artifact.tombstone_vector_count);
-    encode_artifact_seal(encoder, artifact.seal);
+    encoder.u64(artifact.wal_entry_count);
     encoder.text(&artifact.generation_corpus_sha256);
     encoder.text(&artifact.covered_live_docset_sha256);
     encoder.text(&artifact.covered_content_sha256);
@@ -4637,27 +4152,10 @@ fn encode_generation_artifact(
     encoder.u64(evidence.vector_slot_count);
     encoder.u64(evidence.live_vector_count);
     encoder.u64(evidence.tombstone_vector_count);
-    encode_artifact_seal(encoder, evidence.seal);
+    encoder.u64(evidence.wal_entry_count);
     encoder.text(&evidence.generation_corpus_sha256);
     encoder.text(&evidence.covered_live_docset_sha256);
     encoder.text(&evidence.covered_content_sha256);
-    if let Some(generation) = artifact.fsvi_generation.as_ref() {
-        // Optional descriptor extension. 0xff is disjoint from following
-        // artifact-role (1..=4) and shard-presence (0..=1) tags. Omission
-        // preserves the documented legacy v1/v2 canonical transcript.
-        encoder.u8(0xff);
-        encoder.bytes(&generation.canonical_bytes());
-    }
-}
-
-fn encode_artifact_seal(encoder: &mut SemanticCanonicalEncoder, seal: SemanticArtifactSealStateV1) {
-    match seal {
-        SemanticArtifactSealStateV1::Vector { wal_entry_count } => {
-            encoder.u8(1);
-            encoder.u64(wal_entry_count);
-        }
-        SemanticArtifactSealStateV1::Ann {} => encoder.u8(2),
-    }
 }
 
 fn normalized_manifest_relative_path(recorded: &str) -> Result<PathBuf, String> {
@@ -4736,40 +4234,6 @@ fn semantic_vector_root(data_dir: &Path) -> PathBuf {
 
 fn semantic_generations_root(data_dir: &Path) -> PathBuf {
     semantic_vector_root(data_dir).join(SEMANTIC_GENERATIONS_DIRNAME)
-}
-
-/// Exclusively create one unpublished generation directory. Unlike idempotent
-/// sealing, staging may never reuse an existing generation's artifact names.
-/// Failed stages remain unselected for the explicit ownership-aware lifecycle.
-pub(crate) fn create_semantic_generation_stage_directory(
-    data_dir: &Path,
-    generation_id: &str,
-) -> Result<PathBuf, SemanticGenerationError> {
-    validate_generation_id(generation_id).map_err(|reason| {
-        SemanticGenerationError::InvalidManifest {
-            class: SemanticManifestInvariantClass::Path,
-            reason,
-        }
-    })?;
-    prepare_semantic_vector_root(data_dir, &semantic_vector_root(data_dir))?;
-    let parent = semantic_generations_root(data_dir);
-    ensure_directory_chain_without_links(data_dir, &parent).map_err(|error| {
-        SemanticGenerationError::ManifestIo {
-            generation_id: generation_id.into(),
-            source: error.to_string(),
-        }
-    })?;
-    let path = parent.join(generation_id);
-    fs::create_dir(&path).map_err(|error| SemanticGenerationError::ManifestIo {
-        generation_id: generation_id.into(),
-        source: error.to_string(),
-    })?;
-    validate_existing_generation_directory(data_dir, &path)?;
-    sync_parent_directory(&path).map_err(|error| SemanticGenerationError::ManifestIo {
-        generation_id: generation_id.into(),
-        source: error.to_string(),
-    })?;
-    Ok(path)
 }
 
 fn prepare_semantic_vector_root(
@@ -5040,71 +4504,6 @@ fn sha256_reader(file: &fs::File) -> std::io::Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn read_native_ann_receipt(
-    generation_dir: &Path,
-    graph_path: &Path,
-    role: SemanticArtifactRole,
-    sync_for_seal: bool,
-) -> Result<NativeHnswGenerationReceiptV2, SemanticGenerationError> {
-    const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
-    let receipt_path = native_hnsw_generation_receipt_path(graph_path).map_err(|source| {
-        SemanticGenerationError::AnnReceiptAdmission {
-            role,
-            source: Box::new(source),
-        }
-    })?;
-    let io_error = |error: std::io::Error| SemanticGenerationError::ArtifactIo {
-        role,
-        source: error.to_string(),
-    };
-    reject_existing_path_links(generation_dir, &receipt_path).map_err(io_error)?;
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .custom_flags(libc::O_NOATIME | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
-    }
-    let file = options.open(&receipt_path).map_err(io_error)?;
-    let metadata = file.metadata().map_err(io_error)?;
-    let identity = portable_file_identity(&file, &metadata).map_err(io_error)?;
-    if !metadata.is_file()
-        || identity.is_some_and(|identity| identity.link_count != 1)
-        || metadata.len() > MAX_RECEIPT_BYTES
-    {
-        return Err(SemanticGenerationError::ArtifactIo {
-            role,
-            source: "native ANN receipt must be a single-link regular file of at most64KiB"
-                .to_owned(),
-        });
-    }
-    verify_path_still_names_open_file(&receipt_path, identity).map_err(io_error)?;
-    let mut bytes = Vec::new();
-    (&file)
-        .take(MAX_RECEIPT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(io_error)?;
-    if u64::try_from(bytes.len()).ok() != Some(metadata.len()) {
-        return Err(SemanticGenerationError::ArtifactIo {
-            role,
-            source: "native ANN receipt changed length while being inspected".to_owned(),
-        });
-    }
-    verify_path_still_names_open_file(&receipt_path, identity).map_err(io_error)?;
-    let receipt =
-        NativeHnswGenerationReceiptV2::from_bytes(&bytes, &receipt_path).map_err(|source| {
-            SemanticGenerationError::AnnReceiptAdmission {
-                role,
-                source: Box::new(source),
-            }
-        })?;
-    if sync_for_seal {
-        file.sync_all().map_err(io_error)?;
-    }
-    Ok(receipt)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct PortableFileIdentity {
     volume: u64,
@@ -5276,11 +4675,6 @@ fn log_generation_validation_failure(
         SemanticGenerationError::ArtifactIo { role, .. }
         | SemanticGenerationError::ArtifactSizeMismatch { role, .. }
         | SemanticGenerationError::ArtifactDigestMismatch { role, .. }
-        | SemanticGenerationError::ArtifactAdmission { role, .. }
-        | SemanticGenerationError::AnnReceiptAdmission { role, .. }
-        | SemanticGenerationError::ArtifactWitnessMismatch { role, .. }
-        | SemanticGenerationError::ArtifactAdmissionBudgetExceeded { role, .. }
-        | SemanticGenerationError::UnsupportedVectorFormat { role }
         | SemanticGenerationError::EmbeddingIdentityMismatch { role, .. } => Some(*role),
         _ => None,
     };
@@ -6072,11 +5466,7 @@ mod tests {
             vector_slot_count: covered_document_count,
             live_vector_count: covered_document_count,
             tombstone_vector_count: 0,
-            seal: if role.is_vector() {
-                SemanticArtifactSealStateV1::Vector { wal_entry_count: 0 }
-            } else {
-                SemanticArtifactSealStateV1::Ann {}
-            },
+            wal_entry_count: 0,
             generation_corpus_sha256: corpus.corpus_sha256.clone(),
             covered_live_docset_sha256: covered_live_docset_sha256.clone(),
             covered_content_sha256: covered_content_sha256.clone(),
@@ -6088,7 +5478,6 @@ mod tests {
             artifact_sha256,
             size_bytes,
             artifact_format: artifact_format.to_owned(),
-            fsvi_generation: None,
             artifact_parameters_sha256,
             embedding_identity,
             ann_base: None,
@@ -6097,7 +5486,7 @@ mod tests {
             vector_slot_count: covered_document_count,
             live_vector_count: covered_document_count,
             tombstone_vector_count: 0,
-            seal: validation.seal,
+            wal_entry_count: 0,
             generation_corpus_sha256: corpus.corpus_sha256.clone(),
             covered_live_docset_sha256,
             covered_content_sha256,
@@ -6160,10 +5549,7 @@ mod tests {
         let wal_entry_count = artifacts
             .iter()
             .filter(|artifact| artifact.role.is_vector())
-            .map(|artifact| match artifact.seal {
-                SemanticArtifactSealStateV1::Vector { wal_entry_count } => wal_entry_count,
-                SemanticArtifactSealStateV1::Ann {} => 0,
-            })
+            .map(|artifact| artifact.wal_entry_count)
             .sum();
         SemanticGenerationManifestV1 {
             schema_version: SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION,
@@ -6177,7 +5563,6 @@ mod tests {
             requested_topology: SemanticGenerationTopology::FullProgressive,
             realized_topology,
             status: SemanticGenerationStatus::Sealed,
-            purpose: SemanticGenerationPurpose::Semantic,
             corpus: test_corpus_identity(),
             producer: test_producer_attestation(),
             selected_document_count: 3,
@@ -7139,6 +6524,1138 @@ mod tests {
         assert_eq!(shards.total_size_bytes(), 4096);
     }
 
+    // The pre-review tests below are retained verbatim as schema archaeology:
+    // they describe the rejected shadow-identity/full-coverage-only draft and
+    // intentionally do not compile into the test target. The active tests
+    // following the module exercise the accepted canonical identity and
+    // compare-and-swap contract.
+    #[rustfmt::skip]
+    #[cfg(any())]
+    mod superseded_pre_review_generation_contract {
+        use super::*;
+
+    // ── Superseded immutable generation manifest and pointer ───────────
+
+    fn mutated_generation(
+        base: &SemanticGenerationManifestV1,
+        mutate: impl FnOnce(&mut SemanticGenerationManifestV1),
+    ) -> SemanticGenerationManifestV1 {
+        let mut candidate = base.clone();
+        mutate(&mut candidate);
+        candidate
+    }
+
+    #[test]
+    fn immutable_generation_canonical_serialization_and_authoritative_fields_are_hashed() {
+        let corpus = test_corpus_identity();
+        let artifact = test_generation_artifact(
+            SemanticArtifactRole::FastVector,
+            "fast/vector.fsvi",
+            b"fast-vector",
+            &corpus,
+        );
+        let base = test_generation_manifest(SemanticGenerationTopology::FastOnly, vec![artifact]);
+        base.validate().unwrap();
+        let canonical = base.canonical_bytes().unwrap();
+        assert_eq!(
+            canonical,
+            base.canonical_bytes().unwrap(),
+            "canonical serialization must be byte deterministic"
+        );
+        let canonical_text = std::str::from_utf8(&canonical).unwrap();
+        let ordered_root_keys = [
+            "\"schema_version\"",
+            "\"generation_id\"",
+            "\"build_id\"",
+            "\"request_id\"",
+            "\"previous_generation_id\"",
+            "\"created_at_ms\"",
+            "\"completed_at_ms\"",
+            "\"published_at_ms\"",
+            "\"requested_topology\"",
+            "\"realized_topology\"",
+            "\"status\"",
+            "\"corpus\"",
+            "\"producer\"",
+            "\"artifacts\"",
+        ];
+        let positions =
+            ordered_root_keys.map(|key| canonical_text.find(key).expect("canonical key"));
+        assert!(
+            positions.windows(2).all(|window| window[0] < window[1]),
+            "canonical root fields must remain in schema order: {positions:?}"
+        );
+        let ordered_embedding_keys = [
+            "\"embedder_id\"",
+            "\"embedder_revision\"",
+            "\"dimension\"",
+            "\"model_manifest_sha256\"",
+            "\"model_files_sha256\"",
+            "\"input_contract_sha256\"",
+        ];
+        let positions =
+            ordered_embedding_keys.map(|key| canonical_text.find(key).expect("embedding key"));
+        assert!(
+            positions.windows(2).all(|window| window[0] < window[1]),
+            "canonical embedding identity fields must remain in schema order: {positions:?}"
+        );
+        let decoded: SemanticGenerationManifestV1 = serde_json::from_slice(&canonical).unwrap();
+        assert_eq!(decoded, base);
+
+        let mutations: Vec<(&str, SemanticGenerationManifestV1)> = vec![
+            (
+                "schema_version",
+                mutated_generation(&base, |value| value.schema_version += 1),
+            ),
+            (
+                "generation_id",
+                mutated_generation(&base, |value| value.generation_id.push('x')),
+            ),
+            (
+                "build_id",
+                mutated_generation(&base, |value| value.build_id.push('x')),
+            ),
+            (
+                "request_id",
+                mutated_generation(&base, |value| value.request_id = None),
+            ),
+            (
+                "previous_generation_id",
+                mutated_generation(&base, |value| value.previous_generation_id = None),
+            ),
+            (
+                "created_at_ms",
+                mutated_generation(&base, |value| value.created_at_ms += 1),
+            ),
+            (
+                "completed_at_ms",
+                mutated_generation(&base, |value| value.completed_at_ms += 1),
+            ),
+            (
+                "published_at_ms",
+                mutated_generation(&base, |value| value.published_at_ms += 1),
+            ),
+            (
+                "requested_topology",
+                mutated_generation(&base, |value| {
+                    value.requested_topology = SemanticGenerationTopology::FastOnly;
+                }),
+            ),
+            (
+                "realized_topology",
+                mutated_generation(&base, |value| {
+                    value.realized_topology = SemanticGenerationTopology::QualityOnly;
+                }),
+            ),
+            (
+                "database_uuid",
+                mutated_generation(&base, |value| value.corpus.database_uuid.push('x')),
+            ),
+            (
+                "source_change_sequence",
+                mutated_generation(&base, |value| value.corpus.source_change_sequence += 1),
+            ),
+            (
+                "schema_contract_sha256",
+                mutated_generation(&base, |value| {
+                    value.corpus.schema_contract_sha256 = test_sha256("changed-schema");
+                }),
+            ),
+            (
+                "content_selection_sha256",
+                mutated_generation(&base, |value| {
+                    value.corpus.content_selection_sha256 = test_sha256("changed-selection");
+                }),
+            ),
+            (
+                "canonicalization_sha256",
+                mutated_generation(&base, |value| {
+                    value.corpus.canonicalization_sha256 = test_sha256("changed-canonicalization");
+                }),
+            ),
+            (
+                "chunking_sha256",
+                mutated_generation(&base, |value| {
+                    value.corpus.chunking_sha256 = test_sha256("changed-chunking");
+                }),
+            ),
+            (
+                "document_id_contract_sha256",
+                mutated_generation(&base, |value| {
+                    value.corpus.document_id_contract_sha256 = test_sha256("changed-document-id");
+                }),
+            ),
+            (
+                "config_sha256",
+                mutated_generation(&base, |value| {
+                    value.corpus.config_sha256 = test_sha256("changed-config");
+                }),
+            ),
+            (
+                "corpus_sha256",
+                mutated_generation(&base, |value| {
+                    value.corpus.corpus_sha256 = test_sha256("changed-corpus");
+                }),
+            ),
+            (
+                "ordered_live_docset_sha256",
+                mutated_generation(&base, |value| {
+                    value.corpus.ordered_live_docset_sha256 = test_sha256("changed-docset");
+                }),
+            ),
+            (
+                "content_sha256",
+                mutated_generation(&base, |value| {
+                    value.corpus.content_sha256 = test_sha256("changed-content");
+                }),
+            ),
+            (
+                "corpus_document_count",
+                mutated_generation(&base, |value| value.corpus.document_count += 1),
+            ),
+            (
+                "cass_git_commit",
+                mutated_generation(&base, |value| value.producer.cass_git_commit.push('x')),
+            ),
+            (
+                "frankensearch_git_commit",
+                mutated_generation(&base, |value| {
+                    value.producer.frankensearch_git_commit.push('x');
+                }),
+            ),
+            (
+                "cargo_lock_sha256",
+                mutated_generation(&base, |value| {
+                    value.producer.cargo_lock_sha256 = test_sha256("changed-lock");
+                }),
+            ),
+            (
+                "rust_toolchain",
+                mutated_generation(&base, |value| value.producer.rust_toolchain.push('x')),
+            ),
+            (
+                "enabled_features",
+                mutated_generation(&base, |value| {
+                    value.producer.enabled_features.push("zstd".to_owned());
+                }),
+            ),
+            (
+                "build_profile",
+                mutated_generation(&base, |value| value.producer.build_profile.push('x')),
+            ),
+            (
+                "binary_elf_sha256",
+                mutated_generation(&base, |value| {
+                    value.producer.binary_elf_sha256 = test_sha256("changed-binary");
+                }),
+            ),
+            (
+                "document_count",
+                mutated_generation(&base, |value| value.document_count += 1),
+            ),
+            (
+                "vector_count",
+                mutated_generation(&base, |value| value.vector_count += 1),
+            ),
+            (
+                "live_vector_count",
+                mutated_generation(&base, |value| value.live_vector_count -= 1),
+            ),
+            (
+                "tombstone_count",
+                mutated_generation(&base, |value| value.tombstone_count += 1),
+            ),
+            (
+                "wal_entry_count",
+                mutated_generation(&base, |value| value.wal_entry_count += 1),
+            ),
+            (
+                "artifact_role",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].role = SemanticArtifactRole::QualityVector;
+                }),
+            ),
+            (
+                "artifact_path",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].relative_path.push('x');
+                }),
+            ),
+            (
+                "artifact_sha256",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].artifact_sha256 = test_sha256("changed-artifact");
+                }),
+            ),
+            (
+                "artifact_size",
+                mutated_generation(&base, |value| value.artifacts[0].size_bytes += 1),
+            ),
+            (
+                "storage_format",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].storage_format.push('x');
+                }),
+            ),
+            (
+                "storage_format_version",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].storage_format_version += 1;
+                }),
+            ),
+            (
+                "quantization",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].quantization.push('x');
+                }),
+            ),
+            (
+                "embedder_id",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].embedding.embedder_id.push('x');
+                }),
+            ),
+            (
+                "embedder_revision",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].embedding.embedder_revision.push('x');
+                }),
+            ),
+            (
+                "dimension",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].embedding.dimension += 1;
+                }),
+            ),
+            (
+                "model_manifest_sha256",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].embedding.model_manifest_sha256 =
+                        test_sha256("changed-model-manifest");
+                }),
+            ),
+            (
+                "model_files_sha256",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].embedding.model_files_sha256 =
+                        test_sha256("changed-model-files");
+                }),
+            ),
+            (
+                "input_contract_sha256",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].embedding.input_contract_sha256 =
+                        test_sha256("changed-input");
+                }),
+            ),
+            (
+                "artifact_document_count",
+                mutated_generation(&base, |value| value.artifacts[0].document_count += 1),
+            ),
+            (
+                "artifact_vector_count",
+                mutated_generation(&base, |value| value.artifacts[0].vector_count += 1),
+            ),
+            (
+                "artifact_live_count",
+                mutated_generation(&base, |value| value.artifacts[0].live_vector_count -= 1),
+            ),
+            (
+                "artifact_tombstone_count",
+                mutated_generation(&base, |value| value.artifacts[0].tombstone_count += 1),
+            ),
+            (
+                "artifact_wal_count",
+                mutated_generation(&base, |value| value.artifacts[0].wal_entry_count += 1),
+            ),
+            (
+                "coverage_numerator",
+                mutated_generation(&base, |value| value.artifacts[0].coverage_numerator -= 1),
+            ),
+            (
+                "coverage_denominator",
+                mutated_generation(&base, |value| value.artifacts[0].coverage_denominator += 1),
+            ),
+            (
+                "artifact_generation_sha256",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].generation_sha256 = test_sha256("changed-generation");
+                }),
+            ),
+            (
+                "artifact_docset_sha256",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].ordered_live_docset_sha256 =
+                        test_sha256("changed-artifact-docset");
+                }),
+            ),
+            (
+                "artifact_content_sha256",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].content_sha256 = test_sha256("changed-artifact-content");
+                }),
+            ),
+            (
+                "validator_id",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].validation.validator_id.push('x');
+                }),
+            ),
+            (
+                "validated_at_ms",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].validation.validated_at_ms += 1;
+                }),
+            ),
+            (
+                "validation_artifact_sha256",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].validation.artifact_sha256 =
+                        test_sha256("changed-validation-artifact");
+                }),
+            ),
+            (
+                "validation_size",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].validation.size_bytes += 1;
+                }),
+            ),
+            (
+                "validation_document_count",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].validation.document_count += 1;
+                }),
+            ),
+            (
+                "validation_vector_count",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].validation.vector_count += 1;
+                }),
+            ),
+            (
+                "validation_live_count",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].validation.live_vector_count -= 1;
+                }),
+            ),
+            (
+                "validation_tombstone_count",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].validation.tombstone_count += 1;
+                }),
+            ),
+            (
+                "validation_wal_count",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].validation.wal_entry_count += 1;
+                }),
+            ),
+            (
+                "validation_generation_sha256",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].validation.generation_sha256 =
+                        test_sha256("changed-validation-generation");
+                }),
+            ),
+            (
+                "validation_docset_sha256",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].validation.ordered_live_docset_sha256 =
+                        test_sha256("changed-validation-docset");
+                }),
+            ),
+            (
+                "validation_content_sha256",
+                mutated_generation(&base, |value| {
+                    value.artifacts[0].validation.content_sha256 =
+                        test_sha256("changed-validation-content");
+                }),
+            ),
+        ];
+        let base_digest = base.sha256().unwrap();
+        for (label, mutation) in mutations {
+            assert_ne!(
+                mutation.sha256().unwrap(),
+                base_digest,
+                "authoritative field {label} must affect canonical digest"
+            );
+        }
+
+        let mut json = serde_json::to_value(&base).unwrap();
+        json["status"] = serde_json::Value::String("building".to_owned());
+        assert!(
+            serde_json::from_value::<SemanticGenerationManifestV1>(json).is_err(),
+            "mutable/building status must not decode as an immutable generation"
+        );
+    }
+
+    #[test]
+    fn immutable_generation_validates_fast_quality_full_and_partial_topologies() {
+        let corpus = test_corpus_identity();
+        let fast = test_generation_artifact(
+            SemanticArtifactRole::FastVector,
+            "fast/vector.fsvi",
+            b"fast-vector",
+            &corpus,
+        );
+        let quality = test_generation_artifact(
+            SemanticArtifactRole::QualityVector,
+            "quality/vector.fsvi",
+            b"quality-vector",
+            &corpus,
+        );
+
+        test_generation_manifest(SemanticGenerationTopology::FastOnly, vec![fast.clone()])
+            .validate()
+            .unwrap();
+        test_generation_manifest(
+            SemanticGenerationTopology::QualityOnly,
+            vec![quality.clone()],
+        )
+        .validate()
+        .unwrap();
+        test_generation_manifest(
+            SemanticGenerationTopology::FullProgressive,
+            vec![fast.clone(), quality.clone()],
+        )
+        .validate()
+        .unwrap();
+
+        let partial =
+            test_generation_manifest(SemanticGenerationTopology::FastOnly, vec![fast.clone()]);
+        assert_eq!(
+            partial.requested_topology,
+            SemanticGenerationTopology::FullProgressive
+        );
+        partial.validate().unwrap();
+
+        let mut contradictory = partial.clone();
+        contradictory.requested_topology = SemanticGenerationTopology::QualityOnly;
+        assert!(matches!(
+            contradictory.validate(),
+            Err(SemanticGenerationError::InvalidManifest { .. })
+        ));
+
+        let mut missing = test_generation_manifest(
+            SemanticGenerationTopology::FullProgressive,
+            vec![fast.clone(), quality.clone()],
+        );
+        missing.artifacts.pop();
+        missing.vector_count = fast.vector_count;
+        missing.live_vector_count = fast.live_vector_count;
+        assert!(matches!(
+            missing.validate(),
+            Err(SemanticGenerationError::InvalidManifest { .. })
+        ));
+
+        let duplicate = test_generation_manifest(
+            SemanticGenerationTopology::FastOnly,
+            vec![fast.clone(), fast],
+        );
+        assert!(matches!(
+            duplicate.validate(),
+            Err(SemanticGenerationError::InvalidManifest { .. })
+        ));
+    }
+
+    #[test]
+    fn immutable_generation_rejects_count_evidence_ann_and_path_inconsistency() {
+        let corpus = test_corpus_identity();
+        let fast_bytes = b"fast-vector";
+        let fast = test_generation_artifact(
+            SemanticArtifactRole::FastVector,
+            "fast/vector.fsvi",
+            fast_bytes,
+            &corpus,
+        );
+        let mut ann = test_generation_artifact(
+            SemanticArtifactRole::FastAnn,
+            "fast/vector.hnsw",
+            b"fast-ann",
+            &corpus,
+        );
+        let valid = test_generation_manifest(
+            SemanticGenerationTopology::FastOnly,
+            vec![fast.clone(), ann.clone()],
+        );
+        valid.validate().unwrap();
+
+        let mut tombstoned = fast.clone();
+        tombstoned.vector_count += 2;
+        tombstoned.tombstone_count = 2;
+        tombstoned.validation.vector_count = tombstoned.vector_count;
+        tombstoned.validation.tombstone_count = tombstoned.tombstone_count;
+        test_generation_manifest(SemanticGenerationTopology::FastOnly, vec![tombstoned])
+            .validate()
+            .unwrap();
+
+        ann.embedding.dimension += 1;
+        ann.validation.artifact_sha256 = ann.artifact_sha256.clone();
+        let bad_ann = test_generation_manifest(
+            SemanticGenerationTopology::FastOnly,
+            vec![fast.clone(), ann],
+        );
+        assert!(matches!(
+            bad_ann.validate(),
+            Err(SemanticGenerationError::InvalidManifest { .. })
+        ));
+
+        let mut bad_evidence = valid.clone();
+        bad_evidence.artifacts[0].validation.vector_count += 1;
+        assert!(matches!(
+            bad_evidence.validate(),
+            Err(SemanticGenerationError::InvalidManifest { .. })
+        ));
+
+        let mut bad_count = valid.clone();
+        bad_count.vector_count += 1;
+        assert!(matches!(
+            bad_count.validate(),
+            Err(SemanticGenerationError::InvalidManifest { .. })
+        ));
+
+        for unsafe_path in [
+            "/absolute/vector.fsvi",
+            "../escape.fsvi",
+            "fast/../escape.fsvi",
+            "./fast/vector.fsvi",
+            "fast\\vector.fsvi",
+            "fast//vector.fsvi",
+            "fast/vector.fsvi/",
+            "fast/\0vector.fsvi",
+            " manifest.fsvi",
+            "manifest.json",
+        ] {
+            let mut candidate = test_generation_manifest(
+                SemanticGenerationTopology::FastOnly,
+                vec![test_generation_artifact(
+                    SemanticArtifactRole::FastVector,
+                    unsafe_path,
+                    fast_bytes,
+                    &corpus,
+                )],
+            );
+            candidate.artifacts[0].relative_path = unsafe_path.to_owned();
+            assert!(
+                matches!(
+                    candidate.validate(),
+                    Err(SemanticGenerationError::InvalidManifest { .. })
+                ),
+                "unsafe path must fail closed: {unsafe_path}"
+            );
+        }
+    }
+
+    #[test]
+    fn immutable_generation_rejects_weak_provenance_and_embedding_identity() {
+        let corpus = test_corpus_identity();
+        let artifact = test_generation_artifact(
+            SemanticArtifactRole::FastVector,
+            "fast/vector.fsvi",
+            b"fast-vector",
+            &corpus,
+        );
+        let base =
+            test_generation_manifest(SemanticGenerationTopology::FastOnly, vec![artifact.clone()]);
+
+        let mut weak_commit = base.clone();
+        weak_commit.producer.cass_git_commit = "main".to_owned();
+        assert!(matches!(
+            weak_commit.validate(),
+            Err(SemanticGenerationError::InvalidManifest { .. })
+        ));
+
+        let mut unsorted_features = base.clone();
+        unsorted_features.producer.enabled_features =
+            vec!["semantic".to_owned(), "native".to_owned()];
+        assert!(matches!(
+            unsorted_features.validate(),
+            Err(SemanticGenerationError::InvalidManifest { .. })
+        ));
+
+        let mut missing_model_identity = base.clone();
+        missing_model_identity.artifacts[0]
+            .embedding
+            .model_files_sha256 = "unverified".to_owned();
+        assert!(matches!(
+            missing_model_identity.validate(),
+            Err(SemanticGenerationError::InvalidManifest { .. })
+        ));
+
+        let mut impossible_dimension = base.clone();
+        impossible_dimension.artifacts[0].embedding.dimension =
+            MAX_EMBEDDING_DIMENSION.saturating_add(1);
+        assert!(matches!(
+            impossible_dimension.validate(),
+            Err(SemanticGenerationError::InvalidManifest { .. })
+        ));
+
+        let mut wrong_format = base.clone();
+        wrong_format.artifacts[0].storage_format = "hnsw".to_owned();
+        assert!(matches!(
+            wrong_format.validate(),
+            Err(SemanticGenerationError::InvalidManifest { .. })
+        ));
+
+        let mut incomplete_live_set = artifact;
+        incomplete_live_set.live_vector_count -= 1;
+        incomplete_live_set.tombstone_count += 1;
+        incomplete_live_set.validation.live_vector_count = incomplete_live_set.live_vector_count;
+        incomplete_live_set.validation.tombstone_count = incomplete_live_set.tombstone_count;
+        let incomplete = test_generation_manifest(
+            SemanticGenerationTopology::FastOnly,
+            vec![incomplete_live_set],
+        );
+        assert!(matches!(
+            incomplete.validate(),
+            Err(SemanticGenerationError::InvalidManifest { .. })
+        ));
+    }
+
+    #[test]
+    fn immutable_generation_publish_and_restart_load_use_only_pointer_and_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let corpus = test_corpus_identity();
+        let fast_bytes = b"fast-vector".to_vec();
+        let quality_bytes = b"quality-vector".to_vec();
+        let fast = test_generation_artifact(
+            SemanticArtifactRole::FastVector,
+            "fast/vector.fsvi",
+            &fast_bytes,
+            &corpus,
+        );
+        let quality = test_generation_artifact(
+            SemanticArtifactRole::QualityVector,
+            "quality/vector.fsvi",
+            &quality_bytes,
+            &corpus,
+        );
+        let manifest = test_generation_manifest(
+            SemanticGenerationTopology::FullProgressive,
+            vec![fast, quality],
+        );
+        let contents = BTreeMap::from([
+            (SemanticArtifactRole::FastVector, fast_bytes),
+            (SemanticArtifactRole::QualityVector, quality_bytes),
+        ]);
+        write_generation_artifacts(temp.path(), &manifest, &contents);
+
+        let digest = manifest.write_immutable(temp.path()).unwrap();
+        assert_eq!(
+            manifest.write_immutable(temp.path()).unwrap(),
+            digest,
+            "identical immutable write retry must be idempotent"
+        );
+        let pointer = SemanticCurrentPointerV1::for_manifest(&manifest).unwrap();
+        assert_eq!(pointer.manifest_sha256, digest);
+        pointer.publish_atomic(temp.path()).unwrap();
+
+        let loaded = load_current_semantic_generation(temp.path(), Some(&manifest.corpus)).unwrap();
+        assert_eq!(loaded.pointer, pointer);
+        assert_eq!(loaded.manifest, manifest);
+        assert_eq!(loaded.artifact_paths.len(), 2);
+        assert!(
+            !temp.path().join("vector_index/vector.fast.idx").exists(),
+            "resolution must not depend on a conventional filename"
+        );
+
+        let mut conflicting = manifest.clone();
+        conflicting.build_id.push_str("-different");
+        assert!(matches!(
+            conflicting.write_immutable(temp.path()),
+            Err(SemanticGenerationError::ImmutableManifestConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn immutable_generation_resolution_distinguishes_missing_corrupt_future_and_stale() {
+        let missing = tempfile::tempdir().unwrap();
+        let error = load_current_semantic_generation(missing.path(), None).unwrap_err();
+        assert!(matches!(error, SemanticGenerationError::MissingPointer));
+        assert_eq!(
+            error.recovery_action(),
+            SemanticGenerationRecoveryAction::ReindexRequired
+        );
+
+        let corrupt = tempfile::tempdir().unwrap();
+        let pointer_path = SemanticCurrentPointerV1::path(corrupt.path());
+        fs::create_dir_all(pointer_path.parent().unwrap()).unwrap();
+        fs::write(&pointer_path, b"not-json").unwrap();
+        let error = load_current_semantic_generation(corrupt.path(), None).unwrap_err();
+        assert!(matches!(
+            error,
+            SemanticGenerationError::PointerParse { .. }
+        ));
+
+        let future = tempfile::tempdir().unwrap();
+        let pointer_path = SemanticCurrentPointerV1::path(future.path());
+        fs::create_dir_all(pointer_path.parent().unwrap()).unwrap();
+        let future_pointer = SemanticCurrentPointerV1 {
+            schema_version: SEMANTIC_CURRENT_POINTER_SCHEMA_VERSION + 1,
+            generation_id: "gen-future".to_owned(),
+            manifest_sha256: test_sha256("future"),
+            published_at_ms: 1,
+        };
+        fs::write(&pointer_path, serde_json::to_vec(&future_pointer).unwrap()).unwrap();
+        let error = load_current_semantic_generation(future.path(), None).unwrap_err();
+        assert!(matches!(
+            error,
+            SemanticGenerationError::UnsupportedPointerSchema { .. }
+        ));
+        assert_eq!(
+            error.recovery_action(),
+            SemanticGenerationRecoveryAction::UpgradeRequired
+        );
+
+        let stale = tempfile::tempdir().unwrap();
+        let corpus = test_corpus_identity();
+        let bytes = b"fast-vector".to_vec();
+        let artifact = test_generation_artifact(
+            SemanticArtifactRole::FastVector,
+            "fast/vector.fsvi",
+            &bytes,
+            &corpus,
+        );
+        let manifest =
+            test_generation_manifest(SemanticGenerationTopology::FastOnly, vec![artifact]);
+        write_generation_artifacts(
+            stale.path(),
+            &manifest,
+            &BTreeMap::from([(SemanticArtifactRole::FastVector, bytes)]),
+        );
+        manifest.write_immutable(stale.path()).unwrap();
+        SemanticCurrentPointerV1::for_manifest(&manifest)
+            .unwrap()
+            .publish_atomic(stale.path())
+            .unwrap();
+        let mut expected = manifest.corpus.clone();
+        expected.source_change_sequence += 1;
+        expected.corpus_sha256 = test_sha256("newer-corpus");
+        let error = load_current_semantic_generation(stale.path(), Some(&expected)).unwrap_err();
+        assert!(matches!(error, SemanticGenerationError::StaleCorpus { .. }));
+    }
+
+    #[test]
+    fn immutable_generation_detects_manifest_artifact_hash_and_size_substitution() {
+        let temp = tempfile::tempdir().unwrap();
+        let corpus = test_corpus_identity();
+        let bytes = b"fast-vector".to_vec();
+        let artifact = test_generation_artifact(
+            SemanticArtifactRole::FastVector,
+            "fast/vector.fsvi",
+            &bytes,
+            &corpus,
+        );
+        let manifest =
+            test_generation_manifest(SemanticGenerationTopology::FastOnly, vec![artifact]);
+        write_generation_artifacts(
+            temp.path(),
+            &manifest,
+            &BTreeMap::from([(SemanticArtifactRole::FastVector, bytes.clone())]),
+        );
+        manifest.write_immutable(temp.path()).unwrap();
+        let pointer = SemanticCurrentPointerV1::for_manifest(&manifest).unwrap();
+        pointer.publish_atomic(temp.path()).unwrap();
+
+        let artifact_path = manifest
+            .generation_dir(temp.path())
+            .unwrap()
+            .join("fast/vector.fsvi");
+        fs::write(&artifact_path, b"same-length!").unwrap();
+        let error = load_current_semantic_generation(temp.path(), None).unwrap_err();
+        assert!(matches!(
+            &error,
+            SemanticGenerationError::ArtifactDigestMismatch { .. }
+                | SemanticGenerationError::ArtifactSizeMismatch { .. }
+        ));
+        assert_eq!(
+            error.recovery_action(),
+            SemanticGenerationRecoveryAction::RollbackOrReindex
+        );
+
+        fs::write(&artifact_path, &bytes).unwrap();
+        let manifest_path = manifest.manifest_path(temp.path()).unwrap();
+        let mut manifest_bytes = fs::read(&manifest_path).unwrap();
+        manifest_bytes.push(b' ');
+        fs::write(&manifest_path, manifest_bytes).unwrap();
+        let error = load_current_semantic_generation(temp.path(), None).unwrap_err();
+        assert!(matches!(
+            &error,
+            SemanticGenerationError::ManifestDigestMismatch { .. }
+        ));
+        assert_eq!(
+            error.recovery_action(),
+            SemanticGenerationRecoveryAction::RollbackOrReindex
+        );
+    }
+
+    #[test]
+    fn immutable_pointer_publish_faults_never_expose_a_mixed_generation() {
+        let checkpoints = [
+            (
+                PointerPublishCheckpoint::TemporaryBytesWritten,
+                "gen-20260726-old",
+            ),
+            (
+                PointerPublishCheckpoint::TemporaryFileSynced,
+                "gen-20260726-old",
+            ),
+            (
+                PointerPublishCheckpoint::PointerReplaced,
+                "gen-20260726-new",
+            ),
+            (
+                PointerPublishCheckpoint::ParentDirectorySynced,
+                "gen-20260726-new",
+            ),
+        ];
+
+        for (fault, expected_generation_id) in checkpoints {
+            let temp = tempfile::tempdir().unwrap();
+            let corpus = test_corpus_identity();
+            let old_bytes = b"old-vector".to_vec();
+            let new_bytes = b"new-vector".to_vec();
+            let old_artifact = test_generation_artifact(
+                SemanticArtifactRole::FastVector,
+                "fast/vector.fsvi",
+                &old_bytes,
+                &corpus,
+            );
+            let new_artifact = test_generation_artifact(
+                SemanticArtifactRole::FastVector,
+                "fast/vector.fsvi",
+                &new_bytes,
+                &corpus,
+            );
+            let mut old_manifest =
+                test_generation_manifest(SemanticGenerationTopology::FastOnly, vec![old_artifact]);
+            old_manifest.generation_id = "gen-20260726-old".to_owned();
+            old_manifest.build_id = "build-old".to_owned();
+            old_manifest.previous_generation_id = None;
+            let mut new_manifest =
+                test_generation_manifest(SemanticGenerationTopology::FastOnly, vec![new_artifact]);
+            new_manifest.generation_id = "gen-20260726-new".to_owned();
+            new_manifest.build_id = "build-new".to_owned();
+            new_manifest.previous_generation_id = Some(old_manifest.generation_id.clone());
+            new_manifest.created_at_ms += 1_000;
+            new_manifest.completed_at_ms += 1_000;
+            new_manifest.published_at_ms += 1_000;
+
+            write_generation_artifacts(
+                temp.path(),
+                &old_manifest,
+                &BTreeMap::from([(SemanticArtifactRole::FastVector, old_bytes.clone())]),
+            );
+            write_generation_artifacts(
+                temp.path(),
+                &new_manifest,
+                &BTreeMap::from([(SemanticArtifactRole::FastVector, new_bytes.clone())]),
+            );
+            old_manifest.write_immutable(temp.path()).unwrap();
+            new_manifest.write_immutable(temp.path()).unwrap();
+            SemanticCurrentPointerV1::for_manifest(&old_manifest)
+                .unwrap()
+                .publish_atomic(temp.path())
+                .unwrap();
+
+            let new_pointer = SemanticCurrentPointerV1::for_manifest(&new_manifest).unwrap();
+            let mut injected = false;
+            let error = new_pointer
+                .publish_atomic_with_hook(temp.path(), |checkpoint| {
+                    if checkpoint == fault {
+                        injected = true;
+                        return Err(SemanticGenerationError::PointerIo {
+                            source: format!("injected failure after {fault:?}"),
+                        });
+                    }
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(injected, "fault checkpoint {fault:?} must be reached");
+            assert!(matches!(error, SemanticGenerationError::PointerIo { .. }));
+
+            let loaded = load_current_semantic_generation(temp.path(), Some(&corpus)).unwrap();
+            assert_eq!(
+                loaded.manifest.generation_id, expected_generation_id,
+                "failure after {fault:?} must expose exactly the old or new sealed generation"
+            );
+            let expected_bytes = if expected_generation_id == old_manifest.generation_id {
+                &old_bytes
+            } else {
+                &new_bytes
+            };
+            let selected_artifact = loaded
+                .artifact_paths
+                .get(&SemanticArtifactRole::FastVector)
+                .unwrap();
+            assert_eq!(
+                fs::read(selected_artifact).unwrap(),
+                *expected_bytes,
+                "pointer and artifact bytes must always come from the same generation"
+            );
+        }
+    }
+
+    #[test]
+    fn immutable_generation_rejects_unknown_fields_missing_manifest_and_future_manifest() {
+        let corpus = test_corpus_identity();
+        let bytes = b"fast-vector".to_vec();
+        let artifact = test_generation_artifact(
+            SemanticArtifactRole::FastVector,
+            "fast/vector.fsvi",
+            &bytes,
+            &corpus,
+        );
+        let manifest =
+            test_generation_manifest(SemanticGenerationTopology::FastOnly, vec![artifact]);
+
+        let mut manifest_json: serde_json::Value =
+            serde_json::from_slice(&manifest.canonical_bytes().unwrap()).unwrap();
+        manifest_json
+            .as_object_mut()
+            .unwrap()
+            .insert("guessed_ready".to_owned(), serde_json::Value::Bool(true));
+        assert!(
+            serde_json::from_value::<SemanticGenerationManifestV1>(manifest_json).is_err(),
+            "unknown manifest fields must fail closed"
+        );
+
+        let missing = tempfile::tempdir().unwrap();
+        let pointer = SemanticCurrentPointerV1 {
+            schema_version: SEMANTIC_CURRENT_POINTER_SCHEMA_VERSION,
+            generation_id: manifest.generation_id.clone(),
+            manifest_sha256: manifest.sha256().unwrap(),
+            published_at_ms: manifest.published_at_ms,
+        };
+        let pointer_path = SemanticCurrentPointerV1::path(missing.path());
+        fs::create_dir_all(pointer_path.parent().unwrap()).unwrap();
+        fs::write(&pointer_path, pointer.canonical_bytes().unwrap()).unwrap();
+        assert!(matches!(
+            load_current_semantic_generation(missing.path(), None),
+            Err(SemanticGenerationError::MissingManifest { .. })
+        ));
+
+        let future = tempfile::tempdir().unwrap();
+        let mut future_manifest = manifest;
+        future_manifest.schema_version = SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION + 1;
+        write_generation_artifacts(
+            future.path(),
+            &future_manifest,
+            &BTreeMap::from([(SemanticArtifactRole::FastVector, bytes)]),
+        );
+        let manifest_path = future_manifest.manifest_path(future.path()).unwrap();
+        let manifest_bytes = future_manifest.canonical_bytes().unwrap();
+        fs::write(&manifest_path, &manifest_bytes).unwrap();
+        let future_pointer = SemanticCurrentPointerV1 {
+            schema_version: SEMANTIC_CURRENT_POINTER_SCHEMA_VERSION,
+            generation_id: future_manifest.generation_id.clone(),
+            manifest_sha256: sha256_hex(&manifest_bytes),
+            published_at_ms: future_manifest.published_at_ms,
+        };
+        let pointer_path = SemanticCurrentPointerV1::path(future.path());
+        fs::write(&pointer_path, future_pointer.canonical_bytes().unwrap()).unwrap();
+        let error = load_current_semantic_generation(future.path(), None).unwrap_err();
+        assert!(matches!(
+            error,
+            SemanticGenerationError::UnsupportedManifestSchema { .. }
+        ));
+        assert_eq!(
+            error.recovery_action(),
+            SemanticGenerationRecoveryAction::UpgradeRequired
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn immutable_generation_property_rejects_parent_alias_paths(
+            directory in "[A-Za-z0-9_-]{1,64}",
+            filename in "[A-Za-z0-9_-]{1,64}\\.fsvi",
+        ) {
+            let corpus = test_corpus_identity();
+            let bytes = b"property-vector";
+            let traversal = format!("{directory}/../{filename}");
+            let artifact = test_generation_artifact(
+                SemanticArtifactRole::FastVector,
+                &traversal,
+                bytes,
+                &corpus,
+            );
+            let candidate =
+                test_generation_manifest(SemanticGenerationTopology::FastOnly, vec![artifact]);
+            prop_assert!(matches!(
+                candidate.validate(),
+                Err(SemanticGenerationError::InvalidManifest { .. })
+            ), "parent traversal path unexpectedly validated");
+        }
+
+        #[test]
+        fn immutable_generation_property_digest_is_stable_and_generation_sensitive(
+            suffix in "[A-Za-z0-9_-]{1,32}",
+        ) {
+            let corpus = test_corpus_identity();
+            let artifact = test_generation_artifact(
+                SemanticArtifactRole::FastVector,
+                "fast/vector.fsvi",
+                b"property-vector",
+                &corpus,
+            );
+            let base =
+                test_generation_manifest(SemanticGenerationTopology::FastOnly, vec![artifact]);
+            let mut changed = base.clone();
+            changed.generation_id = format!("gen-{suffix}");
+            prop_assert_eq!(base.sha256().unwrap(), base.sha256().unwrap());
+            prop_assert_ne!(base.sha256().unwrap(), changed.sha256().unwrap());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_generation_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_artifact = outside.path().join("outside.fsvi");
+        fs::write(&outside_artifact, b"fast-vector").unwrap();
+        let corpus = test_corpus_identity();
+        let artifact = test_generation_artifact(
+            SemanticArtifactRole::FastVector,
+            "fast/vector.fsvi",
+            b"fast-vector",
+            &corpus,
+        );
+        let manifest =
+            test_generation_manifest(SemanticGenerationTopology::FastOnly, vec![artifact]);
+        let generation_dir = manifest.generation_dir(temp.path()).unwrap();
+        fs::create_dir_all(generation_dir.join("fast")).unwrap();
+        symlink(&outside_artifact, generation_dir.join("fast/vector.fsvi")).unwrap();
+        manifest.write_immutable(temp.path()).unwrap();
+        let error = SemanticCurrentPointerV1::for_manifest(&manifest)
+            .unwrap()
+            .publish_atomic(temp.path())
+            .unwrap_err();
+        assert!(matches!(error, SemanticGenerationError::ArtifactIo { .. }));
+
+        let pointer_escape = tempfile::tempdir().unwrap();
+        let outside_pointer = outside.path().join("outside-current.json");
+        fs::write(
+            &outside_pointer,
+            SemanticCurrentPointerV1::for_manifest(&manifest)
+                .unwrap()
+                .canonical_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+        let pointer_path = SemanticCurrentPointerV1::path(pointer_escape.path());
+        fs::create_dir_all(pointer_path.parent().unwrap()).unwrap();
+        symlink(&outside_pointer, &pointer_path).unwrap();
+        assert!(matches!(
+            load_current_semantic_generation(pointer_escape.path(), None),
+            Err(SemanticGenerationError::InvalidPointer { .. })
+        ));
+    }
+    }
+
     // ── Accepted immutable generation contract ────────────────────────
 
     fn accepted_mutated_generation(
@@ -7171,71 +7688,6 @@ mod tests {
         manifest
     }
 
-    /// Filesystem publication tests use a real public writer image. Metadata
-    /// tests above deliberately keep their synthetic descriptors separate.
-    fn writer_produced_generation_fixture(
-        generation_id: &str,
-    ) -> (
-        SemanticGenerationManifestV1,
-        BTreeMap<SemanticArtifactRole, Vec<u8>>,
-    ) {
-        use crate::search::vector_index::{ROLE_USER, SemanticDocId, VectorIndex};
-
-        let temp = tempfile::tempdir().expect("writer fixture directory");
-        let path = temp.path().join("fixture.fsvi");
-        let identity = test_semantic_identity("fast", 256, "fsvi-v2");
-        let digest = Sha256::digest(generation_id.as_bytes());
-        let mut nonce = [0_u8; 16];
-        nonce.copy_from_slice(&digest[..16]);
-        let generation = ArtifactGenerationIdentityV1::new(1, nonce).unwrap();
-        let binding = FsviV2IdentityBinding::new(generation, identity.clone()).unwrap();
-        let mut writer = VectorIndex::create_v2(&path, binding.clone()).unwrap();
-        for document in 0_u8..3 {
-            let mut vector = vec![0.0_f32; 256];
-            vector[usize::from(document)] = 1.0;
-            let id = SemanticDocId {
-                message_id: u64::from(document) + 1,
-                chunk_idx: 0,
-                agent_id: 1,
-                workspace_id: 1,
-                source_id: 0,
-                role: ROLE_USER,
-                created_at_ms: 1_700_000_000_000,
-                content_hash: Some([document + 1; 32]),
-            };
-            writer
-                .write_record(&id.to_doc_id_string(), &vector)
-                .unwrap();
-        }
-        writer.finish().unwrap();
-        let owner = ValidatedFsviBytes::open_published(&path, &binding).unwrap();
-        let bytes = fs::read(&path).unwrap();
-        let mut corpus = test_corpus_identity();
-        corpus.ordered_live_docset_sha256 = hex::encode(owner.witness().ordered_live_docset_digest);
-        let mut artifact = complete_generation_artifact(
-            SemanticArtifactRole::FastVector,
-            "fast/primary.fsvi",
-            &bytes,
-            &corpus,
-        );
-        artifact.artifact_format = "fsvi-v2".to_owned();
-        artifact.fsvi_generation = Some(generation);
-        artifact.embedding_identity = identity;
-        artifact.artifact_parameters_sha256 = test_sha256("fsvi-v2-f16-little-l2");
-        artifact.validation.validator_id = "frankensearch-fsvi-v2-owner".to_owned();
-        artifact.validate_fsvi_owner(&owner).unwrap();
-        let mut manifest = generation_with_id(
-            generation_id,
-            SemanticGenerationTopology::FastOnly,
-            vec![artifact],
-        );
-        manifest.corpus = corpus;
-        (
-            manifest,
-            BTreeMap::from([(SemanticArtifactRole::FastVector, bytes)]),
-        )
-    }
-
     fn seal_generation(
         data_dir: &Path,
         manifest: &SemanticGenerationManifestV1,
@@ -7265,22 +7717,12 @@ mod tests {
                 .freeze()
                 .expect("explicit hash control");
         artifact.artifact_format = artifact.embedding_identity.identity.storage.format.clone();
-        let mut hash_control =
+        let hash_control =
             test_generation_manifest(SemanticGenerationTopology::FastOnly, vec![artifact]);
         let error = hash_control
             .validate()
             .expect_err("hash control must fail closed");
         assert_eq!(error.reason_code(), "semantic_manifest_identity_invalid");
-        hash_control.purpose = SemanticGenerationPurpose::HashControl;
-        hash_control
-            .validate()
-            .expect("explicit control purpose is executable control evidence");
-        let mut false_control = manifest.clone();
-        false_control.purpose = SemanticGenerationPurpose::HashControl;
-        assert_eq!(
-            false_control.validate().unwrap_err().reason_code(),
-            "semantic_manifest_identity_invalid"
-        );
 
         let mut noncanonical = manifest;
         noncanonical.artifacts[0]
@@ -7296,99 +7738,6 @@ mod tests {
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn semantic_source_empty_manifest_seals_without_fabricated_artifacts() {
-        use crate::franken_sync::compat::TransactionExt;
-        use crate::search::semantic_reader::publication::text::hydration::PassageProjection;
-        use crate::storage::sqlite::FrankenStorage;
-        use source_snapshot::{
-            SemanticSourceContract, SemanticSourceSnapshotBudget,
-            persist_semantic_source_certificate_in_transaction,
-            semantic_source_snapshot_in_transaction,
-        };
-
-        let root = tempfile::tempdir().unwrap();
-        let storage = FrankenStorage::open(&root.path().join("actual-empty-source.db")).unwrap();
-        let mut transaction = storage.raw().transaction().unwrap();
-        let source = semantic_source_snapshot_in_transaction(
-            &transaction,
-            SemanticSourceContract::new(PassageProjection::RawPassagesV2),
-            SemanticSourceSnapshotBudget::default(),
-        )
-        .unwrap();
-        assert_eq!(source.identity().document_count, 0);
-        persist_semantic_source_certificate_in_transaction(&transaction, &source).unwrap();
-        transaction.commit().unwrap();
-        // Provenance below is explicitly fixture provenance. This tests the
-        // real empty source/seal/CAS mechanics, not a production model claim.
-        let mut empty =
-            test_generation_manifest(SemanticGenerationTopology::QualityOnly, Vec::new());
-        empty.purpose = SemanticGenerationPurpose::EmptyCorpus;
-        empty.corpus = source.identity().clone();
-        empty.selected_document_count = 0;
-        empty.validate().unwrap();
-        empty.write_immutable(root.path()).unwrap();
-        let pointer =
-            SemanticCurrentPointerV1::for_manifest(&empty, empty.sealed_at_ms, 1).unwrap();
-        pointer
-            .publish_atomic(root.path(), &SemanticExpectedCurrentV1::Absent)
-            .unwrap();
-        let loaded =
-            load_current_semantic_generation(root.path(), Some(source.identity())).unwrap();
-        assert!(loaded.artifact_paths.is_empty());
-        assert_eq!(
-            loaded.manifest.purpose,
-            SemanticGenerationPurpose::EmptyCorpus
-        );
-        assert!(matches!(
-            resolve_semantic_generation_disk_state(root.path(), Some(source.identity())).unwrap(),
-            SemanticGenerationDiskStateV1::EmptyCorpus { .. }
-        ));
-        assert!(matches!(
-            resolve_semantic_generation_disk_state(root.path(), None).unwrap(),
-            SemanticGenerationDiskStateV1::SourceUnknown { .. }
-        ));
-        let entries = fs::read_dir(empty.generation_dir(root.path()).unwrap())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            entries,
-            vec![std::ffi::OsString::from(
-                SEMANTIC_GENERATION_MANIFEST_FILENAME
-            )]
-        );
-        let mutations: [fn(&mut SemanticGenerationManifestV1); 8] = [
-            |manifest: &mut SemanticGenerationManifestV1| manifest.selected_document_count = 1,
-            |manifest: &mut SemanticGenerationManifestV1| {
-                manifest.total_vector_slot_count_across_tiers = 1
-            },
-            |manifest: &mut SemanticGenerationManifestV1| {
-                manifest.total_live_vector_count_across_tiers = 1
-            },
-            |manifest: &mut SemanticGenerationManifestV1| {
-                manifest.total_tombstone_vector_count_across_tiers = 1
-            },
-            |manifest: &mut SemanticGenerationManifestV1| {
-                manifest.total_wal_entry_count_across_tiers = 1
-            },
-            |manifest: &mut SemanticGenerationManifestV1| {
-                manifest.purpose = SemanticGenerationPurpose::Semantic
-            },
-            |manifest: &mut SemanticGenerationManifestV1| {
-                manifest.corpus.ordered_live_docset_sha256 = "0".repeat(64)
-            },
-            |manifest: &mut SemanticGenerationManifestV1| {
-                manifest.corpus.content_sha256 = "0".repeat(64)
-            },
-        ];
-        for mutate in mutations {
-            let mut invalid = empty.clone();
-            mutate(&mut invalid);
-            assert!(invalid.validate().is_err());
-        }
     }
 
     #[test]
@@ -7456,19 +7805,34 @@ mod tests {
 
     #[test]
     fn accepted_immutable_generation_rejects_declared_or_on_disk_wal_state() {
-        let (manifest, contents) = writer_produced_generation_fixture("gen-wal-free");
-        let corpus = manifest.corpus.clone();
+        let corpus = test_corpus_identity();
+        let bytes = b"wal-free-vector".to_vec();
+        let artifact = complete_generation_artifact(
+            SemanticArtifactRole::FastVector,
+            "fast/primary.fsvi",
+            &bytes,
+            &corpus,
+        );
+        let manifest = generation_with_id(
+            "gen-wal-free",
+            SemanticGenerationTopology::FastOnly,
+            vec![artifact],
+        );
 
         let mut declared_wal = manifest.clone();
-        declared_wal.artifacts[0].seal = SemanticArtifactSealStateV1::Vector { wal_entry_count: 1 };
-        declared_wal.artifacts[0].validation.seal = declared_wal.artifacts[0].seal;
+        declared_wal.artifacts[0].wal_entry_count = 1;
+        declared_wal.artifacts[0].validation.wal_entry_count = 1;
         let error = declared_wal
             .validate()
             .expect_err("sealed generation cannot declare live WAL entries");
         assert_eq!(error.reason_code(), "semantic_manifest_not_durably_sealed");
 
         let seal_temp = tempfile::tempdir().unwrap();
-        write_generation_artifacts(seal_temp.path(), &manifest, &contents);
+        write_generation_artifacts(
+            seal_temp.path(),
+            &manifest,
+            &BTreeMap::from([(SemanticArtifactRole::FastVector, bytes.clone())]),
+        );
         let artifact_path = manifest
             .generation_dir(seal_temp.path())
             .unwrap()
@@ -7480,7 +7844,11 @@ mod tests {
         ));
 
         let load_temp = tempfile::tempdir().unwrap();
-        seal_generation(load_temp.path(), &manifest, &contents);
+        seal_generation(
+            load_temp.path(),
+            &manifest,
+            &BTreeMap::from([(SemanticArtifactRole::FastVector, bytes)]),
+        );
         let pointer =
             SemanticCurrentPointerV1::for_manifest(&manifest, manifest.sealed_at_ms + 1, 1)
                 .unwrap();
@@ -7514,14 +7882,11 @@ mod tests {
             &corpus,
         );
         let mut base_with_wal = base.clone();
-        base_with_wal.seal = SemanticArtifactSealStateV1::Vector { wal_entry_count: 7 };
-        base_with_wal.validation.seal = base_with_wal.seal;
+        base_with_wal.wal_entry_count = 7;
+        base_with_wal.validation.wal_entry_count = 7;
         let ann_from_live_base = bind_ann_to_base(ann_template.clone(), &base_with_wal);
-        assert_eq!(ann_from_live_base.seal, SemanticArtifactSealStateV1::Ann {});
-        assert_eq!(
-            ann_from_live_base.validation.seal,
-            SemanticArtifactSealStateV1::Ann {}
-        );
+        assert_eq!(ann_from_live_base.wal_entry_count, 0);
+        assert_eq!(ann_from_live_base.validation.wal_entry_count, 0);
 
         let ann = bind_ann_to_base(ann_template, &base);
         let manifest = test_generation_manifest(
@@ -7543,12 +7908,12 @@ mod tests {
         }
 
         let mut live_ann_wal = manifest.clone();
-        live_ann_wal.artifacts[1].seal = SemanticArtifactSealStateV1::Vector { wal_entry_count: 1 };
-        live_ann_wal.artifacts[1].validation.seal = live_ann_wal.artifacts[1].seal;
+        live_ann_wal.artifacts[1].wal_entry_count = 1;
+        live_ann_wal.artifacts[1].validation.wal_entry_count = 1;
         let error = live_ann_wal
             .validate()
-            .expect_err("ANN artifact must reject vector WAL evidence");
-        assert_eq!(error.reason_code(), "semantic_manifest_ann_binding_invalid");
+            .expect_err("immutable ANN artifact must reject a live WAL");
+        assert_eq!(error.reason_code(), "semantic_manifest_not_durably_sealed");
 
         let mut wrong_space = manifest;
         wrong_space.artifacts[1].embedding_identity =
@@ -7561,75 +7926,6 @@ mod tests {
             SemanticGenerationError::EmbeddingIdentityMismatch { .. }
         ));
         assert_eq!(error.reason_code(), "semantic_embedding_identity_mismatch");
-    }
-
-    #[test]
-    fn accepted_artifact_seals_reject_ann_wal_fields_and_role_confusion() {
-        let corpus = test_corpus_identity();
-        let base = complete_generation_artifact(
-            SemanticArtifactRole::FastVector,
-            "fast/primary.fsvi",
-            b"base-vector",
-            &corpus,
-        );
-        let ann = bind_ann_to_base(
-            complete_generation_artifact(
-                SemanticArtifactRole::FastAnn,
-                "fast/search.hnsw",
-                b"ann-index",
-                &corpus,
-            ),
-            &base,
-        );
-        let manifest = test_generation_manifest(
-            SemanticGenerationTopology::FastOnly,
-            vec![base, ann.clone()],
-        );
-        manifest.validate().unwrap();
-        let json = serde_json::to_value(&ann).unwrap();
-        assert_eq!(json["seal"], serde_json::json!({"kind": "ann"}));
-        assert_eq!(json["validation"]["seal"], json["seal"]);
-        for pointer in ["/seal", "/validation/seal", "", "/validation"] {
-            let mut invalid = json.clone();
-            invalid
-                .pointer_mut(pointer)
-                .unwrap()
-                .as_object_mut()
-                .unwrap()
-                .insert("wal_entry_count".into(), serde_json::json!(0));
-            assert!(
-                serde_json::from_value::<SemanticGenerationArtifact>(invalid).is_err(),
-                "ANN WAL field must be rejected at {pointer}"
-            );
-        }
-        for index in [0, 1] {
-            let mut invalid = manifest.clone();
-            invalid.artifacts[index].seal = if index == 0 {
-                SemanticArtifactSealStateV1::Ann {}
-            } else {
-                SemanticArtifactSealStateV1::Vector { wal_entry_count: 0 }
-            };
-            invalid.artifacts[index].validation.seal = invalid.artifacts[index].seal;
-            assert_eq!(
-                invalid.validate().unwrap_err().reason_code(),
-                "semantic_manifest_ann_binding_invalid"
-            );
-        }
-        let mut mismatched = manifest;
-        mismatched.artifacts[1].validation.seal =
-            SemanticArtifactSealStateV1::Vector { wal_entry_count: 0 };
-        assert!(
-            mismatched.validate().is_err(),
-            "validation evidence must agree with its descriptor"
-        );
-        let mut vector_transcript = SemanticCanonicalEncoder::new(b"test.artifact-seal");
-        encode_artifact_seal(
-            &mut vector_transcript,
-            SemanticArtifactSealStateV1::Vector { wal_entry_count: 0 },
-        );
-        let mut ann_transcript = SemanticCanonicalEncoder::new(b"test.artifact-seal");
-        encode_artifact_seal(&mut ann_transcript, SemanticArtifactSealStateV1::Ann {});
-        assert_ne!(vector_transcript.finish(), ann_transcript.finish());
     }
 
     #[test]
@@ -7753,7 +8049,7 @@ mod tests {
             "\"vector_slot_count\"",
             "\"live_vector_count\"",
             "\"tombstone_vector_count\"",
-            "\"seal\"",
+            "\"wal_entry_count\"",
             "\"generation_corpus_sha256\"",
             "\"covered_live_docset_sha256\"",
             "\"covered_content_sha256\"",
@@ -7807,7 +8103,7 @@ mod tests {
             "\"vector_slot_count\"",
             "\"live_vector_count\"",
             "\"tombstone_vector_count\"",
-            "\"seal\"",
+            "\"wal_entry_count\"",
             "\"generation_corpus_sha256\"",
             "\"covered_live_docset_sha256\"",
             "\"covered_content_sha256\"",
@@ -7872,9 +8168,6 @@ mod tests {
         }
 
         assert_digest_field!("schema_version", |value| value.schema_version += 1);
-        assert_digest_field!("purpose", |value| {
-            value.purpose = SemanticGenerationPurpose::HashControl;
-        });
         assert_digest_field!("generation_id", |value| value.generation_id.push('x'));
         assert_digest_field!("build_id", |value| value.build_id.push('x'));
         assert_digest_field!("request_id", |value| value.request_id = None);
@@ -8007,8 +8300,8 @@ mod tests {
         assert_digest_field!("artifact.tombstone_vector_count", |value| {
             value.artifacts[0].tombstone_vector_count += 1;
         });
-        assert_digest_field!("artifact.seal", |value| {
-            value.artifacts[0].seal = SemanticArtifactSealStateV1::Vector { wal_entry_count: 1 };
+        assert_digest_field!("artifact.wal_entry_count", |value| {
+            value.artifacts[0].wal_entry_count += 1;
         });
         assert_digest_field!("artifact.generation_corpus_sha256", |value| {
             value.artifacts[0].generation_corpus_sha256 = test_sha256("changed-generation");
@@ -8048,9 +8341,8 @@ mod tests {
         assert_digest_field!("validation.tombstone_vector_count", |value| {
             value.artifacts[0].validation.tombstone_vector_count += 1;
         });
-        assert_digest_field!("validation.seal", |value| {
-            value.artifacts[0].validation.seal =
-                SemanticArtifactSealStateV1::Vector { wal_entry_count: 1 };
+        assert_digest_field!("validation.wal_entry_count", |value| {
+            value.artifacts[0].validation.wal_entry_count += 1;
         });
         assert_digest_field!("validation.generation_corpus_sha256", |value| {
             value.artifacts[0].validation.generation_corpus_sha256 =
@@ -8153,9 +8445,24 @@ mod tests {
         ];
         for checkpoint in checkpoints {
             let temp = tempfile::tempdir().unwrap();
-            let (manifest, contents) =
-                writer_produced_generation_fixture(&format!("gen-seal-{checkpoint:?}"));
-            write_generation_artifacts(temp.path(), &manifest, &contents);
+            let corpus = test_corpus_identity();
+            let bytes = b"durable-vector".to_vec();
+            let artifact = complete_generation_artifact(
+                SemanticArtifactRole::FastVector,
+                "fast/primary.fsvi",
+                &bytes,
+                &corpus,
+            );
+            let manifest = generation_with_id(
+                &format!("gen-seal-{checkpoint:?}"),
+                SemanticGenerationTopology::FastOnly,
+                vec![artifact],
+            );
+            write_generation_artifacts(
+                temp.path(),
+                &manifest,
+                &BTreeMap::from([(SemanticArtifactRole::FastVector, bytes)]),
+            );
             let error = manifest
                 .write_immutable_with_hook(temp.path(), |observed| {
                     if observed == checkpoint {
@@ -8203,11 +8510,25 @@ mod tests {
         use std::sync::{Arc, Barrier};
 
         let temp = tempfile::tempdir().unwrap();
+        let corpus = test_corpus_identity();
         let mut manifests = Vec::new();
-        for suffix in ["a", "b"] {
-            let (manifest, contents) =
-                writer_produced_generation_fixture(&format!("gen-concurrent-{suffix}"));
-            seal_generation(temp.path(), &manifest, &contents);
+        for (suffix, bytes) in [("a", b"vector-a".to_vec()), ("b", b"vector-b".to_vec())] {
+            let artifact = complete_generation_artifact(
+                SemanticArtifactRole::FastVector,
+                "fast/primary.fsvi",
+                &bytes,
+                &corpus,
+            );
+            let manifest = generation_with_id(
+                &format!("gen-concurrent-{suffix}"),
+                SemanticGenerationTopology::FastOnly,
+                vec![artifact],
+            );
+            seal_generation(
+                temp.path(),
+                &manifest,
+                &BTreeMap::from([(SemanticArtifactRole::FastVector, bytes)]),
+            );
             manifests.push(manifest);
         }
 
@@ -8247,8 +8568,7 @@ mod tests {
                 .count(),
             1
         );
-        let loaded =
-            load_current_semantic_generation(temp.path(), Some(&manifests[0].corpus)).unwrap();
+        let loaded = load_current_semantic_generation(temp.path(), Some(&corpus)).unwrap();
         assert!(
             manifests
                 .iter()
@@ -8266,10 +8586,25 @@ mod tests {
         ];
         for (fault, selects_new) in checkpoints {
             let temp = tempfile::tempdir().unwrap();
+            let corpus = test_corpus_identity();
             let mut manifests = Vec::new();
-            for id in ["gen-pointer-old", "gen-pointer-new"] {
-                let (manifest, contents) = writer_produced_generation_fixture(id);
-                seal_generation(temp.path(), &manifest, &contents);
+            for (id, bytes) in [
+                ("gen-pointer-old", b"old-vector".to_vec()),
+                ("gen-pointer-new", b"new-vector".to_vec()),
+            ] {
+                let artifact = complete_generation_artifact(
+                    SemanticArtifactRole::FastVector,
+                    "fast/primary.fsvi",
+                    &bytes,
+                    &corpus,
+                );
+                let manifest =
+                    generation_with_id(id, SemanticGenerationTopology::FastOnly, vec![artifact]);
+                seal_generation(
+                    temp.path(),
+                    &manifest,
+                    &BTreeMap::from([(SemanticArtifactRole::FastVector, bytes)]),
+                );
                 manifests.push(manifest);
             }
             let old_pointer =
@@ -8296,8 +8631,7 @@ mod tests {
                 )
                 .expect_err("injected pointer checkpoint");
             assert!(matches!(error, SemanticGenerationError::PointerIo { .. }));
-            let loaded =
-                load_current_semantic_generation(temp.path(), Some(&manifests[0].corpus)).unwrap();
+            let loaded = load_current_semantic_generation(temp.path(), Some(&corpus)).unwrap();
             assert_eq!(
                 loaded.manifest.generation_id,
                 manifests[usize::from(selects_new)].generation_id
@@ -8308,8 +8642,24 @@ mod tests {
     #[test]
     fn accepted_pointer_selection_timestamp_is_independent_and_supports_republication() {
         let temp = tempfile::tempdir().unwrap();
-        let (manifest, contents) = writer_produced_generation_fixture("gen-republish");
-        seal_generation(temp.path(), &manifest, &contents);
+        let corpus = test_corpus_identity();
+        let bytes = b"republish-vector".to_vec();
+        let artifact = complete_generation_artifact(
+            SemanticArtifactRole::FastVector,
+            "fast/primary.fsvi",
+            &bytes,
+            &corpus,
+        );
+        let manifest = generation_with_id(
+            "gen-republish",
+            SemanticGenerationTopology::FastOnly,
+            vec![artifact],
+        );
+        seal_generation(
+            temp.path(),
+            &manifest,
+            &BTreeMap::from([(SemanticArtifactRole::FastVector, bytes)]),
+        );
         assert!(
             SemanticCurrentPointerV1::for_manifest(&manifest, manifest.sealed_at_ms - 1, 1)
                 .is_err()
@@ -8344,10 +8694,28 @@ mod tests {
     #[test]
     fn accepted_pointer_cas_rejects_aba_and_requires_a_strictly_newer_selection_epoch() {
         let temp = tempfile::tempdir().unwrap();
+        let corpus = test_corpus_identity();
         let mut manifests = Vec::new();
-        for generation_id in ["gen-aba-a", "gen-aba-b"] {
-            let (manifest, contents) = writer_produced_generation_fixture(generation_id);
-            seal_generation(temp.path(), &manifest, &contents);
+        for (generation_id, bytes) in [
+            ("gen-aba-a", b"aba-vector-a".to_vec()),
+            ("gen-aba-b", b"aba-vector-b".to_vec()),
+        ] {
+            let artifact = complete_generation_artifact(
+                SemanticArtifactRole::FastVector,
+                "fast/primary.fsvi",
+                &bytes,
+                &corpus,
+            );
+            let manifest = generation_with_id(
+                generation_id,
+                SemanticGenerationTopology::FastOnly,
+                vec![artifact],
+            );
+            seal_generation(
+                temp.path(),
+                &manifest,
+                &BTreeMap::from([(SemanticArtifactRole::FastVector, bytes)]),
+            );
             manifests.push(manifest);
         }
 
@@ -8704,7 +9072,7 @@ mod tests {
         // recovery from free-form text.
         let absent = tempfile::tempdir().unwrap();
         assert_eq!(
-            resolve_semantic_generation_disk_state(absent.path(), None).unwrap(),
+            resolve_semantic_generation_disk_state(absent.path()).unwrap(),
             SemanticGenerationDiskStateV1::Absent
         );
         assert_eq!(
@@ -8729,7 +9097,7 @@ mod tests {
         )
         .unwrap();
         fs::write(legacy_vector_root.join("vector.fast.idx"), b"legacy-vector").unwrap();
-        let legacy = resolve_semantic_generation_disk_state(legacy_root.path(), None).unwrap();
+        let legacy = resolve_semantic_generation_disk_state(legacy_root.path()).unwrap();
         assert_eq!(
             legacy,
             SemanticGenerationDiskStateV1::LegacyUnidentified { artifact_count: 2 }
@@ -8761,7 +9129,7 @@ mod tests {
         )
         .unwrap();
         let pointer_missing =
-            resolve_semantic_generation_disk_state(pointer_missing_root.path(), None).unwrap();
+            resolve_semantic_generation_disk_state(pointer_missing_root.path()).unwrap();
         assert_eq!(
             pointer_missing,
             SemanticGenerationDiskStateV1::PointerMissingWithGenerationDirectories {
@@ -8802,7 +9170,7 @@ mod tests {
             b"legacy-vector",
         )
         .unwrap();
-        let building = resolve_semantic_generation_disk_state(building_root.path(), None).unwrap();
+        let building = resolve_semantic_generation_disk_state(building_root.path()).unwrap();
         assert_eq!(
             building,
             SemanticGenerationDiskStateV1::Building {
@@ -8850,8 +9218,7 @@ mod tests {
             b"torn-pointer-publication",
         )
         .unwrap();
-        let interrupted =
-            resolve_semantic_generation_disk_state(interrupted_root.path(), None).unwrap();
+        let interrupted = resolve_semantic_generation_disk_state(interrupted_root.path()).unwrap();
         assert_eq!(
             interrupted,
             SemanticGenerationDiskStateV1::InterruptedPublish {
@@ -8895,7 +9262,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolve_semantic_generation_disk_state(directory_lookalike_root.path(), None).unwrap(),
+            resolve_semantic_generation_disk_state(directory_lookalike_root.path()).unwrap(),
             SemanticGenerationDiskStateV1::LegacyUnidentified { artifact_count: 1 }
         );
         let malformed_generation_root = tempfile::tempdir().unwrap();
@@ -8907,7 +9274,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            resolve_semantic_generation_disk_state(malformed_generation_root.path(), None),
+            resolve_semantic_generation_disk_state(malformed_generation_root.path()),
             Err(SemanticGenerationError::InvalidPointer { reason })
                 if reason == "semantic generations root contains a non-directory entry"
         ));
@@ -9092,14 +9459,24 @@ mod tests {
         }
 
         let temp = tempfile::tempdir().unwrap();
-        let (manifest, contents) = writer_produced_generation_fixture("gen-structured-log");
-        let corpus = manifest.corpus.clone();
-        write_generation_artifacts(temp.path(), &manifest, &contents);
-        let mut tampered = contents
-            .get(&SemanticArtifactRole::FastVector)
-            .unwrap()
-            .clone();
-        *tampered.last_mut().unwrap() ^= 1;
+        let corpus = test_corpus_identity();
+        let bytes = b"logged-vector".to_vec();
+        let artifact = complete_generation_artifact(
+            SemanticArtifactRole::FastVector,
+            "fast/primary.fsvi",
+            &bytes,
+            &corpus,
+        );
+        let manifest = generation_with_id(
+            "gen-structured-log",
+            SemanticGenerationTopology::FastOnly,
+            vec![artifact],
+        );
+        write_generation_artifacts(
+            temp.path(),
+            &manifest,
+            &BTreeMap::from([(SemanticArtifactRole::FastVector, bytes)]),
+        );
         let buffer = Arc::new(Mutex::new(Vec::new()));
         let filter = tracing_subscriber::filter::dynamic_filter_fn(|_, _| true)
             .with_max_level_hint(tracing_subscriber::filter::LevelFilter::TRACE);
@@ -9123,7 +9500,7 @@ mod tests {
                 .generation_dir(temp.path())
                 .unwrap()
                 .join("fast/primary.fsvi");
-            fs::write(artifact_path, &tampered).unwrap();
+            fs::write(artifact_path, b"tamper-vector").unwrap();
             assert!(load_current_semantic_generation(temp.path(), Some(&corpus)).is_err());
         });
         let logs = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
@@ -9154,7 +9531,7 @@ mod tests {
         assert!(!logs.contains(&manifest.artifacts[0].artifact_sha256));
         assert!(!logs.contains(&manifest.producer.binary_elf_sha256));
         assert!(logs.contains(fingerprint_prefix(&manifest.artifacts[0].artifact_sha256)));
-        assert!(logs.contains(fingerprint_prefix(&sha256_hex(&tampered))));
+        assert!(logs.contains(fingerprint_prefix(&sha256_hex(b"tamper-vector"))));
     }
 
     proptest! {

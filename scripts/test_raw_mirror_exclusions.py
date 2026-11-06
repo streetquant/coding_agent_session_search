@@ -20,9 +20,9 @@ import tempfile
 import tomllib
 
 
-def execute(command: list[str], root: Path, env: dict[str, str], timeout_seconds: int = 3600) -> None:
+def execute(command: list[str], root: Path, env: dict[str, str]) -> None:
     print("+ " + " ".join(command), flush=True)
-    subprocess.run(command, cwd=root, env=env, check=True, timeout=timeout_seconds)  # ubs:ignore[python.taint.command] Fixed Cargo argv with shell=False; env supplies toolchain configuration.
+    subprocess.run(command, cwd=root, env=env, check=True)
 
 
 def main() -> None:

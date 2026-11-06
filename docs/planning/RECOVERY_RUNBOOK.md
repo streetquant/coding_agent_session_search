@@ -215,15 +215,10 @@ A WAL failure must never downgrade the backup to a verified single-file database
 Keep the original bundle for inspection; changing its manifest checksums does not
 repair missing or damaged data.
 
-SHM is a derived index of the WAL. A read-only engine open can initialize an
-existing SHM file. When the recorded bundle contains SHM, verification leaves it
-untouched and reports `storage_probe_status=requires_private_storage_probe`.
-Without SHM, a probe that requires WAL-index recovery reports
-`storage_probe_status=requires_private_wal_index_recovery`. Both states mean the
-manifest checks passed and native storage admission remains deferred. The plain
-Verify output and JSON expose that storage status and warning; `verified` alone
-describes bundle integrity, not a completed native probe.
-Rehearsal admits the private candidate and rebuilds SHM there if needed.
+SHM is a derived index of the WAL. If the database engine needs to rebuild it,
+verification reports `storage_probe_status=requires_private_wal_index_recovery`:
+the manifest checks passed, but storage admission still requires rehearsal.
+Rehearsal rebuilds SHM only in the private candidate and runs a database check.
 The original backup remains unchanged, and the candidate database and WAL must
 still match their recorded checksums after the probe. Apply runs the same check
 before promotion.

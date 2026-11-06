@@ -107,89 +107,6 @@ impl HostProbeResult {
     }
 }
 
-/// The outcome of probing one host: the probe result plus whether the bounded
-/// transport deadline expired.
-///
-/// A host whose transport exceeds the deadline is *reported*, never dropped:
-/// the outcome exists so the fleet report can state how many hosts were
-/// probed, how many answered and how many timed out.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HostProbeOutcome {
-    /// The probe result for the host.
-    pub result: HostProbeResult,
-    /// True when the host's transport exceeded the probe deadline.
-    pub timed_out: bool,
-}
-
-impl HostProbeOutcome {
-    /// A host that failed to answer for a reason other than a timeout.
-    fn failed(host_name: &str, error: impl Into<String>) -> Self {
-        Self {
-            result: HostProbeResult::unreachable(host_name, error),
-            timed_out: false,
-        }
-    }
-
-    /// A host whose transport exceeded the probe deadline.
-    fn timed_out(host_name: &str, error: impl Into<String>) -> Self {
-        Self {
-            result: HostProbeResult::unreachable(host_name, error),
-            timed_out: true,
-        }
-    }
-}
-
-/// Completeness accounting for one bounded fleet probe.
-///
-/// `probed` counts the hosts the probe attempted. Every probed host falls into
-/// exactly one of `answered` (the host replied inside the deadline),
-/// `timed_out` (the transport exceeded the deadline) or `failed` (the transport
-/// failed for another reason), so a partial sweep is distinguishable from a
-/// complete one instead of silently looking like the whole fleet answered.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProbeFleetReport {
-    /// Hosts the probe attempted.
-    pub probed: usize,
-    /// Hosts that answered inside the probe deadline.
-    pub answered: usize,
-    /// Hosts whose transport exceeded the probe deadline.
-    pub timed_out: usize,
-    /// Hosts whose transport failed for a reason other than a timeout.
-    pub failed: usize,
-    /// Names of the hosts whose transport exceeded the probe deadline.
-    pub timed_out_hosts: Vec<String>,
-}
-
-impl ProbeFleetReport {
-    /// Derive the report from the per-host outcomes of one probe.
-    pub fn from_outcomes(outcomes: &[HostProbeOutcome]) -> Self {
-        let mut report = Self {
-            probed: outcomes.len(),
-            answered: 0,
-            timed_out: 0,
-            failed: 0,
-            timed_out_hosts: Vec::new(),
-        };
-        for outcome in outcomes {
-            if outcome.timed_out {
-                report.timed_out += 1;
-                let host_name = outcome.result.host_name.clone(); // ubs:ignore[rust.collections.clone-in-loop] The persisted report outlives the borrowed outcomes and owns one name per timed-out host.
-                report.timed_out_hosts.push(host_name); // ubs:ignore[rust.security.path-traversal] Vec<String> stores display host labels; this performs no filesystem path operation.
-            } else if outcome.result.reachable {
-                report.answered += 1;
-            } else {
-                report.failed += 1;
-            }
-        }
-        report
-    }
-
-    /// True when every probed host answered inside the probe deadline.
-    pub fn is_complete(&self) -> bool {
-        self.timed_out == 0 && self.failed == 0
-    }
-}
-
 /// Status of cass installation on a remote host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -342,37 +259,6 @@ fn collect_probe_dirs(probe_paths: Vec<(&'static str, Vec<String>)>) -> Vec<Stri
     dir_list
 }
 
-/// Return true when `parent` is a path ancestor of `child`.
-///
-/// The probe list deliberately contains both source roots and their parent
-/// configuration directories (for example `~/.claude/projects` and
-/// `~/.claude`). Comparing complete path components keeps a parent such as
-/// `~/.claude` from being confused with an unrelated path like
-/// `~/.claude-work`.
-fn is_path_ancestor(parent: &str, child: &str) -> bool {
-    child
-        .strip_prefix(parent)
-        .is_some_and(|suffix| suffix.starts_with('/'))
-}
-
-/// Select only the leaf paths for recursive statistics probes.
-///
-/// Parent paths remain in `PROBE_DIRS` so setup can still discover an
-/// installed agent whose session directory is not present yet. They are
-/// presence probes only; recursively walking them would count caches and
-/// transcripts repeatedly and can make a read-only SSH probe unbounded.
-fn recursive_probe_dirs(dir_list: &[String]) -> Vec<String> {
-    dir_list
-        .iter()
-        .filter(|candidate| {
-            !dir_list
-                .iter()
-                .any(|child| is_path_ancestor(candidate, child))
-        })
-        .cloned()
-        .collect()
-}
-
 fn probe_dir_array_entries(dir_list: &[String]) -> String {
     dir_list
         .iter()
@@ -389,21 +275,11 @@ fn probe_dir_array_entries(dir_list: &[String]) -> String {
 /// Output format is key=value pairs, with special markers for sections.
 fn build_probe_script() -> String {
     let dir_list = collect_probe_dirs(franken_agent_detection::default_probe_paths_tilde());
-    let recursive_dirs = recursive_probe_dirs(&dir_list);
-    build_probe_script_for_dir_modes(&dir_list, &recursive_dirs)
+    build_probe_script_for_dirs(&dir_list)
 }
 
-#[cfg(test)]
 fn build_probe_script_for_dirs(dir_list: &[String]) -> String {
-    // This helper is used by focused tests with an explicit path list. Treat
-    // those paths as source roots so the tests exercise the same bounded
-    // recursive branch as a dynamically discovered leaf path.
-    build_probe_script_for_dir_modes(dir_list, dir_list)
-}
-
-fn build_probe_script_for_dir_modes(dir_list: &[String], recursive_dirs: &[String]) -> String {
     let dirs_str = probe_dir_array_entries(dir_list);
-    let recursive_dirs_str = probe_dir_array_entries(recursive_dirs);
 
     format!(
         r#"#!/bin/bash
@@ -530,106 +406,6 @@ fi
 PROBE_DIRS=(
 {dirs}
 )
-RECURSIVE_PROBE_DIRS=(
-{recursive_dirs}
-)
-
-# Recursive source statistics are deliberately path-specific. Parent config
-# roots (for example ~/.claude) are presence probes only, while leaf session
-# roots (for example ~/.claude/projects) get a bounded metadata scan. This
-# keeps setup from traversing caches and from walking an ancestor twice.
-is_recursive_probe_path() {{
-    local candidate=$1
-    local recursive_dir
-    for recursive_dir in "${{RECURSIVE_PROBE_DIRS[@]}}"; do
-        if [ "$candidate" = "$recursive_dir" ]; then
-            return 0
-        fi
-    done
-    return 1
-}}
-
-# Return "size_mb|file_count" for session-shaped files under one source root.
-# The timeout wraps both find and the stat aggregation. Hosts without either
-# helper still report the path's presence, but deliberately skip the recursive
-# walk rather than falling back to an unbounded find.
-probe_tree_stats() {{
-    local root=$1
-    local timeout_bin
-    local stats
-    local status
-    local worker_script
-
-    if command -v timeout &> /dev/null; then
-        timeout_bin=timeout
-    elif command -v gtimeout &> /dev/null; then
-        timeout_bin=gtimeout
-    else
-        return 125
-    fi
-
-    # Keep find's NUL-delimited output safe for arbitrary filenames and do
-    # portable per-file stat calls in the same timed worker. pipefail carries a
-    # find/stat failure through the aggregation instead of letting awk hide it.
-    worker_script='
-# Keep the worker shell alive after TERM so the timeout kill-after signal reaches
-# the complete process group, including descendants that ignore TERM.
-trap "" TERM
-set -o pipefail
-# Use find primaries shared by GNU and BSD implementations. The enclosing
-# timeout supplies the traversal bound instead of nonportable depth options.
-find "$1" -type f \
-    \( -name "*.jsonl" -o -name "*.json" -o -name "*.claude" -o -name "*.db" -o -name "*.md" \) \
-    -print0 2>/dev/null |
-(
-    bytes=0
-    count=0
-    while IFS= read -r -d "" file; do
-        if size=$(stat -c "%s" "$file" 2>/dev/null); then
-            :
-        elif size=$(stat -f "%z" "$file" 2>/dev/null); then
-            :
-        else
-            continue
-        fi
-        [ -n "$size" ] || continue
-        case "$size" in
-            *[!0-9]*) continue ;;
-        esac
-        bytes=$((bytes + size))
-        count=$((count + 1))
-    done
-    printf "%s|%s\n" "$((bytes / 1048576))" "$count"
-)
-'
-
-    if stats=$("$timeout_bin" --signal=TERM --kill-after=1s 5s \
-        bash -c "$worker_script" probe-tree-stats "$root"); then
-        status=0
-    else
-        status=$?
-    fi
-    if [ "$status" -ne 0 ]; then
-        return "$status"
-    fi
-    if [ -n "$stats" ]; then
-        printf '%s\n' "$stats"
-    else
-        return 1
-    fi
-}}
-
-probe_file_size_mb() {{
-    local bytes
-    if bytes=$(stat -c '%s' "$1" 2>/dev/null); then
-        printf '%s\n' "$((bytes / 1048576))"
-    elif bytes=$(stat -f '%z' "$1" 2>/dev/null); then
-        printf '%s\n' "$((bytes / 1048576))"
-    else
-        printf '0\n'
-    fi
-}}
-
 for dir in "${{PROBE_DIRS[@]}}"; do
     # Expand only the leading tilde marker from our static probe list. Do not
     # eval paths: connector-owned paths can contain shell metacharacters.
@@ -639,25 +415,16 @@ for dir in "${{PROBE_DIRS[@]}}"; do
         *) expanded_dir="$dir" ;;
     esac
     if [ -e "$expanded_dir" ]; then
-        if [ -f "$expanded_dir" ]; then
-            SIZE=$(probe_file_size_mb "$expanded_dir")
-            COUNT=1  # A direct source file is a single session candidate.
-        elif is_recursive_probe_path "$dir"; then
-            STATS=$(probe_tree_stats "$expanded_dir")
-            if [ $? -eq 0 ] && [ -n "$STATS" ]; then
-                IFS='|' read -r SIZE COUNT <<< "$STATS"
-            else
-                # Preserve discovery while making an incomplete estimate
-                # explicit and cheap after a timeout or missing helper.
-                SIZE=0
-                COUNT=0
-            fi
+        SIZE=""
+        if DU_OUTPUT=$(probe_optional du -sm "$expanded_dir" 2>/dev/null); then
+            SIZE=$(printf '%s\n' "$DU_OUTPUT" | cut -f1)
+        fi
+        # Count JSONL files for session estimate
+        if [ -d "$expanded_dir" ]; then
+            # A timed-out walk must not be presented as a complete count.
+            COUNT=$(set -o pipefail; probe_optional find "$expanded_dir" -maxdepth 8 \( -name "*.jsonl" -o -name "*.json" \) 2>/dev/null | wc -l | tr -d ' ') || COUNT=""
         else
-            # Ancestor/config roots are intentionally not traversed. Their
-            # existence is enough for setup to offer the source path; the
-            # connector-specific leaf path carries the actual transcripts.
-            SIZE=0
-            COUNT=0
+            COUNT=1  # Single file
         fi
         echo "AGENT_DATA=$dir|$SIZE|$COUNT"
     fi
@@ -665,8 +432,7 @@ done
 
 echo "===PROBE_END==="
 "#,
-        dirs = dirs_str,
-        recursive_dirs = recursive_dirs_str
+        dirs = dirs_str
     )
 }
 
@@ -682,16 +448,6 @@ echo "===PROBE_END==="
 /// # Returns
 /// A `HostProbeResult` with all gathered information, or error details if probe failed.
 pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
-    probe_host_outcome(host, timeout_secs).result
-}
-
-/// Probe a single SSH host and report whether the bounded transport deadline
-/// expired.
-///
-/// The deadline and the transport's own timeout are both reported as
-/// `timed_out` outcomes, so the fleet report can tell a host that was too
-/// slow apart from a host that refused the connection.
-pub fn probe_host_outcome(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeOutcome {
     let start = Instant::now();
     let timeout_secs = timeout_secs.max(1);
     let command_timeout = Duration::from_secs(timeout_secs);
@@ -703,7 +459,7 @@ pub fn probe_host_outcome(host: &DiscoveredHost, timeout_secs: u64) -> HostProbe
     let child_stdin = match file_backed_child_stdin(probe_script.as_bytes()) {
         Ok(stdin) => stdin,
         Err(e) => {
-            return HostProbeOutcome::failed(
+            return HostProbeResult::unreachable(
                 &host.name,
                 format!("Failed to prepare SSH probe input: {e}"),
             );
@@ -724,7 +480,10 @@ pub fn probe_host_outcome(host: &DiscoveredHost, timeout_secs: u64) -> HostProbe
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            return HostProbeOutcome::failed(&host.name, format!("Failed to execute ssh: {}", e));
+            return HostProbeResult::unreachable(
+                &host.name,
+                format!("Failed to execute ssh: {}", e),
+            );
         }
     };
 
@@ -732,13 +491,13 @@ pub fn probe_host_outcome(host: &DiscoveredHost, timeout_secs: u64) -> HostProbe
     let output = match wait_for_child_output_with_timeout(child, command_timeout) {
         Ok(Some(o)) => o,
         Ok(None) => {
-            return HostProbeOutcome::timed_out(
+            return HostProbeResult::unreachable(
                 &host.name,
                 format!("Connection timed out after {timeout_secs} seconds"),
             );
         }
         Err(e) => {
-            return HostProbeOutcome::failed(&host.name, format!("SSH command failed: {}", e));
+            return HostProbeResult::unreachable(&host.name, format!("SSH command failed: {}", e));
         }
     };
 
@@ -747,34 +506,25 @@ pub fn probe_host_outcome(host: &DiscoveredHost, timeout_secs: u64) -> HostProbe
     // Check for SSH failures
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let (error_msg, timed_out) = if stderr.contains("Connection refused") {
-            ("Connection refused".to_string(), false)
+        let error_msg = if stderr.contains("Connection refused") {
+            "Connection refused".to_string()
         } else if stderr.contains("Connection timed out") || stderr.contains("timed out") {
-            ("Connection timed out".to_string(), true)
+            "Connection timed out".to_string()
         } else if stderr.contains("Permission denied") {
-            (
-                "Permission denied (key not loaded in ssh-agent?)".to_string(),
-                false,
-            )
+            "Permission denied (key not loaded in ssh-agent?)".to_string()
         } else if is_host_key_verification_failure(&stderr) {
-            (host_key_verification_error(&host.name), false)
+            host_key_verification_error(&host.name)
         } else if stderr.contains("No route to host") {
-            ("No route to host".to_string(), false)
+            "No route to host".to_string()
         } else {
-            (format!("SSH failed: {}", stderr.trim()), false)
+            format!("SSH failed: {}", stderr.trim())
         };
 
-        return HostProbeOutcome {
-            result: HostProbeResult::unreachable(&host.name, error_msg),
-            timed_out,
-        };
+        return HostProbeResult::unreachable(&host.name, error_msg);
     }
     // Parse successful output
     let stdout = String::from_utf8_lossy(&output.stdout);
-    HostProbeOutcome {
-        result: parse_probe_output(&host.name, &stdout, connection_time_ms),
-        timed_out: false,
-    }
+    parse_probe_output(&host.name, &stdout, connection_time_ms)
 }
 
 /// Parse the probe script output into a HostProbeResult.
@@ -1018,30 +768,6 @@ pub fn probe_hosts_parallel<F>(
 where
     F: Fn(usize, usize, &str) + Send + Sync,
 {
-    probe_hosts_parallel_outcomes(hosts, timeout_secs, on_progress)
-        .into_iter()
-        .map(|outcome| outcome.result)
-        .collect()
-}
-
-/// Probe multiple hosts in parallel, reporting per-host outcomes.
-///
-/// Same bounded fan-out as [`probe_hosts_parallel`]: a dedicated Rayon pool
-/// with at most four workers per batch, one outcome per supplied host in input
-/// order, and a sequential fallback when the pool cannot be created. The
-/// difference is that each outcome records whether the host's transport
-/// exceeded the probe deadline, so a host that timed out is reported as such
-/// instead of being indistinguishable from a host that refused the
-/// connection. Derive the fleet-wide accounting with
-/// [`ProbeFleetReport::from_outcomes`].
-pub fn probe_hosts_parallel_outcomes<F>(
-    hosts: &[DiscoveredHost],
-    timeout_secs: u64,
-    on_progress: F,
-) -> Vec<HostProbeOutcome>
-where
-    F: Fn(usize, usize, &str) + Send + Sync,
-{
     use rayon::prelude::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1053,10 +779,10 @@ where
     let completed = Arc::new(AtomicUsize::new(0));
     let on_progress = Arc::new(on_progress);
     let probe = |host: &DiscoveredHost| {
-        let outcome = probe_host_outcome(host, timeout_secs);
+        let result = probe_host(host, timeout_secs);
         let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
         on_progress(done, total, &host.name);
-        outcome
+        result
     };
 
     // GH505: a CPU-sized pool is not a network admission policy. Do not use
@@ -1193,7 +919,6 @@ pub fn deduplicate_probe_results(
                     _ => 0,
                 };
                 if a_sessions != b_sessions {
-                    // ubs:ignore[rust.security.constant-time-compare] These are public indexed-session counts used only to sort source rows.
                     return b_sessions.cmp(&a_sessions);
                 }
 
@@ -1577,58 +1302,6 @@ CASS_VERSION=0.4.2
         String::from_utf8_lossy(&output.stdout).to_string()
     }
 
-    #[cfg(unix)]
-    fn run_probe_script_with_path_value(
-        script: &str,
-        home: &std::path::Path,
-        path_value: &str,
-        timeout: Duration,
-    ) -> Option<std::process::Output> {
-        use std::io::Write;
-
-        let mut cmd = Command::new("bash");
-        cmd.arg("-s")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("HOME", home)
-            .env("PATH", path_value);
-        configure_child_process_group(&mut cmd);
-
-        let mut child = cmd.spawn().expect("bash should be available");
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(script.as_bytes())
-                .expect("write probe script");
-        }
-        wait_for_child_output_with_timeout(child, timeout)
-            .expect("probe script should finish or hit its deadline")
-    }
-    #[cfg(unix)]
-    fn write_test_executable(path: &std::path::Path, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
-
-        std::fs::write(path, body).expect("write test executable");
-        let mut permissions = std::fs::metadata(path)
-            .expect("test executable metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).expect("set test executable permissions");
-    }
-
-    #[cfg(unix)]
-    fn link_system_tools(tool_dir: &std::path::Path, names: &[&str]) {
-        let current_path = std::env::var_os("PATH").expect("test PATH");
-        for name in names {
-            let source = std::env::split_paths(&current_path)
-                .map(|directory| directory.join(name))
-                .find(|candidate| candidate.is_file())
-                .unwrap_or_else(|| panic!("missing system tool {name}"));
-            std::os::unix::fs::symlink(source, tool_dir.join(name))
-                .unwrap_or_else(|error| panic!("link system tool {name}: {error}"));
-        }
-    }
-
     /// Execute PROBE_SCRIPT on the local system via bash, returning stdout.
     #[cfg(not(windows))]
     fn run_probe_script_locally() -> String {
@@ -1654,294 +1327,6 @@ CASS_VERSION=0.4.2
         assert!(
             !script.contains("eval echo"),
             "probe paths must not be expanded through eval"
-        );
-    }
-
-    #[test]
-    fn recursive_probe_dirs_walks_only_component_descendant_leaves() {
-        let dirs = vec![
-            "~/.claude".to_string(),
-            "~/.claude/projects".to_string(),
-            "~/.claude-work".to_string(),
-            "~/.codex/sessions".to_string(),
-        ];
-
-        assert_eq!(
-            recursive_probe_dirs(&dirs),
-            vec![
-                "~/.claude/projects".to_string(),
-                "~/.claude-work".to_string(),
-                "~/.codex/sessions".to_string(),
-            ]
-        );
-        assert!(is_path_ancestor("~/.claude", "~/.claude/projects"));
-        assert!(!is_path_ancestor("~/.claude", "~/.claude-work"));
-        assert!(!is_path_ancestor("~/.claude", "~/.claude"));
-    }
-
-    #[test]
-    #[cfg(not(windows))]
-    fn probe_script_marks_parent_as_presence_only_and_counts_leaf_sessions() {
-        let home = tempfile::tempdir().expect("temp home");
-        let parent = home.path().join(".claude");
-        let leaf = parent.join("projects");
-        std::fs::create_dir_all(parent.join("cache")).expect("create parent cache");
-        std::fs::create_dir_all(&leaf).expect("create leaf");
-        std::fs::write(parent.join("cache").join("unrelated.json"), b"{}")
-            .expect("write parent-only file");
-        std::fs::write(leaf.join("session.jsonl"), b"turn\n").expect("write leaf session");
-
-        let dirs = vec!["~/.claude".to_string(), "~/.claude/projects".to_string()];
-        let recursive_dirs = recursive_probe_dirs(&dirs);
-        let script = build_probe_script_for_dir_modes(&dirs, &recursive_dirs);
-        let output = run_probe_script_with_home(&script, Some(home.path()));
-
-        assert!(
-            output.contains("AGENT_DATA=~/.claude|0|0"),
-            "parent config root must be presence-only: {output}"
-        );
-        assert!(
-            output.contains("AGENT_DATA=~/.claude/projects|0|1"),
-            "leaf source must count its transcript without the parent cache: {output}"
-        );
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn probe_script_hard_kills_term_ignoring_find_and_classifies_timeout() {
-        struct PidCleanup(Vec<i32>);
-
-        impl Drop for PidCleanup {
-            fn drop(&mut self) {
-                for pid in &self.0 {
-                    let _ = Command::new("kill")
-                        .args(["-KILL", &pid.to_string()])
-                        .status();
-                }
-            }
-        }
-
-        let home = tempfile::tempdir().expect("temp home");
-        let leaf = home.path().join(".claude/projects");
-        std::fs::create_dir_all(&leaf).expect("create leaf");
-
-        let fake_tools = tempfile::tempdir().expect("fake tools");
-        let find_path = fake_tools.path().join("find");
-        let fifo_path = find_path.with_extension("pipe");
-        let pid_path = find_path.with_extension("pid");
-        let mkfifo = Command::new("mkfifo")
-            .arg(&fifo_path)
-            .status()
-            .expect("mkfifo should run");
-        assert!(mkfifo.success(), "mkfifo should succeed");
-        write_test_executable(
-            &find_path,
-            r#"#!/bin/bash
-exec 9<> "$0.pipe"
-(
-    trap '' TERM
-    while :; do
-        read -r -t 1 _ <&9 || true
-    done
-) &
-worker=$!
-printf '%s\n%s\n' "$$" "$worker" > "$0.pid"
-trap '' TERM
-while :; do
-    read -r -t 1 _ <&9 || true
-done
-"#,
-        );
-
-        let script = build_probe_script_for_dirs(&["~/.claude/projects".to_string()]);
-        let path_value = format!("{}:/usr/bin:/bin", fake_tools.path().display());
-        let output = run_probe_script_with_path_value(
-            &script,
-            home.path(),
-            &path_value,
-            Duration::from_secs(12),
-        );
-        let pids = std::fs::read_to_string(&pid_path)
-            .expect("fake find should record its PIDs")
-            .lines()
-            .map(|line| line.parse::<i32>().expect("valid fake find PID"))
-            .collect::<Vec<_>>();
-        assert_eq!(pids.len(), 2, "fake find should record parent and child");
-        let _cleanup = PidCleanup(pids.clone());
-
-        let mut live_pids = pids.clone();
-        for _ in 0..30 {
-            live_pids = pids
-                .iter()
-                .copied()
-                .filter(|pid| {
-                    Command::new("kill")
-                        .args(["-0", &pid.to_string()])
-                        .status()
-                        .is_ok_and(|status| status.success())
-                })
-                .collect();
-            if live_pids.is_empty() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-
-        let output = output.expect("outer probe shell should finish");
-        assert!(output.status.success(), "probe shell failed");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains("AGENT_DATA=~/.claude/projects|0|0"),
-            "timeout must classify the recursive estimate as incomplete: {stdout}"
-        );
-        assert!(
-            live_pids.is_empty(),
-            "timeout must kill find and its child; leaked PIDs: {live_pids:?}"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn probe_script_uses_bsd_stat_and_gtimeout_and_preserves_find_failure_status() {
-        let home = tempfile::tempdir().expect("temp home");
-        let leaf = home.path().join(".codex/sessions");
-        std::fs::create_dir_all(&leaf).expect("create leaf");
-        let weird_name = r#"session space;$(touch "$HOME/SHOULD_NOT_EXIST").jsonl"#;
-        let weird_path = leaf.join(weird_name);
-        if let Some(parent) = weird_path.parent() {
-            std::fs::create_dir_all(parent).expect("create literal path parent");
-        }
-        std::fs::write(&weird_path, b"session").expect("write literal session");
-
-        let fake_tools = tempfile::tempdir().expect("fake tools");
-        let tool_bin = tempfile::tempdir().expect("system tool links");
-        link_system_tools(
-            tool_bin.path(),
-            &[
-                "bash", "uname", "tr", "cat", "df", "awk", "grep", "sed", "head",
-            ],
-        );
-
-        let find_path = fake_tools.path().join("find");
-        write_test_executable(
-            &find_path,
-            r##"#!/bin/bash
-if [ -e "$0.fail" ]; then
-    exit 73
-fi
-printf '%s\n' "$@" > "$0.args"
-for arg in "$@"; do
-    [ "$arg" = "-printf" ] && exit 97
-done
-file="$1/session space;\$(touch \"\$HOME/SHOULD_NOT_EXIST\").jsonl"
-printf '%s\0' "$file"
-"##,
-        );
-
-        let stat_path = fake_tools.path().join("stat");
-        write_test_executable(
-            &stat_path,
-            r#"#!/bin/bash
-if [ "$1" = "-c" ]; then
-    exit 2
-fi
-if [ "$1" = "-f" ] && [ "$2" = "%z" ]; then
-    printf '%s\n' "$3" > "$0.path"
-    printf '2097152\n'
-    exit 0
-fi
-exit 3
-"#,
-        );
-
-        let gtimeout_path = fake_tools.path().join("gtimeout");
-        write_test_executable(
-            &gtimeout_path,
-            r#"#!/bin/bash
-printf '%s\n' "$@" > "$0.args"
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --signal=*|--kill-after=*) shift ;;
-        *) break ;;
-    esac
-done
-shift
-"$@"
-status=$?
-printf '%s\n' "$status" > "$0.status"
-exit "$status"
-"#,
-        );
-
-        let path_value = format!(
-            "{}:{}",
-            fake_tools.path().display(),
-            tool_bin.path().display()
-        );
-        let script = build_probe_script_for_dirs(&["~/.codex/sessions".to_string()]);
-        let output = run_probe_script_with_path_value(
-            &script,
-            home.path(),
-            &path_value,
-            Duration::from_secs(8),
-        )
-        .expect("portable probe shell should finish");
-        assert!(output.status.success(), "portable probe shell failed");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains("AGENT_DATA=~/.codex/sessions|2|1"),
-            "BSD stat fallback should count the literal session: {stdout}"
-        );
-
-        let find_args =
-            std::fs::read_to_string(find_path.with_extension("args")).expect("find args");
-        assert!(find_args.contains("-print0"));
-        assert!(!find_args.contains("-printf"));
-        let timeout_args =
-            std::fs::read_to_string(gtimeout_path.with_extension("args")).expect("gtimeout args");
-        assert!(timeout_args.contains("--signal=TERM"));
-        assert!(timeout_args.contains("--kill-after=1s"));
-        assert!(timeout_args.contains("5s"));
-        assert_eq!(
-            std::fs::read_to_string(gtimeout_path.with_extension("status"))
-                .expect("gtimeout status")
-                .trim(),
-            "0"
-        );
-        assert_eq!(
-            std::fs::read_to_string(stat_path.with_extension("path"))
-                .expect("stat path")
-                .trim_end(),
-            weird_path.to_string_lossy()
-        );
-        assert!(
-            !home.path().join("SHOULD_NOT_EXIST").exists(),
-            "literal metacharacters from find must not execute"
-        );
-
-        std::fs::write(find_path.with_extension("fail"), b"fail").expect("enable find failure");
-        let failure = run_probe_script_with_path_value(
-            &script,
-            home.path(),
-            &path_value,
-            Duration::from_secs(8),
-        )
-        .expect("failed find probe shell should finish");
-        assert!(
-            failure.status.success(),
-            "outer probe should preserve discovery"
-        );
-        let failure_stdout = String::from_utf8_lossy(&failure.stdout);
-        assert!(
-            failure_stdout.contains("AGENT_DATA=~/.codex/sessions|0|0"),
-            "find failure must classify the estimate as incomplete: {failure_stdout}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(gtimeout_path.with_extension("status"))
-                .expect("failed gtimeout status")
-                .trim(),
-            "73",
-            "find's nonzero status must survive the aggregation pipeline"
         );
     }
 
@@ -2580,205 +1965,6 @@ exit "$status"
         assert!(results.is_empty());
     }
 
-    /// Run only the named test against a local stub transport.
-    ///
-    /// The stub `ssh` in `PATH` answers one host, refuses one host and hangs
-    /// past the probe deadline on a third. No real host is contacted and no
-    /// process-wide environment change leaks into parallel library tests.
-    #[cfg(target_os = "linux")]
-    fn probe_timeout_fixture_child(test_name: &str) -> bool {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-
-        if dotenvy::var("CASS_TEST_PROBE_TIMEOUT_CHILD").is_ok_and(|name| name == test_name) {
-            return true;
-        }
-        let root = tempfile::tempdir().unwrap();
-        for directory in ["bin", "home", "config", "cache", "data", "tmp"] {
-            fs::create_dir_all(root.path().join(directory)).unwrap();
-        }
-        let stub = root.path().join("bin/ssh");
-        fs::write(
-            &stub,
-            r#"#!/bin/sh
-set -eu
-host=""
-for arg in "$@"; do
-  case "$arg" in
-    100.64.0.*) host="$arg" ;;
-  esac
-done
-printf 'probe %s\n' "$host" >> "$CASS_TEST_PROBE_ROOT/probes"
-case "$host" in
-  100.64.0.2)
-    printf '===PROBE_START===\nCASS_VERSION=0.7.1\nCASS_HEALTH=NOT_INDEXED\nOS=Linux\nARCH=x86_64\nHOME=/home/developer\n===PROBE_END===\n'
-    exit 0
-    ;;
-  100.64.0.3)
-    printf 'Connection refused\n' >&2
-    exit 255
-    ;;
-  100.64.0.1)
-    # A transport that never answers: the probe deadline must expire.
-    /bin/sleep 30
-    exit 0
-    ;;
-esac
-exit 1
-"#,
-        )
-        .unwrap();
-        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
-        fs::write(root.path().join("probes"), "").unwrap();
-        let output = assert_cmd::Command::new(std::env::current_exe().unwrap())
-            .env_clear()
-            .current_dir(root.path())
-            .env(
-                "PATH",
-                format!("{}:/usr/bin:/bin", root.path().join("bin").display()),
-            )
-            .env("HOME", root.path().join("home"))
-            .env("XDG_CONFIG_HOME", root.path().join("config"))
-            .env("XDG_CACHE_HOME", root.path().join("cache"))
-            .env("XDG_DATA_HOME", root.path().join("data"))
-            .env("CASS_DATA_DIR", root.path().join("cass-data"))
-            .env("TMPDIR", root.path().join("tmp"))
-            .env("CASS_TEST_PROBE_ROOT", root.path())
-            .env("CASS_TEST_PROBE_TIMEOUT_CHILD", test_name)
-            .env("RUST_MIN_STACK", "134217728")
-            .args([
-                "--exact",
-                test_name,
-                "--nocapture",
-                "--test-threads=1",
-                "--color=never",
-            ])
-            .timeout(Duration::from_secs(120))
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
-            "the isolated regression must actually run: {output:?}"
-        );
-        false
-    }
-
-    /// A bounded fleet probe must report the hosts whose transport exceeded
-    /// the deadline instead of dropping them: the fleet report states how many
-    /// hosts were probed, how many answered and how many timed out.
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn test_parallel_probe_reports_timed_out_hosts_instead_of_dropping_them() {
-        if !probe_timeout_fixture_child(
-            "sources::probe::tests::test_parallel_probe_reports_timed_out_hosts_instead_of_dropping_them",
-        ) {
-            return;
-        }
-        let hosts: Vec<_> = ["100.64.0.1", "100.64.0.2", "100.64.0.3"]
-            .into_iter()
-            .map(|name| DiscoveredHost {
-                name: name.to_string(),
-                hostname: None,
-                user: None,
-                port: None,
-                identity_file: None,
-            })
-            .collect();
-        let outcomes = probe_hosts_parallel_outcomes(&hosts, 1, |_, _, _| {});
-
-        // Every probed host is reported, in input order: the host that
-        // exceeded the transport deadline is not dropped.
-        assert_eq!(outcomes.len(), hosts.len());
-        assert_eq!(
-            outcomes
-                .iter()
-                .map(|outcome| outcome.result.host_name.clone())
-                .collect::<Vec<_>>(),
-            hosts
-                .iter()
-                .map(|host| host.name.clone())
-                .collect::<Vec<_>>()
-        );
-
-        let report = ProbeFleetReport::from_outcomes(&outcomes);
-        assert_eq!(report.probed, 3);
-        assert_eq!(report.answered, 1);
-        assert_eq!(report.timed_out, 1);
-        assert_eq!(report.failed, 1);
-        assert_eq!(report.timed_out_hosts, vec!["100.64.0.1".to_string()]);
-        assert!(
-            !report.is_complete(),
-            "a timed-out host is not a complete probe"
-        );
-
-        let timed_out = outcomes
-            .iter()
-            .find(|outcome| outcome.timed_out)
-            .expect("the slow host is reported as timed out");
-        assert!(!timed_out.result.reachable);
-        assert!(
-            timed_out
-                .result
-                .error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("timed out"),
-            "the timed-out host names the deadline: {:?}",
-            timed_out.result.error
-        );
-
-        // A refused connection is a failure, not a timeout.
-        let refused = outcomes
-            .iter()
-            .find(|outcome| outcome.result.host_name == "100.64.0.3")
-            .expect("the refusing host is reported");
-        assert!(!refused.timed_out);
-        assert!(!refused.result.reachable);
-
-        // The answering host is reachable and not a timeout.
-        let answered = outcomes
-            .iter()
-            .find(|outcome| outcome.result.host_name == "100.64.0.2")
-            .expect("the answering host is reported");
-        assert!(answered.result.reachable);
-        assert!(!answered.timed_out);
-    }
-
-    /// The plain result API keeps working next to the outcome API: it returns
-    /// the same per-host results, one per host.
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn test_parallel_probe_results_stay_one_per_host() {
-        if !probe_timeout_fixture_child(
-            "sources::probe::tests::test_parallel_probe_results_stay_one_per_host",
-        ) {
-            return;
-        }
-        let hosts: Vec<_> = ["100.64.0.1", "100.64.0.2", "100.64.0.3"]
-            .into_iter()
-            .map(|name| DiscoveredHost {
-                name: name.to_string(),
-                hostname: None,
-                user: None,
-                port: None,
-                identity_file: None,
-            })
-            .collect();
-        let results = probe_hosts_parallel(&hosts, 1, |_, _, _| {});
-        assert_eq!(results.len(), hosts.len());
-        assert_eq!(
-            results
-                .iter()
-                .map(|result| result.host_name.clone())
-                .collect::<Vec<_>>(),
-            hosts
-                .iter()
-                .map(|host| host.name.clone())
-                .collect::<Vec<_>>()
-        );
-    }
-
     /// Run only the named test in an isolated environment. Real OpenSSH uses
     /// a refusing ProxyCommand; only external Tailscale status is a fixture.
     /// No process-wide environment changes leak into parallel library tests.
@@ -3015,10 +2201,7 @@ exec /bin/cat "$CASS_TEST_PROBE_ROOT/status.json"
             .unwrap_err();
             // All eligible hosts reach real OpenSSH; the refusing transport
             // makes each unreachable. Provider endpoints must never get here.
-            assert!(matches!(
-                error,
-                super::super::setup::SetupError::NoHosts { .. }
-            ));
+            assert!(matches!(error, super::super::setup::SetupError::NoHosts));
         });
         let expected: Vec<_> = (1..=17).map(|index| format!("100.64.0.{index}")).collect();
         assert_bounded_probe_transports(&expected);

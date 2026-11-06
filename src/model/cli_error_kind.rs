@@ -86,8 +86,6 @@ pub enum ErrorKind {
     InvalidAgent,
     InvalidFilename,
     InvalidLine,
-    InvalidMessageAnchor,
-    StaleMessageAnchor,
     Io,
     LexicalRebuild,
     /// Snake-case wire literal (legacy): `lexical_generation`.
@@ -111,12 +109,10 @@ pub enum ErrorKind {
     PackEmptyQuery,
     PackInvalidField,
     PackInvalidLimit,
-    PackInvalidRedactionPolicy,
     PackNoEvidence,
     PackUnsupportedFormat,
     Pages,
     ParseError,
-    PartialResult,
     PasswordReadError,
     PasswordRequired,
     RebuildError,
@@ -126,9 +122,6 @@ pub enum ErrorKind {
     /// Snake-case wire literal (legacy): `retained_publish_backup`.
     RetainedPublishBackup,
     Schedule,
-    /// An archive needs an operator-driven schema repair before it can be
-    /// opened (`cass doctor --fix`). 2l1b0.65.
-    SchemaRepairRequired,
     Search,
     SemanticBackfill,
     SemanticManifest,
@@ -144,7 +137,6 @@ pub enum ErrorKind {
     Ssh,
     Storage,
     StorageFingerprint,
-    StorageRecoveryRequired,
     Timeout,
     Tui,
     TuiHeadlessOnce,
@@ -199,8 +191,6 @@ impl ErrorKind {
             Self::InvalidAgent => "invalid-agent",
             Self::InvalidFilename => "invalid-filename",
             Self::InvalidLine => "invalid-line",
-            Self::InvalidMessageAnchor => "invalid-message-anchor",
-            Self::StaleMessageAnchor => "stale-message-anchor",
             Self::Io => "io",
             Self::LexicalRebuild => "lexical-rebuild",
             Self::LexicalGeneration => "lexical-generation",
@@ -222,12 +212,10 @@ impl ErrorKind {
             Self::PackEmptyQuery => "pack-empty-query",
             Self::PackInvalidField => "pack-invalid-field",
             Self::PackInvalidLimit => "pack-invalid-limit",
-            Self::PackInvalidRedactionPolicy => "pack-invalid-redaction-policy",
             Self::PackNoEvidence => "pack-no-evidence",
             Self::PackUnsupportedFormat => "pack-unsupported-format",
             Self::Pages => "pages",
             Self::ParseError => "parse-error",
-            Self::PartialResult => "partial-result",
             Self::PasswordReadError => "password-read-error",
             Self::PasswordRequired => "password-required",
             Self::RebuildError => "rebuild-error",
@@ -236,7 +224,6 @@ impl ErrorKind {
             Self::ResumeExecFailed => "resume-exec-failed",
             Self::RetainedPublishBackup => "retained-publish-backup",
             Self::Schedule => "schedule",
-            Self::SchemaRepairRequired => "schema-repair-required",
             Self::Search => "search",
             Self::SemanticBackfill => "semantic-backfill",
             Self::SemanticManifest => "semantic-manifest",
@@ -252,7 +239,6 @@ impl ErrorKind {
             Self::Ssh => "ssh",
             Self::Storage => "storage",
             Self::StorageFingerprint => "storage-fingerprint",
-            Self::StorageRecoveryRequired => "storage-recovery-required",
             Self::Timeout => "timeout",
             Self::Tui => "tui",
             Self::TuiHeadlessOnce => "tui-headless-once",
@@ -306,8 +292,6 @@ impl ErrorKind {
             "invalid-agent" => Self::InvalidAgent,
             "invalid-filename" => Self::InvalidFilename,
             "invalid-line" => Self::InvalidLine,
-            "invalid-message-anchor" => Self::InvalidMessageAnchor,
-            "stale-message-anchor" => Self::StaleMessageAnchor,
             "io" => Self::Io,
             "lexical-rebuild" => Self::LexicalRebuild,
             "lexical-generation" => Self::LexicalGeneration,
@@ -329,12 +313,10 @@ impl ErrorKind {
             "pack-empty-query" => Self::PackEmptyQuery,
             "pack-invalid-field" => Self::PackInvalidField,
             "pack-invalid-limit" => Self::PackInvalidLimit,
-            "pack-invalid-redaction-policy" => Self::PackInvalidRedactionPolicy,
             "pack-no-evidence" => Self::PackNoEvidence,
             "pack-unsupported-format" => Self::PackUnsupportedFormat,
             "pages" => Self::Pages,
             "parse-error" => Self::ParseError,
-            "partial-result" => Self::PartialResult,
             "password-read-error" => Self::PasswordReadError,
             "password-required" => Self::PasswordRequired,
             "rebuild-error" => Self::RebuildError,
@@ -343,7 +325,6 @@ impl ErrorKind {
             "resume-exec-failed" => Self::ResumeExecFailed,
             "retained-publish-backup" => Self::RetainedPublishBackup,
             "schedule" => Self::Schedule,
-            "schema-repair-required" => Self::SchemaRepairRequired,
             "search" => Self::Search,
             "semantic-backfill" => Self::SemanticBackfill,
             "semantic-manifest" => Self::SemanticManifest,
@@ -359,7 +340,6 @@ impl ErrorKind {
             "ssh" => Self::Ssh,
             "storage" => Self::Storage,
             "storage-fingerprint" => Self::StorageFingerprint,
-            "storage-recovery-required" => Self::StorageRecoveryRequired,
             "timeout" => Self::Timeout,
             "tui" => Self::Tui,
             "tui-headless-once" => Self::TuiHeadlessOnce,
@@ -413,8 +393,6 @@ impl ErrorKind {
             Self::InvalidAgent,
             Self::InvalidFilename,
             Self::InvalidLine,
-            Self::InvalidMessageAnchor,
-            Self::StaleMessageAnchor,
             Self::Io,
             Self::LexicalRebuild,
             Self::LexicalGeneration,
@@ -436,12 +414,10 @@ impl ErrorKind {
             Self::PackEmptyQuery,
             Self::PackInvalidField,
             Self::PackInvalidLimit,
-            Self::PackInvalidRedactionPolicy,
             Self::PackNoEvidence,
             Self::PackUnsupportedFormat,
             Self::Pages,
             Self::ParseError,
-            Self::PartialResult,
             Self::PasswordReadError,
             Self::PasswordRequired,
             Self::RebuildError,
@@ -450,7 +426,6 @@ impl ErrorKind {
             Self::ResumeExecFailed,
             Self::RetainedPublishBackup,
             Self::Schedule,
-            Self::SchemaRepairRequired,
             Self::Search,
             Self::SemanticBackfill,
             Self::SemanticManifest,
@@ -466,7 +441,6 @@ impl ErrorKind {
             Self::Ssh,
             Self::Storage,
             Self::StorageFingerprint,
-            Self::StorageRecoveryRequired,
             Self::Timeout,
             Self::Tui,
             Self::TuiHeadlessOnce,
@@ -525,30 +499,28 @@ mod tests {
         }
     }
 
-    /// Pin the reviewed vocabulary alongside the typed CliErrorKind
-    /// producers in src/lib.rs. Audit new producers and both conversion
-    /// tables before changing this count; literal-only searches no longer
-    /// cover the migrated call sites.
+    /// The vocabulary covers every kind currently emitted by
+    /// src/lib.rs at landing time (audited via
+    /// `grep -oE 'kind: \"[a-z_-]+\"' src/lib.rs | sort -u`). A
+    /// regression that added a new kind to lib.rs without adding it
+    /// here would be invisible until a future enum migration site
+    /// hit a missing variant; pinning the count here surfaces the
+    /// drift immediately at CI time.
     #[test]
-    fn variant_count_matches_audited_cli_error_vocabulary() {
-        // 93 unique kinds: GH #450 added `migration-repair-pending` (95), then
+    fn variant_count_matches_audited_lib_rs_kind_literals() {
+        // 92 unique kinds: GH #450 added `migration-repair-pending` (95), then
         // 2l1b0.58 folded the duplicate spellings `index-missing` into
         // `missing-index` and `io-error` into `io`, and dropped `update-check`,
         // whose only producer (the pre-TUI update prompt) 2l1b0.56 removed.
-        // 2l1b0.65 added `schema-repair-required` (93).
-        // dnj94 added `storage-recovery-required` (94). Message-anchor
-        // validation added `invalid-message-anchor` and `stale-message-anchor` (96).
-        // Pack privacy/budget commit 787a3b9d added `partial-result` and
-        // `pack-invalid-redaction-policy`, with typed lib.rs producers (98).
         // If lib.rs grows a new kind, bump this count AND add the variant +
         // arms above.
-        const AUDITED_KIND_COUNT: usize = 98;
+        const AUDITED_KIND_COUNT: usize = 92;
         assert_eq!(
             ErrorKind::all_variants().len(),
             AUDITED_KIND_COUNT,
-            "ErrorKind variant count drifted from the audited vocabulary; \
-             review the typed CliErrorKind producers in src/lib.rs and both \
-             conversion tables before updating the constant"
+            "ErrorKind variant count drifted from the audited lib.rs literal set; \
+             re-run `grep -oE 'kind: \"[a-z_-]+\"' src/lib.rs | sort -u | wc -l` and \
+             update the constant + add the missing variant"
         );
     }
 

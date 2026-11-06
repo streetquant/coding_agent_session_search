@@ -88,7 +88,6 @@ fn make_hit(id: &str, score: f32) -> SearchHit {
         origin_kind: "local".to_string(),
         origin_host: None,
         conversation_id: None,
-        message_anchor: None,
     }
 }
 

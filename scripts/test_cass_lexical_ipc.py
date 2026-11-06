@@ -362,8 +362,8 @@ class AdmissionTests(unittest.TestCase):
     def test_worker_retains_only_the_guarded_root_descriptor(self):
         self.mode("root_probe")
         unrelated = os.open(self.cass, os.O_RDONLY)
+        os.set_inheritable(unrelated, True)
         try:
-            os.set_inheritable(unrelated, True)
             first, second = self.search(), self.search()
         finally:
             os.close(unrelated)
@@ -511,7 +511,6 @@ class AdmissionTests(unittest.TestCase):
     def test_insecure_and_symlink_socket_parent_refused(self):
         insecure = self.home / "insecure"
         insecure.mkdir(mode=0o755)
-        insecure.chmod(0o755)
         with self.assertRaises(ipc.Failure):
             ipc.query(insecure / "s", self.request(), 1)
         private = self.home / "private"
@@ -590,20 +589,6 @@ class MetadataAndProtocolTests(unittest.TestCase):
                 ipc.mount_records(bad)
         with mock.patch.object(ipc, "MAX_MOUNTS", 1), self.assertRaises(ValueError):
             ipc.mount_records(self.RECORD + self.RECORD.replace(b"17 1", b"18 1"))
-
-    def test_namespace_bind_mount_does_not_disable_unrelated_local_storage(self):
-        namespace = b"18 1 0:4 net:[4026531833] /run/netns/test rw - nsfs nsfs rw\n"
-        records = ipc.mount_records(self.RECORD + namespace)
-        self.assertEqual(records[17][:3], (0, 42, b"tmpfs"))
-        self.assertEqual(records[18][2], b"nsfs")
-        self.assertNotIn(b"nsfs", ipc.LOCAL_FILESYSTEMS)
-        for bad in (namespace.replace(b"nsfs nsfs", b"tmpfs none"),
-                    namespace.replace(b"net:[4026531833]", b"relative"),
-                    namespace.replace(b"4026531833", b"bad"),
-                    namespace.replace(b"4026531833", b"0"),
-                    namespace.replace(b"4026531833", b"9" * 21)):
-            with self.subTest(bad=bad), self.assertRaises(ValueError):
-                ipc.mount_records(self.RECORD + bad)
 
     def test_descriptor_mount_requires_one_bounded_kernel_id(self):
         for bad in (b"pos:\t0\n", b"mnt_id: 1\nmnt_id: 1\n", b"mnt_id: -1\n",

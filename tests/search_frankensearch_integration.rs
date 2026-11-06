@@ -17,6 +17,7 @@ use std::collections::HashSet;
 use tempfile::TempDir;
 
 mod util;
+use util::e2e_log::PhaseTracker;
 
 // =============================================================================
 // ZERO TANTIVY IMPORTS AUDIT
@@ -111,52 +112,46 @@ fn cass_selects_only_the_explicit_tantivy_compatibility_surface() {
         "CASS must not select the facade's swappable generic lexical feature: {dependency}"
     );
 
-    // The completed upstream retained-mapping repair is not published in the
-    // registry yet. Keep both the exact facade version and the reviewed
-    // immutable source revision; a floating Git branch is not a source pin.
-    // SQLite's independent registry-only contract remains enforced by build.rs.
-    let upstream = "https://github.com/Dicklesworthstone/frankensearch";
-    let revision = "5ee999fcaba6f85d19c0e3f00883f1d5d4918887";
+    // gh#416: frankensearch resolves from crates.io behind an EXACT version
+    // pin (the registry holds stale same-version twins from an older tree, so
+    // a caret req could resolve wrong source; `=` fences that off). The old
+    // form of this contract pinned a git revision — that shape is now itself
+    // a defect, checked below via the absence of any git source.
     let pinned_version = dependency
         .split_once("version = \"=")
         .and_then(|(_, suffix)| suffix.split_once('"'))
         .map(|(version, _)| version.to_owned())
-        .expect("frankensearch dependency must pin an exact version (= prefix)");
+        .expect("frankensearch dependency must pin an exact registry version (= prefix)");
     assert!(
-        dependency.contains(&format!("git = \"{upstream}\""))
-            && dependency.contains(&format!("rev = \"{revision}\"")),
-        "frankensearch must resolve the exact reviewed upstream repair: {dependency}"
+        !dependency.contains("git ="),
+        "frankensearch must not resolve from git; crates.io publishing forbids it: {dependency}"
     );
     let lockfile = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"),
     )
     .expect("read Cargo.lock");
     let expected_lock = format!(
-        "name = \"frankensearch\"\nversion = \"{pinned_version}\"\nsource = \"git+{upstream}?rev={revision}#{revision}\""
+        "name = \"frankensearch\"\nversion = \"{pinned_version}\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\""
     );
     assert!(
         lockfile.contains(&expected_lock),
-        "Cargo.lock must resolve frankensearch {pinned_version} from the exact reviewed revision"
+        "Cargo.lock must resolve frankensearch {pinned_version} from the crates.io registry"
     );
     let build_contract =
         std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("build.rs"))
             .expect("read build.rs");
     assert!(
-        build_contract.contains(&format!("expected_version: \"{pinned_version}\""))
-            && build_contract.contains(&format!("expected_git: \"{upstream}\""))
-            && build_contract.contains(&format!("expected_rev: \"{revision}\"")),
-        "build.rs must enforce the same exact FrankenSearch version and source as Cargo.toml"
+        build_contract.contains(&format!("expected_version: \"{pinned_version}\"")),
+        "build.rs must enforce the same exact FrankenSearch version as Cargo.toml"
     );
     let readme =
         std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
             .expect("read README.md");
     assert!(
-        readme.contains(&format!("(crate {pinned_version})"))
-            && readme.contains(upstream)
-            && readme.contains(revision)
+        readme.contains(&format!("={pinned_version}"))
             && readme.contains("cass-compat")
             && readme.contains("lexical-tantivy"),
-        "README dependency contract must name the pinned version, revision and explicit compatibility lane"
+        "README dependency contract must name the pinned registry version and explicit compatibility lane"
     );
     assert!(
         lockfile.contains("name = \"frankensearch-lexical\""),
@@ -487,6 +482,152 @@ fn lexical_search_through_frankensearch_pipeline() {
         .search("token refresh", filters, 10, 0, FieldMask::FULL)
         .unwrap();
     assert!(!hits.is_empty(), "should find multi-term query");
+}
+
+/// No-mock schema-v8 compatibility receipt spanning the operations CASS needs
+/// to survive the facade flip: create, ingest, commit, reopen, merge, query,
+/// drop, and fresh reopen.
+#[test]
+// Merges two independently-built shard directories, which is the Tantivy-only
+// N-directory merge. Quill's concat_merge joins segments within ONE manifest,
+// so the staged-shard strategy that needed this is disabled for the Quill
+// backend. Ignored rather than weakened; see the `staged_shard_plan` binding.
+#[ignore = "Tantivy-only shard merge; unreachable on the Quill backend"]
+fn cass_schema_v8_survives_create_merge_query_and_fresh_reopen() {
+    assert_eq!(
+        frankensearch::lexical_tantivy::CASS_SCHEMA_VERSION,
+        "v8",
+        "the compatibility receipt is specifically for CASS schema v8"
+    );
+
+    let tracker = PhaseTracker::new(
+        "search_frankensearch_integration",
+        "cass_schema_v8_survives_create_merge_query_and_fresh_reopen",
+    );
+    let root = TempDir::new().expect("compatibility fixture root");
+    let left_path = root.path().join("left");
+    let right_path = root.path().join("right");
+    let merged_path = root.path().join("merged");
+
+    tracker.phase(
+        "create_ingest_commit",
+        "build two real schema-v8 shards",
+        || {
+            let mut left = TantivyIndex::open_or_create(&left_path).expect("create left shard");
+            let left_conversation = util::ConversationFixtureBuilder::new("claude_code")
+                .title("left compatibility shard")
+                .source_path(root.path().join("left.jsonl"))
+                .base_ts(1_700_000_000_000)
+                .messages(1)
+                .with_content(0, "quill facade migration keeps oauth lexical history")
+                .build_normalized();
+            left.add_conversation(&left_conversation)
+                .expect("ingest left shard");
+            left.commit().expect("commit left shard");
+
+            let mut right = TantivyIndex::open_or_create(&right_path).expect("create right shard");
+            let right_conversation = util::ConversationFixtureBuilder::new("codex")
+                .title("right compatibility shard")
+                .source_path(root.path().join("right.jsonl"))
+                .base_ts(1_700_000_001_000)
+                .messages(1)
+                .with_content(0, "tantivy schema eight survives restart and merge")
+                .build_normalized();
+            right
+                .add_conversation(&right_conversation)
+                .expect("ingest right shard");
+            right.commit().expect("commit right shard");
+        },
+    );
+
+    tracker.phase(
+        "reopen_merge",
+        "reopen both shards and merge real index files",
+        || {
+            let left = TantivyIndex::open_or_create(&left_path).expect("reopen left shard");
+            let right = TantivyIndex::open_or_create(&right_path).expect("reopen right shard");
+            assert_eq!(
+                left.reader()
+                    .expect("left reader")
+                    .doc_count()
+                    .expect("doc count"),
+                1
+            );
+            assert_eq!(
+                right
+                    .reader()
+                    .expect("right reader")
+                    .doc_count()
+                    .expect("doc count"),
+                1
+            );
+            drop((left, right));
+
+            let merged = TantivyIndex::merge_compatible_index_directories(
+                &merged_path,
+                &[left_path.as_path(), right_path.as_path()],
+            )
+            .expect("merge compatible schema-v8 shards");
+            assert_eq!(
+                merged
+                    .reader()
+                    .expect("merged reader")
+                    .doc_count()
+                    .expect("doc count"),
+                2
+            );
+        },
+    );
+
+    tracker.phase(
+        "query_restart",
+        "query, drop every owner, and query after fresh reopen",
+        || {
+            for (query, expected_agent, expected_content) in [
+                (
+                    "oauth",
+                    "claude_code",
+                    "quill facade migration keeps oauth lexical history",
+                ),
+                (
+                    "schema eight",
+                    "codex",
+                    "tantivy schema eight survives restart and merge",
+                ),
+            ] {
+                let client = SearchClient::open(&merged_path, None)
+                    .expect("open merged search client")
+                    .expect("merged search client exists");
+                let hits = client
+                    .search(query, SearchFilters::default(), 10, 0, FieldMask::FULL)
+                    .expect("query merged index");
+                assert_eq!(hits.len(), 1, "query {query:?} must find its source shard");
+                assert_eq!(hits[0].agent, expected_agent);
+                assert_eq!(hits[0].content, expected_content);
+                drop(client);
+
+                let restarted = SearchClient::open(&merged_path, None)
+                    .expect("fresh reopen merged search client")
+                    .expect("freshly reopened search client exists");
+                let restarted_hits = restarted
+                    .search(query, SearchFilters::default(), 10, 0, FieldMask::FULL)
+                    .expect("query after fresh reopen");
+                assert_eq!(
+                    restarted_hits.len(),
+                    1,
+                    "query {query:?} must survive fresh reopen"
+                );
+                assert_eq!(restarted_hits[0].agent, expected_agent);
+                assert_eq!(restarted_hits[0].content, expected_content);
+            }
+        },
+    );
+
+    tracker.verbose(&format!(
+        "backend=tantivy namespace=lexical_tantivy schema_version={} documents=2",
+        frankensearch::lexical_tantivy::CASS_SCHEMA_VERSION
+    ));
+    tracker.complete();
 }
 
 /// Verify agent filter works through the frankensearch pipeline.

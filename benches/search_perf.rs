@@ -166,7 +166,6 @@ fn make_bench_hit(id: &str, score: f32) -> SearchHit {
         origin_kind: "local".to_string(),
         origin_host: None,
         conversation_id: None,
-        message_anchor: None,
     }
 }
 
@@ -319,7 +318,6 @@ fn pack_bench_plan(candidates: Vec<PackCandidate>, limits: PackPlannerLimits) ->
         candidates,
         explain_selection: true,
         include_skill_content: false,
-        redaction_policy: Default::default(),
     })
     .expect("answer pack benchmark plan")
 }

@@ -4,13 +4,22 @@
 **Status:** Contract for implementation beads
 **Date:** 2026-05-08
 
-> **Implementation qualification (2026-10-29; bead 2l1b0.20).** The current
-> correction adds approximate-search pass-through, selectable excerpt redaction,
-> duration freshness windows, optional selection diagnostics and typed timeout
-> exits. See the conformance matrix for executed evidence and outstanding gates;
-> source changes alone do not establish installed acceptance. The numeric
-> `--freshness-window-seconds` option remains available and conflicts with the
-> duration option. Empty required evidence uses `not-found` (13).
+> **Implementation status (checked 2026-09-24 against `cass pack --help` and
+> src/lib.rs; bead 2l1b0.59).** This contract is the target; these parts
+> differ from the shipped command, and the implementation work is tracked by
+> 2l1b0.20:
+> - Not implemented: `--approximate`, `--redaction <policy>` and its
+>   `pack-invalid-redaction-policy` error. Redaction is fixed (index-time
+>   secret redaction), not selectable per pack.
+> - `--freshness-window <duration>` shipped as `--freshness-window-seconds <n>`.
+> - Timeouts do not exit 8 (`partial-result`) or 10 (`timeout`): pack exits 0
+>   and reports `budget.timed_out: true` with `skipped_sections` and a `retry`
+>   command in the top-level `budget` block (as `search` does).
+> - `--explain-selection` adds a `selection` object to each evidence item;
+>   there is no top-level `selection_debug`.
+> - `pack-no-evidence` is defined as a kind but never raised. The shipped way
+>   to fail on an empty pack is `--require-evidence`, which exits 13 with kind
+>   `not-found`. `pack-budget-too-small` is raised as described below.
 
 This document defines the first implementation contract for `cass pack`: a
 robot-first command that turns existing indexed session evidence into a compact,
@@ -84,7 +93,7 @@ The command reuses search filters where possible:
 | `--until <time>` | string | none | Same syntax as search: ISO, keyword, or relative offset. |
 | `--mode <mode>` | enum | `hybrid` | `hybrid`, `lexical`, or `semantic`; hybrid must fail open to lexical. |
 | `--approximate` | bool | false | Passed through to semantic/hybrid ANN search when available. |
-| `--refresh` | bool | false | Markdown without an explicit timeout runs the existing incremental refresh before packing. Budgeted output defers refresh, marks the pack partial and supplies a separate index command. |
+| `--refresh` | bool | false | Runs the existing safe incremental search refresh before packing. |
 | `--timeout <ms>` | integer | none | Bounded execution; partial packs must be marked partial. |
 | `--request-id <id>` | string | none | Echoed in `_meta.request_id`. |
 | `--data-dir <path>` | path | platform default | Same data directory semantics as search. |
@@ -107,11 +116,8 @@ Pack-specific flags:
 | `--require-evidence` | bool | false | Empty packs become an error instead of success with no evidence. |
 | `--explain-selection` | bool | false | Includes per-candidate score components and rejection reasons. |
 
-`--redaction off` requires an explicit `--source local`. Robot output must
-still set `privacy.redaction_policy="off"` and `privacy.sensitive_output=true`;
-Markdown displays a sensitive-output notice. This permits unmasked local
-excerpts, while private source coordinates and free-form envelope strings remain
-protected. It does not restore secrets already redacted at ingestion.
+`--redaction off` is allowed only for local operator workflows. Robot output must
+still set `privacy.redaction_policy="off"` and `privacy.sensitive_output=true`.
 
 ## Field Masks
 
@@ -129,7 +135,6 @@ protected. It does not restore secrets already redacted at ingestion.
 - `omitted`
 - `privacy`
 - `warnings`
-- `budget`
 
 `--field-mask minimal` includes:
 
@@ -144,10 +149,6 @@ protected. It does not restore secrets already redacted at ingestion.
 
 `--field-mask full` includes every defined response field, including
 `selection_debug` when `--explain-selection` is set.
-
-Without an explicit mask, the full envelope is emitted. JSONL retains its
-record contract and ignores field projection with a stderr warning. Markdown
-uses its fixed human display layout.
 
 Explicit masks are comma-separated top-level or dotted field names. Unknown
 fields are ignored with a warning in `_meta.warnings[]`; they do not change the
@@ -346,14 +347,6 @@ Citation fields:
 | `match_type` | string | Existing search match type. |
 | `verified` | bool | True when the cited path/span was read successfully. |
 
-Physical verification currently covers modern local Codex JSONL, with an
-8 MiB per-file bound, a 32 MiB request bound and a one-second source deadline
-within the remaining command budget. Other providers, remote sources and
-oversized files retain canonical archived evidence with `verified=false` and
-null physical line numbers. A readable path alone does not establish a verified
-citation: the source record must match the archived session, role, ordinal,
-timestamp and content unambiguously.
-
 Selection fields:
 
 | Field | Type | Contract |
@@ -429,11 +422,8 @@ Tie-break order is stable:
 3. Newer `created_at_ms`, with null timestamps last.
 4. Lexicographic `source_id`.
 5. Lexicographic `source_path`.
-6. Lower known `conversation_id`, with missing identities last.
-7. Lexicographic agent slug.
-8. Lower `message_index`, with null indexes last.
-9. Lower verified `line_start`, with null lines last.
-10. Lower `content_hash`.
+6. Lower `line_start`, with null lines last.
+7. Lower `content_hash`.
 
 Scoring inputs:
 
@@ -522,18 +512,10 @@ Each `source_readiness[]` item includes:
 - `last_indexed_at_ms`
 - `recommended_action`
 
-Unknown source synchronization timestamps are null. `last_indexed_at_ms` is the
-newest indexed timestamp among emitted evidence for the source, or null. Neither
-timestamp is inferred from message creation time. Source readiness describes
-the sources represented by emitted evidence rather than an exhaustive fleet
-inventory.
-
 The pack command must not hide degraded semantic readiness. If semantic assets
-are absent but lexical search is ready, a hybrid request succeeds with
-`realized.fallback_mode="lexical"`, the executor's actual fallback reason and
-a warning. An explicit `--mode semantic` request uses the shared search
-contract and returns `semantic-unavailable` (code 15) rather than claiming
-semantic evidence was produced. Neither path acquires missing models.
+are absent but lexical search is ready, the pack succeeds with
+`realized.fallback_mode="lexical"` and a warning only when `--mode semantic` was
+explicitly requested.
 
 ## Privacy Contract
 
@@ -557,13 +539,7 @@ redacts credentials, keys, passwords, cookies, private keys, and skill content.
 
 Redaction invariants:
 
-- Redaction preserves canonical message coordinates and physical line numbers.
-  Private source paths and host labels remain masked under every policy; those
-  citations carry `followup_available=false` and
-  `followup_unavailable_reason="redacted-source-coordinates"`. Consumers must
-  not execute a follow-up command from masked coordinates. This preserves the
-  approved coordinate-privacy boundary rather than exposing a private path to
-  satisfy the original path-invariance wording.
+- Redaction never changes citation path or line fields.
 - Redaction must preserve excerpt UTF-8 validity.
 - Redaction must emit `redactions[]` with `kind`, `start_char`, `end_char`, and
   `replacement`.
@@ -584,8 +560,8 @@ Consumers must branch on `err.kind`, not just numeric code.
 | `pack-empty-query` | 2 | false | Query is empty after normalization. |
 | `pack-invalid-limit` | 2 | false | A pack-specific limit is outside allowed range. |
 | `pack-invalid-field` | 2 | false | Field mask has no valid fields. |
-| `pack-invalid-redaction-policy` | 2 | false | Unknown policy, or `off` without explicit local-source admission. |
-| `pack-unsupported-format` | 2 | false | Missing explicit output format, `--robot-format sessions`, or unsupported display format. |
+| `pack-invalid-redaction-policy` | 2 | false | Unknown redaction policy. |
+| `pack-unsupported-format` | 2 | false | `--robot-format sessions` or unsupported display format. |
 | `missing-db` | 3 | true | Database is absent. |
 | `missing-index` | 3 | true | Lexical index is absent and cannot be refreshed. |
 | `not-found` | 13 | false | No evidence and `--require-evidence` is set. |
@@ -607,13 +583,6 @@ Empty search results are success by default:
 }
 ```
 
-Deadline failures preserve the bounded pack on stdout. Robot formats emit the
-typed error envelope on stderr; explicit human Markdown uses the existing
-human-readable error formatting. Exit 8 means usable evidence was emitted; exit 10 means no
-usable evidence was emitted. `budget.timed_out`, shed sections and the retry
-command remain available in the pack. A deferred budgeted `--refresh` marks
-partial output without claiming a timeout.
-
 ## Format Contracts
 
 JSON is pretty-printed by default. Compact JSON is a single-line object with the
@@ -621,8 +590,7 @@ same fields. TOON encodes the same payload with the existing `toon` crate path.
 
 JSONL emits one object per line:
 
-1. `{"schema_version": "cass.pack.v2", "_meta": ..., "budget": ...}`;
-   `selection_debug` is added to this header only with `--explain-selection`.
+1. `{"schema_version": "cass.pack.v2", "_meta": ..., "budget": ...}`
 2. `{"pack": ...}`
 3. One line per `evidence` item.
 4. One line with `{"omitted": ...}`
@@ -655,10 +623,7 @@ goldens first.
 - Use `frankensqlite` for any new SQLite access.
 - Read session spans through existing `view`/`expand` style helpers where
   possible so source mapping behavior stays consistent.
-- Default packing does not mutate source logs, indexes, quarantine directories
-  or health state, even when stale-on-read auto-refresh is enabled for search.
-  Markdown `--refresh` without `--timeout` is the documented incremental-writer
-  opt-in; budgeted output always defers that write.
+- Do not mutate source logs, indexes, quarantine directories, or health state.
 
 ## Required Test Obligations
 
@@ -698,24 +663,20 @@ No-mock integration fixture:
 - assert citations resolve to readable source lines.
 - do not run browser/Playwright tests locally.
 
-Implementation beads use one RCH admission through `scripts/gate.sh`, including
-formatting, all-target clippy with warnings denied, selected pack library and
-integration tests, robot goldens and strict changed-file UBS. All-target clippy
-includes the Rust compiler check; a separate bare `cargo check` admission is
-not required. Record the worker, frozen inputs, selected nonzero test counts
-and `STAGE=<name> EXIT=<code>` receipts. A qualified warm target may replace the
-example target directory below.
+Verification commands for implementation beads:
 
 ```bash
-GATE_TARGET_DIR=/data/tmp/cass-answer-pack-target scripts/gate.sh \
-  --lib-filter pack --no-bin \
-  --integration cli_robot:pack,spec_pack_token_budget,golden_robot_pack,gh493_message_coordinates,e2e_lexical_fail_open:pack
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-answer-pack-target cargo fmt --check
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-answer-pack-target cargo check --all-targets
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-answer-pack-target cargo clippy --all-targets -- -D warnings
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-answer-pack-target cargo test pack
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-answer-pack-target cargo test --test golden_robot_json --test golden_robot_docs
 ```
 
-If goldens change intentionally, review the expected bytes first, then add
-`--regen-goldens` to that admission. It runs the existing `UPDATE_GOLDENS=1`
-path and a separate verification pass. Regeneration must not be used to accept
-an unexplained mismatch; the frozen source identity and reviewed golden bytes
-must still match after the gate.
+If goldens change intentionally, regenerate with:
 
-Review `git diff -- tests/golden/` before committing intentional golden changes.
+```bash
+UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-answer-pack-target cargo test --test golden_robot_json --test golden_robot_docs
+```
+
+Review `git diff tests/golden/` before committing regenerated files.

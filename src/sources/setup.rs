@@ -34,10 +34,7 @@ use super::config::{SourceConfigGenerator, SourcesConfig};
 use super::index::{IndexProgress, RemoteIndexer};
 use super::install::{InstallProgress, RemoteInstaller};
 use super::interactive::{confirm_action, run_host_selection};
-use super::probe::{
-    CassStatus, HostProbeResult, ProbeFleetReport, deduplicate_probe_results,
-    probe_hosts_parallel_outcomes,
-};
+use super::probe::{CassStatus, HostProbeResult, deduplicate_probe_results, probe_hosts_parallel};
 
 /// Options for the setup wizard.
 #[derive(Debug, Clone)]
@@ -228,11 +225,6 @@ pub struct SetupState {
     /// Probe results for each host.
     #[serde(default)]
     pub probed_hosts: Vec<HostProbeResult>,
-    /// Completeness accounting of the bounded fleet probe: how many hosts were
-    /// probed, how many answered and how many timed out. Older state files
-    /// omit it and must not be read as "the whole fleet answered".
-    #[serde(default)]
-    pub probe_report: Option<ProbeFleetReport>,
     /// Whether selection phase is complete.
     pub selection_complete: bool,
     /// Names of selected hosts.
@@ -505,15 +497,8 @@ pub enum SetupError {
     #[error("Setup cancelled by user")]
     Cancelled,
     /// No hosts found.
-    ///
-    /// `probe_report` carries the completeness accounting of the bounded fleet
-    /// probe when the hosts were found but none of them answered, so a caller
-    /// can tell "every host timed out" from "no host was ever probed".
     #[error("No SSH hosts found or selected")]
-    NoHosts {
-        /// Fleet probe accounting, when a probe actually ran.
-        probe_report: Option<ProbeFleetReport>,
-    },
+    NoHosts,
     /// Setup interrupted.
     #[error("Setup interrupted")]
     Interrupted,
@@ -538,11 +523,6 @@ pub struct SetupResult {
     /// as complete; setup itself never claims a sync it did not run
     /// (reality check 2026-09-01, WS-G.1).
     pub sync_pending: bool,
-    /// Completeness accounting of the bounded fleet probe: how many hosts were
-    /// probed, how many answered, how many timed out and which hosts timed
-    /// out. `None` when no probe ran (for example a resumed run whose probe
-    /// phase was already complete in an older checkpoint).
-    pub probe_report: Option<ProbeFleetReport>,
 }
 
 /// Print a phase header.
@@ -558,16 +538,6 @@ fn print_phase_header(phase: &str) {
 fn print_phase_done(message: &str) {
     println!("│ {} {}", "✓".green(), message);
     println!("└{}", "─".repeat(70).dimmed());
-}
-
-/// The Phase 2 summary of a bounded fleet probe: how many hosts were probed,
-/// how many answered, how many timed out and how many failed for another
-/// reason. A partial probe is never summarised as a complete one.
-fn fleet_probe_summary(report: &ProbeFleetReport, with_cass: usize) -> String {
-    format!(
-        "{} of {} host(s) answered, {} timed out, {} failed, {} with cass installed",
-        report.answered, report.probed, report.timed_out, report.failed, with_cass
-    )
 }
 
 // A consent threshold, not a discovery limit. Never truncate a valid fleet.
@@ -784,13 +754,13 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
             );
         }
         opts.clear_checkpoint()?;
-        return Err(SetupError::NoHosts { probe_report: None });
+        return Err(SetupError::NoHosts);
     }
 
     // =========================================================================
     // Phase 2: Probing
     // =========================================================================
-    let (probed_hosts, probe_report) = if !state.probing_complete {
+    let probed_hosts = if !state.probing_complete {
         check_interrupted()?;
         // Count the current filtered candidates, not raw provider inventory or
         // a cached count. Real runs save discovery but leave probing incomplete
@@ -815,7 +785,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
         };
 
         let progress_clone = progress.clone();
-        let outcomes = probe_hosts_parallel_outcomes(
+        let results = probe_hosts_parallel(
             &discovered_hosts,
             opts.timeout,
             move |completed, total, name| {
@@ -830,46 +800,24 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
             pb.finish_and_clear();
         }
 
-        // Every probed host lands in exactly one bucket: answered, timed out
-        // or failed. Hosts whose transport exceeded the deadline are counted
-        // and named, never dropped, so a partial sweep is distinguishable
-        // from a fleet that answered as a whole.
-        let probe_report = ProbeFleetReport::from_outcomes(&outcomes);
-        let results: Vec<HostProbeResult> =
-            outcomes.into_iter().map(|outcome| outcome.result).collect();
-
         // Deduplicate hosts that resolve to the same machine (multiple SSH aliases)
         let (results, merged_aliases) = deduplicate_probe_results(results);
 
+        let reachable = results.iter().filter(|p| p.reachable).count();
         let with_cass = results
             .iter()
             .filter(|p| p.cass_status.is_installed())
             .count();
 
         state.probed_hosts = results.clone();
-        state.probe_report = Some(probe_report.clone());
         state.probing_complete = true;
         opts.save_checkpoint(&state)?;
 
         if !opts.json {
-            print_phase_done(&fleet_probe_summary(&probe_report, with_cass));
-
-            // Name the hosts whose transport exceeded the deadline: a timed-out
-            // host is not a broken host, and the operator has to be able to
-            // retry it.
-            if probe_report.timed_out > 0 {
-                println!(
-                    "│ {} {} host(s) exceeded the {}s probe timeout: {}",
-                    "⚠".yellow(),
-                    probe_report.timed_out,
-                    opts.timeout,
-                    probe_report.timed_out_hosts.join(", ")
-                );
-                println!(
-                    "│   retry the probe with a longer timeout: cass sources setup --timeout {}",
-                    opts.timeout.saturating_mul(2)
-                );
-            }
+            print_phase_done(&format!(
+                "{} reachable, {} with cass installed",
+                reachable, with_cass
+            ));
 
             // Show merged aliases if any
             if !merged_aliases.is_empty() {
@@ -894,11 +842,9 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
             }
         }
 
-        (results, Some(probe_report))
+        results
     } else {
-        // A resumed run keeps the accounting of the probe that already ran, so
-        // the report stays truthful across the resume boundary.
-        (state.probed_hosts.clone(), state.probe_report.clone())
+        state.probed_hosts.clone()
     };
 
     let reachable_hosts: Vec<_> = probed_hosts.iter().filter(|p| p.reachable).collect();
@@ -906,27 +852,13 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
     if reachable_hosts.is_empty() {
         if !opts.json {
             println!();
-            match probe_report.as_ref() {
-                Some(report) if report.timed_out > 0 => {
-                    println!(
-                        "{}",
-                        format!(
-                            "  No reachable hosts found: {} of {} probed host(s) timed out after {}s. Check SSH connectivity or raise --timeout.",
-                            report.timed_out, report.probed, opts.timeout
-                        )
-                        .yellow()
-                    );
-                }
-                _ => {
-                    println!(
-                        "{}",
-                        "  No reachable hosts found. Check SSH connectivity.".yellow()
-                    );
-                }
-            }
+            println!(
+                "{}",
+                "  No reachable hosts found. Check SSH connectivity.".yellow()
+            );
         }
         opts.clear_checkpoint()?;
-        return Err(SetupError::NoHosts { probe_report });
+        return Err(SetupError::NoHosts);
     }
 
     // =========================================================================
@@ -1049,7 +981,6 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
             total_sessions: 0,
             dry_run: opts.dry_run,
             sync_pending: false,
-            probe_report,
         });
     }
 
@@ -1510,7 +1441,6 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
         total_sessions,
         dry_run: opts.dry_run,
         sync_pending,
-        probe_report,
     })
 }
 
@@ -1794,7 +1724,7 @@ mod tests {
 
     #[test]
     fn test_setup_error_display_no_hosts() {
-        let err = SetupError::NoHosts { probe_report: None };
+        let err = SetupError::NoHosts;
         assert_eq!(format!("{err}"), "No SSH hosts found or selected");
     }
 
@@ -1815,7 +1745,7 @@ mod tests {
     fn test_setup_error_source_is_preserved_as_none() {
         let errors = [
             SetupError::Cancelled,
-            SetupError::NoHosts { probe_report: None },
+            SetupError::NoHosts,
             SetupError::Interrupted,
             SetupError::Io(std::io::Error::other("io")),
             SetupError::Json(serde_json::from_str::<serde_json::Value>("{").unwrap_err()),
@@ -1835,7 +1765,6 @@ mod tests {
             total_sessions: 150,
             dry_run: false,
             sync_pending: false,
-            probe_report: None,
         };
         assert_eq!(result.sources_added, 3);
         assert_eq!(result.hosts_installed, 1);
@@ -1853,50 +1782,9 @@ mod tests {
             total_sessions: 0,
             dry_run: true,
             sync_pending: false,
-            probe_report: None,
         };
         assert!(result.dry_run);
         assert_eq!(result.sources_added, 5);
-    }
-
-    #[test]
-    fn test_fleet_probe_summary_reports_timed_out_hosts() {
-        let report = ProbeFleetReport {
-            probed: 5,
-            answered: 2,
-            timed_out: 2,
-            failed: 1,
-            timed_out_hosts: vec!["slow-a".to_string(), "slow-b".to_string()],
-        };
-        let summary = fleet_probe_summary(&report, 1);
-        assert!(summary.contains("2 of 5 host(s) answered"), "{summary}");
-        assert!(summary.contains("2 timed out"), "{summary}");
-        assert!(summary.contains("1 failed"), "{summary}");
-        assert!(summary.contains("1 with cass installed"), "{summary}");
-    }
-
-    #[test]
-    fn test_setup_state_keeps_probe_report_across_resume() {
-        let state = SetupState {
-            probe_report: Some(ProbeFleetReport {
-                probed: 3,
-                answered: 1,
-                timed_out: 1,
-                failed: 1,
-                timed_out_hosts: vec!["slow".to_string()],
-            }),
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&state).unwrap();
-        let loaded: SetupState = serde_json::from_str(&json).unwrap();
-        assert_eq!(loaded.probe_report, state.probe_report);
-
-        // An older checkpoint without the field loads as "no accounting",
-        // never as "the whole fleet answered".
-        let mut older = serde_json::to_value(SetupState::default()).unwrap();
-        older.as_object_mut().unwrap().remove("probe_report");
-        let loaded: SetupState = serde_json::from_value(older).unwrap();
-        assert!(loaded.probe_report.is_none());
     }
 
     fn make_selected_probe(host_name: &str) -> HostProbeResult {

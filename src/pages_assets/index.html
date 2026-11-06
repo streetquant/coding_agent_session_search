@@ -5,8 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Encrypted cass Archive</title>
 
-    <!-- CSP: No unsafe-inline, no eval. Frame restrictions are supplied by
-         the deployment and service-worker response headers. -->
+    <!-- CSP: No unsafe-inline, no eval -->
     <meta http-equiv="Content-Security-Policy" content="
         default-src 'self';
         script-src 'self' 'wasm-unsafe-eval';
@@ -15,6 +14,7 @@
         connect-src 'self';
         worker-src 'self' blob:;
         object-src 'none';
+        frame-ancestors 'none';
         form-action 'none';
         base-uri 'none';
     ">
@@ -26,7 +26,7 @@
 </head>
 <body>
     <!-- Skip link for keyboard users -->
-    <a href="#app-content" class="skip-link">Skip to main content</a>
+    <a href="#main-content" class="skip-link">Skip to main content</a>
 
     <!-- Screen reader announcer for dynamic content -->
     <div id="sr-announcer" class="visually-hidden" aria-live="polite" aria-atomic="true"></div>
@@ -161,7 +161,7 @@
         </header>
 
         <!-- Main content area (populated by viewer.js) -->
-        <main id="app-content" role="main" aria-label="Archive content">
+        <main id="main-content" role="main" aria-label="Archive content">
             <div class="loading-state" role="status" aria-live="polite">
                 <div class="spinner" aria-hidden="true"></div>
                 <p>Loading database...</p>

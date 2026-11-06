@@ -18,7 +18,6 @@ struct Request {
     db: PathBuf,
     source: Option<String>,
     conversation_id: Option<i64>,
-    message_anchor: Option<String>,
     message_index: usize,
     context: usize,
 }
@@ -275,23 +274,6 @@ fn resolve_snapshot(
                     _ => role,
                 };
                 let content = content.unwrap_or_default();
-                let message_anchor = crate::search::query::message_anchor_for_content(
-                    source_id,
-                    &path,
-                    Some(conversation_id),
-                    Some(anchor.number),
-                    &content,
-                );
-                if anchor.number == request.message_index
-                    && let Some(expected) = request.message_anchor.as_deref()
-                    && message_anchor.as_deref() != Some(expected)
-                {
-                    return Err(error(
-                        CliErrorKind::StaleMessageAnchor.kind_str(),
-                        "The archived message no longer matches this content anchor",
-                        "Re-run search for a current anchor. No target or neighbouring message was emitted.",
-                    ));
-                }
                 retained.admit(role.len().saturating_add(content.len())).map_err(resource_limit)?;
                 Ok(json!({
                     "line": anchor.number,
@@ -301,7 +283,6 @@ fn resolve_snapshot(
                     "message_id": id,
                     "conversation_id": conversation_id,
                     "source_id": source_id,
-                    "message_anchor": message_anchor,
                     "role": role,
                     "content": content,
                     "is_target": anchor.number == request.message_index,
@@ -357,27 +338,6 @@ fn run(
     output_format: Option<RobotFormat>,
     timeout_ms: Option<u64>,
 ) -> CliResult<()> {
-    if request.message_anchor.is_none() {
-        return Err(error(
-            CliErrorKind::InvalidMessageAnchor.kind_str(),
-            "Canonical message targets require a message anchor",
-            "Request message_anchor from search and copy it unchanged with the same source/path/conversation/ordinal tuple.",
-        ));
-    }
-    if let Some(anchor) = request.message_anchor.as_deref()
-        && !anchor.strip_prefix("v1:").is_some_and(|digest| {
-            digest.len() == 64
-                && digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
-    {
-        return Err(error(
-            CliErrorKind::InvalidMessageAnchor.kind_str(),
-            "Message anchor must be v1: followed by 64 lowercase hexadecimal digits",
-            "Copy message_anchor unchanged from the same search hit or pack citation.",
-        ));
-    }
     if let Some(source) = request.source.as_deref() {
         crate::validate_followup_source_id(source, "canonical message lookup")?;
     }
@@ -822,7 +782,6 @@ pub(super) fn run_view(
     output_format: Option<RobotFormat>,
     timeout_ms: Option<u64>,
     message_index: Option<usize>,
-    message_anchor: Option<&str>,
 ) -> CliResult<()> {
     let Some(message_index) = message_index else {
         if window.line.is_some() {
@@ -853,7 +812,6 @@ pub(super) fn run_view(
         db: db_override.unwrap_or_else(crate::default_db_path),
         source: crate::canonical_followup_source_id(source_id),
         conversation_id,
-        message_anchor: message_anchor.map(str::to_owned),
         message_index,
         context: window.context,
     };
@@ -875,7 +833,6 @@ pub(super) fn run_expand(
     output_format: Option<RobotFormat>,
     message_index: Option<usize>,
     conversation_id: Option<i64>,
-    message_anchor: Option<&str>,
 ) -> CliResult<()> {
     let Some(message_index) = message_index else {
         let line = line.ok_or_else(|| {
@@ -913,7 +870,6 @@ pub(super) fn run_expand(
             db: db_override.unwrap_or_else(crate::default_db_path),
             source: crate::canonical_followup_source_id(source_id),
             conversation_id,
-            message_anchor: message_anchor.map(str::to_owned),
             message_index,
             context,
         },

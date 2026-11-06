@@ -122,15 +122,10 @@ class HarnessTests(unittest.TestCase):
             bench.run(self.args(cass=self.service('bad', 'bad_exit')))
 
     def test_startup_transport_errors(self) -> None:
-        for mode in ['wrong_id', 'eof', 'oversized']:
-            with self.subTest(mode=mode), self.assertRaises(RuntimeError):
+        for mode, error in [('wrong_id', RuntimeError), ('eof', RuntimeError),
+                            ('malformed', json.JSONDecodeError), ('oversized', RuntimeError)]:
+            with self.subTest(mode=mode), self.assertRaises(error):
                 bench.Service(self.service(mode, mode), self.index, 2)
-
-    def test_malformed_json_has_bounded_operation_error_and_preserves_cause(self) -> None:
-        with self.assertRaisesRegex(RuntimeError, '^status returned malformed service JSON$') as raised:
-            bench.Service(self.service('malformed', 'malformed'), self.index, 2)
-        self.assertIsInstance(raised.exception.__cause__, json.JSONDecodeError)
-        self.assertNotIn('not json', str(raised.exception))
 
     def test_timeout_kills_and_reaps_child(self) -> None:
         children = []

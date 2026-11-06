@@ -42,10 +42,7 @@ def run_session(args, mode: str, count: int, *, expect_error: bool = False) -> d
     cpu1 = resource.getrusage(resource.RUSAGE_CHILDREN)
     if result.returncode != 0:
         raise RuntimeError(f"{mode}: worker exited {result.returncode}: {result.stderr[-2000:]}")
-    try:
-        replies = [json.loads(line) for line in result.stdout.splitlines()]
-    except json.JSONDecodeError as error:
-        raise RuntimeError(f"{mode}: worker returned malformed service JSON") from error
+    replies = [json.loads(line) for line in result.stdout.splitlines()]
     if len(replies) != len(requests):
         raise RuntimeError(f"{mode}: response count differs from requests")
     for request, reply in zip(requests, replies, strict=True):

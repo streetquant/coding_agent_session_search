@@ -1708,7 +1708,6 @@ fn make_session_hit(
         origin_kind: "local".into(),
         origin_host: None,
         conversation_id: None,
-        message_anchor: None,
     }
 }
 

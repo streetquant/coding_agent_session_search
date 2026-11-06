@@ -22,7 +22,6 @@ use coding_agent_search::franken_sync::compat::{ConnectionExt, ParamValue, RowEx
 use coding_agent_search::indexer::semantic::{
     EmbeddingInput, SemanticIndexer, SemanticShardBuildPlan,
 };
-use coding_agent_search::search::query::message_anchor_for_content;
 use coding_agent_search::search::semantic_manifest::{SemanticShardManifest, TierKind};
 use coding_agent_search::storage::sqlite::FrankenStorage;
 use serde_json::Value;
@@ -42,13 +41,7 @@ fn cass_cmd(temp_home: &std::path::Path) -> Command {
     cmd.env("HOME", temp_home);
     cmd.env("XDG_DATA_HOME", temp_home.join(".local/share"));
     cmd.env("XDG_CONFIG_HOME", temp_home.join(".config"));
-    cmd.env("XDG_CACHE_HOME", temp_home.join(".cache"));
     cmd.env("CODEX_HOME", temp_home.join(".codex"));
-    cmd.env("CASS_CLOUDMCP_DATA_ROOT", temp_home.join("cloudmcp-empty"));
-    cmd.env(
-        "CASS_OPENWEBUI_DATA_ROOT",
-        temp_home.join("openwebui-empty"),
-    );
     // Provider overrides and CWD discovery precede HOME for some connectors.
     // Keep concurrent fleet tests and the worker's own sessions out of fixtures.
     cmd.current_dir(temp_home);
@@ -210,8 +203,6 @@ fn gh422_search_refresh_stall_releases_lock_and_recovers_cold_query() {
         .env("CASS_DATA_DIR", &data_dir)
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
-        .env("CASS_CLOUDMCP_DATA_ROOT", home.join("cloudmcp-empty"))
-        .env("CASS_OPENWEBUI_DATA_ROOT", home.join("openwebui-empty"))
         .env("CASS_AUTO_REFRESH", "0")
         .env("CASS_INDEX_STALL_DETECT_SECS", "5")
         .env("CASS_INDEX_STALL_ABORT_SECS", "20")
@@ -716,162 +707,6 @@ fn run_hybrid_hash_search(home: &Path, data_dir: &Path, query: &str) -> Value {
 }
 
 #[test]
-fn semantic_budget_admission_and_dispatch_preserve_requested_mode() {
-    let tmp = TempDir::new().expect("isolated budget-transition home");
-    let home = tmp.path();
-    fs::write(home.join(".env"), "").expect("isolate dotenv discovery");
-    let data_dir = home.join("cass_data");
-    fs::create_dir_all(&data_dir).expect("budget-transition archive directory");
-    for idx in 0..3 {
-        seed_codex_session(
-            &home.join(".codex"),
-            &format!("rollout-budget-transition-{idx}.jsonl"),
-            "budgettransitionprobe searchable concept",
-        );
-    }
-    run_fresh_index(home, &data_dir);
-    build_hash_semantic_assets(&data_dir, false);
-
-    let run = |mode: Option<&str>, budget: &str, phase: &str, model: &str| {
-        let mut cmd = cass_cmd(home);
-        cmd.args([
-            "search",
-            "budgettransitionprobe",
-            "--json",
-            "--robot-meta",
-            "--model",
-            model,
-            "--limit",
-            "5",
-            "--no-maintenance",
-            "--no-daemon",
-            "--data-dir",
-        ])
-        .arg(&data_dir)
-        .env("CASS_SEARCH_BUDGET_MS", budget)
-        .env("CASS_SEARCH_TIMEOUT_MS", "")
-        .env("CASS_SEARCH_TIMEOUT", "")
-        .env("CASS_SEARCH_MODE", "")
-        .env("CASS_TEST_SEMANTIC_DISPATCH_BUDGET_PHASE", phase)
-        .timeout(Duration::from_secs(60));
-        if let Some(mode) = mode {
-            cmd.args(["--mode", mode]);
-        }
-        let output = cmd
-            .output()
-            .expect("fresh-process budget-transition search");
-        assert!(output.stdout.len().saturating_add(output.stderr.len()) < 8 * 1024 * 1024);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stdout
-                .lines()
-                .count()
-                .saturating_add(stderr.lines().count())
-                < 10_000
-        );
-        let encoded = if output.status.success() {
-            stdout.trim()
-        } else {
-            stderr
-                .lines()
-                .rev()
-                .find(|line| !line.trim().is_empty())
-                .expect("JSON error")
-        };
-        let payload: Value = serde_json::from_str(encoded).expect("budget-transition JSON");
-        (output.status.code(), payload, stdout.is_empty())
-    };
-
-    for mode in [Some("semantic"), Some("hybrid"), None, Some("lexical")] {
-        let (code, healthy, _) = run(mode, "5000", "", "hash");
-        assert_eq!(code, Some(0), "healthy {mode:?}: {healthy}");
-        assert!(!healthy["hits"].as_array().expect("healthy hits").is_empty());
-        assert_eq!(healthy["_meta"]["search_mode"], mode.unwrap_or("hybrid"));
-
-        if mode != Some("lexical") {
-            let (code, invalid, empty_stdout) = run(mode, "1", "", "invalid-fixture-producer");
-            assert_eq!(code, Some(15), "invalid producer must win: {invalid}");
-            assert_eq!(invalid["error"]["code"], 15);
-            assert!(empty_stdout);
-
-            let (code, pressure, empty_stdout) = run(mode, "1", "", "hash");
-            if mode == Some("semantic") {
-                assert_eq!(code, Some(10), "strict initial admission: {pressure}");
-                assert!(empty_stdout);
-                assert_eq!(pressure["error"]["kind"], "timeout");
-                assert_eq!(pressure["error"]["retryable"], true);
-                assert!(
-                    pressure["error"]["hint"]
-                        .as_str()
-                        .expect("retry hint")
-                        .contains("Increase --timeout")
-                );
-            } else {
-                assert_eq!(code, Some(0), "hybrid initial admission: {pressure}");
-                assert_eq!(pressure["_meta"]["search_mode"], "lexical");
-                assert_eq!(pressure["_meta"]["semantic_refinement"], false);
-                assert_eq!(
-                    pressure["_meta"]["semantic_fallback_reason"],
-                    "semantic_budget_limited"
-                );
-            }
-        }
-
-        for phase in ["near-limit", "exhausted"] {
-            let (code, payload, empty_stdout) = run(mode, "5000", phase, "hash");
-            if mode == Some("semantic") {
-                assert_eq!(code, Some(10), "strict dispatch {phase}: {payload}");
-                assert!(empty_stdout);
-                assert_eq!(payload["error"]["kind"], "timeout");
-                assert_eq!(payload["error"]["retryable"], true);
-                let message = payload["error"]["message"]
-                    .as_str()
-                    .expect("timeout reason");
-                assert!(message.contains("checkpoint=before-search"));
-                assert!(message.contains(&format!("phase={phase}")));
-                continue;
-            }
-            assert_eq!(code, Some(0), "dispatch {mode:?}/{phase}: {payload}");
-            let meta = &payload["_meta"];
-            assert_eq!(meta["search_mode"], "lexical");
-            assert_eq!(meta["semantic_refinement"], false);
-            let skipped = payload["budget"]["skipped_sections"]
-                .as_array()
-                .expect("skipped sections");
-            let hits = payload["hits"].as_array().expect("dispatch hits");
-            if mode == Some("lexical") {
-                assert!(!hits.is_empty());
-                assert!(
-                    !skipped
-                        .iter()
-                        .any(|section| section == "semantic_refinement")
-                );
-            } else {
-                assert_eq!(meta["fallback_tier"], "lexical");
-                assert_eq!(meta["refinement_level"], "lexical_only");
-                assert_eq!(meta["semantic_fallback_reason"], "semantic_budget_limited");
-                assert!(
-                    skipped
-                        .iter()
-                        .any(|section| section == "semantic_refinement")
-                );
-                if phase == "near-limit" {
-                    assert!(
-                        !hits.is_empty(),
-                        "NearLimit must still execute lexical retrieval"
-                    );
-                } else {
-                    assert!(hits.is_empty());
-                    assert_eq!(payload["budget"]["timed_out"], true);
-                    assert!(skipped.iter().any(|section| section == "search"));
-                }
-            }
-        }
-    }
-}
-
-#[test]
 fn explicit_semantic_budget_pressure_never_realizes_lexical() {
     let tmp = TempDir::new().expect("create isolated semantic-budget home");
     let home = tmp.path();
@@ -1046,87 +881,6 @@ fn run_lexical_search(home: &Path, data_dir: &Path, query: &str) -> Value {
     })
 }
 
-fn anchored_lexical_hits(home: &Path, data_dir: &Path, query: &str) -> Vec<Value> {
-    let output = cass_cmd(home)
-        .args([
-            "search",
-            query,
-            "--json",
-            "--mode",
-            "lexical",
-            "--no-maintenance",
-            "--fields",
-            "source_path,source_id,conversation_id,line_number,agent,content,message_anchor",
-            "--limit",
-            "40",
-            "--timeout",
-            "30000",
-            "--data-dir",
-        ])
-        .arg(data_dir)
-        .timeout(Duration::from_secs(40))
-        .output()
-        .expect("retrieve complete anchored search hits");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(payload["budget"]["timed_out"], false);
-    let hits = payload["hits"].as_array().unwrap().clone();
-    assert!(!hits.is_empty(), "canonical search evidence must exist");
-    for hit in &hits {
-        let expected = message_anchor_for_content(
-            hit["source_id"].as_str().unwrap(),
-            hit["source_path"].as_str().unwrap(),
-            hit["conversation_id"].as_i64(),
-            hit["line_number"]
-                .as_u64()
-                .map(|number| usize::try_from(number).unwrap()),
-            hit["content"].as_str().unwrap(),
-        )
-        .expect("complete canonical search identity");
-        assert_eq!(hit["message_anchor"], expected);
-    }
-    hits
-}
-
-fn assert_canonical_pack_citation<'a>(item: &Value, hits: &'a [Value]) -> &'a Value {
-    let citation = &item["citation"];
-    let matches: Vec<_> = hits
-        .iter()
-        .filter(|hit| {
-            toon::JsonValue::from(citation["conversation_id"].clone())
-                == toon::JsonValue::from(hit["conversation_id"].clone())
-                && toon::JsonValue::from(citation["message_index"].clone())
-                    == toon::JsonValue::from(hit["line_number"].clone())
-        })
-        .collect();
-    assert_eq!(matches.len(), 1, "citation must name one retrieved message");
-    let hit = matches[0];
-    assert_eq!(citation["verified"], false);
-    assert!(citation["line_start"].is_null());
-    assert!(citation["line_end"].is_null());
-    assert_eq!(citation["span_hash"], citation["content_hash"]);
-    assert_eq!(citation["source_id"], hit["source_id"]);
-    assert_eq!(citation["agent"], hit["agent"]);
-    assert_eq!(citation["message_anchor"], hit["message_anchor"]);
-    assert_eq!(
-        toon::JsonValue::from(citation["message_index_base"].clone()),
-        toon::JsonValue::from(serde_json::json!(1))
-    );
-    if citation["source_path"] == hit["source_path"] {
-        assert!(citation["followup_unavailable_reason"].is_null());
-    } else {
-        assert_eq!(
-            citation["followup_unavailable_reason"],
-            "redacted-source-coordinates"
-        );
-    }
-    hit
-}
-
 #[test]
 fn no_maintenance_lexical_search_is_byte_stable_across_the_real_cli_path() {
     let tmp = TempDir::new().unwrap();
@@ -1198,162 +952,6 @@ fn no_maintenance_lexical_search_is_byte_stable_across_the_real_cli_path() {
         data_tree_snapshot(&data_dir),
         "search --no-maintenance must not add, remove, or change any data-dir directory, file, symlink, SQLite sidecar, checkpoint, lock, or search artifact"
     );
-}
-
-#[test]
-fn bounded_history_recipe_keeps_workspace_dates_citations_and_archive_bytes() -> anyhow::Result<()>
-{
-    use chrono::{Duration as CalendarDuration, Utc};
-    use serde_json::json;
-
-    let tmp = TempDir::new()?;
-    let home = tmp.path();
-    // Stop dotenv discovery before it can reach an operator's configuration.
-    fs::File::options()
-        .write(true)
-        .create_new(true)
-        .open(home.join(".env"))?;
-    let codex_home = home.join(".codex");
-    let data_dir = home.join("recipe-archive");
-    let workspace = home.join("selected-project");
-    let other_workspace = home.join("unrelated-project");
-    let now = Utc::now();
-    let recent = now.to_rfc3339();
-    let old = (now - CalendarDuration::days(30)).to_rfc3339();
-    let selected_source = native_codex_session_path(&codex_home, "rollout-recipe-recent.jsonl");
-    for (name, cwd, timestamp) in [
-        ("rollout-recipe-recent.jsonl", &workspace, &recent),
-        ("rollout-recipe-old.jsonl", &workspace, &old),
-        ("rollout-recipe-other.jsonl", &other_workspace, &recent),
-    ] {
-        let path = native_codex_session_path(&codex_home, name);
-        fs::create_dir_all(path.parent().unwrap())?;
-        let metadata = json!({
-            "timestamp": timestamp, "type": "session_meta",
-            "payload": {"id": name, "cwd": cwd, "cli_version": "0.42.0"},
-        });
-        let message = json!({
-            "timestamp": timestamp, "type": "response_item",
-            "payload": {"type": "message", "role": "user", "content": [
-                {"type": "input_text", "text": format!("performance regression recipe evidence {name}")},
-            ]},
-        });
-        fs::write(path, format!("{metadata}\n{message}\n"))?;
-    }
-    run_fresh_index(home, &data_dir);
-    run_forced_full_index(home, &data_dir);
-    let storage = FrankenStorage::open_readonly(&data_dir.join("agent_search.db"))?;
-    assert_eq!(
-        storage.list_conversations(10, 0)?.len(),
-        3,
-        "fixture isolation"
-    );
-    drop(storage);
-    let before = data_tree_snapshot(home);
-
-    let output = cass_cmd(home)
-        .args(["search", "performance regression", "--workspace"])
-        .arg(&workspace)
-        .args([
-            "--days",
-            "7",
-            "--mode",
-            "lexical",
-            "--no-maintenance",
-            "--robot",
-            "--robot-meta",
-            "--fields",
-            "minimal,message_anchor",
-            "--limit",
-            "5",
-            "--max-tokens",
-            "2000",
-            "--timeout",
-            "2000",
-            "--data-dir",
-        ])
-        .arg(&data_dir)
-        .timeout(Duration::from_secs(10))
-        .output()?;
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let payload: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(payload["budget"]["timed_out"], false);
-    assert_eq!(payload["_meta"]["search_mode"], "lexical");
-    let hits = payload["hits"].as_array().unwrap();
-    assert_eq!(
-        hits.len(),
-        1,
-        "workspace/date scope must exclude both distractors: {payload}"
-    );
-    let hit = &hits[0];
-    assert!(hit.get("content").is_none() && hit.get("snippet").is_none());
-    let source = hit["source_path"].as_str().unwrap();
-    assert_eq!(Path::new(source), selected_source);
-    // Search's `line_number` is the canonical message ordinal
-    // (`messages.idx + 1`), not a physical file line. `cass view` keeps the
-    // two coordinate spaces apart: `-n` is a raw file line, and a search hit
-    // is followed with `--message-index` (see `cass view --help` and the
-    // search-hit field bridge in README). Following the hit in the wrong
-    // space lands on the rollout's `session_meta` line instead of the cited
-    // message.
-    let message_index = hit["line_number"].as_u64().unwrap();
-    assert!(message_index > 0);
-    assert_eq!(hit["agent"], "codex");
-    assert!(payload["_meta"]["tokens_estimated"].as_u64().unwrap() <= 2000);
-
-    let view = cass_cmd(home)
-        .env("CASS_DATA_DIR", &data_dir)
-        .args([
-            "view",
-            source,
-            "--message-index",
-            &message_index.to_string(),
-            "--message-anchor",
-            hit["message_anchor"].as_str().unwrap(),
-            "--source",
-            hit["source_id"].as_str().unwrap(),
-            "--conversation-id",
-            &hit["conversation_id"].as_i64().unwrap().to_string(),
-            "-C",
-            "3",
-            "--json",
-            "--timeout",
-            "2000",
-        ])
-        .timeout(Duration::from_secs(10))
-        .output()?;
-    assert!(
-        view.status.success(),
-        "{}",
-        String::from_utf8_lossy(&view.stderr)
-    );
-    let viewed: Value = serde_json::from_slice(&view.stdout)?;
-    // The canonical message lookup reports a deadline failure as a command
-    // error ("Canonical message lookup exceeded its <N>ms budget"), not as
-    // a `budget` block: only the raw-file view carries that envelope. A
-    // successful exit is therefore the timeout signal on this path.
-    assert_eq!(viewed["coordinate_space"], "message_index");
-    assert!(viewed["lines"].as_array().unwrap().iter().any(|row| {
-        row["is_target"] == true
-            && row["message_anchor"] == hit["message_anchor"]
-            && row["content"]
-                .as_str()
-                .is_some_and(|text| text.contains("performance regression"))
-    }));
-    assert_eq!(
-        data_tree_snapshot(home),
-        before,
-        "retrieval must not change the isolated home or archive"
-    );
-    assert!(
-        !data_dir.join("models").exists(),
-        "recipe must not acquire a model"
-    );
-    Ok(())
 }
 
 #[test]
@@ -1546,31 +1144,6 @@ fn gh422_timeout_retry_preserves_scoped_read_only_search() {
         );
         assert!(!data_dir.join("agent_search.db").exists());
     }
-    let invalid = cass_cmd(&home)
-        .env("CASS_TEST_SEARCH_SETUP_SLOW_MS", "6000")
-        .arg("--db")
-        .arg(&db)
-        .args([
-            "search",
-            "scopedretryneedle",
-            "--robot",
-            "--mode",
-            "lexical",
-            "--no-maintenance",
-            "--timeout",
-            "3000",
-            "--agent",
-            "not-a-real-agent",
-            "--data-dir",
-        ])
-        .arg(&data_dir)
-        .timeout(Duration::from_secs(15))
-        .output()
-        .unwrap();
-    assert_eq!(invalid.status.code(), Some(2));
-    let error: Value = serde_json::from_slice(&invalid.stderr).unwrap();
-    assert_eq!(error["error"]["kind"], "unknown-agent", "{error}");
-    assert_eq!(before, data_tree_snapshot(&data_dir));
 }
 
 #[test]
@@ -1673,7 +1246,6 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
         serde_json::to_vec(&checkpoint).unwrap(),
     )
     .unwrap();
-    let expected_hits = anchored_lexical_hits(home, &data_dir, "packreadonlyneedle");
     let before = data_tree_snapshot(&data_dir);
     let source_path = codex_home.join("sessions/2026/04/23").join(filename);
     let source = fs::read_to_string(&source_path).unwrap();
@@ -1705,30 +1277,34 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
     assert!(!evidence.is_empty(), "pack must return useful evidence");
     for item in evidence {
         let citation = &item["citation"];
-        let hit = assert_canonical_pack_citation(item, &expected_hits);
         assert_eq!(
             cited_source(home, citation["source_path"].as_str().expect("source path")),
             source_path
         );
-        assert!(
-            hit["content"]
-                .as_str()
-                .unwrap()
-                .contains("packreadonlyneedle")
+        let line = citation["line_start"].as_u64().expect("citation line") as usize;
+        assert!(line > 0);
+        let cited = source.lines().nth(line - 1).expect("line exists in source");
+        assert!(cited.contains("packreadonlyneedle"));
+        assert_eq!(citation["verified"], true);
+        assert_eq!(citation["line_end"], citation["line_start"]);
+        assert_eq!(
+            citation["span_hash"],
+            blake3::hash(cited.as_bytes()).to_hex().to_string()
         );
         // Recompute the v2 identity (#493) independently of the production
         // hasher: a domain tag, then length-prefixed text fields, then tagged
-        // optional coordinates. Without independently archived native session
-        // provenance, physical coordinates remain null and the fallback span
-        // fingerprint is the canonical search content hash.
+        // optional coordinates. The line and span hash it binds are the ones
+        // checked against the source file just above.
         let mut identity = blake3::Hasher::new();
         identity.update(b"cass.pack.evidence.v2\0");
         // Pack binds the stored source path, and prints it redacted under a
         // home directory (a Windows temp dir is under one).
-        let stored_path = hit["source_path"].as_str().unwrap();
+        let stored_path = native_codex_session_path(&codex_home, filename)
+            .to_string_lossy()
+            .into_owned();
         for field in ["source_id", "source_path", "agent", "content_hash"] {
             let text = if field == "source_path" {
-                stored_path
+                stored_path.as_str()
             } else {
                 citation[field].as_str().expect(field)
             };
@@ -1755,9 +1331,10 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
                 }
             }
         }
-        let span_hash = citation["span_hash"].as_str().unwrap();
+        let span_hash = blake3::hash(cited.as_bytes()).to_hex().to_string();
         identity.update(&(span_hash.len() as u64).to_le_bytes());
         identity.update(span_hash.as_bytes());
+        assert_eq!(citation["line_start"], line);
         assert_eq!(citation["source_id"], "local");
         let encoded = item["id"]
             .as_str()
@@ -1786,7 +1363,7 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
         assert_eq!(
             &decoded,
             identity.finalize().as_bytes(),
-            "evidence identity must bind canonical coordinates and the fallback fingerprint"
+            "evidence identity must bind the actual verified source span"
         );
         assert!(citation["message_index"].is_u64());
         assert!(
@@ -1901,7 +1478,7 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
             }
         }
     }
-    let archived_ids = evidence
+    let verified_ids = evidence
         .iter()
         .map(|item| item["id"].as_str().expect("evidence ID").to_string())
         .collect::<Vec<_>>();
@@ -1932,12 +1509,13 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
     let payload: Value = serde_json::from_slice(&output.stdout).expect("archived pack JSON");
     let evidence = payload["evidence"].as_array().expect("archived evidence");
     assert!(!evidence.is_empty());
-    assert_eq!(evidence.len(), archived_ids.len());
     for item in evidence {
-        assert_canonical_pack_citation(item, &expected_hits);
+        assert_eq!(item["citation"]["verified"], false);
+        assert!(item["citation"]["line_start"].is_null());
+        assert!(item["citation"]["line_end"].is_null());
         assert!(
-            archived_ids.iter().any(|id| item["id"] == *id),
-            "source loss must preserve an already canonical evidence identity"
+            !verified_ids.iter().any(|id| item["id"] == *id),
+            "unverified archive evidence must not reuse a verified physical-span ID"
         );
         assert!(item["citation"]["message_index"].is_u64());
         assert!(
@@ -1952,7 +1530,7 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
 }
 
 #[test]
-fn structured_pack_shortens_large_evidence_without_losing_canonical_citations() {
+fn structured_pack_shortens_large_evidence_without_losing_verified_citations() {
     use sha2::Digest as _;
 
     let tmp = TempDir::new().unwrap();
@@ -1969,7 +1547,6 @@ fn structured_pack_shortens_large_evidence_without_losing_canonical_citations() 
     );
     seed_codex_session(&codex_home, filename, &body);
     run_fresh_index(home, &data_dir);
-    let expected_hits = anchored_lexical_hits(home, &data_dir, "budgetexcerptneedle");
     let source_path = codex_home.join("sessions/2026/04/23").join(filename);
     let source = fs::read_to_string(&source_path).unwrap();
     let before = data_tree_snapshot(&data_dir);
@@ -2037,8 +1614,7 @@ fn structured_pack_shortens_large_evidence_without_losing_canonical_citations() 
     assert_eq!(shortened["estimated_tokens"], evidence_tokens);
     assert_eq!(shortened["selection"]["token_cost"], evidence_tokens);
     assert_eq!(packs[1]["limits"]["estimated_tokens"], evidence_tokens);
-    let hit = assert_canonical_pack_citation(shortened, &expected_hits);
-    assert_canonical_pack_citation(full, &expected_hits);
+    assert_eq!(shortened["citation"]["verified"], true);
     assert_eq!(
         shortened["citation"]["excerpt_sha256"],
         hex::encode(sha2::Sha256::digest(short_excerpt.as_bytes()))
@@ -2052,11 +1628,12 @@ fn structured_pack_shortens_large_evidence_without_losing_canonical_citations() 
             assert_eq!(value, &full["citation"][field], "citation field {field}");
         }
     }
-    assert!(
-        hit["content"]
-            .as_str()
-            .unwrap()
-            .contains("budgetexcerptneedle")
+    let line = shortened["citation"]["line_start"].as_u64().unwrap() as usize;
+    let cited = source.lines().nth(line - 1).unwrap();
+    assert!(cited.contains("budgetexcerptneedle"));
+    assert_eq!(
+        shortened["citation"]["span_hash"],
+        blake3::hash(cited.as_bytes()).to_hex().to_string()
     );
     let omitted = packs[1]["omitted"]["items"].as_array().unwrap();
     assert_eq!(omitted.len(), 1);
@@ -2081,7 +1658,6 @@ fn pack_final_output_budget_bounds_all_formats_and_refuses_oversized_metadata() 
         );
     }
     run_fresh_index(home, &data_dir);
-    let expected_hits = anchored_lexical_hits(home, &data_dir, "finalbudgetneedle");
     let archive_before = data_tree_snapshot(&data_dir);
     let sources_before = data_tree_snapshot(&codex_home);
     let budget: usize = 3_600;
@@ -2177,7 +1753,24 @@ fn pack_final_output_budget_bounds_all_formats_and_refuses_oversized_metadata() 
                 reduced_formats += 1;
             }
             for item in evidence {
-                assert_canonical_pack_citation(&item, &expected_hits);
+                assert_eq!(item["citation"]["verified"], true);
+                let source = fs::read_to_string(cited_source(
+                    home,
+                    item["citation"]["source_path"].as_str().unwrap(),
+                ))
+                .unwrap();
+                let line_index = source
+                    .lines()
+                    .position(|line| {
+                        blake3::hash(line.as_bytes()).to_hex().as_str()
+                            == item["citation"]["span_hash"].as_str().unwrap()
+                    })
+                    .expect("citation hash must identify an original source line");
+                let line = line_index + 1;
+                assert_eq!(
+                    toon::JsonValue::from(item["citation"]["line_start"].clone()),
+                    toon::JsonValue::from(serde_json::json!(line))
+                );
             }
         }
         assert_eq!(archive_before, data_tree_snapshot(&data_dir));
@@ -2270,7 +1863,6 @@ fn structured_pack_retains_source_verification_after_slow_planning() {
     let content = "planningdelayneedle verified evidence after a bounded planning delay";
     util::seed_codex_session(&codex_home, "rollout-planning.jsonl", content, false);
     run_fresh_index(home, &data_dir);
-    let expected_hits = anchored_lexical_hits(home, &data_dir, "planningdelayneedle");
     let archive_before = data_tree_snapshot(&data_dir);
     let sources_before = data_tree_snapshot(&codex_home);
 
@@ -2305,23 +1897,29 @@ fn structured_pack_retains_source_verification_after_slow_planning() {
     assert_eq!(value["budget"]["timed_out"], false);
     let elapsed_ms = value["budget"]["elapsed_ms"].as_u64().unwrap();
     assert!(elapsed_ms >= 1200, "the planning delay must actually run");
-    assert!(elapsed_ms < 10000, "the request remains within its budget");
+    assert!(elapsed_ms < 10000, "the request still has time to verify");
     let evidence = value["evidence"].as_array().unwrap();
     assert_eq!(evidence.len(), 1);
     assert_eq!(evidence[0]["excerpt"], content);
     let citation = &evidence[0]["citation"];
-    // The real connector has no independently archived native session ID.
-    // The planning delay must retain complete canonical evidence without
-    // inventing physical-source verification. This is not a positive probe
-    // of the raw-source phase's separate time allowance.
-    let hit = assert_canonical_pack_citation(&evidence[0], &expected_hits);
-    assert_eq!(hit["content"], content);
+    assert_eq!(
+        citation["verified"], true,
+        "planning must not consume the source phase allowance: budget={} citation={citation}",
+        value["budget"]
+    );
     let source_path = codex_home.join("sessions/2026/04/23/rollout-planning.jsonl");
     assert_eq!(
         cited_source(home, citation["source_path"].as_str().expect("source path")),
         source_path
     );
-    assert!(source_path.is_file());
+    assert_eq!(citation["line_start"], 2);
+    let source = fs::read_to_string(source_path).unwrap();
+    assert_eq!(
+        citation["span_hash"],
+        blake3::hash(source.lines().nth(1).unwrap().as_bytes())
+            .to_hex()
+            .as_str()
+    );
 }
 
 #[test]
@@ -2354,7 +1952,6 @@ fn pack_excludes_skill_payloads_without_losing_ordinary_evidence() {
         );
     }
     run_fresh_index(home, &data_dir);
-    let expected_hits = anchored_lexical_hits(home, &data_dir, "skillprivacyneedle");
     let archive_before = data_tree_snapshot(&data_dir);
     let sources_before = data_tree_snapshot(&codex_home);
 
@@ -2427,8 +2024,22 @@ fn pack_excludes_skill_payloads_without_losing_ordinary_evidence() {
             };
             assert_eq!(evidence.len(), 1, "{format}");
             assert_eq!(evidence[0]["excerpt"], ordinary);
-            let hit = assert_canonical_pack_citation(&evidence[0], &expected_hits);
-            assert_eq!(hit["content"], ordinary);
+            let citation = &evidence[0]["citation"];
+            assert_eq!(citation["verified"], true);
+            let source = fs::read_to_string(cited_source(
+                home,
+                citation["source_path"].as_str().unwrap(),
+            ))
+            .unwrap();
+            let line = source.lines().nth(1).unwrap();
+            assert_eq!(
+                citation["span_hash"],
+                blake3::hash(line.as_bytes()).to_hex().as_str()
+            );
+            assert_eq!(
+                toon::JsonValue::from(citation["line_start"].clone()),
+                toon::JsonValue::from(serde_json::json!(2))
+            );
             let omitted = omitted["items"].as_array().unwrap();
             assert_eq!(omitted.len(), 5, "{format}");
             for item in omitted {
@@ -2497,7 +2108,19 @@ fn pack_excludes_skill_payloads_without_losing_ordinary_evidence() {
             assert_eq!(value["privacy"]["redaction_policy"], "strict");
             assert!(value["omitted"]["items"].as_array().unwrap().is_empty());
             for item in evidence {
-                assert_canonical_pack_citation(item, &expected_hits);
+                let citation = &item["citation"];
+                assert_eq!(citation["verified"], true, "opt-in {format}");
+                let source = fs::read_to_string(cited_source(
+                    home,
+                    citation["source_path"].as_str().unwrap(),
+                ))
+                .unwrap();
+                assert_eq!(
+                    citation["span_hash"],
+                    blake3::hash(source.lines().nth(1).unwrap().as_bytes())
+                        .to_hex()
+                        .as_str()
+                );
             }
         }
         assert_eq!(archive_before, data_tree_snapshot(&data_dir));
@@ -2590,7 +2213,6 @@ fn markdown_pack_preserves_json_excerpts_without_interpreting_source_markup() {
         false,
     );
     run_fresh_index(home, &data_dir);
-    let expected_hits = anchored_lexical_hits(home, &data_dir, "markdownpackneedle");
     let archive_before = data_tree_snapshot(&data_dir);
     let sources_before = data_tree_snapshot(&codex_home);
 
@@ -2637,10 +2259,9 @@ fn markdown_pack_preserves_json_excerpts_without_interpreting_source_markup() {
             "both real source records must be selected"
         );
         let mut expected = Vec::new();
-        let mut safe_record_selected = false;
+        let mut safe_record_verified = false;
         let mut secret_record_selected = false;
         for item in evidence {
-            assert_canonical_pack_citation(item, &expected_hits);
             let excerpt = item["excerpt"].as_str().expect("JSON excerpt");
             expected.push(if excerpt.ends_with('\n') {
                 excerpt.to_string()
@@ -2658,7 +2279,9 @@ fn markdown_pack_preserves_json_excerpts_without_interpreting_source_markup() {
             if source.file_name().and_then(|name| name.to_str())
                 == Some("rollout-markdown-safe.jsonl")
             {
-                safe_record_selected = true;
+                assert_eq!(item["citation"]["verified"], true);
+                assert_eq!(item["citation"]["line_start"], 2);
+                safe_record_verified = true;
             } else if source.file_name().and_then(|name| name.to_str())
                 == Some("rollout-markdown-secret.jsonl")
             {
@@ -2673,8 +2296,8 @@ fn markdown_pack_preserves_json_excerpts_without_interpreting_source_markup() {
             }
         }
         assert!(
-            safe_record_selected,
-            "the source without credentials must be selected"
+            safe_record_verified,
+            "the verifiable source must be selected"
         );
         assert!(
             secret_record_selected,

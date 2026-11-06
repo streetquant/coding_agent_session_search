@@ -363,10 +363,6 @@ struct Session {
     canonical_read_attempts: u64,
     canonical_reads_completed: u64,
     client: Option<SearchClient>,
-    /// MANIFEST slot read beside the snapshot open (mknmt): anything but
-    /// `Current` means the pinned snapshot is older than the newest publish.
-    manifest_source: Option<QuillManifestSource>,
-    snapshot_manifest_source: Option<&'static str>,
     // Declaration/drop order matters: reader destruction precedes lease release.
     reader_lease: Option<admission::Lease>,
     admission_pool: Option<admission::Pool>,
@@ -392,8 +388,6 @@ impl Session {
             canonical_read_attempts: 0,
             canonical_reads_completed: 0,
             client: None,
-            manifest_source: None,
-            snapshot_manifest_source: None,
             reader_lease: None,
             admission_pool: None,
             open_attempts: 0,
@@ -412,11 +406,7 @@ impl Session {
             };
             self.open_attempts = self.open_attempts.saturating_add(1);
             let client = open_snapshot(&self.index)?;
-            let manifest_source = client.lexical_manifest_source()?;
             self.successful_opens = self.successful_opens.saturating_add(1);
-            self.manifest_source =
-                searchable_index_live_docs(&self.index).map(|live| live.manifest_source);
-            self.snapshot_manifest_source = manifest_source;
             self.client = Some(client);
             self.manifest_source =
                 searchable_index_live_docs(&self.index).map(|live| live.manifest_source);
@@ -440,8 +430,6 @@ impl Session {
         self.refiner.unload();
         self.semantic.unload();
         drop(self.client.take());
-        self.manifest_source = None;
-        self.snapshot_manifest_source = None;
         drop(self.reader_lease.take());
         self.manifest_source = None;
     }
@@ -475,8 +463,6 @@ impl Session {
             "successful_opens": self.successful_opens,
             "queries_completed": self.queries_completed,
             "snapshot_policy": "pinned_until_reload",
-            "manifest_source": self.manifest_source.map(QuillManifestSource::as_str),
-            "snapshot_manifest_source": self.snapshot_manifest_source,
             "freshness": "not_checked",
             "manifest_source": self.manifest_source.map(QuillManifestSource::as_str),
             "canonical_view_enabled": self.archive.is_some(),

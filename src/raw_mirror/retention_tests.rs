@@ -72,7 +72,7 @@ fn eighty_index_intervals_have_bounded_growth_and_readable_latest_snapshots() {
     }
     let final_report = maintain(&fixture.data, &fixture.policy(), 10_000).unwrap();
     assert_eq!(retired + final_report.retired_manifests, 78);
-    assert_eq!(collect_prune_manifests(&raw_mirror_root(&fixture.data), RawMirrorPruneLimits::default()).unwrap().len(), 2);
+    assert_eq!(collect_prune_manifests(&raw_mirror_root(&fixture.data)).unwrap().len(), 2);
     assert_eq!(fixture.bytes(records.last().unwrap()), bytes);
     assert!(fixture.exists(&records[78]));
     assert!(!fixture.exists(&records[0]));
@@ -171,7 +171,7 @@ fn active_index_lease_prevents_automatic_retention() {
     fixture.record(b"one\ntwo\nthree\n", 3);
     let lease = try_acquire_index_run_lock_for_prune(&fixture.data).unwrap();
     assert!(maintain(&fixture.data, &fixture.policy(), 1000).is_err());
-    assert_eq!(collect_prune_manifests(&raw_mirror_root(&fixture.data), RawMirrorPruneLimits::default()).unwrap().len(), 3);
+    assert_eq!(collect_prune_manifests(&raw_mirror_root(&fixture.data)).unwrap().len(), 3);
     drop(lease);
     assert_eq!(maintain(&fixture.data, &fixture.policy(), 1000).unwrap().retired_manifests, 1);
 }

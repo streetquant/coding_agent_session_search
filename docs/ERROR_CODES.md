@@ -8,37 +8,10 @@
 > by the process exit code plus the kebab-case `err.kind` in the JSON error
 > envelope. The exit codes are listed by `cass robot-docs exit-codes` and
 > under `exit_codes` in `cass capabilities --json`; the kind vocabulary (about
-> 93 values) lives in `src/model/cli_error_kind.rs`. Branch on `err.kind`,
+> 90 values) lives in `src/model/cli_error_kind.rs`. Branch on `err.kind`,
 > never on an `E` code.
 
 This document describes the Pages export error cases and provides guidance for resolution.
-
-## CLI Error Kinds That Need An External Tool
-
-Two cass error kinds are produced by code paths that need the external
-`sqlite3` command-line tool. Both name the missing tool instead of failing
-with a bare spawn error, and neither runs on a healthy archive.
-
-### `schema-repair-required`
-
-**Exit code**: 7
-
-**Cause**: The archive's `sqlite_master` carries duplicate `fts_messages`
-virtual-table rows, a legacy shape frankensqlite refuses to open. Ordinary
-cass surfaces (health, status, search, index) never repair it, so they report
-this kind and leave the archive byte-identical.
-
-**Resolution**: Run `cass doctor --fix`. The doctor owns the mutation lock and
-performs the repair, then the archive opens normally again. The repair needs
-the external `sqlite3` tool because frankensqlite cannot open the conflicting
-catalog to repair it; a host without that tool gets a typed missing-tool
-message naming it.
-
-### `storage`
-
-The `storage` kind also covers the historical-bundle salvage path, which uses
-the `sqlite3` CLI's `.recover` when frankensqlite cannot open a damaged
-bundle. A host without the tool gets the same typed missing-tool message.
 
 ## Error Code Format
 

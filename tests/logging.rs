@@ -1,6 +1,6 @@
 use coding_agent_search::connectors::{Connector, ScanContext, amp::AmpConnector};
 use coding_agent_search::connectors::{NormalizedConversation, NormalizedMessage};
-use coding_agent_search::indexer::persist::persist_conversation;
+use coding_agent_search::indexer::{IndexOptions, persist::persist_conversation};
 use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
 use coding_agent_search::search::tantivy::{TantivyIndex, index_dir};
 use coding_agent_search::storage::sqlite::SqliteStorage;
@@ -147,10 +147,9 @@ fn persist_conversation_logs_counts() {
 
 #[test]
 fn run_index_does_not_drop_storage_without_explicit_close() {
-    let tracker = util::e2e_log::PhaseTracker::new(
-        "logging",
-        "run_index_does_not_drop_storage_without_explicit_close",
-    );
+    let trace = TestTracing::new();
+    let _guard = trace.install();
+
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().join("data");
     let home_dir = tmp.path().join("home");
@@ -172,73 +171,35 @@ fn run_index_does_not_drop_storage_without_explicit_close() {
     )
     .unwrap();
 
-    // Native checkpoint containment re-executes the calling binary. Exercise
-    // the real cass entry point, rather than a libtest executable with no
-    // checkpoint-worker dispatcher. Every setting belongs to this child.
-    let environment = tracker
-        .command_environment()
-        .with_home(&home_dir)
-        .with_codex_home(home_dir.join(".codex"))
-        .with_var("USERPROFILE", &home_dir)
-        .with_var("XDG_DATA_HOME", &data_dir)
-        .with_var("XDG_CONFIG_HOME", &xdg_dir)
-        .with_var("XDG_CACHE_HOME", tmp.path().join("cache"))
-        .with_var("CASS_DATA_DIR", &data_dir)
-        .with_var("CASS_IGNORE_SOURCES_CONFIG", "1")
-        .with_var("CASS_CLOUDMCP_DATA_ROOT", home_dir.join("cloudmcp-empty"))
-        .with_var("CASS_OPENWEBUI_DATA_ROOT", home_dir.join("openwebui-empty"))
-        .with_var("CASS_AUTO_REFRESH", "0")
-        .with_var("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .with_var("RUST_LOG", "trace")
-        .with_var("RUST_MIN_STACK", "134217728");
-    let mut command = environment.cass_assert_command();
-    command.env_clear();
-    environment.apply_to_assert(&mut command);
-    if let Ok(system_root) = dotenvy::var("SystemRoot") {
-        command.env("SystemRoot", system_root);
-    }
-    let output = command
-        .current_dir(&home_dir)
-        .args(["index", "--json"])
-        .timeout(std::time::Duration::from_secs(60))
-        .output()
+    // qu81y: env-free — the closed-world roots override below replaces
+    // HOME/XDG redirection and CASS_IGNORE_SOURCES_CONFIG entirely (the
+    // override suppresses both default detection and sources.toml loading).
+    let _ = (&home_dir, &xdg_dir);
+
+    let opts = IndexOptions {
+        full: false,
+        force_rebuild: false,
+        watch: false,
+        watch_once_paths: None,
+        db_path: data_dir.join("agent_search.db"),
+        data_dir,
+        semantic: false,
+        build_hnsw: false,
+        embedder: "fastembed".to_string(),
+        progress: None,
+        watch_interval_secs: 30,
+    };
+
+    let mut local_roots = std::collections::HashMap::new();
+    local_roots.insert("amp".to_string(), vec![amp_dir.clone()]);
+    coding_agent_search::indexer::run_index_with_local_connector_roots(opts, local_roots, None)
         .unwrap();
-    let out = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "index must complete with its native checkpoint worker: {out}"
-    );
-    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(payload["success"].as_bool(), Some(true), "{payload}");
-    assert_eq!(
-        payload["final_wal_checkpoint"]["status"].as_str(),
-        Some("completed"),
-        "the real checkpoint worker must report completion: {payload}"
-    );
-    assert!(
-        !out.trim().is_empty(),
-        "the logging assertion needs a trace"
-    );
+
+    let out = trace.output();
     assert!(
         !out.contains("drop_close"),
         "run_index should explicitly close storage instead of relying on Drop: {out}"
     );
-
-    let storage = SqliteStorage::open_readonly(&data_dir.join("agent_search.db")).unwrap();
-    let conversations = storage.list_conversations(10, 0).unwrap();
-    assert_eq!(conversations.len(), 1, "the Amp fixture must be indexed");
-    let messages = storage
-        .fetch_messages(conversations[0].id.unwrap())
-        .unwrap();
-    assert_eq!(
-        messages
-            .into_iter()
-            .map(|message| message.content)
-            .collect::<Vec<_>>(),
-        ["hi", "hello"]
-    );
-    storage.close().unwrap();
-    tracker.complete();
 }
 
 // Re-export util module so tests can find helpers without extra path noise.

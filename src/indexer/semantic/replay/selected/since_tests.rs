@@ -188,18 +188,11 @@ fn catch_up_missing_parent_rejects_the_batch_before_returning_cursor_progress() 
 #[test]
 fn negative_raw_message_ids_keep_progress_even_when_projection_skips_them() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let storage = fixture(temp.path(), 1, 0)?;
-    let parent: i64 = storage.raw().query_row_map(
-        "SELECT id FROM conversations WHERE external_id = ?1",
-        &[ParamValue::from("selected-0")],
-        |row| row.get_typed(0),
-    )?;
-    // Seed the unusual ID before any tail or analytics row can reference it.
+    let storage = fixture(temp.path(), 1, 1)?;
+    let row = coordinates(&storage)?[0];
     storage.raw().execute_compat(
-        "INSERT INTO messages(id, conversation_id, idx, role, author, created_at, content, extra_json)
-         VALUES (-5, ?1, 0, 'user', 'fixture', 1700000000000,
-                 'parent 0 message 0: compiler ownership 東京', '{\"raw_only\":\"not a semantic projection\"}')",
-        &[ParamValue::from(parent)],
+        "UPDATE messages SET id = -5 WHERE id = ?1",
+        &[ParamValue::from(row.0)],
     )?;
     let actual = packet_embedding_inputs_from_storage_since(&storage, i64::MIN)?;
     assert!(actual.inputs.is_empty());

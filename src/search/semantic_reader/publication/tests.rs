@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::search::semantic_manifest::{
     SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION, SemanticArtifactValidationEvidence,
-    SemanticExpectedCurrentV1, SemanticGenerationPurpose, SemanticGenerationStatus,
-    SemanticGenerationTopology, SemanticProducerAttestation,
+    SemanticExpectedCurrentV1, SemanticGenerationStatus, SemanticGenerationTopology,
+    SemanticProducerAttestation,
 };
 use crate::search::semantic_reader::{SemanticResultPhase, SemanticShardExpectation};
 use crate::search::vector_index::{ROLE_USER, SemanticDocId};
@@ -23,7 +23,6 @@ use frankensearch::core::{
     EmbeddingProducerAttestationV1, EmbeddingSpaceIdentityV1, EmbeddingSpaceKindV1,
     GoldenVectorCertificateV1, VECTOR_STORAGE_IDENTITY_SCHEMA_V1, VectorStorageIdentityV1,
 };
-use frankensearch::index::VectorIndex;
 use sha2::{Digest, Sha256};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -192,7 +191,7 @@ fn fixture(
             vector_slot_count: witness.record_count,
             live_vector_count: witness.live_count,
             tombstone_vector_count: witness.tombstone_count,
-            seal: SemanticArtifactSealStateV1::Vector { wal_entry_count: 0 },
+            wal_entry_count: 0,
             generation_corpus_sha256: digest(b"source-corpus"),
             covered_live_docset_sha256: hex::encode(witness.ordered_live_docset_digest),
             covered_content_sha256: content,
@@ -204,7 +203,6 @@ fn fixture(
             artifact_sha256: validation.artifact_sha256.clone(),
             size_bytes: validation.size_bytes,
             artifact_format: "fsvi-v2".into(),
-            fsvi_generation: Some(binding.generation()),
             artifact_parameters_sha256: digest(b"fsvi-v2-f16-fixture"),
             embedding_identity: binding.frozen_identity().clone(),
             ann_base: None,
@@ -213,7 +211,7 @@ fn fixture(
             vector_slot_count: validation.vector_slot_count,
             live_vector_count: validation.live_vector_count,
             tombstone_vector_count: validation.tombstone_vector_count,
-            seal: SemanticArtifactSealStateV1::Vector { wal_entry_count: 0 },
+            wal_entry_count: 0,
             generation_corpus_sha256: validation.generation_corpus_sha256.clone(),
             covered_live_docset_sha256: validation.covered_live_docset_sha256.clone(),
             covered_content_sha256: validation.covered_content_sha256.clone(),
@@ -240,7 +238,6 @@ fn fixture(
     };
     let manifest = SemanticGenerationManifestV1 {
         schema_version: SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION,
-        purpose: SemanticGenerationPurpose::Semantic,
         generation_id: name.into(),
         build_id: format!("build-{name}"),
         request_id: None,
@@ -594,118 +591,6 @@ fn source_identity_and_declared_budget_are_mandatory_admission_gates() -> TestRe
 }
 
 #[test]
-fn fsvi_v2_requires_a_valid_manifest_generation_without_header_discovery() -> TestResult {
-    let root = tempfile::tempdir()?;
-    let original = fixture(root.path(), "gen-missing-identity", 1, Some(A), None);
-    for generation in [
-        None,
-        Some(ArtifactGenerationIdentityV1 {
-            nonce: [0; 16],
-            ..binding(SemanticArtifactRole::FastVector, 1).generation()
-        }),
-        Some(ArtifactGenerationIdentityV1 {
-            schema_version: u16::MAX,
-            ..binding(SemanticArtifactRole::FastVector, 1).generation()
-        }),
-    ] {
-        let mut manifest = original.clone();
-        manifest.artifacts[0].fsvi_generation = generation;
-        assert!(matches!(
-            manifest.validate(),
-            Err(SemanticGenerationError::InvalidManifest {
-                class: crate::search::semantic_manifest::SemanticManifestInvariantClass::Identity,
-                ..
-            })
-        ));
-    }
-    Ok(())
-}
-
-#[test]
-fn forged_manifest_generation_cannot_borrow_an_unchanged_vector_image() -> TestResult {
-    for forged in [
-        ArtifactGenerationIdentityV1::new(2, [42; 16])?,
-        ArtifactGenerationIdentityV1::new(1, [43; 16])?,
-    ] {
-        let root = tempfile::tempdir()?;
-        let mut manifest = fixture(root.path(), "gen-forged-identity", 1, Some(A), None);
-        let digest_before = manifest.sha256()?;
-        let path = manifest
-            .generation_dir(root.path())?
-            .join(&manifest.artifacts[0].relative_path);
-        let bytes_before = fs::read(&path)?;
-        manifest.artifacts[0].fsvi_generation = Some(forged);
-        manifest.validate()?;
-        assert_ne!(manifest.sha256()?, digest_before);
-        assert!(matches!(
-            manifest.write_immutable(root.path()),
-            Err(SemanticGenerationError::ArtifactAdmission { .. })
-        ));
-        fs::write(
-            manifest.manifest_path(root.path())?,
-            manifest.canonical_bytes()?,
-        )?;
-        let pointer = SemanticCurrentPointerV1::for_manifest(&manifest, 41, 1)?;
-        fs::write(
-            SemanticCurrentPointerV1::path(root.path()),
-            pointer.canonical_bytes()?,
-        )?;
-        assert!(matches!(
-            SelectedSemanticGeneration::open_current(
-                root.path(),
-                &manifest.corpus,
-                SemanticSelectionBudget::default(),
-            ),
-            Err(SemanticSelectionError::Admission {
-                role: SemanticArtifactRole::FastVector,
-                ..
-            })
-        ));
-        assert_eq!(fs::read(path)?, bytes_before);
-    }
-    Ok(())
-}
-
-#[test]
-fn selected_owner_admission_does_not_touch_vector_access_time() -> TestResult {
-    use std::fs::{File, FileTimes};
-    use std::io::Read;
-    use std::time::UNIX_EPOCH;
-
-    let root = tempfile::tempdir()?;
-    let manifest = fixture(root.path(), "gen-preserve-atime", 1, Some(A), None);
-    select(root.path(), &manifest, None);
-    // Prove this filesystem exposes an ordinary-read atime change first.
-    let canary = root.path().join("ordinary-read-atime-canary");
-    fs::write(&canary, b"canary")?;
-    let mut canary_file = File::open(&canary)?;
-    canary_file.set_times(FileTimes::new().set_accessed(UNIX_EPOCH))?;
-    let mut byte = [0];
-    canary_file.read_exact(&mut byte)?;
-    if canary_file.metadata()?.accessed()? == UNIX_EPOCH {
-        eprintln!("atime regression not exercised: filesystem ignores ordinary-read atime");
-        return Ok(());
-    }
-
-    let vector = manifest
-        .generation_dir(root.path())?
-        .join(&manifest.artifacts[0].relative_path);
-    File::open(&vector)?.set_times(FileTimes::new().set_accessed(UNIX_EPOCH))?;
-    let before = fs::metadata(&vector)?;
-    let reader = SelectedSemanticGeneration::open_current(
-        root.path(),
-        &manifest.corpus,
-        SemanticSelectionBudget::default(),
-    )?;
-    assert_eq!(first_id(&reader.activate(&queries())?.search(1, None)?), 1);
-    let after = fs::metadata(&vector)?;
-    assert_eq!(after.accessed()?, before.accessed()?);
-    assert_eq!(after.modified()?, before.modified()?);
-    assert_eq!(after.len(), before.len());
-    Ok(())
-}
-
-#[test]
 fn manifest_consistent_but_false_vector_counts_are_refused() -> TestResult {
     let root = tempfile::tempdir()?;
     let mut m = fixture(root.path(), "gen-false-count", 1, Some(A), None);
@@ -716,28 +601,8 @@ fn manifest_consistent_but_false_vector_counts_are_refused() -> TestResult {
     a.validation.tombstone_vector_count += 1;
     m.total_vector_slot_count_across_tiers += 1;
     m.total_tombstone_vector_count_across_tiers += 1;
-    assert!(matches!(
-        m.write_immutable(root.path()),
-        Err(SemanticGenerationError::ArtifactWitnessMismatch {
-            field: "vector_slot_count",
-            ..
-        })
-    ));
-    // An external producer can bypass CASS sealing. Exercise reader admission
-    // against that exact boundary rather than weakening the production sealer.
-    fs::write(m.manifest_path(root.path())?, m.canonical_bytes()?)?;
-    let pointer = SemanticCurrentPointerV1::for_manifest(&m, 41, 1)?;
-    fs::write(
-        SemanticCurrentPointerV1::path(root.path()),
-        pointer.canonical_bytes()?,
-    )?;
-    assert!(matches!(
-        load_current_semantic_generation(root.path(), Some(&m.corpus)),
-        Err(SemanticGenerationError::ArtifactWitnessMismatch {
-            field: "vector_slot_count",
-            ..
-        })
-    ));
+    select(root.path(), &m, None);
+    load_current_semantic_generation(root.path(), Some(&m.corpus))?;
     assert!(matches!(
         SelectedSemanticGeneration::open_current(
             root.path(),
@@ -760,19 +625,7 @@ fn manifest_consistent_but_false_docset_is_refused() -> TestResult {
     m.corpus.ordered_live_docset_sha256 = wrong.clone();
     m.artifacts[0].covered_live_docset_sha256 = wrong.clone();
     m.artifacts[0].validation.covered_live_docset_sha256 = wrong;
-    assert!(matches!(
-        m.write_immutable(root.path()),
-        Err(SemanticGenerationError::ArtifactWitnessMismatch {
-            field: "covered_live_docset_sha256",
-            ..
-        })
-    ));
-    fs::write(m.manifest_path(root.path())?, m.canonical_bytes()?)?;
-    let pointer = SemanticCurrentPointerV1::for_manifest(&m, 41, 1)?;
-    fs::write(
-        SemanticCurrentPointerV1::path(root.path()),
-        pointer.canonical_bytes()?,
-    )?;
+    select(root.path(), &m, None);
     assert!(matches!(
         SelectedSemanticGeneration::open_current(
             root.path(),
@@ -1038,7 +891,6 @@ fn attach_native_graph(
     let graph = ValidatedNativeHnsw::build(owner, params, 17).unwrap();
     let receipt = graph.save(&directory.join(&relative_path)).unwrap();
     let artifact = native_ann_artifact(&base, &receipt, &relative_path, 25).unwrap();
-    assert!(artifact.fsvi_generation.is_none());
     manifest.artifacts.push(artifact);
     manifest.artifacts.sort_by_key(|artifact| artifact.role);
     manifest.validate().unwrap();
@@ -1138,21 +990,6 @@ fn native_ann_artifact_builder_refuses_foreign_bases_and_unsafe_paths() -> TestR
         native_ann_artifact(foreign, &receipt, "fast_vector/selected.fshnsw", 25),
         Err(NativeAnnArtifactError::ReceiptMismatch)
     ));
-    let mut forged = base.clone();
-    forged.fsvi_generation = Some(ArtifactGenerationIdentityV1::new(2, [42; 16])?);
-    assert!(matches!(
-        native_ann_artifact(&forged, &receipt, "fast_vector/selected.fshnsw", 25),
-        Err(NativeAnnArtifactError::ReceiptMismatch)
-    ));
-    let mut mislabeled_ann = a.clone();
-    mislabeled_ann.artifacts[1].fsvi_generation = base.fsvi_generation;
-    assert!(matches!(
-        mislabeled_ann.validate(),
-        Err(SemanticGenerationError::InvalidManifest {
-            class: crate::search::semantic_manifest::SemanticManifestInvariantClass::AnnBinding,
-            ..
-        })
-    ));
     for path in [
         "../selected.fshnsw",
         "/selected.fshnsw",
@@ -1250,28 +1087,7 @@ fn receipt_fingerprint_is_selected_by_the_manifest_not_inferred_from_disk() -> T
     artifact.artifact_parameters_sha256 = digest(b"another-receipt");
     artifact.ann_base.as_mut().unwrap().parameters_sha256 =
         artifact.artifact_parameters_sha256.clone();
-    assert!(matches!(
-        m.write_immutable(root.path()),
-        Err(SemanticGenerationError::ArtifactWitnessMismatch {
-            role: SemanticArtifactRole::FastAnn,
-            field: "native ANN receipt binding",
-        })
-    ));
-    // Challenge the independent serving boundary with an externally forged
-    // selection; the production sealer must not accept this fixture.
-    fs::write(m.manifest_path(root.path())?, m.canonical_bytes()?)?;
-    let pointer = SemanticCurrentPointerV1::for_manifest(&m, 41, 1)?;
-    assert!(matches!(
-        pointer.publish_atomic(root.path(), &SemanticExpectedCurrentV1::Absent),
-        Err(SemanticGenerationError::ArtifactWitnessMismatch {
-            role: SemanticArtifactRole::FastAnn,
-            ..
-        })
-    ));
-    fs::write(
-        SemanticCurrentPointerV1::path(root.path()),
-        pointer.canonical_bytes()?,
-    )?;
+    select(root.path(), &m, None);
     let before = snapshot(root.path());
     let reader = open(root.path(), &m).with_ann(AnnAdmissionBudget::default())?;
     let batch = native_batch(&reader);
@@ -1282,174 +1098,6 @@ fn receipt_fingerprint_is_selected_by_the_manifest_not_inferred_from_disk() -> T
     );
     assert_eq!(first_id(&batch), 1);
     assert_eq!(snapshot(root.path()), before);
-    Ok(())
-}
-
-#[test]
-fn native_receipt_audits_refuse_invalid_sidecars_without_repair() -> TestResult {
-    use crate::search::semantic_manifest::resolve_semantic_generation_disk_state;
-    use std::error::Error;
-    use std::os::unix::fs::symlink;
-
-    for case in [
-        "malformed",
-        "missing",
-        "oversized",
-        "foreign",
-        "symlink",
-        "hardlink",
-    ] {
-        let root = tempfile::tempdir()?;
-        let mut m = fixture(root.path(), "gen-ann-receipt-audit", 1, Some(A), None);
-        attach_native_graph(root.path(), &mut m, SemanticArtifactRole::FastVector, 1);
-        let current = select(root.path(), &m, None);
-        let graph = m.generation_dir(root.path())?.join(
-            &m.artifact(SemanticArtifactRole::FastAnn)
-                .unwrap()
-                .relative_path,
-        );
-        let receipt_path = native_hnsw_generation_receipt_path(&graph)?;
-        match case {
-            "malformed" => fs::write(&receipt_path, b"not a native receipt")?,
-            "missing" => fs::rename(&receipt_path, receipt_path.with_extension("preserved"))?,
-            "oversized" => fs::write(&receipt_path, vec![0; 64 * 1024 + 1])?,
-            "foreign" => {
-                let mut other = fixture(root.path(), "gen-foreign-receipt", 2, Some(B), None);
-                let receipt = attach_native_graph(
-                    root.path(),
-                    &mut other,
-                    SemanticArtifactRole::FastVector,
-                    2,
-                );
-                fs::write(&receipt_path, receipt.to_bytes()?)?;
-            }
-            "symlink" => {
-                let saved = receipt_path.with_extension("preserved");
-                fs::rename(&receipt_path, &saved)?;
-                symlink(saved.file_name().unwrap(), &receipt_path)?;
-            }
-            "hardlink" => fs::hard_link(&receipt_path, receipt_path.with_extension("alias"))?,
-            _ => unreachable!(),
-        }
-        let before = snapshot(root.path());
-        let assert_rejected = |error: SemanticGenerationError| {
-            match case {
-                "malformed" => {
-                    assert!(matches!(
-                        error,
-                        SemanticGenerationError::AnnReceiptAdmission { .. }
-                    ));
-                    assert!(error.source().is_some());
-                    assert_eq!(error.reason_code(), "semantic_ann_receipt_corrupt");
-                }
-                "foreign" => assert!(matches!(
-                    error,
-                    SemanticGenerationError::ArtifactWitnessMismatch {
-                        role: SemanticArtifactRole::FastAnn,
-                        field: "native ANN receipt binding",
-                    }
-                )),
-                _ => assert!(matches!(
-                    error,
-                    SemanticGenerationError::ArtifactIo {
-                        role: SemanticArtifactRole::FastAnn,
-                        ..
-                    }
-                )),
-            }
-            assert!(!error.to_string().contains(root.path().to_str().unwrap()));
-            assert!(error.to_string().len() < 256);
-            assert_eq!(
-                error.recovery_action(),
-                crate::search::semantic_manifest::SemanticGenerationRecoveryAction::RollbackOrReindex,
-            );
-        };
-        assert_rejected(m.write_immutable(root.path()).unwrap_err());
-        let next = SemanticCurrentPointerV1::for_manifest(&m, 42, 2)?;
-        assert_rejected(
-            next.publish_atomic(root.path(), &SemanticExpectedCurrentV1::exact(&current))
-                .unwrap_err(),
-        );
-        assert_rejected(
-            load_current_semantic_generation(root.path(), Some(&m.corpus)).unwrap_err(),
-        );
-        assert_rejected(
-            resolve_semantic_generation_disk_state(root.path(), Some(&m.corpus)).unwrap_err(),
-        );
-        assert_eq!(
-            snapshot(root.path()),
-            before,
-            "{case} inspection changed files"
-        );
-    }
-    Ok(())
-}
-
-#[test]
-fn native_receipt_full_audits_preserve_graph_and_receipt_access_times() -> TestResult {
-    use crate::search::semantic_manifest::resolve_semantic_generation_disk_state;
-    use std::fs::{File, FileTimes};
-    use std::io::Read;
-    use std::time::UNIX_EPOCH;
-
-    let root = tempfile::tempdir()?;
-    let mut m = fixture(root.path(), "gen-ann-atime-audit", 1, Some(A), None);
-    attach_native_graph(root.path(), &mut m, SemanticArtifactRole::FastVector, 1);
-    let directory = m.generation_dir(root.path())?;
-    let graph = directory.join(
-        &m.artifact(SemanticArtifactRole::FastAnn)
-            .unwrap()
-            .relative_path,
-    );
-    let receipt = native_hnsw_generation_receipt_path(&graph)?;
-    let vector = directory.join(
-        &m.artifact(SemanticArtifactRole::FastVector)
-            .unwrap()
-            .relative_path,
-    );
-    let mut control = File::open(&receipt)?;
-    control.set_times(FileTimes::new().set_accessed(UNIX_EPOCH))?;
-    control.read_exact(&mut [0; 1])?;
-    if control.metadata()?.accessed()? == UNIX_EPOCH {
-        eprintln!("native receipt atime control not exercised: filesystem ignores read atime");
-        return Ok(());
-    }
-    let paths = [vector, graph, receipt];
-    let before: Vec<_> = paths
-        .iter()
-        .map(|path| {
-            let file = File::open(path)?;
-            file.set_times(FileTimes::new().set_accessed(UNIX_EPOCH))?;
-            file.metadata()
-        })
-        .collect::<std::io::Result<_>>()?;
-    let assert_preserved = |step| -> TestResult {
-        for (path, before) in paths.iter().zip(&before) {
-            let after = fs::metadata(path)?;
-            assert_eq!(
-                after.accessed()?,
-                before.accessed()?,
-                "{step} changed atime"
-            );
-            assert_eq!(
-                after.modified()?,
-                before.modified()?,
-                "{step} changed mtime"
-            );
-            assert_eq!(after.len(), before.len(), "{step} changed length");
-        }
-        Ok(())
-    };
-    m.write_immutable(root.path())?;
-    assert_preserved("sealing")?;
-    SemanticCurrentPointerV1::for_manifest(&m, 41, 1)?
-        .publish_atomic(root.path(), &SemanticExpectedCurrentV1::Absent)?;
-    assert_preserved("pointer publication")?;
-    load_current_semantic_generation(root.path(), Some(&m.corpus))?;
-    assert_preserved("selected-generation load")?;
-    resolve_semantic_generation_disk_state(root.path(), Some(&m.corpus))?;
-    assert_preserved("readiness audit")?;
-    eprintln!("native receipt atime control exercised: four audit paths preserved metadata");
     Ok(())
 }
 

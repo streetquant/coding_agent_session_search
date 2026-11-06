@@ -1,9 +1,2 @@
 # Generated validation binaries are not build inputs.
 .gate-bin/
-
-# Host-local diagnostics and agent state are not compilation or test inputs.
-/.local-state/
-/.integration/
-/.ai-bridge/
-/.rch/
-/test-results/

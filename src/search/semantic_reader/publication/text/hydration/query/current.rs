@@ -233,7 +233,7 @@ impl RefillState {
 
 fn verify_pass(
     batch: &SemanticSearchBatch,
-    transaction: &dyn SemanticReadSnapshot,
+    transaction: &Transaction<'_>,
     projection: PassageProjection,
     work: &mut Work,
     state: &mut RefillState,
@@ -311,7 +311,7 @@ fn verify_pass(
 
 fn refill<B: BatchSource>(
     request: &CurrentTextQuery<'_>,
-    transaction: &dyn SemanticReadSnapshot,
+    transaction: &Transaction<'_>,
     mut work: Work,
     retrieve: impl Fn(&dyn SearchFilter) -> SemanticReaderResult<B>,
 ) -> Result<CurrentSemanticBatch<B>, CurrentSearchError> {
@@ -326,7 +326,7 @@ fn refill<B: BatchSource>(
 // neither a new phase nor successful source verification renews any allowance.
 fn refill_accounted<B: BatchSource>(
     request: &CurrentTextQuery<'_>,
-    transaction: &dyn SemanticReadSnapshot,
+    transaction: &Transaction<'_>,
     work: &mut Work,
     state: &mut RefillState,
     mut retrieve: impl FnMut(&Excluding<'_>) -> SemanticReaderResult<B>,
@@ -388,7 +388,7 @@ impl SemanticGenerationReader {
     pub fn search_current_text_in_transaction(
         &self,
         request: CurrentTextQuery<'_>,
-        transaction: &dyn SemanticReadSnapshot,
+        transaction: &Transaction<'_>,
     ) -> Result<CurrentSemanticBatch<SemanticSearchBatch>, CurrentSearchError> {
         let work = request.admit()?;
         let cached = CachedProducers::new(request.text, request.producers);
@@ -405,7 +405,7 @@ impl SelectedSemanticGeneration {
     pub fn search_current_text_in_transaction(
         &self,
         request: CurrentTextQuery<'_>,
-        transaction: &dyn SemanticReadSnapshot,
+        transaction: &Transaction<'_>,
     ) -> Result<CurrentSemanticBatch<SelectedSemanticBatch>, CurrentSearchError> {
         let work = request.admit()?;
         let cached = CachedProducers::new(request.text, request.producers);

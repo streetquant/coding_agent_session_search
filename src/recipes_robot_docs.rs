@@ -50,47 +50,9 @@ session-history analysis. Every command here is read-only or backup-gated.
   * Prefer the tool's own guidance: follow `next_command`,
     `recommended_action`, and `recommended_commands[]` from `cass triage --json`
     / `cass status --json` instead of hand-rolled repair rituals.
-  * Keep every probe bounded. Read-only does not imply cheap or fast on a large
-    archive. Give readiness diagnostics a caller-side deadline and record a
-    timeout as incomplete evidence, not a reason to loop indefinitely.
-
-## 0. Quick history questions — scoped retrieval first
-
-For a history summary, start with a specific query, one workspace and a small
-recent result page. Do not begin with fleet preflight, indexing or broad
-aggregates. Hybrid remains the product default; explicit lexical mode keeps
-this workflow out of semantic inference.
-
-    cass --version
-    cass search --help
-    cass search "performance regression" --workspace /path/to/project --days 7 \
-      --mode lexical --no-maintenance --robot --robot-meta --fields minimal \
-      --limit 5 --max-tokens 2000 --timeout 2000
-
-Check the interface once per installed version. These retrieval flags are
-available in 0.8.0. If --no-maintenance is unsupported, report the version
-mismatch; never silently remove the read-only constraint. A maintenance-required
-response ends this retrieval attempt; review any repair as a separate task.
-Do not install models or run index/repair to answer a quick history question.
-
---timeout is in milliseconds. Also impose a caller-side wall-clock deadline
-(for example, GNU timeout 10s). External exit 124 means an incomplete attempt;
-interrupted stdout may not be valid JSON. Even after exit 0, inspect
-budget.timed_out: timed-out empty hits do not prove that history is absent.
-
---max-tokens is a soft estimate for the hit page, excluding the response
-envelope and robot metadata. It is not a hard output, CPU or memory limit.
-Check total output size before including it in a prompt.
-
-Expand only a useful hit using its exact source_path and line_number:
-
-    cass view /path/to/session.jsonl -n 42 -C 3 --json --timeout 2000
-
-Context lines are not a byte limit: one JSONL record can be large. Preserve
-source/line citations in the summary. Broaden dates or terms deliberately after
-a completed query; choose hybrid/semantic only when conceptual retrieval is
-needed and its cost is acceptable. Use readiness commands to diagnose readiness,
-not as an unconditional prelude to retrieval.
+  * Keep every probe bounded. `cass status --json` / `cass health --json` /
+    `cass doctor --check --json` are read-only and finish within a few seconds;
+    treat a stall as a finding, not a reason to wait indefinitely.
 
 ## 1. Stale vs missing vs archive-risk — decision tree
 

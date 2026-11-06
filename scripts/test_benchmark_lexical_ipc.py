@@ -8,7 +8,6 @@ import sys
 import tempfile
 import unittest
 
-import benchmark_lexical_ipc as benchmark
 import test_cass_lexical_ipc as guards
 
 MODULE_PATH = guards.MODULE_PATH
@@ -95,36 +94,6 @@ class BenchmarkTests(unittest.TestCase):
         result, evidence = self.benchmark()
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(evidence.exists())
-
-    def test_timeout_terminates_owned_worker_descendants(self):
-        descendant_pid = self.home / "descendant.pid"
-        child = (
-            "import os,pathlib,time; "
-            f"pathlib.Path({str(descendant_pid)!r}).write_text(str(os.getpid())); "
-            "time.sleep(60)"
-        )
-        parent = (
-            "import subprocess,sys,time; "
-            f"subprocess.Popen([sys.executable, '-c', {child!r}]); "
-            "time.sleep(60)"
-        )
-        with self.assertRaises(benchmark.ipc.Failure) as raised:
-            benchmark.run_client([sys.executable, "-c", parent], 1)
-        self.assertEqual(raised.exception.kind, "timeout")
-        self.assertTrue(descendant_pid.exists(), "descendant must start before timeout")
-        pid = int(descendant_pid.read_text())
-        # A terminated orphan may remain a zombie until the host reaper runs.
-        status = Path(f"/proc/{pid}/stat")
-        for _ in range(100):
-            try:
-                state = status.read_text().rsplit(")", 1)[1].split()[0]
-            except FileNotFoundError:
-                break
-            if state == "Z":
-                break
-            benchmark.time.sleep(0.01)
-        else:
-            self.fail("benchmark cleanup left its descendant running")
 
     def test_benchmark_refuses_forged_reuse_on_fresh_admission(self):
         self.mode("forged_reuse")

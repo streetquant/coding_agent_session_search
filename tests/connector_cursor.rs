@@ -1,5 +1,5 @@
 use coding_agent_search::connectors::cursor::CursorConnector;
-use coding_agent_search::connectors::{Connector, NormalizedConversation, ScanContext, ScanRoot};
+use coding_agent_search::connectors::{Connector, NormalizedConversation, ScanContext};
 use coding_agent_search::franken_sync::Connection as FrankenConnection;
 use coding_agent_search::franken_sync::compat::ConnectionExt;
 use serde::Deserialize;
@@ -7,13 +7,6 @@ use serde_json::json;
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
-
-#[test]
-fn public_cursor_connector_preserves_registry_construction_surface() {
-    let _unit_constructed = CursorConnector;
-    let _constructed = CursorConnector::new();
-    let _app_support = CursorConnector::app_support_dir();
-}
 
 // ============================================================================
 // Helper
@@ -415,11 +408,7 @@ fn scan_finds_workspace_storage_dbs() {
 fn scan_empty_dir_returns_empty() {
     let tmp = TempDir::new().unwrap();
     let connector = CursorConnector::new();
-    let ctx = ScanContext::with_roots(
-        tmp.path().to_path_buf(),
-        vec![ScanRoot::local(tmp.path().to_path_buf())],
-        None,
-    );
+    let ctx = ScanContext::local_default(tmp.path().to_path_buf(), None);
     let convs = connector.scan(&ctx).unwrap();
     assert!(convs.is_empty());
 }
