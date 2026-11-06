@@ -7,7 +7,11 @@ import {
   waitForPageReady,
 } from "../setup/test-utils";
 
-/** Read computed fenced-code style and WCAG contrast in the browser. */
+/**
+ * Runs in the page (self-contained): the computed text style of a fenced
+ * code block and the WCAG contrast of its text over its `pre` background.
+ * Colors go through a canvas so oklch() and rgb() compare alike.
+ */
 function readCodeBlock(code: Element) {
   const pre = code.closest("pre") ?? code;
   const own = window.getComputedStyle(code);
@@ -211,7 +215,11 @@ test.describe("CDN Fallback - Network Blocking", () => {
     expect(legibility.backgroundColor).not.toBe("");
     expect(legibility.fontFamily).not.toBe("");
 
-    // A missing fenced block must fail; dark and light themes both stay readable.
+    // README "Graceful Degradation": without Prism's theme, fenced code must
+    // still read as code in both themes. `pre` keeps a near-black background in
+    // the light theme too, so code that fell back to the light theme's
+    // foreground would be dark on dark. The basic export's fixture holds rust
+    // and typescript fences, so a missing block fails instead of skipping.
     const fencedCode = page.locator('pre > code[class*="language-"]').first();
     await fencedCode.scrollIntoViewIfNeeded();
     await expect(fencedCode).toBeVisible();

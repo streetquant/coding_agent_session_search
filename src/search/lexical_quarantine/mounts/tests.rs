@@ -87,6 +87,13 @@ fn empty_truncated_or_malformed_tables_never_mean_no_mounts() {
         b"1 1 8:1 / /data/\0 rw - ext4 disk rw\n",
         b"1 1 8:1 / / rw - ext4 disk\n",
         b"1 1 8:1 / / rw - ext4 disk rw trailing\n",
+        // Only the exact kernel-object root shape `<name>:[<digits>]` is a
+        // non-path root; lookalikes stay malformed.
+        b"1 1 0:5 net:[] /run/netns/x rw - nsfs nsfs rw\n",
+        b"1 1 0:5 net:[12a] /run/netns/x rw - nsfs nsfs rw\n",
+        b"1 1 0:5 :[1] /run/netns/x rw - nsfs nsfs rw\n",
+        b"1 1 0:5 Net:[1] /run/netns/x rw - nsfs nsfs rw\n",
+        b"1 1 0:5 net:[1 /run/netns/x rw - nsfs nsfs rw\n",
     ] {
         let error = check_reader(Cursor::new(invalid_table), root, &mut budget()).unwrap_err();
         assert_eq!(
@@ -97,80 +104,26 @@ fn empty_truncated_or_malformed_tables_never_mean_no_mounts() {
     }
 }
 
-/// The kernel publishes a path root for ordinary filesystems and a
-/// `<name>:[<inode>]` token for a pseudo filesystem that has no path root,
-/// for example a container network-namespace bind mount. A container host
-/// publishes the token form, so refusing it refused the whole table and
-/// disabled quarantine retention everywhere on that host.
+/// A real Docker host's mountinfo (rch worker vmi1149989, 2026-10-22) has an
+/// nsfs line whose root is a kernel object, not a path. Rejecting it refused
+/// quarantine retention on every Docker or `ip netns` host. The table must
+/// parse, and a bundle that contains the namespace mount is still refused.
 #[test]
-fn a_pseudo_filesystem_root_does_not_refuse_the_whole_mount_table() -> Result<(), String> {
-    let root = Path::new("/data/.lexical-rebuild-quarantine-000001");
-
+fn kernel_object_roots_such_as_docker_netns_parse_and_still_detect_mount_points() {
     let mut bytes = b"1 1 8:1 / / rw - ext4 /dev/test rw\n".to_vec();
     bytes.extend_from_slice(
-        b"1205 27 0:4 net:[4026531833] /run/docker/netns/default rw shared:1081 - nsfs nsfs rw\n",
+        b"297 31 0:5 net:[4026531833] /run/docker/netns/default rw shared:358 - nsfs nsfs rw\n",
     );
-    if let Err(error) = check_reader(Cursor::new(bytes), root, &mut budget()) {
-        return Err(format!(
-            "a pseudo-filesystem root refused the table: {error}"
-        ));
-    }
-
-    // The root form does not weaken the boundary: a pseudo filesystem mounted
-    // inside the bundle is still refused for its mount point.
-    refuse_for_the_mount_point(root, b"/data/.lexical-rebuild-quarantine-000001")?;
-    refuse_for_the_mount_point(root, b"/data/.lexical-rebuild-quarantine-000001/index")?;
-
-    // A root that is neither an absolute path nor a well-formed token stays
-    // malformed, and the whole table is refused.
-    let mut accepted = None;
-    for invalid_root in [
-        b"relative".as_slice(),
-        b"net:[abc]".as_slice(),
-        b"net:[]".as_slice(),
-        b"net:[4026531833".as_slice(),
-        b"net:4026531833]".as_slice(),
-        b"net:[4026531833]x".as_slice(),
-        b"net:[4026531833]]".as_slice(),
-        b"[:4026531833]".as_slice(),
-        b"net[4026531833]".as_slice(),
-    ] {
-        let mut bytes = b"1 1 8:1 / / rw - ext4 /dev/test rw\n".to_vec();
-        bytes.extend_from_slice(b"1205 27 0:4 ");
-        bytes.extend_from_slice(invalid_root);
-        bytes.extend_from_slice(b" /elsewhere rw shared:1081 - nsfs nsfs rw\n");
-        match check_reader(Cursor::new(bytes), root, &mut budget()) {
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => {}
-            _ => {
-                accepted = Some(invalid_root);
-                break;
-            }
-        }
-    }
-    if let Some(invalid_root) = accepted {
-        return Err(format!(
-            "a malformed root was accepted: {}",
-            String::from_utf8_lossy(invalid_root)
-        ));
-    }
-    Ok(())
-}
-
-/// A pseudo-filesystem root whose mount point lies inside the bundle must
-/// still be refused, and the refusal must keep its mount-point reason.
-fn refuse_for_the_mount_point(root: &Path, point: &[u8]) -> Result<(), String> {
-    let mut inside = b"1205 27 0:4 net:[4026531833] ".to_vec();
-    inside.extend_from_slice(point);
-    inside.extend_from_slice(b" rw shared:1081 - nsfs nsfs rw\n");
-    let error = check_reader(Cursor::new(inside), root, &mut budget()).unwrap_err();
-    if error.to_string().contains("mount point") {
-        Ok(())
-    } else {
-        Err(format!(
-            "{} was not refused as a mount point: {error}",
-            String::from_utf8_lossy(point)
-        ))
-    }
+    check_reader(
+        Cursor::new(&bytes),
+        Path::new("/data/.lexical-rebuild-quarantine-000001"),
+        &mut budget(),
+    )
+    .unwrap();
+    let error =
+        check_reader(Cursor::new(&bytes), Path::new("/run/docker"), &mut budget()).unwrap_err();
+    assert_ne!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    assert!(error.to_string().contains("mount point"), "{error}");
 }
 
 struct Counted<R> {

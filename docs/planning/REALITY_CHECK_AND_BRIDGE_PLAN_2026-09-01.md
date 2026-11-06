@@ -1,4 +1,1535 @@
-# Reality Check and Bridge Plan — refreshed 2026-10-14
+# Reality Check and Bridge Plan — refreshed 2026-11-04
+
+## Assessment: 2026-11-04 (ChartreuseOwl)
+
+**Verdict: CASS is a substantial working history-search product, but it is not
+finished or release-qualified.** The lexical user journey works on the released
+binary. Main contains important fixes and real implementations, while dependable
+large-archive operation, complete semantic lifecycle integration, and current
+cross-platform delivery remain unfinished. Counting closed beads cannot establish
+those outcomes.
+
+This assessment supersedes yesterday's conclusions where current evidence differs.
+In particular, the parse-error repair and background semantic catch-up have landed;
+fourteen ANN tests were ignored rather than repaired; and the actual CASS DSR build
+route has **two healthy builders**, despite failures in the default host inventory.
+The starting revision also failed to compile. A concurrent commit corrected that
+borrow error, and substantial lexical-recovery work landed during this assessment.
+Those revisions must be distinguished rather than combined into one green claim.
+
+### Source and evidence boundaries
+
+- Read in full: suite `/data/projects/AGENTS.md` (663 lines), project `AGENTS.md`
+  (1,388), and `README.md` (3,957 initially, plus all 72 incoming lines). Reviewed
+  the current bridge assessment, original design/semantic/Pages plans, current
+  semantic/publication/service contracts, answer-pack matrix, doctor release
+  checklist, source implementations and named tests. The historical plan archive
+  is context, not a current acceptance certificate; this is not a claim to have
+  executed every scenario or read every historical plan line.
+- Initial clean tracked source: `2ef2af1aaae176845559d5a4547adea8f3afc641`, 854
+  commits after `v0.10.0`. During the check main advanced through `60a55b5a`
+  (watermark borrow fix), `e5a2e9e1` (memory-reserve diagnostics) and `9aa9065f`
+  (lexical recovery), `aa4f5d45` (documentation), then `c507db8b` (bind recovery
+  to the exact writer-admitted generation), 861 commits after the release.
+  Package version remains `0.10.0`.
+- A later fetch found five more commits through
+  `7e18249689c2cb4b62a6b0b3b6e86134b1724593`: streamed replay persistence,
+  passive lexical freshness/cache authority, V24 canonical mutation tracking,
+  coverage-certificate/CAS primitives, and journal-guided replay selection.
+  Reviewed their commit evidence, all additional README text and the relevant
+  production boundaries. This is a delta review, not a claim to have executed
+  all new tests or fully audited every new line. The commits explicitly leave
+  full application validation pending. The completed repair gate stayed frozen
+  at `c507db8b`; these newer commits cannot inherit its result. Local main was
+  not blindly pulled across its staged lexical source edit.
+- Concurrent commit `7535bd42a04d1921ce3bd2ef6ff2cde5244c1c82` subsequently
+  landed the equivalent clamp fixes and restored the canary's access by making
+  `committed_snapshot` public. It also corrected a test lint and made the unused
+  conditional semantic-completion primitive test-only until production adopts
+  it. Its author reports fmt/clippy exit 0 on a tree also containing the next
+  additive receipt change; that is not an exact-HEAD runtime receipt. The earlier
+  E0624 and clamp failures describe `c507db8b`, not an unfixed latest-source
+  blocker. This pass's narrower test-placement alternative stays unmerged.
+- The final fetch also found `c72b890f22d2dff5e30c26c0ab00a6999efa769d`,
+  a 42-file semantic-serving implementation. Neither governing file nor README
+  changed. Read its complete 255-line evidence/limits report and inspected
+  publication, conditional completion, retained-owner loading, transactional
+  candidate hydration and client propagation boundaries. Certified native Unix
+  legacy generations now have real production serving integration; the earlier
+  claim that only certificate primitives existed is superseded. Its author
+  reports 26 component cases and two million-record probes, with full application
+  runtime tests still pending and strict UBS red. Those are attributed component
+  receipts, not this assessment's runtime results. The final independent probe
+  remains frozen at `0d91b8f3`; it cannot qualify this subsequent implementation.
+- Final direct DSR health refresh (`dsr-cass-health-completion-refresh.json`,
+  `2026-11-05T02:41:47Z`) again found both actual CASS builders healthy, with
+  disk warnings and no errors. No release/build result follows from health.
+- Fresh released-binary run: `/home/ubuntu/.local/bin/cass`, SHA256
+  `d221153d8e0a79ae37eb492855d32cd2aadb98e707c74c37445f779a46c626dd`.
+  Downloaded the published Linux amd64 archive again and verified its asset
+  digest `638ea8a8a9023c2e046bf8868392e6191218b89cf006e81af3ca205b546c4681`;
+  hashing its `cass` member in memory exactly matches the installed executable.
+  Receipt: `published-v0100-binary-identity-final.json`, `2026-11-05T02:59:28Z`.
+  Same deterministic synthetic corpus as yesterday, recreated in a new private
+  home: 456 Claude/Codex conversations, 12,038 messages, including a 3,000-message
+  conversation, old timestamps, filters, and synthetic credentials. No owner
+  archive, credentials or provider files were used.
+- Fresh receipts and retained probes:
+  `/data/tmp/cass-reality-check-20261104-chartreuseowl/`. Every journey step has
+  argv, stdout, stderr, exit, wall time and peak RSS. Independent
+  `e2e/verify_journey.py` checks returned counts and behavior; merely running the
+  shell script is not a success assertion.
+- Baseline gate: source-bound RCH job on `hz4`, source-content SHA256
+  `ddef7a197ee765a1051387fc5112edaccd7dadfab5223e418c19b61ea0fb1ae9`, unfiltered
+  lib suite requested. It found E0308 at the watermark read in `src/indexer/mod.rs`.
+  `STAGE=clippy EXIT=101`; no runtime suite pass follows from that build failure.
+  This obsolete attempt was stopped after that diagnostic; it ended with
+  `STAGE=rch EXIT=143`, missing later receipts, and source-stability refusal as
+  main changed. It is a retained failed attempt, not a completed qualification.
+- Isolated repair: `/data/projects/cass-reality-20261104-chartreuseowl`, advanced
+  without overwriting its engine edit from `2ef2af1a` through `aa4f5d45` to
+  `c507db8b`. It contains the
+  semantic DISTINCT repair described below. It is not a shipped fix or clean main.
+  The earlier binary-build and repair-gate jobs at the known-broken starting
+  revision were explicitly cancelled through RCH after the upstream borrow fix
+  landed; cancelled jobs are not compiler or runtime passes.
+- The `aa4f5d45` repair gate on `vmi1227854`, content SHA256
+  `e9fdc75b488777e5c6db7fa431dacd38280d7a4d4d4ac1d344b738a6e41dd190`,
+  reached compilation but hit RCH's 1,800-second SSH ceiling. Identity, freshness
+  and fmt passed; clippy, lib-build, lib-tests, CLI integration, goldens and UBS
+  have no terminal receipt. `STAGE=rch EXIT=1`; no Rust test ran to a recorded
+  terminal result. The remote group was reported killed and verified dead.
+  Failed artifact recovery retained an identical golden copy with incorrect
+  private-copy permissions; it is preserved in the receipt root. This is an
+  infrastructure failure, not a compiler pass or scanner verdict.
+- Local changed-file preflight on `c507db8b` plus the repair used the privately
+  acquired pinned UBS v5.4.4 runner and routing contract, both checked against
+  the hashes in `scripts/gate.sh`. The real Rust parser control passed and the
+  AST executable/source hashes stayed unchanged through the scan. Result:
+  **exit 1, one file, 0 critical, 773 warnings, 155 informational findings**.
+  This is a blocking whole-file result, not 773 newly introduced defects; no
+  complete old/new finding attribution was performed. The targeted scanner
+  explicitly skipped compilation and dependency-hygiene phases. No global
+  scanner policy, allowlist or threshold was changed, and no engine finding was
+  suppressed. The semantic source repair remains isolated.
+- After tightening the negative to the canonical messages cursor and adding
+  the `i64::MAX` boundary, the final two-file local preflight returned **exit 1,
+  0 critical, 774 warnings, 184 informational findings**; all source/AST SHA
+  checks passed. The previous 773 count belongs to the earlier engine snapshot.
+  The refreshed candidate includes the equivalent lexical clamp corrections.
+  Validation on disk-constrained workers omits dev/test debug symbols
+  through the gate's existing resource controls. Assertions, dependency graph,
+  test scope and scanner thresholds are unchanged. These are functional checks,
+  not release-profile performance or representative memory qualification.
+- The four-file gate after test relocation on `hz3` (content SHA256
+  `07bc15226ab2d0b77a6da12d18d78437b8c2132fd9f458b6795e3cf86dc09339`)
+  passed identity, freshness and formatting, then returned `clippy EXIT=101`.
+  My new EXPLAIN regression helper failed E0308 because its direct
+  `query_map_collect` return had `FrankenError` instead of `anyhow::Error`.
+  The owned attempt was stopped before changing source; the corrected helper
+  wraps the fallible return in `Ok(...?)`. No runtime test pass follows from
+  this diagnostic or its source correction. The final patch and hashes are
+  `candidate-after-error-conversion.{patch,sha256}` in the receipt root.
+- Strict local UBS on those exact final four files returned **exit 1, 0
+  critical, 1,288 warnings, 242 informational findings**. Before/after source
+  and AST hashes match. This remains a whole-file blocker; it is not a count
+  of newly introduced defects. The pinned `hz3` retry refused admission after
+  its queue deadline (`EXIT=103`), verifying nothing. No local fallback or
+  admission-floor override was used.
+- The corrected four-file gate finished on `hz4`, frozen content SHA256
+  `2da229a3c7ea058bd9c0f932b45bfdbd9bf46319c7b222284c420d519f536fc2`.
+  Identity, freshness, fmt, all-target clippy and lib-build passed. Selected
+  library tests returned **78 passed, 4 failed, 2 ignored, 9,128 filtered out**
+  in 202.94 s (`STAGE=lib-tests EXIT=101`). The real hash-embedder background
+  CLI regression passed (1 test, 75.78 s), and 69 goldens passed across two
+  binaries. Strict UBS returned exit 1 with the same 1,288 warnings. Transport
+  and `job-complete` returned zero; the gate correctly returned **RED, exit 1**.
+  Receipt: `gate-final-hz4-after-error-conversion.console.log` and
+  `/data/tmp/cass-gate.oLLKR0`, finished `2026-11-05T02:12:35Z`.
+- The selected library executable was hashed through its live process:
+  SHA256 `ead485f4d8c70b350a0f0eb6c7a2df219131cae9c9942a43361745ae869a0942`.
+  The CLI actually executed by that gate's `cli_index` test was retained
+  through `/proc/<pid>/exe`, copied locally and independently hash-checked:
+  SHA256 `9ec87883a4a694bd8d87929e62e85b1a077ff64434fb5f4fd401978e1c25ecbb`.
+  Both receipts record the worker, ancestor process chain, size, inode and
+  frozen source digest. This is the candidate used below, not the release or
+  later `0d91b8f3` source. Its functional debug profile omits symbols, with
+  assertions enabled and dependencies at the repository's opt-level 1.
+
+### What the fresh released-binary journey established
+
+The 43-command journey passed **60 independent control assertions**: exact initial
+canonical counts, a no-op retaining both counts, an append adding exactly five
+messages without another conversation, cross-provider and large-conversation
+marker hits, age/agent filters, invalid-date refusal, health readiness, view and
+expand, a cited pack, forget preview/apply and persistence after re-indexing.
+Default hybrid truthfully became lexical without installed models; explicit
+semantic search returned exit 15. Expected error exits were checked separately.
+Six additional title-free Boolean controls passed: AND/OR precedence,
+parentheses, NOT, dash exclusion, disjunction and phrase matching. Their expected
+message coordinates were checked, rather than accepting any nonempty response.
+
+Initial indexing took **37.72 s and 686,416 KiB peak RSS** on this synthetic run.
+These are observations, not an incumbent comparison or an archive-scale bound.
+The release's HTML and Markdown exports again retained both planted credentials
+verbatim. That defect is already repaired in main's source under `.84`, but a
+source fix does not protect users still installing the release.
+
+An additional real MiniLM control reused checksum-verified installed weights
+through `models install --from-file`; no model was downloaded. The released
+binary backfilled 180 messages across 30 sessions. A paraphrase with no lexical
+matches ranked the garage/battery sessions first in semantic and hybrid modes.
+Repeated backfill reported unchanged and embedded zero documents. Eighteen
+assertions checked the model-backed run, including the expected released defect.
+After one appended message and `index --background`, explicit semantic returned
+exit 15 and hybrid returned zero hits via lexical fallback. This freshly
+reproduces the released #458 behavior; current-source catch-up remains a
+separate qualification.
+
+A fresh watch probe appended one message after watcher startup. All 40 retained
+search polls exited zero: 39 returned no matches, then one returned the marker at
+**123.6 s**. This confirms the documented active-session deferral on the release;
+the two-second debounce is not the time-to-searchability of an active session.
+Current README already explains that distinction. The watcher remained alive
+until cleanup; SIGINT did not stop it within five seconds, then the probe's own
+process exited 143 after SIGTERM. That is a cleanup observation, not the GH515
+forced-cut/WAL acceptance proof or a current-source shutdown verdict.
+
+The final GitHub/package-channel refresh at approximately `2026-11-05T02:41Z`
+still reports latest release [v0.10.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.10.0), published
+`2026-10-02T02:54:21Z`. There are **10 open GitHub issues** in the current read,
+not yesterday's 35. A reduced issue count does not mean those source fixes have
+been released. New #539 and #540 initially had no work-graph record.
+Live package-channel reads show Homebrew and Scoop at `0.10.0`, and [crates.io](https://crates.io/crates/coding-agent-search)
+still at `0.7.0` (last updated 2026-08-25). This checks published manifests and
+registry metadata, not fresh installations on every platform.
+
+### What the source-bound candidate established, and what failed
+
+The captured candidate also completed the same 43-command journey with **60/60
+checked outcomes** on a new private synthetic home. Both planted credentials
+were absent from its HTML and Markdown exports. Stock SQLite 3.46.1 opened the
+resulting archive read-only and returned `PRAGMA quick_check = ok`. This is
+bounded interoperation, not damaged-owner-archive recovery or a corruption
+advisory requalification. Candidate index timing/RSS is retained as an observation;
+the different source, dependency graph and debug profile do not establish a
+performance win over the release.
+
+The separate real-MiniLM candidate run passed **23 checks**. Backfill published
+180 vectors for 30 conversations, repeated backfill embedded zero documents,
+and the no-lexical-match paraphrase retrieved the garage/battery material in
+semantic and hybrid modes. After one ordinary appended message and background
+indexing, canonical and quality-vector counts both became **181**, the quality
+tier remained current, and both queries still refined semantically with no
+fallback. This verifies the narrow background lifecycle fix on real MiniLM,
+beyond the hash integration fixture. It does not establish general relevance,
+foreground catch-up, immutable retained serving or archive-scale cost.
+
+Readiness still described semantic state as `building` with residual backfill
+while quality coverage was current and usable. Progressive readiness remained
+false with `owner_backed_reader_required`; ordinary fully refined hybrid is not
+evidence of the disabled progressive owner. Retain this distinction in `.26`'s
+contract/readiness cleanup.
+
+The library selection was **not green**. Its four failures need separate triage:
+
+| Frozen-cohort test | Observed failure and actual limit |
+|---|---|
+| `gh494_publish_failure_at_eof_is_finalized_on_retry_instead_of_returning_success` | A real directory obstruction refused publication, but the test expected phase `persist_generation_manifest` while recovery reported `persist_recovered_generation`. Later preservation assertions were not reached; do not erase them to make the label green. |
+| `gh496_count_refresh_cannot_complete_or_overwrite_an_incomplete_staged_audit` | The initial fixture premise compared live count `Some(4)` with `db_state.total_messages = 0`; it failed before exercising the intended count-refresh guard. |
+| `gh496_edits_deletions_and_identity_changes_refuse_prefix_reuse` | The public rebuild returned, but full projected content for conversation 1/message 0 was missing or stale for at least one of the ten mutation variants. The log does not identify which variant; it does not prove all ten fail. |
+| `gh496_replaced_archive_at_same_path_is_not_the_checkpoint_archive` | Reopening the replacement database path failed after moving the original DB/WAL/SHM. The intended archive-identity assertions were not reached. |
+
+These are results for `c507db8b` plus the recorded four-file candidate. No
+matched, unmodified C507 control was executed; later main is a distinct cohort.
+
+The final independent gate froze the then-current main snapshot `0d91b8f3`,
+with no candidate source edits, on `hz4`: content SHA256
+`1d99e35633baf8e312c3aa1f61b1648414e16d8290204ff67223238ab7439b39`.
+The first pinned-worker attempt refused source-namespace initialization before
+any stage (`gate-current-0d91-targeted.console.log`, exit 103). The ordinary
+unpinned retry selected `hz4`. Identity, freshness, fmt, all-target clippy and
+lib-build passed. Selected library runtime returned **55 passed, 5 failed,
+1 ignored, 9,194 filtered out** in 126.53 s. All four recovery failures above
+reproduced with the same reached/unreached boundaries. They therefore remain
+unresolved in this newer unmodified snapshot as well as in the prototype; this
+is not a single-variable attribution experiment.
+
+The fifth failure is
+`storage::sqlite::semantic_coverage_tests::gh458_forget_and_reused_ids_keep_durable_invalidation`.
+Forget, watermark clearing and stale-boundary CAS assertions passed, then the
+replacement insert's maximum ID was `Some(3)` rather than the fixture's required
+`Some(1)`. It never established the intended top-rowid-reuse condition, and its
+later reuse-invalidation/high-water assertions did not execute. This is neither
+proof of stale-vector resurrection nor passing reused-ID protection; `962e8`
+retains that missing acceptance. Forty replay-cache cases, eleven canonical
+coverage cases and four packet cases passed. The million-passage inventory
+case was explicitly ignored because it writes/validates more than 128 MiB;
+this run does not repeat its author's separate million-record measurement.
+
+The actual current-cohort library executable was hashed through its live process:
+SHA256 `bd52c2affd69b31275581070ba8edce5724faede6d80069fd2a769fecc48dbf5`,
+423,151,184 bytes. `current-lib-executable-identity.console.log` records the
+worker, ancestors, source digest and file identity. The gate receipt is
+`gate-current-0d91-unpinned.console.log`. Strict pinned UBS completed **exit 1,
+15 files, 96 critical, 27,877 warnings and 10,422 informational findings**, with
+the real Rust AST control passed. This is a blocking whole-file result, not
+96 newly introduced defects; no complete baseline attribution was performed.
+The four-file and fifteen-file scan totals have different scopes and must not
+be added or treated as a defect-growth comparison. No CLI integration or
+goldens were requested in this final cohort,
+and none of these results qualifies the subsequent `c72b890f` serving changes.
+The gate ended **RED, exit 1**, at `2026-11-05T03:12:23Z`, receipt
+`/data/tmp/cass-gate.zqEry5`; transport and `job-complete` were zero. Its warning
+about a missing positive terminal test-count receipt follows the failed library
+selection, not zero executed cases; the actual harness counts above are retained.
+All source candidates remain unmerged.
+
+### Vision checklist: implementation, proof and remaining ownership
+
+`WORKING-R` means the narrow released-binary journey above passed. `PARTIAL`
+means implementation or promised acceptance is incomplete. `UNPROVEN` means
+there is real implementation but no current execution for the stated scope.
+The table does not turn test source, previous receipts or one Linux fixture into
+whole-project clearance. Bead suffixes use `coding_agent_session_search-`.
+
+| # | Testable promise from README/plans | Current code and evidence | Remaining work |
+|---|---|---|---|
+| 1 | Discover and normalize every advertised provider | PARTIAL qualification: real FAD registry/CASS adapters; fresh journey covers Claude/Codex, not all 34 | `cooow`, `.24`, provider acceptance |
+| 2 | Batch/watch/quarantine use the same provider semantics | PARTIAL qualification; [Continue constructs the CASS adapter](https://github.com/Dicklesworthstone/coding_agent_session_search/blob/c507db8bf1797c8b1879ec58d95a2a4b098f5920/src/indexer/mod.rs#L32257) in `ConnectorKind`, correcting the older assessment | `cooow`, GH538 |
+| 3 | Durable pure-Rust canonical SQLite storage | WORKING-R for the fixture; production uses `franken_sync`/FrankenSQLite, `rusqlite` is dev-only; external sqlite3 repairs remain | `.65`, engine/integrity owners |
+| 4 | Stable identity, no duplicates, append/forget correctness | WORKING-R on ordinary files; shared-store/reinclude source and regression repair exist | `fx9fd`, `.24`, shared-store acceptance |
+| 5 | Cheap no-op and small-delta indexing | PARTIAL; durable reuse, lexical-count fixes and journal-guided replay now exist; the separate semantic catch-up path retained an adjacent DISTINCT scan | `.86`, `.86.1`, `3zq55`, `irqgt`, `ayhvu` |
+| 6 | Host-safe indexing with durable resume | PARTIAL; governor/checkpoints exist; new growth-safe lexical recovery landed unqualified during this check | `.46`, `.72`, GH496, `gm63q` |
+| 7 | Preserve raw evidence with explicit retention | PARTIAL qualification; chunked raw mirror, hold-down, selectors and audited pruning are real | retention owners, `.26`, `.69` |
+| 8 | Archive-first diagnosis/repair/restore preserves authority | PARTIAL; real candidates/fingerprints/receipts/backups; damaged-owner-archive recovery remains unproven | `scohn`, `.2`–`.6`, `.73` |
+| 9 | Versioned streaming logical archive round trip | PARTIAL; real codec/import/search/view; engine-bound restore/collation acceptance remains | `.34`, `svhcf`, `p94yt` |
+| 10 | Correct lexical Boolean/phrase/wildcard/filter retrieval | WORKING-R for sampled retrieval/filters; standard grammar and fuel limits are real Quill paths | `.11`, `.68`, metamorphic/scale gates |
+| 11 | Missing/corrupt lexical assets heal through atomic publication | PARTIAL; real scratch/atomic swap/quarantine pipeline, verified-replay recovery and passive Current/Unverified/Stale/Incompatible evidence | `h3jnv`, `.46`, `.48`, `lndgg` |
+| 12 | Hybrid defaults to lexical when semantic is unavailable | WORKING-R missing-model fallback; robot metadata names the realized mode and reason | `.11`, `ds7uy.4`, model-backed lifecycle |
+| 13 | Useful native local MiniLM with explicit acquisition | WORKING-R on the real-model paraphrase/backfill fixture; broad relevance, target-platform and current-source qualification remain separate | `jyfuq.2`, `dl6ye`, `bzurv`, `.33` |
+| 14 | Real progressive fast/quality refinement | PARTIAL and deliberately inactive in CLI/TUI; the private owner-backed progressive capability remains false even after `c72b890f`; certified single-tier retention is a different contract | `ds7uy.1`–`.5`, `jyfuq` |
+| 15 | Semantic generations remain useful through ingestion | PARTIAL; background lifecycle passed in the frozen candidate; `c72b890f` adds certified immutable Unix legacy serving and transactional candidate validation, but full application runtime qualification remains pending | `962e8`, `ds7uy.*`, issue-458 native gates |
+| 16 | Native ANN covers all authoritative shards/updates | PARTIAL; exact fallback preserves correctness; [12 incremental-HNSW](../../src/indexer/semantic/delegate/hnsw.rs#L279) and [two ANN-WAL tests](../../src/search/query/ann_shards/wal_tests.rs#L178) were ignored, not fixed | `of9i7`, `ds7uy.3.3`, `wfm4e`, `fdvur`, `3rz35` |
+| 17 | Retained daemon/service avoids repeated cold setup | Real authenticated daemon and persistent lexical/semantic service; warm retention differs from one-shot startup cost | `.32`, `o9ixv`, native lifecycle owners |
+| 18 | Bounded robot retrieval and truthful effective inputs | WORKING-R sampled errors/filters/fallback; broad budget/metadata paths exist, scale costs remain | `.11`, `.68`, budget owners |
+| 19 | Stable machine envelopes/discovery/goldens | PARTIAL broader coverage; exit-2 envelope and golden landed in `ee228018`/`d0cff956`, `878z7` closed with prior evidence | `.69`, `.85`, `eq69o`, goldens |
+| 20 | Deterministic cited/private answer packs | WORKING-R narrow cited extraction; every historical MUST/SHOULD is not thereby qualified | `.20`, answer-pack conformance matrix |
+| 21 | Trust distinguishes claim proof from mere provenance | PARTIAL; live correlation emits likely/unverified/stale; commit or closed-bead references alone never establish trusted claims | trust/guided/swarm owners |
+| 22 | Useful live swarm cockpit | PARTIAL; Git/JSONL/Mail/RCH collection is real and bounded; evidence/unknown-provider limitations remain | `.16`–`.18`, `oh96l`, `gnrxb` |
+| 23 | Guided operations execute advertised safe adapters | PARTIAL; local onboarding, lexical repair and support adapters are real; observation-only/unavailable mutations remain explicit | `.19`, `5u82n` |
+| 24 | Rich responsive TUI navigation/details/views/recording | Extensive real implementation/tests; current real-terminal, platform and large-archive experience UNPROVEN here | `.22`, `.54`, `.28` |
+| 25 | Persistent CLI/TUI bookmarks | Implemented with FrankenSQLite and Alt+E, not the old claimed missing feature | bookmark regressions, `.26` |
+| 26 | Correct bounded token analytics and shared dashboard | PARTIAL qualification; real queries/rollups/validation, remaining engine/memory/source-classification work | `.21`, `xn5a4`, `xcqqa`, `rril3` |
+| 27 | Safe HTML/generic export and encryption | Release still leaks planted credentials; main's shared redaction repair exists; native browser acceptance separate | `.84`, `.23`, `sd5o9` |
+| 28 | Private filtered Pages archive with key lifecycle | Real export/encryption/password/recovery/revoke/rotate implementation; no fresh native browser lane in this run | `.23`, `70o8f`, browser receipts |
+| 29 | Bounded browser/offline/mobile behavior from Pages plan | PARTIAL; [the viewer keeps JS and WASM plaintext copies](../../src/pages_assets/database.js#L25), no OPFS reuse path; ciphertext prefetch cap is not total RSS | `.23`, historical-plan disposition `.26` |
+| 30 | Real additive multi-machine sync and provenance | Real SSH/rsync/scp/SFTP implementation; local fixture/reingest is not an actual fleet round trip | `av59c`, `.24`, transport owners |
+| 31 | Watch/schedules keep history and models fresh | PARTIAL; real timers/guards/backoff and background semantic delta; active-session deferral still dominates seconds-scale watch debounce | GH538, `362yj`, `0m49m`, `v6ysi`, `962e8` |
+| 32 | Concurrent storage improves whole indexing jobs | Engine concurrent mode on, default indexer remains one writer; experimental parallel persist opt-in, benefit UNPROVEN | `.29`, archive integrity first |
+| 33 | Current checksum-verified multi-platform distribution | PARTIAL; DSR recipe and two healthy CASS builders exist, release still old; native Windows/runtime/channel proof remains | `.25`, `yrjna`, `hutyl`, `ytp3b`, `zztql` |
+| 34 | Honest performance and consistent current contracts | PARTIAL; useful fixes coexist with expensive opens, archive-wide work, stale task premises and optional historical plans | `.26`, `.69`, `.86`, `.72`, `o9ixv` |
+
+No committed `todo!()` or `unimplemented!()` was found by the keyword scan under
+`src/`; an AST `todo!` scan also returned no matches. These are bounded stub
+checks. The main gaps are integration, resource cost, runtime failures and proof,
+not empty command handlers. Four shared source files alone total about 308,000
+lines before the incoming recovery work; changing an innocent-looking helper
+can inherit a large verification and scanner surface.
+
+### The concrete repair attempted in this assessment
+
+`packet_embedding_inputs_from_storage_since` retained a query shaped as
+`SELECT DISTINCT m.conversation_id FROM messages m WHERE m.id > ?1 ORDER BY
+m.conversation_id ASC`. On the pinned FrankenSQLite 0.4.12 engine, that form
+rewinds the messages table and creates sorting/DISTINCT structures even though
+the caller needs only conversations touched after its watermark. The adjacent
+lexical path had already removed this pattern; semantic catch-up had not.
+
+The isolated candidate streams `SELECT conversation_id FROM messages WHERE id >
+?1 ORDER BY id`, deduplicates into a `BTreeSet`, then runs the existing canonical
+hydration and filtering. This preserves ascending unique conversation IDs and
+retains only touched conversations during discovery. It does not make the later
+conversation replay O(delta), bound the whole process's RSS, or change watermark
+semantics.
+
+A checksum-verified published fsqlite 0.4.12 CLI supplies an independent engine
+control. Its SHA256 is
+`71259ce7c788fbf227f58dab7f6696c0c58d62b1637e1e789c86e696653c4543`.
+With the same schema and bound parameter, the old program uses `Rewind`,
+`SorterOpen` and `OpenAutoindex`; the replacement uses `SeekGT` and none of those
+materialization instructions. Interleaved tail rows emit `20,10,20,999`, which
+must become `10,20,999` after deduplication. The candidate's Rust test adds exact
+old/new VDBE controls, historical/watermark rows, holes, repeats, orphan and empty
+delta behavior; existing packet tests cover canonical content and provenance.
+The requested CLI background regression uses the real hash-embedder pipeline to
+check lifecycle and publication. It is not a MiniLM relevance test; the separate
+real-MiniLM runs above distinguish the released and source-bound executables.
+The subsequent source-bound Rust range-seek regression and all three existing
+packet controls passed; the real hash CLI and MiniLM background fixtures also
+passed. This verifies the bounded repair's mechanism and behavior in the frozen
+candidate. It is not a measured whole-command speedup or a green whole gate.
+The source patch and input hashes are retained beside the gate receipts; `.86.1`
+owns implementation and validation together. `semantic-query-only.patch`
+(SHA256 `2eae2cff00613aad548faabddf0236083b0cef17dce196756aca78ede2b60c70`)
+excludes the superseded test-placement alternative and clamp maintenance. A
+read-only `git apply --check` succeeds on `c72b890f`; patch applicability is not
+runtime qualification of that newer source.
+
+The independent plan check was also repeated against a copy of the full migrated
+CASS synthetic archive, including its actual `messages` unique index and
+`extra_bin` column. Its messages table is root page 14. The exact former
+parameterized query opens that root on cursor 0 and executes `Rewind`, without
+`SeekGT`; the replacement opens the same root and executes `SeekGT`, without a
+rewind or materialized sort/distinct structure. Thus the historical scan is not
+an artifact of the minimal fixture or a rewind of a temporary result table.
+`production-schema-plan/verification.json` asserts those specific cursor/root
+relationships. The Rust negative control was strengthened to the same standard.
+
+The current candidate's all-target clippy stage then exposed two manual-clamp
+errors in `lexical_resume.rs:726` and `:733`. A separate maintenance repair uses
+`clamp(1, MAX_BATCH_BYTES)` and `clamp(1, MAX_BATCH_MESSAGES)` in place of the
+equivalent final `min(MAX).max(1)` pairs. The literal maxima are positive
+(64 MiB and 16,384 messages), so zero, in-range and oversized values retain their
+prior bounds. This does not change recovery policy or establish a performance win.
+
+That file's strict preflight initially had one warning: formatting the mismatch
+diagnostic immediately before returning from the document loop. The project
+explicitly permits documented inline exemptions for acceptable warnings. An
+external paired control retained a genuine repeated-allocation loop: UBS
+reported two warnings before the single-line exemption, one afterward, and still
+exited 1 on the repeated allocation. The production exemption documents only the
+immediate error return. It admits one diagnostic site, zero measured performance
+wins and no repeated-allocation sites. No category or file was disabled. The
+control receipts live in `ubs-error-return-controls/`. The lint-only candidate
+is isolated at `/data/projects/cass-lint-20261104-chartreuseowl`. Its private-target
+gate passed identity, freshness, formatting and strict UBS, but all-target clippy
+failed with two E0624 diagnostics. Thus this is not a completed compiler or
+runtime-recovery qualification.
+
+Those diagnostics expose a second defect at the tested source: the snapshot
+regression added in `c507db8b` calls the private writer method `committed_snapshot()` from
+`canary/exact.rs`, which the external `lexical_reconcile_canary` integration crate
+also includes. The bounded candidate moves the writer/pinned-content regression
+into existing in-crate `gh496_tests.rs`, retaining its positive, replacement and
+old-view assertions. The native Arc identity assertion stays in the exact
+snapshot module's full-content regression. Production visibility stays unchanged;
+no test is skipped and no new source file is introduced. Both isolated worktrees
+retain this alternative; main instead resolves access in `7535bd42` through the
+public method, and does not contain this test relocation. Local pinned
+formatting and diff checks pass. Strict UBS on these two changed test files is
+**exit 1, 0 critical, 514 warnings, 62 informational findings**. This is a
+whole-file blocker, not a claim that this move created 514 defects. No test file
+or category was exempted. `.46` retains this implementation/validation unit.
+
+### The gaps that matter most
+
+1. **Ship the already useful fixes under the existing bar.** The release still
+   exposes the older storage family and the demonstrated export leak. Direct
+   tag/current lockfile comparison finds all 20 SQLite-family packages at
+   0.4.6 in `v0.10.0` versus 0.4.12 in main. The current CHANGELOG and governing
+   dependency contract identify 0.4.6 as affected by the explicit-transaction
+   b-tree corruption advisory; this session did not rerun that corruption probe.
+   Current source fixes are not delivered fixes. `hutyl` remains a decision, not implicit
+   permission to replace strict UBS with a baseline-delta policy.
+2. **Prove the actual indexing and recovery path at realistic scale.** The owner
+   archive directory still contains only `RELOCATED.md`; no local owner canary is
+   running. New growth-safe recovery retains work through full content audit,
+   rather than an O(delta) source scan. Its own report explicitly says compiler
+   and runtime validation did not finish and UBS is red. The implementation is
+   valuable, but the reporter's 8.4M-message/12-GiB scenario remains unproven.
+3. **Finish semantic serving as a product lifecycle.** The background delta is a
+   real improvement. It is not immutable current-source serving, progressive
+   CLI/TUI delivery, native ANN across WAL/shards, or general title-aware search.
+   In the independently executed candidate, foreground indexing still leaves
+   semantic assets stale unless semantic work or later background catch-up runs.
+   Subsequent `c72b890f` now relaxes admission for certified immutable native Unix
+   legacy owners, validates each winning passage and parent in one canonical
+   transaction, and carries partial coverage through clients. This is substantive
+   implementation progress, with attributed component receipts, rather than a
+   passing native application result. Unsupported owners/platforms stay strict,
+   certified legacy ANN falls back to exact vectors, cold admission hashes whole
+   artifacts, and streamed identity inventory and ID sets still perform
+   archive-sized work. The new path needs its own exact-source native gate and
+   large-archive lifecycle/relevance acceptance.
+4. **Make routine work scale with its actual obligation.** #539 reports two
+   small-delta commands at 110.2/60.3 s, with estimated archive-sized costs of
+   45/35 s. Those are qualified reporter observations, not reproduced timings.
+   Current lexical/count/finalizer changes address some instances. The semantic
+   DISTINCT query demonstrates that the adjacent pattern was still present.
+5. **Close platform/fleet/browser acceptance with execution.** A native Windows
+   machine is still unavailable in the default inventory. Cross-compiling its
+   binary on Linux is not native runtime proof. A local model/hash fixture does
+   not establish MiniLM relevance; local source fixtures do not prove SSH fleet
+   transport; Rust Pages tests do not prove real browser unlock/offline behavior.
+
+### Would all existing beads close the vision gap?
+
+**They cover most of the vision, but completing their status fields would not
+prove delivery.** At entry the graph had 2,475 non-tombstoned issues: 2,300 closed,
+78 open, 63 in progress and 34 blocked. `bv` found no cycles, but nine blocked
+issues had no remaining dependency blocker; old release beads still named old
+versions, and `.25` explicitly required GitHub Actions and a 16 MiB test stack.
+Those instructions contradicted permanent policy and current runtime needs.
+
+The important new uncovered work was #539's complete routine-cost acceptance and
+#540's optional title signal. They now have `.86` and `.87`; the observed semantic
+query repair is `.86.1`. The title request is an enhancement, not proof that
+existing body-only semantic retrieval is universally defective. The reporter's
+SciFact merge gained 26 first results and lost 19; the private query suite heavily
+paraphrases titles. No new default or broad quality claim follows from that.
+
+Structural work in this pass is scoped: new children, current DSR-only acceptance
+for `.25`, and evidence comments. No peer implementation bead was closed or
+reassigned. Completing all work still needs exact-candidate acceptance, current
+release artifacts, and explicit decisions about optional historical ambitions.
+The final triage snapshot has 2,478 issues: 2,300 closed, 80 open, 64 in progress
+and 34 blocked; 178 remain unfinished and 121 are actionable. Both `bv` and
+`br dep cycles --json` report no cycles. These are graph-health facts, not a
+product-completion percentage.
+
+### Bridge plan and acceptance, in order of user impact
+
+| Order | Outcome and exact remaining acceptance | Owner / graph |
+|---|---|---|
+| 1 | Freeze a candidate, clear all-target compilation and execute the relevant regressions; keep the starting E0308, subsequent E0624, incoming fixes and each ignored test distinct | `55wh0`, `z6ycn`, `.46`, exact candidate gate |
+| 2 | Resolve strict scanner findings and the recorded release decision without changing a gate merely to ship; run DSR's actual CASS routing | `5v57k`, `hutyl`, `yrjna`, `.25` |
+| 3 | Execute index/search/view/export/install journeys on exact release artifacts per target, real MiniLM where supported, and the real DSR-host browser lane; publish only verified channel claims | `.25`, `aegfi`, `.23`, `zztql`, release owners |
+| 4 | Re-enable the owner canary on an adequately sized host/copy, then prove catch-up, source freshness, memory and durable resume under the reported external limits | `erxoj`, `.46`, `.72`, `scohn` |
+| 5 | Remove the surviving semantic DISTINCT scan with old-query negative, exact VDBE SeekGT proof, dedup/order/orphan/empty-delta checks and real background semantic coverage | `.86.1` (this pass's isolated implementation) |
+| 6 | Finish #539's whole-command cost accounting: same delta at different archive sizes; name every required verification; retain unchanged corruption/coverage behavior | `.86`, `3zq55`, `irqgt`, `o9ixv`, existing levers |
+| 7 | Validate per-embedder catch-up and complete immutable owner-backed serving, progressive routing and real native ANN, including the fourteen ignored cases | `962e8`, `ds7uy.*`, `of9i7`, `jyfuq` |
+| 8 | Deliver stable-prefix watch ingestion and real SSH fleet convergence, with partial-line/rewrite/duplicate/source-unavailable negatives | `v6ysi`, GH538, `.24`, `av59c` |
+| 9 | Evaluate optional title/body representation and fusion with one model, full public corpus, fixed policy, gained/lost cases, privacy/filter/citation preservation and measured cost | `.87`; does not block maintenance release |
+| 10 | Finish remaining guide/swarm/analytics/Pages contracts and reconcile every retained historical promise with an implemented, tested behavior or explicit scope decision | `.18`–`.24`, `.26`, `.69`, current owners |
+
+### Ambition and five refinement passes
+
+Three ambition reviews changed the plan in concrete ways: (1) treat delivered
+artifact behavior, rather than more source commits, as the main unit of progress;
+(2) inspect adjacent callers, which found the remaining semantic DISTINCT scan
+after the lexical fix; (3) keep new relevance ideas optional and evaluate both
+gained and lost answers, so #540 cannot consume the maintenance release path.
+
+The frozen generation/refinement templates were used for the new work; verbatim
+copies and local phase notes are retained in `phase-templates.txt` under the
+receipt root. Five reviews covered: all 34 vision rows and existing owners;
+bounded streaming work and invariant preservation; falsifiable tests/negative
+controls; dependencies and DSR-only execution; and convergence without duplicate
+implementation beads. The semantic repair was refined from collecting every
+new message's ID to streaming into a set bounded by touched conversations.
+Implementation and tests remain in one bead under the suite's no-scope-splitting
+rule. New validation cites observed GH539 costs or an existing named release gate.
+
+The bridge therefore preserves ambition without pretending that an unfinished
+library API is enabled in the CLI, an ignored test is fixed, a healthy host is a
+tested artifact, or a small fixture proves the large-archive resource contract.
+
+The assessment publishes this report and the scoped tracker updates. The Rust
+proposal stays reviewable in its isolated worktree and core-only patch because
+its acceptance is incomplete. Metadata is committed from a separate clean
+checkout following main, preserving the shared checkout's staged lexical edit
+and concurrent source history. Both owned gates have ended; the final frozen
+QA checkout has no remaining worker processes. The receipt root's
+`final-evidence-manifest-20261105.json` binds the terminal logs, actual executable
+identities, retained patches and independent journey verifiers.
+
+---
+
+## Assessment: 2026-11-03 (SapphireDeer)
+
+**Verdict: main is a better product than anything a user can install, and the
+project has no working path to ship it.** On a synthetic real-format corpus, the
+published v0.10.0 binary and a HEAD build ran the same 43-step journey plus
+Boolean, watch, TUI and real-MiniLM probes. Both index, search, apply the Boolean grammar correctly (6/6 title-free probes), filter, append
+without duplicates, forget and serve the TUI. The two user-visible defects found in
+the release are fixed on HEAD:
+
+- v0.10.0's HTML and Markdown exports contain synthetic GitHub and AWS credentials
+  verbatim; HEAD's do not;
+- v0.10.0's archive error envelope lacks `hint`.
+
+HEAD is no slower in wall time and uses about 6% more peak RSS on this corpus. On
+both binaries, watch takes two to three minutes, not the documented 5 s, to make an
+appended message searchable. With real MiniLM, any ordinary ingest turns semantic
+search off until `cass index --semantic` reruns (GH #458, reproduced on both).
+
+v0.10.0 is still the latest release after 32 days. Main is 838 commits ahead. 14 of
+the 35 open GitHub issues are fixed only on main, and six owner comments promised those fixes "in the next
+release" two to four weeks ago. Three independent blockers stop delivery. Separately, main's full lib suite is red by 16
+tests, 12 of them from one commit that landed without a runtime result:
+
+1. the owner's release-bar decision (`hutyl`, open 12 days);
+2. a strict-UBS scope that fails any change to a monolith on findings older than
+   the change;
+3. dsr build capacity: 0 of 3 hosts are healthy.
+
+None of these is a product defect, and no amount of feature or proof work closes
+them.
+
+This section supersedes the 2026-10-27 assessment and the 2026-10-28 follow-up
+where they disagree. It changes no gate, test, golden, dependency or bead status.
+No peer bead was claimed or closed.
+
+### Scope, identity and evidence boundaries
+
+- **Docs read in full:** `/data/projects/AGENTS.md`, the repository `AGENTS.md` (1,388
+  lines), all 3,938 lines of `README.md`, and the 2026-10-27/28 sections of this
+  document.
+- **Source reviewed:** `main` = `origin/main` = `8c0f8928`. That is 64 commits after the
+  10-27 SHA `1bf194de` and 838 after `v0.10.0`. `Cargo.toml` still says `0.10.0`.
+- **Released binary:** `/home/ubuntu/.local/bin/cass`, SHA-256 `d221153d…`. This is the
+  published v0.10.0 Linux asset; the 10-28 follow-up matched it to the release digest.
+- **HEAD binary:** built on rch hz4 from a detached worktree at `8c0f8928` with
+  `cargo build --locked --release`, thin LTO and 16 codegen units (functionally the
+  shipped profile, not its fat-LTO performance). SHA-256 `8f42d1d8…`. It too reports
+  `cass 0.10.0` with `build_commit: unknown`, so an unreleased build cannot be told
+  apart from the release by `--version`.
+- **Corpus:** each binary ran the same journey (`journey.sh`, `watch_probe.sh`) in its own
+  isolated `HOME`, with `CASS_AUTO_REFRESH=0`, against the same deterministic synthetic
+  corpus (seed 20261103). The corpus has 456 conversations and 12,038 messages: 300
+  Claude Code sessions in 6 projects, 150 Codex rollouts, one 3,000-message session,
+  a 60-day-old session, a Boolean probe session, a session carrying synthetic GitHub
+  and AWS credentials, and a two-session project to forget.
+- **What the corpus is not:** it is not the reporter's provider mix, scale or raw-mirror
+  history. Scale and memory claims below are only what was measured on it.
+- **Receipts:** scripts and per-step stdout/stderr/exit/time/RSS are copied to
+  `/data/tmp/cass-reality-check-20261103-sapphiredeer/`.
+- **Host state:** ts1 has no owner archive. `~/.local/share/coding-agent-search/` holds only
+  `RELOCATED.md`: it was moved to `trj:/bulk/relocated-2026-10-24/...` because the disk
+  was full. `/` is still at 100% with 13 GB free. No real archive was opened, indexed
+  or repaired by this check.
+
+### What actually ran (same corpus, same host, same session)
+
+| Step | Published v0.10.0 (`d221153d`) | HEAD build (`8f42d1d8`) | What it establishes |
+|---|---|---|---|
+| `selftest`, `health` on an empty dir, `index --full` | ok; exit 1 `not_initialized`; exit 0, 456 / 12,038, 27.4 s, 693 MB peak RSS | same; 30.4 s, 727 MB | First-run journey works on both |
+| `health` / `status` / `stats` after | healthy, fresh, exact counts | same | Truth surfaces agree with the corpus |
+| Marker searches (Claude, Codex, 3,000-message session) | 1 exact hit each, ~0.11 s wall | 1 each, ~0.13 s | Real retrieval across connectors and skew |
+| Common term `checkpoint` | 10,524, `count_precision: exact` | same | Exact totals at this size |
+| Boolean grammar, title-free probe (6 queries: `a OR b c`, `(a OR b) c`, `x NOT y`, `x -y`, OR chain, phrase) | **6/6 PASS** | **6/6 PASS** | NOT > AND > OR and parentheses are already in the release |
+| Same queries where the conversation title holds the terms | 4, 4, 0 | 4, 4, 0 | **Message search also matches the conversation title (first prompt)**, so `x NOT y` drops every message of a conversation whose first prompt mentions `y`. Not documented |
+| `--days 30` / `--days 90` on a 60-day-old session | 0 / 1 | same | Time window applies |
+| `--since not-a-date` | exit 2 `usage` | same | No silent substitution |
+| `--agent claude_code` on a Codex marker | 0 | same | Agent filter applies |
+| Default hybrid, no model / `--mode semantic` | realized lexical with reason / exit 15 | same | Truthful fail-open, no hash substitution |
+| `status --jsn` | runs `status` | same | Typo recovery as documented |
+| `view`, `expand`, `pack --require-evidence` | ok; pack 1 evidence, redaction applied | same | Drill-down and pack |
+| `export-html` / `export --format markdown` of the secret session | **both credentials verbatim, 0 `[REDACTED]`** | redacted (5 / 3 markers), receipt `policy: redact-secrets` | `.84` defect shipped; fixed on HEAD |
+| `archive verify <missing>` | exit 14, fields `code,kind,message,retryable` | exit 14, plus `hint` (null) | `.85` fixed on HEAD |
+| Re-index with no change | +0 messages, 2.85 s | +0, 1.54 s | No duplicate work at this size |
+| Append 5 messages, incremental index | exactly +5, 3.66 s | exactly +5, 2.25 s | Incremental correctness |
+| `forget` preview / `--apply` / re-index | read-only; removes 2 / 20 (23.3 s, 794 MB); stays forgotten | same (20.3 s, 854 MB) | Forget persistence |
+| `index --watch`, append to an active session | searchable after ~123 s (189 s on a second run); ignored SIGINT for 5 s, SIGTERM needed | searchable after ~139 s (polls every ~30 s); same SIGINT behaviour | README's 2 s debounce / 5 s maximum wait is not what users get |
+| Real TUI in a pty: launch, type the marker, Esc, Ctrl+C | first launch: query typed at 6 s not drawn within 4.6 s; 3 later launches drew the hit | same (1 miss on first launch, 2 passes) | Search-as-you-type works warm; a cold first launch can drop early keystrokes |
+| Interleaved `index --full` ABAB, fresh data dirs | 31.7 s, 27.5 s; 676, 690 MB | 27.7 s, 27.0 s; 729, 728 MB | Wall time within noise; HEAD +~6% peak RSS. A small corpus, not a scale claim |
+| Real MiniLM, `models install` + `index --semantic`, paraphrase query (lexical: 0 hits), then a one-message ingest | before: semantic/hybrid top-2 correct; **after: semantic exit 15, hybrid lexical 0 hits** | identical (fresh data dir). An earlier HEAD run that appeared to keep serving reused a data dir, so its "ingest" added no row; corrected | Any ordinary ingest switches semantic search off on both binaries. `cass index --semantic` restores it (about 2 s here) |
+| Real MiniLM, `models install` + `models backfill --tier quality`, same ingest | before: correct; after: semantic exit 15, hybrid lexical **0 hits** | identical | #458 reproduced on both (180 messages); not a regression |
+| Robot parse error (`models install --json`, `stats --json --bogus`, `search foo --robot --bogus-flag`) | exit 2, `{status, error:<string>, kind:"argument_parsing", examples…}`; `models install` / `stats` examples suggest `cass view` | identical | Undocumented second envelope for exit 2 (new bead) |
+| Data dir after the journey | ~405 MB from 8.7 MB of sources: live lexical 155 MB, one retained publish backup 172 MB, DB ~48 MB, raw mirror 13 MB | live lexical 172 MB (+11%) | ~13 KB of lexical per short message, doubled by the default one-generation backup |
+
+The synthetic corpus makes per-message overhead look worse than on real archives,
+whose messages are longer. The ratios are reported, not extrapolated.
+
+**Gate on HEAD: `gate: RED`, on the lib suite only.** I ran the default `scripts/gate.sh`
+with no filters and no retries from a fresh detached worktree at `8c0f8928`, on rch
+vmi1152480 with a cold target, from 20:10Z to 22:20Z. `SOURCE_CONTENT_SHA256 11559d02…`.
+
+- Green: source-identity, source-freshness, fmt, all-target clippy `-D warnings`,
+  lib-build, `cli_robot` (329), `bookmarks_cli` (9), `search_metamorphic` (11),
+  `pages_bundle` (65), `search_service` (175 / 8 ignored), bin-build, bin-cass (230 / 1
+  ignored, two named skips) and goldens (16 + 52).
+- The UBS stage scanned zero files, because an unmodified checkout has no diff against
+  `origin/main`. It says nothing about the whole-file backlog below.
+- **lib-tests failed: 9,086 passed, 16 failed, 63 ignored.**
+  - **12** are all of `indexer::semantic::delegate::hnsw::incremental_tests`. Each fails
+    with `Index version mismatch: expected v1, found v2`. They landed in `92b93c04`
+    (10-27, `of9i7`) with "no runtime result yet", so main's full lib suite has been red
+    since then.
+  - **2** are the known `ann_shards::wal_tests` (`55wh0` / `ds7uy.3.3`, red since 10-22).
+  - **1** is the known GH #515 watch-once case (`362yj` / `0m49m`).
+  - **1** is new and unowned: `storage::sqlite::tests::reinclude_exact_session_preserves_provenance_siblings_and_pending_work`.
+    A workspace `forget` deleted 3 conversations where 4 were expected. This may be a
+    stale expectation (`UNIQUE(source_id, agent_id, external_id)` collapses one fixture
+    variant) or a real retention defect in the README-documented `forget --workspace-glob`.
+    It needs triage before the expected value changes (`fx9fd`).
+- Receipts and comments are on `55wh0`, `hutyl`, `of9i7` and `fx9fd`. The receipt and
+  console log are in the receipts directory.
+
+For the release bar this matters as follows:
+- The 12 HNSW tests and the forget test cover features that do not exist in v0.10.0
+  (native HNSW append, forget re-inclusion).
+- The 3 owned reds predate this check.
+- Under "no worse than v0.10.0", the HNSW append path must stay unadvertised and
+  unreachable by default until `of9i7` lands. That is already true per the code audit:
+  only test callers.
+- The forget failure must be triaged, because `forget --workspace-glob` is a documented
+  feature of the candidate.
+
+### Delta against the 2026-10-27 vision table
+
+Rows that did not change keep their 10-27 status and ownership. Changed or newly
+measured rows:
+
+| # | Promise | 10-27 | 2026-11-03 evidence | Owner |
+|---|---|---|---|---|
+| 10 | Correct Boolean/phrase/wildcard/filter search | WORKING* (basic lexical) | **WORKING on both binaries** (title-free probe, 6/6, `_meta.effective.query_structure` matches the executed grouping). Undocumented semantics: message search also matches the conversation title (first prompt), so `x NOT y` excludes every message of a conversation whose first prompt contains `y` | `2l1b0.26` (document it) |
+| 12 | Default hybrid with explicit degradation | WORKING* | Fail-open is unchanged on both binaries: requested hybrid, realized lexical, explicit reason; `--mode semantic` exits 15. **With real MiniLM on HEAD** (30 sessions / 180 messages; paraphrase query "automobile ignition failure low power", which lexical misses): after `models install` + `index --semantic`, semantic and hybrid rank the car/battery sessions first. **On both binaries, the same one-message ingest then switches semantic off** (exit 15, hybrid lexical 0 hits), on this path and on the backfill path, until `cass index --semantic` reruns. After `models install` + **`models backfill --tier quality`** (the path the nightly scheduler runs), the same one-message ingest makes `--mode semantic` exit 15 ("semantic assets not current") and default hybrid return **0 hits** via lexical. That is GH #458, reproduced on both binaries. Every plain `cass index` changes the fingerprint (`content-v1:{conversations}:{max conversation id}:{max message id}`), including stale-on-read catch-up and the scheduler's 15-minute job, so on an active machine semantic search is off nearly all the time | `962e8` (repro + design comments filed), `ds7uy.*` |
+| 14 | Progressive quality/fast refinement | PARTIAL | Unchanged and fail-closed: `vector_index.rs:223-228` hard-codes `owner_backed_progressive_reader: false`; hybrid hard-codes `SemanticTierMode::Single` (`query.rs:7682`); `two_tier_search.rs` has no production caller; the TUI's `CASS_TUI_TWO_TIER` path falls through to exact single-tier | `ds7uy.1`–`.5` |
+| 16 | ANN truthful readiness | PARTIAL | `hnsw_ready` is now hard-coded `false` (`asset_state.rs:984-988`, ecfaafe5) and presence is `hnsw_present`; **README.md:323 still says `hnsw_ready` means the sidecar is present.** `append_hnsw_generation` (92b93c04) has only test callers | `wfm4e`, `of9i7`, `2l1b0.26` |
+| 27 | Safe HTML/generic export | PARTIAL (`.84` open) | **Shipped defect, fixed on HEAD.** v0.10.0 HTML (77,534 bytes) and Markdown exports contain both synthetic credentials verbatim, with no `[REDACTED]`. HEAD: neither credential, 5 / 3 `[REDACTED]` markers, the session marker preserved, receipt `{policy: redact-secrets, redaction_applied: true}` | `.84` (blocked on UBS only) |
+| 19 | Robot envelope consistency | PARTIAL (`.85`) | v0.10.0 `archive verify <missing>`: exit 14, fields `code,kind,message,retryable`. HEAD: the same plus `hint` (null), the five-field envelope. Separately, **argument-parsing errors (exit 2) bypass the envelope on both binaries**: `error` is a string, `kind: argument_parsing`, and the examples name the wrong command | `.85` (blocked on UBS only); new bead `robot-parse-error-envelope` |
+| 31 | Freshness through watch | UNPROVEN | Measured on both binaries: a message appended to an active Claude Code session under `index --watch` became searchable after ~123 s on v0.10.0 (189 s on a second run) and ~139 s on HEAD, which polls every ~30 s. README *Watch Mode Internals* promises a 2 s debounce and 5 s maximum wait. The 120 s `CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS` deferral dominates. Both ignored SIGINT for 5 s | new bead `watch-stable-prefix-ingest` |
+| 5/6 | Cheap, bounded indexing | PARTIAL | Interleaved A/B, 12k messages: wall time 31.7/27.5 s (v0.10.0) vs 27.7/27.0 s (HEAD); peak RSS 676/690 MB vs 729/728 MB (+~6%). No-op re-index 2.85 vs 1.54 s; 5-message append 3.66 vs 2.25 s. ~700 MB of RSS for a 9 MB corpus shows a large fixed floor; at-scale costs remain the domain of the existing beads | `.72`, `3zq55`, `irqgt` |
+| 33 | Current release on every channel | PARTIAL | **Blocked at three layers** (below). GitHub v0.10.0 (10-02), crates.io 0.7.0 (08-25), `dsr health all` 0/3 healthy | `hutyl`, new dsr-capacity bead, `yrjna`, `.25` |
+| new | Owner's own machine runs cass | — | **NOT WORKING:** the archive was relocated off ts1 on 10-24; agents on ts1 told by AGENTS.md to "use cass" search an empty data dir with v0.10.0 | new dogfood bead |
+
+Docs-truth defects found while reading the README in full (owned by `2l1b0.26`):
+
+- `README.md:323`: the `hnsw_ready` semantics above.
+- `:2391`: "The TUI has no bookmark keybindings today" contradicts `:1982` and `:3054`
+  (`Alt+E`) and the `event_mapping_alt_e_maps_to_bookmark_selected_hit` test.
+- `:2722`: "applies v14–v22, so a new database records versions 13–22" contradicts
+  `:2802` and `CURRENT_SCHEMA_VERSION = 23` (`src/storage/sqlite.rs:4100`).
+- `:1518-1521`: the table calls the 5,000,000-document exact-count threshold "Current
+  (unreleased)", but commit `81ea0649` is in v0.10.0.
+- `:51`/`:83`: the Agent Quickstart is "verified on 0.8.0".
+- `:3017`: the release-binary example still uses `VERSION=v0.2.0`.
+- *Watch Mode Internals* (`:2839-2856`): the 2 s/5 s claim above.
+- *Query Language* (`:1748` onward): "Messages containing ..." omits that a message also
+  matches through its conversation title (the first prompt). With the title
+  `zzbool alphaq betaq`, `zzbool NOT alphaq` returns 0 of 4 messages on both binaries.
+
+### Shipped state: what users have
+
+A fix matrix of all 35 open issues (`gh` plus `git merge-base --is-ancestor <fix>
+v0.10.0` plus beads) found:
+
+- **14 FIXED_UNRELEASED** (#530 #525 #522 #521 #520 #519 #517 #516 #514 #512 #511 #510 #508
+  #426). 11 are firm; #530, #525 and #508 await reporter or scale confirmation.
+- **11 PARTIAL**, **4 STALE** (#495, #462, #443 and #379: fixes shipped in v0.8.0–v0.10.0,
+  no reporter retest), **2 UPSTREAM** (#515, #349), **2 FEATURE** (#537, #481) and
+  **2 OPEN** (#460, #391).
+- Every open issue has a bead. #530's bead arrived after ~92 h, and #538's and #508's
+  after ~38 h, against the 24 h rule.
+- Reporters active since 10-20: #538, #537, #530, #458 and #496. per0733 alone is active
+  on #530, #537 and #496, reported #521 and #522, and runs released binaries only.
+- Owner comments promising the "next release": #522 (10-19), #512 (10-12), #481 (10-19),
+  plus "stays open until a release carries it" on #519, #517 and #516.
+
+### Why nothing ships: three independent blockers
+
+1. **Decision.** `release-bar-decision-hutyl` (P0 question, filed 10-22, last touched
+   10-27) proposes cutting 0.11.0 under a "no worse than v0.10.0" bar. No owner answer
+   is recorded. `yrjna` still names `p3gh0`, `55wh0`, `5v57k` and `irqgt` as blockers.
+   - `p3gh0` is the #462 bead. #462's engine fix shipped in v0.9.0; a retest was
+     requested on 10-03 and never answered. So one release blocker holds an issue
+     whose fix users already have.
+2. **Scanner scope.** `scripts/gate.sh` runs pinned UBS `--ci --fail-on-warning` over every
+   file the change touches. Strict scans this week, all with the AST engine:
+   - `src/lib.rs` + `tests/cli_robot.rs` + `tests/daemon_client_integration.rs`:
+     77 critical / 7,713 warning.
+   - Four files including `src/indexer/mod.rs`: 82 / 19,121.
+   - A single test file: 2 / 238.
+
+   Each scope inherits every pre-existing finding in the touched files. A change that
+   introduces no finding still fails if it edits `lib.rs`, so the verdict measures the
+   file's history, not the change.
+
+   Today's `8c0f8928` correctly closed a scanner fail-open (no AST engine meant zero Rust
+   findings). That raises the measured count further. Under whole-file scope the release
+   needs the monoliths' entire backlog triaged, and there was no net movement in the
+   week since 10-27: one bead closed, `5v57k` still in progress.
+
+   The 2026-09-22 audit found about 30 code-complete bug beads whose only remaining
+   closure condition is this scan. That is why the ledger is frozen:
+   - 2,299 closed, against 2,298 on 10-27;
+   - 46 of 63 in-progress beads not updated since 10-20, and 18 not since before 09-01;
+   - 15 epics ready to close;
+   - 7 of 33 unfinished P0s are epics.
+
+   Changing that bar is the owner's decision, not an agent's, because it is the
+   proposal inside `hutyl`.
+3. **Capacity.** `dsr health all` at ~20:10Z: mmini 100% used (4.47 GiB free against a
+   40 GiB floor, down from 18.55 GiB at 09:32Z); trj's storage probe fails; wlap is
+   unreachable. ts1 is at 100% with 193 linked worktrees of this repository. rch
+   workers vmi1152480 (`No space left on device`), hz3, vmi1153651 and vmi1156319 are
+   disk-critical. **Even an approved bar could not produce a native release today.**
+   No open bead owned this before this check.
+
+The swarm's effort this week went where these blockers say it would: the GH #538
+watch-ingestion series (one macOS reporter), scanner integrity, and receipts. The
+receipts include bead comments of several hundred words of SHA-256 digests for scoped
+gates that end "no release clearance". That rigor is real, but under the current bar
+it is AGENTS.md's named pattern 10 (conformance metastasis): it cannot convert into a
+shipped fix until blocker 1 or 2 moves.
+
+### The five reality-check answers
+
+1. **What works:** the whole lexical journey on both binaries:
+   - discovery of Claude and Codex, canonical persistence, health/status truth;
+   - marker, agent, `--days` and invalid-`--since` handling;
+   - exact counts and incremental append with exactly +5 messages and no duplicates;
+   - a no-op re-index; forget preview/apply/re-index persistence;
+   - view/expand/pack, timeline, `doctor check`, fail-open hybrid and explicit semantic
+     refusal.
+
+   The same journey passes on HEAD, which also fixes the shipped export leak and the
+   archive-envelope gap. Real MiniLM semantic and hybrid search answer a paraphrase
+   query that lexical misses, until the next ingest.
+2. **What does not:**
+   - Users run a release whose exports carry credentials verbatim.
+   - Any ordinary ingest switches semantic search off until `cass index --semantic`
+     reruns. That includes stale-on-read catch-up and the scheduler's 15-minute job
+     (#458, reproduced on both binaries). Progressive refinement is fail-closed.
+   - Robot argument-parsing errors (exit 2) use an undocumented envelope: `error` is a
+     string and `kind` is `argument_parsing`, on both binaries.
+   - Watch freshness for an active session is 2–3 minutes, not 5 s.
+   - Indexing has a high fixed memory floor (~700 MB peak for a 9 MB corpus on both binaries).
+   - The owner's own archive is not running anywhere current.
+   - Large-archive memory and read amplification remain partial (#496, #461, #320).
+   - The full lib suite on main is red: 9,086 passed / 16 failed. 12 are native-HNSW
+     append tests that have never passed (FSVI v1/v2). The others are 2 known ANN WAL
+     cases, 1 known GH #515 case and 1 unowned forget re-include case.
+3. **What blocks:** the decision, the scanner scope and the capacity layers above.
+   Technical work items (semantic serving, ANN, `.72` RSS) block quality, not delivery.
+4. **Would finishing all open and in-progress beads close the gap? No.**
+   - Before this pass, nothing owned the capacity outage, the dogfood outage or watch
+     latency.
+   - Several open beads are stale premises: `p3gh0` awaits a retest of a shipped fix;
+     the July `uojcg.*` epics are in progress at P0 with no update since 07-24; `g3zyo`
+     and `yxcga` still name fsqlite 0.3.x pins.
+   - Under the current UBS bar, the existing beads cannot close even when their code
+     is done. Completing them mechanically would still not cut a release.
+5. **Vision goals with no bead before this check:**
+   - native build capacity;
+   - the owner archive / dogfood loop;
+   - watch time-to-searchable for an active session;
+   - the robot argument-parsing error envelope;
+   - a release cadence that keeps users within one period of a landed fix.
+
+   The docs-truth list above goes to `2l1b0.26`, not to a new bead.
+
+### Bridge plan (ordered by user impact, not by ease)
+
+| Order | Outcome | Named acceptance / negative | Owner |
+|---|---|---|---|
+| 1 | **Owner decides the 0.11.0 bar** | A decision recorded on `hutyl`. The recommended form is no-worse-than-v0.10.0 plus a UBS **new-only delta** against a v0.10.0 baseline: zero new criticals, new warnings reviewed. Negative control: one added production `panic!` fails the delta while an unchanged pre-existing finding does not | owner; `hutyl` (comment filed with fresh numbers) |
+| 2 | **Restore native build capacity** | `dsr health all` shows a healthy host per target. The before-output (0/3) is retained as the negative pair; floors are not lowered | new bead `release-infra-dsr-capacity`; owner action (no deletion without permission) |
+| 3 | **Ship 0.11.0 from main** | Journey smoke on each dsr target, with the previous release and the candidate in the same invocation; release notes list known reds and beads; all 14 FIXED_UNRELEASED issues and six promise threads get the version | `yrjna`, `.25` (as narrowed by 1); `p3gh0` re-justified or dropped |
+| 4 | **Make shipping routine** | Two consecutive cadence releases at most 16 days apart, each with a journey receipt per target and a zero-new-critical UBS delta | new bead `release-train-ratchet` (blocked by 1 and 2) |
+| 5 | **Keep semantic serving through ingest** | Serve a quality generation by 2P-set coverage instead of exact fingerprint equality. Named probe: `sem_probe_backfill.sh`, where the paraphrase hit must survive a one-message ingest on the backfill path (it fails today). Old semantic-only hit still returned after a 68-message ingest; negatives for forgotten and Codebuff-updated conversations | `962e8` (design comment filed), `ds7uy.*` |
+| 6 | **Seconds, not minutes, for active sessions under watch** | Stable-prefix ingest for append-only JSONL. `watch_appended_jsonl_line_searchable_within_debounce` (<10 s); negatives for a partial trailing line (ingested exactly once), rewritten-in-place sources (still deferred) and truncation (no duplicates) | new bead `watch-stable-prefix-ingest` |
+| 7 | **One error envelope for robot callers** | `parse_error_envelope_matches_documented_shape`: exit 2 parse errors carry `error{code,kind,message,hint,retryable}` with the helpful extras nested. Negative: `models install --json` examples must start with `cass models`. Golden added with a GOLDEN-CHANGE note | new bead `robot-parse-error-envelope` |
+| 8 | **Owner archive back in service on current main** | `health` 0 and `last_indexed_at` < 24 h on the restored host, and a search for today's session hits (negative: before the restore it misses). Peak RSS, wall time and disk growth recorded on `.72`/`.46` | new bead `dogfood-owner-archive` |
+| 9 | **Current docs tell the truth** | The eight README items above corrected in place, with link/claim checks. Docs never close a feature bead | `2l1b0.26` (comment filed) |
+| 10 | Continue the existing quality work | Unchanged ownership: `.72`/`3zq55`/`irqgt` (whole-job RSS and I/O), `ds7uy.3.3`/`of9i7` (ANN), `5v57k` (UBS backlog burn-down, production criticals first) | existing owners |
+
+Items 1–4 are the whole delivery path, and none of them is code in `src/`. Item 4
+exists so that this check does not have to be repeated in a month with the same
+answer.
+
+### Ambition rounds and refinement (plan space, recorded briefly)
+
+1. **Round 1: from "unblock 0.11.0" to "never block again".** A single release
+   decision repeats the September–October pattern: each release accretes
+   prerequisites until it stops. The ratchet makes the previous release the
+   incumbent and runs it live in the same invocation as the candidate, which is
+   AGENTS.md's vs-incumbent rule applied to releases. That turned item 3 into item 4.
+2. **Round 2: attack where users lose, not where proof is easy.** The largest gap
+   between README promise and runtime is that default hybrid is lexical nearly all the
+   time on an active archive, because any ingest makes the semantic tier unservable.
+   This was reproduced with real MiniLM on both binaries. The second is minute-scale watch
+   latency for the session an agent is in. Both are cheaper to fix than to keep proving: one is a validity
+   predicate, the other a stable-prefix watermark on receipts that already exist. That
+   added items 5 and 6.
+3. **Round 3: the right math, kept small.** Canonical messages are a 2P-set: rows are
+   added, and removed only by explicit forget/dedup/purge. A derived vector generation
+   is valid exactly while its added set is still a subset of the archive and its
+   removal set has no new entries in covered conversations. That predicate replaces
+   exact-equality serving without weakening correctness: a removal or in-place update
+   is still caught. The same lens shows why the UBS delta is not a loosening. The
+   finding set is a multiset over (rule, content fingerprint), and the release check
+   asks whether the candidate's set is a sub-multiset of the baseline's plus reviewed
+   additions. The negative control proves the check can fail.
+
+Refinement passes over the new beads and comments:
+
+1. **Coverage:** each of the 5 NO_BEAD gaps has a leaf; the docs list went to
+   `.26`, not a new bead.
+2. **Falsifiability:** every new leaf names a populated probe and at least one
+   negative a naive fix would fail.
+3. **Proof class:** journey numbers are labelled as a small synthetic corpus, and the
+   HEAD build is labelled thin-LTO. No microbenchmark is presented as a whole-job
+   result.
+4. **Dependencies:** the ratchet is blocked by `hutyl` and the capacity bead; `yrjna`
+   gets the capacity bead as a blocker; `br dep cycles` stays empty.
+5. **Convergence:** a fifth read found nothing to add without duplicating an existing
+   owner.
+
+---
+
+## Release qualification follow-up: 2026-10-28 (#537 / #530)
+
+**Release verdict: BLOCKED. No corrected release or release candidate was built
+or published in this follow-up.** The latest GitHub release remains
+[`v0.10.0`](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.10.0),
+published `2026-10-02T02:54:21Z`. There is no first released version containing
+the subsequent #530 corrections to recommend, and no justified release date.
+`release-bar-decision-hutyl` remains an unresolved owner decision; its proposed
+"no worse than v0.10.0" bar is not approval to remove prerequisites.
+
+This is an additive qualification and operator-guidance update. It supersedes
+the older assessment's uncertainty about the probed Linux executable's release
+provenance, and its description of `.84` / `.85` as still unimplemented. It does
+not supersede the existing release requirements or certify current source.
+No production code, dependency, test assertion, skip, scanner policy, or bead
+status is changed by this documentation update.
+
+### Identity and new evidence
+
+The reviewed source and tracker snapshot are `main` at
+`19207dcf912fb8d6e104116cde6976eeb701c1d4`. The issue discussions include
+[the Oct27 freshness report](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/537#issuecomment-6456648306),
+[the existing qualification follow-up](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/537#issuecomment-6460007754),
+and [the #530 correction history](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/530#issuecomment-6378296003).
+Already landed corrections include surplus-document refusal (`b605426e`), archive
+writer admission (`35fcb9d1`), append-safe targeted recovery (`bef5ae45`), and
+avoiding whole-history semantic preparation (`fbff882b`). Workspace exclusions
+and selective history retention are also implemented and tested in source; their
+presence on `main` does not make them available in v0.10.0.
+
+The actual published Linux amd64 archive was downloaded and matched its GitHub
+asset digest, `SHA256SUMS`, and release manifest:
+
+- Archive SHA-256: `638ea8a8a9023c2e046bf8868392e6191218b89cf006e81af3ca205b546c4681`.
+- Extracted executable SHA-256: `d221153d8e0a79ae37eb492855d32cd2aadb98e707c74c37445f779a46c626dd`.
+- Release source commit: `2bfe708d35734656f0d34eab112bf051e354519c`.
+
+The executable is byte-identical to the previously probed binary whose provenance
+was unknown. This establishes that executable's identity as the published Linux
+asset; its own `build_commit: unknown` is still not candidate source attestation.
+Its in-memory selftest succeeded without accessing an archive. Other platforms'
+listed digests were inspected, but their binaries were not downloaded or run.
+
+| Execution or check | Observed result | Evidence boundary |
+|---|---|---|
+| Published v0.10.0, isolated Claude JSONL, 40 conversations / 800 messages | Initial index exit 0, 5.393 s, kernel peak RSS 137,652 KiB; native status shows 800 canonical / live / checkpoint messages and matching completed fingerprints; unique tail search succeeds | Small released-binary baseline, not current-source or large-archive qualification |
+| Same baseline through the proposed qualification lane | `NO_VERDICT`: released JSON lacks `indexing_stats.deferred_active_sources` | Missing candidate evidence is not silently treated as zero deferred sources |
+| 31k / 1.71m synthetic released-binary baseline | Externally stopped with SIGKILL after 808.181 s when shared-host free space crossed the guard's 3 GiB threshold; kernel peak RSS 616,124 KiB; sampled logical reads 31,502,555,478 bytes | Initial full build incomplete; **NO_VERDICT**, not the reporter's incremental workload or a candidate pass |
+| Proposed qualification runner's own controls | 28 tests pass, including actual child timeout, memory-budget rejection, and process reaping | Tests the runner's evidence handling; does not execute the CASS Rust integration tests |
+| Proposed freshness change, pinned nightly rustfmt | Parse/format check exit 0; `git diff --check` exit 0 | No compiler, Clippy, or Rust runtime verdict |
+| Frozen proposed Rust files, pinned strict UBS with AST engine | Exit 1: 46 critical / 10,442 warning / 2,873 informational findings | Red; all 46 critical sites are unchanged baseline code, but the warning set is not fully dispositioned |
+| Frozen qualification runner and controls, pinned strict UBS | Exit 1: 0 critical / 2 warning / 162 informational findings | Red; narrow review found no control transfer in the flagged `finally` and confirmed `wait4` reaping, but no scanner-policy correction was qualified |
+| Required `scripts/gate.sh --docs-truth` with indexing, archive, privacy, robot, Pages and search integration targets | `STAGE=rch EXIT=127`; source/fmt/Clippy/test/golden/UBS terminal receipts missing | RCH is unavailable in this execution environment. **NO_VERDICT on current-source validation**, not a failing Rust test result |
+
+The full-size fixture has exactly 31,000 conversations, 1,710,000 messages,
+1,397,449,788 source bytes, and one 32,768-message conversation. Its inventory
+SHA-256 is `4289a86d2fcb17dece7a711bd6eae7a3428774bf5d912cf098246fc0526d91b0`.
+It contains mixed natural-language/code sizes and dates, but only Claude JSONL;
+it does not reproduce the reporter's provider mix, shared databases, existing
+canonical size, or raw-mirror history. The binary's actual exclusion event confirms
+exactly one enabled connector; the retained invocation environment supplies its
+explicit synthetic Claude root. The process used a 6 GiB RSS
+observation limit and 1,200-second initial-build deadline; resource readings are
+for the measured child, not a hard process-tree/cgroup memory proof. Sampled
+`/proc` I/O counters are lower bounds, and cache state was not controlled.
+The scale run started before the runner's final self-identity check was added;
+its retained raw observations cannot qualify the final runner. Concurrent writers,
+incremental passes, crash recovery and candidate search continuity did not run
+in that baseline lane.
+
+The disk guard verified the executable and process identity (PID 32270) before
+signaling only that owned synthetic benchmark process group at
+`2026-10-28T20:31:45Z`. Its observation was 3,114,962,944 free bytes against a
+3,221,225,472-byte threshold. The raw runner receipt is preserved as
+`indexing_verdict: FAIL`, `initial: exit -9`, `release_verdict: NO_VERDICT`; the
+known external resource stop means there is no completed product qualification
+verdict. It is neither an application crash diagnosis nor a reproduced scheduled
+incremental timeout. The whole shared-host free-space decline is not attributed
+to CASS. The measured CASS child's sampled I/O also records 310,702,080 physical
+read bytes and 8,939,986,944 write bytes; these are incomplete-run observations,
+not a completed build cost or an incremental budget.
+After the stop, all 31,000 original source files were independently checked against
+the retained inventory: sizes and SHA-256 values were unchanged. The fixture's
+data directory occupied 11,622,572,032 allocated bytes at that observation. This
+establishes source preservation and a file-footprint observation, not canonical
+integrity, cleanup completion, or a safe steady-state storage bound.
+
+### Successful indexing with a stale timestamp
+
+`persist_final_index_run_metadata_with_writer` deliberately preserves a successful
+indexing result when the final metadata write fails, logging the failure instead
+of discarding already durable indexing work. Consequently, exit 0 with an
+unchanged `last_indexed_at` is a real possible outcome. This explains a class of
+the reported symptom; it is **not a demonstrated root cause on the reporter's
+host**. The two metadata writes are not atomic: a scan marker can commit before
+the indexed marker fails, and a close failure need not imply rollback.
+
+A focused, uncommitted correction has been prepared to expose an optional
+`indexing_stats.freshness_metadata` receipt with `status: persisted | deferred`,
+the attempted indexed timestamp, and the confirmed durable scan/indexed values.
+On failure, confirmed values are null: they are unconfirmed, not proof of absence
+or rollback. A run with no write attempt has no receipt. The receipt is cleared
+when a reused progress object starts another run. This preserves the existing
+durable-index success policy while making monitoring distinguish a completed
+indexing operation from confirmed freshness persistence.
+
+Prepared Rust controls cover actual read-only write refusal, partial metadata
+writes and successful retry, denied archive-writer admission, reuse of progress
+across runs, two unchanged CLI passes, canonical-only force rebuilds, and held-open
+source deferral followed by catch-up. They have **not been compiled or executed**
+here. Neither this code nor the new runner is committed by this update: the
+required current-source gate is unavailable and their strict scans are red.
+
+Keep the existing meanings distinct: `last_scan_ts` can remain unchanged when
+sources are deferred; canonical-only rebuilds must not imply a source scan; empty
+watch callbacks must not manufacture freshness. A fresh timestamp also does not
+prove every active source was ingested. On the reviewed source, reusing an
+`--idempotency-key` can replay a cached successful result instead of retrying a
+deferred metadata write; it is not a recovery mechanism. The reporter's examples
+do not establish that this option was involved.
+
+### Requirements that still block release
+
+These are acceptance obligations, not a request to remove safeguards:
+
+| Requirement / owner | Outstanding acceptance |
+|---|---|
+| Exact-source gate: `55wh0`, `5v57k`, `yrjna`, `.25` | Run the complete required RCH gate on one frozen source identity with positive test counts and terminal receipts; resolve real failures and qualify any justified scanner correction with controls. The prior retained full selected run reports 12 HNSW failures and 106 critical / 20,722 UBS warnings; those are prior-snapshot findings, not new executions or directly comparable to this two-file scan. |
+| Indexing cost and integrity: `3zq55`, `irqgt`, `p3gh0`, `.46`, `.72`, `iify0`, `.24` | On a current-source release candidate, run the full 31k / 1.71m archive, unchanged passes, append, and concurrent writer cases. Measure end-to-end RSS, I/O, disk growth and elapsed time, including startup/finalization; prove no duplicate/missing messages, no unnecessary rebuild, honest active-source deferral and eventual catch-up. The earlier 31k-conversation incremental fixture contained 310k messages, so it is not a 1.71m-message qualification. |
+| Lexical generation and recovery: #530, `h3jnv`, `lndgg`, `.48` | Preserve equality between canonical snapshot fingerprints, checkpoint counts and the published live generation; refuse surplus/stale generations. Kill at the staged commit/checkpoint gap, resume without source loss or duplicate publication, and keep the previously published generation searchable during rebuild. All of this requires actual concurrent execution, not merely test definitions. |
+| Native logical-archive recovery: `svhcf`, `p94yt`, `.34` | Run the original populated probes without their current skips on approved, uniformly pinned released dependencies. `publication_materializes_wal_rows_without_borrowing_replay_sidecars` is blocked by the 0.4.12 read-only freelist-integrity false rejection; `explicit_or_unattested_collations_keep_binary_order_and_verify` is blocked by PK/collation introspection. Preserve WAL materialization, integrity checks, no-clobber publication and source immutability. Latest upstream release was freshly checked as v0.4.12; the known upstream main fix is not yet in an adoptable tagged update. |
+| Semantic/native ANN: `of9i7`, `ds7uy.3.3`, `fdvur` | Resolve the identity-complete FSVI v2/native-reader mismatch and qualify actual owner-supported incremental graph updates and tombstone admission. Do not downgrade fixtures, drop identity checks, use private upstream layout, or call a full rebuild incremental. |
+| Privacy and robot errors: `.84`, `.85`, `.23` | The shared export privacy boundary and shared archive error envelope are implemented. Retained native evidence for compile inputs verified identical at `870797c0` includes five CLI privacy controls, a decrypted encrypted-payload check, source/DB/WAL immutability controls, and the archive error negative. The later rerun is self-verification, not a new full-gate pass. These fixes remain gate-blocked rather than unimplemented. Requalify the exact candidate, raw/canonical HTML and generic exports, TUI policy parity and explicit sensitive-output receipts; `.23` separately retains browser/publication recovery acceptance. |
+| Historical archive and platform acceptance: `.2`, `.4`, `.41`, `.45`, `.47`, `scohn`, `aegfi`, `yviq2` | Obtain the required damaged/historical archive, orphan/legacy-FTS writer-reader, and Windows writer evidence; finish DSR cross-platform build/install/artifact acceptance. DSR is not available here. The previously recorded macOS disk-floor failure is historical evidence, not a fresh fleet-health measurement. |
+
+The durable release graph still lists nonclosed blocking dependencies of `yrjna`:
+`55wh0`, `5v57k`, `irqgt`, `p3gh0`. The `.25` acceptance bead additionally retains
+`.11`, `.2`, `.20`, `.22`, `.23`, `.24`, `.4`, `.41`, `.45`, `.47`, `.84`, `aegfi`,
+`iify0`, `scohn`, and `yviq2`. Retrieval, answer-pack, terminal, privacy and sync
+acceptance cannot be silently reclassified as optional to ship this fix.
+The `yviq2` title is stale about missing configuration: the DSR project exists;
+its remaining acceptance is the blocker. GitHub Actions requirements in historical
+text are superseded by the permanent Actions ban. The FAD git dependency blocks
+crates.io publication of this manifest, not by itself the locked-source GitHub
+binary channel. Neither distinction clears the actual release gates.
+
+### Supported guidance while deployments require released binaries
+
+- There is no released upgrade containing these corrections yet. Do not recommend
+  a main-branch build, an unqualified candidate, a fabricated version number, or a
+  release date to a released-only deployment.
+- Serialize scheduled indexing so one invocation owns the work. Provide a quiet
+  maintenance window long enough for one complete pass; avoid a loop of forced
+  rebuilds killed at every scheduled deadline. This is operational mitigation,
+  not a claim that v0.10.0 can meet the reporter's 20-minute window.
+- `CASS_AUTO_REFRESH=0` and lexical search with `--no-maintenance` can stop
+  read-triggered maintenance while investigating; they do not disable OS-scheduled
+  index jobs. For example, `CASS_AUTO_REFRESH=0 cass search '<known recent term>'
+  --mode lexical --no-maintenance --robot --robot-meta` observes lexical coverage
+  without establishing canonical archive integrity.
+- Retain stdout JSON, stderr, exit status, start/end time, `status` / `health`, the
+  JSON `last_indexed_at` and its age, and searches for known recent messages.
+  Compare the timestamp across invocations. Exit 0 and a convenience freshness
+  boolean alone do not establish successful catch-up. The new deferred-source and
+  metadata receipts described above are unavailable in v0.10.0.
+- v0.10.0 supports `cass forget --source-glob '<reviewed-glob>' --json` to preview
+  deletion selection, followed by `--apply` only after scope review and a verified
+  backup. Preview does not apply the requested deletions, but the tag opens the
+  archive through the ordinary writable storage opener; do not describe it as a
+  guaranteed mutation-free inspection. Glob matching crosses directories, and
+  shared stores cannot be separated into individual workspaces by a file glob.
+  This removes CASS history, not source files. Universal workspace exclusion and
+  workspace/age-selective forgetting on main are not released options. Apply can
+  rebuild derived indexes, and a later change to a shared source can reintroduce
+  its forgotten conversations unless the supported source scope is excluded.
+- `CASS_EXCLUDE_PATHS` in v0.10.0 applies to Claude, Codex and Pi, not every
+  connector. Validate the installed provider's supported scope before relying on
+  it to prevent re-ingestion of forgotten history.
+- `cass mirror prune --older-than 30d --json` previews eligible raw-mirror removal;
+  use its provider/source-path selectors and inspect the result before `--apply`.
+  Do not prune the only surviving evidence needed for recovery. Raw-mirror
+  retention is separate from canonical history and lexical freshness. Disabling
+  new mirror capture reduces recoverability and is not a general indexing fix.
+- The demonstrated default raw-source export privacy defect remains in v0.10.0.
+  Keep its HTML/generic exports private until contents, titles, filenames and
+  receipts have been inspected and redacted in a separate sharing copy. Index-time
+  redaction and encryption do not make a secret-bearing exported payload safe to
+  share. Preserve the original source evidence.
+- For suspected corruption, preserve a consistent archive backup including
+  committed WAL and original sources; use the supported `cass doctor check
+  --json`, `cass doctor repair --dry-run --json`, and backup list/verify/restore
+  rehearsal workflow before approving repairs. Do not hand-delete DB, lexical,
+  mirror, lock, WAL or SHM files. Avoid stock `sqlite3` against the live v0.10.0
+  archive: the known old-engine interoperability failure can leave later writes
+  refusing admission. Inspect a consistent copy when a stock-engine comparison
+  is needed, including for stock `sqlite3 -readonly`; it is not a substitute for
+  native recovery acceptance. v0.10.0's ordinary native read-only opener can also
+  perform recovery writes, so deeper doctor diagnostics are not promised to be
+  mutation-free. A large archive can return integrity unverified/deferred; open
+  success and row counts are not an integrity certificate.
+
+Release delivery can resume after the applicable requirements above have positive
+exact-candidate evidence and the DSR artifacts pass checksum, identity, installation
+and platform smoke verification. Then name the actual first tag containing the
+fixes and provide upgrade/rollback instructions tied to those artifacts. This
+follow-up records no permission to lower that bar.
+
+## Assessment: 2026-10-27 (QuietPond)
+
+**Verdict: CASS delivers its core search value as a useful alpha. It is not yet a
+fully qualified, consistently bounded, completely integrated realization of its
+vision.** The main problems are unfinished serving integration, resource costs on
+real archives, specific privacy/recovery contracts, and delivering validated fixes
+to users. This is not a project consisting mainly of stubs.
+
+This section supersedes earlier assessments below where they disagree. Earlier
+evidence and plans remain intact for provenance. No implementation bead was closed
+by this assessment, no safety gate was relaxed, and no production code changed.
+
+### Scope, identity and evidence boundaries
+
+- Reviewed `main` at `1bf194de686566b41d19d2d928a2cde66f92bc84`, 774 commits after
+  the `v0.10.0` release commit. Cargo still says `0.10.0`. A live remote-ref query
+  found `origin/main` at the same SHA; commit count is delivery context, not proof.
+- Read all 663 lines of `/data/projects/AGENTS.md`, all 1,382 lines of repository
+  `AGENTS.md`, and all 3,885 lines of `README.md` before source investigation.
+  Three read-only subsystem investigations read the founding, search/semantic,
+  optimization, storage/recovery, Pages, TUI, analytics and testing plans and
+  current contracts. The answer-pack and swarm contracts and prior assessments
+  were included. Generic CLI advice is reference material, not an automatic
+  expansion of CASS's product commitments.
+- Source scale at this SHA: 553 Rust files / 727,187 lines under `src/`. The four
+  shared files `lib.rs`, `indexer/mod.rs`, `storage/sqlite.rs` and `ui/app.rs`
+  total 301,359 lines. This explains review and qualification cost; line count
+  does not measure feature completion.
+- Fresh executable probes used `/home/ubuntu/.local/bin/cass`, SHA-256
+  `d221153d8e0a79ae37eb492855d32cd2aadb98e707c74c37445f779a46c626dd`.
+  It reports `0.10.0`, `build_commit: unknown`, 32 connectors, and no
+  `source_ingest_reuse` capability. Reviewed HEAD has 34 runtime connectors and
+  that capability. **This executable cannot certify current HEAD or be identified
+  as the exact published release merely from its version.**
+- The default home archive on this host is uninitialized. Its health/status
+  diagnosis and missing-index refusals were truthful; no operator archive was
+  indexed or repaired. Positive probes used one isolated synthetic remote mirror
+  and `sources reingest`, whose closed local-root map avoids default home scans.
+- Evidence is retained privately under
+  `/data/tmp/cass-reality-check-20261027-quietpond/`: runtime JSON/exit/stderr
+  records, fixture source and outputs, public release/issue observations, DSR/RCH
+  receipts, source-review memo, and original tracker snapshot. Temporary paths
+  are local receipts, not a promise of permanent artifact hosting.
+
+### What actually ran
+
+| Probe | Observed result | What it establishes |
+|---|---|---|
+| `cass selftest --json` | Exit 0; in-memory FrankenSQLite typed round trip; archive not accessed | This installed executable is functional; no disk-archive qualification |
+| Home `health` / `status` | Health exit 1, status exit 0; `not_initialized`; health latency 8 ms | Truthful empty-install diagnosis, not large-archive latency |
+| Synthetic `sources reingest --source fixture --full --json` | Exit 0; 1 conversation / 2 messages, 2,932 ms | Real mirror-to-canonical-to-lexical journey without SSH or home discovery |
+| Repeat identical reingest | Exit 0; still 1 / 2, 2,929 ms | No duplicate canonical messages in this fixture |
+| Lexical search, `--no-maintenance --robot-meta` | Exit 0; 2 hits, exact total 2, no timeout; synthetic credential absent and `[REDACTED]` present | Real retrieval, index redaction and bounded metadata on this tiny corpus |
+| Default hybrid, missing MiniLM | Exit 0; 2 lexical hits; requested hybrid, realized lexical, explicit consent/model fallback | Correct fail-open behavior; no model downloaded |
+| Explicit semantic, missing MiniLM | Exit 15, `semantic-unavailable` | No same-dimensional hash substitution |
+| `pack --max-tokens 4000 --require-evidence` | Exit 0; `cass.pack.v2`, 2 evidence items / 1 session, strict privacy, no synthetic credential | Extractive pack path works. Remote physical spans are null/`verified=false`; no physical-citation proof |
+| Canonical `view` using explicit DB, source, conversation and message index | Exit 0; secret absent | Search identity can reach the redacted stored message |
+| Persistent `serve --stdio` | Status, two searches and shutdown all succeed; 2 hits each, second search `reader_reused=true` | Real retained lexical-reader reuse; no semantic/ANN or MCP-handshake qualification |
+| Direct-source HTML and Markdown export | Exit 0; synthetic recognized password retained in title/body and HTML JSON receipt | Reproduced privacy-contract defect, now `.84` |
+| HTML export of the already indexed synthetic Codex source | Query output redacted, same readable source export contains credential | Raw-source preference bypasses canonical redaction even when indexed |
+| Missing-file `archive verify` | Exit 14; one JSON error, empty stdout, missing `hint` field | Reproduced delegated error-shape defect, now `.85` |
+| Browser worker Node tests | 51 pass, 0 fail/skip | Real WebCrypto/HKDF/DEFLATE/worker/HTTP behavior; controlled Argon2 input, no browser/SQLite-WASM/native Argon2 proof |
+| `scripts/validate_docs.sh --links` | Exit 1; 82 findings across repository documents, none naming this refreshed report | Findings require classification: fragment-only Markdown links are falsely tested as filesystem paths; this is not proof of 82 broken links |
+| Full `scripts/gate.sh --docs-truth` | RCH selection outcome unconfirmed; no source/fmt/clippy/test/golden/UBS terminal stage | **NO_VERDICT on current-source validation**, not a failing test suite |
+
+The first `view` probes incorrectly put `--data-dir` on that subcommand and exited
+2. The successful probe used the supported global `--db` plus `CASS_DATA_DIR` and
+canonical coordinates. Failed probe outputs remain in the evidence directory.
+The sub-60 ms figure is an engine claim; a two-message fixture cannot validate
+one-shot latency, quality, memory or I/O on a multi-million-message archive.
+
+The full gate's retained receipt is `gate.receipt` plus `gate.console.log`:
+`STAGE=rch EXIT=1`, all requested stage receipts missing. The original lease is
+`rchw-b9ba40ab-e124-4d90-a9e0-dc2aa58b6495`; same-identity cancellation was not
+acknowledged (`not_queued`), and recovery reports the original wrapper absent or
+unverified before admission. The job was not replayed or run locally. The raw
+lease and errors remain evidence of unresolved execution custody, not permission
+to restart shared infrastructure or erase locks.
+
+### Vision checklist and work coverage
+
+`WORKING*` means the narrow installed-executable fixture above passed. It does not
+mean fresh HEAD or full release qualification. `PARTIAL` includes a real
+implementation whose stated integration or acceptance is unfinished. `UNPROVEN`
+means the promised scope lacks current execution evidence. Existing bead suffixes
+below use the common `coding_agent_session_search-` prefix.
+
+| # | Testable promise / source | Current reality and evidence | Remaining ownership |
+|---|---|---|---|
+| 1 | Discover/normalize all advertised providers; README connectors | PARTIAL qualification; FAD registry plus CASS adapters are real (`connectors/mod.rs:380`); 34 on HEAD, 32 in probe binary | `cooow`, `.24`, provider-specific beads |
+| 2 | Same completeness and exclusions in batch/watch/retry | PARTIAL: Continue watch/retry constructs upstream connector instead of CASS adapter (`indexer/mod.rs:31522`, `:32152`) | `cooow`, refined this pass |
+| 3 | Canonical pure-Rust SQLite production storage | WORKING* for fixture; FrankenStorage persists rows; `rusqlite` dev-only. External `sqlite3` repair subprocesses remain | `.65`, integrity/release owners |
+| 4 | Dedup and stable source/conversation/message identity | WORKING* repeated reingest; native-ID/shared-store reconciliation is implemented | `fx9fd`, `.24`, larger corpus acceptance |
+| 5 | Cheap unchanged/incremental indexing | PARTIAL: durable reuse exists; Oct27 `3zq55` reports 5.3 GiB logical reads on no-change and 8.7 GiB for one append | `3zq55`, `ayhvu`, `irqgt` |
+| 6 | Responsive bounded indexing and durable resume | PARTIAL: resident controller and staged checkpoints are wired; process-wide peaks and startup/finalization still matter | `.46`, `.72`, `xcqqa`, `xn5a4`, `index-bounded-shutdown-gm63q` |
+| 7 | Preserve raw evidence without uncontrolled growth | PARTIAL qualification: chunking, budgets, prefix-preserving retention and staging reclaim implemented | `.26`/`.69` for truthful policy docs; retention owners retain acceptance |
+| 8 | Archive-first doctor, safe repairs and restore | PARTIAL: actual plans, candidates, fingerprints, receipts and backups; damaged-owner-archive recovery unproven | `scohn`, `.2`, `.3`, `.4`, `.6` |
+| 9 | Versioned streaming logical archive round trip | PARTIAL: v3 codec/schema bridges/extraction implemented; pinned-engine restore and PK-collation acceptance fail/skip | `.34`, `svhcf`, `p94yt` |
+| 10 | Correct BM25/Boolean/phrase/wildcard/filter search | WORKING* basic lexical; full source implements standard grammar and bounded fuel through Quill | `search_metamorphic`, `.11`, `.68`, cold/open/query-specific beads |
+| 11 | Self-healing derived lexical generations | PARTIAL: staged atomic publish, background repair and retained generations implemented | `h3jnv`, `.46`, `.48`, native publication `lndgg` |
+| 12 | Default hybrid with explicit degradation | WORKING* missing-model fail-open and explicit semantic refusal | `.11`, `ds7uy.4`, `jyfuq` for complete model-backed lifecycle |
+| 13 | Useful local native MiniLM retrieval with explicit acquisition | Implemented; prior scoped native evidence exists; UNPROVEN on this HEAD/run | `jyfuq.2`, `dl6ye`, `bzurv`, `.33` |
+| 14 | Owner-backed progressive quality/fast search | PARTIAL architecture: private owner capability always false; ordinary CLI collapses progressive to single (`vector_index.rs:224`, `lib.rs:33219`) | `ds7uy.1`–`.5`, `jyfuq` |
+| 15 | Immutable semantic generation adoption and continuous serving through ingest | PARTIAL: new retained/current/hydration APIs are library-only; ordinary loader refuses current pointer without owner | `ds7uy.1`–`.4`, `962e8` |
+| 16 | Native ANN acceleration, truthful readiness and WAL/shard coverage | PARTIAL: exact fallback protects correctness; persistent semantic ANN disabled; `hnsw_ready=false` distinct from presence | `ds7uy.3.3`, `wfm4e`, `of9i7`, `fdvur`, `3rz35` |
+| 17 | Warm daemon and retained service avoid repeated setup | WORKING* lexical reader reuse; actual authenticated native daemon/service code exists | `.32`, native lifecycle/owner acceptance, `o9ixv` |
+| 18 | Bounded robot retrieval, interpretation echo and no silent substitution | WORKING* positive/error/fallback samples; broad contracts implemented | `.11`, `.68`, budget/large-archive owners |
+| 19 | Stable robot envelopes, discovery, schemas and goldens | PARTIAL: many golden surfaces; archive lacks promised hint; assertion-only and introspection gaps remain | New `.85`, `eq69o`, `.69`, `.20` |
+| 20 | Deterministic cited, private answer packs | WORKING* narrow extraction/privacy; full MAY/MUST reconciliation incomplete | `.20`; `ANSWER_PACKS_CONFORMANCE_MATRIX.md` is not a passing certificate |
+| 21 | Evidence distinguishes landed, trusted, stale and failed attempts | PARTIAL: live correlation gives likely/unverified/stale; claim-specific trusted/failed proof remains outside ordinary correlation | Existing guided/trust and swarm evidence epics |
+| 22 | Useful live swarm cockpit without taking ownership | PARTIAL: bounded Git/Beads/Mail/RCH and passive CASS/proof metadata readers exist; evidence is unverified, counts can be unknown | `.16`–`.18`, `oh96l`, `swarm-coordination-intelligence-gnrxb` |
+| 23 | Guided plans execute and verify their advertised operations | PARTIAL: read-only proofs, support bundle and lexical repair adapters exist; other mutations explicitly unavailable (`guide_runner.rs:1020`) | `.19`, `guided-ops-repro-trust-5u82n` |
+| 24 | Rich TUI navigation, ranking, filters, details, views and recording | Implemented, extensive tests; UNPROVEN current real-terminal/large-archive journeys | `.22`, residual `.54`, `.28` |
+| 25 | Persistent CLI/TUI bookmarks | Implemented including Alt+E, BookmarkStore and populated tests; no fresh HEAD execution | `.26`/`.69` correct stale no-keybinding text |
+| 26 | Correct shared CLI/TUI token analytics with bounded filters | PARTIAL qualification: accounting/query/rebuild layers real; whole-ledger accuracy and memory remain | `.21`, `xn5a4`, `xcqqa`, residual `rril3` |
+| 27 | Safe portable HTML/generic export with optional encryption | PARTIAL: rendering/encryption real; direct raw source bypasses credential redaction | **New `.84`**, `.23`, `sd5o9` |
+| 28 | Private filtered Pages export, password/recovery/revoke/rotate | Real implementation and prior native browser evidence; PARTIAL overall acceptance | `.23`, `70o8f`, key/export tests |
+| 29 | Browser memory/offline/mobile/accessibility goals from Pages plan | PARTIAL: plaintext DB remains memory-only; 32 MiB prefetch bounds ciphertext, not total RSS; OPFS reuse unavailable (`database.js:7`) | `.23`, `.26` for historical disposition |
+| 30 | Real multi-machine additive sync, provenance and source filtering | WORKING* mirror reingest only; real transport implemented; complete fleet proof separate | `.24`, `av59c`, source-specific issue owners |
+| 31 | Scheduled freshness catches up without duplicate or unsafe work | Implemented timers, guards and durable state; UNPROVEN active fleet/macOS/large-archive convergence | `.24`, `962e8`, `synme`, `362yj`, `0m49m` |
+| 32 | Concurrent storage improves whole indexing jobs | Engine mode on; single writer default; experimental parallel persist off. Benefit UNPROVEN | `.29`; do not claim enabled default parallel writers |
+| 33 | Current, checksum-verified cross-platform installation/release | PARTIAL: DSR project configured; latest release lags HEAD and crates.io further lags | `.25`, `yrjna`, `5v57k`, `zztql`, platform/security owners |
+| 34 | Honest performance and consistent current documentation | PARTIAL: meaningful measured fixes coexist with open whole-job costs and historical contradictions | `.26`, `.69`, `3zq55`, `.72`, `o9ixv`, `.11` |
+
+Keyword scan found no committed `todo!()`/`unimplemented!()` sites under `src/`;
+AST checks on the dispatch/search/guide entry paths also found none. This is a
+bounded placeholder check, not a proof that every path works. The meaningful gaps
+are demonstrated refusals, disabled integrations, measured costs and missing
+acceptance, rather than the number of TODO comments.
+
+### Newly uncovered gaps and specific existing gaps
+
+**`.84` — raw-source export redaction parity, P1.** The installed-binary control
+has redacted canonical search and canonical drill-down, yet raw HTML exports
+reintroduce the same recognized password. Both generic `run_export` and
+`run_export_html` prefer a readable local JSONL through the helpers around
+`lib.rs:107246`; the raw preferences are around `:114055` and `:114701`.
+HTML and Markdown probes include title/body/receipt coverage. The fix belongs at
+the sharing boundary with the existing redactor, visible effective policy, and
+an explicit sensitive raw-fidelity option if that workflow is retained. Preserve
+source evidence and message identity. Narrowing the README alone does not fix it.
+
+**`.85` — archive robot envelope, P2.** `main.rs:347` builds a separate four-field
+error; `handle_fatal_error` at `:169` builds the advertised five-field error with
+nullable `hint`. Use the shared serializer while preserving archive classification,
+stderr-only failure and no-clobber behavior. A real missing-file negative must fail
+against the current implementation and pass after the fix.
+
+**Continue adapter parity remains under `cooow`.** Normal scans use the CASS
+Continue adapter; watch/retry use FAD directly. Test identical incomplete,
+backdated and excluded snapshots through all entry points. A registry count alone
+cannot prove that the retry/completion policies agree.
+
+**Documentation validation has a concrete parsing defect under existing `.26`.**
+The fresh link-only run reports 82 findings. `check_links` extracts a path using a
+pattern requiring a non-`#` first character; a fragment-only `[label](#anchor)`
+therefore remains the entire original Markdown expression, fails the subsequent
+`#` check, and gets tested as a nonexistent file. The retained log contains many
+such historical-plan TOC links. Fix the parser with valid fragment/relative-link
+controls and a genuinely missing-target negative; preserve real link checks and
+classify the remaining findings. Do not delete the links or weaken the gate to
+make this report green.
+
+**Logical restore is not complete on the pin.** `scripts/gate.sh` retains named
+bin-test skips for `svhcf` and `p94yt`. The former records fsqlite 0.4.12 rejecting
+a valid WAL-materialized candidate's freelist during read-only snapshot integrity
+checking; upstream fix `58ddae0de` is recorded but not adopted here. Passing a
+selected gate would not clear those excluded populated probes.
+
+**Semantic serving needs adoption, not another type layer.** Keep producer,
+identity and owner guards. Connect immutable writers/readers, current-source
+hydration, ordinary CLI/TUI/service and readiness as one unit, then qualify real
+MiniLM/HNSW lifecycle, independent quality candidates, source mutation and restart.
+Setting an owner flag true or regenerating graph fixtures would not do this.
+
+**Resource efficiency remains a product issue.** The latest `3zq55` comment
+contains actual Oct27 current-main observations on a synthetic 31k-session archive:
+13.0–13.1 s / 5,318 MiB logical reads unchanged, 19.0 s / 8,718 MiB / 4.18 GiB
+peak RSS after one append. These are earlier retained measurements, not this
+session's benchmark. The same-day `w5137` live release A/B reports a fixed
+quadratic mirror walk, 1,437.7 s versus 1,798.2 s full indexing, with main's peak
+RSS about 0.6 GiB higher. A legitimate throughput gain does not erase that loss or
+prove the process-wide budget. Attack the observed whole-job cost next.
+
+### Shipped state and blockers
+
+Live observations on Oct27: the GitHub release API reports
+[`v0.10.0`](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.10.0)
+published `2026-10-02T02:54:21Z`; the crates.io API reports
+[`coding-agent-search 0.7.0`](https://crates.io/crates/coding-agent-search/0.7.0).
+The release tag's `Cargo.lock` has fsqlite/core `0.4.6`; reviewed main pins the
+uniform `0.4.12` family. Current runtime qualification notes for the newer family
+are useful scope-specific evidence, and do not prove repair of damaged archives.
+The FAD git revision still prevents publishing this manifest directly to crates.io.
+
+DSR is configured under `coding_agent_session_search`, with Linux amd64/arm64,
+macOS arm64 and Windows amd64 targets. `dsr health all` reports Linux and Windows
+healthy; macOS has 14.58 GiB free and fails the existing 20 GiB admission floor.
+The alias `cass` is not registered; its initial lookup failure is not evidence of
+a missing project config. No release was built or published in this assessment.
+
+The Oct26 `browser-e2e-lane-bnueb` closeout records actual macOS browser execution
+at `640ac09c`: 24 encryption + 39 HTML + 38 Pages + 23 CDN tests passed, with two
+explicit WebKit skips. This supersedes the earlier claim that the browser lane
+never runs. It does not establish current HEAD, Windows, mobile/accessibility,
+complete offline reload/search, large-memory or publication-failure qualification.
+The new 51-test Node run is additional narrow evidence, not a replacement.
+
+Strict UBS (`5v57k`), exact-current-source acceptance, remaining platform cases,
+the known storage probes and semantic/resource integration still constrain release
+claims. `release-bar-decision-hutyl` is an existing owner decision, not an approved
+exception. This assessment changes no release gate and infers no approval from
+time elapsed, a prior release's known issues or a documentation edit.
+
+### Work graph and the five reality-check answers
+
+`br doctor` initially found DB/JSONL count and ID drift: 126 durable issues were
+missing from the local materialization. `br sync --import-only --json` succeeded
+with 126 created / 137 updated / 0 removed. Subsequent sync status reports 2,465
+exportable DB issues and 2,465 unique JSONL IDs, no drift. The baseline was 2,298
+closed, 82 open, 54 in progress, 30 blocked, one tombstone. No database or recovery
+artifact was rebuilt or deleted. Graph structure was held by one reservation owner.
+
+All 34 live open GitHub issues had at least one corresponding durable bead when
+matching issue identifiers in titles/descriptions. Some have only closed fixes
+plus a release-delivery obligation; that is not proof the reporter is fixed in the
+installed release. No unsolicited public comments or issue closures were made.
+
+1. **Working:** the actual ingestion/canonical/lexical/fallback/pack/drill-down/
+   retained-service path passed on isolated synthetic data with the installed
+   executable. TUI, analytics, repair, native semantic, encryption and Pages have
+   substantial reachable implementations and prior scoped proof. They are not all
+   freshly qualified in this run.
+2. **Missing or incomplete:** `.84`/`.85`, adapter consistency, current semantic
+   serving adoption/progressive/native ANN, ongoing-ingest semantic availability,
+   bounded whole-process work and complete platform/browser/archive acceptance.
+3. **Blocking:** unfinished integration and specific engine/API behavior, measured
+   scale costs, the unconfirmed RCH execution, macOS admission, strict UBS, FAD
+   publication and the explicit owner release decision. These are distinct kinds
+   of blockers and should not be hidden behind a single test percentage.
+4. **Would finishing all existing open/in-progress beads finish the project? No,
+   as written.** Before this pass two confirmed bugs had no dedicated leaf.
+   Existing beads include superseded version upgrades, stale premises, owner
+   decisions and broad proof obligations. Closing them mechanically could neither
+   implement the new gaps nor produce a current release. After the additive
+   `.84`/`.85` and refinements below, all identified *current* gaps have explicit
+   ownership, but implementation plus their named acceptance and delivery are
+   still required. Unknown defects cannot be ruled out by graph coverage.
+5. **Uncovered goals:** `.84` and `.85` are now self-contained bug leaves with
+   negative unit/E2E assertions. Historical optional inline field queries, search
+   context and dynamic completions lack specific leaves; `.26` now explicitly owns
+   their adopt/defer/supersede decision. They have not been silently discarded or
+   invented as new urgent feature commitments.
+
+### Bridge plan, ambition and refinement
+
+Use the existing `2l1b0` campaign and existing subsystem owners. Two new leaves
+are sufficient; another broad epic would duplicate already-owned work.
+
+| Order | Concrete outcome and implementation scope | Named acceptance / negative | Dependencies and ownership |
+|---|---|---|---|
+| 1 | Close raw-export secret bypass across generic/HTML source and archive paths; reuse shared redactor and expose policy | `export_redaction_parity`: recognized title/body/tool/metadata/receipt secret absent by default; explicit raw mode visibly sensitive; benign near-miss and identity preserved; encrypted payload checked after decrypt | `.84`; release `.25` blocks on it |
+| 2 | Share delegated archive error serialization | `delegated_archive_error_schema`: missing-file exit14, empty stdout, one stderr object, all five fields; malformed-wire and ordinary error controls | `.85`, shared robot discovery/schema owner |
+| 3 | Make connector entry points use equivalent completeness policy | Same incomplete/backdated/excluded Continue source through batch/watch/quarantine; current direct-upstream route fails the negative | `cooow`; keep active owner |
+| 4 | Adopt complete semantic serving generation and owner lifecycle | True independent quality hit outside fast topK, wrong-producer refusal, restart/ingest/edit/delete/atomic rollover, real native ANN exact oracle across shards/WAL | `ds7uy.*`, `962e8`, `jyfuq.2`, `wfm4e`; guard removal only after proof |
+| 5 | Reduce measured whole-index/read/open/memory cost | Current-source real-corpus job profiles, actual RSS/IO, bounded progress and restart; include worst-loss workloads and A/A controls | `.46`/`.72`, `3zq55`, `xn5a4`, `xcqqa`, `o9ixv`; no microbench-as-job claim |
+| 6 | Complete restore, fleet, terminal, analytics and browser user journeys | Populated named probes including skipped restore case, real source sync, unchanged repeats, real terminal, native model and scoped platform/browser cases | `.11`, `.21`–`.24`, `.34`, `svhcf`, `p94yt`; preserve skips as non-passes |
+| 7 | Qualify and deliver one exact candidate under current approved bar | Source/lock/binary/model/corpus identities; nonzero terminal test counts; full required STAGE receipts, strict UBS, DSR artifact checks and channel observations | `.25`, `5v57k`, `yrjna`, `zztql`, existing owner decisions; no Actions |
+| 8 | Keep current claims usable and historical ambition explicit | Source-backed connector/flag/exit/env examples; retention/ANN/bookmark correction; explicit optional-feature disposition | `.26`/`.69`; docs alone never close feature/acceptance work |
+
+Each implementation leaf includes its own tests and sanitized detailed E2E logs.
+The suite's ban on scope-splitting takes precedence over an older skill example
+that creates a separate test closure for the same unit of work. No test or gate
+is weakened, no failing control is removed, and no golden is regenerated here.
+
+Three ambition rounds improved this bridge before its final graph review:
+
+1. **Cross-surface behavior:** expanded the privacy finding from an unindexed raw
+   file to indexed-versus-exported parity, both export families, receipts and
+   decrypted output; preserved intentional raw fidelity through explicit policy.
+2. **Actual serving and whole-job value:** targeted owner-backed semantic adoption,
+   quality candidates independent of fast topK, and observed read/RSS losses;
+   rejected another scaffolding layer or generic benchmark matrix as progress.
+3. **Recovery and delivery:** bound each claim to source/executable/corpus identity,
+   included old/new publication and native ownership negatives, corrected real
+   browser/DSR progress, and retained the release bar rather than relaxing it.
+
+The frozen skill bead-generation and refinement checklists were applied to the
+existing graph, using `br` for every mutation. Five refinement passes then checked:
+
+1. **Coverage:** both new defects get leaves; historical optional promises get an
+   explicit `.26` disposition rather than an implicit deletion or duplicate epic.
+2. **Behavior preservation:** source/canonical bytes, coordinates, raw-fidelity
+   workflow, all export formats and current archive wire contracts remain covered.
+3. **Falsifiability:** each new leaf specifies a populated negative the current
+   implementation fails, benign controls and exact-source E2E receipts; old
+   16 MiB stack prose is superseded by 128 MiB in new acceptance.
+4. **Dependencies and proof class:** `.25` depends on `.84`; `.85` remains a
+   distinct robot-contract fix; existing owners retain their statuses. Real
+   browser evidence and narrow Node/installed-binary evidence remain separate.
+5. **Convergence:** reviewed both complete new descriptions and existing-owner
+   comments against the full checklist and cycle/triage output. No further
+   nonduplicating implementation leaf or dependency correction was identified.
+
+Existing `.26`, `cooow`, `.25` and `ds7uy.3` received concrete evidence/acceptance
+comments; `.26` also received an additive named acceptance criterion for the
+observed link-validator defect. No peer task was claimed or closed. Final
+`br dep cycles`, including archived issues, reports zero cycles. `bv` triage and
+planning succeed: 84 open / 54 in progress / 30 blocked, 116 actionable. `bv`
+insights skips its own cycle enumeration above 2,000 nodes, so its empty array
+is not the cycle proof; the explicit `br` check is. The forecast has low
+confidence and is not a delivery commitment. No existing issue ID or status was
+removed or changed. Final graph/sync receipts are recorded in the private
+evidence directory and the assessment closeout comment.
+
+---
+
+## Assessment: 2026-10-22 (RainyBluff)
+
+Scope: `origin/main` `9988ceec` (701 commits after the `v0.10.0` tag, Cargo version still
+0.10.0). Read all 1,380 lines of `AGENTS.md` and all 3,867 lines of `README.md` on that
+commit, the 10-14 section below, and the open bead and GitHub ledgers (2,446 beads; 34 open
+issues). Evidence is from this session: rch gates b108j, b111, b113b, b115, b116 and b117e,
+native Windows runs on wlap, and read-only `cass` 0.10.0 probes of this host's own archive
+(`health`, `status`, `storage`, `schedule status`). Nothing in the live archive was written.
+
+### Headline
+
+The code on `main` is far ahead of what users run, and the gap is widening. Seven hundred
+commits of fixes have not shipped: the fsqlite 0.4.12 b-tree corruption fix (bd-obwsy;
+shipped v0.10.0 runs the affected 0.4.6), the truthful freshness model, raw-mirror growth
+and quarantine retention, query fuel, timeline OOM, and the Windows OpenCode export abort.
+The release is not blocked by one bug. It is blocked by a dependency graph that cannot
+converge: `yrjna` waits on a strict UBS pass over ~720K lines (`5v57k`), and `2l1b0.25`
+waits on about fifteen "prove X end to end at scale" beads, including repairing the owner's
+damaged archive (`scohn`). crates.io is further behind still: it serves 0.7.0 from
+2026-08-25, and cass cannot publish there while FAD is a git dependency (`zztql`).
+
+The clearest evidence is this host. Installed cass 0.10.0 reports the archive `healthy`,
+`fresh: true`, `stale: false`, while `last_indexed_at` is 2026-10-07: 15.8 days old against a
+30-minute threshold. Every agent search here has silently missed two weeks of sessions. No
+scheduler is installed. The last background catch-up (2026-10-13) refused to start because a
+full lexical rebuild required 196.5 GB free and 37 GB was available. After that, the
+freshness bug (fixed on main as `2l1b0.81`, unreleased) reported `fresh`, so stale-on-read
+never tried again. The data dir is 220 GB: canonical DB 42.7 GB, lexical index 81.1 GB (live
+generation 41 GB, plus 34 GB in four failed-rebuild quarantine bundles that 0.10.0 never
+retired), raw mirror 86.5 GB. Releasing `main` alone would not heal this host. Main's rule
+still charges `2 x DB + 2 x live lexical` (about 167 GB) for a lexical-only repair of an
+unchanged archive. Only 81 GB is free, or 115 GB after pruning the quarantines.
+
+### Vision checklist (README/AGENTS promises against `main`, with the shipped 0.10.0 where it differs)
+
+| # | Promise | Status | Evidence |
+|---|---|---|---|
+| 1 | Discover and ingest 34 connectors, never modify sources | WORKING | capabilities golden lists 34; connector suites green in b100/b104b |
+| 2 | SQLite is a durable source of truth | PARTIAL | main pins fsqlite 0.4.12 (bd-obwsy fix); shipped 0.10.0 runs the affected 0.4.6; #391 recurring b-tree damage open (`2l1b0.2` blocked); owner archive integrity open (`scohn`, `2l1b0.73`) |
+| 3 | Lexical search is fast, required and self-healing | WORKING small/medium; BROKEN at scale | gates green on fixtures; on a 9.7M-document archive the only repair path cannot start (headroom rule, quarantine growth); about two thirds of the 34 open issues are large-archive wedges, OOM, fragmentation or corruption |
+| 4 | Hybrid default with opt-in local semantic, truthful fail-open | PARTIAL | fail-open and metadata work; two-tier progressive is inactive (README now says so); native ANN admission over WAL updates red (`ds7uy.3.3`, 2 lib tests); 2,000-char prefix regression red (gh470 vs #458, `962e8`) |
+| 5 | Index stays fresh automatically, freshness surfaces are truthful | REGRESSED on 0.10.0; PARTIAL on main | host above; on main the daemon timer was silently throttled to the 300 s read-path cadence and disabled entirely by `CASS_AUTO_REFRESH_SOURCE_SCAN_SECS=0` (107fabfa); two #515 daemon tests red on plain main (b115). Fixed in this pass, see below. Active-writer deferrals were silent in `index --json` (fixed in this pass) |
+| 6 | Stable robot contracts, no silent substitution | WORKING | goldens 68/0, cli_robot 329/0, search_metamorphic green |
+| 7 | Responsive TUI at scale | UNPROVEN at scale | `2l1b0.22` open; snapshot suites only |
+| 8 | Multi-machine sources with provenance | WORKING in fixtures; UNPROVEN live | e2e_sources 121/0; live harness exists, `2l1b0.24` and `av59c` open |
+| 9 | HTML/Markdown/Pages/archive export with encryption | WORKING in Rust; browser side UNPROVEN | html_export_integration 28/0, pages_bundle green; the Playwright suites have had no runner since the GitHub Actions removal (no bead until this pass) |
+| 10 | Archive-first doctor and recovery | WORKING on fixtures | cli_doctor 117/0; a real damaged archive (owner's) is still unrepaired |
+| 11 | Linux, macOS and Windows | PARTIAL | Windows: 26 native lib/integration failures (`if17v`), publish blocked by an open reader (`lndgg`), `v107y`; macOS: proof host's disk is 98% full, `d32jo` and `2l1b0.36` open |
+| 12 | Installer, Homebrew, Scoop, GitHub releases, crates.io, self-update | STALLED | last release v0.10.0 (2026-10-02); crates.io 0.7.0; dsr release path works (`yviq2`'s cass part) but the release beads cannot close |
+| 13 | Local-only, index-time secret redaction | WORKING | redaction suites green |
+| 14 | Analytics, timeline, pack, bookmarks, swarm | WORKING | timeline OOM fixed on main (unreleased) |
+| 15 | Truthful README | PARTIAL | glibc floor stated as 2.38 at line 592 (installer and line 2987 say 2.28); 21 migrations documented, code has 22 (`forgotten_sources`); a CI pipeline section and Codecov badge describe Actions jobs that no longer exist; crates.io paragraph says `cargo install` builds the current line (it builds 0.7.0); connector diagrams show 20 of 34 |
+
+### The five questions
+
+1. **What works now.** On Linux, small and medium archives, the core loop works end to end:
+   discovery across 34 connectors, canonical SQLite, Quill lexical search, robot contracts,
+   view/expand/pack, export, doctor on fixtures, multi-machine sync on fixtures. The
+   release-qualification sweeps this week (gates b100, b104b, b108j, b113b and b117e) ran
+   fmt, clippy, the full lib suite and 40 distinct integration targets of about 320. Remaining
+   reds on main: the two ANN `wal_tests` (`ds7uy.3.3`),
+   `gh470_prefix_checkpoint` (`962e8`), and four #515 daemon process tests (two fixed in this
+   pass).
+2. **What does not work.** (a) Users run a 20-day-old release that lacks a data-integrity fix
+   and reports a stale index as fresh. (b) Self-healing fails on large archives: repair needs
+   more free disk than such hosts have, quarantine bundles accumulate, and most open GitHub
+   issues are scale failures. (c) Semantic acceleration is partial (ANN admission, the gh470
+   prefix regression, two-tier inactive). (d) Windows and macOS proof is incomplete, and the
+   browser suites never run.
+3. **What blocks.** (1) Release governance: the release depends on beads that cannot finish
+   on any short horizon (strict UBS over the monoliths, at-scale proof beads, owner-archive
+   repair). This is an owner decision. (2) Two owner design calls hold red tests on main: ANN
+   admission (`ds7uy.3.3`) and gh470 versus #458 retention (`962e8`). (3) Proof
+   infrastructure: rch workers refill their disks within a day (the rch GC never collects
+   staging source copies; 427 GB reclaimed by hand on 10-21 and 10-22), the macOS host is
+   full, and there is no browser lane. (4) The FAD git pin blocks crates.io.
+4. **Would finishing every open and in-progress bead close the gap? No.** The 10-14 answer
+   ("YES") does not hold. The set is not finishable as written: 58 of 71 in-progress beads
+   have not been touched since before 2026-10-01, and some are obsolete (`90y8u` upgrade to
+   fsqlite 0.3.18, `91njy` release v0.8.0, `hyydu` adopt 0.4.4). Others are unbounded (strict
+   UBS on 720K lines, `scohn`). Finishing them also would not ship anything, because no bead
+   owns cutting a release from the current main under a bar it can meet. And four gaps found
+   in this pass had no bead.
+5. **Goals no bead covered (beads filed in this pass, children of `2l1b0`, label
+   `reality-check-20261022`):**
+   - `lexical-repair-headroom-nw61n` (P1): the preflight charges `2 x DB` even when the DB is
+     unchanged, so self-healing cannot start on large archives. The `lexical x 2` term is
+     real (trj consumed about 115 GB for a 25 GB DB in July,
+     `index-rebuild-headroom-underestimate-2mm1t`), so the bead measures the real peak per
+     path before changing the rule.
+   - `release-bar-decision-hutyl` (P0, question for the owner): ship 0.11.0 under a "no
+     worse than 0.10.0" bar with a known-issues list, and move certification beads off the
+     release path. Related to `yrjna`.
+   - `browser-e2e-lane-bnueb` (P2): a runner for the Playwright HTML-export and Pages suites
+     on a dsr host. `2l1b0.23` now depends on it.
+   - `readme-truth-20261022-9h3pj` (P2): the README claims in row 15.
+
+### Bridge plan (ordered by user value per unit of work)
+
+1. **Ship what is done.** Land the fixes from this pass. The owner decides the release bar.
+   Then cut 0.11.0 through dsr with a known-issues list, then a scheduled release train.
+   Every week without a release leaves the fixes on main undelivered and users on known-bad
+   code.
+2. **Make self-healing possible at scale.** Measure the real peak disk of a lexical-only
+   rebuild (staged shards plus merge output) on a fixture large enough to show it. Charge
+   that for a lexical-only repair of an unchanged archive. Keep the DB term for paths that
+   rewrite the DB (migration repair, `--full` rescans). Count retained quarantine bundles
+   and retire superseded ones. Negative test: a `--full` rescan still charges the DB term.
+   Longer term, repair the broken generation segment by segment instead of rebuilding it,
+   which removes the 2x requirement altogether.
+3. **Settle the owner calls that hold reds on main:** `ds7uy.3.3` (proposal posted) and
+   `962e8`.
+4. **Truth surfaces:** freshness (in the release), active-writer deferral reporting (this
+   pass), README truth pass (this pass).
+5. **Proof lanes:** a browser runner on a dsr host; the Windows baseline (`if17v`, `lndgg`);
+   room on the macOS host; an rch staging-copy retention policy for the fleet (an infra
+   change outside this repo, owner call).
+6. **Ledger hygiene (`2l1b0.30`):** release stale claims and close obsolete beads with
+   evidence, so `br ready` and `bv` point at real work.
+
+### What this pass changed on main (receipts in the commits)
+
+- `cass index --json` reports `indexing_stats.deferred_active_sources` and a sample when a
+  writer kept sources from being read (h3jnv / #530). It also adds the reporter's exact
+  timer sequence as a regression test: on current main, `--full --force-rebuild`, then
+  `--watch-once` over 11 new sessions, then a plain index appends without rebuilding.
+- The archive lease path drops std's `\\?\` spelling on Windows (txc9h; native Windows red
+  then green on wlap).
+- The resident daemon's periodic index runs at its own interval again (#514/#515: two red
+  daemon process tests go green).
+- The `franken_sync` regression test shows that a cancelled `BEGIN IMMEDIATE` waiting on
+  another writer returns `Abort` promptly. This rules out the engine as the cause of the
+  remaining #515 migration-shutdown failure.
+
+Limits: no macOS run (the host is full), no browser run, no run on a damaged archive, no
+full 320-target sweep (fleet disks), and the host archive was observed, not repaired.
 
 ## Assessment: 2026-10-14 (Antigravity)
 

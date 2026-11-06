@@ -1,4 +1,4 @@
-//! Real-binary proof for the reviewed logical-archive v20, v21 and v22 -> v23
+//! Real-binary proof for the reviewed logical-archive v20, v21, v22 and v23 -> v24
 //! bridges.
 
 use std::collections::BTreeMap;
@@ -11,12 +11,10 @@ use assert_cmd::Command;
 use coding_agent_search::franken_sync::Connection;
 use coding_agent_search::franken_sync::compat::RowExt;
 use coding_agent_search::model::types::{Agent, AgentKind};
-use coding_agent_search::storage::sqlite::{
-    CURRENT_SCHEMA_VERSION, SqliteStorage, semantic_source_clock_trigger_contracts,
-};
+use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, SqliteStorage};
 use serde_json::Value;
 
-const REVIEWED_TARGET_VERSION: i64 = 23;
+const REVIEWED_TARGET_VERSION: i64 = 24;
 
 fn command(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_cass"));
@@ -61,9 +59,10 @@ fn database_files(path: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 }
 
 /// A canonical database at storage schema `version`, made by undoing on a
-/// current database exactly what each later reviewed step added: v23's
-/// semantic authority tables/triggers, v22's `forgotten_sources` table,
-/// and for v20 also v21's context index.
+/// current database exactly what each later reviewed step added: v24's semantic
+/// journal and authority, v23's session
+/// tombstones, v22's source tombstones, and v21's context index. The v22 fixture
+/// retains an existing source tombstone, which migration must preserve.
 fn make_source(root: &Path, version: i64) -> PathBuf {
     assert_eq!(
         CURRENT_SCHEMA_VERSION, REVIEWED_TARGET_VERSION,
@@ -80,48 +79,54 @@ fn make_source(root: &Path, version: i64) -> PathBuf {
             kind: AgentKind::Cli,
         })
         .expect("insert canonical source row");
-    if version == 22 {
+    if version >= 22 {
         storage
             .raw()
             .execute(
-                "INSERT INTO forgotten_sources VALUES
-                 ('/private/forgotten-session.jsonl', 12345, 23456, 34567)",
+                "INSERT INTO forgotten_sources(source_path, size_bytes, mtime_ms, forgotten_at_ms)
+             VALUES('/fixture/retained-forget.jsonl', 12, 34, 56)",
             )
-            .expect("preserve a real v22 tombstone through migration");
+            .expect("seed existing source tombstone");
+    }
+    if version >= 23 {
+        storage.raw().execute(
+            "INSERT INTO forgotten_conversations(source_id, agent_slug, source_path, external_id, forgotten_at_ms)
+             VALUES('local', 'codex', '/fixture/shared.db', 'retained-session', 78)",
+        ).expect("seed existing session tombstone");
     }
     drop(storage);
 
     let downgrade = match version {
         20 => {
-            "DROP TABLE forgotten_sources;
+            "DROP TABLE forgotten_conversations;
+             DROP TABLE forgotten_sources;
              DROP INDEX idx_conversations_context;
              DELETE FROM _schema_migrations WHERE version >= 21;
              UPDATE meta SET value = '20' WHERE key = 'schema_version';"
         }
         21 => {
-            "DROP TABLE forgotten_sources;
+            "DROP TABLE forgotten_conversations;
+             DROP TABLE forgotten_sources;
              DELETE FROM _schema_migrations WHERE version >= 22;
              UPDATE meta SET value = '21' WHERE key = 'schema_version';"
         }
         22 => {
-            "DELETE FROM _schema_migrations WHERE version >= 23;
+            "DROP TABLE forgotten_conversations;
+             DELETE FROM _schema_migrations WHERE version >= 23;
              UPDATE meta SET value = '22' WHERE key = 'schema_version';"
+        }
+        23 => {
+            "DELETE FROM _schema_migrations WHERE version >= 24;
+             UPDATE meta SET value = '23' WHERE key = 'schema_version';"
         }
         other => panic!("no reviewed downgrade for schema {other}"),
     };
     let connection =
         Connection::open(source.to_str().expect("UTF-8 fixture path")).expect("open fixture");
-    for (name, _) in semantic_source_clock_trigger_contracts() {
-        connection
-            .execute(&format!("DROP TRIGGER \"{name}\""))
-            .expect("remove each reviewed v23 authority trigger");
-    }
-    connection
-        .execute_batch(
-            "DROP TABLE semantic_source_certificates_v1;
-             DROP TABLE semantic_source_identity_v1;",
-        )
-        .expect("remove the reviewed v23 authority tables");
+    connection.execute_batch(
+        "DROP TABLE semantic_conversation_changes;
+         DELETE FROM meta WHERE key IN ('semantic_archive_state_v1', 'semantic_message_id_high_water_v1');",
+    ).expect("remove semantic authority absent before v24");
     connection
         .execute_batch(downgrade)
         .expect("downgrade only what the reviewed steps added");
@@ -144,19 +149,24 @@ fn export_source(home: &Path, source: &Path, backup: &Path, archive_id: &str) ->
 }
 
 #[test]
-fn reviewed_v20_backup_migrates_to_v23_and_retries_read_only() {
-    assert_reviewed_backup_migrates(20, "reviewed_v20_to_v23");
+fn reviewed_v20_backup_migrates_to_v24_and_retries_read_only() {
+    assert_reviewed_backup_migrates(20, "reviewed_v20_to_v24");
 }
 
-/// A v0.9.0 export (schema v21) restores into the current v23 build.
+/// A v0.9.0 export (schema v21) restores into the current v24 build.
 #[test]
-fn reviewed_v21_backup_migrates_to_v23_and_retries_read_only() {
-    assert_reviewed_backup_migrates(21, "reviewed_v21_to_v23");
+fn reviewed_v21_backup_migrates_to_v24_and_retries_read_only() {
+    assert_reviewed_backup_migrates(21, "reviewed_v21_to_v24");
 }
 
 #[test]
-fn reviewed_v22_backup_migrates_to_v23_and_retries_read_only() {
-    assert_reviewed_backup_migrates(22, "reviewed_v22_to_v23");
+fn reviewed_v22_backup_preserves_tombstones_and_retries_read_only() {
+    assert_reviewed_backup_migrates(22, "reviewed_v22_to_v24");
+}
+
+#[test]
+fn reviewed_v23_backup_preserves_tombstones_without_fabricating_semantic_authority() {
+    assert_reviewed_backup_migrates(23, "reviewed_v23_to_v24");
 }
 
 fn assert_reviewed_backup_migrates(version: i64, mode: &str) {
@@ -236,52 +246,44 @@ fn assert_reviewed_backup_migrates(version: i64, mode: &str) {
         agent.get_typed::<Option<String>>(1).expect("agent version"),
         Some("preserve-me".into())
     );
-    // Older sources get an empty tombstone table; v22's tombstones survive.
+    // Newly introduced tables are empty; existing v22 tombstones survive.
     let forgotten = storage
         .raw()
         .query_row("SELECT COUNT(*) FROM forgotten_sources")
         .expect("forgotten_sources exists after migration");
     assert_eq!(
         forgotten.get_typed::<i64>(0).expect("count"),
-        i64::from(version == 22)
+        if version >= 22 { 1 } else { 0 }
     );
-    if version == 22 {
-        let tombstone = storage
+    if version >= 22 {
+        let stamp = storage
             .raw()
             .query_row(
                 "SELECT source_path, size_bytes, mtime_ms, forgotten_at_ms FROM forgotten_sources",
             )
-            .expect("read the migrated tombstone");
+            .expect("preserved source tombstone");
         assert_eq!(
-            tombstone.get_typed::<String>(0).unwrap(),
-            "/private/forgotten-session.jsonl"
+            stamp.get_typed::<String>(0).expect("source path"),
+            "/fixture/retained-forget.jsonl"
         );
-        assert_eq!(tombstone.get_typed::<i64>(1).unwrap(), 12345);
-        assert_eq!(tombstone.get_typed::<i64>(2).unwrap(), 23456);
-        assert_eq!(tombstone.get_typed::<i64>(3).unwrap(), 34567);
+        assert_eq!(stamp.get_typed::<i64>(1).expect("size"), 12);
+        assert_eq!(stamp.get_typed::<i64>(2).expect("mtime"), 34);
+        assert_eq!(stamp.get_typed::<i64>(3).expect("forgotten time"), 56);
     }
-    let authority = storage
-        .raw()
-        .query_row(
-            "SELECT singleton, database_uuid, change_sequence FROM semantic_source_identity_v1",
-        )
-        .expect("v23 initializes authority for the restored corpus");
-    assert_eq!(authority.get_typed::<i64>(0).unwrap(), 1);
-    let uuid = authority.get_typed::<String>(1).unwrap();
-    assert_eq!(uuid.len(), 32);
-    assert!(
-        uuid.bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    );
-    assert_eq!(authority.get_typed::<i64>(2).unwrap(), 0);
     assert_eq!(
         storage
             .raw()
-            .query_row("SELECT COUNT(*) FROM semantic_source_certificates_v1")
-            .expect("old archives cannot carry semantic certificates")
+            .query_row("SELECT COUNT(*) FROM forgotten_conversations")
+            .expect("session tombstones table exists")
             .get_typed::<i64>(0)
-            .unwrap(),
-        0
+            .expect("count"),
+        i64::from(version >= 23)
+    );
+    assert!(
+        storage
+            .semantic_archive_state()
+            .expect("read coverage authority")
+            .is_none()
     );
     drop(storage);
 

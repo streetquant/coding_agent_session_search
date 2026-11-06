@@ -78,46 +78,79 @@ mod linux {
         probe.state.lock().unwrap().refresh_count
     }
 
-    fn assert_closed_writer_policy(probe: &SourceWriterProbe, identity: FileIdentity) {
-        let deferred = probe.should_defer(identity);
+    /// z6ycn: as a non-root user every process whose descriptors this user
+    /// cannot list is a visibility gap, and one that appears during a census
+    /// (an sshd session on a build worker, for example) blocks the refresh.
+    /// Keeping the positive is then the probe's intended answer. True only when
+    /// the census was otherwise complete, every owner stayed visible, and every
+    /// new gap belongs to some other process.
+    fn refresh_blocked_only_by_foreign_opacity(probe: &SourceWriterProbe) -> bool {
         let state = probe.state.lock().unwrap();
-        assert_eq!(
-            deferred, state.refresh_blocked,
-            "a closed writer is released unless procfs visibility became uncertain"
-        );
-        if deferred {
-            assert!(
-                state.census.writers[&identity]
-                    .iter()
-                    .all(|witness| witness.observe(identity) == DescriptorState::Closed)
-            );
+        state.last_refresh_block.as_ref().is_some_and(|block| {
+            block.complete
+                && block.owners_visible
+                && !block.new_gap_pids.is_empty()
+                && !block.new_gap_pids.contains(&std::process::id())
+        })
+    }
+
+    /// Query a source whose answer depends on a refresh. `None` means that
+    /// refresh was blocked only by foreign opacity, after asserting the
+    /// conservative answer; the caller retries its whole scenario.
+    fn query_after_refresh(probe: &SourceWriterProbe, identity: FileIdentity) -> Option<bool> {
+        let deferred = probe.should_defer(identity);
+        if refresh_blocked_only_by_foreign_opacity(probe) {
+            assert!(deferred, "a blocked refresh must keep the cached positive");
+            return None;
         }
-        drop(state);
-        assert!(
-            !SourceWriterProbe::capture(session_source).should_defer(identity),
-            "a fresh census must not invent a writer after both descriptors close"
-        );
+        Some(deferred)
+    }
+
+    /// Run a live-procfs scenario with fresh fixtures until one attempt's
+    /// refreshes all kept an unchanged visibility scope (`Ok(true)`). Every
+    /// assertion still runs on that attempt; a host where no attempt succeeds
+    /// fails the test rather than skipping it.
+    fn with_foreign_opacity_retries(
+        mut scenario: impl FnMut() -> io::Result<bool>,
+    ) -> io::Result<()> {
+        const ATTEMPTS: usize = 20;
+        for _ in 0..ATTEMPTS {
+            if scenario()? {
+                return Ok(());
+            }
+        }
+        Err(io::Error::other(format!(
+            "all {ATTEMPTS} attempts had a refresh blocked by newly opaque foreign processes"
+        )))
     }
 
     #[test]
     fn cached_writer_is_rechecked_after_the_descriptor_closes() -> io::Result<()> {
-        let fixture = Fixture::new()?;
-        let path = fixture.source("closed")?;
-        let identity = file_identity(&path)?;
-        let contents = fs::read(&path)?;
-        let modified = fs::metadata(&path)?.modified()?;
-        let held = writer(&path)?;
-        let probe = SourceWriterProbe::capture(session_source);
-        assert!(
-            captured(&probe, identity),
-            "the old immutable set would defer this source"
-        );
-        drop(held);
-        assert_closed_writer_policy(&probe, identity);
-        assert_eq!(refresh_count(&probe), 1);
-        assert_eq!(fs::read(&path)?, contents);
-        assert_eq!(fs::metadata(&path)?.modified()?, modified);
-        Ok(())
+        with_foreign_opacity_retries(|| {
+            let fixture = Fixture::new()?;
+            let path = fixture.source("closed")?;
+            let identity = file_identity(&path)?;
+            let contents = fs::read(&path)?;
+            let modified = fs::metadata(&path)?.modified()?;
+            let held = writer(&path)?;
+            let probe = SourceWriterProbe::capture(session_source);
+            assert!(
+                captured(&probe, identity),
+                "the old immutable set would defer this source"
+            );
+            drop(held);
+            let Some(deferred) = query_after_refresh(&probe, identity) else {
+                return Ok(false);
+            };
+            assert!(
+                !deferred,
+                "closed writer must not remain active for the scan"
+            );
+            assert_eq!(refresh_count(&probe), 1);
+            assert_eq!(fs::read(&path)?, contents);
+            assert_eq!(fs::metadata(&path)?.modified()?, modified);
+            Ok(true)
+        })
     }
 
     #[test]
@@ -146,31 +179,44 @@ mod linux {
         assert!(!probe.should_defer(identity));
         assert_eq!(refresh_count(&probe), 0);
 
-        let held = writer(&path)?;
-        let probe = SourceWriterProbe::capture(session_source);
-        assert!(captured(&probe, identity));
-        drop(held);
-        let _successor_reader = File::open(&path)?;
-        assert_closed_writer_policy(&probe, identity);
-        Ok(())
+        with_foreign_opacity_retries(|| {
+            let held = writer(&path)?;
+            let probe = SourceWriterProbe::capture(session_source);
+            assert!(captured(&probe, identity));
+            drop(held);
+            let _successor_reader = File::open(&path)?;
+            let Some(deferred) = query_after_refresh(&probe, identity) else {
+                return Ok(false);
+            };
+            assert!(!deferred, "a read-only successor is not writer evidence");
+            Ok(true)
+        })
     }
 
     #[test]
     fn a_successor_descriptor_is_found_after_the_original_closes() -> io::Result<()> {
-        let fixture = Fixture::new()?;
-        let path = fixture.source("successor")?;
-        let identity = file_identity(&path)?;
-        let held = writer(&path)?;
-        let probe = SourceWriterProbe::capture(session_source);
-        assert!(captured(&probe, identity));
-        // This distinct descriptor did not exist during the original census.
-        let successor = writer(&path)?;
-        drop(held);
-        assert!(probe.should_defer(identity));
-        assert_eq!(refresh_count(&probe), 1);
-        drop(successor);
-        assert_closed_writer_policy(&probe, identity);
-        Ok(())
+        with_foreign_opacity_retries(|| {
+            let fixture = Fixture::new()?;
+            let path = fixture.source("successor")?;
+            let identity = file_identity(&path)?;
+            let held = writer(&path)?;
+            let probe = SourceWriterProbe::capture(session_source);
+            assert!(captured(&probe, identity));
+            // This distinct descriptor did not exist during the original census.
+            let successor = writer(&path)?;
+            drop(held);
+            let Some(deferred) = query_after_refresh(&probe, identity) else {
+                return Ok(false);
+            };
+            assert!(deferred);
+            assert_eq!(refresh_count(&probe), 1);
+            drop(successor);
+            let Some(deferred) = query_after_refresh(&probe, identity) else {
+                return Ok(false);
+            };
+            assert!(!deferred);
+            Ok(true)
+        })
     }
 
     #[test]
@@ -187,18 +233,118 @@ mod linux {
         assert!(!captured(&initial, identity));
         drop(held_alias);
 
-        let held = writer(&path)?;
+        with_foreign_opacity_retries(|| {
+            let held = writer(&path)?;
+            let probe = SourceWriterProbe::capture(session_source);
+            assert!(captured(&probe, identity));
+            let successor = writer(&alias)?;
+            drop(held);
+            let Some(deferred) = query_after_refresh(&probe, identity) else {
+                return Ok(false);
+            };
+            assert!(
+                deferred,
+                "a known positive inode remains writable through another suffix"
+            );
+            assert_eq!(refresh_count(&probe), 1);
+            drop(successor);
+            let Some(deferred) = query_after_refresh(&probe, identity) else {
+                return Ok(false);
+            };
+            assert!(!deferred);
+            Ok(true)
+        })
+    }
+
+    #[test]
+    fn initial_capture_never_follows_a_non_session_descriptor() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let source = fixture.source("followed")?;
+        let feed = fixture.root.join("feed.tsv.gz");
+        fs::write(&feed, b"not a session source")?;
+        let _held_source = writer(&source)?;
+        let _held_feed = writer(&feed)?;
         let probe = SourceWriterProbe::capture(session_source);
-        assert!(captured(&probe, identity));
-        let successor = writer(&alias)?;
-        drop(held);
+        let state = probe.state.lock().unwrap();
+        assert!(state.census.writers.contains_key(&file_identity(&source)?));
         assert!(
-            probe.should_defer(identity),
-            "a known positive inode remains writable through another suffix"
+            state.census.followed.contains(&fs::canonicalize(&source)?),
+            "a session-named writer is followed for its identity"
         );
-        assert_eq!(refresh_count(&probe), 1);
-        drop(successor);
-        assert_closed_writer_policy(&probe, identity);
+        // Following this one stats it on its own filesystem. On a hung sshfs
+        // mount that stat blocked for minutes, and index runs on the host sat
+        // in the census until their stall watchdog fired.
+        assert!(!state.census.followed.contains(&fs::canonicalize(&feed)?));
+        Ok(())
+    }
+
+    #[test]
+    fn mount_table_marks_network_and_fuse_mounts_remote() {
+        let mounts = parse_mount_remoteness(
+            &[
+                "22 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw",
+                "36 35 98:0 /mnt1 /mnt/parent rw,noatime master:1 - ext3 /dev/root rw",
+                "40 1 0:45 / /data/ssd rw,relatime shared:30 - zfs pool/ssd rw,xattr",
+                "41 1 0:46 / /tmp rw,nosuid,nodev shared:31 - tmpfs tmpfs rw,size=8g",
+                "42 24 0:47 / /sys/fs/fuse/connections rw,relatime shared:32 - fusectl fusectl rw",
+                "412 30 0:61 / /home/u/bulk rw,relatime shared:220 - fuse.sshfs u@host:/bulk rw",
+                "413 30 0:62 / /mnt/nas rw,relatime shared:221 - fuseblk /dev/sdb1 rw",
+                "414 30 0:63 / /net/home rw,relatime shared:222 - nfs4 server:/home rw,vers=4.2",
+                // An escaped space in a mount path never forms the separator.
+                "415 30 0:64 / /mnt/a\\040-\\040b rw,relatime - cifs //server/share rw",
+                "not a mount line",
+            ]
+            .join("\n"),
+        );
+        for local in [22, 36, 40, 41, 42] {
+            assert_eq!(mounts.get(&local), Some(&false), "mount {local}");
+        }
+        for remote in [412, 413, 414, 415] {
+            assert_eq!(mounts.get(&remote), Some(&true), "mount {remote}");
+        }
+        assert_eq!(mounts.len(), 9);
+    }
+
+    #[test]
+    fn a_descriptor_not_proven_local_counts_as_remote() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        fs::write(
+            fixture.root.join("mountinfo"),
+            [
+                "36 35 98:0 / /data rw,noatime - ext4 /dev/sda1 rw",
+                "412 30 0:61 / /bulk rw,relatime - fuse.sshfs u@host:/bulk rw",
+            ]
+            .join("\n"),
+        )?;
+        let fdinfo = |name: &str, contents: &str| -> io::Result<PathBuf> {
+            let path = fixture.root.join(name);
+            fs::write(&path, contents)?;
+            Ok(path)
+        };
+        let local = fdinfo("local", "pos:\t0\nflags:\t02100001\nmnt_id:\t36\nino:\t7\n")?;
+        let sshfs = fdinfo("sshfs", "pos:\t0\nflags:\t02100001\nmnt_id:\t412\n")?;
+        let unlisted = fdinfo("unlisted", "pos:\t0\nflags:\t02100001\nmnt_id:\t999\n")?;
+        let unnamed = fdinfo("no-mount-id", "pos:\t0\nflags:\t02100001\n")?;
+        let mut mount_types = None;
+        assert!(!descriptor_on_remote_filesystem(
+            &fixture.root,
+            &local,
+            &mut mount_types
+        ));
+        for descriptor in [&sshfs, &unlisted, &unnamed] {
+            assert!(
+                descriptor_on_remote_filesystem(&fixture.root, descriptor, &mut mount_types),
+                "{}",
+                descriptor.display()
+            );
+        }
+        // Without a readable mount table no descriptor is proven local.
+        let mut unreadable = None;
+        assert!(descriptor_on_remote_filesystem(
+            &fixture.root.join("no-such-process"),
+            &local,
+            &mut unreadable
+        ));
         Ok(())
     }
 
@@ -227,92 +373,85 @@ mod linux {
 
     #[test]
     fn a_new_process_writer_cannot_be_missed_when_the_cached_owner_closes() -> io::Result<()> {
-        let fixture = Fixture::new()?;
-        let path = fixture.source("new-process")?;
-        let identity = file_identity(&path)?;
-        let held = writer(&path)?;
-        let probe = SourceWriterProbe::capture(session_source);
-        assert!(captured(&probe, identity));
-        let module = module_path!().split_once("::").unwrap().1;
-        let mut command = Command::new(std::env::current_exe()?);
-        command
-            .args([
-                "--ignored",
-                "--exact",
-                &format!("{module}::writer_holder_child"),
-            ])
-            .env("CASS_WRITER_PROBE_CHILD_ROOT", &fixture.root)
-            .stdin(Stdio::from(held))
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit());
-        let mut child = ChildGuard(command.spawn()?);
-        drop(command);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !fixture.root.join("ready").try_exists()? {
-            assert!(
-                child.0.try_wait()?.is_none(),
-                "holder exited before readiness"
-            );
-            assert!(Instant::now() < deadline, "holder did not become ready");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(
-            probe.should_defer(identity),
-            "successor lives in a new process"
-        );
-        assert_eq!(refresh_count(&probe), 1);
-        let refresh_was_blocked = {
-            let state = probe.state.lock().unwrap();
-            if !state.refresh_blocked {
+        with_foreign_opacity_retries(|| {
+            let fixture = Fixture::new()?;
+            let path = fixture.source("new-process")?;
+            let identity = file_identity(&path)?;
+            let held = writer(&path)?;
+            let probe = SourceWriterProbe::capture(session_source);
+            assert!(captured(&probe, identity));
+            let module = module_path!().split_once("::").unwrap().1;
+            let mut command = Command::new(std::env::current_exe()?);
+            command
+                .args([
+                    "--ignored",
+                    "--exact",
+                    &format!("{module}::writer_holder_child"),
+                ])
+                .env("CASS_WRITER_PROBE_CHILD_ROOT", &fixture.root)
+                .stdin(Stdio::from(held))
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit());
+            let mut child = ChildGuard(command.spawn()?);
+            drop(command);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !fixture.root.join("ready").try_exists()? {
                 assert!(
-                    state.census.writers[&identity].iter().any(|witness| {
-                        let DescriptorWitness::Proc { process, .. } = witness;
-                        process.is_some_and(|owner| owner.pid == child.0.id())
-                    }),
-                    "a complete refresh must retain the successor's actual descriptor"
+                    child.0.try_wait()?.is_none(),
+                    "holder exited before readiness"
                 );
+                assert!(Instant::now() < deadline, "holder did not become ready");
+                std::thread::sleep(Duration::from_millis(5));
             }
-            state.refresh_blocked
-        };
-        fs::write(fixture.root.join("release"), b"release")?;
-        assert!(child.0.wait()?.success());
-        // Disappearance cannot distinguish a departed owner from a PID hidden
-        // by procfs policy. Preserve the positive until a new filter capture.
-        assert!(probe.should_defer(identity));
-        let expected_refreshes = if refresh_was_blocked { 1 } else { 2 };
-        assert_eq!(refresh_count(&probe), expected_refreshes);
-        assert!(probe.should_defer(identity));
-        assert_eq!(refresh_count(&probe), expected_refreshes);
-        assert!(!SourceWriterProbe::capture(session_source).should_defer(identity));
-        Ok(())
+            let Some(deferred) = query_after_refresh(&probe, identity) else {
+                return Ok(false);
+            };
+            assert!(deferred, "successor lives in a new process");
+            assert_eq!(refresh_count(&probe), 1);
+            fs::write(fixture.root.join("release"), b"release")?;
+            assert!(child.0.wait()?.success());
+            // Disappearance cannot distinguish a departed owner from a PID hidden
+            // by procfs policy. Preserve the positive until a new filter capture.
+            assert!(probe.should_defer(identity));
+            assert_eq!(refresh_count(&probe), 2);
+            assert!(probe.should_defer(identity));
+            assert_eq!(refresh_count(&probe), 2);
+            assert!(!SourceWriterProbe::capture(session_source).should_defer(identity));
+            Ok(true)
+        })
     }
 
     #[test]
     fn one_refresh_clears_twenty_already_closed_positive_sources() -> io::Result<()> {
-        let fixture = Fixture::new()?;
-        let mut writers = Vec::new();
-        let mut identities = Vec::new();
-        for index in 0..20 {
-            let path = fixture.source(&format!("source-{index}"))?;
-            identities.push(file_identity(&path)?);
-            writers.push(writer(&path)?);
-        }
-        let probe = SourceWriterProbe::capture(session_source);
-        assert!(
-            identities
-                .iter()
-                .all(|&identity| captured(&probe, identity))
-        );
-        drop(writers);
-        for identity in identities {
-            assert_closed_writer_policy(&probe, identity);
-        }
-        assert_eq!(
-            refresh_count(&probe),
-            1,
-            "one shared census covers all closed sources"
-        );
-        Ok(())
+        with_foreign_opacity_retries(|| {
+            let fixture = Fixture::new()?;
+            let mut writers = Vec::new();
+            let mut identities = Vec::new();
+            for index in 0..20 {
+                let path = fixture.source(&format!("source-{index}"))?;
+                identities.push(file_identity(&path)?);
+                writers.push(writer(&path)?);
+            }
+            let probe = SourceWriterProbe::capture(session_source);
+            assert!(
+                identities
+                    .iter()
+                    .all(|&identity| captured(&probe, identity))
+            );
+            drop(writers);
+            for identity in identities {
+                let Some(deferred) = query_after_refresh(&probe, identity) else {
+                    return Ok(false);
+                };
+                assert!(!deferred);
+            }
+            assert_eq!(
+                refresh_count(&probe),
+                1,
+                "one shared census covers all closed sources"
+            );
+            Ok(true)
+        })
     }
 
     #[test]

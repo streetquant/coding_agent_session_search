@@ -2,14 +2,9 @@
 // `#[allow(unsafe_code)]` + a SAFETY comment (startup env writes, unavoidable FFI per AGENTS.md).
 #![cfg_attr(not(test), deny(unsafe_code))]
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
 mod codex_layout_cli;
 mod lexical_quarantine_cli;
 mod logical_archive;
-mod raw_mirror_cli;
 mod search_service;
 pub mod semantic_reclaim_cli;
 
@@ -157,154 +152,7 @@ fn is_robot_mode_args() -> bool {
     env_requests_robot_output()
 }
 
-#[derive(Clone, Copy)]
-struct DoctorErrorContext {
-    surface: &'static str,
-    mode: &'static str,
-    asset_class: &'static str,
-}
-
-fn doctor_error_context(
-    command: Option<&coding_agent_search::Commands>,
-) -> Option<DoctorErrorContext> {
-    use coding_agent_search::Commands;
-
-    let Some(Commands::Doctor {
-        check,
-        fix,
-        repair,
-        cleanup,
-        archive_scan,
-        archive_normalize,
-        backups_list,
-        backups_verify,
-        backups_restore,
-        baseline_save,
-        baseline_diff,
-        baseline_update,
-        support_bundle,
-        support_bundle_verify,
-        archive_export,
-        archive_export_verify,
-        archive_relocate,
-        dry_run,
-        yes,
-        ..
-    }) = command
-    else {
-        return None;
-    };
-    let apply_requested = *yes && !*dry_run;
-    let (surface, mode, asset_class) = if *baseline_save {
-        ("baseline", "baseline-save", "operation_receipt")
-    } else if *baseline_diff {
-        ("baseline-diff", "baseline-diff", "operation_receipt")
-    } else if *baseline_update {
-        ("baseline", "baseline-update", "operation_receipt")
-    } else if *support_bundle_verify {
-        ("support-bundle", "support-bundle-verify", "support_bundle")
-    } else if *support_bundle {
-        ("support-bundle", "support-bundle", "support_bundle")
-    } else if *archive_export_verify {
-        ("archive-export", "archive-export-verify", "unknown")
-    } else if *archive_relocate {
-        ("archive-relocate", "archive-relocate", "unknown")
-    } else if *archive_export {
-        ("archive-export", "archive-export", "unknown")
-    } else if *backups_restore {
-        (
-            "backups",
-            if apply_requested {
-                "restore-apply"
-            } else {
-                "restore-rehearsal"
-            },
-            "backup_bundle",
-        )
-    } else if *backups_verify || *backups_list {
-        ("backups", "read-only-check", "backup_bundle")
-    } else if *archive_scan {
-        ("archive-scan", "read-only-check", "unknown")
-    } else if *archive_normalize {
-        (
-            "archive-normalize",
-            if apply_requested {
-                "archive-normalize-apply"
-            } else {
-                "archive-normalize-dry-run"
-            },
-            "unknown",
-        )
-    } else if *repair {
-        (
-            "repair",
-            if apply_requested {
-                "fingerprint-apply"
-            } else {
-                "repair-dry-run"
-            },
-            "unknown",
-        )
-    } else if *cleanup {
-        (
-            "cleanup",
-            if apply_requested {
-                "cleanup-apply"
-            } else {
-                "cleanup-dry-run"
-            },
-            "unknown",
-        )
-    } else if *fix {
-        ("legacy-doctor", "safe-auto-fix", "unknown")
-    } else if *check {
-        ("check", "read-only-check", "unknown")
-    } else {
-        ("legacy-doctor", "read-only-check", "unknown")
-    };
-    Some(DoctorErrorContext {
-        surface,
-        mode,
-        asset_class,
-    })
-}
-
-fn doctor_error_payload(
-    err: &coding_agent_search::CliError,
-    context: DoctorErrorContext,
-) -> serde_json::Value {
-    // Context comes from the normalized, parsed command. It identifies the
-    // requested operation; a fatal error establishes no risk assessment,
-    // selected authority, completed probe, or durable artifact.
-    serde_json::json!({
-        "err": {
-            "code": err.code,
-            "kind": err.kind,
-            "message": err.message,
-            "hint": err.hint,
-            "retryable": err.retryable,
-            "surface": context.surface,
-            "mode": context.mode,
-            "risk_level": "unknown",
-            "asset_class": context.asset_class,
-            "blocked_reasons": [err.kind],
-            "failure_context_path": null,
-            "event_log_path": null,
-            "artifact_manifest_path": null,
-            "recommended_action": err.hint.as_deref().unwrap_or("cass doctor check --json"),
-            "redaction_status": "not_redacted"
-        }
-    })
-}
-
 fn handle_fatal_error(err: coding_agent_search::CliError) -> ! {
-    handle_fatal_error_with_doctor_context(err, None)
-}
-
-fn handle_fatal_error_with_doctor_context(
-    err: coding_agent_search::CliError,
-    doctor_context: Option<DoctorErrorContext>,
-) -> ! {
     if err.was_already_reported() {
         std::process::exit(err.code);
     }
@@ -316,20 +164,7 @@ fn handle_fatal_error_with_doctor_context(
         eprintln!("{}", err.message);
     } else if is_robot_mode_args() {
         // Wrap unstructured error for robot consumers.
-        let payload = doctor_context.map_or_else(
-            || {
-                serde_json::json!({
-                    "error": {
-                        "code": err.code,
-                        "kind": err.kind,
-                        "message": err.message,
-                        "hint": err.hint,
-                        "retryable": err.retryable,
-                    }
-                })
-            },
-            |context| doctor_error_payload(&err, context),
-        );
+        let payload = err.json_envelope();
         eprintln!("{payload}");
     } else {
         // Human-readable output stays on stderr per Unix convention. The
@@ -472,32 +307,6 @@ fn main() -> anyhow::Result<()> {
     });
 
     let raw_args: Vec<String> = std::env::args().collect();
-    if raw_args.get(1).map(String::as_str)
-        == Some(coding_agent_search::indexer::FINAL_WAL_CHECKPOINT_WORKER_ARG)
-    {
-        if raw_args.len() != 4 {
-            anyhow::bail!(
-                "{} requires exactly a database path and checkpoint context",
-                coding_agent_search::indexer::FINAL_WAL_CHECKPOINT_WORKER_ARG
-            );
-        }
-        let (Some(db_arg), Some(context_arg)) = (raw_args.get(2), raw_args.get(3)) else {
-            anyhow::bail!(
-                "{} requires exactly a database path and checkpoint context",
-                coding_agent_search::indexer::FINAL_WAL_CHECKPOINT_WORKER_ARG
-            );
-        };
-        let db_path = std::path::Path::new(db_arg);
-        let worker_result =
-            coding_agent_search::indexer::run_final_wal_checkpoint_worker(db_path, context_arg);
-        // Release any cached synchronous bridge runtimes even when opening or
-        // checkpointing the worker DB fails, before the process tears down.
-        let _ = coding_agent_search::shutdown_thread_local_bridge_runtimes();
-        let outcome = worker_result?;
-        println!("{}", serde_json::to_string(&outcome)?);
-        return Ok(());
-    }
-
     if raw_command_name(&raw_args) == Some("codex-layout-migrate") {
         // The proof owns the archive/receipt locks. Do not enter ordinary
         // startup, automatic maintenance or model initialization on this path.
@@ -528,14 +337,14 @@ fn main() -> anyhow::Result<()> {
             Ok(()) => Ok(()),
             Err(error) => {
                 let (code, kind, retryable) = logical_archive::classify_failure(&error);
-                let payload = serde_json::json!({
-                    "error": {
-                        "code": code,
-                        "kind": kind,
-                        "message": error.to_string(),
-                        "retryable": retryable
-                    }
-                });
+                let payload = coding_agent_search::CliError {
+                    code,
+                    kind,
+                    message: error.to_string(),
+                    hint: None,
+                    retryable,
+                }
+                .json_envelope();
                 eprintln!("{payload}");
                 std::process::exit(code);
             }
@@ -555,20 +364,18 @@ fn main() -> anyhow::Result<()> {
         Ok(parsed) => parsed,
         Err(err) => handle_fatal_error(err),
     };
-    let doctor_context = doctor_error_context(parsed.cli.command.as_ref());
 
     let parsed = match coding_agent_search::try_run_with_parsed_fast(parsed) {
         Ok(result) => {
             return match result {
                 Ok(()) => Ok(()),
-                Err(err) => handle_fatal_error_with_doctor_context(err, doctor_context),
+                Err(err) => handle_fatal_error(err),
             };
         }
         Err(parsed) => *parsed,
     };
 
     apply_default_tantivy_writer_thread_cap();
-    raw_mirror_cli::maintain(&parsed.cli);
 
     let runtime = if command_uses_current_thread(parsed.cli.command.as_ref()) {
         asupersync::runtime::RuntimeBuilder::current_thread().build()?
@@ -589,7 +396,7 @@ fn main() -> anyhow::Result<()> {
 
     match result {
         Ok(()) => Ok(()),
-        Err(err) => handle_fatal_error_with_doctor_context(err, doctor_context),
+        Err(err) => handle_fatal_error(err),
     }
 }
 

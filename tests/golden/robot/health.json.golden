@@ -420,6 +420,7 @@
     },
     "pending": {
       "sessions": 0,
+      "lexical_replay": null,
       "watch_active": false,
       "orphaned": false
     },

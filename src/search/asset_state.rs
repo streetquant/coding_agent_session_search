@@ -17,10 +17,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::indexer::{
-    LEXICAL_REBUILD_PAGE_SIZE_PUBLIC, LexicalRebuildCheckpoint,
-    lexical_rebuild_page_size_is_compatible, load_lexical_rebuild_checkpoint,
+    LEXICAL_REBUILD_PAGE_SIZE_PUBLIC, LexicalCheckpointFreshness, LexicalRebuildCheckpoint,
+    completed_lexical_checkpoint_freshness, lexical_rebuild_page_size_is_compatible,
+    lexical_storage_fingerprint_for_db_cached, load_lexical_rebuild_checkpoint,
 };
-use crate::search::ann_index::{SemanticAnnReadiness, hnsw_index_path};
+use crate::search::ann_index::hnsw_index_path;
 use crate::search::embedder::Embedder;
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::hash_embedder::HashEmbedder;
@@ -188,18 +189,7 @@ pub(crate) fn clear_index_run_lock_metadata_sidecar(lock_path: &Path) -> Result<
             "syncing cleared index-run lock metadata sidecar {}",
             sidecar_path.display()
         )
-    })?;
-    drop(sidecar);
-    match std::fs::remove_file(&sidecar_path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err).with_context(|| {
-            format!(
-                "removing cleared index-run lock metadata sidecar {}",
-                sidecar_path.display()
-            )
-        }),
-    }
+    })
 }
 
 fn read_capped_metadata_from_path(path: &Path, max_len: u64) -> std::io::Result<String> {
@@ -476,21 +466,6 @@ pub(crate) enum SemanticPreference {
     HashFallback,
 }
 
-/// How deeply a readiness surface inspects the optional ANN accelerator.
-///
-/// `Bounded` is the default everywhere: it reports that a sidecar is present
-/// without deserializing a graph, so it never advertises native readiness.
-/// `Deep` performs the exact native admission against the retained exact
-/// owner, which is the only thing allowed to report `hnsw_ready`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum SemanticAnnProbeMode {
-    /// Cheap filesystem-only presence inspection. Never loads a graph.
-    #[default]
-    Bounded,
-    /// Exact native admission against the production-selected cohort.
-    Deep,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SearchAssetSnapshot {
     pub lexical: LexicalAssetState,
@@ -584,12 +559,6 @@ pub(crate) struct SemanticAssetState {
     pub hnsw_present: bool,
     pub hnsw_state: &'static str,
     pub hnsw_ready: bool,
-    /// Stable reason code for a refused ANN cohort.
-    ///
-    /// `None` while the cohort is unprobed or admitted. When set, it is the
-    /// same `SemanticAnnUnavailableReason` code the serving path reports when
-    /// it falls back to exact search, so no surface invents its own vocabulary.
-    pub hnsw_reason_code: Option<&'static str>,
     pub progressive_ready: bool,
     pub progressive_reason_code: Option<&'static str>,
     /// Sub-fix 3 for cass#257: true when a quality-tier vector index is
@@ -661,6 +630,7 @@ pub(crate) struct SemanticTierAssetState {
     pub size_bytes: Option<u64>,
     pub index_path: Option<PathBuf>,
     pub shard_count: Option<u32>,
+    pub coverage: Option<crate::search::vector_index::SemanticCoverageSnapshot>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -707,11 +677,6 @@ pub(crate) struct InspectSearchAssetsInput<'a> {
     pub db_available: bool,
     pub compute_lexical_fingerprint: bool,
     pub inspect_semantic: bool,
-    /// How deeply the optional ANN accelerator is inspected.
-    ///
-    /// The default bounded mode reports presence without loading a graph.
-    /// Only the deep mode may report native ANN readiness.
-    pub probe_semantic_ann: SemanticAnnProbeMode,
 }
 
 const LEXICAL_STORAGE_FINGERPRINT_MTIME_TOLERANCE_MS: i64 = 1_000;
@@ -771,7 +736,6 @@ pub(crate) fn inspect_search_assets(
         db_available,
         compute_lexical_fingerprint,
         inspect_semantic,
-        probe_semantic_ann,
     } = input;
 
     let lexical = inspect_lexical_assets(InspectLexicalAssetsInput {
@@ -792,7 +756,6 @@ pub(crate) fn inspect_search_assets(
             semantic_preference,
             current_db_fingerprint,
             db_available,
-            probe_semantic_ann,
         )
     } else {
         semantic_state_not_inspected(data_dir, semantic_preference, current_db_fingerprint)
@@ -825,7 +788,6 @@ fn semantic_state_not_inspected(
         hnsw_present: false,
         hnsw_state: "not_inspected",
         hnsw_ready: false,
-        hnsw_reason_code: None,
         progressive_ready: false,
         progressive_reason_code: None,
         // The fast-path skip-DB-open lane doesn't have an
@@ -852,40 +814,91 @@ pub(crate) fn inspect_semantic_assets(
     preference: SemanticPreference,
     current_db_fingerprint: Option<&str>,
     db_available: bool,
-    ann_probe: SemanticAnnProbeMode,
 ) -> SemanticAssetState {
     if !db_available {
         let availability = SemanticAvailability::DatabaseUnavailable {
             db_path: db_path.to_path_buf(),
             error: "database unavailable during asset inspection".to_string(),
         };
-        let mut state = semantic_state_from_availability(
+        return semantic_state_from_availability(
             data_dir,
             &availability,
             preference,
             current_db_fingerprint,
         );
-        if ann_probe == SemanticAnnProbeMode::Deep {
-            apply_deep_semantic_ann_probe(&mut state, data_dir, db_path, current_db_fingerprint);
-        }
-        return state;
     }
 
     let availability = match preference {
         SemanticPreference::DefaultModel => probe_semantic_availability(data_dir),
         SemanticPreference::HashFallback => probe_hash_semantic_availability(data_dir),
     };
-    let availability = apply_semantic_identity_invalidation(db_path, availability, preference);
-    let mut state = semantic_state_from_availability(
-        data_dir,
-        &availability,
-        preference,
-        current_db_fingerprint,
-    );
-    if ann_probe == SemanticAnnProbeMode::Deep {
-        apply_deep_semantic_ann_probe(&mut state, data_dir, db_path, current_db_fingerprint);
+    if availability.can_search()
+        && let Some(embedder_id) = semantic_embedder_id(&availability, preference)
+    {
+        let observation = FrankenStorage::open_readonly(db_path)
+            .map_err(|error| error.to_string())
+            .and_then(|storage| {
+                crate::search::model_manager::observe_covered_semantic_artifact(
+                    data_dir,
+                    &storage,
+                    &embedder_id,
+                )
+            });
+        match observation {
+            Ok(Some((record, coverage))) => {
+                let mut state = semantic_state_from_availability(
+                    data_dir,
+                    &availability,
+                    preference,
+                    current_db_fingerprint,
+                );
+                state.status = if coverage.status == "partial" {
+                    "partial"
+                } else {
+                    "ready"
+                };
+                state.availability = if coverage.status == "partial" {
+                    "partial_coverage"
+                } else {
+                    "ready"
+                };
+                state.summary = if coverage.status == "partial" {
+                    "verified semantic generation remains searchable while current messages are reconciled".to_owned()
+                } else {
+                    "verified semantic generation covers the current canonical snapshot".to_owned()
+                };
+                state.available = true;
+                state.can_search = true;
+                state.semantic_only_search_available = true;
+                state.fallback_mode = None;
+                state.hint = (coverage.status == "partial").then(||
+                    "Results exclude changed or removed identities; newer messages become searchable after semantic catch-up.".to_owned());
+                state.vector_index_path = Some(data_dir.join(&record.index_path));
+                state.hnsw_path = None;
+                state.hnsw_present = false;
+                state.hnsw_state = "missing";
+                let tier = match record.tier {
+                    TierKind::Fast => &mut state.fast_tier,
+                    TierKind::Quality => &mut state.quality_tier,
+                };
+                tier.coverage = Some(coverage);
+                tier.index_path = Some(data_dir.join(&record.index_path));
+                state.quality_tier_published |= state.quality_tier.coverage.is_some();
+                return state;
+            }
+            Ok(None) => {}
+            Err(context) => {
+                return semantic_state_from_availability(
+                    data_dir,
+                    &SemanticAvailability::LoadFailed { context },
+                    preference,
+                    current_db_fingerprint,
+                );
+            }
+        }
     }
-    state
+    let availability = apply_semantic_identity_invalidation(db_path, availability, preference);
+    semantic_state_from_availability(data_dir, &availability, preference, current_db_fingerprint)
 }
 
 fn apply_semantic_identity_invalidation(
@@ -900,17 +913,7 @@ fn apply_semantic_identity_invalidation(
         SemanticPreference::HashFallback => SemanticIdentityTier::Fast,
         SemanticPreference::DefaultModel => SemanticIdentityTier::Quality,
     };
-    // k2k20: this marker check runs inside `cass status`/`cass health`. The
-    // ordinary readonly opener may run dirty-WAL/schema recovery and hydrate a
-    // multi-GB archive (observed as an 84 s silent health check); neither is
-    // acceptable on an observation surface. Use the strict, mutation-free
-    // opener under a short bound. An unconfirmed marker degrades semantic
-    // availability truthfully (`LoadFailed`) instead of blocking the surface.
-    const SEMANTIC_IDENTITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-    let storage = match FrankenStorage::open_strict_readonly_with_timeout(
-        db_path,
-        SEMANTIC_IDENTITY_PROBE_TIMEOUT,
-    ) {
+    let storage = match FrankenStorage::open_readonly(db_path) {
         Ok(storage) => storage,
         Err(err) => {
             // `db_available` is a point-in-time observation, not proof that
@@ -1012,18 +1015,11 @@ pub(crate) fn semantic_state_from_availability(
     } else {
         runtime.model_dir.or(base_model_dir)
     };
-    // The shard manifest is the owner contract: a sharded generation names its
-    // own per-shard sidecars, so the conventional monolithic filename does not
-    // exist for it. Resolving through the manifest keeps bounded status honest
-    // about what is actually present.
-    let hnsw_path =
-        selected_ann_sidecar_path(data_dir, embedder_id.as_deref(), current_db_fingerprint).or(
-            if use_runtime_paths {
-                runtime.hnsw_path
-            } else {
-                runtime.hnsw_path.or(base_hnsw_path)
-            },
-        );
+    let hnsw_path = if use_runtime_paths {
+        runtime.hnsw_path
+    } else {
+        runtime.hnsw_path.or(base_hnsw_path)
+    };
     let (hnsw_present, hnsw_state) = bounded_ann_presence(hnsw_path.as_deref());
 
     // Sub-fix 3 for cass#257: report quality-tier readiness as a
@@ -1052,7 +1048,6 @@ pub(crate) fn semantic_state_from_availability(
         // advertise native readiness. A metadata entry alone proves nothing
         // about graph integrity, completeness, or source identity.
         hnsw_ready: false,
-        hnsw_reason_code: None,
         progressive_ready,
         progressive_reason_code,
         quality_tier_published,
@@ -1076,110 +1071,6 @@ fn bounded_ann_presence(path: Option<&Path>) -> (bool, &'static str) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (false, "absent"),
         Err(_) => (false, "inspection_failed"),
     }
-}
-
-/// Resolve the ANN sidecar the production selection pairs with the current
-/// exact generation.
-///
-/// The shard manifest names the sidecar for every shard of a sharded
-/// generation. Guessing the conventional monolithic filename would report an
-/// absent accelerator for a fully built sharded generation, so the manifest
-/// is consulted first and the conventional path is only the monolithic
-/// fallback the serving path itself uses.
-fn selected_ann_sidecar_path(
-    data_dir: &Path,
-    embedder_id: Option<&str>,
-    db_fingerprint: Option<&str>,
-) -> Option<PathBuf> {
-    let embedder_id = embedder_id?;
-    let db_fingerprint = db_fingerprint?;
-    for tier in [TierKind::Quality, TierKind::Fast] {
-        let Some(records) =
-            complete_shard_records_for_state(data_dir, tier, embedder_id, db_fingerprint)
-        else {
-            continue;
-        };
-        if let Some(path) = records.iter().find_map(|shard| {
-            if !shard.ann_ready {
-                return None;
-            }
-            let recorded = shard.ann_index_path.as_deref()?;
-            resolve_semantic_artifact_path(data_dir, recorded)
-        }) {
-            return Some(path);
-        }
-    }
-    None
-}
-
-/// The output dimension of a known embedder, without loading a model.
-fn semantic_embedder_dimension(embedder_id: &str) -> Option<usize> {
-    if embedder_id == HashEmbedder::default().id() {
-        return Some(HashEmbedder::default().dimension());
-    }
-    FastEmbedder::config_for(embedder_id).map(|config| config.dimension)
-}
-
-/// Replace the bounded ANN projection with an exact native-admission verdict.
-///
-/// The probe resolves the production-selected cohort through the owner
-/// contract and then performs the very admission the serving path performs,
-/// so `hnsw_ready` is true only when a real approximate search would use
-/// native ANN. It never rebuilds a graph, never writes, and reports only
-/// bounded reason codes.
-fn apply_deep_semantic_ann_probe(
-    state: &mut SemanticAssetState,
-    data_dir: &Path,
-    db_path: &Path,
-    current_db_fingerprint: Option<&str>,
-) {
-    let Some(readiness) = probe_semantic_ann_readiness(
-        data_dir,
-        db_path,
-        state.embedder_id.as_deref(),
-        current_db_fingerprint,
-    ) else {
-        // The probe could not resolve an exact cohort at all. The bounded
-        // verdict stays authoritative: reporting `absent` here would turn a
-        // sidecar that is demonstrably present into a false negative.
-        return;
-    };
-    state.hnsw_state = readiness.state();
-    state.hnsw_ready = readiness.is_ready();
-    state.hnsw_reason_code = readiness.reason_code();
-}
-
-/// Perform the exact native admission for the production-selected cohort.
-///
-/// Returns `None` when no cohort could be resolved at all, so the caller
-/// keeps the bounded presence verdict instead of inventing one.
-fn probe_semantic_ann_readiness(
-    data_dir: &Path,
-    db_path: &Path,
-    embedder_id: Option<&str>,
-    current_db_fingerprint: Option<&str>,
-) -> Option<SemanticAnnReadiness> {
-    let embedder_id = embedder_id?;
-    let dimension = semantic_embedder_dimension(embedder_id)?;
-    // The probe must select the same generation the serving path selects, and
-    // that selection is keyed by the current database fingerprint. A deep
-    // probe may read the archive strictly read-only to obtain it; the bounded
-    // path never does, and the strict opener never checkpoints or repairs.
-    let fingerprint = current_db_fingerprint
-        .map(ToOwned::to_owned)
-        .or_else(|| crate::indexer::lexical_storage_fingerprint_for_db_strict(db_path).ok());
-    let cohort = crate::search::model_manager::selected_semantic_ann_cohort(
-        data_dir,
-        embedder_id,
-        dimension,
-        fingerprint.as_deref(),
-    );
-    if cohort.is_empty() {
-        // No exact cohort resolved. There is nothing to admit, and the
-        // bounded presence verdict already describes what is on disk.
-        return None;
-    }
-    Some(crate::search::query::semantic_ann_readiness(&cohort))
 }
 
 fn semantic_preference_surface(
@@ -1383,7 +1274,7 @@ fn semantic_tier_queryable(
     availability: &SemanticAvailability,
     tier: &SemanticTierAssetState,
 ) -> bool {
-    if !tier.ready || tier.current_db_matches == Some(false) {
+    if !tier.ready || (tier.current_db_matches == Some(false) && tier.coverage.is_none()) {
         return false;
     }
     let Some(embedder_id) = tier.embedder_id.as_deref() else {
@@ -1450,6 +1341,7 @@ fn semantic_tier_asset_state(
         size_bytes: Some(artifact.size_bytes),
         index_path: None,
         shard_count: Some(1),
+        coverage: None,
     }
 }
 
@@ -1543,6 +1435,7 @@ fn promote_complete_shard_generation_state(
         size_bytes: Some(size_bytes),
         index_path: Some(first_index_path),
         shard_count: u32::try_from(records.len()).ok(),
+        coverage: None,
     };
 }
 
@@ -1619,21 +1512,35 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
     let index_path = crate::search::tantivy::expected_index_dir(data_dir);
     let checkpoint = load_lexical_rebuild_checkpoint(&index_path)
         .with_context(|| format!("loading lexical checkpoint from {}", index_path.display()))?;
-    let current_db_fingerprint = if db_available && compute_lexical_fingerprint {
-        Some(
-            // Keep the status/opened path on the same identity-keyed cache
-            // used by search. Health intentionally remains skip-open and
-            // serves this sidecar read-only; priming it here lets a status
-            // immediately followed by health agree even when an older
-            // matching checkpoint predates the sidecar.
-            crate::indexer::lexical_storage_fingerprint_for_db_cached(db_path, &index_path)
-                .with_context(|| {
+    let completion_freshness = checkpoint.as_ref().filter(|state| state.completed).map(|state| {
+        completed_lexical_checkpoint_freshness(&index_path, db_path, state).unwrap_or_else(|error| {
+            tracing::debug!(%error, "lexical completion freshness could not be passively verified");
+            LexicalCheckpointFreshness::Unverified(
+                "lexical completion evidence is unavailable; content verification is required",
+            )
+        })
+    });
+    let current_db_fingerprint = if db_available
+        && completion_freshness == Some(LexicalCheckpointFreshness::Current)
+    {
+        // The source epoch and native publication were just checked together.
+        // No SQLite open is needed to repeat that completed observation.
+        checkpoint
+            .as_ref()
+            .map(|state| state.storage_fingerprint.clone())
+    } else if db_available && compute_lexical_fingerprint {
+        match lexical_storage_fingerprint_for_db_cached(db_path, &index_path) {
+            Ok(fingerprint) => Some(fingerprint),
+            Err(error) if crate::indexer::lexical_fingerprint_observation_changed(&error) => None,
+            Err(error) => {
+                return Err(error).with_context(|| {
                     format!(
                         "computing lexical storage fingerprint for {}",
                         db_path.display()
                     )
-                })?,
-        )
+                });
+            }
+        }
     } else if db_available {
         // GH #353: the skip-open surfaces (health watermark lane, count-less
         // status) deliberately never open the archive, but they must still
@@ -1647,7 +1554,7 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
         None
     };
 
-    Ok(lexical_state_from_observations(LexicalObservationInput {
+    let mut state = lexical_state_from_observations(LexicalObservationInput {
         index_path: &index_path,
         db_path,
         stale_threshold,
@@ -1657,7 +1564,39 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
         checkpoint: checkpoint.as_ref(),
         current_db_fingerprint: current_db_fingerprint.as_deref(),
         live: crate::search::tantivy::searchable_index_live_docs(&index_path),
-    }))
+    });
+    if state.exists && !state.rebuilding {
+        match completion_freshness {
+            Some(LexicalCheckpointFreshness::Unverified(reason)) if !state.stale => {
+                // A metadata write or a WAL checkpoint changes the physical
+                // epoch without proving missing lexical content. Say that the
+                // evidence is unverified; do not turn every read into another
+                // expensive rebuild. Existing age/count/replay-debt signals
+                // still take precedence and schedule ordinary maintenance.
+                state.fresh = false;
+                state.status = "unverified";
+                state.status_reason = Some(reason.to_string());
+            }
+            Some(LexicalCheckpointFreshness::Incompatible(reason)) => {
+                state.fresh = false;
+                state.stale = true;
+                if !state.engine_incompatible && !state.hollow {
+                    state.status = "incompatible";
+                    state.status_reason = Some(reason.to_string());
+                }
+            }
+            Some(LexicalCheckpointFreshness::Stale(reason)) => {
+                state.fresh = false;
+                state.stale = true;
+                if !state.engine_incompatible && !state.hollow && state.status == "ready" {
+                    state.status = "stale";
+                    state.status_reason = Some(reason.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(state)
 }
 
 struct LexicalObservationInput<'a> {
@@ -1926,7 +1865,7 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     let status_reason = if stalled {
         let secs = stall_age_ms.unwrap_or(0) / 1000;
         Some(format!(
-            "indexing thread has not posted forward progress for {secs}s while the lock heartbeat keeps refreshing — see issue #258 for diagnostics (run `cass doctor check --json` and capture a stack trace)"
+            "indexing thread has not posted forward progress for {secs}s while the lock heartbeat keeps refreshing — run `cass doctor check --json`, capture a stack trace, and attach both to a new GitHub issue"
         ))
     } else if rebuilding {
         Some("lexical rebuild is in progress".to_string())
@@ -2257,7 +2196,7 @@ pub(crate) fn evaluate_maintenance_coordination_from_snapshot(
         return MaintenanceCoordinationOutcome::Stale {
             job_id,
             reason: format!(
-                "indexing thread has not posted forward progress for {stall_age_ms}ms while the heartbeat keeps refreshing (stall threshold {threshold_ms}ms) — see issue #258"
+                "indexing thread has not posted forward progress for {stall_age_ms}ms while the heartbeat keeps refreshing (stall threshold {threshold_ms}ms)"
             ),
         };
     }
@@ -2675,48 +2614,6 @@ mod tests {
             SemanticPreference::HashFallback,
         );
         assert!(ready.is_hash_fallback());
-    }
-
-    /// k2k20: this marker read runs on `cass status`/`cass health`, so it must
-    /// use the strict mutation-free opener. A dirty WAL left by an unclean
-    /// shutdown must stay byte-identical (the ordinary opener would checkpoint
-    /// it, turning a readiness observation into multi-GB recovery work).
-    #[test]
-    fn semantic_identity_probe_reads_marker_without_recovering_a_dirty_wal() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let db_path = temp.path().join("cass.db");
-        let storage = FrankenStorage::open(&db_path).expect("create cass db");
-        storage
-            .mark_semantic_identity_rebuild_required(SemanticIdentityTier::Fast)
-            .expect("mark fast semantic identity stale");
-        storage
-            .close_without_checkpoint()
-            .expect("close without checkpoint");
-        let wal_path = crate::storage::sqlite::database_sidecar_path(&db_path, "-wal");
-        let before = std::fs::metadata(&wal_path)
-            .map(|meta| meta.len())
-            .unwrap_or(0);
-        assert!(
-            before > 0,
-            "precondition: an uncheckpointed close must leave WAL frames"
-        );
-
-        let state = apply_semantic_identity_invalidation(
-            &db_path,
-            SemanticAvailability::HashFallback,
-            SemanticPreference::HashFallback,
-        );
-        assert!(
-            state.is_index_stale(),
-            "the strict probe must still read the invalidation marker: {state:?}"
-        );
-        let after = std::fs::metadata(&wal_path)
-            .map(|meta| meta.len())
-            .unwrap_or(0);
-        assert_eq!(
-            before, after,
-            "an observation must not checkpoint the archive (WAL {before} -> {after})"
-        );
     }
 
     #[cfg(windows)]
@@ -3218,55 +3115,6 @@ mod tests {
         let reason = state.status_reason.as_deref().unwrap_or_default();
         assert!(reason.contains("cass index --full"));
         assert!(reason.contains("Tantivy"));
-    }
-
-    #[test]
-    fn lexical_state_accepts_old_age_for_completed_matching_generation() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let index_path = temp.path().join("index").join("v4");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(
-            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
-            b"{}",
-        )
-        .expect("write quill manifest");
-        let db_path = temp.path().join("agent_search.db");
-        std::fs::write(&db_path, b"db").expect("write db file");
-        let checkpoint = LexicalRebuildCheckpoint {
-            db_path: db_path.display().to_string(),
-            total_conversations: 10,
-            storage_fingerprint: "content-v1:10:20:30".to_string(),
-            committed_offset: 10,
-            committed_conversation_id: Some(20),
-            processed_conversations: 10,
-            indexed_docs: 100,
-            schema_hash: SCHEMA_HASH.to_string(),
-            page_size: LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
-            completed: true,
-            updated_at_ms: 1_733_000_000_000,
-        };
-
-        let state = lexical_state_from_observations(LexicalObservationInput {
-            index_path: &index_path,
-            db_path: &db_path,
-            stale_threshold: 60,
-            // The generation is deliberately older than the wall-clock
-            // threshold. Matching DB/checkpoint identity is the stronger
-            // publication proof for an unchanged canonical archive.
-            last_indexed_at_ms: Some(1_733_000_000_000),
-            now_ms: 1_733_000_600_000,
-            maintenance: SearchMaintenanceSnapshot::default(),
-            checkpoint: Some(&checkpoint),
-            current_db_fingerprint: Some("content-v1:10:20:30"),
-            live: None,
-        });
-
-        assert_eq!(state.status, "ready");
-        assert!(state.fresh);
-        assert!(!state.stale);
-        assert_eq!(state.fingerprint.matches_current_db_fingerprint, Some(true));
-        assert_eq!(state.checkpoint.completed, Some(true));
-        assert_eq!(state.checkpoint.db_matches, Some(true));
     }
 
     #[test]
@@ -3889,10 +3737,12 @@ mod tests {
             .status_reason
             .as_deref()
             .expect("stalled state should populate status_reason");
+        // #382: operators are sent to a new issue, not to a closed one.
         assert!(
             reason.contains("forward progress")
-                && (reason.contains("#258") || reason.contains("issue #258")),
-            "status_reason should mention forward progress and reference #258 ({reason})",
+                && reason.contains("attach both to a new GitHub issue")
+                && !reason.contains("issue #"),
+            "status_reason should mention forward progress and ask for a new issue ({reason})",
         );
     }
 
@@ -4094,10 +3944,10 @@ mod tests {
         let outcome = evaluate_maintenance_coordination_from_snapshot(&snapshot, now_ms);
         match outcome {
             MaintenanceCoordinationOutcome::Stale { ref reason, .. } => {
+                // #382: no pointer to a closed issue.
                 assert!(
-                    reason.contains("forward progress")
-                        && (reason.contains("#258") || reason.contains("issue #258")),
-                    "stalled coordination reason should mention forward progress and #258: {reason}",
+                    reason.contains("forward progress") && !reason.contains("issue #"),
+                    "stalled coordination reason should mention forward progress and name no closed issue: {reason}",
                 );
             }
             other => assert!(
@@ -4137,7 +3987,6 @@ mod tests {
             db_available: false,
             compute_lexical_fingerprint: false,
             inspect_semantic: true,
-            probe_semantic_ann: SemanticAnnProbeMode::Bounded,
         })
         .expect("asset inspection should not fail when db availability is already known");
 
@@ -4178,7 +4027,6 @@ mod tests {
             db_available: false,
             compute_lexical_fingerprint: false,
             inspect_semantic: false,
-            probe_semantic_ann: SemanticAnnProbeMode::Bounded,
         })
         .expect("asset inspection should not open semantic DB when semantic inspection is skipped");
 
@@ -4236,7 +4084,6 @@ mod tests {
             db_available: true,
             compute_lexical_fingerprint: false,
             inspect_semantic: true,
-            probe_semantic_ann: SemanticAnnProbeMode::Bounded,
         })
         .expect("semantic metadata inspection should degrade without failing the whole snapshot");
 
@@ -5445,7 +5292,11 @@ mod tests {
             compute_lexical_fingerprint: true,
         })
         .expect("status inspection");
-        assert_eq!(status_view.status, "ready");
+        assert_eq!(status_view.status, "unverified");
+        assert!(
+            !status_view.fresh,
+            "counts cannot certify a legacy checkpoint"
+        );
         assert!(!status_view.stale);
         assert_eq!(
             status_view.fingerprint.matches_current_db_fingerprint,
@@ -5465,9 +5316,9 @@ mod tests {
             compute_lexical_fingerprint: false,
         })
         .expect("primed skip-open inspection");
-        assert_eq!(primed_health.status, "ready");
+        assert_eq!(primed_health.status, "unverified");
         assert!(!primed_health.stale);
-        assert!(primed_health.fresh);
+        assert!(!primed_health.fresh);
         assert_eq!(
             primed_health.fingerprint.current_db_fingerprint,
             status_view.fingerprint.current_db_fingerprint

@@ -12,7 +12,7 @@ use std::time::Duration;
 const PRIVATE_BODY: &str = "guide-live-private-session-body-sentinel";
 
 fn cass(home: &Path) -> Command {
-    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+    let mut command = Command::new(util::cass_bin());
     // Do not inherit connector roots, remote sources, or agent-home overrides
     // from the developer or RCH worker running this test. Keep only OS/loader
     // infrastructure needed to launch the already-built executable.
@@ -99,6 +99,617 @@ fn step<'a>(payload: &'a Value, id: &str) -> &'a Value {
 
 fn db_digest(data_dir: &Path) -> blake3::Hash {
     blake3::hash(&std::fs::read(data_dir.join("agent_search.db")).expect("archive bytes"))
+}
+
+fn configure_remote(home: &Path, remote_path: &str) -> std::path::PathBuf {
+    use coding_agent_search::sources::config::SourceDefinition;
+    let mut source = SourceDefinition::ssh("guide-remote", "fixture.invalid");
+    source.paths = vec![remote_path.into()];
+    configure_sources(home, vec![source])
+}
+
+fn configure_sources(
+    home: &Path,
+    sources: Vec<coding_agent_search::sources::config::SourceDefinition>,
+) -> std::path::PathBuf {
+    use coding_agent_search::sources::config::SourcesConfig;
+    let config_dir = home.join("xdg-config/cass");
+    std::fs::create_dir_all(&config_dir).expect("config directory");
+    let config = SourcesConfig {
+        sources,
+        ..Default::default()
+    };
+    let path = config_dir.join("sources.toml");
+    std::fs::write(&path, toml::to_string(&config).expect("source TOML"))
+        .expect("source configuration");
+    path
+}
+
+fn onboard(home: &Path, data_dir: &Path, db: &Path, confirm: bool) -> Value {
+    let (_, plan) = run(
+        cass(home)
+            .env_remove("CASS_IGNORE_SOURCES_CONFIG")
+            .args(["guide", "onboard-source", "--json"])
+            .arg("--db")
+            .arg(db),
+        data_dir,
+    );
+    let privacy = plan["plan"]["privacy_tier"].as_str().expect("privacy");
+    let cost = plan["plan"]["cost_risk"]["risk_level"]
+        .as_str()
+        .expect("cost");
+    let mut command = cass(home);
+    command
+        .env_remove("CASS_IGNORE_SOURCES_CONFIG")
+        // Any SSH/rsync invocation would fail: onboarding consumes staged files.
+        .env("PATH", home.join("empty-path"))
+        .args([
+            "guide",
+            "onboard-source",
+            "--apply",
+            "--confirm-fact",
+            "sources_config_writable",
+            "--accept-privacy-tier",
+            privacy,
+            "--accept-cost-risk",
+            cost,
+            "--confirm-stop-conditions-clear",
+            "--json",
+        ])
+        .arg("--db")
+        .arg(db);
+    if confirm {
+        command.args(["--confirm-step", "3"]);
+    }
+    run(&mut command, data_dir).1
+}
+
+#[test]
+fn live_onboarding_indexes_configured_local_sources_only_after_confirmation() {
+    use coding_agent_search::sources::config::SourceDefinition;
+    for relative in [false, true] {
+        let home = tempfile::tempdir().expect("home");
+        let data_dir = home.path().join("data with spaces");
+        let db = home.path().join("selected local archive.db");
+        let source_root = home.path().join("configured codex");
+        util::seed_codex_session(
+            &source_root,
+            "rollout-guide-local.jsonl",
+            PRIVATE_BODY,
+            false,
+        );
+        let mut source = SourceDefinition::local("guide-local");
+        source.paths = vec![if relative {
+            "~/configured codex".into()
+        } else {
+            source_root.to_string_lossy().into_owned()
+        }];
+        let config = configure_sources(home.path(), vec![source]);
+        let config_before = std::fs::read(&config).expect("configuration bytes");
+        let session = source_root.join("sessions/2026/04/23/rollout-guide-local.jsonl");
+        let session_before = std::fs::read(&session).expect("session bytes");
+
+        let unconfirmed = onboard(home.path(), &data_dir, &db, false);
+        let preview = step(&unconfirmed, "sources.dry-sync");
+        assert_eq!(preview["proof_gate"]["result"], "passed", "{unconfirmed}");
+        assert_eq!(preview["proof_gate"]["source"], "source-config");
+        assert_eq!(preview["observation"]["configured_local_sources"], 1);
+        assert_eq!(preview["observation"]["configured_remote_sources"], 0);
+        assert_eq!(preview["observation"]["local_paths_checked"], 1);
+        assert_eq!(preview["observation"]["transport_started"], false);
+        assert_eq!(preview["observation"]["sources_registered"], false);
+        assert_eq!(
+            step(&unconfirmed, "index.incremental")["result"],
+            "awaiting-confirmation"
+        );
+        assert_eq!(unconfirmed["execution"]["attempted_mutation_count"], 0);
+        assert!(!db.exists());
+
+        let output = onboard(home.path(), &data_dir, &db, true);
+        let indexed = step(&output, "index.incremental");
+        assert_eq!(indexed["result"], "executed", "{output}");
+        assert_eq!(indexed["proof_gate"]["result"], "passed");
+        assert_eq!(indexed["observation"]["conversations"], 1);
+        assert_eq!(indexed["execution_scope"]["requires_staged_mirrors"], false);
+        assert_eq!(output["mutation_contract"]["touches_network"], false);
+        assert!(!data_dir.join("agent_search.db").exists());
+        assert_eq!(std::fs::read(&config).expect("config after"), config_before);
+        assert_eq!(
+            std::fs::read(&session).expect("session after"),
+            session_before
+        );
+        let (success, hits) = run_on_archive(
+            home.path(),
+            &data_dir,
+            &db,
+            &[
+                "search",
+                PRIVATE_BODY,
+                "--mode",
+                "lexical",
+                "--source",
+                "guide-local",
+                "--json",
+            ],
+        );
+        assert!(success, "{hits}");
+        assert_eq!(hits["hits"].as_array().expect("hits").len(), 1);
+        assert!(!output.to_string().contains(PRIVATE_BODY));
+    }
+}
+
+#[test]
+fn live_onboarding_refuses_missing_or_invalid_local_sources() {
+    use coding_agent_search::sources::config::SourceDefinition;
+    for scenario in ["missing-root", "empty-path", "no-paths", "empty-config"] {
+        let home = tempfile::tempdir().expect("home");
+        let data_dir = home.path().join("data");
+        let db = data_dir.join("agent_search.db");
+        let mut source = SourceDefinition::local("guide-local");
+        source.paths = match scenario {
+            "missing-root" => vec![home.path().join("missing").to_string_lossy().into_owned()],
+            "empty-path" => vec![String::new()],
+            _ => Vec::new(),
+        };
+        configure_sources(
+            home.path(),
+            if scenario == "empty-config" {
+                Vec::new()
+            } else {
+                vec![source]
+            },
+        );
+        let output = onboard(home.path(), &data_dir, &db, true);
+        assert_eq!(
+            step(&output, "sources.dry-sync")["proof_gate"]["result"],
+            "failed",
+            "{scenario}: {output}"
+        );
+        assert_eq!(
+            output["execution"]["attempted_mutation_count"], 0,
+            "{output}"
+        );
+        assert!(!db.exists());
+    }
+}
+
+#[test]
+fn live_onboarding_mixed_sources_requires_every_configured_local_path() {
+    use coding_agent_search::sources::config::{SourceDefinition, SourcesConfig};
+    for missing in [false, true] {
+        let home = tempfile::tempdir().expect("home");
+        let data_dir = home.path().join("data");
+        let db = data_dir.join("agent_search.db");
+        let config = configure_remote(home.path(), "~/.codex");
+        let mut sources = SourcesConfig::load_from(&config)
+            .expect("remote config")
+            .sources;
+        let mirror = data_dir.join("remotes/guide-remote/mirror").join(
+            coding_agent_search::sources::sync::path_to_safe_dirname("~/.codex"),
+        );
+        util::seed_codex_session(
+            &mirror,
+            "rollout-mixed-remote.jsonl",
+            "mixedremotemarker",
+            true,
+        );
+        let local_root = home.path().join("configured codex");
+        util::seed_codex_session(
+            &local_root,
+            "rollout-mixed-local.jsonl",
+            "mixedlocalmarker",
+            true,
+        );
+        let mut local = SourceDefinition::local("guide-local");
+        local.paths = vec![local_root.to_string_lossy().into_owned()];
+        if missing {
+            local
+                .paths
+                .push(home.path().join("missing").to_string_lossy().into_owned());
+        }
+        sources.push(local);
+        configure_sources(home.path(), sources);
+        let output = onboard(home.path(), &data_dir, &db, true);
+        let preview = step(&output, "sources.dry-sync");
+        if missing {
+            assert_eq!(preview["proof_gate"]["result"], "failed", "{output}");
+            assert_eq!(output["execution"]["attempted_mutation_count"], 0);
+            assert!(!db.exists());
+        } else {
+            assert_eq!(preview["proof_gate"]["result"], "passed", "{output}");
+            assert_eq!(preview["observation"]["configured_local_sources"], 1);
+            assert_eq!(preview["observation"]["configured_remote_sources"], 1);
+            assert_eq!(preview["observation"]["local_paths_checked"], 1);
+            assert_eq!(preview["observation"]["configured_paths"], 2);
+            assert_eq!(
+                step(&output, "index.incremental")["execution_scope"]["requires_staged_mirrors"],
+                true
+            );
+            assert_eq!(
+                step(&output, "index.incremental")["result"],
+                "executed",
+                "{output}"
+            );
+            assert_eq!(
+                step(&output, "index.incremental")["observation"]["conversations"],
+                2
+            );
+        }
+    }
+}
+
+#[test]
+fn live_onboarding_indexes_a_staged_remote_only_after_explicit_confirmation() {
+    let home = tempfile::tempdir().expect("home");
+    let data_dir = home.path().join("data with spaces");
+    let db = home.path().join("selected archive.db");
+    let config = configure_remote(home.path(), "~/.codex");
+    let mirror = data_dir.join("remotes/guide-remote/mirror").join(
+        coding_agent_search::sources::sync::path_to_safe_dirname("~/.codex"),
+    );
+    util::seed_codex_session(&mirror, "rollout-guide-remote.jsonl", PRIVATE_BODY, true);
+    let config_before = std::fs::read(&config).expect("config bytes");
+    let unconfirmed = onboard(home.path(), &data_dir, &db, false);
+    let preview = step(&unconfirmed, "sources.dry-sync");
+    assert_eq!(preview["proof_gate"]["result"], "passed", "{unconfirmed}");
+    assert_eq!(preview["observation"]["transport_started"], false);
+    assert_eq!(preview["observation"]["sources_registered"], false);
+    assert_eq!(
+        preview["environment"]["CASS_DATA_DIR"],
+        data_dir.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        step(&unconfirmed, "index.incremental")["result"],
+        "awaiting-confirmation"
+    );
+    assert_eq!(unconfirmed["execution"]["attempted_mutation_count"], 0);
+    assert!(!db.exists());
+
+    let output = onboard(home.path(), &data_dir, &db, true);
+    let indexed = step(&output, "index.incremental");
+    assert_eq!(indexed["result"], "executed", "{output}");
+    assert_eq!(indexed["proof_gate"]["result"], "passed");
+    assert_eq!(indexed["observation"]["conversations"], 1);
+    assert_eq!(indexed["observation"]["lexical_ready"], true);
+    assert_eq!(indexed["observation"]["source_scan_fresh"], true);
+    assert_eq!(indexed["execution_scope"]["remote_sync"], false);
+    assert_eq!(output["execution"]["applied_mutation_count"], 1);
+    assert_eq!(output["mutation_contract"]["mutates_db"], true);
+    assert_eq!(output["mutation_contract"]["touches_network"], false);
+    assert_eq!(std::fs::read(&config).expect("config after"), config_before);
+    assert!(!data_dir.join("agent_search.db").exists());
+    assert!(!output.to_string().contains(PRIVATE_BODY));
+    let (success, hits) = run_on_archive(
+        home.path(),
+        &data_dir,
+        &db,
+        &[
+            "search",
+            PRIVATE_BODY,
+            "--mode",
+            "lexical",
+            "--source",
+            "guide-remote",
+            "--json",
+        ],
+    );
+    assert!(success, "{hits}");
+    assert!(
+        hits["hits"].as_array().is_some_and(|hits| !hits.is_empty()),
+        "{hits}"
+    );
+}
+
+#[test]
+fn live_onboarding_refuses_missing_or_invalid_config_and_unstaged_mirrors() {
+    for scenario in ["missing-config", "invalid-path", "missing-mirror"] {
+        let home = tempfile::tempdir().expect("home");
+        let data_dir = home.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data directory");
+        if scenario != "missing-config" {
+            configure_remote(
+                home.path(),
+                if scenario == "invalid-path" {
+                    ""
+                } else {
+                    "~/.codex"
+                },
+            );
+        }
+        let db = data_dir.join("agent_search.db");
+        let output = onboard(home.path(), &data_dir, &db, true);
+        let preview = step(&output, "sources.dry-sync");
+        assert_eq!(
+            preview["proof_gate"]["result"],
+            if scenario == "missing-mirror" {
+                "passed"
+            } else {
+                "failed"
+            },
+            "{scenario}: {output}"
+        );
+        assert_ne!(
+            step(&output, "index.incremental")["result"],
+            "executed",
+            "{output}"
+        );
+        assert_eq!(
+            output["execution"]["attempted_mutation_count"], 0,
+            "{output}"
+        );
+        assert!(!db.exists());
+    }
+}
+
+#[test]
+fn live_onboarding_preserves_the_archive_when_another_indexer_holds_the_lock() {
+    let home = tempfile::tempdir().expect("home");
+    let data_dir = home.path().join("data");
+    seed_archive(home.path(), &data_dir);
+    configure_remote(home.path(), "~/.codex");
+    let mirror = data_dir.join("remotes/guide-remote/mirror").join(
+        coding_agent_search::sources::sync::path_to_safe_dirname("~/.codex"),
+    );
+    util::seed_codex_session(
+        &mirror,
+        "rollout-guide-locked.jsonl",
+        "guidependingremote",
+        true,
+    );
+    let before = db_digest(&data_dir);
+    let holder = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(data_dir.join("index-run.lock"))
+        .expect("existing index lock");
+    fs2::FileExt::try_lock_exclusive(&holder).expect("hold actual index lock");
+    let output = onboard(
+        home.path(),
+        &data_dir,
+        &data_dir.join("agent_search.db"),
+        true,
+    );
+    let indexed = step(&output, "index.incremental");
+    assert_eq!(indexed["result"], "failed", "{output}");
+    assert_eq!(indexed["observation"]["index_busy"], true);
+    assert_eq!(indexed["observation"]["exit_code"], 7);
+    assert_eq!(output["execution"]["applied_mutation_count"], 0);
+    assert_eq!(db_digest(&data_dir), before);
+    fs2::FileExt::unlock(&holder).expect("release actual index lock");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn live_onboarding_times_out_a_blocked_indexer_and_releases_its_archive_lock() {
+    use coding_agent_search::sources::config::SourceDefinition;
+    use std::fs::{self, OpenOptions};
+    use std::os::unix::ffi::OsStrExt;
+    use std::time::Instant;
+
+    let home = tempfile::tempdir().expect("home");
+    let data_dir = home.path().join("timeout data");
+    let db = data_dir.join("agent_search.db");
+    seed_archive(home.path(), &data_dir);
+    let source_root = home.path().join("configured codex");
+    util::seed_codex_session(
+        &source_root,
+        "rollout-guide-timeout.jsonl",
+        "guidetimeoutpending",
+        false,
+    );
+    let mut source = SourceDefinition::local("guide-timeout");
+    source.paths = vec![source_root.to_string_lossy().into_owned()];
+    let config = configure_sources(home.path(), vec![source]);
+    let session = source_root.join("sessions/2026/04/23/rollout-guide-timeout.jsonl");
+    let config_before = fs::read(&config).expect("configuration bytes");
+    let session_before = fs::read(&session).expect("session bytes");
+
+    let mirror_lease = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(data_dir.join("raw-mirror/v1/.mutation.lock"))
+        .expect("existing mirror mutation lease");
+    fs2::FileExt::try_lock_exclusive(&mirror_lease).expect("block actual mirror capture");
+    let resolved_data = data_dir.canonicalize().expect("resolved data directory");
+    let started = Instant::now();
+    let (child_pid, output) = std::thread::scope(|scope| {
+        let execution = scope.spawn(|| onboard(home.path(), &data_dir, &db, true));
+        let admission_deadline = Instant::now() + Duration::from_secs(30);
+        let child_pid = loop {
+            let pid = fs::read_to_string(data_dir.join("index-run.lock"))
+                .ok()
+                .and_then(|metadata| {
+                    metadata.lines().find_map(|line| {
+                        line.strip_prefix("pid=")
+                            .and_then(|value| value.parse::<u32>().ok())
+                    })
+                });
+            if let Some(pid) = pid
+                && let Ok(argv) = fs::read(format!("/proc/{pid}/cmdline"))
+                && argv.split(|byte| *byte == 0).any(|arg| arg == b"index")
+                && argv
+                    .split(|byte| *byte == 0)
+                    .any(|arg| arg == resolved_data.as_os_str().as_bytes())
+            {
+                break pid;
+            }
+            assert!(
+                !execution.is_finished(),
+                "guide must start a real index child before reporting the blocked operation"
+            );
+            assert!(
+                Instant::now() < admission_deadline,
+                "guide did not acquire the archive for its actual index child"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
+
+        let competing = cass(home.path())
+            .args(["index", "--json"])
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .arg("--db")
+            .arg(&db)
+            .timeout(Duration::from_secs(20))
+            .output()
+            .expect("competing real indexer");
+        assert_eq!(
+            competing.status.code(),
+            Some(7),
+            "blocked guide child must retain archive ownership: {}",
+            String::from_utf8_lossy(&competing.stderr)
+        );
+        (child_pid, execution.join().expect("guided index thread"))
+    });
+
+    // The real adapter owns a 120-second budget. The mirror lease stays held
+    // through these checks, so normal indexing completion cannot impersonate
+    // timeout cleanup or release of the child's archive ownership.
+    assert!(started.elapsed() >= Duration::from_secs(120));
+    assert!(started.elapsed() < Duration::from_secs(180));
+    let indexed = step(&output, "index.incremental");
+    assert_eq!(indexed["result"], "failed", "{output}");
+    assert_eq!(indexed["detail"], "cass command deadline exceeded");
+    assert_eq!(indexed["mutation_started"], true);
+    assert_eq!(indexed["proof_gate"]["result"], "failed");
+    assert_eq!(output["execution"]["attempted_mutation_count"], 1);
+    assert_eq!(output["execution"]["applied_mutation_count"], 0);
+    assert!(
+        !Path::new(&format!("/proc/{child_pid}")).exists(),
+        "guide must reap the child it timed out"
+    );
+    let archive_owner = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(data_dir.join("index-run.lock"))
+        .expect("retained archive owner metadata");
+    fs2::FileExt::try_lock_exclusive(&archive_owner)
+        .expect("timed-out child released archive ownership");
+    fs2::FileExt::unlock(&archive_owner).expect("release archive ownership probe");
+    assert_eq!(
+        fs::read(&config).expect("config after timeout"),
+        config_before
+    );
+    assert_eq!(
+        fs::read(&session).expect("session after timeout"),
+        session_before
+    );
+    assert!(!output.to_string().contains(PRIVATE_BODY));
+
+    fs2::FileExt::unlock(&mirror_lease).expect("allow real mirror capture to resume");
+    let recovered = onboard(home.path(), &data_dir, &db, true);
+    let indexed = step(&recovered, "index.incremental");
+    assert_eq!(indexed["result"], "executed", "{recovered}");
+    assert_eq!(indexed["proof_gate"]["result"], "passed");
+    assert_eq!(recovered["execution"]["applied_mutation_count"], 1);
+    let (success, hits) = run_on_archive(
+        home.path(),
+        &data_dir,
+        &db,
+        &[
+            "search",
+            "guidetimeoutpending",
+            "--mode",
+            "lexical",
+            "--source",
+            "guide-timeout",
+            "--json",
+        ],
+    );
+    assert!(success, "{hits}");
+    assert_eq!(hits["hits"].as_array().expect("recovered hits").len(), 1);
+    assert_eq!(
+        fs::read(&config).expect("final configuration"),
+        config_before
+    );
+    assert_eq!(fs::read(&session).expect("final session"), session_before);
+    assert!(!recovered.to_string().contains(PRIVATE_BODY));
+}
+
+#[test]
+fn live_onboarding_reports_partial_progress_when_a_session_has_an_active_writer() {
+    let home = tempfile::tempdir().expect("home");
+    let data_dir = home.path().join("data");
+    let db = data_dir.join("agent_search.db");
+    configure_remote(home.path(), "~/.codex");
+    let mirror = data_dir.join("remotes/guide-remote/mirror").join(
+        coding_agent_search::sources::sync::path_to_safe_dirname("~/.codex"),
+    );
+    util::seed_codex_session(
+        &mirror,
+        "rollout-available.jsonl",
+        "guideavailablemarker",
+        true,
+    );
+    // Mirrors are intentionally immutable snapshots for the active-source
+    // policy. Hold a real local writer while the staged remote stays readable.
+    let local = home.path().join(".codex");
+    util::seed_codex_session(&local, "rollout-active.jsonl", "guideactivemarker", true);
+    let active = local.join("sessions/2026/04/23/rollout-active.jsonl");
+    let holder = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&active)
+        .expect("active session");
+    fs2::FileExt::try_lock_exclusive(&holder).expect("active writer lock");
+    let output = onboard(home.path(), &data_dir, &db, true);
+    let indexed = step(&output, "index.incremental");
+    assert_eq!(indexed["result"], "failed", "{output}");
+    assert_eq!(indexed["mutation_started"], true);
+    assert_eq!(indexed["observation"]["deferred_active_sources"], 1);
+    assert_eq!(indexed["observation"]["state_may_have_changed"], true);
+    assert_eq!(output["execution"]["applied_mutation_count"], 0);
+    assert_eq!(output["mutation_contract"]["read_only"], false);
+    let (_, status) = run_on_archive(home.path(), &data_dir, &db, &["status", "--json"]);
+    assert_eq!(status["database"]["conversations"], 1, "{status}");
+    let (success, hits) = run_on_archive(
+        home.path(),
+        &data_dir,
+        &db,
+        &[
+            "search",
+            "guideavailablemarker",
+            "--mode",
+            "lexical",
+            "--json",
+        ],
+    );
+    assert!(success, "{hits}");
+    assert!(hits["hits"].as_array().is_some_and(|hits| !hits.is_empty()));
+    fs2::FileExt::unlock(&holder).expect("release active writer lock");
+    drop(holder);
+    let retried = onboard(home.path(), &data_dir, &db, true);
+    assert_eq!(
+        step(&retried, "index.incremental")["result"],
+        "executed",
+        "{retried}"
+    );
+    assert_eq!(
+        step(&retried, "index.incremental")["observation"]["conversations"],
+        2
+    );
+    let retry_counts = &step(&retried, "index.incremental")["observation"]["index_observations"];
+    assert_eq!(retry_counts["conversations"], 1);
+    let (success, active_hits) = run_on_archive(
+        home.path(),
+        &data_dir,
+        &db,
+        &["search", "guideactivemarker", "--mode", "lexical", "--json"],
+    );
+    assert!(success, "{active_hits}");
+    assert!(
+        active_hits["hits"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty())
+    );
+    let no_op = onboard(home.path(), &data_dir, &db, true);
+    let indexed = step(&no_op, "index.incremental");
+    assert_eq!(indexed["result"], "executed", "{no_op}");
+    assert_eq!(indexed["observation"]["conversations"], 2);
+    assert_eq!(
+        indexed["observation"]["index_observations"]["conversations"],
+        0
+    );
 }
 
 #[test]
@@ -210,4 +821,184 @@ fn live_confirmed_capsule_returns_a_manifest_receipt_without_modifying_the_archi
     );
     assert!(!output.to_string().contains(PRIVATE_BODY));
     assert_eq!(db_digest(&data_dir), before);
+}
+
+fn run_on_archive(home: &Path, data_dir: &Path, db: &Path, args: &[&str]) -> (bool, Value) {
+    run(cass(home).args(args).arg("--db").arg(db), data_dir)
+}
+
+#[test]
+fn live_confirmed_lexical_repair_verifies_the_selected_archive_without_ingesting_sources() {
+    let home = tempfile::tempdir().expect("home");
+    let data_dir = home.path().join("data with spaces");
+    let db_path = home.path().join("selected canonical.db");
+    std::fs::create_dir_all(&data_dir).expect("data directory");
+    util::seed_codex_session(
+        &home.path().join(".codex"),
+        "rollout-guide-repair.jsonl",
+        PRIVATE_BODY,
+        true,
+    );
+    let archive = |args: &[&str]| run_on_archive(home.path(), &data_dir, &db_path, args);
+    let (success, seeded) = archive(&["index", "--full", "--json"]);
+    assert!(success, "seed index failed: {seeded}");
+    let (_, before) = archive(&["status", "--json"]);
+    assert_eq!(before["database"]["conversations"], 1, "{before}");
+    let index_dir = coding_agent_search::search::tantivy::expected_index_dir(&data_dir);
+    std::fs::rename(&index_dir, home.path().join("preserved-lexical-generation"))
+        .expect("preserve lexical assets outside the active index directory");
+    util::seed_codex_session(
+        &home.path().join(".codex"),
+        "rollout-guide-pending.jsonl",
+        "guideunindexedpendingmarker",
+        true,
+    );
+
+    let (_, plan) = archive(&["guide", "repair-assets", "--json"]);
+    let planned = step(&plan, "doctor.rebuild-stale-assets");
+    assert_eq!(planned["result"], "planned");
+    assert_eq!(planned["execution_scope"]["source_scan"], false);
+    assert_eq!(planned["execution_scope"]["semantic_rebuild"], false);
+    assert!(!index_dir.join("MANIFEST").exists());
+    let cost = plan["plan"]["cost_risk"]["risk_level"]
+        .as_str()
+        .expect("cost risk");
+    let mut apply_args = vec![
+        "guide",
+        "repair-assets",
+        "--apply",
+        "--confirm-fact",
+        "disk_headroom_ok",
+        "--accept-cost-risk",
+        cost,
+        "--confirm-stop-conditions-clear",
+        "--json",
+    ];
+    let (_, unconfirmed) = archive(&apply_args);
+    assert_eq!(
+        step(&unconfirmed, "doctor.rebuild-stale-assets")["result"],
+        "awaiting-confirmation",
+        "{unconfirmed}"
+    );
+    assert_eq!(unconfirmed["execution"]["attempted_mutation_count"], 0);
+    assert!(!index_dir.join("MANIFEST").exists());
+
+    apply_args.extend(["--confirm-step", "3"]);
+    let (_, repaired) = archive(&apply_args);
+    let repair = step(&repaired, "doctor.rebuild-stale-assets");
+    assert_eq!(repair["result"], "executed", "{repaired}");
+    assert_eq!(repair["proof_gate"]["name"], "lexical-ready");
+    assert_eq!(repair["proof_gate"]["result"], "passed");
+    assert_eq!(repair["mutation_started"], true);
+    assert_eq!(repair["observation"]["lexical_ready"], true);
+    assert_eq!(repair["observation"]["sources_scanned"], false);
+    assert_eq!(repair["observation"]["semantic_rebuilt"], false);
+    assert_eq!(repaired["execution"]["applied_mutation_count"], 1);
+    assert_eq!(repaired["mutation_contract"]["mutates_db"], true);
+    assert_eq!(repaired["mutation_contract"]["mutates_files"], true);
+    assert_eq!(repaired["mutation_contract"]["touches_network"], false);
+    assert!(!repaired.to_string().contains(PRIVATE_BODY));
+    assert!(
+        !data_dir.join("agent_search.db").exists(),
+        "repair must honor the explicit archive override"
+    );
+
+    let (_, after) = archive(&["status", "--json"]);
+    for pointer in [
+        "/database/conversations",
+        "/database/messages",
+        "/index/fingerprint/current_db_fingerprint",
+    ] {
+        assert_eq!(
+            after.pointer(pointer),
+            before.pointer(pointer),
+            "canonical corpus changed at {pointer}: {after}"
+        );
+    }
+    assert_eq!(after["index"]["manifest_source"], "current");
+    assert_eq!(
+        after["index"]["fingerprint"]["matches_current_db_fingerprint"],
+        true
+    );
+    let (search_ok, searchable) = archive(&["search", PRIVATE_BODY, "--json"]);
+    assert!(
+        search_ok,
+        "repaired archive must be searchable: {searchable}"
+    );
+    assert!(
+        searchable["hits"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty()),
+        "{searchable}"
+    );
+    let (_, pending) = archive(&["search", "guideunindexedpendingmarker", "--json"]);
+    assert_eq!(
+        pending["hits"].as_array().map(Vec::len),
+        Some(0),
+        "repair must not ingest pending sources: {pending}"
+    );
+
+    let (_, already_ready) = archive(&apply_args);
+    assert_eq!(
+        step(&already_ready, "doctor.rebuild-stale-assets")["result"],
+        "already-ready",
+        "{already_ready}"
+    );
+    assert_eq!(already_ready["execution"]["attempted_mutation_count"], 0);
+    assert_eq!(already_ready["mutation_contract"]["read_only"], true);
+}
+
+#[test]
+fn canonical_repair_guard_refuses_missing_and_empty_archives_without_source_discovery() {
+    for existing_empty in [false, true] {
+        let home = tempfile::tempdir().expect("home");
+        let data_dir = home.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data directory");
+        if existing_empty {
+            let (success, empty) = run(
+                cass(home.path()).args(["index", "--full", "--json"]),
+                &data_dir,
+            );
+            assert!(success, "initialize empty archive: {empty}");
+            assert_eq!(empty["conversations"], 0);
+        }
+        util::seed_codex_session(
+            &home.path().join(".codex"),
+            "rollout-guide-guard.jsonl",
+            "guidecanonicalguardmarker",
+            true,
+        );
+        let refused = cass(home.path())
+            .env("CASS_INDEX_REQUIRE_CANONICAL_REBUILD", "1")
+            .args(["index", "--force-rebuild", "--no-progress-events", "--json"])
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .output()
+            .expect("run guarded canonical repair");
+        assert!(
+            !refused.status.success(),
+            "scoped repair must refuse missing/empty archive: {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        if existing_empty {
+            let (_, after) = run(cass(home.path()).args(["status", "--json"]), &data_dir);
+            assert_eq!(
+                after["database"]["conversations"], 0,
+                "guard must refuse before source discovery: {after}"
+            );
+        } else {
+            assert!(!data_dir.join("agent_search.db").exists());
+        }
+        // Ordinary first-run --force-rebuild keeps source discovery when the
+        // internal canonical-only scope requirement is absent.
+        let (success, ordinary) = run(
+            cass(home.path()).args(["index", "--force-rebuild", "--no-progress-events", "--json"]),
+            &data_dir,
+        );
+        assert!(
+            success,
+            "ordinary first-run force rebuild must still work: {ordinary}"
+        );
+        assert_eq!(ordinary["conversations"], 1, "{ordinary}");
+    }
 }

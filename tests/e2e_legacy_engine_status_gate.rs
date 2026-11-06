@@ -7,6 +7,10 @@
 //! The legacy shape is produced deterministically from a real index: build a
 //! Quill generation, then rename its `MANIFEST` to `meta.json` (rename only;
 //! nothing is deleted).
+//!
+//! Bead `coding_agent_session_search-mknmt`: a corrupt current `MANIFEST` is
+//! read through `MANIFEST.prev`; status, health and search robot-meta must say
+//! so, and `cass index` must rebuild the newest publish.
 
 mod util;
 

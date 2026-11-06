@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# dpfvr_ubs_gate_e2e.sh — exercise the ubs-changed-files CI gate logic locally.
+# dpfvr_ubs_gate_e2e.sh — exercise scripts/gate.sh's changed-file UBS logic.
 #
-# Per coding_agent_session_search-dpfvr. The full job runs in GitHub Actions;
-# this script reproduces the gate's diff/filter/invocation logic against
-# representative scenarios so we can verify behavior without pushing a PR.
+# Per coding_agent_session_search-dpfvr. The gate runs through rch (GitHub
+# Actions is permanently off); this script reproduces the gate's
+# diff/filter/invocation logic against representative scenarios locally.
 
 set -euo pipefail
 
@@ -12,9 +12,9 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # These cases exercise the production batched-gate parsers directly. Inputs are
 # terminal-output fixtures, not substitute cargo/ubs executables or live proof.
-if [ "${1:-}" = --batched-only ] || [ "${1:-}" = --formatter-only ] || [ "${1:-}" = --source-only ]; then
+if [ "${1:-}" = --batched-only ] || [ "${1:-}" = --formatter-only ] || [ "${1:-}" = --scanner-engine-only ]; then
     proof_dir="$(mktemp -d -t cass-gate-parser.XXXXXX)"
-    gate="${2:-$PROJECT_ROOT/scripts/gate.sh}"
+    gate="$PROJECT_ROOT/scripts/gate.sh"
     pass=0
     fail=0
     check_exit() {
@@ -30,6 +30,44 @@ if [ "${1:-}" = --batched-only ] || [ "${1:-}" = --formatter-only ] || [ "${1:-}
             fail=$((fail + 1))
         fi
     }
+    if [ "${1:-}" = --scanner-engine-only ]; then
+        # Real tools only: the absent path and ordinary system executables
+        # cannot satisfy the parser protocol. Never replace the scanner.
+        real_ast="$(command -v ast-grep)" || exit 2
+        check_exit scanner-engine-real 0 bash "$gate" --verify-ubs-rust-engine "$real_ast"
+        check_exit scanner-engine-missing 2 bash "$gate" --verify-ubs-rust-engine "$proof_dir/absent-ast-grep"
+        check_exit scanner-engine-empty 2 bash "$gate" --verify-ubs-rust-engine /bin/true
+        check_exit scanner-engine-error 2 bash "$gate" --verify-ubs-rust-engine /bin/false
+        check_exit scanner-engine-invalid-json 2 bash "$gate" --verify-ubs-rust-engine /bin/echo
+        check_exit scanner-engine-optimized-valid 0 env PYTHONOPTIMIZE=2 bash "$gate" --verify-ubs-rust-engine "$real_ast"
+        check_exit scanner-engine-optimized-empty 2 env PYTHONOPTIMIZE=2 bash "$gate" --verify-ubs-rust-engine /bin/true
+
+        # A direct call does not exercise declare -f serialization in the
+        # actual remote batch. Bash can accept a corrupted heredoc as shell
+        # syntax while passing a shell statement into the Python validator.
+        check_exit scanner-engine-printed-batch 0 bash "$gate" \
+            --ubs-files src/storage/sqlite.rs --print-remote-script
+        batch_functions="$proof_dir/scanner-engine-batch-functions.sh"
+        awk '/^test_log_counts \(\)/ { batch=1 } batch && /^echo SOURCE_HEAD=/ { exit } batch { print }' \
+            "$proof_dir/scanner-engine-printed-batch.log" > "$batch_functions"
+        check_exit scanner-engine-batch-shell 0 bash -n "$batch_functions"
+        check_serialized_engine() {
+            local label="$1" expected="$2" engine="$3" optimize="$4"
+            check_exit "$label" "$expected" env PYTHONOPTIMIZE="$optimize" bash -c \
+                'source "$1"; verify_ubs_rust_engine "$2" "$3"' \
+                _ "$batch_functions" "$engine" "$proof_dir"
+        }
+        check_serialized_engine scanner-engine-batch-real 0 "$real_ast" 0
+        check_serialized_engine scanner-engine-batch-missing 2 "$proof_dir/absent-ast-grep" 0
+        check_serialized_engine scanner-engine-batch-empty 2 /bin/true 0
+        check_serialized_engine scanner-engine-batch-error 2 /bin/false 0
+        check_serialized_engine scanner-engine-batch-invalid-json 2 /bin/echo 0
+        check_serialized_engine scanner-engine-batch-optimized-valid 0 "$real_ast" 2
+        check_serialized_engine scanner-engine-batch-optimized-empty 2 /bin/true 2
+        echo "Scanner engine gate: PASS=$pass FAIL=$fail fixtures=$proof_dir"
+        [ "$fail" -eq 0 ]
+        exit $?
+    fi
     if [ "${1:-}" = --formatter-only ]; then
         # Use real cargo-fmt and rustfmt for both format outcomes. Then inject
         # process failures through cargo-fmt's RUSTFMT override: the waiting
@@ -71,90 +109,6 @@ SH
         [ "$fail" -eq 0 ]
         exit $?
     fi
-
-    # Exercise explicit scanner input identity with real files and retained
-    # broken/directory scratch aliases. Nothing is removed and no scanner or
-    # compiler is replaced. The invalid pin below must still fail in run_ubs.
-    source_root="$proof_dir/scanner-project"
-    mkdir -p "$source_root/scripts" "$source_root/src" "$source_root/.local-state" \
-        "$source_root/.github/workflows"
-    printf 'pub fn selected() {}\n' > "$source_root/src/selected.rs"
-    printf 'pub fn spaced() {}\n' > "$source_root/src/space name.rs"
-    printf 'pub fn newline() {}\n' > "$source_root/src/line
-break.rs"
-    ln -s absent-fixture "$source_root/.local-state/broken"
-    ln -s ../src "$source_root/.local-state/directory-alias"
-    cp "$gate" "$source_root/scripts/gate.sh"
-    cd "$source_root" || exit 1
-    check_exit source-identity-pristine 0 bash "$gate" --verify-ubs-source src/selected.rs
-    before="$(cat "$proof_dir/source-identity-pristine.log")"
-    check_exit source-identity-repeat 0 bash "$gate" --verify-ubs-source src/selected.rs
-    check_exit source-identity-stable 0 cmp -s "$proof_dir/source-identity-pristine.log" "$proof_dir/source-identity-repeat.log"
-    printf '// changed selected input\n' >> src/selected.rs
-    check_exit source-identity-changed 0 bash "$gate" --verify-ubs-source src/selected.rs
-    after="$(cat "$proof_dir/source-identity-changed.log")"
-    check_exit source-identity-detects-bytes 0 test "$before" != "$after"
-    check_exit source-identity-space-newline 0 bash "$gate" --verify-ubs-source 'src/space name.rs' 'src/line
-break.rs'
-    check_exit source-identity-missing 2 bash "$gate" --verify-ubs-source src/missing.rs
-    check_exit source-identity-broken-requested 2 bash "$gate" --verify-ubs-source .local-state/broken
-    check_exit source-identity-directory-requested 2 bash "$gate" --verify-ubs-source .local-state/directory-alias
-    check_exit source-identity-absolute 2 bash "$gate" --verify-ubs-source "$source_root/src/selected.rs"
-    check_exit source-identity-traversal 2 bash "$gate" --verify-ubs-source src/../src/selected.rs
-    check_exit source-identity-empty 2 bash "$gate" --verify-ubs-source
-    cp src/selected.rs src/selected-copy.rs
-    ln -s selected.rs src/selected-alias.rs
-    check_exit source-identity-file-alias 0 bash "$gate" --verify-ubs-source src/selected-alias.rs
-    before="$(cat "$proof_dir/source-identity-file-alias.log")"
-    mv --no-clobber src/selected-alias.rs src/retained-original-alias.rs
-    ln -s selected-copy.rs src/selected-alias.rs
-    check_exit source-identity-rebound-alias 0 bash "$gate" --verify-ubs-source src/selected-alias.rs
-    after="$(cat "$proof_dir/source-identity-rebound-alias.log")"
-    check_exit source-identity-detects-alias 0 test "$before" != "$after"
-    git init --quiet --initial-branch=main
-    git add -- src/selected.rs
-    git -c user.name='CASS gate fixture' -c user.email='cass-gate-fixture@invalid' \
-        -c commit.gpgsign=false commit --quiet -m 'Retained scanner admission fixture'
-    git update-ref refs/remotes/origin/main HEAD
-    printf 'v0.0.0-unreviewed\n' > .github/workflows/ubs-version.txt
-    check_exit scanner-admission-preserves-pin-refusal 1 bash scripts/gate.sh --verify-ubs src/selected.rs
-    check_exit scanner-admission-reaches-pinned-check 0 grep -Fq 'gate: no reviewed UBS runner digest for v0.0.0-unreviewed' \
-        "$proof_dir/scanner-admission-preserves-pin-refusal.log"
-    check_exit scanner-admission-source-identity 0 grep -Fxq 'STAGE=source-identity EXIT=0' \
-        "$proof_dir/scanner-admission-preserves-pin-refusal.log"
-    check_exit scanner-admission-source-stability 0 grep -Fxq 'STAGE=source-stability EXIT=0' \
-        "$proof_dir/scanner-admission-preserves-pin-refusal.log"
-    check_exit scanner-admission-empty 2 bash scripts/gate.sh --verify-ubs
-    check_exit scanner-admission-missing 2 bash scripts/gate.sh --verify-ubs src/missing.rs
-    check_exit scanner-admission-keeps-broken-alias 0 test -L .local-state/broken
-    check_exit scanner-admission-keeps-directory-alias 0 test -L .local-state/directory-alias
-    cd "$PROJECT_ROOT" || exit 1
-    if [ "${1:-}" = --source-only ]; then
-        echo "Scanner source gate: PASS=$pass FAIL=$fail fixtures=$proof_dir"
-        [ "$fail" -eq 0 ]
-        exit $?
-    fi
-
-    # Exercise the production transport decoder with real shell execution.
-    # Decode failures must not execute even a completely emitted command.
-    cat > "$proof_dir/remote-script.sh" <<'REMOTE'
-printf '%s\n' 'quotes: "double", $dollar, `backtick`, \backslash' 'unicode: λ'
-REMOTE
-    bash "$proof_dir/remote-script.sh" > "$proof_dir/remote-script.expected"
-    payload="$(gzip -c < "$proof_dir/remote-script.sh" | base64 -w0)"
-    check_exit remote-payload-roundtrip 0 bash "$gate" --verify-remote-payload "$payload"
-    check_exit remote-payload-literal-output 0 cmp -s "$proof_dir/remote-script.expected" "$proof_dir/remote-payload-roundtrip.log"
-    failure_payload="$(printf 'exit 42\n' | gzip -c | base64 -w0)"
-    check_exit remote-payload-failure 42 bash "$gate" --verify-remote-payload "$failure_payload"
-    printf 'printf executed > %q\n' "$proof_dir/corrupt-payload-executed" > "$proof_dir/remote-side-effect.sh"
-    gzip -c < "$proof_dir/remote-side-effect.sh" > "$proof_dir/remote-side-effect.gz"
-    side_effect_payload="$(base64 -w0 < "$proof_dir/remote-side-effect.gz")"
-    check_exit remote-payload-invalid-base64 1 bash "$gate" --verify-remote-payload "${side_effect_payload}!"
-    check_exit remote-payload-invalid-no-execution 0 test ! -e "$proof_dir/corrupt-payload-executed"
-    truncated_payload="$(head -c -8 "$proof_dir/remote-side-effect.gz" | base64 -w0)"
-    check_exit remote-payload-truncated-gzip 1 bash "$gate" --verify-remote-payload "$truncated_payload"
-    check_exit remote-payload-truncated-no-execution 0 test ! -e "$proof_dir/corrupt-payload-executed"
-
     receipt="$proof_dir/complete.txt"
     cat > "$receipt" <<'RECEIPT'
 STAGE=source-identity EXIT=0
@@ -188,6 +142,76 @@ RECEIPT
     { cat "$receipt"; echo 'STAGE=unexpected-after-completion EXIT=0'; } > "$proof_dir/not-terminal.txt"
     check_exit nonterminal-job-complete 1 bash "$gate" --verify-receipt "$proof_dir/not-terminal.txt" 0 "${expected[@]}"
     check_exit stale-docs-binary 1 bash "$gate" --verify-receipt "$receipt" 0 "${expected[@]}" docs-build docs-binary-identity docs-truth
+
+    # Exercise the actual scope builder without a fleet admission. Retained
+    # scanner downloads must not make the gate scan itself; production and
+    # test sources, including a deliberately bad unwrap, must remain selected.
+    scope_root="$proof_dir/scope"
+    mkdir -p "$scope_root/scripts" "$scope_root/src" "$scope_root/tests" \
+        "$scope_root/.rch-tmp/cass-gate-ubs.example/modules"
+    cp "$gate" "$scope_root/scripts/gate.sh"
+    cp "$PROJECT_ROOT/.ubsignore" "$scope_root/.ubsignore"
+    printf '%s\n' 'pub fn parse(raw: &str) -> u64 { raw.parse().unwrap() }' > "$scope_root/src/production.rs"
+    printf '%s\n' '#[test] fn selected_test() { assert!(true); }' > "$scope_root/tests/selected.rs"
+    printf '%s\n' 'raise RuntimeError("downloaded scanner fixture")' > "$scope_root/.rch-tmp/cass-gate-ubs.example/modules/scanner.py"
+    git -C "$scope_root" init -q --initial-branch=main
+    git -C "$scope_root" add scripts/gate.sh .ubsignore
+    git -C "$scope_root" -c user.name=gate-test -c user.email=gate-test@example.invalid \
+        -c commit.gpgsign=false commit -q -m 'isolated gate scope baseline'
+    check_exit inspect-real-batch 0 env GATE_BASE=HEAD bash "$scope_root/scripts/gate.sh" \
+        --no-lib --no-bin --no-goldens --integration '' --print-remote-script
+    check_exit printed-batch-is-shell 0 bash -n "$proof_dir/inspect-real-batch.log"
+    check_exit production-unwrap-still-selected 0 grep -F './src/production.rs' "$proof_dir/inspect-real-batch.log"
+    check_exit test-source-still-selected 0 grep -F './tests/selected.rs' "$proof_dir/inspect-real-batch.log"
+    # check_exit combines stdout/stderr, so select the actual invocation line
+    # rather than the separate receipt announcing the ignored cache path.
+    awk '/; echo STAGE=ubs EXIT=/ { print }' "$proof_dir/inspect-real-batch.log" > "$proof_dir/scope-invocation.txt"
+    check_exit acquired-scanner-not-selected 1 grep -F './.rch-tmp/' "$proof_dir/scope-invocation.txt"
+
+    # Execute the real batch's setup with an inherited worker profile. These
+    # are environment/quoting checks, not substitutes for Cargo or RCH proof.
+    # Leave every compiler, test, scanner and receipt requirement untouched.
+    check_exit requested-job-profile 0 env GATE_BASE=HEAD CARGO_BUILD_JOBS=1 \
+        CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+        bash "$scope_root/scripts/gate.sh" --no-lib --no-bin --no-goldens \
+        --integration '' --print-remote-script
+    awk '/^test_log_counts \(\)/ { batch=1 } batch && /^echo SOURCE_HEAD=/ { exit } batch { print }' "$proof_dir/requested-job-profile.log" \
+        > "$proof_dir/requested-job-setup.sh"
+    check_exit requested-profile-overrides-worker-defaults 0 env \
+        CARGO_BUILD_JOBS=7 CARGO_INCREMENTAL=1 CARGO_PROFILE_DEV_DEBUG=line-tables-only \
+        CARGO_PROFILE_TEST_DEBUG=line-tables-only RCH_ENV_ALLOWLIST=RUSTFLAGS \
+        bash -c 'source "$1"; test "$CARGO_BUILD_JOBS" = 1 &&
+            test "$CARGO_INCREMENTAL" = 0 && test "$CARGO_PROFILE_DEV_DEBUG" = 0 &&
+            test "$CARGO_PROFILE_TEST_DEBUG" = 0 && test "$RCH_ENV_ALLOWLIST" = RUSTFLAGS' \
+        _ "$proof_dir/requested-job-setup.sh"
+    check_exit unset-job-profile 0 env -u CARGO_BUILD_JOBS -u CARGO_INCREMENTAL \
+        -u CARGO_PROFILE_DEV_DEBUG -u CARGO_PROFILE_TEST_DEBUG GATE_BASE=HEAD \
+        bash "$scope_root/scripts/gate.sh" --no-lib --no-bin --no-goldens \
+        --integration '' --print-remote-script
+    awk '/^test_log_counts \(\)/ { batch=1 } batch && /^echo SOURCE_HEAD=/ { exit } batch { print }' "$proof_dir/unset-job-profile.log" \
+        > "$proof_dir/unset-job-setup.sh"
+    check_exit unset-profile-preserves-worker-defaults 0 env \
+        CARGO_BUILD_JOBS=7 CARGO_INCREMENTAL=1 CARGO_PROFILE_DEV_DEBUG=line-tables-only \
+        CARGO_PROFILE_TEST_DEBUG=line-tables-only bash -c 'source "$1";
+            test "$CARGO_BUILD_JOBS" = 7 && test "$CARGO_INCREMENTAL" = 1 &&
+            test "$CARGO_PROFILE_DEV_DEBUG" = line-tables-only &&
+            test "$CARGO_PROFILE_TEST_DEBUG" = line-tables-only' _ "$proof_dir/unset-job-setup.sh"
+    literal_profile='$(touch '"$proof_dir"'/job-env-injected)'
+    check_exit literal-job-profile 0 env GATE_BASE=HEAD "CARGO_PROFILE_DEV_DEBUG=$literal_profile" \
+        CARGO_PROFILE_TEST_DEBUG='' CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=false \
+        CASS_RAW_MIRROR_MIN_FREE_BYTES=0 bash "$scope_root/scripts/gate.sh" \
+        --no-lib --no-bin --no-goldens --integration '' --print-remote-script
+    check_exit literal-job-profile-is-shell 0 bash -n "$proof_dir/literal-job-profile.log"
+    awk '/^test_log_counts \(\)/ { batch=1 } batch && /^echo SOURCE_HEAD=/ { exit } batch { print }' "$proof_dir/literal-job-profile.log" \
+        > "$proof_dir/literal-job-setup.sh"
+    check_exit literal-and-empty-profile-preserved 0 env CARGO_PROFILE_TEST_DEBUG=line-tables-only \
+        bash -c 'source "$1"; test "$CARGO_PROFILE_DEV_DEBUG" = "$2" &&
+            test "${CARGO_PROFILE_TEST_DEBUG+x}" = x && test -z "$CARGO_PROFILE_TEST_DEBUG"' \
+        _ "$proof_dir/literal-job-setup.sh" "$literal_profile"
+    check_exit profile-cannot-execute-shell-input 1 test -e "$proof_dir/job-env-injected"
+    check_exit assertions-and-storage-policy-not-forwarded 1 \
+        grep -E '^export (CARGO_PROFILE_TEST_DEBUG_ASSERTIONS|CASS_RAW_MIRROR_MIN_FREE_BYTES)=' \
+        "$proof_dir/literal-job-profile.log"
 
     printf 'running 3 tests\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out\n' > "$proof_dir/tests-positive.txt"
     printf 'running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out\n' > "$proof_dir/tests-empty.txt"
@@ -275,7 +299,7 @@ TESTS
         echo 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'
     } > "$proof_dir/tests-nested-filter.txt"
     check_exit child-only-filter-match-rejected 1 bash "$gate" --verify-test-log "$proof_dir/tests-nested-filter.txt" parent::real_match child::only_match
-    check_exit repeated-integration-target 2 bash "$gate" --integration 'e2e_lexical_fail_open:a,e2e_lexical_fail_open:b'
+    check_exit repeated-integration-target 2 env GATE_BASE=HEAD bash "$scope_root/scripts/gate.sh" --integration 'e2e_lexical_fail_open:a,e2e_lexical_fail_open:b'
 
     # Exercise actual source admission and filesystem timestamps, without
     # invoking or substituting Cargo. An old build-script fingerprint must
@@ -359,12 +383,12 @@ FAIL=0
 expect_eq() {
     local description="$1"
     local actual="$2"
-    local expected_value="$3"
-    if [ "$actual" = "$expected_value" ]; then
+    local expected="$3"
+    if [ "$actual" = "$expected" ]; then
         echo "[dpfvr_e2e] OK: $description (got=$actual)"
         PASS=$((PASS + 1))
     else
-        echo "[dpfvr_e2e] FAIL: $description (expected=$expected_value got=$actual)"
+        echo "[dpfvr_e2e] FAIL: $description (expected=$expected got=$actual)"
         FAIL=$((FAIL + 1))
     fi
 }

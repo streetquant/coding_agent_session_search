@@ -16,6 +16,7 @@ use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
 use anyhow::{Context, Result, anyhow, bail};
 use frankensqlite::AsyncConnection as FrankenAsyncConnection;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -40,8 +41,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::info;
-
-mod openwebui_snapshot;
 
 const DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const DOCTOR_MUTATION_LOCK_MAX_METADATA_READ: u64 = 64 * 1024;
@@ -73,7 +72,7 @@ pub enum LazyDbError {
 /// used, closed, and dropped on one dedicated owner thread.
 ///
 /// Pinned fsqlite 0.3.x deliberately makes its raw `Connection` `!Send`: its
-/// internal `Rc` ownership and `RefCell` borrowing are thread-affine even when callers serialize
+/// internal `Rc<RefCell<_>>` state is thread-affine even when callers serialize
 /// access with a mutex. `AsyncConnection` is the supported cross-thread handle;
 /// these methods keep CASS's synchronous call shape while every engine command
 /// remains on that handle's owner worker.
@@ -211,7 +210,7 @@ impl std::ops::Deref for LazyFrankenDbGuard<'_> {
     fn deref(&self) -> &FrankenOwnerConnection {
         self.0
             .as_ref()
-            .expect("LazyFrankenDb connection must be initialized before access") // ubs:ignore -- This guard is only constructed by get after initializing the private connection slot.
+            .expect("LazyFrankenDb connection must be initialized before access")
     }
 }
 
@@ -502,12 +501,11 @@ fn doctor_mutation_lock_path_for_db_open(db_path: &Path) -> Option<PathBuf> {
 }
 
 fn doctor_lock_metadata_pid_is_current_process(raw: &str) -> bool {
-    // ubs:ignore -- Compares existing lock-owner PID metadata; generates no credential.
     raw.lines().any(|line| {
         let Some((key, value)) = line.split_once('=') else {
             return false;
         };
-        key.trim() == "pid" // ubs:ignore -- Public metadata field name; following PID check creates no secret.
+        key.trim() == "pid"
             && value
                 .trim()
                 .parse::<u32>()
@@ -588,7 +586,6 @@ fn acquire_doctor_mutation_db_open_guard(
             .write(true)
             .open(&lock_path)
             .with_context(|| {
-                // ubs:ignore -- Lockfile open errors return immediately through `?`; only a successful open followed by WouldBlock is retried.
                 format!(
                     "opening doctor mutation lock {} before opening {}",
                     lock_path.display(),
@@ -657,7 +654,6 @@ fn acquire_existing_doctor_mutation_db_open_guard(
             }
             Err(err) => {
                 return Err(err).with_context(|| {
-                    // ubs:ignore -- This non-WouldBlock open error returns immediately; only WouldBlock is retried below.
                     format!(
                         "opening existing doctor mutation lock {} before strict read-only open of {}",
                         lock_path.display(),
@@ -779,12 +775,6 @@ fn open_index_schema_connection_with_timeout(
     timeout: Duration,
 ) -> Result<FrankenConnection> {
     if !index_engine_migration_is_complete(path) {
-        #[cfg(debug_assertions)]
-        index_storage_open_rendezvous_for_test(
-            path,
-            "CASS_TEST_INDEX_ENGINE_OPEN_READY",
-            "CASS_TEST_INDEX_ENGINE_OPEN_RELEASE",
-        )?;
         let repairing = open_franken_raw_connection_with_timeout(path, timeout)?;
         if !index_engine_migration_is_complete(path) {
             return Ok(repairing);
@@ -793,10 +783,9 @@ fn open_index_schema_connection_with_timeout(
     }
     let deadline = Instant::now() + timeout;
     let mut backoff = Duration::from_millis(4);
-    let schema_path = path.to_string_lossy();
     loop {
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
-        match FrankenConnection::open_existing_schema_only(schema_path.as_ref()) {
+        match FrankenConnection::open_existing_schema_only(path.to_string_lossy().to_string()) {
             Ok(conn) => return Ok(conn),
             Err(err) if retryable_franken_error(&err) && Instant::now() < deadline => {
                 sleep_with_franken_retry_backoff(
@@ -868,7 +857,7 @@ fn close_first_open_repair_handle(mut conn: FrankenConnection, path: &Path) {
 }
 
 pub(crate) fn index_engine_migration_is_complete(path: &Path) -> bool {
-    // fsqlite-core 0.4.13 migration::MigrationMarker and
+    // fsqlite-core 0.3.18 migration::MigrationMarker and
     // CURRENT_MIGRATION_VERSION. build.rs enforces this exact engine family;
     // review this admission when changing the pin. The engine's marker is
     // pathname-scoped, not an integrity attestation or content fingerprint.
@@ -879,13 +868,7 @@ pub(crate) fn index_engine_migration_is_complete(path: &Path) -> bool {
         last_run_at: u64,
         repairs_applied: Vec<String>,
     }
-    // The engine resolves existing database paths before migration and writes
-    // the marker beside conn.path(), including through file/directory aliases.
-    // An alias-local marker cannot establish migration of the real database.
-    let Ok(database_path) = fs::canonicalize(path) else {
-        return false;
-    };
-    let mut marker_path = database_path.into_os_string();
+    let mut marker_path = path.as_os_str().to_os_string();
     marker_path.push(".fsqlite-migration-state");
     let Ok(file) = fs::File::open(Path::new(&marker_path)) else {
         return false;
@@ -944,16 +927,14 @@ pub(crate) fn open_franken_raw_connection_with_timeout(
     let mut backoff = Duration::from_millis(4);
     loop {
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
-        match FrankenConnection::open(&path_str).map_err(anyhow::Error::from) {
+        match FrankenConnection::open(&path_str)
+            .with_context(|| format!("opening raw frankensqlite db at {}", path.display()))
+        {
             Ok(conn) => return Ok(conn),
             Err(err) if retryable_franken_anyhow(&err) => {
                 let now = Instant::now();
                 if now >= deadline {
-                    return Err(context_franken_open_error(
-                        err,
-                        "opening raw frankensqlite db",
-                        path,
-                    ));
+                    return Err(err);
                 }
                 let remaining = deadline.saturating_duration_since(now);
                 sleep_with_franken_retry_backoff(
@@ -962,19 +943,9 @@ pub(crate) fn open_franken_raw_connection_with_timeout(
                     Duration::from_millis(128),
                 );
             }
-            Err(err) => {
-                return Err(context_franken_open_error(
-                    err,
-                    "opening raw frankensqlite db",
-                    path,
-                ));
-            }
+            Err(err) => return Err(err),
         }
     }
-}
-
-fn context_franken_open_error(error: anyhow::Error, operation: &str, path: &Path) -> anyhow::Error {
-    error.context(format!("{operation} at {}", path.display()))
 }
 
 pub(crate) fn open_franken_raw_readonly_connection_with_timeout(
@@ -1003,11 +974,7 @@ pub(crate) fn open_franken_raw_readonly_connection_with_timeout(
             Err(err) if retryable_franken_anyhow(&err) => {
                 let now = Instant::now();
                 if now >= deadline {
-                    return Err(context_franken_open_error(
-                        err,
-                        "opening raw frankensqlite db readonly",
-                        path,
-                    ));
+                    return Err(err);
                 }
                 let remaining = deadline.saturating_duration_since(now);
                 sleep_with_franken_retry_backoff(
@@ -1025,13 +992,7 @@ pub(crate) fn open_franken_raw_readonly_connection_with_timeout(
             {
                 wal_recovery_attempted = true;
             }
-            Err(err) => {
-                return Err(context_franken_open_error(
-                    err,
-                    "opening raw frankensqlite db readonly",
-                    path,
-                ));
-            }
+            Err(err) => return Err(err),
         }
     }
 }
@@ -1058,6 +1019,7 @@ pub(crate) fn open_franken_async_readonly_connection_with_timeout(
     let deadline = Instant::now() + timeout;
     let mut backoff = Duration::from_millis(4);
     let mut wal_recovery_attempted = false;
+    let mut duplicate_fts_repair_attempted = false;
     loop {
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
         match FrankenAsyncConnection::open_schema_only_with_wal_index_recovery_sync(&path_str)
@@ -1071,11 +1033,7 @@ pub(crate) fn open_franken_async_readonly_connection_with_timeout(
             Err(err) if retryable_franken_anyhow(&err) => {
                 let now = Instant::now();
                 if now >= deadline {
-                    return Err(context_franken_open_error(
-                        err,
-                        "opening dedicated-owner frankensqlite db readonly",
-                        path,
-                    ));
+                    return Err(err);
                 }
                 let remaining = deadline.saturating_duration_since(now);
                 sleep_with_franken_retry_backoff(
@@ -1084,42 +1042,24 @@ pub(crate) fn open_franken_async_readonly_connection_with_timeout(
                     Duration::from_millis(128),
                 );
             }
-            // A read-only open never repairs the archive: it reports the
-            // typed repair-required condition and leaves the bytes alone
-            // (2l1b0.65). `cass doctor --fix` performs the repair.
-            Err(err) if is_conflicting_virtual_table_entries_error(&err) => {
+            Err(err)
+                if !duplicate_fts_repair_attempted
+                    && format!("{err:#}").contains("conflicting virtual-table entries") =>
+            {
                 tracing::warn!(
                     db = %path.display(),
                     error = %err,
-                    "dedicated-owner readonly open found duplicate fts_messages schema rows; \
-                     reporting schema repair required without mutating the archive"
+                    "dedicated-owner readonly open found duplicate fts_messages schema rows; deduplicating through the sanctioned sqlite3 bridge"
                 );
-                return Err(conflicting_fts_schema_repair_required(path));
-            }
-            // GH #402/#503: async search hydration has no deferred-FTS5
-            // constructor. Report the same typed repair the sync tolerant
-            // lane admits, instead of a generic DB-open failure.
-            Err(err) if is_legacy_fts5_shadow_autoindex_open_error(&err) => {
-                tracing::warn!(
-                    db = %path.display(),
-                    error = %err,
-                    "dedicated-owner readonly open found the pre-#434 fts_messages shadow \
-                     catalog; reporting the derived-shadow repair without mutating the archive"
-                );
-                return Err(legacy_fts5_shadow_catalog_repair_required(path));
+                dedupe_conflicting_fts_schema_rows_via_sqlite3(path)?;
+                duplicate_fts_repair_attempted = true;
             }
             Err(err)
                 if !wal_recovery_attempted && attempt_dirty_wal_recovery_checkpoint(path, &err) =>
             {
                 wal_recovery_attempted = true;
             }
-            Err(err) => {
-                return Err(context_franken_open_error(
-                    err,
-                    "opening dedicated-owner frankensqlite db readonly",
-                    path,
-                ));
-            }
+            Err(err) => return Err(err),
         }
     }
 }
@@ -1148,17 +1088,17 @@ pub(crate) fn open_franken_async_strict_readonly_connection_with_timeout(
             &path_str,
             FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
         )
-        .map_err(anyhow::Error::from)
-        {
+        .with_context(|| {
+            format!(
+                "strictly opening dedicated-owner frankensqlite db readonly at {}",
+                path.display()
+            )
+        }) {
             Ok(conn) => return Ok(conn),
             Err(err) if retryable_franken_anyhow(&err) => {
                 let now = Instant::now();
                 if now >= deadline {
-                    return Err(context_franken_open_error(
-                        err,
-                        "strictly opening dedicated-owner frankensqlite db readonly",
-                        path,
-                    ));
+                    return Err(err);
                 }
                 let remaining = deadline.saturating_duration_since(now);
                 sleep_with_franken_retry_backoff(
@@ -1167,32 +1107,7 @@ pub(crate) fn open_franken_async_strict_readonly_connection_with_timeout(
                     Duration::from_millis(128),
                 );
             }
-            // A strict readonly open never mutates the archive, so a catalog
-            // carrying conflicting `fts_messages` rows is reported as the
-            // typed repair-required condition (2l1b0.65).
-            Err(err) if is_conflicting_virtual_table_entries_error(&err) => {
-                return Err(conflicting_fts_schema_repair_required(path));
-            }
-            // GH #402/#503: the pre-#434 FTS shadow catalog has a sync
-            // tolerant lane but no async equivalent; classify it as the
-            // derived-shadow repair rather than a generic open failure.
-            Err(err) if is_legacy_fts5_shadow_autoindex_open_error(&err) => {
-                tracing::warn!(
-                    db = %path.display(),
-                    error = %err,
-                    "strict dedicated-owner readonly open found the pre-#434 fts_messages \
-                     shadow catalog; reporting the derived-shadow repair without mutating \
-                     the archive"
-                );
-                return Err(legacy_fts5_shadow_catalog_repair_required(path));
-            }
-            Err(err) => {
-                return Err(context_franken_open_error(
-                    err,
-                    "strictly opening dedicated-owner frankensqlite db readonly",
-                    path,
-                ));
-            }
+            Err(err) => return Err(err),
         }
     }
 }
@@ -1216,89 +1131,6 @@ pub(crate) fn open_franken_owner_strict_readonly_connection_with_timeout(
 ) -> Result<FrankenOwnerConnection> {
     open_franken_async_strict_readonly_connection_with_timeout(path, timeout)
         .map(FrankenOwnerConnection)
-}
-
-/// GH #503: does this open failure refuse the pre-#434 derived-FTS catalog?
-///
-/// The engine reports `sqlite_master is missing implicit autoindex slot N for
-/// table \`fts_messages_config\`` when a derived FTS5 shadow table declares a
-/// primary key whose implicit autoindex has no `sqlite_master` row. Older cass
-/// wrote that catalog. Canonical (`conversations`/`messages`) autoindex
-/// failures must keep failing closed, so the table name is part of the match.
-pub(crate) fn is_legacy_fts5_shadow_autoindex_open_error(err: &anyhow::Error) -> bool {
-    let rendered = format!("{err:#}");
-    rendered.contains("missing implicit autoindex slot") && rendered.contains("`fts_messages")
-}
-
-/// GH #503: classify an already-open handle whose catalog carries the
-/// pre-#434 derived-FTS shadow.
-///
-/// The ordinary read-only schema-only open can succeed on this catalog when
-/// fsqlite's implicit-autoindex prepass is skipped, in which case the error
-/// string above never appears and the pending derived-shadow repair would be
-/// invisible to `cass status`. The catalog itself is still structurally
-/// wrong: a rowid `fts_messages_config(k PRIMARY KEY, v)` owes
-/// `sqlite_autoindex_fts_messages_config_1`, while the legacy shadow omitted
-/// that row (the healthy modern shadow is `WITHOUT ROWID` and needs none).
-/// Inspect that exact mismatch, never infer it from an open failure.
-fn legacy_fts5_shadow_missing_autoindex_detail(conn: &FrankenConnection) -> Option<String> {
-    let (fts_tables, config_sql, autoindexes) = conn
-        .query_row_map(
-            "SELECT \
-                 (SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages'), \
-                 (SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages_config'), \
-                 (SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'sqlite_autoindex_fts_messages_config_1')",
-            fparams![],
-            |row| {
-                Ok((
-                    row.get_typed::<i64>(0)?,
-                    row.get_typed::<Option<String>>(1)?,
-                    row.get_typed::<i64>(2)?,
-                ))
-            },
-        )
-        .ok()?;
-    if fts_tables == 0 {
-        return None;
-    }
-    let config_sql = config_sql?;
-    if config_sql.to_ascii_lowercase().contains("without rowid") || autoindexes > 0 {
-        return None;
-    }
-    Some(
-        "database disk image is malformed: sqlite_master is missing implicit autoindex slot 1 \
-         for table `fts_messages_config`"
-            .to_string(),
-    )
-}
-
-/// Open the pinned engine's only legacy-tolerant lane for a read-only caller:
-/// the deferred-FTS5 repair open.
-///
-/// fsqlite binds a missing FTS5-shadow implicit autoindex only when
-/// `defer_fts5_hydration` is set, which is true only for the writable
-/// `open_existing_schema_only_deferred_fts5` constructor (GH #503). This
-/// helper applies `query_only` before returning, so every SQL write on the
-/// handle is refused; opening the existing-only lane leaves the archive bytes
-/// unchanged. FTS5 queries see an empty index until the derived shadow is
-/// rebuilt by an explicit writable repair.
-fn open_legacy_fts5_shadow_catalog_reader(path: &Path) -> Result<FrankenConnection> {
-    let path_str = path.to_string_lossy().to_string();
-    let conn = FrankenConnection::open_existing_schema_only_deferred_fts5(&path_str)
-        .map_err(anyhow::Error::new)
-        .with_context(|| {
-            format!(
-                "opening the legacy-tolerant deferred-FTS5 lane read-only at {}",
-                path.display()
-            )
-        })?;
-    conn.execute("PRAGMA query_only = 1;").with_context(|| {
-        format!(
-            "setting query_only on the legacy-tolerant reader at {}",
-            path.display()
-        )
-    })?;
-    Ok(conn)
 }
 
 pub(crate) fn retryable_franken_error(err: &crate::franken_sync::FrankenError) -> bool {
@@ -1530,7 +1362,6 @@ impl FrankenConnectionManager {
         let mut readers: Vec<parking_lot::Mutex<FrankenOwnerConnection>> =
             Vec::with_capacity(reader_count);
         for _ in 0..reader_count {
-            // ubs:ignore -- Each owner thread needs an independent owned path String; open consumes it.
             let conn = match FrankenOwnerConnection::open(path_str.clone()) {
                 Ok(conn) => conn,
                 Err(source) => {
@@ -1580,7 +1411,6 @@ impl FrankenConnectionManager {
         let idx = self
             .reader_idx
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // ubs:ignore -- Construction clamps reader_count to one and pushes every reader before returning; the pool is non-empty and immutable.
         self.readers[idx % self.readers.len()].lock()
     }
 
@@ -1953,6 +1783,147 @@ fn franken_read_message_extra_compat(
     serde_json::Value::Null
 }
 
+// Keep the writer and both query connection facades on exactly the same raw
+// projection. Nullable IDs/timestamps must not be coalesced: None and Some(0)
+// can produce the same semantic document ID but describe different parents.
+const SEMANTIC_PARENT_PROJECTION: &str = "SELECT m.id, m.conversation_id, m.idx, c.started_at, m.created_at, \
+     c.source_path, c.external_id, c.title, c.agent_id, a.slug, \
+     c.workspace_id, w.path, c.source_id, c.origin_host, \
+     s.kind, s.host_label, s.machine_id, \
+     CASE WHEN a.slug IN ('codebuff', 'grok_bot') THEN m.extra_json ELSE NULL END, \
+     CASE WHEN a.slug IN ('codebuff', 'grok_bot') THEN m.extra_bin ELSE NULL END, m.role \
+     FROM messages m JOIN conversations c ON c.id = m.conversation_id \
+     LEFT JOIN agents a ON a.id = c.agent_id \
+     LEFT JOIN workspaces w ON w.id = c.workspace_id \
+     LEFT JOIN sources s ON s.id = c.source_id";
+
+fn hash_semantic_parent_field(hash: &mut Sha256, field: Option<&[u8]>) {
+    if let Some(value) = field {
+        hash.update([1]);
+        hash.update((value.len() as u64).to_le_bytes());
+        hash.update(value);
+    } else {
+        hash.update([0]);
+    }
+}
+
+fn semantic_parent_digest_from_row(row: &FrankenRow) -> Result<(i64, [u8; 32])> {
+    let message_id: i64 = row.get_typed(0)?;
+    anyhow::ensure!(message_id > 0, "nonpositive canonical semantic message ID");
+    let mut hash = Sha256::new();
+    hash.update(b"cass-semantic-parent-v1\0");
+    for column in [0, 1, 2, 3, 4, 8, 10] {
+        let value: Option<i64> = row.get_typed(column)?;
+        hash_semantic_parent_field(
+            &mut hash,
+            value.map(i64::to_le_bytes).as_ref().map(|v| v.as_slice()),
+        );
+    }
+    for column in [5, 6, 7, 9, 11, 12, 13, 14, 15, 16, 19] {
+        let value: Option<String> = row.get_typed(column)?;
+        hash_semantic_parent_field(&mut hash, value.as_deref().map(str::as_bytes));
+    }
+    let agent_slug: Option<String> = row.get_typed(9)?;
+    let native_identity = match agent_slug.as_deref() {
+        Some("codebuff") => {
+            let extra = franken_read_message_extra_compat(row, 17, 18);
+            Some(codebuff_native_message_id(&extra)?.to_owned())
+        }
+        Some("grok_bot") => {
+            let extra = franken_read_message_extra_compat(row, 17, 18);
+            Some(grok_bot_native_entry_id(&extra)?.to_owned())
+        }
+        _ => None,
+    };
+    hash_semantic_parent_field(&mut hash, native_identity.as_deref().map(str::as_bytes));
+    Ok((message_id, hash.finalize().into()))
+}
+
+/// Visit canonical parent proofs in message-ID order with bounded metadata
+/// pages. This does not open or finish a transaction; the caller must retain
+/// its committed read snapshot across the entire visit.
+pub fn visit_semantic_parent_identities(
+    connection: &FrankenConnection,
+    mut visit: impl FnMut(i64, [u8; 32]) -> Result<()>,
+) -> Result<()> {
+    const PAGE_SIZE: usize = 1024;
+    let mut after = None;
+    loop {
+        let (sql, parameters) = if let Some(last) = after {
+            (
+                format!(
+                    "{SEMANTIC_PARENT_PROJECTION} WHERE m.id > ?1 ORDER BY m.id LIMIT {PAGE_SIZE}"
+                ),
+                vec![SqliteValue::from(last)],
+            )
+        } else {
+            (
+                format!("{SEMANTIC_PARENT_PROJECTION} ORDER BY m.id LIMIT {PAGE_SIZE}"),
+                Vec::new(),
+            )
+        };
+        let rows = connection.query_with_params(&sql, &parameters)?;
+        let exhausted = rows.len() < PAGE_SIZE;
+        for row in rows {
+            let (message_id, digest) = semantic_parent_digest_from_row(&row)?;
+            anyhow::ensure!(
+                after.is_none_or(|previous| message_id > previous),
+                "semantic parent stream is not ordered"
+            );
+            visit(message_id, digest)?;
+            after = Some(message_id);
+        }
+        if exhausted {
+            return Ok(());
+        }
+    }
+}
+
+fn lookup_semantic_parent_identities_with_query(
+    ids: &[i64],
+    mut query: impl FnMut(&str, &[SqliteValue]) -> Result<Vec<FrankenRow>>,
+) -> Result<HashMap<i64, [u8; 32]>> {
+    let mut identities = HashMap::with_capacity(ids.len());
+    for chunk in ids.chunks(256) {
+        let placeholders = (1..=chunk.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("{SEMANTIC_PARENT_PROJECTION} WHERE m.id IN ({placeholders})");
+        let parameters = chunk
+            .iter()
+            .copied()
+            .map(SqliteValue::from)
+            .collect::<Vec<_>>();
+        for row in query(&sql, &parameters)? {
+            let (message_id, digest) = semantic_parent_digest_from_row(&row)?;
+            identities.insert(message_id, digest);
+        }
+    }
+    Ok(identities)
+}
+
+/// Batch proof lookup on the caller's existing synchronous read transaction.
+pub fn lookup_semantic_parent_identities_in_connection(
+    connection: &FrankenConnection,
+    ids: &[i64],
+) -> Result<HashMap<i64, [u8; 32]>> {
+    lookup_semantic_parent_identities_with_query(ids, |sql, values| {
+        Ok(connection.query_with_params(sql, values)?)
+    })
+}
+
+/// The same proof lookup on search's existing async-connection transaction.
+/// No connection is reopened and no nested transaction is introduced.
+pub fn lookup_semantic_parent_identities_on_async(
+    connection: &FrankenAsyncConnection,
+    ids: &[i64],
+) -> Result<HashMap<i64, [u8; 32]>> {
+    lookup_semantic_parent_identities_with_query(ids, |sql, values| {
+        Ok(connection.query_with_params_sync(sql, values)?)
+    })
+}
+
 // -------------------------------------------------------------------------
 // Migration Error Types (P1.5)
 // -------------------------------------------------------------------------
@@ -2001,108 +1972,21 @@ pub fn is_user_data_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// A connector's scan contract: the source form whose content can predate a
-/// scan's modification-time cutoff.
-///
-/// The contract is one declaration. The form it names, the identity a
-/// completed scan is recorded under, the policy that decides whether the
-/// connector may keep a cutoff while its contract is pending, and the rule
-/// that exempts the form from that cutoff all come from the same variant, so
-/// the policy and its enforcement cannot drift apart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectorScanContract {
-    /// A Codex rollout compressed to `.jsonl.zst` (GH #513).
-    ///
-    /// The compressed form keeps the modification time of the plain rollout it
-    /// was compressed from, so it can hold content newer than a
-    /// modification-time cutoff. The connector selects the compressed form on
-    /// its own terms, so the contract is satisfied by construction: the
-    /// connector keeps an ordinary incremental cutoff, and the compressed form
-    /// is exempt from it per source.
-    CompressedCodexRollout,
-}
-
-impl ConnectorScanContract {
-    /// The source form the contract names.
-    pub fn source_form(self) -> &'static str {
-        match self {
-            Self::CompressedCodexRollout => "rollout-jsonl-zst",
-        }
-    }
-
-    /// The identity a completed scan under this contract is recorded under.
-    ///
-    /// The identity carries the contract's cutoff-independence property, so a
-    /// contract whose property changes re-arms the pending bootstrap instead
-    /// of keeping a recorded identity that no longer describes the contract.
-    pub fn identity(self) -> &'static str {
-        match self {
-            Self::CompressedCodexRollout => "rollout-jsonl-zst+cutoff-independent",
-        }
-    }
-
-    /// Whether the connector selects the contract's source form independently
-    /// of a scan's modification-time cutoff.
-    ///
-    /// A connector that selects the form on its own terms satisfies the
-    /// contract by construction, so it keeps an ordinary incremental cutoff. A
-    /// connector whose form still rides the cutoff must be scanned without one
-    /// until a scan under the contract completes.
-    pub fn cutoff_independent_form(self) -> bool {
-        match self {
-            Self::CompressedCodexRollout => true,
-        }
-    }
-
-    /// Whether a path carries the contract's source form.
-    pub fn source_form_matches(self, path: &Path) -> bool {
-        match self {
-            Self::CompressedCodexRollout => {
-                franken_agent_detection::connectors::codex::is_compressed_rollout(path)
-            }
-        }
-    }
-}
-
 /// Connectors whose reader learned a source form that can already be on disk
-/// with an old modification time, which an incremental scan skips.
-///
-/// A connector whose contract names a form it selects independently of a
-/// cutoff keeps that cutoff, and the form is exempt from it per source: the
-/// connector lists the form and reads it on its own terms. A connector whose
-/// form still rides the cutoff is scanned without a cutoff until a scan under
-/// the contract completes; durable source reuse still skips unchanged files.
-/// codex: a rollout Codex compresses to `.jsonl.zst` keeps the plain rollout's
-/// modification time (GH #513).
-const CONNECTOR_SCAN_CONTRACTS: &[(&str, ConnectorScanContract)] =
-    &[("codex", ConnectorScanContract::CompressedCodexRollout)];
+/// with an old modification time, which an incremental scan skips. Until a
+/// scan of the connector under its current contract succeeds, the connector
+/// is scanned without a cutoff; durable source reuse still skips unchanged
+/// files. codex: a rollout Codex compresses to `.jsonl.zst` keeps the plain
+/// rollout's modification time (GH #513).
+const CONNECTOR_SCAN_CONTRACTS: &[(&str, &str)] = &[("codex", "rollout-jsonl-zst")];
 
 /// The scan contract a connector's watermark must be recorded under.
-pub fn connector_scan_contract(connector_name: &str) -> Option<ConnectorScanContract> {
+pub fn connector_scan_contract(connector_name: &str) -> Option<&'static str> {
     let name = connector_name.trim();
     CONNECTOR_SCAN_CONTRACTS
         .iter()
         .find(|(connector, _)| connector.eq_ignore_ascii_case(name))
         .map(|(_, contract)| *contract)
-}
-
-/// Whether the connector selects its scan contract's source form independently
-/// of a scan's modification-time cutoff.
-pub fn connector_scan_contract_is_cutoff_independent(connector_name: &str) -> bool {
-    connector_scan_contract(connector_name)
-        .is_some_and(|contract| contract.cutoff_independent_form())
-}
-
-/// Whether a source carries the source form its connector's scan contract
-/// names.
-///
-/// This is the enforcement half of the contract: the same declaration that
-/// lets a connector keep a cutoff exempts the form that the cutoff would
-/// otherwise skip.
-pub fn connector_scan_contract_source_form_matches(connector_name: &str, path: &Path) -> bool {
-    connector_scan_contract(connector_name).is_some_and(|contract| {
-        contract.cutoff_independent_form() && contract.source_form_matches(path)
-    })
 }
 
 /// What the indexer needs to choose a connector's incremental cutoff.
@@ -2398,104 +2282,17 @@ pub(crate) fn validate_fts_messages_integrity_for_async_connection(
     )
 }
 
-/// Typed marker for an archive whose `sqlite_master` carries duplicate
-/// `fts_messages` virtual-table rows.
-///
-/// frankensqlite refuses to *open* such a catalog at all ("conflicting
-/// virtual-table entries"), so no cass open path can repair it while opening
-/// it. An ordinary open — read-only or read-write — therefore never spawns a
-/// repair: it returns this typed error, and the CLI surfaces it as the
-/// `schema-repair-required` kind pointing at `cass doctor --fix` (2l1b0.65).
-/// The repair itself lives in
-/// [`repair_conflicting_fts_schema_rows_via_sqlite3`] and is doctor-only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConflictingFtsSchemaRepairKind {
-    /// The catalog carries more than one `fts_messages` virtual-table row.
-    DuplicateRows,
-    /// The pre-#434 derived-FTS catalog declares an implicit autoindex that
-    /// `sqlite_master` does not carry. Canonical rows are readable through
-    /// the legacy-tolerant deferred-FTS5 lane; only the derived shadow needs
-    /// `doctor --rebuild-canonical-fts`.
-    LegacyFts5ShadowCatalog,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ConflictingFtsSchemaRepairRequired {
-    pub(crate) db_path: PathBuf,
-    pub(crate) kind: ConflictingFtsSchemaRepairKind,
-}
-
-impl std::fmt::Display for ConflictingFtsSchemaRepairRequired {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.kind {
-            ConflictingFtsSchemaRepairKind::DuplicateRows => write!(
-                f,
-                "the archive at {} carries duplicate `fts_messages` virtual-table rows in \
-                 sqlite_master, which frankensqlite refuses to open; run 'cass doctor --fix' \
-                 to repair it",
-                self.db_path.display()
-            ),
-            ConflictingFtsSchemaRepairKind::LegacyFts5ShadowCatalog => write!(
-                f,
-                "the archive at {} carries the pre-#434 `fts_messages_config` catalog \
-                 (sqlite_master is missing its implicit autoindex), which the strict \
-                 frankensqlite read path refuses to open; canonical rows remain readable, \
-                 but the derived FTS shadow needs 'cass doctor --rebuild-canonical-fts'",
-                self.db_path.display()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ConflictingFtsSchemaRepairRequired {}
-
-/// Build the typed duplicate-catalog repair-required error for `db_path`.
-pub(crate) fn conflicting_fts_schema_repair_required(db_path: &Path) -> anyhow::Error {
-    anyhow::Error::new(ConflictingFtsSchemaRepairRequired {
-        db_path: db_path.to_path_buf(),
-        kind: ConflictingFtsSchemaRepairKind::DuplicateRows,
-    })
-}
-
-/// Build the typed repair-required error for the pre-#434 derived-FTS
-/// catalog. Async search hydration cannot use the sync tolerant lane, so it
-/// reports this same condition rather than a generic open failure.
-pub(crate) fn legacy_fts5_shadow_catalog_repair_required(db_path: &Path) -> anyhow::Error {
-    anyhow::Error::new(ConflictingFtsSchemaRepairRequired {
-        db_path: db_path.to_path_buf(),
-        kind: ConflictingFtsSchemaRepairKind::LegacyFts5ShadowCatalog,
-    })
-}
-
-/// Recover the typed repair-required marker from an error chain, if present.
-pub(crate) fn conflicting_fts_schema_repair_required_from_error(
-    err: &anyhow::Error,
-) -> Option<&ConflictingFtsSchemaRepairRequired> {
-    err.downcast_ref::<ConflictingFtsSchemaRepairRequired>()
-}
-
-/// Whether an error means "the catalog carries conflicting virtual-table
-/// entries", the shape frankensqlite refuses to open.
-pub(crate) fn is_conflicting_virtual_table_entries_error(err: &anyhow::Error) -> bool {
-    format!("{err:#}").contains("conflicting virtual-table entries")
-}
-
 /// Remove historical duplicate `fts_messages` rows from `sqlite_master`,
 /// keeping the earliest (canonical) row.
 ///
-/// frankensqlite can *write* `sqlite_master` under `PRAGMA writable_schema`
-/// (fsqlite 0.4.12), but it cannot *open* a catalog that carries conflicting
-/// virtual-table entries, so it can never run this surgery itself. The stock
-/// `sqlite3` CLI is the only engine that opens such a catalog, which is why
-/// this shell-out exists at all — and why it is called from exactly one place:
-/// the `cass doctor --fix` repair path. Ordinary opens return the typed
-/// [`ConflictingFtsSchemaRepairRequired`] error instead of mutating the
-/// archive behind the caller's back (2l1b0.65).
-///
-/// The call is a documented, test-covered fallback: `rg 'Command::new("sqlite3")'
-/// src` still reports this one, the historical-bundle metadata probe and the
-/// historical `.recover` salvage, and no other production path spawns an
-/// external SQLite engine.
+/// fsqlite 0.3.x refuses to open a database whose sqlite_master carries the
+/// pre-fix duplicate `fts_messages` virtual-table row ("conflicting
+/// virtual-table entries"), so this repair must run before the engine open.
+/// writable_schema WRITES are the one documented operation frankensqlite does
+/// not support (AGENTS.md: "PRAGMA writable_schema: Not supported for write
+/// operations"), so the surgery shells to the `sqlite3` CLI — the same
+/// production pattern `scrub_staged_derived_fts_metadata_via_sqlite3` uses
+/// for staged-seed sqlite_master repair.
 /// Error for a failed launch of the external `sqlite3` CLI. A host without it
 /// (Windows by default, minimal containers) used to see only "No such file or
 /// directory"; say which tool is missing and what needed it (2l1b0.65).
@@ -2510,25 +2307,32 @@ fn sqlite3_cli_launch_error(error: std::io::Error, action: &str) -> anyhow::Erro
     }
 }
 
-pub(crate) fn repair_conflicting_fts_schema_rows_via_sqlite3(db_path: &Path) -> Result<()> {
+pub(crate) fn dedupe_conflicting_fts_schema_rows_via_sqlite3(db_path: &Path) -> Result<()> {
+    let dedupe_sql = "PRAGMA writable_schema = ON;
+         DELETE FROM sqlite_master
+          WHERE type = 'table'
+            AND name = 'fts_messages'
+            AND rowid NOT IN (
+                SELECT MIN(rowid) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'fts_messages'
+            );
+         PRAGMA writable_schema = OFF;";
+
     let run_dedupe = |disable_defensive: bool| -> Result<std::process::Output> {
         let mut command = Command::new("sqlite3");
         command.arg("-batch").arg(db_path);
         if disable_defensive {
             command.arg(".dbconfig defensive off");
         }
-        command
-            .arg(DEDUPE_SQLITE_MASTER_SQL)
-            .output()
-            .map_err(|error| {
-                sqlite3_cli_launch_error(
-                    error,
-                    &format!(
-                        "the duplicate fts schema-row repair of {}",
-                        db_path.display()
-                    ),
-                )
-            })
+        command.arg(dedupe_sql).output().map_err(|error| {
+            sqlite3_cli_launch_error(
+                error,
+                &format!(
+                    "the duplicate fts schema-row repair of {}",
+                    db_path.display()
+                ),
+            )
+        })
     };
     let render_output = |output: &std::process::Output| -> String {
         format!(
@@ -2563,72 +2367,6 @@ pub(crate) fn repair_conflicting_fts_schema_rows_via_sqlite3(db_path: &Path) -> 
     );
     Ok(())
 }
-
-/// The outcome of probing an archive for the conflicting `fts_messages`
-/// catalog shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConflictingFtsSchemaProbe {
-    /// The archive opens and carries at most one `fts_messages` catalog row.
-    Clean,
-    /// The archive carries duplicate `fts_messages` catalog rows, so
-    /// frankensqlite refuses to open it and the repair is required.
-    RepairRequired,
-    /// The archive could not be probed for this shape at all.
-    Undetermined,
-}
-
-/// Probe an archive for the conflicting `fts_messages` catalog shape.
-///
-/// The probe never mutates the archive and never spawns an external engine:
-/// frankensqlite either opens the catalog (then the `fts_messages` row count
-/// answers the question) or refuses it with the conflicting-virtual-table
-/// error (then the repair is required by construction).
-pub(crate) fn probe_conflicting_fts_schema_rows(db_path: &Path) -> ConflictingFtsSchemaProbe {
-    if !db_path.exists() {
-        return ConflictingFtsSchemaProbe::Clean;
-    }
-    let path_str = db_path.to_string_lossy().to_string();
-    match FrankenConnection::open_schema_only_with_wal_index_recovery(&path_str) {
-        Ok(conn) => {
-            let rows = conn
-                .query_row_map(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                    fparams![],
-                    |row| row.get_typed::<i64>(0),
-                )
-                .ok();
-            match rows {
-                Some(count) if count > 1 => ConflictingFtsSchemaProbe::RepairRequired,
-                _ => ConflictingFtsSchemaProbe::Clean,
-            }
-        }
-        Err(err)
-            if err
-                .to_string()
-                .contains("conflicting virtual-table entries") =>
-        {
-            ConflictingFtsSchemaProbe::RepairRequired
-        }
-        Err(_) => ConflictingFtsSchemaProbe::Undetermined,
-    }
-}
-
-/// The `sqlite_master` surgery that removes the duplicate `fts_messages`
-/// virtual-table rows, keeping the earliest (canonical) row.
-///
-/// The stock CLI refuses a plain `DELETE FROM sqlite_master` on a catalog with
-/// conflicting virtual-table rows while its defensive mode is on, so the
-/// surgery runs with `.dbconfig defensive off` first and retries without it
-/// only as a fallback.
-const DEDUPE_SQLITE_MASTER_SQL: &str = "PRAGMA writable_schema = ON;
-     DELETE FROM sqlite_master
-      WHERE type = 'table'
-        AND name = 'fts_messages'
-        AND rowid NOT IN (
-            SELECT MIN(rowid) FROM sqlite_master
-             WHERE type = 'table' AND name = 'fts_messages'
-        );
-     PRAGMA writable_schema = OFF;";
 
 #[cfg(test)]
 pub(crate) fn materialize_fresh_fts_schema_via_rusqlite(db_path: &Path) -> Result<()> {
@@ -3081,17 +2819,6 @@ pub(crate) enum FtsConsistencyRepair {
     },
 }
 
-/// GH #345: durable progress of a bounded canonical-FTS rebuild.
-///
-/// `committed_rows` counts rows already published through committed batches
-/// (a re-run resumes after them); `total_rows` is the indexable canonical
-/// count, or `0` when the rebuild could not compute it up front.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FtsRebuildProgress {
-    pub committed_rows: usize,
-    pub total_rows: usize,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FtsShadowParityStatus {
     Absent,
@@ -3367,7 +3094,7 @@ fn historical_bundle_root_paths(db_path: &Path) -> Vec<PathBuf> {
             return;
         }
         if !roots.iter().any(|existing| existing == &path) {
-            roots.push(path); // ubs:ignore -- Vec<PathBuf> collection of discovered historical database candidates.
+            roots.push(path);
         }
     };
 
@@ -3423,7 +3150,7 @@ fn push_named_database_children(
                 continue;
             }
             if candidate.exists() && !roots.iter().any(|existing| existing == &candidate) {
-                roots.push(candidate); // ubs:ignore -- Vec<PathBuf> collection; candidate uses the canonical database basename.
+                roots.push(candidate);
             }
         }
     }
@@ -3601,12 +3328,6 @@ fn probe_historical_bundle_via_sqlite3_metadata(root_path: &Path) -> Option<Hist
         .arg("-batch")
         .arg("-noheader")
         .arg(&bundle_uri)
-        // `.dbconfig defensive off` is deliberate: the stock CLI's defensive
-        // mode refuses to open a bundle whose sqlite_master carries
-        // conflicting virtual-table entries, and that is exactly the shape
-        // this probe exists to inspect. The connection stays `?immutable=1`,
-        // so the probe still cannot write to the bundle.
-        .arg(".dbconfig defensive off")
         // `writable_schema=ON` is deliberate: it relaxes schema-integrity
         // enforcement so this probe can still read `schema_version` out of a
         // bundle whose sqlite_master is damaged. Nothing here writes, and the
@@ -3614,18 +3335,11 @@ fn probe_historical_bundle_via_sqlite3_metadata(root_path: &Path) -> Option<Hist
         // corrupt anything — but it is bracketed with an explicit OFF so a
         // future edit that adds a statement here does not silently inherit an
         // unprotected connection.
-        //
-        // The three values share one row because the CLI prints lines of its
-        // own: `.dbconfig defensive off` echoes the setting it just changed.
-        // Taking the first three lines positionally would read that echo as
-        // `schema_version` and shift every later value by one.
         .arg(
             "PRAGMA writable_schema=ON;
-             SELECT COALESCE((SELECT value FROM meta WHERE key = 'schema_version'), '')
-                  || '|' ||
-                  (SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages')
-                  || '|' ||
-                  COALESCE((SELECT MAX(id) FROM messages), 0);
+             SELECT COALESCE((SELECT value FROM meta WHERE key = 'schema_version'), '');
+             SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages';
+             SELECT COALESCE(MAX(id), 0) FROM messages;
              PRAGMA writable_schema=OFF;",
         )
         .output()
@@ -3635,13 +3349,13 @@ fn probe_historical_bundle_via_sqlite3_metadata(root_path: &Path) -> Option<Hist
     }
 
     let stdout = String::from_utf8(output.stdout).ok()?;
-    // Read the single row the probe asked for, not a fixed line offset: the
-    // CLI's own output (the `.dbconfig` echo) is not part of the answer.
-    let row = stdout.lines().find(|line| line.contains('|'))?;
-    let mut fields = row.split('|');
-    let schema_version = fields.next()?.trim().parse::<i64>().ok();
-    let fts_schema_rows = fields.next()?.trim().parse::<i64>().ok();
-    let max_message_id = fields.next()?.trim().parse::<i64>().ok().unwrap_or(0);
+    let mut lines = stdout.lines();
+    let schema_version = lines.next().and_then(|raw| raw.trim().parse::<i64>().ok());
+    let fts_schema_rows = lines.next().and_then(|raw| raw.trim().parse::<i64>().ok());
+    let max_message_id = lines
+        .next()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .unwrap_or(0);
 
     Some(HistoricalBundleProbe {
         schema_version,
@@ -3732,15 +3446,6 @@ fn is_recoverable_insert_line(line: &str) -> bool {
     })
 }
 
-/// Salvage a damaged historical bundle through the stock `sqlite3` CLI's
-/// `.recover` mode.
-///
-/// This is a documented, test-covered fallback: frankensqlite has no
-/// equivalent of `.recover`, so a bundle whose pages are damaged beyond a
-/// plain open is recovered by the external engine and re-imported into a
-/// fresh frankensqlite database. It never runs on a healthy bundle, and a
-/// host without the `sqlite3` tool gets the typed missing-tool error from
-/// [`sqlite3_cli_launch_error`] instead of a spawn failure (2l1b0.65).
 fn recover_historical_bundle_via_sqlite3(
     bundle: &HistoricalDatabaseBundle,
 ) -> Result<HistoricalReadConnection> {
@@ -3897,7 +3602,8 @@ fn clear_seeded_runtime_meta(conn: &FrankenConnection) -> Result<()> {
     conn.execute(
         "DELETE FROM meta
          WHERE key LIKE 'historical_bundle_salvaged:%'
-            OR key IN ('last_scan_ts', 'last_indexed_at', 'last_embedded_message_id')",
+            OR key LIKE 'last_embedded_message_id%'
+            OR key IN ('last_scan_ts', 'last_indexed_at')",
     )?;
     Ok(())
 }
@@ -3928,14 +3634,7 @@ fn record_historical_bundle_import(
     Ok(())
 }
 
-/// Remove the derived FTS5 metadata rows from a staged archive's
-/// `sqlite_master` so the FTS rebuild can recreate them cleanly.
-///
-/// The staged copy is a cass-owned file whose catalog frankensqlite can open,
-/// and frankensqlite writes `sqlite_master` under `PRAGMA writable_schema`,
-/// so the surgery runs on the pinned engine instead of shelling out to the
-/// external `sqlite3` CLI (2l1b0.65).
-fn scrub_staged_derived_fts_metadata(staged_db_path: &Path) -> Result<()> {
+fn scrub_staged_derived_fts_metadata_via_sqlite3(staged_db_path: &Path) -> Result<()> {
     let scrub_sql = "PRAGMA writable_schema = ON;
          DELETE FROM sqlite_master
           WHERE name = 'fts_messages'
@@ -3956,41 +3655,45 @@ fn scrub_staged_derived_fts_metadata(staged_db_path: &Path) -> Result<()> {
              );
          PRAGMA writable_schema = OFF;";
 
-    let path_str = staged_db_path.to_string_lossy().to_string();
-    let conn = FrankenConnection::open_existing_schema_only(&path_str)
-        .or_else(|_| FrankenConnection::open_existing_schema_only_deferred_fts5(&path_str))
-        .with_context(|| {
-            format!(
-                "opening staged frankensqlite db at {} for the derived FTS metadata scrub",
-                staged_db_path.display()
+    let run_scrub = |disable_defensive: bool| -> Result<std::process::Output> {
+        let mut command = Command::new("sqlite3");
+        command.arg("-batch").arg(staged_db_path);
+        if disable_defensive {
+            command.arg(".dbconfig defensive off");
+        }
+        command.arg(scrub_sql).output().map_err(|error| {
+            sqlite3_cli_launch_error(
+                error,
+                &format!(
+                    "the staged FTS metadata scrub of {}",
+                    staged_db_path.display()
+                ),
             )
-        })?;
-    conn.execute("PRAGMA writable_schema = ON;")
-        .with_context(|| {
-            format!(
-                "enabling writable_schema for the staged FTS metadata scrub of {}",
-                staged_db_path.display()
-            )
-        })?;
-    let scrubbed = conn.execute(scrub_sql).with_context(|| {
+        })
+    };
+    let render_output = |output: &std::process::Output| -> String {
         format!(
-            "scrubbing staged derived FTS metadata of {}",
-            staged_db_path.display()
+            "status {}; stdout: {}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
         )
-    });
-    let writable_schema_restored = conn.execute("PRAGMA writable_schema = OFF;");
-    let scrubbed = scrubbed?;
-    writable_schema_restored.with_context(|| {
-        format!(
-            "restoring writable_schema after the staged FTS metadata scrub of {}",
-            staged_db_path.display()
-        )
-    })?;
-    tracing::info!(
-        db = %staged_db_path.display(),
-        rows = scrubbed,
-        "removed staged derived FTS metadata rows via frankensqlite"
-    );
+    };
+
+    let defensive_off_output = run_scrub(true)?;
+    if defensive_off_output.status.success() {
+        return Ok(());
+    }
+
+    let fallback_output = run_scrub(false)?;
+    if !fallback_output.status.success() {
+        anyhow::bail!(
+            "sqlite3 staged FTS metadata scrub failed for {}; defensive-off attempt {}; fallback without .dbconfig {}",
+            staged_db_path.display(),
+            render_output(&defensive_off_output),
+            render_output(&fallback_output)
+        );
+    }
     Ok(())
 }
 
@@ -4012,7 +3715,7 @@ fn ensure_seeded_canonical_fts_consistency(staged_db_path: &Path) -> Result<FtsC
                 error = %err,
                 "staged historical seed has malformed derived FTS metadata; scrubbing and rebuilding FTS on staged copy"
             );
-            scrub_staged_derived_fts_metadata(staged_db_path).with_context(|| {
+            scrub_staged_derived_fts_metadata_via_sqlite3(staged_db_path).with_context(|| {
                 format!(
                     "scrubbing malformed staged FTS metadata before finalization: {}",
                     staged_db_path.display()
@@ -4537,8 +4240,44 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 23;
+pub const CURRENT_SCHEMA_VERSION: i64 = 24;
 pub(crate) const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
+const SEMANTIC_ARCHIVE_STATE_META_KEY: &str = "semantic_archive_state_v1";
+const SEMANTIC_MESSAGE_ID_HIGH_WATER_META_KEY: &str = "semantic_message_id_high_water_v1";
+
+/// Committed canonical authority. Neither row counts nor reused numeric IDs
+/// identify an archive incarnation or describe its destructive mutations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticArchiveState {
+    pub archive_id: String,
+    pub mutation_seq: u64,
+}
+
+impl SemanticArchiveState {
+    pub fn parse(value: &str) -> Result<Self> {
+        let state: Self =
+            serde_json::from_str(value).context("decoding canonical semantic archive state")?;
+        anyhow::ensure!(
+            state.archive_id.len() == 32
+                && state
+                    .archive_id
+                    .bytes()
+                    .all(|byte| { byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) })
+                && state.mutation_seq <= i64::MAX as u64,
+            "invalid canonical semantic archive identity or mutation sequence"
+        );
+        Ok(state)
+    }
+}
+
+/// Latest changed conversation IDs, including durable deletion tombstones.
+/// A global invalidation makes this insufficient for an incremental replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticConversationChanges {
+    pub state: SemanticArchiveState,
+    pub conversation_ids: Vec<i64>,
+    pub complete: bool,
+}
 const LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v2";
 const PREVIOUS_LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v1";
 const LEGACY_OMP_LEXICAL_PUBLISHED_META_KEY: &str =
@@ -4653,10 +4392,9 @@ fn unique_backup_path(path: &Path) -> PathBuf {
     let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("db");
 
-    // ubs:ignore -- Local database backup name; uniqueness is not authentication.
     path.with_file_name(format!(
         "{file_name}.backup.{}.{}.{}",
-        std::process::id(), // ubs:ignore -- PID disambiguates the backup filename, not a credential.
+        std::process::id(),
         timestamp,
         nonce
     ))
@@ -5266,138 +5004,33 @@ CREATE TABLE IF NOT EXISTS forgotten_sources (
 );
 ";
 
-/// Persistent source authority is initialized once during writable migration.
-/// Every canonical change advances its clock in the SAME SQLite transaction,
-/// including direct SQL. Read-only semantic admission never runs this DDL.
-// ubs:ignore[rust.domain.sql-concat] -- Immutable SQL trigger arithmetic; no string concatenation or interpolated input.
 const MIGRATION_V23: &str = r"
-CREATE TABLE IF NOT EXISTS semantic_source_identity_v1 (
-    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-    database_uuid TEXT NOT NULL,
-    change_sequence INTEGER NOT NULL CHECK(typeof(change_sequence) = 'integer' AND change_sequence >= 0)
+-- Shared stores change whenever any session changes. Keep forgotten session
+-- identities independently of the store's file stamp (GH #537). These values
+-- deliberately do not reference rows that forgetting or agent removal deletes.
+CREATE TABLE IF NOT EXISTS forgotten_conversations (
+    source_id TEXT NOT NULL,
+    agent_slug TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    forgotten_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (source_id, agent_slug, source_path, external_id)
 );
-INSERT INTO semantic_source_identity_v1(singleton, database_uuid, change_sequence)
-SELECT 1, lower(hex(randomblob(16))), 0
-WHERE NOT EXISTS (SELECT 1 FROM semantic_source_identity_v1 WHERE singleton = 1);
-
-CREATE TABLE IF NOT EXISTS semantic_source_certificates_v1 (
-    contract_sha256 TEXT PRIMARY KEY,
-    snapshot_json TEXT NOT NULL,
-    snapshot_sha256 TEXT NOT NULL
-);
-
-CREATE TRIGGER IF NOT EXISTS cass_semantic_source_authority_insert
-BEFORE INSERT ON semantic_source_identity_v1
-WHEN EXISTS(SELECT 1 FROM semantic_source_identity_v1 WHERE singleton = 1)
-BEGIN
-    SELECT RAISE(ABORT, 'semantic source authority already exists and cannot be replaced');
-END;
-CREATE TRIGGER IF NOT EXISTS cass_semantic_source_authority_update
-BEFORE UPDATE ON semantic_source_identity_v1
-WHEN NEW.singleton != OLD.singleton OR NEW.database_uuid != OLD.database_uuid
-     OR typeof(NEW.change_sequence) != 'integer' OR NEW.change_sequence < OLD.change_sequence
-BEGIN
-    SELECT RAISE(ABORT, 'semantic source identity is immutable and its clock cannot wrap or reverse');
-END;
-CREATE TRIGGER IF NOT EXISTS cass_semantic_source_authority_delete
-BEFORE DELETE ON semantic_source_identity_v1
-BEGIN
-    SELECT RAISE(ABORT, 'semantic source authority cannot be removed');
-END;
-
-CREATE TRIGGER IF NOT EXISTS cass_semantic_source_agents_insert AFTER INSERT ON agents
-BEGIN
-    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
-END;
-CREATE TRIGGER IF NOT EXISTS cass_semantic_source_agents_update AFTER UPDATE ON agents
-BEGIN
-    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
-END;
-CREATE TRIGGER IF NOT EXISTS cass_semantic_source_agents_delete AFTER DELETE ON agents
-BEGIN
-    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
-END;
-CREATE TRIGGER IF NOT EXISTS cass_semantic_source_workspaces_insert AFTER INSERT ON workspaces
-BEGIN
-    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
-END;
-CREATE TRIGGER IF NOT EXISTS cass_semantic_source_workspaces_update AFTER UPDATE ON workspaces
-BEGIN
-    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
-END;
-CREATE TRIGGER IF NOT EXISTS cass_semantic_source_workspaces_delete AFTER DELETE ON workspaces
-BEGIN
-    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
-END;
-CREATE TRIGGER IF NOT EXISTS cass_semantic_source_sources_insert AFTER INSERT ON sources
-BEGIN
-    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
-END;
-CREATE TRIGGER IF NOT EXISTS cass_semantic_source_sources_update AFTER UPDATE ON sources
-BEGIN
-    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
-END;
-CREATE TRIGGER IF NOT EXISTS cass_semantic_source_sources_delete AFTER DELETE ON sources
-BEGIN
-    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
-END;
-CREATE TRIGGER IF NOT EXISTS cass_semantic_source_conversations_insert AFTER INSERT ON conversations
-BEGIN
-    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
-END;
-CREATE TRIGGER IF NOT EXISTS cass_semantic_source_conversations_update AFTER UPDATE ON conversations
-BEGIN
-    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
-END;
-CREATE TRIGGER IF NOT EXISTS cass_semantic_source_conversations_delete AFTER DELETE ON conversations
-BEGIN
-    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
-END;
-CREATE TRIGGER IF NOT EXISTS cass_semantic_source_messages_insert AFTER INSERT ON messages
-BEGIN
-    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
-END;
-CREATE TRIGGER IF NOT EXISTS cass_semantic_source_messages_update AFTER UPDATE ON messages
-BEGIN
-    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
-END;
-CREATE TRIGGER IF NOT EXISTS cass_semantic_source_messages_delete AFTER DELETE ON messages
-BEGIN
-    UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1;
-END;
 ";
 
-/// Exact clock definitions admitted by the readonly certificate boundary.
-/// A matching trigger name alone cannot certify a monotonic source clock.
-/// Behavioral tests independently exercise these transitions through SQL.
-pub fn semantic_source_clock_trigger_contracts() -> Vec<(String, String)> {
-    let mut contracts = Vec::with_capacity(18);
-    for table in [
-        "agents",
-        "workspaces",
-        "sources",
-        "conversations",
-        "messages",
-    ] {
-        for event in ["insert", "update", "delete"] {
-            let name = format!("cass_semantic_source_{table}_{event}");
-            // ubs:ignore[rust.perf.string-alloc-in-loop] -- Build the finite table/event trigger definitions once for the returned schema contract, not per archive row.
-            let sql = format!(
-                // ubs:ignore[rust.domain.sql-concat] -- Clock arithmetic is SQL; identifiers come only from the fixed table/event lists above.
-                "CREATE TRIGGER {name} AFTER {} ON {table} BEGIN UPDATE semantic_source_identity_v1 SET change_sequence = change_sequence + 1 WHERE singleton = 1; END",
-                event.to_ascii_uppercase()
-            );
-            contracts.push((name, sql));
-        }
-    }
-    contracts.push(("cass_semantic_source_authority_insert".into(),
-        "CREATE TRIGGER cass_semantic_source_authority_insert BEFORE INSERT ON semantic_source_identity_v1 WHEN EXISTS(SELECT 1 FROM semantic_source_identity_v1 WHERE singleton = 1) BEGIN SELECT RAISE(ABORT, 'semantic source authority already exists and cannot be replaced'); END".into()));
-    contracts.push(("cass_semantic_source_authority_update".into(),
-        "CREATE TRIGGER cass_semantic_source_authority_update BEFORE UPDATE ON semantic_source_identity_v1 WHEN NEW.singleton != OLD.singleton OR NEW.database_uuid != OLD.database_uuid OR typeof(NEW.change_sequence) != 'integer' OR NEW.change_sequence < OLD.change_sequence BEGIN SELECT RAISE(ABORT, 'semantic source identity is immutable and its clock cannot wrap or reverse'); END".into()));
-    contracts.push(("cass_semantic_source_authority_delete".into(),
-        "CREATE TRIGGER cass_semantic_source_authority_delete BEFORE DELETE ON semantic_source_identity_v1 BEGIN SELECT RAISE(ABORT, 'semantic source authority cannot be removed'); END".into()));
-    contracts
-}
+const MIGRATION_V24: &str = r"
+-- No foreign key: deletion and numeric-ID reuse must retain their tombstones.
+-- ID zero represents a global/unknown canonical invalidation.
+CREATE TABLE IF NOT EXISTS semantic_conversation_changes (
+    conversation_id INTEGER PRIMARY KEY,
+    mutation_seq INTEGER NOT NULL,
+    invalidation_seq INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_semantic_conversation_changes_seq
+ON semantic_conversation_changes(mutation_seq, conversation_id);
+CREATE INDEX IF NOT EXISTS idx_semantic_conversation_invalidations_seq
+ON semantic_conversation_changes(invalidation_seq);
+";
 
 /// Row from the embedding_jobs table.
 #[derive(Debug, Clone)]
@@ -5546,7 +5179,6 @@ fn lexical_rebuild_message_after_id_sql(cap: usize) -> String {
              FROM messages WHERE id > ?1 ORDER BY id"
     )
 }
-const LEXICAL_REBUILD_FOOTPRINT_PAGE_ROWS: usize = 2048;
 
 /// One lexical-rebuild projection row (`id, idx, role, author, created_at,
 /// capped content, source byte length`) as a [`Message`] whose text is bounded
@@ -5560,14 +5192,7 @@ fn lexical_rebuild_message_from_row(
     let boundary = lexical_content_truncation_boundary(&content, cap);
     if boundary < content.len() {
         // GH #466: truncate would retain the projected cell's whole allocation.
-        content = content
-            .get(..boundary)
-            .ok_or_else(|| {
-                crate::franken_sync::FrankenError::Internal(
-                    "lexical content truncation produced an invalid UTF-8 boundary".to_owned(),
-                )
-            })?
-            .to_owned();
+        content = content[..boundary].to_owned();
     }
     Ok(Message {
         id: Some(row.get_typed(0)?),
@@ -5661,11 +5286,8 @@ pub(crate) fn close_franken_in_place_with_busy_retry(
             Err(err) => return Err(err),
         }
     }
-    unreachable!("close retry loop returns on the final attempt") // ubs:ignore -- Attempt 12 cannot retry; every success and final error returns above.
+    unreachable!("close retry loop returns on the final attempt")
 }
-
-/// Progress reporter for a bounded `--rebuild-canonical-fts` rebuild.
-type FtsRebuildProgressReporter = Box<dyn Fn(FtsRebuildProgress) + Send + Sync>;
 
 /// Thread-affine storage owning the primary raw connection and any cached raw
 /// ephemeral writer. Moving it to another OS thread must remain a compile-time
@@ -5706,23 +5328,10 @@ pub struct FrankenStorage {
     /// stall watchdog reads a healthy multi-minute shadow rebuild as a wedge
     /// and exits 70 after the base abort threshold.
     fts_maintenance_heartbeat: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
-    /// GH #345: truthful, per-committed-batch progress for a bounded
-    /// `--rebuild-canonical-fts` rebuild. `None` outside an explicit repair
-    /// (the index tail keeps its own progress counters).
-    fts_rebuild_progress: parking_lot::Mutex<Option<FtsRebuildProgressReporter>>,
     /// GH #413 follow-up (iify0): the run's view of the derived fts5 shadow,
     /// shared with every pool writer this connection spawns (see
     /// [`FtsShadowRunState`]).
     fts_shadow_run: Arc<FtsShadowRunState>,
-    /// GH #503: set when this read-only handle was admitted through the
-    /// pinned engine's legacy-tolerant deferred-FTS5 open because an
-    /// `fts_messages*` shadow table carries the pre-#434 catalog (a declared
-    /// primary key with no `sqlite_master` implicit autoindex row). Holds the
-    /// ordinary open's refusal for the repair hint. The canonical rows are
-    /// readable; FTS5 queries on this handle see an empty index until the
-    /// derived shadow is rebuilt by an explicit writable repair
-    /// (`cass doctor --rebuild-canonical-fts --yes`).
-    legacy_fts5_shadow_repair: Option<String>,
 }
 
 /// GH #413 follow-up (iify0): per-process state of the derived `fts_messages`
@@ -5911,16 +5520,14 @@ pub(crate) fn error_message_indicates_populated_fts_shadow_without_rowid_reload(
     mentions_populated_without_rowid_shadow && lower.contains("not yet supported")
 }
 
-/// Test-only rendezvous for engine admission and SQL on an admitted connection.
+/// Test-only rendezvous separating uncancellable engine bootstrap from SQL
+/// issued on an admitted connection. Baseline and candidate use the same hook.
 #[cfg(debug_assertions)]
-fn index_storage_open_rendezvous_for_test(
-    path: &Path,
-    ready_env: &str,
-    release_env: &str,
-) -> Result<()> {
-    let (Some(ready), Some(release)) =
-        (dotenvy::var(ready_env).ok(), dotenvy::var(release_env).ok())
-    else {
+fn index_storage_open_rendezvous_for_test(path: &Path) -> Result<()> {
+    let (Some(ready), Some(release)) = (
+        dotenvy::var("CASS_TEST_INDEX_STORAGE_OPEN_READY").ok(),
+        dotenvy::var("CASS_TEST_INDEX_STORAGE_OPEN_RELEASE").ok(),
+    ) else {
         return Ok(());
     };
     let ready = PathBuf::from(ready);
@@ -5981,23 +5588,12 @@ impl FrankenStorage {
             ensured_daily_stats_keys,
             fts_messages_present_cache: AtomicI8::new(FTS_MESSAGES_PRESENT_UNKNOWN),
             fts_maintenance_heartbeat: parking_lot::Mutex::new(None),
-            fts_rebuild_progress: parking_lot::Mutex::new(None),
             fts_shadow_run,
-            legacy_fts5_shadow_repair: None,
         }
     }
 
     fn apply_open_stage_busy_timeout(&self) {
-        // fsqlite's native POSIX lock wait does not poll the operation Cx.
-        // Under index cancellation, return to CASS's retry loops promptly so
-        // they can observe the stop. Their five-second contention budgets
-        // remain intact; ordinary unsupervised opens retain the native wait.
-        let pragma = if crate::franken_sync::cancellation_scope_active() {
-            "PRAGMA busy_timeout = 100;"
-        } else {
-            "PRAGMA busy_timeout = 5000;"
-        };
-        if let Err(err) = self.conn.execute(pragma) {
+        if let Err(err) = self.conn.execute("PRAGMA busy_timeout = 5000;") {
             tracing::debug!(
                 error = %err,
                 "failed to apply open-stage busy_timeout before migrations"
@@ -6037,12 +5633,12 @@ impl FrankenStorage {
             // archives.
             match FrankenConnection::open_existing_schema_only(&path_str) {
                 Ok(conn) => conn,
-                // fsqlite validates sqlite_master at schema load and refuses
-                // the historical duplicate `fts_messages` row debris that
-                // older engines tolerated. A canonical open never repairs the
-                // archive behind the caller's back: it reports the typed
-                // repair-required condition and `cass doctor --fix` performs
-                // the repair (2l1b0.65).
+                // fsqlite 0.3.x validates sqlite_master at schema load and
+                // refuses the historical duplicate `fts_messages` row debris
+                // that 0.2.x tolerated (and that cass used to dedupe lazily in
+                // `ensure_search_fallback_fts_consistency`). Repair the
+                // duplicate rows through the rusqlite salvage bridge, then
+                // retry the open once.
                 Err(err)
                     if err
                         .to_string()
@@ -6052,10 +5648,16 @@ impl FrankenStorage {
                         db = %path.display(),
                         error = %err,
                         "frankensqlite refused open due to duplicate fts_messages \
-                         schema rows; reporting schema repair required without \
-                         mutating the archive"
+                         schema rows; deduplicating via sqlite3 bridge and retrying"
                     );
-                    return Err(conflicting_fts_schema_repair_required(path));
+                    dedupe_conflicting_fts_schema_rows_via_sqlite3(path)?;
+                    FrankenConnection::open_existing_schema_only(&path_str).with_context(|| {
+                        format!(
+                            "opening existing frankensqlite db at {} after \
+                                 duplicate fts schema-row repair",
+                            path.display()
+                        )
+                    })?
                 }
                 Err(err) => {
                     return Err(err).with_context(|| {
@@ -6068,11 +5670,7 @@ impl FrankenStorage {
                 .with_context(|| format!("creating frankensqlite db at {}", path.display()))?
         };
         #[cfg(debug_assertions)]
-        index_storage_open_rendezvous_for_test(
-            path,
-            "CASS_TEST_INDEX_STORAGE_OPEN_READY",
-            "CASS_TEST_INDEX_STORAGE_OPEN_RELEASE",
-        )?;
+        index_storage_open_rendezvous_for_test(path)?;
         let storage = Self::new(conn, path.to_path_buf());
         storage.apply_open_stage_busy_timeout();
         retry_transient_storage_op("run_migrations", || storage.run_migrations())?;
@@ -6246,7 +5844,6 @@ impl FrankenStorage {
         let busy_timeout_ms = writer.index_writer_busy_timeout_ms.load(Ordering::Relaxed);
         let conn = writer.into_raw();
         let mut cached = self.cached_ephemeral_writer.lock();
-        // ubs:ignore -- This is the cache-release invariant paired with acquire_cached_ephemeral_writer; callers release only reusable writers.
         debug_assert!(
             matches!(&*cached, CachedEphemeralWriter::InUse),
             "cached ephemeral writer state should be in-use when releasing"
@@ -6291,7 +5888,6 @@ impl FrankenStorage {
         };
         if let Err(error) = close_franken_in_place_with_busy_retry(&mut cached_writer.conn, false) {
             let mut cached = self.cached_ephemeral_writer.lock();
-            // ubs:ignore -- The checkpoint caller invokes this only at a between-batches quiescent boundary; conditional restoration preserves any changed cache state.
             debug_assert!(
                 matches!(&*cached, CachedEphemeralWriter::Uninitialized),
                 "cached writer state changed while an idle writer was closing"
@@ -6437,41 +6033,26 @@ impl FrankenStorage {
         // class upstream retries in prepare's prologue since 55d7f2c5). The
         // lexical-rebuild page-prep workers open readonly right next to the
         // active writer, so a bounded retry here is load-bearing.
-        let mut legacy_fts5_shadow_repair = None;
         let conn = match retry_transient_storage_op("open_readonly", || {
             FrankenConnection::open_schema_only_with_wal_index_recovery(&path_str)
                 .map_err(anyhow::Error::new)
         }) {
             Ok(conn) => conn,
             // Same duplicate-fts_messages debris handling as the canonical
-            // open: fsqlite refuses the historical duplicate schema row at
-            // load. A readonly open never mutates the archive, so it reports
-            // the typed repair-required condition instead (2l1b0.65).
+            // open: fsqlite 0.3.x refuses the historical duplicate schema row
+            // at load. The dedupe is a sanctioned mutation from an ordinary
+            // read lane — it repairs sqlite_master metadata only (the lexical
+            // self-healing contract), then the readonly open is retried.
             Err(err) if format!("{err:#}").contains("conflicting virtual-table entries") => {
                 tracing::warn!(
                     db = %path.display(),
                     error = %err,
                     "frankensqlite refused readonly open due to duplicate \
-                     fts_messages schema rows; reporting schema repair required \
-                     without mutating the archive"
+                     fts_messages schema rows; deduplicating via sqlite3 bridge"
                 );
-                return Err(conflicting_fts_schema_repair_required(path));
-            }
-            // GH #503: the pre-#434 derived-FTS catalog refused the ordinary
-            // read-only schema reload. Open the engine's legacy-tolerant
-            // deferred-FTS5 lane (query_only is applied inside) so the
-            // canonical rows are readable; the derived shadow still needs an
-            // explicit writable repair.
-            Err(err) if is_legacy_fts5_shadow_autoindex_open_error(&err) => {
-                tracing::warn!(
-                    db = %path.display(),
-                    error = %err,
-                    "readonly open found the pre-#434 fts_messages shadow catalog; \
-                     admitting the archive through the legacy-tolerant lane \
-                     without a writable repair"
-                );
-                legacy_fts5_shadow_repair = Some(format!("{err:#}"));
-                open_legacy_fts5_shadow_catalog_reader(path)?
+                dedupe_conflicting_fts_schema_rows_via_sqlite3(path)?;
+                FrankenConnection::open_schema_only_with_wal_index_recovery(&path_str)
+                    .map_err(anyhow::Error::new)?
             }
             // gh #389: a hard (non-busy) readonly failure with a non-empty
             // `-wal` present is the unclean-shutdown dirty-WAL shape — the
@@ -6495,11 +6076,7 @@ impl FrankenStorage {
                 });
             }
         };
-        let mut storage = Self::new(conn, path.to_path_buf());
-        if legacy_fts5_shadow_repair.is_none() {
-            legacy_fts5_shadow_repair = legacy_fts5_shadow_missing_autoindex_detail(storage.raw());
-        }
-        storage.legacy_fts5_shadow_repair = legacy_fts5_shadow_repair;
+        let storage = Self::new(conn, path.to_path_buf());
         storage.apply_readonly_config()?;
         Ok(storage)
     }
@@ -6528,29 +6105,11 @@ impl FrankenStorage {
         let deadline = Instant::now() + timeout;
         let _doctor_guard = acquire_existing_doctor_mutation_db_open_guard(path, timeout)?;
         let mut backoff = Duration::from_millis(4);
-        let mut legacy_fts5_shadow_repair = None;
         let conn = loop {
             match open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
                 .map_err(anyhow::Error::new)
             {
                 Ok(conn) => break conn,
-                // GH #503: the pre-#434 derived-FTS catalog refuses the
-                // ordinary read-only schema reload. Admit the archive through
-                // the engine's legacy-tolerant deferred-FTS5 lane (query_only
-                // applied inside); canonical rows are readable and the
-                // derived shadow still needs an explicit writable repair.
-                Err(err) if is_legacy_fts5_shadow_autoindex_open_error(&err) => {
-                    tracing::warn!(
-                        db = %path.display(),
-                        error = %err,
-                        "strict readonly open found the pre-#434 fts_messages shadow \
-                         catalog; admitting the archive through the legacy-tolerant \
-                         lane without a writable repair"
-                    );
-                    // ubs:ignore[rust.perf.string-alloc-in-loop] -- This one legacy-catalog error is retained and immediately exits the open retry loop.
-                    legacy_fts5_shadow_repair = Some(format!("{err:#}"));
-                    break open_legacy_fts5_shadow_catalog_reader(path)?;
-                }
                 Err(err) if retryable_franken_anyhow(&err) => {
                     let now = Instant::now();
                     if now >= deadline {
@@ -6578,11 +6137,7 @@ impl FrankenStorage {
                 }
             }
         };
-        let mut storage = Self::new(conn, path.to_path_buf());
-        if legacy_fts5_shadow_repair.is_none() {
-            legacy_fts5_shadow_repair = legacy_fts5_shadow_missing_autoindex_detail(storage.raw());
-        }
-        storage.legacy_fts5_shadow_repair = legacy_fts5_shadow_repair;
+        let storage = Self::new(conn, path.to_path_buf());
         storage.apply_readonly_config()?;
         Ok(storage)
     }
@@ -6615,15 +6170,6 @@ impl FrankenStorage {
     /// Access the raw frankensqlite connection.
     pub fn raw(&self) -> &FrankenConnection {
         &self.conn
-    }
-
-    /// GH #503: the ordinary open's refusal when this read-only handle was
-    /// admitted through the engine's legacy-tolerant deferred-FTS5 lane.
-    /// `None` for every ordinary open. Callers surface it as a
-    /// `schema-repair-required` hint for the derived shadow; the canonical
-    /// rows are readable on this handle.
-    pub(crate) fn legacy_fts5_shadow_repair_detail(&self) -> Option<&str> {
-        self.legacy_fts5_shadow_repair.as_deref()
     }
 
     /// Consume the storage wrapper and return the underlying frankensqlite
@@ -6750,7 +6296,7 @@ impl FrankenStorage {
     /// V13 or newer already; additive post-V13 migrations are applied normally.
     pub fn run_migrations(&self) -> Result<()> {
         transition_from_meta_version(&self.conn)?;
-        self.drop_legacy_fts_messages_bounded()?;
+        self.refuse_unbounded_legacy_fts_teardown()?;
 
         let (mut applied, was_fresh) =
             run_attributed_migration_steps(&self.conn, BASE_MIGRATION_STEPS)?;
@@ -6777,61 +6323,63 @@ impl FrankenStorage {
         // Keep meta.schema_version in sync for backward compatibility.
         self.sync_meta_schema_version(current)?;
 
+        if current >= 24 && semantic_archive_state_in_connection(&self.conn)?.is_none() {
+            let mut tx = self.conn.transaction()?;
+            ensure_semantic_archive_state(&tx)?;
+            tx.commit()?;
+        }
+
         Ok(())
     }
 
-    /// GH #349: run the V14 legacy `fts_messages` teardown in autocommit.
+    /// GH #349: bounded pre-flight for the V14 `fts_contentless` migration.
     ///
-    /// `MigrationRunner` applies each migration inside `BEGIN IMMEDIATE` /
-    /// `COMMIT`. FrankenSQLite frees a dropped b-tree in bounded page batches
-    /// (2048 pages per batch), but only autocommit lets each batch commit on
-    /// its own; inside an explicit transaction every batch joins that one
-    /// transaction, so tearing down a multi-GB internal-content FTS5 shadow
-    /// accumulates unbounded freed-page state and aborts with `out of memory`.
+    /// When the archive still carries a legacy `fts_messages` FTS5 shadow,
+    /// the migration must DROP it, and that teardown is unbounded inside
+    /// frankensqlite — on multi-GB archives it aborts with `out of memory`
+    /// after minutes at multi-GiB RSS. Above the configured byte budget this
+    /// refuses up front with a typed, actionable error instead of attempting
+    /// the drop, leaving the archive untouched. Small archives migrate
+    /// exactly as before, and `CASS_MIGRATION_LEGACY_FTS_DROP_BUDGET_BYTES`
+    /// (see [`LEGACY_FTS_TEARDOWN_BUDGET_ENV`]) tunes or disables the gate.
     ///
-    /// This runs before the attributed migration steps and targets only the
-    /// derived `fts_messages` virtual table, and only while V14 is pending;
-    /// canonical tables are never touched. V14's own
-    /// `DROP TABLE IF EXISTS fts_messages` then commits as a no-op, so the
-    /// migration ledger still records `fts_contentless` exactly as before.
-    /// A crash after the drop but before V14's ledger row is resumable: the
-    /// next open finds no `fts_messages`, runs the no-op, and records V14.
-    ///
-    /// Returns whether the legacy table was dropped.
-    fn drop_legacy_fts_messages_bounded(&self) -> Result<bool> {
-        if schema_migration_is_applied(&self.conn, 14).unwrap_or(false) {
-            return Ok(false);
-        }
-        let present = self
+    /// Every probe here is bounded: one indexed sqlite_master row read, one
+    /// `_schema_migrations` point query, and file metadata for the archive
+    /// family. Probes that themselves fail fail open — the migration then
+    /// runs and any real failure surfaces attributed per step.
+    fn refuse_unbounded_legacy_fts_teardown(&self) -> Result<()> {
+        let carries_fts_messages = self
             .conn
             .query(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' \
-                 AND name = 'fts_messages' COLLATE NOCASE LIMIT 1;",
+                 AND name = 'fts_messages' LIMIT 1;",
             )
             .map(|rows| !rows.is_empty())
             .unwrap_or(false);
-        if !present {
-            return Ok(false);
+        if !carries_fts_messages {
+            return Ok(());
         }
-        // Boundedness is a property of the autocommit lane: if a caller wrapped
-        // run_migrations in a transaction, every page-free batch would join it.
-        let in_autocommit = !self.conn.as_async().in_transaction();
-        #[cfg(test)]
-        LEGACY_FTS_TEARDOWN_RAN_IN_AUTOCOMMIT.with(|probe| probe.set(in_autocommit));
-        anyhow::ensure!(
-            in_autocommit,
-            "legacy fts_messages teardown must run outside an explicit transaction"
+        let Some(budget_bytes) = legacy_fts_teardown_budget_bytes() else {
+            return Ok(());
+        };
+        let v14_pending = !schema_migration_is_applied(&self.conn, 14).unwrap_or(true);
+        if !v14_pending {
+            return Ok(());
+        }
+        let archive_bytes = archive_family_bytes(&self.db_path);
+        if archive_bytes <= budget_bytes {
+            return Ok(());
+        }
+        tracing::warn!(
+            archive_bytes,
+            budget_bytes,
+            env = LEGACY_FTS_TEARDOWN_BUDGET_ENV,
+            "refusing unbounded legacy fts_messages teardown during schema migration"
         );
-        self.conn
-            .execute("DROP TABLE IF EXISTS fts_messages")
-            .with_context(
-                || "running schema migration v14 (fts_contentless): dropping legacy fts_messages in bounded autocommit mode",
-            )?;
-        info!(
-            db = %self.db_path.display(),
-            "dropped legacy fts_messages in autocommit before migration v14"
-        );
-        Ok(true)
+        Err(anyhow::Error::new(LegacyFtsTeardownRefusal {
+            archive_bytes,
+            budget_bytes,
+        }))
     }
 
     /// Some historical canonical rebuild paths produced databases whose
@@ -6859,6 +6407,24 @@ impl FrankenStorage {
             );
 
             for batch in current_schema_repair_batches_for_missing_tables(&missing_tables)? {
+                if batch.name == "semantic_coverage" {
+                    // Recreating a lost journal cannot preserve its former
+                    // completeness authority. Reset the incarnation atomically
+                    // with the table so readers never see an empty trusted log.
+                    let mut tx = self.conn.transaction()?;
+                    tx.execute_compat(
+                        "DELETE FROM meta WHERE key = ?1 OR key = ?2",
+                        fparams![
+                            SEMANTIC_ARCHIVE_STATE_META_KEY,
+                            SEMANTIC_MESSAGE_ID_HIGH_WATER_META_KEY
+                        ],
+                    )?;
+                    tx.execute_batch(batch.sql)?;
+                    ensure_semantic_archive_state(&tx)?;
+                    tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
+                    tx.commit()?;
+                    continue;
+                }
                 self.conn
                     .execute_batch(batch.sql)
                     .with_context(|| format!("repairing current-schema batch {}", batch.name))?;
@@ -6885,7 +6451,6 @@ impl FrankenStorage {
             if columns.contains(column_name) {
                 continue;
             }
-            // ubs:ignore[rust.perf.string-alloc-in-loop] -- One-time schema repair visits a fixed column list; SQL identifiers cannot be bound as parameters.
             let sql = format!("ALTER TABLE conversations ADD COLUMN {column_name} {column_type};");
             self.conn.execute(&sql).with_context(|| {
                 format!("adding missing conversations.{column_name} token-summary column")
@@ -7178,7 +6743,8 @@ const POST_TAIL_CACHE_MIGRATION_STEPS: &[(i64, &str, &str)] = &[
     (20, "conversation_external_tail_lookup", MIGRATION_V20),
     (21, "conversation_context_index", MIGRATION_V21),
     (22, "forgotten_sources", MIGRATION_V22),
-    (23, "semantic_source_identity", MIGRATION_V23),
+    (23, "forgotten_conversations", MIGRATION_V23),
+    (24, "semantic_coverage", MIGRATION_V24),
 ];
 
 /// Migration versions that ordinary storage open may apply when their ledger
@@ -7219,13 +6785,75 @@ fn run_attributed_migration_steps(
     Ok((applied, was_fresh))
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Test-only evidence that the GH #349 legacy `fts_messages` pre-drop ran
-    /// on the autocommit lane (the lane where each bounded page-free batch
-    /// commits). Thread-local because `run_migrations` runs on the caller.
-    static LEGACY_FTS_TEARDOWN_RAN_IN_AUTOCOMMIT: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
+/// Environment override for the GH #349 legacy-FTS teardown refusal budget,
+/// in bytes of on-disk archive family (main db + sidecars). `0` disables the
+/// refusal entirely and forces the unbounded teardown attempt.
+const LEGACY_FTS_TEARDOWN_BUDGET_ENV: &str = "CASS_MIGRATION_LEGACY_FTS_DROP_BUDGET_BYTES";
+
+/// Default refusal budget: archives above this size never attempt the V14
+/// legacy `fts_messages` teardown automatically.
+const DEFAULT_LEGACY_FTS_TEARDOWN_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Typed refusal of the V14 `fts_contentless` teardown of a large legacy
+/// `fts_messages` FTS5 shadow (GH #349).
+///
+/// The drop is unbounded inside frankensqlite (WITHOUT-ROWID shadow teardown)
+/// and aborts with `out of memory` after minutes and multi-GiB RSS on
+/// multi-GB archives. Refusing up front keeps the archive untouched, names
+/// the failing migration, and carries the safe next actions.
+#[derive(Debug, Error)]
+#[error(
+    "migration v14 (fts_contentless) refused: this archive still carries a legacy fts_messages \
+     FTS5 shadow whose teardown is unbounded in frankensqlite (GH #345/#349: the drop aborts \
+     with 'out of memory' after minutes on multi-GB archives); archive family is \
+     {archive_bytes} bytes, above the {budget_bytes}-byte refusal budget. The archive was not \
+     modified. Next actions: run 'cass doctor check --json' for a bounded read-only diagnosis; \
+     upgrade to a cass build carrying the frankensqlite bounded WITHOUT-ROWID teardown fix and \
+     retry 'cass index --full'; or back up the archive and rebuild a fresh one from provider \
+     session logs. To force the unbounded attempt anyway, set \
+     CASS_MIGRATION_LEGACY_FTS_DROP_BUDGET_BYTES to a byte value above the archive size \
+     (0 disables the refusal entirely)."
+)]
+pub(crate) struct LegacyFtsTeardownRefusal {
+    pub(crate) archive_bytes: u64,
+    pub(crate) budget_bytes: u64,
+}
+
+/// Total on-disk size of the archive family: the main db plus its WAL, SHM,
+/// and journal sidecars. Missing members contribute zero.
+fn archive_family_bytes(db_path: &Path) -> u64 {
+    ["", "-wal", "-shm", "-journal"]
+        .into_iter()
+        .filter_map(|suffix| {
+            std::fs::symlink_metadata(database_sidecar_path(db_path, suffix))
+                .ok()
+                .filter(|meta| meta.is_file())
+                .map(|meta| meta.len())
+        })
+        .sum()
+}
+
+/// Resolve the legacy-FTS teardown refusal budget. `None` means the operator
+/// explicitly disabled the refusal via a `0` budget; an unparsable value
+/// falls back to the default with a warning rather than silently disabling
+/// the gate.
+fn legacy_fts_teardown_budget_bytes() -> Option<u64> {
+    match std::env::var(LEGACY_FTS_TEARDOWN_BUDGET_ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(bytes) => Some(bytes),
+            Err(_) => {
+                tracing::warn!(
+                    value = %raw,
+                    env = LEGACY_FTS_TEARDOWN_BUDGET_ENV,
+                    default = DEFAULT_LEGACY_FTS_TEARDOWN_BUDGET_BYTES,
+                    "unparsable refusal budget; using the default"
+                );
+                Some(DEFAULT_LEGACY_FTS_TEARDOWN_BUDGET_BYTES)
+            }
+        },
+        Err(_) => Some(DEFAULT_LEGACY_FTS_TEARDOWN_BUDGET_BYTES),
+    }
 }
 
 fn schema_migration_is_applied(conn: &FrankenConnection, version: i64) -> Result<bool> {
@@ -8046,6 +7674,16 @@ const CURRENT_SCHEMA_REPAIR_BATCHES: &[SchemaRepairBatch] = &[
         tables: &["forgotten_sources"],
         sql: MIGRATION_V22,
     },
+    SchemaRepairBatch {
+        name: "forgotten_conversations",
+        tables: &["forgotten_conversations"],
+        sql: MIGRATION_V23,
+    },
+    SchemaRepairBatch {
+        name: "semantic_coverage",
+        tables: &["semantic_conversation_changes"],
+        sql: MIGRATION_V24,
+    },
 ];
 
 fn current_schema_repair_batches_for_missing_tables(
@@ -8079,7 +7717,7 @@ fn current_schema_repair_batches_for_missing_tables(
 }
 
 /// Migration name lookup for backfilling `_schema_migrations` during transition.
-const MIGRATION_NAMES: [(i64, &str); 23] = [
+const MIGRATION_NAMES: [(i64, &str); 24] = [
     (1, "core_tables"),
     (2, "fts_messages"),
     (3, "fts_messages_rebuild"),
@@ -8102,7 +7740,8 @@ const MIGRATION_NAMES: [(i64, &str); 23] = [
     (20, "conversation_external_tail_lookup"),
     (21, "conversation_context_index"),
     (22, "forgotten_sources"),
-    (23, "semantic_source_identity"),
+    (23, "forgotten_conversations"),
+    (24, "semantic_coverage"),
 ];
 
 /// Transitions an existing database from `meta` table schema versioning to the
@@ -8244,6 +7883,14 @@ const REQUIRED_CURRENT_SCHEMA_TABLE_PROBES: &[(&str, &str)] = &[
         "forgotten_sources",
         "SELECT source_path FROM forgotten_sources LIMIT 1;",
     ),
+    (
+        "forgotten_conversations",
+        "SELECT source_id, agent_slug, source_path, external_id FROM forgotten_conversations LIMIT 1;",
+    ),
+    (
+        "semantic_conversation_changes",
+        "SELECT conversation_id, mutation_seq, invalidation_seq FROM semantic_conversation_changes LIMIT 1;",
+    ),
 ];
 
 const REQUIRED_CONVERSATION_TOKEN_COLUMNS: &[(&str, &str)] = &[
@@ -8353,8 +8000,8 @@ fn delete_orphan_message_id_chunk(conn: &FrankenConnection, ids: &[i64]) -> Resu
                 error = %err,
                 "orphan-message cleanup ran out of memory; retrying as smaller batches"
             );
-            let left = delete_orphan_message_id_chunk(conn, &ids[..split_at])?; // ubs:ignore -- This branch requires len > 1, so split_at is strictly inside the slice.
-            let right = delete_orphan_message_id_chunk(conn, &ids[split_at..])?; // ubs:ignore -- This branch requires len > 1, so split_at is strictly inside the slice.
+            let left = delete_orphan_message_id_chunk(conn, &ids[..split_at])?;
+            let right = delete_orphan_message_id_chunk(conn, &ids[split_at..])?;
             Ok(left.saturating_add(right))
         }
         Err(err) => Err(err),
@@ -8387,10 +8034,15 @@ fn delete_orphan_message_id_chunk_once(conn: &FrankenConnection, ids: &[i64]) ->
             }
         }
     }
-    deleted = deleted.saturating_add(
-        delete_rows_by_i64_chunks(&tx, "DELETE FROM messages WHERE id IN", ids)
-            .context("deleting orphan rows from messages")?,
-    );
+    let messages_deleted = delete_rows_by_i64_chunks(&tx, "DELETE FROM messages WHERE id IN", ids)
+        .context("deleting orphan rows from messages")?;
+    deleted = deleted.saturating_add(messages_deleted);
+    if messages_deleted > 0 {
+        // The parent may already have vanished outside supported writers.
+        // There is no complete conversation delta to recover here.
+        record_semantic_conversation_changes(&tx, &[0], true)?;
+        clear_semantic_embed_watermark_after_deletion(&tx)?;
+    }
     tx.commit()?;
     Ok(deleted)
 }
@@ -8440,8 +8092,8 @@ fn delete_direct_orphan_id_chunk(
                 error = %err,
                 "direct orphan cleanup ran out of memory; retrying as smaller batches"
             );
-            let left = delete_direct_orphan_id_chunk(conn, entry, &ids[..split_at])?; // ubs:ignore -- This branch requires len > 1, so split_at is strictly inside the slice.
-            let right = delete_direct_orphan_id_chunk(conn, entry, &ids[split_at..])?; // ubs:ignore -- This branch requires len > 1, so split_at is strictly inside the slice.
+            let left = delete_direct_orphan_id_chunk(conn, entry, &ids[..split_at])?;
+            let right = delete_direct_orphan_id_chunk(conn, entry, &ids[split_at..])?;
             Ok(left.saturating_add(right))
         }
         Err(err) => Err(err),
@@ -8574,9 +8226,6 @@ pub struct InsertOutcome {
     pub inserted_indices: Vec<i64>,
     /// Native messages whose payload changed without allocating another row.
     pub updated_indices: Vec<i64>,
-    /// Incoming variants retained only in their native source because the
-    /// canonical message at the same position has different content/identity.
-    pub unresolved_message_conflicts: usize,
     /// Existing messages need new derived workspace associations or titles,
     /// not reinsertion. Provider metadata alone does not set this flag.
     pub workspace_changed: bool,
@@ -8602,7 +8251,6 @@ fn provider_workspace_is_authoritative(
     let present = workspace.is_some_and(|path| !path.as_os_str().is_empty());
     match agent_slug {
         "cursor" => {
-            // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value read indexing yields Null for absent keys and non-object values.
             metadata["cursor_format"] == "agent"
                 && match metadata["cursor_workspace_attribution"].as_str() {
                     Some("workspace_trusted") => present,
@@ -8644,16 +8292,190 @@ fn replay_owns_provider_workspace(
         )
 }
 
+fn semantic_archive_state_with_query(
+    mut query: impl FnMut(&str) -> Result<Vec<FrankenRow>>,
+) -> Result<Option<SemanticArchiveState>> {
+    let rows = query("SELECT value FROM meta WHERE key = 'semantic_archive_state_v1'")?;
+    rows.first()
+        .map(|row| SemanticArchiveState::parse(&row.get_typed::<String>(0)?))
+        .transpose()
+}
+
+/// Read-only archive authority for a caller-owned canonical transaction.
+pub fn semantic_archive_state_in_connection(
+    connection: &FrankenConnection,
+) -> Result<Option<SemanticArchiveState>> {
+    semantic_archive_state_with_query(|sql| Ok(connection.query(sql)?))
+}
+
+/// Initialize only from a canonical write transaction. Old schema callers keep
+/// strict serving; reads never synthesize a mutation history.
+fn ensure_semantic_archive_state(
+    tx: &FrankenTransaction<'_>,
+) -> Result<Option<SemanticArchiveState>> {
+    if let Some(state) = semantic_archive_state_with_query(|sql| Ok(tx.query(sql)?))? {
+        return Ok(Some(state));
+    }
+    if tx
+        .query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'semantic_conversation_changes'")?
+        .is_empty()
+    {
+        return Ok(None);
+    }
+    let mut identity = [0_u8; 16];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut identity)
+        .map_err(|_| anyhow!("creating canonical semantic archive identity"))?;
+    let state = SemanticArchiveState {
+        archive_id: hex::encode(identity),
+        mutation_seq: 0,
+    };
+    let high_water: i64 = tx.query_row_map(
+        "SELECT COALESCE(MAX(id), 0) FROM messages",
+        fparams![],
+        |row| row.get_typed(0),
+    )?;
+    tx.execute_compat(
+        "INSERT INTO meta(key, value) VALUES(?1, ?2)",
+        fparams![
+            SEMANTIC_ARCHIVE_STATE_META_KEY,
+            serde_json::to_string(&state)?
+        ],
+    )?;
+    tx.execute_compat(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+        fparams![
+            SEMANTIC_MESSAGE_ID_HIGH_WATER_META_KEY,
+            high_water.to_string()
+        ],
+    )?;
+    Ok(Some(state))
+}
+
+/// Record supported canonical changes in the same transaction as their rows.
+/// Appends preserve old invalidation boundaries; deletion/reidentity tombstones
+/// survive subsequent reuse of either the conversation or message IDs.
+fn record_semantic_conversation_changes(
+    tx: &FrankenTransaction<'_>,
+    conversation_ids: &[i64],
+    invalidates_existing: bool,
+) -> Result<()> {
+    if conversation_ids.is_empty() {
+        return Ok(());
+    }
+    let Some(mut state) = ensure_semantic_archive_state(tx)? else {
+        return Ok(());
+    };
+    state.mutation_seq = state
+        .mutation_seq
+        .checked_add(1)
+        .filter(|sequence| *sequence <= i64::MAX as u64)
+        .context("canonical semantic mutation sequence exhausted")?;
+    let sequence = i64::try_from(state.mutation_seq)?;
+    for conversation_id in conversation_ids.iter().copied().collect::<BTreeSet<_>>() {
+        anyhow::ensure!(
+            conversation_id >= 0,
+            "negative semantic conversation identity"
+        );
+        let invalidation = if invalidates_existing {
+            sequence
+        } else {
+            tx.query_row_map(
+                "SELECT invalidation_seq FROM semantic_conversation_changes WHERE conversation_id = ?1",
+                fparams![conversation_id],
+                |row| row.get_typed::<i64>(0),
+            ).optional()?.unwrap_or(0)
+        };
+        tx.execute_compat(
+            "INSERT OR REPLACE INTO semantic_conversation_changes(conversation_id, mutation_seq, invalidation_seq) VALUES(?1, ?2, ?3)",
+            fparams![conversation_id, sequence, invalidation],
+        )?;
+    }
+    tx.execute_compat(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+        fparams![
+            SEMANTIC_ARCHIVE_STATE_META_KEY,
+            serde_json::to_string(&state)?
+        ],
+    )?;
+    Ok(())
+}
+
+fn record_semantic_message_insertions(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    message_ids: &[i64],
+) -> Result<()> {
+    let Some(minimum) = message_ids.iter().copied().min() else {
+        return Ok(());
+    };
+    let Some(_) = ensure_semantic_archive_state(tx)? else {
+        return Ok(());
+    };
+    let high_water: String = tx.query_row_map(
+        "SELECT value FROM meta WHERE key = ?1",
+        fparams![SEMANTIC_MESSAGE_ID_HIGH_WATER_META_KEY],
+        |row| row.get_typed(0),
+    )?;
+    let high_water: i64 = high_water
+        .parse()
+        .context("invalid semantic message-ID high water")?;
+    let reused = minimum <= high_water;
+    record_semantic_conversation_changes(tx, &[conversation_id], reused)?;
+    if reused {
+        tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
+    }
+    if let Some(maximum) = message_ids.iter().copied().max()
+        && maximum > high_water
+    {
+        tx.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![SEMANTIC_MESSAGE_ID_HIGH_WATER_META_KEY, maximum.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+fn record_semantic_parent_repair(
+    tx: &FrankenTransaction<'_>,
+    affected_query: &str,
+    parameters: &[ParamValue],
+) -> Result<()> {
+    if !tx.query_params(affected_query, parameters)?.is_empty() {
+        // Filling a missing dimension is canonical repair, not an ordinary
+        // append. The old provenance was incomplete, so require reconciliation.
+        record_semantic_conversation_changes(tx, &[0], true)?;
+        tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
+    }
+    Ok(())
+}
+
 /// Canonical rows were deleted (forget, dedup, agent purge). Their vectors
 /// stay in the semantic artifact and SQLite reuses the freed top message ids,
 /// so a watermark that covers them lets `cass index --semantic` take the #394
 /// skip forever: the tier is never re-certified, and a reused id would resolve
 /// to the deleted text's vector. Dropping the watermark sends the next semantic
 /// run through the full re-embed, the same invalidation the reconcilers below
-/// apply on identity changes (2l1b0.78).
+/// apply on identity changes (2l1b0.78). Every vector space loses its
+/// watermark: the deleted rows were in all of them.
 fn clear_semantic_embed_watermark_after_deletion(tx: &FrankenTransaction<'_>) -> Result<()> {
-    tx.execute("DELETE FROM meta WHERE key = 'last_embedded_message_id'")?;
+    tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
     Ok(())
+}
+
+/// Each vector space keeps its own embed watermark, keyed by embedder id
+/// (`last_embedded_message_id:fnv1a-384`, `last_embedded_message_id:minilm-384`).
+/// A single shared key let one embedder's run certify another embedder's older
+/// index: the next delta appended only rows above the foreign watermark and
+/// republished that index as current with a coverage hole (962e8).
+const SEMANTIC_EMBED_WATERMARK_KEY_PREFIX: &str = "last_embedded_message_id:";
+
+/// Drops every per-embedder watermark, and the retired single shared key that
+/// no reader trusts any more.
+const CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL: &str =
+    "DELETE FROM meta WHERE key LIKE 'last_embedded_message_id%'";
+
+fn semantic_embed_watermark_key(embedder_id: &str) -> String {
+    format!("{SEMANTIC_EMBED_WATERMARK_KEY_PREFIX}{embedder_id}")
 }
 
 /// Delete one duplicate conversation and its children inside `tx`. Messages,
@@ -8665,6 +8487,7 @@ fn delete_duplicate_conversation_rows(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
 ) -> Result<()> {
+    record_semantic_conversation_changes(tx, &[conversation_id], true)?;
     tx.execute_compat(
         "DELETE FROM conversation_external_lookup WHERE conversation_id = ?1",
         fparams![conversation_id],
@@ -8697,142 +8520,6 @@ fn delete_duplicate_conversation_rows(
     Ok(())
 }
 
-fn provider_workspace_attribution_is_authoritative(
-    agent_slug: &str,
-    external_id: Option<&str>,
-    workspace: Option<&Path>,
-    metadata: &serde_json::Value,
-) -> bool {
-    let Some(external_id) = external_id else {
-        return false;
-    };
-    if provider_workspace_is_authoritative(agent_slug, workspace, metadata) {
-        return true;
-    }
-    // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
-    let binding = &metadata["workspace_binding"];
-    agent_slug == "antigravity"
-        // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
-        && binding["source"] == "native_conversation_summaries"
-        // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
-        && binding["native_conversation_id"].as_str() == Some(external_id)
-        // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
-        && match binding["state"].as_str() {
-            Some("bound") => workspace.is_some_and(Path::is_absolute),
-            Some("missing" | "ambiguous" | "invalid") => workspace.is_none(),
-            // A failed native metadata read is not authority to erase a binding.
-            _ => false,
-        }
-}
-
-/// Refresh native snapshot provenance only when its entire source
-/// snapshot matches the canonical messages. A stale or partial replay cannot
-/// describe the newer archive or replace its existing provenance hash.
-fn franken_reconcile_native_snapshot_provenance(
-    tx: &FrankenTransaction<'_>,
-    conversation_id: i64,
-    conv: &Conversation,
-) -> Result<()> {
-    let Some(native_id) = conv.external_id.as_deref().filter(|id| !id.is_empty()) else {
-        return Ok(());
-    };
-    let matches_identity = |metadata: &serde_json::Value| match conv.agent_slug.as_str() {
-        "opencode" => {
-            // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
-            metadata["harness"] == "opencode2"
-                // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
-                && metadata["native_format"] == "session_v2/session_message"
-                // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
-                && metadata["native_session_id"].as_str() == Some(native_id)
-        }
-        "cloudmcp" => {
-            // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
-            metadata["source"] == "cloudmcp"
-                // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
-                && metadata["schema_version"] == "cloudmcp.conversation-manifest.v1"
-                // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
-                && metadata["conversation_id"].as_str() == Some(native_id)
-        }
-        _ => false,
-    };
-    if !matches_identity(&conv.metadata_json) {
-        return Ok(());
-    }
-    // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
-    let Some(content_hash) = conv.metadata_json["content_hash"]
-        .as_str()
-        .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
-    else {
-        return Ok(());
-    };
-    let (external_id, source_path, mut metadata): (Option<String>, String, serde_json::Value) = tx
-        .query_row_map(
-            "SELECT external_id, source_path, metadata_json, metadata_bin
-         FROM conversations WHERE id = ?1",
-            fparams![conversation_id],
-            |row| {
-                Ok((
-                    row.get_typed(0)?,
-                    row.get_typed(1)?,
-                    franken_read_metadata_compat(row, 2, 3),
-                ))
-            },
-        )?;
-    if external_id != conv.external_id
-        || source_path != path_to_string(&conv.source_path)
-        || !matches_identity(&metadata)
-        // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value indexing yields Null for a missing key and cannot panic.
-        || metadata["content_hash"].as_str() == Some(content_hash)
-    {
-        return Ok(());
-    }
-    let matches: Vec<bool> = tx.query_map_collect(
-        "SELECT idx, role, author, created_at, content, extra_json, extra_bin
-         FROM messages WHERE conversation_id = ?1 ORDER BY idx",
-        fparams![conversation_id],
-        |row| {
-            let idx: i64 = row.get_typed(0)?;
-            let Some(message) = usize::try_from(idx)
-                .ok()
-                .and_then(|index| conv.messages.get(index))
-            else {
-                return Ok(false);
-            };
-            let role: String = row.get_typed(1)?;
-            Ok(message.idx == idx
-                && message.role == role_from_str(&role)
-                && message.author == row.get_typed::<Option<String>>(2)?
-                && message.created_at == row.get_typed::<Option<i64>>(3)?
-                && message.content == row.get_typed::<String>(4)?
-                && message.extra_json == franken_read_message_extra_compat(row, 5, 6))
-        },
-    )?;
-    if matches.len() != conv.messages.len() || !matches.into_iter().all(|matched| matched) {
-        return Ok(());
-    }
-    // ubs:ignore[rust.panic.direct-indexing] -- The identity match above proved the stored metadata is a JSON object, so the key insert cannot panic.
-    metadata["content_hash"] = serde_json::Value::String(content_hash.to_owned());
-    if conv.agent_slug == "cloudmcp" {
-        // The verified manifest and transcript describe the same complete
-        // canonical snapshot. Keep local attribution while advancing all
-        // producer-owned provenance together; stale/partial packets fail the
-        // exact message comparison above.
-        if let Some(fields) = conv.metadata_json.as_object() {
-            for (key, value) in fields {
-                if key != "cass" {
-                    metadata[key] = value.clone();
-                }
-            }
-        }
-    }
-    let (json, binary) = franken_metadata_insert_payload(&metadata)?;
-    tx.execute_compat(
-        "UPDATE conversations SET metadata_json = ?1, metadata_bin = ?2 WHERE id = ?3",
-        fparams![json.as_deref(), binary.as_deref(), conversation_id],
-    )?;
-    Ok(())
-}
-
 /// Reconcile only the provider-owned attribution fields. A missing workspace
 /// in an ordinary partial packet must never erase a known association.
 fn franken_reconcile_provider_workspace(
@@ -8851,12 +8538,13 @@ fn franken_reconcile_provider_workspace(
             conv,
         );
     }
-    if !provider_workspace_attribution_is_authoritative(
-        &conv.agent_slug,
-        conv.external_id.as_deref(),
-        conv.workspace.as_deref(),
-        &conv.metadata_json,
-    ) {
+    if conv.external_id.is_none()
+        || !provider_workspace_is_authoritative(
+            &conv.agent_slug,
+            conv.workspace.as_deref(),
+            &conv.metadata_json,
+        )
+    {
         return Ok(false);
     }
     let (previous_workspace, previous_source, mut metadata): (
@@ -8885,29 +8573,21 @@ fn franken_reconcile_provider_workspace(
     if !metadata.is_object() {
         // Preserve non-object legacy metadata rather than replacing it blindly.
         anyhow::bail!(
-            "cannot reconcile provider workspace for conversation {conversation_id}: canonical metadata is not an object"
+            "cannot reconcile the provider workspace for conversation {conversation_id}: canonical metadata is not an object"
         );
     }
-    let fields: &[&str] = if conv.agent_slug == "antigravity" {
-        &["workspace_binding"]
-    } else {
-        &["cursor_workspace_attribution", "cursor_project_dir"]
-    };
-    for &field in fields {
+    for field in ["cursor_workspace_attribution", "cursor_project_dir"] {
         if let Some(value) = conv.metadata_json.get(field)
             && metadata.get(field) != Some(value)
         {
-            metadata[field] = value.clone(); // ubs:ignore -- The source is borrowed input metadata and the canonical row needs an owned JSON value; at most two provider fields are copied.
+            metadata[field] = value.clone();
             changed = true;
         }
     }
     if let Some(original) = conv.metadata_json.pointer("/cass/workspace_original") {
-        let Some(metadata_object) = metadata.as_object_mut() else {
-            anyhow::bail!(
-                "cannot reconcile provider workspace for conversation {conversation_id}: canonical metadata is not an object"
-            );
-        };
-        let cass = metadata_object
+        let cass = metadata
+            .as_object_mut()
+            .expect("checked object")
             .entry("cass")
             .or_insert_with(|| serde_json::json!({}));
         if let Some(cass) = cass.as_object_mut()
@@ -8937,7 +8617,8 @@ fn franken_reconcile_provider_workspace(
                     fparams![tier.meta_key(), generation.as_str()],
                 )?;
             }
-            tx.execute("DELETE FROM meta WHERE key = 'last_embedded_message_id'")?;
+            tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
+            record_semantic_conversation_changes(tx, &[conversation_id], true)?;
         }
     }
     Ok(previous_workspace != workspace_id)
@@ -8946,7 +8627,6 @@ fn franken_reconcile_provider_workspace(
 fn shelley_metadata_is_authoritative(conv: &Conversation) -> bool {
     conv.agent_slug == "shelley"
         && conv.external_id.is_some()
-        // ubs:ignore[rust.panic.direct-indexing] -- serde_json::Value reads return Null for absent keys or non-objects.
         && conv.metadata_json["source"] == "shelley"
         && conv.metadata_json["shelley"].is_object()
 }
@@ -8985,7 +8665,6 @@ fn franken_reconcile_shelley_metadata(
     let mut changed = workspace_changed || title_changed;
     for field in ["source", "shelley"] {
         if metadata.get(field) != conv.metadata_json.get(field) {
-            // ubs:ignore[rust.panic.direct-indexing,rust.collections.clone-in-loop] -- The target object is checked above; two provider subtrees must be owned independently of the borrowed incoming conversation.
             metadata[field] = conv.metadata_json[field].clone();
             changed = true;
         }
@@ -8993,7 +8672,7 @@ fn franken_reconcile_shelley_metadata(
     if let Some(original) = conv.metadata_json.pointer("/cass/workspace_original") {
         let cass = metadata
             .as_object_mut()
-            .context("canonical Shelley metadata is not an object")?
+            .expect("checked object")
             .entry("cass")
             .or_insert_with(|| serde_json::json!({}));
         if let Some(cass) = cass.as_object_mut()
@@ -9012,6 +8691,9 @@ fn franken_reconcile_shelley_metadata(
             "UPDATE conversations SET workspace_id = ?1, title = ?2, metadata_json = ?3, metadata_bin = ?4 WHERE id = ?5",
             fparams![workspace_id, conv.title.as_deref(), json.as_deref(), binary.as_deref(), conversation_id],
         )?;
+        if workspace_changed || title_changed {
+            record_semantic_conversation_changes(tx, &[conversation_id], true)?;
+        }
         if workspace_changed {
             let generation = format!("workspace:{:032x}", rand::random::<u128>());
             for tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
@@ -9020,7 +8702,7 @@ fn franken_reconcile_shelley_metadata(
                     fparams![tier.meta_key(), generation.as_str()],
                 )?;
             }
-            tx.execute("DELETE FROM meta WHERE key = 'last_embedded_message_id'")?;
+            tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
         }
     }
     Ok(workspace_changed || title_changed)
@@ -9312,19 +8994,6 @@ fn replay_fingerprints_from_merge_set(
         .collect()
 }
 
-pub(crate) fn is_openwebui_saved_snapshot(conv: &Conversation) -> bool {
-    conv.agent_slug == "openwebui"
-        && conv
-            .metadata_json
-            .get("schema_version")
-            .and_then(serde_json::Value::as_str)
-            == Some("openwebui.saved-conversation.v1")
-}
-
-pub(crate) fn needs_native_projection_replay(conv: &Conversation, updated_indices: &[i64]) -> bool {
-    is_openwebui_saved_snapshot(conv) || (conv.agent_slug == "codex" && !updated_indices.is_empty())
-}
-
 fn collect_new_messages_for_existing_conversation<'a>(
     conversation_id: i64,
     conv: &'a Conversation,
@@ -9351,9 +9020,7 @@ fn collect_new_messages_for_existing_conversation<'a>(
         }
 
         let incoming_replay = replay_fingerprint_from_merge(&incoming_fingerprint);
-        if !is_openwebui_saved_snapshot(conv)
-            && existing_replay_fingerprints.contains(&incoming_replay)
-        {
+        if existing_replay_fingerprints.contains(&incoming_replay) {
             tracing::debug!(
                 conversation_id,
                 idx = msg.idx,
@@ -9392,26 +9059,6 @@ fn reconciled_native_messages(conv: &Conversation) -> ExistingConversationNewMes
     }
 }
 
-/// Reconciliation rebuilds the message list from native IDs. Copy only the
-/// envelope here, so replay does not first duplicate bodies it will discard.
-fn clone_conversation_header(conv: &Conversation) -> Conversation {
-    Conversation {
-        id: conv.id,
-        agent_slug: conv.agent_slug.clone(),
-        workspace: conv.workspace.clone(),
-        external_id: conv.external_id.clone(),
-        title: conv.title.clone(),
-        source_path: conv.source_path.clone(),
-        started_at: conv.started_at,
-        ended_at: conv.ended_at,
-        approx_tokens: conv.approx_tokens,
-        metadata_json: conv.metadata_json.clone(),
-        messages: Vec::new(),
-        source_id: conv.source_id.clone(),
-        origin_host: conv.origin_host.clone(),
-    }
-}
-
 /// Resolve rolling-window positions before the ordinary idx-based append path.
 /// Canonical message envelopes are the durable native-ID map; no second mapping
 /// table can drift from them. Read and append share the writer transaction,
@@ -9434,7 +9081,7 @@ fn franken_reconcile_native_message_indices<'a>(
         fparams![conv.source_id.as_str(), agent_id, external_id],
         |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
     ).optional()?;
-    let mut native_messages = HashMap::<Cow<'_, str>, _>::new();
+    let mut native_messages = HashMap::new();
     let mut max_idx = None::<i64>;
     if let Some((conversation_id, _)) = existing {
         for row in tx.query_params(
@@ -9443,38 +9090,35 @@ fn franken_reconcile_native_message_indices<'a>(
         )? {
             let idx = row.get_typed::<i64>(0)?;
             let extra = franken_read_message_extra_compat(&row, 5, 6);
-            // ubs:ignore[rust.perf.string-alloc-in-loop] -- The native-ID key must outlive this decoded row; incoming packet IDs below remain borrowed.
             let native_id = grok_bot_native_entry_id(&extra)?.to_owned();
             let identity = (
-                Cow::Owned(row.get_typed::<String>(1)?),
-                row.get_typed::<Option<String>>(2)?.map(Cow::Owned),
+                row.get_typed::<String>(1)?,
+                row.get_typed::<Option<String>>(2)?,
                 row.get_typed::<Option<i64>>(3)?,
-                Cow::Owned(row.get_typed::<String>(4)?),
-                Cow::Owned(extra),
+                row.get_typed::<String>(4)?,
+                extra,
             );
-            if native_messages
-                .insert(Cow::Owned(native_id), identity)
-                .is_some()
-            {
+            if native_messages.insert(native_id, identity).is_some() {
                 bail!("Grok Bot canonical transcript contains duplicate native entry IDs");
             }
             max_idx = Some(max_idx.map_or(idx, |previous| previous.max(idx)));
         }
     }
-    let mut reconciled = clone_conversation_header(conv);
+    let mut reconciled = conv.clone();
+    reconciled.messages.clear();
     if let Some((_, started_at)) = existing {
         reconciled.started_at = started_at;
     }
     for message in &conv.messages {
-        let native_id = grok_bot_native_entry_id(&message.extra_json)?;
+        let native_id = grok_bot_native_entry_id(&message.extra_json)?.to_owned();
         let identity = (
-            Cow::Borrowed(role_as_str(&message.role)),
-            message.author.as_deref().map(Cow::Borrowed),
+            role_str(&message.role),
+            message.author.clone(),
             message.created_at,
-            Cow::Borrowed(message.content.as_str()),
-            Cow::Borrowed(&message.extra_json),
+            message.content.clone(),
+            message.extra_json.clone(),
         );
-        if let Some(canonical) = native_messages.get(native_id) {
+        if let Some(canonical) = native_messages.get(&native_id) {
             if canonical != &identity {
                 // Do not log native IDs or chat content in the diagnostic.
                 bail!("Grok Bot native entry ID conflicts with its canonical message");
@@ -9488,8 +9132,7 @@ fn franken_reconcile_native_message_indices<'a>(
             None => 0,
         };
         max_idx = Some(idx);
-        native_messages.insert(Cow::Borrowed(native_id), identity);
-        // ubs:ignore[rust.collections.clone-in-loop] -- Only unseen native IDs enter the owned output; the input packet remains borrowed for identity checks.
+        native_messages.insert(native_id, identity);
         let mut message = message.clone();
         message.idx = idx;
         reconciled.messages.push(message);
@@ -9558,7 +9201,6 @@ fn franken_reconcile_codebuff_messages<'a>(
             fparams![conversation_id],
         )? {
             let extra_json = franken_read_message_extra_compat(&row, 6, 7);
-            // ubs:ignore[rust.perf.string-alloc-in-loop] -- The native-ID map key must remain owned when the decoded JSON moves into its stored Message.
             let id = codebuff_native_message_id(&extra_json)?.to_owned();
             let idx = row.get_typed::<i64>(1)?;
             let message = Message {
@@ -9572,7 +9214,8 @@ fn franken_reconcile_codebuff_messages<'a>(
             max_idx = Some(max_idx.map_or(idx, |old| old.max(idx)));
         }
     }
-    let mut reconciled = clone_conversation_header(conv);
+    let mut reconciled = conv.clone();
+    reconciled.messages.clear();
     if let Some((conversation_id, started_at)) = existing {
         reconciled.started_at = started_at;
         let (source_path, title, workspace): (String, Option<String>, Option<String>) = tx.query_row_map(
@@ -9606,7 +9249,6 @@ fn franken_reconcile_codebuff_messages<'a>(
             {
                 continue;
             }
-            // ubs:ignore[rust.collections.clone-in-loop] -- Changed payloads must outlive the borrowed packet in the pending projection-revision queue; unchanged IDs skip this copy.
             let mut revised = message.clone();
             revised.id = Some(message_id);
             revised.idx = old.idx;
@@ -9625,6 +9267,11 @@ fn franken_reconcile_codebuff_messages<'a>(
                 fparams![message_id],
             )?;
             franken_insert_snippets(tx, message_id, &revised.snippets)?;
+            record_semantic_conversation_changes(
+                tx,
+                &[existing.context("canonical message lacks conversation")?.0],
+                true,
+            )?;
             revisions.push(CodebuffRevision {
                 conversation_id: existing.context("canonical message lacks conversation")?.0,
                 started_at: reconciled.started_at,
@@ -9640,7 +9287,6 @@ fn franken_reconcile_codebuff_messages<'a>(
                     .context("Codebuff / Freebuff canonical message index exhausted")
             })?;
             max_idx = Some(idx);
-            // ubs:ignore[rust.collections.clone-in-loop] -- New native IDs need owned messages in the reconciled output; existing IDs do not enter this branch.
             let mut message = message.clone();
             message.id = None;
             message.idx = idx;
@@ -9965,17 +9611,17 @@ fn franken_replace_codebuff_rollup_contribution(
     let mut current = AnalyticsRollupAggregator::new();
     current.record(new);
     for (table, bucket_col, deltas) in [
-        ("usage_hourly", "hour_id", previous.hourly),
-        ("usage_daily", "day_id", previous.daily),
+        ("usage_hourly", "hour_id", &previous.hourly),
+        ("usage_daily", "day_id", &previous.daily),
     ] {
-        for (key, delta) in deltas {
-            let (bucket, agent, workspace, source) = &key;
+        for ((bucket, agent, workspace, source), delta) in deltas {
             let present = tx.query_row_map(
                 &format!("SELECT 1 FROM {table} WHERE {bucket_col} = ?1 AND agent_slug = ?2 AND workspace_id = ?3 AND source_id = ?4"),
                 fparams![*bucket, agent.as_str(), *workspace, source.as_str()],
                 |row| row.get_typed::<i64>(0),
             ).optional()?.is_some();
             if !present {
+                let key = (*bucket, agent.clone(), *workspace, source.clone());
                 if table == "usage_hourly" {
                     current.hourly.remove(&key);
                 } else {
@@ -9993,12 +9639,11 @@ fn franken_replace_codebuff_rollup_contribution(
                     ("source_id", ParamValue::from(source.as_str())),
                 ],
                 *workspace,
-                &delta,
+                delta,
             )?;
         }
     }
-    for (key, delta) in previous.models_daily {
-        let (day, agent, workspace, source, family, tier) = &key;
+    for ((day, agent, workspace, source, family, tier), delta) in &previous.models_daily {
         let present = tx
             .query_row_map(
                 "SELECT 1 FROM usage_models_daily WHERE day_id = ?1 AND agent_slug = ?2
@@ -10016,7 +9661,14 @@ fn franken_replace_codebuff_rollup_contribution(
             .optional()?
             .is_some();
         if !present {
-            current.models_daily.remove(&key);
+            current.models_daily.remove(&(
+                *day,
+                agent.clone(),
+                *workspace,
+                source.clone(),
+                family.clone(),
+                tier.clone(),
+            ));
             continue;
         }
         franken_relocate_rollup_subtract(
@@ -10031,7 +9683,7 @@ fn franken_replace_codebuff_rollup_contribution(
                 ("model_tier", ParamValue::from(tier.as_str())),
             ],
             *workspace,
-            &delta,
+            delta,
         )?;
     }
     franken_flush_analytics_rollups_in_tx(tx, &current)?;
@@ -10751,7 +10403,6 @@ impl FrankenStorage {
                 &[SqliteValue::from(conversation_id)],
             )? {
                 let extra = franken_read_message_extra_compat(&row, 5, 6);
-                // ubs:ignore[rust.perf.string-alloc-in-loop] -- The retained map key must outlive the borrowed native-ID view into the moved JSON row.
                 let native_id = codebuff_native_message_id(&extra)?.to_owned();
                 anyhow::ensure!(
                     native.insert(native_id, (row, extra)).is_none(),
@@ -10800,12 +10451,7 @@ impl FrankenStorage {
         workspace: Option<&Path>,
         metadata: &serde_json::Value,
     ) -> Result<bool> {
-        if !provider_workspace_attribution_is_authoritative(
-            agent_slug,
-            external_id,
-            workspace,
-            metadata,
-        ) {
+        if !provider_workspace_is_authoritative(agent_slug, workspace, metadata) {
             return Ok(false);
         }
         let Some(external_id) = external_id else {
@@ -11018,7 +10664,7 @@ impl FrankenStorage {
                         key.as_str(),
                         ts.to_string(),
                         contract_key.as_str(),
-                        contract.identity()
+                        contract
                     ],
                 )?;
             }
@@ -11048,7 +10694,7 @@ impl FrankenStorage {
             let key = Self::connector_scan_contract_meta_key(connector_name);
             self.conn.execute_compat(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
-                fparams![key.as_str(), contract.identity()],
+                fparams![key.as_str(), contract],
             )?;
         }
         Ok(())
@@ -11136,8 +10782,7 @@ impl FrankenStorage {
             } else if let Some(connector_name) = key.strip_prefix("scan_contract:connector:")
                 && let Some(state) =
                     states.get_mut(connector_name.trim().to_ascii_lowercase().as_str())
-                && connector_scan_contract(connector_name).map(|contract| contract.identity())
-                    == Some(value.as_str())
+                && connector_scan_contract(connector_name) == Some(value.as_str())
             {
                 state.scan_contract_pending = false;
             }
@@ -11332,16 +10977,16 @@ impl FrankenStorage {
                 )
             })?;
             let mut conflicting_rows = 0usize;
-            let mut seen_legacy_paths: HashSet<(&str, &str)> = HashSet::new();
-            let mut seen_legacy_external_ids: HashSet<(&str, &str)> = HashSet::new();
+            let mut seen_legacy_paths = HashSet::new();
+            let mut seen_legacy_external_ids = HashSet::new();
             for legacy in &legacy_conversations {
                 let path_is_new = seen_legacy_paths.insert((
-                    legacy.normalized_source_id.as_str(),
-                    legacy.source_path.as_str(),
+                    legacy.normalized_source_id.clone(),
+                    legacy.source_path.clone(),
                 ));
-                let external_id_is_new = legacy.external_id.as_deref().is_none_or(|external_id| {
+                let external_id_is_new = legacy.external_id.as_ref().is_none_or(|external_id| {
                     seen_legacy_external_ids
-                        .insert((legacy.normalized_source_id.as_str(), external_id))
+                        .insert((legacy.normalized_source_id.clone(), external_id.clone()))
                 });
                 let current_sources = self.conn.query_map_collect(
                     "SELECT source_id, origin_host
@@ -11379,11 +11024,7 @@ impl FrankenStorage {
                 ));
             }
 
-            // Keep references into `legacy_conversations`; they remain live
-            // through source-table aggregation below, so staging metadata
-            // updates does not need to duplicate both normalized identity strings.
-            let mut metadata_updates: Vec<(i64, &str, Option<&str>, String)> =
-                Vec::with_capacity(legacy_count);
+            let mut metadata_updates = Vec::with_capacity(legacy_count);
             for legacy in &legacy_conversations {
                 let (metadata_json, metadata_bin): (Option<String>, Option<Vec<u8>>) =
                     self.conn.query_row_map(
@@ -11439,8 +11080,8 @@ impl FrankenStorage {
                 }
                 metadata_updates.push((
                     legacy.id,
-                    legacy.normalized_source_id.as_str(),
-                    legacy.normalized_origin_host.as_deref(),
+                    legacy.normalized_source_id.clone(),
+                    legacy.normalized_origin_host.clone(),
                     serde_json::to_string(&metadata)?,
                 ));
             }
@@ -11472,7 +11113,7 @@ impl FrankenStorage {
                     fparams![semantic_tier.meta_key(), pending_state.as_str()],
                 )?;
             }
-            tx.execute("DELETE FROM meta WHERE key = 'last_embedded_message_id'")?;
+            tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
             let now_ms = Self::now_millis();
             let mut normalized_sources = HashMap::new();
             for legacy in &legacy_conversations {
@@ -11496,18 +11137,19 @@ impl FrankenStorage {
                      WHERE id = ?5 AND agent_id = ?6",
                     fparams![
                         omp_agent_id,
-                        source_id,
-                        origin_host,
+                        source_id.as_str(),
+                        origin_host.as_deref(),
                         metadata_json,
                         conversation_id,
                         legacy_agent_id
                     ],
                 )?;
+                record_semantic_conversation_changes(&tx, &[conversation_id], true)?;
                 tx.execute_compat(
                     "UPDATE token_usage
                      SET agent_id = ?1, source_id = ?2
                      WHERE conversation_id = ?3",
-                    fparams![omp_agent_id, source_id, conversation_id],
+                    fparams![omp_agent_id, source_id.as_str(), conversation_id],
                 )?;
                 tx.execute_compat(
                     "DELETE FROM conversation_external_lookup WHERE conversation_id = ?1",
@@ -11582,7 +11224,8 @@ impl FrankenStorage {
                     fparams![semantic_tier.meta_key(), pending_state.as_str()],
                 )?;
             }
-            tx.execute("DELETE FROM meta WHERE key = 'last_embedded_message_id'")?;
+            tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
+            record_semantic_conversation_changes(&tx, &[0], true)?;
             tx.commit()?;
         }
 
@@ -11888,6 +11531,12 @@ impl FrankenStorage {
         )?;
 
         let mut tx = self.conn.transaction()?;
+        let deleted_conversation_ids: Vec<i64> = tx.query_map_collect(
+            "SELECT id FROM conversations WHERE agent_id = ?1",
+            fparams![agent_id],
+            |row| row.get_typed(0),
+        )?;
+        record_semantic_conversation_changes(&tx, &deleted_conversation_ids, true)?;
         tx.execute_compat(
             "DELETE FROM conversation_external_lookup
              WHERE conversation_id IN (
@@ -11923,21 +11572,6 @@ impl FrankenStorage {
         })
     }
 
-    /// `cass forget` (#292 ask #2): prune an already-indexed subset of
-    /// conversations whose `source_path` matches a glob pattern, from the
-    /// canonical DB. Child rows (messages, snippets, tags, etc.) cascade via
-    /// `ON DELETE CASCADE`; the two non-cascading external-lookup tables are
-    /// deleted explicitly, mirroring [`purge_agent_archive_data`].
-    ///
-    /// `dry_run=true` (the CLI default) inspects only — it returns the matched
-    /// conversation/message counts and a bounded sample of matched source paths
-    /// without mutating anything. `dry_run=false` performs the deletion in a
-    /// single transaction. The caller is responsible for rebuilding derived
-    /// assets (FTS/analytics) afterward, exactly as the agent-purge path does.
-    ///
-    /// Matching is done in Rust with the `glob` crate (not a SQL `GLOB`
-    /// operator) so the semantics are portable and deterministic across the
-    /// frankensqlite backend.
     /// Tombstones written by `cass forget --apply` (2l1b0.50), by source path.
     pub fn forgotten_source_stamps(&self) -> Result<HashMap<String, SourceFileStamp>> {
         let rows: Vec<(String, Option<i64>, Option<i64>)> = self.conn.query_map_collect(
@@ -11965,6 +11599,437 @@ impl FrankenStorage {
             .collect())
     }
 
+    /// Resolve only source paths in the current ingest batch. Ordinary-file
+    /// exclusions retain their nullable size/mtime and changed-file semantics;
+    /// the lookup does not enumerate unrelated forgotten transcripts.
+    pub fn forgotten_source_stamps_for(
+        &self,
+        paths: &[String],
+    ) -> Result<HashMap<String, SourceFileStamp>> {
+        if paths.is_empty() || !historical_table_exists(&self.conn, "forgotten_sources")? {
+            return Ok(HashMap::new());
+        }
+        // Most archives have never forgotten a source. Bound that common
+        // case to one row probe instead of a failed seek for every candidate.
+        if self
+            .conn
+            .query("SELECT 1 FROM forgotten_sources LIMIT 1")?
+            .is_empty()
+        {
+            return Ok(HashMap::new());
+        }
+        let statement = self.conn.prepare(
+            "SELECT size_bytes, mtime_ms FROM forgotten_sources
+             INDEXED BY sqlite_autoindex_forgotten_sources_1
+             WHERE source_path = ?1 LIMIT 1",
+        )?;
+        let mut matched = HashMap::new();
+        for path in paths {
+            if matched.contains_key(path) {
+                continue;
+            }
+            let rows = statement.query_with_params(&[SqliteValue::Text(path.clone().into())])?;
+            if let Some(row) = rows.first() {
+                matched.insert(
+                    path.clone(),
+                    SourceFileStamp {
+                        size_bytes: row.get_typed(0)?,
+                        mtime_ms: row.get_typed(1)?,
+                    },
+                );
+            }
+        }
+        Ok(matched)
+    }
+
+    /// Discover stored exclusions from one read snapshot. Old schemas lacking
+    /// either tombstone table are valid read-only inputs; listing never runs a
+    /// migration or consults provider transcripts for discarded metadata.
+    pub fn list_forget_exclusions(
+        &self,
+        selector: &ForgetExclusionSelector<'_>,
+    ) -> Result<ForgetExclusionList> {
+        let compiled = CompiledForgetExclusionSelector::new(selector, false)?;
+        let mut tx = self.conn.transaction()?;
+        let result = self.collect_forget_exclusions(&tx, &compiled)?;
+        tx.rollback()?;
+        Ok(result)
+    }
+
+    fn collect_forget_exclusions(
+        &self,
+        tx: &FrankenTransaction<'_>,
+        compiled: &CompiledForgetExclusionSelector<'_>,
+    ) -> Result<ForgetExclusionList> {
+        let mut exclusions = if historical_table_exists(&self.conn, "forgotten_conversations")? {
+            tx.query_map_collect(
+                "SELECT source_id, agent_slug, source_path, external_id, forgotten_at_ms
+                 FROM forgotten_conversations
+                 ORDER BY source_id, agent_slug, source_path, external_id",
+                fparams![],
+                |row| {
+                    Ok(ForgottenConversationExclusion {
+                        key: ForgottenConversationKey {
+                            source_id: row.get_typed(0)?,
+                            agent_slug: row.get_typed(1)?,
+                            source_path: row.get_typed(2)?,
+                            external_id: row.get_typed(3)?,
+                        },
+                        forgotten_at_ms: row.get_typed(4)?,
+                        blocked_by_source_stamp: false,
+                    })
+                },
+            )?
+        } else {
+            Vec::new()
+        };
+        exclusions.retain(|record| compiled.matches_session(&record.key));
+
+        let mut legacy_sources: Vec<ForgottenSourceExclusion> = if compiled.source_only()
+            && historical_table_exists(&self.conn, "forgotten_sources")?
+        {
+            tx.query_map_collect(
+                "SELECT source_path, size_bytes, mtime_ms, forgotten_at_ms
+                 FROM forgotten_sources ORDER BY source_path",
+                fparams![],
+                |row| {
+                    Ok(ForgottenSourceExclusion {
+                        source_path: row.get_typed(0)?,
+                        size_bytes: row.get_typed(1)?,
+                        mtime_ms: row.get_typed(2)?,
+                        forgotten_at_ms: row.get_typed(3)?,
+                    })
+                },
+            )?
+        } else {
+            Vec::new()
+        };
+        legacy_sources.retain(|record| compiled.matches_path(&record.source_path));
+        let legacy_paths: HashSet<String> = if compiled.source_only() {
+            legacy_sources
+                .iter()
+                .map(|record| record.source_path.clone())
+                .collect()
+        } else {
+            let paths: Vec<_> = exclusions
+                .iter()
+                .map(|record| record.key.source_path.clone())
+                .collect();
+            self.forgotten_source_stamps_for(&paths)?
+                .into_keys()
+                .collect()
+        };
+        for record in &mut exclusions {
+            record.blocked_by_source_stamp = legacy_paths.contains(&record.key.source_path);
+        }
+        Ok(ForgetExclusionList {
+            exclusions,
+            legacy_sources,
+        })
+    }
+
+    /// Explicitly release selected exclusions, leaving canonical rows and raw
+    /// evidence untouched. The caller holds the maintenance lease for apply.
+    /// A subsequent ordinary `index` revisits preserved historical sources;
+    /// current path/workspace exclusions continue to apply independently.
+    pub fn reinclude_forget_exclusions(
+        &self,
+        selector: &ForgetExclusionSelector<'_>,
+        dry_run: bool,
+    ) -> Result<ReincludeForgetExclusionsResult> {
+        let compiled = CompiledForgetExclusionSelector::new(selector, true)?;
+        let mut tx = self.conn.transaction()?;
+        let listed = self.collect_forget_exclusions(&tx, &compiled)?;
+        let blocked_by_source_stamps = if compiled.source_only() {
+            Vec::new()
+        } else {
+            listed
+                .exclusions
+                .iter()
+                .filter(|record| record.blocked_by_source_stamp)
+                .map(|record| record.key.source_path.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        let mut result = ReincludeForgetExclusionsResult {
+            dry_run,
+            exclusions_matched: listed.exclusions.len(),
+            legacy_sources_matched: listed.legacy_sources.len(),
+            blocked_by_source_stamps,
+            sample_sessions: listed.exclusions.iter().take(20).cloned().collect(),
+            sample_source_paths: listed
+                .legacy_sources
+                .iter()
+                .take(20)
+                .map(|record| record.source_path.clone())
+                .collect(),
+            ..Default::default()
+        };
+        let has_matches = !listed.exclusions.is_empty() || !listed.legacy_sources.is_empty();
+        if !has_matches {
+            tx.rollback()?;
+            return Ok(result);
+        }
+        // Completion keys also include scan-root/provenance information. Match
+        // the saved observations, retaining unrelated sources' reuse evidence.
+        // Shared stores expose logical database/session handles; the ledger
+        // instead observes the physical database, possibly through an alias.
+        let affected_paths: BTreeSet<_> = listed
+            .exclusions
+            .iter()
+            .map(|record| record.key.source_path.clone())
+            .chain(
+                listed
+                    .legacy_sources
+                    .iter()
+                    .map(|record| record.source_path.clone()),
+            )
+            .collect();
+        let mut replay_paths: HashSet<PathBuf> = affected_paths.iter().map(PathBuf::from).collect();
+        for path in &affected_paths {
+            if let Some(source) = Path::new(path).ancestors().find(|path| path.is_file()) {
+                replay_paths.insert(source.to_path_buf());
+            }
+        }
+        let canonical_paths: HashSet<_> = replay_paths
+            .iter()
+            .filter_map(|path| dunce::canonicalize(path).ok())
+            .collect();
+        let affected = |path: &str| {
+            replay_paths.contains(Path::new(path))
+                || dunce::canonicalize(path)
+                    .ok()
+                    .is_some_and(|path| canonical_paths.contains(&path))
+        };
+        // A missing store can still be identified by its recorded primary.
+        // Never apply ancestor matching to dependencies: directory observations
+        // are shared with unrelated siblings and are not physical sources.
+        let primary_ancestors: HashSet<_> = affected_paths
+            .iter()
+            .flat_map(|path| Path::new(path).ancestors().skip(1))
+            .filter(|path| !path.is_dir())
+            .collect();
+        let mut completion_keys = Vec::new();
+        let mut cursor = "source_ingest_v1:".to_owned();
+        loop {
+            let page: Vec<(String, String)> = tx.query_map_collect(
+                "SELECT key, value FROM meta WHERE key > ?1 AND key < 'source_ingest_v1;'
+                 ORDER BY key LIMIT 256",
+                fparams![cursor.as_str()],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )?;
+            let Some(last) = page.last() else { break };
+            cursor = last.0.clone();
+            for (key, observation) in page {
+                let Ok(observation) = serde_json::from_str::<serde_json::Value>(&observation)
+                else {
+                    // Malformed evidence cannot suppress a source scan.
+                    continue;
+                };
+                if observation["primary"]["path"].as_str().is_some_and(|path| {
+                    affected(path) || primary_ancestors.contains(Path::new(path))
+                }) || observation["dependencies"]
+                    .as_array()
+                    .is_some_and(|dependencies| {
+                        dependencies
+                            .iter()
+                            .any(|dependency| dependency["path"].as_str().is_some_and(affected))
+                    })
+                {
+                    completion_keys.push(key);
+                }
+            }
+        }
+        result.source_observations_matched = completion_keys.len();
+        if dry_run {
+            tx.rollback()?;
+            return Ok(result);
+        }
+        if !result.blocked_by_source_stamps.is_empty() {
+            bail!(
+                "cannot reinclude selected sessions while a source-wide exclusion also covers {}; preview a source-only --source-path or --source-glob release before applying it",
+                result.blocked_by_source_stamps.join(", ")
+            );
+        }
+        for record in &listed.exclusions {
+            tx.execute_compat(
+                "DELETE FROM forgotten_conversations
+                 WHERE source_id = ?1 AND agent_slug = ?2
+                   AND source_path = ?3 AND external_id = ?4",
+                fparams![
+                    record.key.source_id.as_str(),
+                    record.key.agent_slug.as_str(),
+                    record.key.source_path.as_str(),
+                    record.key.external_id.as_str()
+                ],
+            )?;
+        }
+        for record in &listed.legacy_sources {
+            tx.execute_compat(
+                "DELETE FROM forgotten_sources WHERE source_path = ?1",
+                fparams![record.source_path.as_str()],
+            )?;
+        }
+        for key in &completion_keys {
+            result.source_observations_removed +=
+                tx.execute_compat("DELETE FROM meta WHERE key = ?1", fparams![key.as_str()])?;
+        }
+        // Lifting a tombstone alone does not revisit old sessions: connector
+        // cutoffs and remote mirror fingerprints can still skip their store.
+        // Reset affected connectors atomically with the release. Source stamps
+        // predate provider metadata, so those require one full rediscovery.
+        let all_connectors = !listed.legacy_sources.is_empty();
+        let session_agents: HashSet<_> = listed
+            .exclusions
+            .iter()
+            .map(|record| record.key.agent_slug.trim().to_ascii_lowercase())
+            .collect();
+        let source_ids: HashSet<_> = listed
+            .exclusions
+            .iter()
+            .map(|record| record.key.source_id.as_str())
+            .collect();
+        let metadata_keys: Vec<String> = tx.query_map_collect(
+            "SELECT key FROM meta WHERE
+                (key >= 'last_scan_ts:connector:' AND key < 'last_scan_ts:connector;')
+                OR (key >= 'mirror_scan_fp:' AND key < 'mirror_scan_fp;')",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        let mut connector_keys = BTreeSet::new();
+        let mut mirror_keys = Vec::new();
+        for key in metadata_keys {
+            if let Some(connector) = key.strip_prefix("last_scan_ts:connector:") {
+                if all_connectors
+                    || Self::connector_agent_slug_candidates(connector)
+                        .iter()
+                        .any(|agent| session_agents.contains(agent))
+                {
+                    connector_keys.insert(key);
+                }
+            } else if let Some(source_id) = key.strip_prefix("mirror_scan_fp:")
+                && (all_connectors || source_ids.contains(source_id))
+            {
+                mirror_keys.push(key);
+            }
+        }
+        for agent in &session_agents {
+            // Absence falls back to the global scan watermark. A present zero
+            // also covers a connector with no previous dedicated watermark.
+            connector_keys.insert(Self::connector_last_scan_ts_meta_key(agent));
+            if matches!(agent.as_str(), "claude" | "claude-code" | "claude_code") {
+                for alias in ["claude", "claude-code", "claude_code"] {
+                    connector_keys.insert(Self::connector_last_scan_ts_meta_key(alias));
+                }
+            }
+        }
+        for key in connector_keys {
+            tx.execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, '0')",
+                fparams![key.as_str()],
+            )?;
+        }
+        if all_connectors {
+            tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('last_scan_ts', '0')")?;
+        }
+        for key in mirror_keys {
+            tx.execute_compat("DELETE FROM meta WHERE key = ?1", fparams![key.as_str()])?;
+        }
+        tx.commit()?;
+        result.exclusions_removed = listed.exclusions.len();
+        result.legacy_sources_removed = listed.legacy_sources.len();
+        Ok(result)
+    }
+
+    /// Session tombstones survive changes to unrelated sessions in the same
+    /// source store. They are independent of both canonical row IDs and file
+    /// size/mtime, so neither a rescan nor a full index revives them.
+    pub fn forgotten_conversation_keys(&self) -> Result<HashSet<ForgottenConversationKey>> {
+        Ok(self
+            .conn
+            .query_map_collect(
+                "SELECT source_id, agent_slug, source_path, external_id FROM forgotten_conversations",
+                fparams![],
+                |row| {
+                    Ok(ForgottenConversationKey {
+                        source_id: row.get_typed(0)?,
+                        agent_slug: row.get_typed(1)?,
+                        source_path: row.get_typed(2)?,
+                        external_id: row.get_typed(3)?,
+                    })
+                },
+            )?
+            .into_iter()
+            .collect())
+    }
+
+    /// Resolve only the current ingest batch against the durable composite
+    /// identity index. Preparing one exact seek avoids loading every archived
+    /// exclusion for each batch, and keeps SQL/parameter/result sizes bounded
+    /// independently of the size of the exclusion archive.
+    pub fn forgotten_conversation_keys_for(
+        &self,
+        keys: &[ForgottenConversationKey],
+    ) -> Result<HashSet<ForgottenConversationKey>> {
+        if keys.is_empty() || !historical_table_exists(&self.conn, "forgotten_conversations")? {
+            return Ok(HashSet::new());
+        }
+        if self
+            .conn
+            .query("SELECT 1 FROM forgotten_conversations LIMIT 1")?
+            .is_empty()
+        {
+            return Ok(HashSet::new());
+        }
+        let statement = self.conn.prepare(
+            "SELECT 1 FROM forgotten_conversations
+             INDEXED BY sqlite_autoindex_forgotten_conversations_1
+             WHERE source_id = ?1 AND agent_slug = ?2
+               AND source_path = ?3 AND external_id = ?4
+             LIMIT 1",
+        )?;
+        let mut matched = HashSet::new();
+        for key in keys {
+            if matched.contains(key) {
+                continue;
+            }
+            let rows = statement.query_with_params(&[
+                SqliteValue::Text(key.source_id.clone().into()),
+                SqliteValue::Text(key.agent_slug.clone().into()),
+                SqliteValue::Text(key.source_path.clone().into()),
+                SqliteValue::Text(key.external_id.clone().into()),
+            ])?;
+            if !rows.is_empty() {
+                matched.insert(key.clone());
+            }
+        }
+        Ok(matched)
+    }
+
+    /// Canonical deletion commits before derived assets can be rebuilt. Keep
+    /// this marker until those assets have been published successfully, so an
+    /// identical retry repairs them even when no canonical rows still match.
+    pub fn forget_derived_rebuild_pending(&self) -> Result<bool> {
+        let pending: Option<String> = self
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = 'forget_derived_rebuild_pending'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .optional()?;
+        Ok(pending.is_some())
+    }
+
+    /// The caller must hold the maintenance lease and clear this only after
+    /// canonical-derived and lexical rebuilding have both succeeded.
+    pub fn clear_forget_derived_rebuild_pending(&self) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM meta WHERE key = 'forget_derived_rebuild_pending'")?;
+        Ok(())
+    }
+
     /// Drops the tombstones of forgotten sources that changed since the
     /// forget, so their next ingest is permanent.
     pub fn clear_forgotten_sources(&self, paths: &[String]) -> Result<()> {
@@ -11984,113 +12049,280 @@ impl FrankenStorage {
         pattern: &str,
         dry_run: bool,
     ) -> Result<ForgetConversationsResult> {
-        let trimmed = pattern.trim();
-        if trimmed.is_empty() {
-            return Err(anyhow!("forget source-glob pattern cannot be empty"));
-        }
-        let glob = glob::Pattern::new(trimmed)
-            .with_context(|| format!("invalid forget source-glob pattern: {trimmed}"))?;
-
-        // Pull (id, source_path) for every conversation and match the glob in
-        // Rust. source_path may be NULL on legacy rows; those never match a
-        // path glob.
-        let rows: Vec<(i64, Option<String>)> = self.conn.query_map_collect(
-            "SELECT id, source_path FROM conversations ORDER BY id",
-            fparams![],
-            |row| {
-                Ok((
-                    row.get_typed::<i64>(0)?,
-                    row.get_typed::<Option<String>>(1)?,
-                ))
+        self.forget_conversations(
+            &ForgetConversationsFilter {
+                source_glob: Some(pattern),
+                ..Default::default()
             },
-        )?;
+            dry_run,
+        )
+    }
 
-        let matched: Vec<(i64, String)> = rows
-            .into_iter()
-            .filter_map(|(id, source_path)| {
-                let path = source_path?;
-                glob.matches(&path).then_some((id, path))
-            })
-            .collect();
-        let matched_ids: Vec<i64> = matched.iter().map(|(id, _)| *id).collect();
-
-        if matched_ids.is_empty() {
-            return Ok(ForgetConversationsResult {
-                pattern: trimmed.to_string(),
-                dry_run,
-                conversations_matched: 0,
-                messages_matched: 0,
-                conversations_deleted: 0,
-                sample_source_paths: Vec::new(),
-            });
+    /// Select canonical conversations by intersecting source, workspace and
+    /// age predicates. One snapshot covers selection, tombstones and deletion;
+    /// a dry run uses only reads and explicitly releases its snapshot. The
+    /// caller rebuilds derived search/analytics assets after an applied change.
+    ///
+    /// Candidate envelopes and message aggregates are read in bounded pages.
+    /// No message body or metadata payload is hydrated for a preview, and no
+    /// SQL statement grows with the total number of selected conversations.
+    pub fn forget_conversations(
+        &self,
+        filter: &ForgetConversationsFilter<'_>,
+        dry_run: bool,
+    ) -> Result<ForgetConversationsResult> {
+        const PAGE_SIZE: usize = 256;
+        let parse_glob = |value: Option<&str>, label: &str| -> Result<Option<glob::Pattern>> {
+            value
+                .map(|pattern| {
+                    let trimmed = pattern.trim();
+                    if trimmed.is_empty() {
+                        bail!("forget {label} pattern cannot be empty");
+                    }
+                    glob::Pattern::new(trimmed)
+                        .with_context(|| format!("invalid forget {label} pattern: {trimmed}"))
+                })
+                .transpose()
+        };
+        let source_glob = parse_glob(filter.source_glob, "source-glob")?;
+        let workspace_glob = parse_glob(filter.workspace_glob, "workspace-glob")?;
+        if source_glob.is_none() && workspace_glob.is_none() && filter.before_ms.is_none() {
+            bail!("forget requires a source-glob, workspace-glob or age cutoff");
         }
 
-        let id_list = matched_ids
-            .iter()
-            .map(i64::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let messages_matched: i64 = self.conn.query_row_map(
-            &format!("SELECT COUNT(*) FROM messages WHERE conversation_id IN ({id_list})"),
-            fparams![],
-            |row| row.get_typed(0),
-        )?;
-
-        if dry_run {
-            return Ok(ForgetConversationsResult {
-                pattern: trimmed.to_string(),
-                dry_run,
-                conversations_matched: matched_ids.len(),
-                messages_matched: messages_matched.max(0) as usize,
-                conversations_deleted: 0,
-                sample_source_paths: matched.into_iter().map(|(_, path)| path).take(20).collect(),
-            });
-        }
-
+        let mut report = ForgetConversationsResult {
+            pattern: filter.source_glob.unwrap_or_default().trim().to_owned(),
+            source_glob: filter.source_glob.map(|value| value.trim().to_owned()),
+            workspace_glob: filter.workspace_glob.map(|value| value.trim().to_owned()),
+            before_ms: filter.before_ms,
+            dry_run,
+            ..Default::default()
+        };
         let mut tx = self.conn.transaction()?;
-        // Non-cascading external-lookup tables first (mirrors agent purge).
-        tx.execute_compat(
-            &format!(
-                "DELETE FROM conversation_external_lookup WHERE conversation_id IN ({id_list})"
-            ),
-            fparams![],
+        let mut next_id = i64::MIN;
+        let mut matched = Vec::new();
+        let mut selected_by_path: HashMap<String, usize> = HashMap::new();
+        loop {
+            let page: Vec<ForgetCandidate> = tx.query_map_collect(
+                "SELECT c.id, c.source_id, a.slug, c.source_path, c.external_id, w.path
+                 FROM conversations c
+                 JOIN agents a ON a.id = c.agent_id
+                 LEFT JOIN workspaces w ON w.id = c.workspace_id
+                 WHERE c.id >= ?1 ORDER BY c.id LIMIT 256",
+                fparams![next_id],
+                |row| {
+                    Ok(ForgetCandidate {
+                        id: row.get_typed(0)?,
+                        source_id: row.get_typed(1)?,
+                        agent_slug: row.get_typed(2)?,
+                        source_path: row.get_typed(3)?,
+                        external_id: row.get_typed(4)?,
+                        workspace: row.get_typed(5)?,
+                    })
+                },
+            )?;
+            let Some(last) = page.last() else { break };
+            let following_id = last.id.checked_add(1);
+            let candidates: Vec<_> = page
+                .into_iter()
+                .filter(|candidate| {
+                    source_glob.as_ref().is_none_or(|pattern| {
+                        candidate
+                            .source_path
+                            .as_deref()
+                            .is_some_and(|path| pattern.matches(path))
+                    }) && workspace_glob.as_ref().is_none_or(|pattern| {
+                        candidate
+                            .workspace
+                            .as_deref()
+                            .is_some_and(|path| pattern.matches(path))
+                    })
+                })
+                .collect();
+            if !candidates.is_empty() {
+                let placeholders = vec!["?"; candidates.len()].join(",");
+                let parameters: Vec<_> = candidates
+                    .iter()
+                    .map(|candidate| ParamValue::from(candidate.id))
+                    .collect();
+                let statistics: HashMap<i64, (i64, i64, Option<i64>)> = tx
+                    .query_map_collect(
+                        &format!(
+                            "SELECT conversation_id, COUNT(*), COUNT(created_at), MAX(created_at)
+                             FROM messages WHERE conversation_id IN ({placeholders})
+                             GROUP BY conversation_id"
+                        ),
+                        &parameters,
+                        |row| {
+                            Ok((
+                                row.get_typed(0)?,
+                                (row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?),
+                            ))
+                        },
+                    )?
+                    .into_iter()
+                    .collect();
+                for candidate in candidates {
+                    let (message_count, dated_count, latest) =
+                        statistics.get(&candidate.id).copied().unwrap_or_default();
+                    if filter.before_ms.is_some_and(|cutoff| {
+                        message_count == 0
+                            || dated_count != message_count
+                            || latest.is_none_or(|timestamp| timestamp >= cutoff)
+                    }) {
+                        continue;
+                    }
+                    report.messages_matched = report
+                        .messages_matched
+                        .checked_add(
+                            usize::try_from(message_count)
+                                .context("invalid matched message count")?,
+                        )
+                        .context("matched message count overflow")?;
+                    if let Some(path) = &candidate.source_path {
+                        *selected_by_path.entry(path.clone()).or_default() += 1;
+                        if report.sample_source_paths.len() < 20 {
+                            report.sample_source_paths.push(path.clone());
+                        }
+                    }
+                    if report.sample_sessions.len() < 20 {
+                        report.sample_sessions.push(ForgetSessionSample {
+                            source_path: candidate.source_path.clone(),
+                            external_id: candidate.external_id.clone(),
+                            workspace: candidate.workspace.clone(),
+                            last_message_at: latest,
+                        });
+                    }
+                    matched.push(candidate);
+                }
+            }
+            let Some(following_id) = following_id else {
+                break;
+            };
+            next_id = following_id;
+        }
+        report.conversations_matched = matched.len();
+        if matched.is_empty() {
+            tx.rollback()?;
+            return Ok(report);
+        }
+
+        // Source-wide stamps must never suppress unselected siblings. Count
+        // all rows for only the matched paths, using bounded parameter lists.
+        let paths: Vec<_> = selected_by_path.keys().map(String::as_str).collect();
+        let mut total_by_path: HashMap<String, usize> = HashMap::new();
+        for page in paths.chunks(PAGE_SIZE) {
+            let placeholders = vec!["?"; page.len()].join(",");
+            let parameters: Vec<_> = page.iter().map(|path| ParamValue::from(*path)).collect();
+            let counts: Vec<(String, i64)> = tx.query_map_collect(
+                &format!("SELECT source_path, COUNT(*) FROM conversations WHERE source_path IN ({placeholders}) GROUP BY source_path"),
+                &parameters,
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )?;
+            for (path, count) in counts {
+                total_by_path.insert(
+                    path,
+                    usize::try_from(count).context("invalid source conversation count")?,
+                );
+            }
+        }
+        // A source remains shared even after earlier forgets removed all but
+        // one of its sessions. A read-only v22 preview has no session table yet.
+        let previously_shared: HashSet<String> = if self.schema_version()? >= 23 {
+            tx.query_map_collect(
+                "SELECT source_path FROM forgotten_conversations",
+                fparams![],
+                |row| row.get_typed(0),
+            )?
+            .into_iter()
+            .collect()
+        } else {
+            HashSet::new()
+        };
+        let mut session_tombstones = Vec::new();
+        let mut file_tombstones = BTreeSet::new();
+        let mut session_only_paths = BTreeSet::new();
+        for candidate in &matched {
+            let Some(path) = &candidate.source_path else {
+                continue;
+            };
+            let total = *total_by_path
+                .get(path)
+                .context("matched source lost its conversation count")?;
+            let shared =
+                total > 1 || source_path_is_shared_store(path) || previously_shared.contains(path);
+            let external_id = candidate
+                .external_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty());
+            if shared && let Some(external_id) = external_id {
+                session_tombstones.push(ForgottenConversationKey {
+                    source_id: candidate.source_id.clone(),
+                    agent_slug: candidate.agent_slug.clone(),
+                    source_path: path.clone(),
+                    external_id: external_id.to_owned(),
+                });
+                session_only_paths.insert(path.clone());
+            } else {
+                if selected_by_path.get(path).copied() != Some(total) {
+                    bail!(
+                        "cannot forget only part of shared source {path}: a selected conversation has no stable external ID; select the entire source with --source-glob"
+                    );
+                }
+                file_tombstones.insert(path.clone());
+            }
+        }
+        if dry_run {
+            tx.rollback()?;
+            return Ok(report);
+        }
+
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('forget_derived_rebuild_pending', '1')",
         )?;
-        tx.execute_compat(
-            &format!(
-                "DELETE FROM conversation_external_tail_lookup WHERE conversation_id IN ({id_list})"
-            ),
-            fparams![],
-        )?;
-        // The remaining child tables (messages, snippets, tags, ...) cascade.
-        tx.execute_compat(
-            &format!("DELETE FROM conversations WHERE id IN ({id_list})"),
-            fparams![],
-        )?;
-        clear_semantic_embed_watermark_after_deletion(&tx)?;
-        // Tombstone every forgotten source so a later scan (triggered by any
-        // sibling change) does not ingest it again while it is unchanged.
         let forgotten_at_ms = Self::now_millis();
-        let matched_paths: BTreeSet<&str> = matched.iter().map(|(_, path)| path.as_str()).collect();
-        for path in matched_paths {
+        for key in &session_tombstones {
+            tx.execute_compat(
+                "INSERT OR REPLACE INTO forgotten_conversations
+                     (source_id, agent_slug, source_path, external_id, forgotten_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                fparams![
+                    key.source_id.as_str(),
+                    key.agent_slug.as_str(),
+                    key.source_path.as_str(),
+                    key.external_id.as_str(),
+                    forgotten_at_ms
+                ],
+            )?;
+        }
+        for path in session_only_paths.difference(&file_tombstones) {
+            tx.execute_compat(
+                "DELETE FROM forgotten_sources WHERE source_path = ?1",
+                fparams![path.as_str()],
+            )?;
+        }
+        for path in &file_tombstones {
             let stamp = SourceFileStamp::of(Path::new(path));
             tx.execute_compat(
                 "INSERT OR REPLACE INTO forgotten_sources
                      (source_path, size_bytes, mtime_ms, forgotten_at_ms)
                  VALUES (?1, ?2, ?3, ?4)",
-                fparams![path, stamp.size_bytes, stamp.mtime_ms, forgotten_at_ms],
+                fparams![
+                    path.as_str(),
+                    stamp.size_bytes,
+                    stamp.mtime_ms,
+                    forgotten_at_ms
+                ],
             )?;
         }
+        for candidate in &matched {
+            delete_duplicate_conversation_rows(&tx, candidate.id)?;
+        }
+        clear_semantic_embed_watermark_after_deletion(&tx)?;
         tx.commit()?;
-
-        Ok(ForgetConversationsResult {
-            pattern: trimmed.to_string(),
-            dry_run,
-            conversations_matched: matched_ids.len(),
-            messages_matched: messages_matched.max(0) as usize,
-            conversations_deleted: matched_ids.len(),
-            sample_source_paths: matched.into_iter().map(|(_, path)| path).take(20).collect(),
-        })
+        self.invalidate_fts_messages_present_cache();
+        report.conversations_deleted = matched.len();
+        Ok(report)
     }
 
     /// `coding_agent_session_search-uhhxy` (gh #302 ask #2): collapse
@@ -12239,7 +12471,6 @@ impl FrankenStorage {
                         conversation_id: *conversation_id,
                         source_id: container.source_id.clone(),
                         source_path: source_path.to_string(),
-                        // ubs:ignore[rust.perf.string-alloc-in-loop] -- Returned cleanup evidence owns the agent name after the temporary query rows are dropped.
                         agent: (*agent).to_string(),
                         owner_agents: container.owner_agents.clone(),
                         owner_conversation_id,
@@ -12599,7 +12830,10 @@ impl FrankenStorage {
              ORDER BY conversation_id ASC",
         )
         .or_else(|err| {
-            if format!("{err:#}").contains("no such index: idx_messages_conv_idx") {
+            if err
+                .to_string()
+                .contains("no such index: idx_messages_conv_idx")
+            {
                 return self.raise_lexical_rebuild_footprints_from_grouped_max_idx(
                     footprints,
                     &positions_by_conversation,
@@ -12705,7 +12939,7 @@ impl FrankenStorage {
                        AND ts.last_message_idx IS NOT NULL
                  )"
             }
-            (false, false) => unreachable!("checked before covered_sql selection"), // ubs:ignore -- The identical all-false guard returns Ok(false) before this match.
+            (false, false) => unreachable!("checked before covered_sql selection"),
         };
         let covered_conversations: i64 = self
             .conn
@@ -12778,7 +13012,10 @@ impl FrankenStorage {
              ORDER BY conversation_id ASC",
         )
         .or_else(|err| {
-            if format!("{err:#}").contains("no such index: idx_messages_conv_idx") {
+            if err
+                .to_string()
+                .contains("no such index: idx_messages_conv_idx")
+            {
                 return self.fill_missing_lexical_rebuild_footprint_tails_from_grouped_messages(
                     footprints,
                     missing_tail_positions,
@@ -13042,97 +13279,6 @@ impl FrankenStorage {
             })
     }
 
-    /// A cheap admission hint for the bounded whole-conversation upgrade.
-    /// The transactional snapshot reconciler still verifies every old row.
-    pub(crate) fn has_legacy_codex_projection(
-        &self,
-        source_id: &str,
-        external_id: Option<&str>,
-    ) -> Result<bool> {
-        let Some(external_id) = external_id else {
-            return Ok(false);
-        };
-        // Resolve the identity before touching message bodies. A join rooted
-        // at messages can materialize an entire large archive even when this
-        // oversized incoming conversation has never been stored.
-        let agent_id: Option<i64> = self
-            .conn
-            .query_row_map(
-                "SELECT id FROM agents WHERE slug='codex'",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .optional()?;
-        let Some(agent_id) = agent_id else {
-            return Ok(false);
-        };
-        let conversation_id: Option<i64> = self
-            .conn
-            .query_row_map(
-                "SELECT id FROM conversations
-                 WHERE source_id=?1 AND agent_id=?2 AND external_id=?3",
-                fparams![source_id, agent_id, external_id],
-                |row| row.get_typed(0),
-            )
-            .optional()?;
-        let Some(conversation_id) = conversation_id else {
-            return Ok(false);
-        };
-        let exists: i64 = self.conn.query_row_map(
-            "SELECT EXISTS(SELECT 1 FROM messages
-             WHERE conversation_id=?1 AND role='tool'
-             AND content LIKE '[Tool output: %'
-             AND content LIKE '% additional chars from tool output]')",
-            fparams![conversation_id],
-            |row| row.get_typed(0),
-        )?;
-        Ok(exists != 0)
-    }
-
-    pub(crate) fn fetch_native_projection_lexical_snapshot(
-        &self,
-        conversation_id: i64,
-    ) -> Result<Conversation> {
-        let mut conversation = self.conn.query_row_map(
-            "SELECT c.id, (SELECT a.slug FROM agents a WHERE a.id=c.agent_id),
-                    (SELECT w.path FROM workspaces w WHERE w.id=c.workspace_id),
-                    c.external_id, c.title, c.source_path, c.started_at, c.ended_at,
-                    c.approx_tokens, c.metadata_json, c.metadata_bin, c.source_id, c.origin_host
-             FROM conversations c WHERE c.id=?1",
-            fparams![conversation_id],
-            |row| {
-                let workspace: Option<String> = row.get_typed(2)?;
-                let path: String = row.get_typed(5)?;
-                Ok(Conversation {
-                    id: Some(row.get_typed(0)?),
-                    agent_slug: row.get_typed(1)?,
-                    workspace: workspace.map(PathBuf::from),
-                    external_id: row.get_typed(3)?,
-                    title: row.get_typed(4)?,
-                    source_path: PathBuf::from(path),
-                    started_at: row.get_typed(6)?,
-                    ended_at: row.get_typed(7)?,
-                    approx_tokens: row.get_typed(8)?,
-                    metadata_json: franken_read_metadata_compat(row, 9, 10),
-                    source_id: row.get_typed(11)?,
-                    origin_host: row.get_typed(12)?,
-                    messages: Vec::new(),
-                })
-            },
-        )?;
-        anyhow::ensure!(
-            is_openwebui_saved_snapshot(&conversation)
-                || (conversation.agent_slug == "codex"
-                    && conversation
-                        .metadata_json
-                        .get("codex_projection_lexical_indices")
-                        .is_some()),
-            "not a native projection snapshot"
-        );
-        conversation.messages = self.fetch_messages_for_lexical_rebuild(conversation_id)?;
-        Ok(conversation)
-    }
-
     /// Fetch messages for a conversation.
     pub fn fetch_messages(&self, conversation_id: i64) -> Result<Vec<Message>> {
         let hinted_sql = "SELECT id, idx, role, author, created_at, content, extra_json, extra_bin \
@@ -13239,22 +13385,9 @@ impl FrankenStorage {
     /// [`Self::fetch_messages_for_lexical_rebuild_idx_range`]) or stops early
     /// ([`Self::fetch_messages_for_lexical_rebuild_within`]).
     pub fn fetch_messages_for_lexical_rebuild(&self, conversation_id: i64) -> Result<Vec<Message>> {
-        self.fetch_messages_for_lexical_rebuild_with_progress(conversation_id, None)
-    }
-
-    /// The callback runs only after a canonical message row has been decoded
-    /// and retained. It also covers rows whose bounded lexical body is empty.
-    pub(crate) fn fetch_messages_for_lexical_rebuild_with_progress(
-        &self,
-        conversation_id: i64,
-        on_row: Option<&dyn Fn()>,
-    ) -> Result<Vec<Message>> {
         let mut messages = Vec::new();
         self.for_each_lexical_rebuild_message(conversation_id, None, |message| {
             messages.push(message);
-            if let Some(on_row) = on_row {
-                on_row();
-            }
             Ok(true)
         })?;
         Ok(messages)
@@ -13349,53 +13482,36 @@ impl FrankenStorage {
         conversation_id: i64,
     ) -> Result<Vec<(i64, usize)>> {
         let cap = lexical_max_message_content_bytes().min(i32::MAX as usize);
-        let sql = |hinted: bool, after: Option<i64>| {
+        let sql = |hinted: bool| {
             format!(
                 "SELECT idx, COALESCE(octet_length(content), 0) FROM messages{} \
-                 WHERE conversation_id = ?1{} ORDER BY idx \
-                 LIMIT {LEXICAL_REBUILD_FOOTPRINT_PAGE_ROWS}",
+                 WHERE conversation_id = ?1 ORDER BY idx",
                 if hinted {
                     " INDEXED BY sqlite_autoindex_messages_1"
                 } else {
                     ""
-                },
-                if after.is_some() { " AND idx > ?2" } else { "" }
+                }
             )
         };
-        let read = |hinted: bool| -> Result<Vec<(i64, usize)>> {
+        let params = [SqliteValue::from(conversation_id)];
+        let read = |sql: &str| -> Result<Vec<(i64, usize)>> {
             let mut footprints = Vec::new();
-            let mut after = None;
-            loop {
-                let mut params = vec![SqliteValue::from(conversation_id)];
-                if let Some(last_idx) = after {
-                    params.push(SqliteValue::from(last_idx));
-                }
-                let before = footprints.len();
-                // Even a numeric row callback can retain a giant scan's
-                // engine working set. Finish bounded statements between
-                // pages; keep only the small footprint pairs across them.
-                self.conn
-                    .query_with_params_for_each(&sql(hinted, after), &params, |row| {
-                        let idx = row.get_typed::<i64>(0)?;
-                        let bytes = usize::try_from(row.get_typed::<i64>(1)?.max(0))
-                            .unwrap_or(usize::MAX)
-                            .min(cap);
-                        footprints.push((idx, bytes));
-                        after = Some(idx);
-                        Ok(())
-                    })
-                    .with_context(|| {
-                        format!("reading lexical footprints for conversation {conversation_id}")
-                    })?;
-                if footprints.len() - before < LEXICAL_REBUILD_FOOTPRINT_PAGE_ROWS {
-                    break;
-                }
-            }
+            self.conn
+                .query_with_params_for_each(sql, &params, |row| {
+                    let bytes = usize::try_from(row.get_typed::<i64>(1)?.max(0))
+                        .unwrap_or(usize::MAX)
+                        .min(cap);
+                    footprints.push((row.get_typed::<i64>(0)?, bytes));
+                    Ok(())
+                })
+                .with_context(|| {
+                    format!("reading lexical footprints for conversation {conversation_id}")
+                })?;
             Ok(footprints)
         };
-        read(true).or_else(|err| {
+        read(&sql(true)).or_else(|err| {
             if format!("{err:#}").contains("no such index: sqlite_autoindex_messages_1") {
-                return read(false);
+                return read(&sql(false));
             }
             Err(err)
         })
@@ -13806,7 +13922,8 @@ impl FrankenStorage {
         // Re-indexing commonly reuses the same normalized source metadata
         // across many conversations. Skip the write entirely when the row is
         // already identical so we avoid needless WAL churn and timestamp bumps.
-        self.conn.execute_compat(
+        let mut tx = self.conn.transaction()?;
+        let changed = tx.execute_compat(
             "INSERT INTO sources(id, kind, host_label, machine_id, platform, config_json, created_at, updated_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(id) DO UPDATE SET
@@ -13834,6 +13951,20 @@ impl FrankenStorage {
                 now
             ],
         )?;
+        if changed == 0 {
+            tx.rollback()?;
+            return Ok(());
+        }
+        let affected: Vec<i64> = tx.query_map_collect(
+            "SELECT id FROM conversations WHERE source_id = ?1",
+            fparams![source.id.as_str()],
+            |row| row.get_typed(0),
+        )?;
+        record_semantic_conversation_changes(&tx, &affected, true)?;
+        if !affected.is_empty() {
+            tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -14694,11 +14825,22 @@ impl FrankenStorage {
         if id == LOCAL_SOURCE_ID {
             anyhow::bail!("cannot delete the local source");
         }
-        let count = self
-            .conn
-            .execute_compat("DELETE FROM sources WHERE id = ?1", fparams![id])?;
+        let mut tx = self.conn.transaction()?;
+        let affected: Vec<i64> = tx.query_map_collect(
+            "SELECT id FROM conversations WHERE source_id = ?1",
+            fparams![id],
+            |row| row.get_typed(0),
+        )?;
+        let count = tx.execute_compat("DELETE FROM sources WHERE id = ?1", fparams![id])?;
         if count > 0 {
+            record_semantic_conversation_changes(&tx, &affected, true)?;
+            if !affected.is_empty() {
+                tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
+            }
+            tx.commit()?;
             self.invalidate_conversation_source_cache(id);
+        } else {
+            tx.rollback()?;
         }
         Ok(count > 0)
     }
@@ -14731,16 +14873,14 @@ impl FrankenStorage {
         conv: &Conversation,
         defer_analytics_updates: bool,
     ) -> Result<InsertOutcome> {
-        if is_openwebui_saved_snapshot(conv)
-            || matches!(conv.agent_slug.as_str(), "codebuff" | "codex")
-        {
+        if conv.agent_slug == "codebuff" {
             return self
                 .insert_conversations_batched_with_analytics(
                     &[(agent_id, workspace_id, conv)],
                     defer_analytics_updates,
                 )?
                 .pop()
-                .context("native snapshot insert returned no outcome");
+                .context("Codebuff / Freebuff insert returned no outcome");
         }
         let normalized_conv = normalized_conversation_for_storage(conv);
         let conv = normalized_conv.as_ref();
@@ -14772,7 +14912,6 @@ impl FrankenStorage {
                 workspace_id,
                 conv,
             )?;
-            franken_reconcile_native_snapshot_provenance(&tx, existing.id, conv)?;
             franken_reassociate_provider_analytics_workspace(&tx, existing.id, conv)?;
             tx.commit()?;
             return Ok(outcome);
@@ -14896,7 +15035,6 @@ impl FrankenStorage {
                     workspace_id,
                     conv,
                 )?;
-                franken_reconcile_native_snapshot_provenance(&tx, existing_id, conv)?;
                 franken_reassociate_provider_analytics_workspace(&tx, existing_id, conv)?;
                 tx.commit()?;
                 return Ok(InsertOutcome {
@@ -14904,7 +15042,6 @@ impl FrankenStorage {
                     conversation_inserted: false,
                     inserted_indices,
                     updated_indices: Vec::new(),
-                    unresolved_message_conflicts: idx_collision_count,
                     workspace_changed,
                 });
             }
@@ -14929,8 +15066,7 @@ impl FrankenStorage {
                 continue;
             }
             let incoming_replay = message_replay_fingerprint(msg);
-            if !is_openwebui_saved_snapshot(conv)
-                && conv.agent_slug != "grok_bot"
+            if conv.agent_slug != "grok_bot"
                 && pending_replay_fingerprints.contains(&incoming_replay)
             {
                 tracing::debug!(
@@ -15006,7 +15142,6 @@ impl FrankenStorage {
             conversation_inserted: true,
             inserted_indices,
             updated_indices: Vec::new(),
-            unresolved_message_conflicts: idx_collision_count,
             workspace_changed: false,
         })
     }
@@ -15086,8 +15221,7 @@ impl FrankenStorage {
             }
 
             let incoming_replay = message_replay_fingerprint(msg);
-            if !is_openwebui_saved_snapshot(conv)
-                && conv.agent_slug != "grok_bot"
+            if conv.agent_slug != "grok_bot"
                 && pending_replay_fingerprints.contains(&incoming_replay)
             {
                 tracing::debug!(
@@ -15194,7 +15328,6 @@ impl FrankenStorage {
             conversation_inserted: true,
             inserted_indices,
             updated_indices: Vec::new(),
-            unresolved_message_conflicts: idx_collision_count,
             workspace_changed: false,
         })
     }
@@ -15415,7 +15548,6 @@ impl FrankenStorage {
             conversation_inserted: false,
             inserted_indices,
             updated_indices: Vec::new(),
-            unresolved_message_conflicts: idx_collision_count,
             workspace_changed: false,
         })
     }
@@ -15579,18 +15711,16 @@ impl FrankenStorage {
             conversation_inserted: false,
             inserted_indices,
             updated_indices: Vec::new(),
-            unresolved_message_conflicts: idx_collision_count,
             workspace_changed: false,
         })
     }
 
-    /// Rebuild the FTS5 index from scratch in bounded, durable batches.
+    /// Rebuild the FTS5 index from scratch in one failure-atomic transaction.
     ///
-    /// Row materialization is chunked and every page commits on its own
-    /// short-lived writer connection (GH #345), so peak memory does not grow
-    /// with the corpus. A process interruption leaves the pages committed so
-    /// far in a queryable Partial shadow, and the next repair resumes them;
-    /// canonical rows are never modified.
+    /// Row materialization remains chunked to bound memory, but the old
+    /// queryable shadow is not published away until the replacement has exact
+    /// canonical parity and the transaction commits. A process interruption
+    /// rolls the create-or-clear operation and every insert back together.
     pub fn rebuild_fts(&self) -> Result<()> {
         self.rebuild_fts_via_frankensqlite().map(|_| ())
     }
@@ -15859,23 +15989,6 @@ impl FrankenStorage {
     fn tick_fts_maintenance_heartbeat(&self) {
         if let Some(heartbeat) = self.fts_maintenance_heartbeat.lock().as_ref() {
             heartbeat();
-        }
-    }
-
-    /// GH #345: install (or, with `None`, clear) the reporter a bounded
-    /// canonical-FTS rebuild invokes after every committed batch. Progress is
-    /// published only after `COMMIT`, so a reported count is durable and a
-    /// re-run resumes from it.
-    pub(crate) fn set_fts_rebuild_progress(
-        &self,
-        progress: Option<Box<dyn Fn(FtsRebuildProgress) + Send + Sync>>,
-    ) {
-        *self.fts_rebuild_progress.lock() = progress;
-    }
-
-    fn report_fts_rebuild_progress(&self, progress: FtsRebuildProgress) {
-        if let Some(reporter) = self.fts_rebuild_progress.lock().as_ref() {
-            reporter(progress);
         }
     }
 
@@ -16332,24 +16445,6 @@ impl FrankenStorage {
             .query_row_map(FTS_INDEXABLE_MESSAGE_COUNT_SQL, fparams![], |row| {
                 row.get_typed::<i64>(0)
             })
-            .or_else(|error| {
-                if error
-                    .to_string()
-                    .contains("no such index: sqlite_autoindex_messages_1")
-                {
-                    // Historical salvage preserves every canonical row in a
-                    // schema without the modern uniqueness index. Keep the
-                    // same parent membership rule and count duplicates exactly;
-                    // current archives retain the fused covering-index path.
-                    return self.conn.query_row_map(
-                        "SELECT COUNT(*) FROM messages \
-                         WHERE conversation_id IN (SELECT rowid FROM conversations)",
-                        fparams![],
-                        |row| row.get_typed::<i64>(0),
-                    );
-                }
-                Err(error)
-            })
             .with_context(|| "counting exact canonical FTS messages by parent index runs")
     }
 
@@ -16371,7 +16466,7 @@ impl FrankenStorage {
                 })?;
         let indexable_messages = self.count_fts_indexable_messages()?;
         let fts_schema_rows = self.conn.query_row_map(
-            FTS_MESSAGES_REGISTRATION_ROW_COUNT_SQL,
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
             fparams![],
             |row| row.get_typed::<i64>(0),
         )?;
@@ -16532,7 +16627,7 @@ impl FrankenStorage {
                     row.get_typed::<i64>(0)
                 })?;
         let fts_schema_rows = self.conn.query_row_map(
-            FTS_MESSAGES_REGISTRATION_ROW_COUNT_SQL,
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
             fparams![],
             |row| row.get_typed::<i64>(0),
         )?;
@@ -16639,10 +16734,50 @@ impl FrankenStorage {
     /// Identify catalog shapes for which `_docsize` is not the complete
     /// engine rowid domain (GH #495).
     fn fts_shadow_residue_detail(&self, fts_schema_rows: i64) -> Result<Option<String>> {
-        // GH #495: the residue rules live in one shared classifier so the
-        // doctor's read-only probe and this mutating repair path cannot
-        // drift apart on the same archive.
-        fts_shadow_residue_detail_with_query(fts_schema_rows, |sql| self.conn.query(sql))
+        if fts_schema_rows == 0 {
+            let names = self.conn.query_map_collect(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name IN (
+                   'fts_messages_config','fts_messages_content','fts_messages_data',
+                   'fts_messages_docsize','fts_messages_idx'
+                 ) ORDER BY name",
+                fparams![],
+                |row| row.get_typed::<String>(0),
+            )?;
+            if !names.is_empty() {
+                return Ok(Some(format!(
+                    "fts_messages registration is absent but derived shadow residue remains: {}",
+                    names.join(", ")
+                )));
+            }
+            return Ok(None);
+        }
+        if fts_schema_rows == 1 && !self.fts_messages_schema_is_canonical_contentless()? {
+            return Ok(Some(
+                "fts_messages uses legacy/noncanonical DDL; _docsize parity cannot prove the engine rowid domain and the derived shadow must be recreated"
+                    .to_string(),
+            ));
+        }
+        if fts_schema_rows == 1 {
+            // GH #374: a canonical registration over legacy rowid shadow
+            // tables. Row counts can match exactly, so without this the full
+            // index refused the archive and pointed at a repair that found
+            // nothing to do.
+            let shadow_ddl = self.conn.query_map_collect(
+                "SELECT name, sql FROM sqlite_master
+                 WHERE type = 'table' AND name IN ('fts_messages_config', 'fts_messages_idx')
+                 ORDER BY name",
+                fparams![],
+                |row| Ok((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?)),
+            )?;
+            if let Some(problem) = shadow_ddl
+                .iter()
+                .find_map(|(table, ddl)| incompatible_legacy_fts_shadow_ddl(table, ddl))
+            {
+                return Ok(Some(problem));
+            }
+        }
+        Ok(None)
     }
 
     fn drop_fts_shadow_residue(&self) -> Result<()> {
@@ -16653,7 +16788,6 @@ impl FrankenStorage {
         for table in FTS_MESSAGES_REQUIRED_SHADOW_TABLES {
             self.conn
                 .execute(&format!("DROP TABLE IF EXISTS {table}"))
-                // ubs:ignore[rust.perf.string-alloc-in-loop] -- Lazy context for a failed repair statement over the fixed FTS shadow-table list.
                 .with_context(|| format!("dropping FTS5 residue table {table}"))?;
         }
         self.set_fts_messages_present_cache(false);
@@ -16694,50 +16828,9 @@ impl FrankenStorage {
                 })
             }
             FtsShadowParityStatus::Partial => {
-                let inserted_rows = match self.stream_fts_rows_via_frankensqlite(true) {
-                    Ok(inserted_rows) => inserted_rows,
-                    Err(err) if fts_insert_error_is_rowid_collision(&err) => {
-                        // GH #495: the catch-up insert collided with a rowid the
-                        // derived shadow already holds — the reporter's
-                        // "PRIMARY KEY constraint failed". The shadow's rowid
-                        // domain disagrees with `_docsize`, so retrying the
-                        // same insert can never succeed. Route the repair
-                        // through the reviewed drop+recreate route instead of
-                        // repeating the insert on every later run. Canonical
-                        // rows are never touched: only the derived shadow is
-                        // dropped, and it is recreated from those rows. An
-                        // unrelated storage error keeps its own failure.
-                        //
-                        // GH #345 / GH #329: the recreate primitive
-                        // materializes every canonical row in the engine's
-                        // memory (~32 KiB per message), so an over-bound
-                        // corpus must not enter it. The same admission check
-                        // the other rebuild routes use applies here: over the
-                        // bound the shadow is retired and the repair reports
-                        // the not-viable detail instead of hydrating the
-                        // engine.
-                        if let Some(detail) = self.fts_shadow_recreate_refused()? {
-                            // GH #497: a settled retirement must not be
-                            // rewritten — drop the shadow only when the
-                            // recorded retirement does not already describe
-                            // this corpus and bound.
-                            if !self.fts_shadow_retirement_matches(&detail)? {
-                                self.drop_fts_shadow_as_not_viable(&detail)?;
-                            }
-                            anyhow::bail!("{detail}");
-                        }
-                        self.drop_fts_shadow_residue().with_context(
-                            || "dropping the colliding FTS shadow before recreating it",
-                        )?;
-                        self.rebuild_fts_via_frankensqlite().with_context(
-                            || "recreating the canonical FTS shadow after a rowid collision",
-                        )?
-                    }
-                    Err(err) => {
-                        return Err(err)
-                            .with_context(|| "resuming missing FTS rows via frankensqlite");
-                    }
-                };
+                let inserted_rows = self
+                    .stream_fts_rows_via_frankensqlite(true)
+                    .with_context(|| "resuming missing FTS rows via frankensqlite")?;
                 let after = self.require_healthy_fts_parity("resumable FTS catch-up")?;
                 self.record_fts_franken_rebuild_generation()?;
                 self.set_fts_messages_present_cache(true);
@@ -16808,46 +16901,57 @@ impl FrankenStorage {
     /// in-place DELETE path cannot. The FTS5 vtab's destructor is a no-op that never reads
     /// `%_data`, and its backing shadow tables are plain, so `DROP TABLE`
     /// removes the corrupt structure without decoding it. Canonical rows are
-    /// never modified. The drop+CREATE runs in autocommit (frankensqlite
-    /// cannot recreate a virtual table in the same transaction as its DROP);
-    /// the repopulate streams bounded pages and commits each on its own
-    /// short-lived writer connection, so a failure leaves a queryable Partial
-    /// shadow and re-running the repair resumes it — the shadow is fully
-    /// derived from canonical rows.
+    /// never modified. NOT fully failure-atomic: the drop+recreate runs in
+    /// autocommit (frankensqlite cannot recreate a virtual table in the same
+    /// transaction as its DROP), so only the repopulate is transactional — a
+    /// failed repopulate leaves an EMPTY (not corrupt) shadow, and re-running
+    /// the repair is safe because the shadow is fully derived from canonical.
     pub(crate) fn rebuild_fts_shadow_via_drop_recreate(&self) -> Result<usize> {
         self.invalidate_fts_messages_present_cache();
 
         // Drop + recreate the shadow in autocommit: frankensqlite does not
         // support recreating a virtual table in the SAME transaction as its
-        // DROP. The replacement starts empty; the repopulate below streams
-        // bounded pages, each committed on its own short-lived writer
-        // connection (GH #345). Every committed page is durable, so an
-        // interrupted rebuild leaves a queryable Partial shadow that the next
-        // run resumes through the ordinary catch-up path instead of publishing
-        // nothing. Canonical rows are never touched, and the shadow is fully
-        // derived, so a re-run is always safe.
+        // DROP. The corrupt shadow is replaced by a fresh empty one here; the
+        // repopulate below is transactional. Full failure-atomicity (preserving
+        // the ORIGINAL) has no value in this path because the original shadow is
+        // corrupt — if the repopulate fails, the shadow is empty (not corrupt)
+        // and re-running the repair is safe, since it is fully derived from
+        // canonical rows.
         self.conn
             .execute("DROP TABLE IF EXISTS fts_messages")
-            .with_context(|| "dropping the FTS5 shadow before recreate")?;
-        self.set_fts_messages_present_cache(false);
+            .with_context(|| "dropping the corrupt FTS5 shadow before recreate")?;
         self.conn
             .execute_compat(FTS5_REGISTER_SQL, fparams![])
-            .with_context(|| "recreating a fresh FTS5 shadow")?;
+            .with_context(|| "recreating a fresh FTS5 shadow after dropping the corrupt one")?;
         self.set_fts_messages_present_cache(true);
-        #[cfg(test)]
-        injected_fts_rebuild_interruption(1)?;
 
-        let inserted_rows = self
-            .stream_fts_rows_via_frankensqlite(false)
-            .with_context(|| {
-                "repopulating the recreated FTS5 shadow in bounded, durable batches; every \
-                 committed batch survives, so re-run 'cass doctor --rebuild-canonical-fts --yes' \
-                 to resume"
-            })?;
-        self.require_healthy_fts_parity("FTS5 drop+recreate rebuild")?;
-        self.record_fts_franken_rebuild_generation()?;
-        self.set_fts_messages_present_cache(true);
-        Ok(inserted_rows)
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE TRANSACTION;")
+            .with_context(|| "starting the corrupt-FTS shadow repopulate transaction")?;
+        let repopulate = (|| -> Result<usize> {
+            let inserted_rows = self.stream_fts_rows_via_frankensqlite(false)?;
+            self.require_healthy_fts_parity("corrupt-FTS drop+recreate rebuild")?;
+            self.record_fts_franken_rebuild_generation()?;
+            self.conn
+                .execute_batch("COMMIT;")
+                .with_context(|| "publishing the corrupt-FTS shadow repopulate")?;
+            Ok(inserted_rows)
+        })();
+
+        match repopulate {
+            Ok(inserted_rows) => {
+                self.set_fts_messages_present_cache(true);
+                Ok(inserted_rows)
+            }
+            Err(err) => {
+                self.invalidate_fts_messages_present_cache();
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(err.context(
+                    "corrupt-FTS shadow repopulate rolled back after the shadow was dropped and \
+                     recreated empty; re-run 'cass doctor --rebuild-canonical-fts --yes' to retry",
+                ))
+            }
+        }
     }
 
     /// True when every `sqlite_master` row named `fts_messages` declares the
@@ -16868,27 +16972,35 @@ impl FrankenStorage {
     /// state, and rows written through one connection's view are invisible
     /// to the next open (content lands in `%_data`/`%_docsize` while the
     /// reader hydrates from the empty `%_content`).
-    ///
-    /// GH #345: rebuilds no longer branch on this method (every status goes
-    /// through drop+recreate), so it is retained as the unit-test oracle for
-    /// the shared classifier.
-    #[cfg(test)]
     fn fts_messages_schema_is_canonical_contentless(&self) -> Result<bool> {
-        // GH #495: the same rule the doctor's read-only probe applies, read
-        // through the shared classifier so the two cannot drift apart.
-        fts_messages_schema_is_canonical_contentless_with_query(&|sql| self.conn.query(sql))
-            .with_context(|| "reading the fts_messages CREATE sql for rebuild routing")
+        let mut saw_row = false;
+        let mut all_contentless = true;
+        self.conn
+            .query_with_params_for_each(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages'",
+                &[] as &[SqliteValue],
+                |row| {
+                    saw_row = true;
+                    let sql: Option<String> = row.get_typed(0)?;
+                    let normalized: String = sql
+                        .unwrap_or_default()
+                        .to_ascii_lowercase()
+                        .split_whitespace()
+                        .collect();
+                    let has_empty_content =
+                        normalized.contains("content=''") || normalized.contains("content=\"\"");
+                    let has_contentless_delete = normalized.contains("contentless_delete=1");
+                    if !(has_empty_content && has_contentless_delete) {
+                        all_contentless = false;
+                    }
+                    Ok(())
+                },
+            )
+            .with_context(|| "reading the fts_messages CREATE sql for rebuild routing")?;
+        Ok(saw_row && all_contentless)
     }
 
     pub(crate) fn rebuild_fts_via_frankensqlite(&self) -> Result<usize> {
-        // 2l1b0.65: a catalog that carries duplicate `fts_messages`
-        // virtual-table rows cannot be rebuilt, and an ordinary rebuild never
-        // repairs it. Report the typed repair-required condition instead of
-        // failing later with a raw "malformed database schema" corruption
-        // error, so every lane points the operator at `cass doctor --fix`.
-        if self.conflicting_fts_schema_rows_present() {
-            return Err(conflicting_fts_schema_repair_required(&self.db_path));
-        }
         self.invalidate_fts_messages_present_cache();
         let mut before = self
             .inspect_search_fallback_fts_parity()
@@ -16914,48 +17026,100 @@ impl FrankenStorage {
                 before.status.as_str()
             );
         }
-        // Every rebuild replaces the shadow: DROP + CREATE in autocommit,
-        // then bounded pages committed on short-lived writer connections
-        // (GH #345). An in-place `DELETE FROM fts_messages` forced the engine
-        // to hydrate the whole shadow on the primary connection and kept the
-        // rebuild inside one giant transaction, which both retained the corpus
-        // in memory (18 GiB at ~2M messages) and published nothing when
-        // interrupted. The replaced shadow is fully derived from canonical
-        // messages, so nothing user-authored is at stake. This also replaces
-        // non-canonical (legacy or stale-duplicate) shadow CREATEs, which
-        // would otherwise split writes and reads across different shadow
-        // tables. `Unqueryable` still bails because its prior artifact cannot
-        // be proven restorable.
-        match before.status {
-            FtsShadowParityStatus::Absent
-            | FtsShadowParityStatus::Healthy
-            | FtsShadowParityStatus::Partial
-            | FtsShadowParityStatus::Excess
-            | FtsShadowParityStatus::Divergent => self.rebuild_fts_shadow_via_drop_recreate(),
-            FtsShadowParityStatus::Residue => {
-                anyhow::bail!("FTS residue must be removed before the drop+recreate rebuild")
-            }
-            FtsShadowParityStatus::Unqueryable => anyhow::bail!(
-                "refusing to replace an unqueryable FTS shadow because its prior artifact \
-                 cannot be proven restorable; preserve the complete database bundle for \
-                 staged recovery"
-            ),
+        // Route queryable shadows whose surviving CREATE is NOT cass's
+        // canonical contentless registration through DROP+recreate instead of
+        // DELETE_ALL. cass only ever creates `content='', contentless_delete=1`
+        // shadows, so a non-contentless CREATE is a legacy or stale-duplicate
+        // catalog row (see `fts_messages_schema_is_canonical_contentless`);
+        // rebuilding "in place" through that row splits writes and reads
+        // across different shadow tables and silently loses the rebuilt
+        // content on the next open. DROP TABLE removes every catalog row of
+        // that name plus the module shadow-table cascade, leaving one clean
+        // canonical schema, and the repopulate is fully derived from
+        // canonical messages so nothing user-authored is at stake. The
+        // `content=''`-without-`contentless_delete` legacy family is
+        // non-canonical too (GH #497); with a single catalog row it is
+        // classified as residue above. Unqueryable still bails in the match
+        // below.
+        if matches!(
+            before.status,
+            FtsShadowParityStatus::Healthy
+                | FtsShadowParityStatus::Partial
+                | FtsShadowParityStatus::Excess
+                | FtsShadowParityStatus::Divergent
+        ) && !self.fts_messages_schema_is_canonical_contentless()?
+        {
+            return self.rebuild_fts_shadow_via_drop_recreate();
         }
-    }
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE TRANSACTION;")
+            .with_context(|| "starting failure-atomic FTS rebuild transaction")?;
 
-    /// Whether the catalog carries more than one `fts_messages` row in
-    /// `sqlite_master` — the historical duplicate-registration debris that
-    /// frankensqlite refuses to open or rebuild (2l1b0.65).
-    fn conflicting_fts_schema_rows_present(&self) -> bool {
-        let count = self
-            .conn
-            .query_row_map(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                fparams![],
-                |row| row.get_typed::<i64>(0),
-            )
-            .ok();
-        matches!(count, Some(count) if count > 1)
+        let rebuild_result = (|| -> Result<usize> {
+            match before.status {
+                FtsShadowParityStatus::Absent => {
+                    self.conn
+                        .execute_compat(FTS5_REGISTER_SQL, fparams![])
+                        .with_context(|| "creating fts_messages inside atomic rebuild")?;
+                }
+                FtsShadowParityStatus::Residue => {
+                    anyhow::bail!("FTS residue must be removed before entering the atomic rebuild")
+                }
+                FtsShadowParityStatus::Healthy
+                | FtsShadowParityStatus::Partial
+                | FtsShadowParityStatus::Excess
+                | FtsShadowParityStatus::Divergent => {
+                    self.conn.execute(FTS5_DELETE_ALL_SQL).with_context(|| {
+                        "clearing the queryable FTS shadow transactionally; a legacy shadow \
+                         without contentless_delete=1 is preserved and requires resumable \
+                         repair instead"
+                    })?;
+                }
+                FtsShadowParityStatus::Unqueryable => anyhow::bail!(
+                    "refusing to replace an unqueryable FTS shadow in place because its \
+                     prior artifact cannot be proven restorable; preserve the complete \
+                     database bundle for staged recovery"
+                ),
+            }
+            self.set_fts_messages_present_cache(true);
+            #[cfg(test)]
+            injected_fts_rebuild_interruption(1)?;
+
+            let inserted_rows = self.stream_fts_rows_via_frankensqlite(false)?;
+            self.require_healthy_fts_parity("transactional FTS rebuild")?;
+            self.record_fts_franken_rebuild_generation()?;
+            self.conn
+                .execute_batch("COMMIT;")
+                .with_context(|| "publishing failure-atomic FTS rebuild transaction")?;
+            Ok(inserted_rows)
+        })();
+
+        match rebuild_result {
+            Ok(inserted_rows) => {
+                self.set_fts_messages_present_cache(true);
+                Ok(inserted_rows)
+            }
+            Err(err) => {
+                self.invalidate_fts_messages_present_cache();
+                match self.conn.execute_batch("ROLLBACK;") {
+                    Ok(()) => Err(err.context(
+                        "failure-atomic FTS rebuild rolled back without publishing a partial shadow",
+                    )),
+                    Err(rollback_err) => {
+                        tracing::error!(
+                            error = %err,
+                            rollback_error = %rollback_err,
+                            "FTS rebuild failed and explicit rollback could not be confirmed"
+                        );
+                        Err(err.context(format!(
+                            "FTS rebuild failed and rollback could not be confirmed: \
+                             {rollback_err}. Preserve the complete database bundle and inspect \
+                             exact FTS parity before any retry"
+                        )))
+                    }
+                }
+            }
+        }
     }
 
     /// `coding_agent_session_search-uhhxy`: rebuild the in-DB FTS5 shadow
@@ -16981,24 +17145,6 @@ impl FrankenStorage {
         let workspace_path_by_id = self.load_fts_workspace_path_map()?;
         let mut entries = Vec::new();
         let mut pending_chars = 0usize;
-        // GH #345: truthful total for the progress reporter. A failure to
-        // count only degrades the displayed denominator; it must not fail a
-        // repairable shadow.
-        let total_rows = match self.count_fts_indexable_messages() {
-            Ok(count) => usize::try_from(count).unwrap_or(usize::MAX),
-            Err(err) => {
-                tracing::debug!(
-                    target: "cass::fts_rebuild",
-                    error = %err,
-                    "could not count canonical rows for FTS rebuild progress"
-                );
-                0
-            }
-        };
-        self.report_fts_rebuild_progress(FtsRebuildProgress {
-            committed_rows: 0,
-            total_rows,
-        });
 
         // Test hooks for the #439 liveness contract (tests/cli_index.rs). A
         // PARK sleeps once before the first page WITHOUT a heartbeat — the
@@ -17033,35 +17179,12 @@ impl FrankenStorage {
             if fetched_count == 0 && page.exhausted {
                 break;
             }
-            // GH #345: every page commits through its own short-lived writer
-            // connection. A fresh connection binds the persisted FTS5 shadow
-            // lazily; the engine's in-memory inverted index therefore lives
-            // only as long as this page (the long-lived storage connection
-            // previously retained the whole corpus, 18 GiB on a 2M-message
-            // archive), and an interrupted rebuild keeps every committed page
-            // instead of publishing nothing.
-            let mut writer = open_archive_writer_connection(&self.db_path)
-                .with_context(|| "opening the bounded per-page FTS rebuild writer")?;
-            if let Err(err) = writer.execute_batch("BEGIN IMMEDIATE TRANSACTION;") {
-                let _ = writer.close_without_checkpoint_in_place();
-                return Err(err).with_context(|| "starting the bounded per-page FTS rebuild batch");
-            }
-
             // Keep resumable repair bounded by the canonical page size. The
             // previous implementation loaded every existing FTS rowid into a
             // process-wide HashSet, which scaled with a multi-million-message
-            // archive before the first repair batch could make progress. Probe
-            // through the writer so the committed prefix, including the pages
-            // this rebuild just published, is visible.
+            // archive before the first repair batch could make progress.
             let existing_fts_rowids = if missing_only {
-                match self.load_fts_message_rowid_set_for_batch_on(&writer, &page.rows) {
-                    Ok(rowids) => Some(rowids),
-                    Err(err) => {
-                        let _ = writer.execute_batch("ROLLBACK;");
-                        let _ = writer.close_without_checkpoint_in_place();
-                        return Err(err);
-                    }
-                }
+                Some(self.load_fts_message_rowid_set_for_batch(&page.rows)?)
             } else {
                 None
             };
@@ -17070,88 +17193,57 @@ impl FrankenStorage {
             let skipped_before_batch = total_skipped_orphans;
             let existing_before_batch = total_skipped_existing;
 
-            let batch_result = (|| -> Result<usize> {
-                let mut batch_inserted = 0usize;
-                for row in page.rows {
-                    if existing_fts_rowids
-                        .as_ref()
-                        .is_some_and(|rowids| rowids.contains(&row.message_id))
-                    {
-                        total_skipped_existing = total_skipped_existing.saturating_add(1);
-                        continue;
-                    }
-                    let Some(conversation) = conversation_by_id.get(&row.conversation_id) else {
-                        total_skipped_orphans = total_skipped_orphans.saturating_add(1);
-                        continue;
-                    };
-                    let agent = conversation
-                        .agent_id
-                        .and_then(|agent_id| agent_slug_by_id.get(&agent_id))
-                        .filter(|slug| !slug.is_empty())
-                        .cloned()
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let workspace = conversation
-                        .workspace_id
-                        .and_then(|workspace_id| workspace_path_by_id.get(&workspace_id))
-                        .cloned()
-                        .unwrap_or_default();
-                    pending_chars = pending_chars.saturating_add(row.content.len());
-                    entries.push(FtsEntry {
-                        content: row.content,
-                        title: conversation.title.clone(),
-                        agent,
-                        workspace,
-                        source_path: conversation.source_path.clone(),
-                        created_at: row.created_at,
-                        message_id: row.message_id,
-                    });
-                    if entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                        || pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                    {
-                        batch_inserted = batch_inserted.saturating_add(
-                            franken_batch_insert_fts_on_connection(&writer, &entries)?,
-                        );
-                        entries.clear();
-                        pending_chars = 0;
-                    }
+            for row in page.rows {
+                if existing_fts_rowids
+                    .as_ref()
+                    .is_some_and(|rowids| rowids.contains(&row.message_id))
+                {
+                    total_skipped_existing = total_skipped_existing.saturating_add(1);
+                    continue;
                 }
-
-                if !entries.is_empty() {
-                    batch_inserted = batch_inserted
-                        .saturating_add(franken_batch_insert_fts_on_connection(&writer, &entries)?);
+                let Some(conversation) = conversation_by_id.get(&row.conversation_id) else {
+                    total_skipped_orphans = total_skipped_orphans.saturating_add(1);
+                    continue;
+                };
+                let agent = conversation
+                    .agent_id
+                    .and_then(|agent_id| agent_slug_by_id.get(&agent_id))
+                    .filter(|slug| !slug.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string());
+                let workspace = conversation
+                    .workspace_id
+                    .and_then(|workspace_id| workspace_path_by_id.get(&workspace_id))
+                    .cloned()
+                    .unwrap_or_default();
+                pending_chars = pending_chars.saturating_add(row.content.len());
+                entries.push(FtsEntry {
+                    content: row.content,
+                    title: conversation.title.clone(),
+                    agent,
+                    workspace,
+                    source_path: conversation.source_path.clone(),
+                    created_at: row.created_at,
+                    message_id: row.message_id,
+                });
+                if entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                    || pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                {
+                    total_inserted = total_inserted.saturating_add(
+                        franken_batch_insert_fts_on_connection(&self.conn, &entries)?,
+                    );
                     entries.clear();
                     pending_chars = 0;
                 }
-                Ok(batch_inserted)
-            })();
+            }
 
-            let batch_inserted = match batch_result {
-                Ok(inserted) => inserted,
-                Err(err) => {
-                    let _ = writer.execute_batch("ROLLBACK;");
-                    let _ = writer.close_without_checkpoint_in_place();
-                    return Err(err);
-                }
-            };
-            if let Err(err) = writer.execute_batch("COMMIT;") {
-                let _ = writer.execute_batch("ROLLBACK;");
-                let _ = writer.close_without_checkpoint_in_place();
-                return Err(err)
-                    .with_context(|| "publishing the bounded per-page FTS rebuild batch");
-            }
-            total_inserted = total_inserted.saturating_add(batch_inserted);
-            if let Err(err) = writer.close_without_checkpoint_in_place() {
-                tracing::debug!(
-                    target: "cass::fts_rebuild",
-                    error = %err,
-                    "per-page FTS rebuild writer close failed; committed frames remain durable"
+            if !entries.is_empty() {
+                total_inserted = total_inserted.saturating_add(
+                    franken_batch_insert_fts_on_connection(&self.conn, &entries)?,
                 );
+                entries.clear();
+                pending_chars = 0;
             }
-            // Published only after COMMIT, so a re-run resumes from here.
-            self.report_fts_rebuild_progress(FtsRebuildProgress {
-                committed_rows: total_inserted.saturating_add(total_skipped_existing),
-                total_rows,
-            });
 
             // GH #413 follow-up: a page that takes longer than the budget is
             // the engine's O(table)-per-statement wall; stop truthfully here
@@ -17359,17 +17451,8 @@ impl FrankenStorage {
         })
     }
 
-    #[cfg(test)]
     fn load_fts_message_rowid_set_for_batch(
         &self,
-        rows: &[FtsRebuildMessageRow],
-    ) -> Result<HashSet<i64>> {
-        self.load_fts_message_rowid_set_for_batch_on(&self.conn, rows)
-    }
-
-    fn load_fts_message_rowid_set_for_batch_on(
-        &self,
-        conn: &FrankenConnection,
         rows: &[FtsRebuildMessageRow],
     ) -> Result<HashSet<i64>> {
         if rows.is_empty() {
@@ -17393,7 +17476,8 @@ impl FrankenStorage {
         for chunk in rows.chunks(FTS_EXACT_ROWID_PROBE_CHUNK_SIZE) {
             let ids: Vec<i64> = chunk.iter().map(|row| row.message_id).collect();
             let sql = fts_exact_rowid_probe_select_sql(&ids);
-            let matched = conn
+            let matched = self
+                .conn
                 .query(&sql)
                 .with_context(|| "probing bounded exact FTS docsize rowids")?;
             for matched_row in matched {
@@ -17489,11 +17573,87 @@ impl FrankenStorage {
             .with_context(|| "fetching messages for embedding")
     }
 
-    /// Get the watermark for incremental semantic embedding.
-    pub fn get_last_embedded_message_id(&self) -> Result<Option<i64>> {
+    /// Current canonical mutation authority. Reads never create an authority
+    /// for an old or incompletely restored archive.
+    pub fn semantic_archive_state(&self) -> Result<Option<SemanticArchiveState>> {
+        semantic_archive_state_in_connection(&self.conn)
+    }
+
+    /// Changes since a captured boundary, read in one SQL snapshot. A missing
+    /// or foreign authority cannot prove a complete incremental replay.
+    pub fn semantic_conversation_changes_since(
+        &self,
+        previous: &SemanticArchiveState,
+    ) -> Result<Option<SemanticConversationChanges>> {
+        let sequence = i64::try_from(previous.mutation_seq)?;
+        let rows = match self.conn.query_with_params(
+            "SELECT meta.value, changes.conversation_id \
+             FROM meta LEFT JOIN semantic_conversation_changes AS changes \
+             ON changes.mutation_seq > ?1 \
+             WHERE meta.key = 'semantic_archive_state_v1' \
+             ORDER BY changes.conversation_id",
+            &[SqliteValue::from(sequence)],
+        ) {
+            Ok(rows) => rows,
+            Err(error) if error_indicates_missing_table(&error) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let Some(first) = rows.first() else {
+            return Ok(None);
+        };
+        let state = SemanticArchiveState::parse(&first.get_typed::<String>(0)?)?;
+        if state.archive_id != previous.archive_id || state.mutation_seq < previous.mutation_seq {
+            return Ok(None);
+        }
+        let mut conversation_ids = Vec::with_capacity(rows.len());
+        let mut complete = true;
+        for row in rows {
+            if let Some(id) = row.get_typed::<Option<i64>>(1)? {
+                if id == 0 {
+                    complete = false;
+                } else {
+                    anyhow::ensure!(id > 0, "invalid semantic conversation journal identity");
+                    conversation_ids.push(id);
+                }
+            }
+        }
+        Ok(Some(SemanticConversationChanges {
+            state,
+            conversation_ids,
+            complete,
+        }))
+    }
+
+    /// Whether a captured generation lost canonical identity. Missing,
+    /// foreign, or regressed archive authority fails closed.
+    pub fn semantic_invalidations_after(&self, previous: &SemanticArchiveState) -> Result<bool> {
+        let sequence = i64::try_from(previous.mutation_seq)?;
+        let rows = match self.conn.query_with_params(
+            "SELECT value, EXISTS(SELECT 1 FROM semantic_conversation_changes \
+             WHERE invalidation_seq > ?1) FROM meta \
+             WHERE key = 'semantic_archive_state_v1'",
+            &[SqliteValue::from(sequence)],
+        ) {
+            Ok(rows) => rows,
+            Err(error) if error_indicates_missing_table(&error) => return Ok(true),
+            Err(error) => return Err(error.into()),
+        };
+        let Some(row) = rows.first() else {
+            return Ok(true);
+        };
+        let state = SemanticArchiveState::parse(&row.get_typed::<String>(0)?)?;
+        Ok(state.archive_id != previous.archive_id
+            || state.mutation_seq < previous.mutation_seq
+            || row.get_typed::<i64>(1)? != 0)
+    }
+
+    /// Read only this embedder's incremental watermark; another vector
+    /// space's watermark provides no authority for its coverage.
+    pub fn get_last_embedded_message_id(&self, embedder_id: &str) -> Result<Option<i64>> {
+        let key = semantic_embed_watermark_key(embedder_id);
         let result: Result<String, _> = self.conn.query_row_map(
-            "SELECT value FROM meta WHERE key = 'last_embedded_message_id'",
-            fparams![],
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![key.as_str()],
             |row| row.get_typed(0),
         );
         match result.optional() {
@@ -17519,13 +17679,50 @@ impl FrankenStorage {
         Ok((max > 0).then_some(max))
     }
 
-    /// Set the watermark for incremental semantic embedding.
-    pub fn set_last_embedded_message_id(&self, id: i64) -> Result<()> {
+    /// Set one vector space's incremental embedding watermark.
+    pub fn set_last_embedded_message_id(&self, embedder_id: &str, id: i64) -> Result<()> {
+        let key = semantic_embed_watermark_key(embedder_id);
         self.conn.execute_compat(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES('last_embedded_message_id', ?1)",
-            fparams![id.to_string()],
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![key.as_str(), id.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Certify only the captured message boundary, atomically with checking
+    /// the archive authority. A raced deletion cannot clear a watermark and
+    /// then have an obsolete publisher restore it. Equal watermarks do not
+    /// cause a needless canonical file write.
+    pub fn set_last_embedded_message_id_if_unchanged(
+        &self,
+        embedder_id: &str,
+        max_id: i64,
+        expected: &SemanticArchiveState,
+    ) -> Result<bool> {
+        anyhow::ensure!(max_id >= 0, "negative semantic embedding watermark");
+        let mut tx = self.conn.transaction()?;
+        if semantic_archive_state_with_query(|sql| Ok(tx.query(sql)?))?.as_ref() != Some(expected) {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        let key = semantic_embed_watermark_key(embedder_id);
+        let current: Option<String> = tx
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![key.as_str()],
+                |row| row.get_typed(0),
+            )
+            .optional()?;
+        if current.as_deref() == Some(max_id.to_string().as_str()) {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        tx.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![key.as_str(), max_id.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Whether semantic artifacts must be rebuilt because canonical filter
@@ -17580,6 +17777,41 @@ impl FrankenStorage {
             fparams![tier.meta_key()],
         )?;
         Ok(())
+    }
+
+    /// Complete an identity rebuild only if its canonical source boundary
+    /// still owns the marker. A later reidentity cannot be acknowledged by
+    /// an earlier publisher.
+    ///
+    /// Publishers acknowledge only the canonical boundary they captured,
+    /// leaving later identity changes pending for their own generation.
+    pub(crate) fn complete_semantic_identity_rebuild_if_current(
+        &self,
+        tier: SemanticIdentityTier,
+        expected: &SemanticArchiveState,
+    ) -> Result<bool> {
+        let mut tx = self.conn.transaction()?;
+        if semantic_archive_state_with_query(|sql| Ok(tx.query(sql)?))?.as_ref() != Some(expected) {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        let marker: Option<String> = tx
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![tier.meta_key()],
+                |row| row.get_typed(0),
+            )
+            .optional()?;
+        if marker.as_deref().is_none_or(|value| value == "complete") {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        tx.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'complete')",
+            fparams![tier.meta_key()],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Get embedding jobs for a database path.
@@ -17925,6 +18157,28 @@ impl FrankenStorage {
         )?.into_iter().collect())
     }
 
+    /// Record a fully observed source whose final batch was intentionally
+    /// excluded by workspace policy or explicit forget tombstones. This is
+    /// separate from canonical batch completion: an arbitrary empty/failed
+    /// parser batch must still never advance a source's observation ledger.
+    pub(crate) fn record_filtered_source_completion(
+        &self,
+        completion: &SourceIngestLedgerEntry,
+    ) -> Result<()> {
+        if !completion.key.starts_with("source_ingest_v1:")
+            || completion.key.len() == "source_ingest_v1:".len()
+        {
+            bail!("source completion ledger key must name a source_ingest_v1 observation");
+        }
+        let mut tx = self.conn.transaction()?;
+        tx.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![completion.key.as_str(), completion.observation.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn insert_conversations_batched_with_source_completion(
         &self,
         conversations: &[(i64, Option<i64>, &Conversation)],
@@ -17956,7 +18210,6 @@ impl FrankenStorage {
             return Ok(Vec::new());
         }
 
-        openwebui_snapshot::validate_batch(conversations)?;
         self.ensure_sources_for_batch(conversations)?;
 
         let defer_lexical_updates = defer_storage_lexical_updates_enabled();
@@ -18000,39 +18253,14 @@ impl FrankenStorage {
 
         for &(agent_id, workspace_id, raw_conv) in conversations {
             let normalized_conv = normalized_conversation_for_storage(raw_conv);
-            let native_snapshot = if is_openwebui_saved_snapshot(normalized_conv.as_ref()) {
-                Some(openwebui_snapshot::reconcile(
-                    self,
-                    &tx,
-                    agent_id,
-                    workspace_id,
-                    normalized_conv.as_ref(),
-                    defer_lexical_updates,
-                    defer_analytics_updates,
-                )?)
-            } else {
-                openwebui_snapshot::reconcile_codex_projection(
-                    self,
-                    &tx,
-                    agent_id,
-                    workspace_id,
-                    normalized_conv.as_ref(),
-                    defer_lexical_updates,
-                    defer_analytics_updates,
-                )?
-            };
-            let snapshot_conv = native_snapshot
-                .as_ref()
-                .map_or(normalized_conv.as_ref(), |snapshot| &snapshot.conversation);
             let revision_start = codebuff_revisions.len();
             let codebuff_conv = franken_reconcile_codebuff_messages(
                 &tx,
                 agent_id,
-                snapshot_conv,
+                normalized_conv.as_ref(),
                 &mut codebuff_revisions,
             )?;
-            // ubs:ignore[rust.panic.direct-indexing] -- The reconcile call only pushes revisions, so the recorded start index stays inside the vector.
-            let revised_indices: Vec<_> = codebuff_revisions[revision_start..]
+            let updated_indices = codebuff_revisions[revision_start..]
                 .iter()
                 .map(|revision| revision.message.idx)
                 .collect();
@@ -18041,16 +18269,14 @@ impl FrankenStorage {
             let conv = reconciled_conv.as_ref();
             let mut total_chars: i64 = 0;
             let mut inserted_indices = Vec::with_capacity(conv.messages.len());
-            let mut updated_indices = revised_indices;
-            let mut unresolved_message_conflicts = 0usize;
             let mut inserted_messages: Vec<(i64, &Message)> =
                 Vec::with_capacity(conv.messages.len());
             let mut session_count_delta = 1_i64;
             let conversation_key = conversation_merge_key(agent_id, conv);
 
-            let existing_conv_id = if native_snapshot.is_some() {
-                None
-            } else if let Some(existing_id) = pending_conversation_ids.get(&conversation_key) {
+            let existing_conv_id = if let Some(existing_id) =
+                pending_conversation_ids.get(&conversation_key)
+            {
                 Some(*existing_id)
             } else {
                 let existing_id =
@@ -18061,35 +18287,7 @@ impl FrankenStorage {
                 existing_id
             };
 
-            let conv_id = if let Some(snapshot) = &native_snapshot {
-                session_count_delta = i64::from(snapshot.conversation_inserted);
-                inserted_indices.clone_from(&snapshot.inserted_indices);
-                updated_indices.clone_from(&snapshot.updated_indices);
-                if snapshot.messages_changed {
-                    for message in &conv.messages {
-                        let message_id = message.id.context("native canonical message ID")?;
-                        inserted_messages.push((message_id, message));
-                        if !defer_lexical_updates {
-                            fts_entries.push(FtsEntry::from_message(message_id, message, conv));
-                            fts_count_total += 1;
-                            fts_pending_chars =
-                                fts_pending_chars.saturating_add(message.content.len());
-                            if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                                || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                            {
-                                flush_pending_fts_entries(
-                                    self,
-                                    &tx,
-                                    &mut fts_entries,
-                                    &mut fts_pending_chars,
-                                    &mut fts_inserted_total,
-                                )?;
-                            }
-                        }
-                    }
-                }
-                snapshot.conversation_id
-            } else if let Some(existing_id) = existing_conv_id {
+            let conv_id = if let Some(existing_id) = existing_conv_id {
                 session_count_delta = 0;
                 let (
                     ExistingConversationNewMessages {
@@ -18139,7 +18337,6 @@ impl FrankenStorage {
                 }
 
                 if idx_collision_count > 0 {
-                    unresolved_message_conflicts = idx_collision_count;
                     tracing::warn!(
                         conversation_id = existing_id,
                         collision_count = idx_collision_count,
@@ -18190,15 +18387,8 @@ impl FrankenStorage {
                         let mut new_messages = Vec::new();
                         for msg in &conv.messages {
                             let incoming_replay = message_replay_fingerprint(msg);
-                            if let Some(existing) = pending_messages.get(&msg.idx)
-                                && existing != &message_merge_fingerprint(msg)
-                            {
-                                unresolved_message_conflicts =
-                                    unresolved_message_conflicts.saturating_add(1);
-                            }
                             if pending_messages.contains_key(&msg.idx)
-                                || (!is_openwebui_saved_snapshot(conv)
-                                    && !matches!(conv.agent_slug.as_str(), "grok_bot" | "codebuff")
+                                || (!matches!(conv.agent_slug.as_str(), "grok_bot" | "codebuff")
                                     && pending_replay_fingerprints.contains(&incoming_replay))
                             {
                                 continue;
@@ -18290,7 +18480,6 @@ impl FrankenStorage {
                         }
 
                         if idx_collision_count > 0 {
-                            unresolved_message_conflicts = idx_collision_count;
                             tracing::warn!(
                                 conversation_id = existing_id,
                                 collision_count = idx_collision_count,
@@ -18341,10 +18530,7 @@ impl FrankenStorage {
             } else {
                 workspace_id
             };
-            if (!defer_analytics_updates
-                || native_snapshot
-                    .as_ref()
-                    .is_some_and(|snapshot| snapshot.rebuild_analytics))
+            if !defer_analytics_updates
                 && (conv.agent_slug != "codebuff"
                     || session_count_delta > 0
                     || !inserted_messages.is_empty())
@@ -18359,16 +18545,14 @@ impl FrankenStorage {
                 let day_id = effective_started_at
                     .map(FrankenStorage::day_id_from_millis)
                     .unwrap_or(0);
-                if native_snapshot.is_none() {
-                    stats.record_delta(
-                        &conv.agent_slug,
-                        &conv.source_id,
-                        day_id,
-                        delta.session_count_delta,
-                        delta.message_count_delta,
-                        delta.total_chars_delta,
-                    );
-                }
+                stats.record_delta(
+                    &conv.agent_slug,
+                    &conv.source_id,
+                    day_id,
+                    delta.session_count_delta,
+                    delta.message_count_delta,
+                    delta.total_chars_delta,
+                );
 
                 let conv_day_id = day_id;
                 let mut session_model_family = String::from("unknown");
@@ -18498,7 +18682,7 @@ impl FrankenStorage {
                         agent_slug: conv.agent_slug.clone(),
                         workspace_id: analytics_workspace_id.unwrap_or(0),
                         source_id: conv.source_id.clone(),
-                        role: role_s,
+                        role: role_s.to_string(),
                         content_chars,
                         content_tokens_est,
                         model_name: usage.model_name.clone(),
@@ -18520,11 +18704,7 @@ impl FrankenStorage {
                     metrics_entries.push(mm);
                 }
 
-                if session_count_delta > 0
-                    || native_snapshot
-                        .as_ref()
-                        .is_some_and(|snapshot| snapshot.messages_changed)
-                {
+                if session_count_delta > 0 {
                     token_stats.record_session(
                         &conv.agent_slug,
                         &conv.source_id,
@@ -18533,22 +18713,16 @@ impl FrankenStorage {
                     );
                 }
 
-                if has_any_tokens
-                    || native_snapshot
-                        .as_ref()
-                        .is_some_and(|snapshot| snapshot.messages_changed)
-                {
+                if has_any_tokens {
                     conv_ids_to_summarize.push(conv_id);
                 }
             }
 
-            franken_reconcile_native_snapshot_provenance(&tx, conv_id, conv)?;
             outcomes.push(InsertOutcome {
                 conversation_id: conv_id,
                 conversation_inserted: session_count_delta > 0,
                 inserted_indices,
                 updated_indices,
-                unresolved_message_conflicts,
                 // The packet as received, not `conv`: for an existing Codebuff
                 // chat that carries the canonical source path, title and
                 // workspace so its FTS rows stay canonical, which would hide
@@ -18584,7 +18758,7 @@ impl FrankenStorage {
         }
 
         // Batched daily_stats update
-        if !stats.is_empty() {
+        if !defer_analytics_updates && !stats.is_empty() {
             let entries = stats.expand();
             let affected = franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
             tracing::debug!(
@@ -18597,7 +18771,7 @@ impl FrankenStorage {
         }
 
         // Batch insert token_usage rows
-        if !token_entries.is_empty() {
+        if !defer_analytics_updates && !token_entries.is_empty() {
             let token_count = token_entries.len();
             let inserted = franken_insert_token_usage_batched_in_tx(&tx, &token_entries)?;
             tracing::debug!(
@@ -18609,7 +18783,7 @@ impl FrankenStorage {
         }
 
         // Batched token_daily_stats update
-        if !token_stats.is_empty() {
+        if !defer_analytics_updates && !token_stats.is_empty() {
             let entries = token_stats.expand();
             let affected = franken_update_token_daily_stats_batched_in_tx(&tx, &entries)?;
             tracing::debug!(
@@ -18622,7 +18796,7 @@ impl FrankenStorage {
         }
 
         // Batch insert message_metrics rows
-        if !metrics_entries.is_empty() {
+        if !defer_analytics_updates && !metrics_entries.is_empty() {
             let mm_count = metrics_entries.len();
             let inserted = franken_insert_message_metrics_batched_in_tx(&tx, &metrics_entries)?;
             tracing::debug!(
@@ -18634,7 +18808,7 @@ impl FrankenStorage {
         }
 
         // Flush usage_hourly + usage_daily rollups
-        if !rollup_agg.is_empty() {
+        if !defer_analytics_updates && !rollup_agg.is_empty() {
             let (hourly, daily, models_daily) =
                 franken_flush_analytics_rollups_in_tx(&tx, &rollup_agg)?;
             tracing::debug!(
@@ -18650,8 +18824,10 @@ impl FrankenStorage {
         }
 
         // Update conversation-level token summaries
-        for conv_id in &conv_ids_to_summarize {
-            franken_update_conversation_token_summaries_in_tx(&tx, *conv_id)?;
+        if !defer_analytics_updates {
+            for conv_id in &conv_ids_to_summarize {
+                franken_update_conversation_token_summaries_in_tx(&tx, *conv_id)?;
+            }
         }
 
         // Canonical rows changed during planning so later packets saw their
@@ -18675,7 +18851,7 @@ impl FrankenStorage {
                     fparams![tier.meta_key(), generation.as_str()],
                 )?;
             }
-            tx.execute("DELETE FROM meta WHERE key = 'last_embedded_message_id'")?;
+            tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
             tx.execute_compat(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
                 fparams![
@@ -18696,9 +18872,8 @@ impl FrankenStorage {
         for ((_, _, conv), outcome) in conversations.iter().zip(&outcomes) {
             if conv.external_id.is_some()
                 && (shelley_metadata_is_authoritative(conv)
-                    || provider_workspace_attribution_is_authoritative(
+                    || provider_workspace_is_authoritative(
                         &conv.agent_slug,
-                        conv.external_id.as_deref(),
                         conv.workspace.as_deref(),
                         &conv.metadata_json,
                     ))
@@ -18712,11 +18887,7 @@ impl FrankenStorage {
             }
         }
 
-        if let Some(completion) = completion
-            && outcomes
-                .iter()
-                .all(|outcome| outcome.unresolved_message_conflicts == 0)
-        {
+        if let Some(completion) = completion {
             tx.execute_compat(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
                 fparams![completion.key.as_str(), completion.observation.as_str()],
@@ -18910,6 +19081,11 @@ fn ensure_agents_in_tx(
                     now
                 ],
             )?;
+            record_semantic_parent_repair(
+                tx,
+                "SELECT 1 FROM conversations WHERE agent_id = ?1 LIMIT 1",
+                fparams![agent_id],
+            )?;
         }
     }
     Ok(())
@@ -18950,6 +19126,11 @@ fn ensure_workspaces_in_tx(
             tx.execute_compat(
                 "INSERT OR IGNORE INTO workspaces(id, path) VALUES(?1, ?2)",
                 fparams![ws_id, path_str.as_str()],
+            )?;
+            record_semantic_parent_repair(
+                tx,
+                "SELECT 1 FROM conversations WHERE workspace_id = ?1 LIMIT 1",
+                fparams![ws_id],
             )?;
         }
     }
@@ -18997,6 +19178,11 @@ fn ensure_sources_in_tx(
                     now,
                     now
                 ],
+            )?;
+            record_semantic_parent_repair(
+                tx,
+                "SELECT 1 FROM conversations WHERE source_id = ?1 LIMIT 1",
+                fparams![source_id.as_str()],
             )?;
         }
     }
@@ -19114,273 +19300,6 @@ pub(crate) fn incompatible_legacy_fts_shadow_ddl(table: &str, ddl: &str) -> Opti
             "legacy {table} schema is not WITHOUT ROWID; this pre-fix FTS5 shadow shape can carry a stale implicit autoindex and must be rebuilt before full indexing"
         )
     })
-}
-
-/// The derived FTS shadow's catalog shape, classified from `sqlite_master`
-/// alone (GH #495).
-///
-/// The doctor's read-only probe and the mutating repair route must reach the
-/// same verdict about the same archive, and `_docsize` cardinality cannot
-/// carry that verdict: an intact legacy `_docsize` makes a shadow cass no
-/// longer writes look healthy, and derived tables that survived without their
-/// registration look merely absent. Both are residue, and only the
-/// drop+recreate repair route converges them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum FtsShadowCatalogVerdict {
-    /// No `fts_messages` registration row and no surviving derived shadow
-    /// table: there is no shadow to repair.
-    Absent,
-    /// Exactly one registration row carrying cass's canonical contentless DDL.
-    Canonical,
-    /// Derived residue: the shadow must be dropped and recreated from
-    /// canonical rows before it can serve lexical search again.
-    Residue { detail: String },
-    /// More than one `fts_messages` registration row: the catalog is
-    /// ambiguous and no in-place repair is safe.
-    Ambiguous { detail: String },
-}
-
-/// The number of `sqlite_master` rows named `fts_messages`.
-///
-/// The doctor's read-only probe and the mutating repair route count the
-/// catalog's registrations with this statement, so they classify an archive
-/// identically (GH #495).
-///
-/// The count deliberately carries **no** `type = 'table'` filter, because the
-/// repair path's own "is this catalog usable" decision counts every catalog
-/// row with that name: a count other than one means an ambiguous catalog the
-/// repair refuses to touch. Both surfaces must read the same statement, so
-/// the filter stays out of both. A stray trigger named `fts_messages` (a
-/// separate SQLite namespace) therefore makes the count two: the repair path
-/// calls the catalog unqueryable, and the doctor keeps its previous verdict
-/// rather than claiming a residue it cannot prove.
-pub(crate) const FTS_MESSAGES_REGISTRATION_ROW_COUNT_SQL: &str =
-    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'";
-
-/// The operator-facing command that rebuilds the derived FTS shadow from
-/// canonical rows.
-///
-/// A residue verdict is only actionable if it names the remedy, so every
-/// residue detail carries this command (GH #495). It is the same command the
-/// doctor's own check surface prints.
-pub(crate) const FTS_SHADOW_REBUILD_COMMAND: &str = "cass doctor --rebuild-canonical-fts --yes";
-
-/// The residue detail of the derived FTS shadow for a catalog that carries
-/// `fts_schema_rows` `fts_messages` registration rows, decided from
-/// `sqlite_master` alone.
-///
-/// `query` reads the catalog; it is a closure so the read-only doctor probe
-/// and the mutating repair path share these rules verbatim instead of
-/// re-deriving them (GH #495).
-pub(crate) fn fts_shadow_residue_detail_with_query(
-    fts_schema_rows: i64,
-    query: impl Fn(&str) -> std::result::Result<Vec<FrankenRow>, crate::franken_sync::FrankenError>,
-) -> Result<Option<String>> {
-    if fts_schema_rows == 0 {
-        let names = fts_residue_shadow_table_names_with_query(&query)?;
-        if !names.is_empty() {
-            return Ok(Some(format!(
-                "fts_messages registration is absent but derived shadow residue remains: {}; run '{}' to rebuild the derived shadow from canonical rows (canonical rows are never modified)",
-                names.join(", "),
-                FTS_SHADOW_REBUILD_COMMAND
-            )));
-        }
-        return Ok(None);
-    }
-    if fts_schema_rows == 1 && !fts_messages_schema_is_canonical_contentless_with_query(&query)? {
-        return Ok(Some(format!(
-            "fts_messages uses legacy/noncanonical DDL; _docsize parity cannot prove the engine rowid domain and the derived shadow must be recreated: run '{}' to rebuild it from canonical rows (canonical rows are never modified)",
-            FTS_SHADOW_REBUILD_COMMAND
-        )));
-    }
-    if fts_schema_rows == 1 {
-        // GH #374: a canonical registration over legacy rowid shadow tables.
-        // Row counts can match exactly, so without this the full index
-        // refused the archive and pointed at a repair that found nothing to
-        // do.
-        if let Some(problem) = fts_legacy_shadow_table_ddl_problem_with_query(&query)? {
-            return Ok(Some(problem));
-        }
-    }
-    Ok(None)
-}
-
-/// The catalog shape of the derived FTS shadow, decided from `sqlite_master`
-/// alone (GH #495).
-///
-/// This is the one classifier the doctor's read-only probe and the mutating
-/// repair route share, so the two surfaces cannot disagree about the same
-/// archive: `Residue` here means exactly what the repair route's `Residue`
-/// status means — the derived shadow must be dropped and recreated from
-/// canonical rows.
-pub(crate) fn fts_shadow_catalog_verdict_with_query(
-    query: impl Fn(&str) -> std::result::Result<Vec<FrankenRow>, crate::franken_sync::FrankenError>,
-) -> Result<FtsShadowCatalogVerdict> {
-    let registration_rows = fts_registration_row_count_with_query(&query)?;
-    let residue = fts_shadow_residue_detail_with_query(registration_rows, &query)?;
-    Ok(match registration_rows {
-        0 => match residue {
-            Some(detail) => FtsShadowCatalogVerdict::Residue { detail },
-            None => FtsShadowCatalogVerdict::Absent,
-        },
-        1 => match residue {
-            Some(detail) => FtsShadowCatalogVerdict::Residue { detail },
-            None => FtsShadowCatalogVerdict::Canonical,
-        },
-        other => FtsShadowCatalogVerdict::Ambiguous {
-            detail: format!(
-                "sqlite_master contains {other} fts_messages rows; expected exactly one"
-            ),
-        },
-    })
-}
-
-fn fts_registration_row_count_with_query(
-    query: &impl Fn(&str) -> std::result::Result<Vec<FrankenRow>, crate::franken_sync::FrankenError>,
-) -> Result<i64> {
-    let rows = query(FTS_MESSAGES_REGISTRATION_ROW_COUNT_SQL)?;
-    match rows.first() {
-        Some(row) => Ok(row.get_typed::<i64>(0)?),
-        None => Ok(0),
-    }
-}
-
-fn fts_residue_shadow_table_names_with_query(
-    query: &impl Fn(&str) -> std::result::Result<Vec<FrankenRow>, crate::franken_sync::FrankenError>,
-) -> Result<Vec<String>> {
-    let rows = query(
-        "SELECT name FROM sqlite_master
-         WHERE type = 'table' AND name IN (
-           'fts_messages_config','fts_messages_content','fts_messages_data',
-           'fts_messages_docsize','fts_messages_idx'
-         ) ORDER BY name",
-    )?;
-    let mut names = Vec::with_capacity(rows.len());
-    for row in &rows {
-        names.push(row.get_typed::<String>(0)?);
-    }
-    Ok(names)
-}
-
-fn fts_messages_schema_is_canonical_contentless_with_query(
-    query: &impl Fn(&str) -> std::result::Result<Vec<FrankenRow>, crate::franken_sync::FrankenError>,
-) -> Result<bool> {
-    let rows =
-        query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages'")?;
-    let mut saw_row = false;
-    let mut all_contentless = true;
-    for row in &rows {
-        saw_row = true;
-        let sql: Option<String> = row.get_typed(0)?;
-        let normalized: String = sql
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .split_whitespace()
-            .collect();
-        let has_empty_content =
-            normalized.contains("content=''") || normalized.contains("content=\"\"");
-        let has_contentless_delete = normalized.contains("contentless_delete=1");
-        if !(has_empty_content && has_contentless_delete) {
-            all_contentless = false;
-        }
-    }
-    Ok(saw_row && all_contentless)
-}
-
-fn fts_legacy_shadow_table_ddl_problem_with_query(
-    query: &impl Fn(&str) -> std::result::Result<Vec<FrankenRow>, crate::franken_sync::FrankenError>,
-) -> Result<Option<String>> {
-    let rows = query(
-        "SELECT name, sql FROM sqlite_master
-         WHERE type = 'table' AND name IN ('fts_messages_config', 'fts_messages_idx')
-         ORDER BY name",
-    )?;
-    let mut shadow_ddl = Vec::with_capacity(rows.len());
-    for row in &rows {
-        shadow_ddl.push((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?));
-    }
-    Ok(shadow_ddl
-        .iter()
-        .find_map(|(table, ddl)| incompatible_legacy_fts_shadow_ddl(table, ddl)))
-}
-
-/// Whether an FTS shadow insert failed because the derived shadow already
-/// holds that rowid (GH #495).
-///
-/// The engine reports this as a primary-key violation: the row is present in
-/// the shadow but missing from the `_docsize` bookkeeping the catch-up probe
-/// consulted, so the shadow's rowid domain disagrees with the probe. The
-/// same insert can never succeed, so the repair must move to the reviewed
-/// drop+recreate route instead of retrying the same insert forever — that is
-/// the reporter's "PRIMARY KEY constraint failed" on a legacy archive.
-///
-/// An unrelated storage error (I/O, corruption, a busy database) is not a
-/// collision and keeps its own truthful failure: dropping a repairable
-/// shadow because of a disk error would destroy a good artifact.
-pub(crate) fn fts_insert_error_is_rowid_collision(error: &anyhow::Error) -> bool {
-    // The classification must be pinned to the FTS shadow insert: a primary
-    // key violation raised by any other statement in the same operation must
-    // not take the destructive drop+recreate route. The insert's own context
-    // names the shadow it wrote, so require both signals.
-    let mut collision = false;
-    let mut fts_shadow_insert = false;
-    for cause in error.chain() {
-        if matches!(
-            cause.downcast_ref::<crate::franken_sync::FrankenError>(),
-            Some(crate::franken_sync::FrankenError::PrimaryKeyViolation)
-        ) {
-            collision = true;
-        }
-        // ubs:ignore[rust.perf.string-alloc-in-loop] -- Error-chain Display text is materialized only on a failed insert to distinguish FTS collisions from unrelated primary-key failures.
-        if cause.to_string().contains("into fts_messages") {
-            fts_shadow_insert = true;
-        }
-    }
-    collision && fts_shadow_insert
-}
-
-#[cfg(test)]
-mod fts_collision_classification_tests {
-    use super::fts_insert_error_is_rowid_collision;
-
-    /// GH #495: a rowid collision and an unrelated storage error must be
-    /// distinguishable, because only the collision may be routed to the
-    /// destructive drop+recreate repair.
-    #[test]
-    fn fts_rowid_collision_is_distinguished_from_unrelated_storage_errors() {
-        let collision: anyhow::Error =
-            anyhow::Error::new(crate::franken_sync::FrankenError::PrimaryKeyViolation)
-                .context("inserting 3 rows into fts_messages during streaming FTS maintenance");
-        assert!(
-            fts_insert_error_is_rowid_collision(&collision),
-            "a primary-key violation from the FTS insert is a rowid collision"
-        );
-
-        let unrelated: anyhow::Error =
-            anyhow::Error::new(crate::franken_sync::FrankenError::DatabaseFull)
-                .context("inserting 3 rows into fts_messages during streaming FTS maintenance");
-        assert!(
-            !fts_insert_error_is_rowid_collision(&unrelated),
-            "an unrelated storage error must not be treated as a rowid collision"
-        );
-
-        let not_an_error = anyhow::anyhow!("the shadow was never reachable");
-        assert!(
-            !fts_insert_error_is_rowid_collision(&not_an_error),
-            "a plain error carries no collision"
-        );
-
-        // The classification is pinned to the FTS shadow insert: a primary
-        // key violation from another statement must not take the destructive
-        // drop+recreate route.
-        let foreign_collision: anyhow::Error =
-            anyhow::Error::new(crate::franken_sync::FrankenError::PrimaryKeyViolation)
-                .context("inserting 3 rows into messages during a canonical import");
-        assert!(
-            !fts_insert_error_is_rowid_collision(&foreign_collision),
-            "a primary-key violation outside the FTS shadow insert is not a shadow collision"
-        );
-    }
 }
 
 pub(crate) fn fts_shadow_not_viable_detail(corpus_messages: u64, bound_messages: u64) -> String {
@@ -19637,6 +19556,7 @@ fn franken_promote_pi_family_external_identity_by_source_path(
             "UPDATE conversations SET external_id = ?1 WHERE id = ?2",
             fparams![external_id, existing_id],
         )?;
+        record_semantic_conversation_changes(tx, &[existing_id], true)?;
     }
 
     let existing = ExistingConversationWithTail {
@@ -20064,6 +19984,7 @@ fn franken_insert_conversation(
     ) {
         Ok(_) => {
             let conv_id = franken_last_rowid(tx)?;
+            record_semantic_conversation_changes(tx, &[conv_id], false)?;
             franken_insert_conversation_tail_state(
                 tx,
                 conv_id,
@@ -20205,13 +20126,10 @@ const MESSAGE_INSERT_BATCH_SIZE: usize = 100;
 /// profile. 100-row chunks slightly regress the 20-message workload.
 const APPEND_MESSAGE_INSERT_BATCH_SIZE: usize = 50;
 
-fn message_insert_batch_sql(row_count: usize) -> Result<&'static str> {
+fn message_insert_batch_sql(row_count: usize) -> &'static str {
     static MESSAGE_INSERT_BATCH_SQL: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
     let max_batch_size = MESSAGE_INSERT_BATCH_SIZE.max(APPEND_MESSAGE_INSERT_BATCH_SIZE);
-    if row_count == 0 || row_count > max_batch_size {
-        anyhow::bail!("message insert batch size {row_count} must be within 1..={max_batch_size}");
-    }
     let cached_sql = MESSAGE_INSERT_BATCH_SQL.get_or_init(|| {
         let mut sql_by_row_count = Vec::with_capacity(max_batch_size + 1);
         sql_by_row_count.push(String::new());
@@ -20233,7 +20151,7 @@ fn message_insert_batch_sql(row_count: usize) -> Result<&'static str> {
                 })
                 .collect::<Vec<_>>()
                 .join(",");
-            sql_by_row_count.push(format!( // ubs:ignore[rust.perf.string-alloc-in-loop] -- Populate the bounded row-count SQL cache once; normal batch insertion reuses these owned templates.
+            sql_by_row_count.push(format!(
                 "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES {placeholders}"
             ));
         }
@@ -20243,7 +20161,7 @@ fn message_insert_batch_sql(row_count: usize) -> Result<&'static str> {
     cached_sql
         .get(row_count)
         .map(String::as_str)
-        .ok_or_else(|| anyhow!("cached message insert SQL is missing row count {row_count}"))
+        .expect("message insert batch size must be covered by the cached SQL table")
 }
 
 fn franken_batch_insert_new_messages(
@@ -20280,6 +20198,8 @@ fn franken_append_insert_new_messages<'a>(
             inserted.push((message_id, *msg));
         }
     }
+    let inserted_ids = inserted.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    record_semantic_message_insertions(tx, conversation_id, &inserted_ids)?;
     Ok(inserted)
 }
 
@@ -20296,7 +20216,7 @@ fn franken_batch_insert_new_messages_with_batch_size(
             inserted_ids.push(franken_insert_new_message(tx, conversation_id, chunk[0])?);
             continue;
         }
-        let sql = message_insert_batch_sql(chunk.len())?;
+        let sql = message_insert_batch_sql(chunk.len());
 
         let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 8);
         for msg in chunk {
@@ -20325,6 +20245,7 @@ fn franken_batch_insert_new_messages_with_batch_size(
         inserted_ids.extend((0..chunk.len()).map(|offset| first_id + offset as i64));
     }
 
+    record_semantic_message_insertions(tx, conversation_id, &inserted_ids)?;
     Ok(inserted_ids)
 }
 
@@ -20423,7 +20344,7 @@ fn franken_batch_insert_new_messages_with_profile_batch_size(
         profile.batch_rows += chunk.len();
 
         let sql_build_start = Instant::now();
-        let sql = message_insert_batch_sql(chunk.len())?;
+        let sql = message_insert_batch_sql(chunk.len());
         profile.sql_build_duration += sql_build_start.elapsed();
 
         let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 8);
@@ -20462,6 +20383,7 @@ fn franken_batch_insert_new_messages_with_profile_batch_size(
         profile.rowid_duration += rowid_start.elapsed();
     }
 
+    record_semantic_message_insertions(tx, conversation_id, &inserted_ids)?;
     Ok(inserted_ids)
 }
 
@@ -20519,21 +20441,16 @@ struct ExistingMessageLookup {
     replay: HashSet<MessageReplayFingerprint>,
 }
 
-fn existing_message_lookup_from_query(
-    tx: &FrankenTransaction<'_>,
-    sql: &str,
-    params: &[ParamValue],
+fn existing_message_lookup_from_rows(
+    rows: Vec<FrankenRow>,
     min_idx: i64,
     max_idx: i64,
     created_bounds: Option<(i64, i64)>,
     replay_full_scan: bool,
-) -> Result<(ExistingMessageLookup, usize)> {
-    let mut by_idx = HashMap::new();
-    let mut replay = HashSet::new();
-    let mut scanned_rows = 0;
-    // The transaction mapper streams rows. Its unit-valued result retains
-    // no text payloads, even when a timestamp range covers a giant history.
-    let _: Vec<()> = tx.query_map_collect(sql, params, |row| {
+) -> Result<ExistingMessageLookup> {
+    let mut by_idx = HashMap::with_capacity(rows.len());
+    let mut replay = HashSet::with_capacity(rows.len());
+    for row in rows {
         let idx: i64 = row.get_typed(0)?;
         let role: String = row.get_typed(1)?;
         let author: Option<String> = row.get_typed(2)?;
@@ -20570,10 +20487,8 @@ fn existing_message_lookup_from_query(
                 content_hash,
             });
         }
-        scanned_rows += 1;
-        Ok(())
-    })?;
-    Ok((ExistingMessageLookup { by_idx, replay }, scanned_rows))
+    }
+    Ok(ExistingMessageLookup { by_idx, replay })
 }
 
 fn franken_existing_message_lookup(
@@ -20598,39 +20513,31 @@ fn franken_existing_message_lookup(
         .map(|msg| msg.idx)
         .max()
         .unwrap_or(min_idx);
-    let mut by_idx = HashMap::with_capacity(incoming_messages.len());
-    // Presence is not content parity: hash the actual stored variant rather
-    // than copying the incoming fingerprint into the lookup. Stream the text
-    // so rereading a large source retains only fingerprints, not its bodies.
-    let idx_rows: Vec<()> = tx.query_map_collect(
-        "SELECT idx, role, author, created_at, content
+    let idx_rows = tx.query_params(
+        "SELECT idx
          FROM messages INDEXED BY sqlite_autoindex_messages_1
          WHERE conversation_id = ?1
            AND idx >= ?2
            AND idx <= ?3",
         fparams![conversation_id, min_idx, max_idx],
-        |row| {
-            let idx: i64 = row.get_typed(0)?;
-            let role: String = row.get_typed(1)?;
-            let content: String = row.get_typed(4)?;
-            by_idx.insert(
-                idx,
-                MessageMergeFingerprint {
-                    idx,
-                    role: role_from_str(&role),
-                    author: row.get_typed(2)?,
-                    created_at: row.get_typed(3)?,
-                    content_hash: *blake3::hash(content.as_bytes()).as_bytes(),
-                },
-            );
-            Ok(())
-        },
     )?;
     record_message_lookup_bounded_queries(1, idx_rows.len());
 
+    let mut existing_indices = HashSet::with_capacity(idx_rows.len());
+    for row in idx_rows {
+        let idx: i64 = row.get_typed(0)?;
+        existing_indices.insert(idx);
+    }
+
+    let mut by_idx = HashMap::with_capacity(incoming_messages.len().min(existing_indices.len()));
     let mut missing_messages = Vec::new();
     for msg in incoming_messages {
-        if !by_idx.contains_key(&msg.idx) {
+        if existing_indices.contains(&msg.idx) {
+            // Same-idx messages are skipped by merge policy even when content has
+            // diverged. Use the incoming fingerprint as a lightweight presence
+            // marker so normal reprocessing does not need to read stored content.
+            by_idx.insert(msg.idx, message_merge_fingerprint(msg));
+        } else {
             missing_messages.push(msg);
         }
     }
@@ -20658,23 +20565,19 @@ fn franken_existing_message_lookup(
 
     let mut replay = HashSet::new();
     if requires_full_scan {
-        let (content_lookup, scanned_rows) = existing_message_lookup_from_query(
-            tx,
+        let rows = tx.query_params(
             "SELECT idx, role, author, created_at, content
              FROM messages INDEXED BY sqlite_autoindex_messages_1
              WHERE conversation_id = ?1",
             fparams![conversation_id],
-            min_idx,
-            max_idx,
-            created_bounds,
-            true,
         )?;
-        record_message_lookup_full_scan_query(scanned_rows);
+        record_message_lookup_full_scan_query(rows.len());
+        let content_lookup =
+            existing_message_lookup_from_rows(rows, min_idx, max_idx, created_bounds, true)?;
         by_idx.extend(content_lookup.by_idx);
         replay.extend(content_lookup.replay);
     } else if let Some((min_created_at, max_created_at)) = created_bounds {
-        let (created_lookup, scanned_rows) = existing_message_lookup_from_query(
-            tx,
+        let rows = tx.query_params(
             "SELECT idx, role, author, created_at, content
              FROM messages INDEXED BY sqlite_autoindex_messages_1
              WHERE conversation_id = ?1
@@ -20682,12 +20585,10 @@ fn franken_existing_message_lookup(
                AND created_at >= ?2
                AND created_at <= ?3",
             fparams![conversation_id, min_created_at, max_created_at],
-            min_idx,
-            max_idx,
-            created_bounds,
-            false,
         )?;
-        record_message_lookup_bounded_queries(1, scanned_rows);
+        record_message_lookup_bounded_queries(1, rows.len());
+        let created_lookup =
+            existing_message_lookup_from_rows(rows, min_idx, max_idx, created_bounds, false)?;
         by_idx.extend(created_lookup.by_idx);
         replay.extend(created_lookup.replay);
     }
@@ -20770,8 +20671,8 @@ fn franken_collect_batched_existing_new_messages<'a>(
             .unwrap_or_default();
         for msg in &tail_plan.messages {
             let fingerprint = message_merge_fingerprint(msg);
+            by_idx.insert(msg.idx, fingerprint.clone());
             replay.insert(replay_fingerprint_from_merge(&fingerprint));
-            by_idx.insert(msg.idx, fingerprint);
         }
         return Ok((tail_plan, by_idx, replay));
     }
@@ -20805,8 +20706,8 @@ fn franken_collect_batched_existing_new_messages<'a>(
             .unwrap_or_default();
         for msg in &tail_plan.messages {
             let fingerprint = message_merge_fingerprint(msg);
+            by_idx.insert(msg.idx, fingerprint.clone());
             replay.insert(replay_fingerprint_from_merge(&fingerprint));
-            by_idx.insert(msg.idx, fingerprint);
         }
         return Ok((tail_plan, by_idx, replay));
     }
@@ -20828,8 +20729,8 @@ fn franken_collect_batched_existing_new_messages<'a>(
             .unwrap_or_default();
         for msg in &tail_plan.messages {
             let fingerprint = message_merge_fingerprint(msg);
+            by_idx.insert(msg.idx, fingerprint.clone());
             replay.insert(replay_fingerprint_from_merge(&fingerprint));
-            by_idx.insert(msg.idx, fingerprint);
         }
         return Ok((tail_plan, by_idx, replay));
     }
@@ -20883,7 +20784,6 @@ fn franken_batch_insert_fts(
             .enumerate()
             .map(|(i, _)| {
                 let base = i * 7 + 1; // +1 for 1-indexed params
-                // ubs:ignore[rust.perf.string-alloc-in-loop] -- Each row contributes seven distinct numbered placeholders to this bounded FTS statement; content remains bound.
                 format!(
                     "(?{},?{},?{},?{},?{},?{},?{})",
                     base,
@@ -20898,7 +20798,6 @@ fn franken_batch_insert_fts(
             .collect::<Vec<_>>()
             .join(",");
 
-        // ubs:ignore[rust.perf.string-alloc-in-loop] -- One SQL string is required per bounded FTS chunk to match its actual placeholder count, including the final short chunk.
         let sql = format!(
             "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at) VALUES {placeholders}"
         );
@@ -20932,7 +20831,6 @@ fn franken_batch_insert_fts(
                 inserted += chunk.len();
             }
             Err(err) => {
-                // ubs:ignore[rust.perf.string-alloc-in-loop] -- Only a failed FTS batch formats this diagnostic, then returns without another iteration.
                 if err.to_string().contains("no such table") {
                     // Fresh DB / Tantivy-authoritative path (#295): the FTS5
                     // shadow tables are not materialized yet. db-resident FTS
@@ -20976,7 +20874,6 @@ fn franken_batch_insert_fts_on_connection(
             .enumerate()
             .map(|(i, _)| {
                 let base = i * 7 + 1;
-                // ubs:ignore[rust.perf.string-alloc-in-loop] -- The streaming connection path emits one seven-column placeholder group per row in a capped FTS chunk.
                 format!(
                     "(?{},?{},?{},?{},?{},?{},?{})",
                     base,
@@ -20991,7 +20888,6 @@ fn franken_batch_insert_fts_on_connection(
             .collect::<Vec<_>>()
             .join(",");
 
-        // ubs:ignore[rust.perf.string-alloc-in-loop] -- This connection-local FTS batch owns one statement with the exact bounded chunk arity; message values are parameters.
         let sql = format!(
             "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at) VALUES {placeholders}"
         );
@@ -21009,7 +20905,6 @@ fn franken_batch_insert_fts_on_connection(
 
         conn.execute_with_params(&sql, &param_values)
             .with_context(|| {
-                // ubs:ignore[rust.perf.string-alloc-in-loop] -- Lazy error context allocates only when a streaming FTS insert fails, preserving the failed batch size.
                 format!(
                     "inserting {} rows into fts_messages during streaming FTS maintenance",
                     chunk.len()
@@ -21356,19 +21251,13 @@ fn franken_insert_token_usage_batched_in_tx(
             ParamValue::from(e.conversation_id),
             ParamValue::from(e.agent_id),
             ParamValue::from(e.workspace_id),
-            // ubs:ignore[rust.collections.clone-in-loop] -- The owned token-usage parameter keeps the source identity independent of the retained input entry.
             ParamValue::from(e.source_id.clone()),
             ParamValue::from(e.timestamp_ms),
             ParamValue::from(e.day_id),
-            // ubs:ignore[rust.collections.clone-in-loop] -- Bind the optional model name without consuming the input entry, which remains available to the caller.
             ParamValue::from(e.model_name.clone()),
-            // ubs:ignore[rust.collections.clone-in-loop] -- The SQL parameter owns the normalized family while this borrowed usage batch remains intact.
             ParamValue::from(e.model_family.clone()),
-            // ubs:ignore[rust.collections.clone-in-loop] -- Preserve the borrowed usage entry while supplying an owned optional model-tier parameter.
             ParamValue::from(e.model_tier.clone()),
-            // ubs:ignore[rust.collections.clone-in-loop] -- The service-tier parameter must outlive its conversion without moving a field out of the borrowed usage entry.
             ParamValue::from(e.service_tier.clone()),
-            // ubs:ignore[rust.collections.clone-in-loop] -- Keep the caller's provider metadata intact while the SQL argument owns its text.
             ParamValue::from(e.provider.clone()),
             ParamValue::from(e.input_tokens),
             ParamValue::from(e.output_tokens),
@@ -21377,12 +21266,10 @@ fn franken_insert_token_usage_batched_in_tx(
             ParamValue::from(e.thinking_tokens),
             ParamValue::from(e.total_tokens),
             ParamValue::from(e.estimated_cost_usd),
-            // ubs:ignore[rust.collections.clone-in-loop] -- The per-row role argument owns its bytes; the source token-usage record is borrowed and reusable.
             ParamValue::from(e.role.clone()),
             ParamValue::from(e.content_chars),
             ParamValue::from(e.has_tool_calls as i64),
             ParamValue::from(e.tool_call_count as i64),
-            // ubs:ignore[rust.collections.clone-in-loop] -- Bind an owned provenance label without changing the caller's retained usage entry.
             ParamValue::from(e.data_source.clone()),
         ];
 
@@ -21413,13 +21300,13 @@ fn franken_update_token_daily_stats_batched_in_tx(
 }
 
 /// Live Track B rollup table.
-const TOKEN_DAILY_STATS_TABLE: &str = "token_daily_stats"; // ubs:ignore -- Public analytics table name, not a credential.
+const TOKEN_DAILY_STATS_TABLE: &str = "token_daily_stats";
 /// Persistent staging table for a resumable Track B rebuild (GH #386). Same
 /// shape as [`TOKEN_DAILY_STATS_TABLE`]; the live table is only touched by the
 /// final atomic swap.
-const TOKEN_DAILY_STATS_REBUILD_STAGE_TABLE: &str = "token_daily_stats_rebuild_stage"; // ubs:ignore -- Public staging table name, not a credential.
+const TOKEN_DAILY_STATS_REBUILD_STAGE_TABLE: &str = "token_daily_stats_rebuild_stage";
 /// `meta` key holding the persisted rebuild cursor (GH #386).
-const TOKEN_DAILY_STATS_REBUILD_CURSOR_KEY: &str = "token_daily_stats_rebuild_cursor"; // ubs:ignore -- Public metadata key for a numeric rebuild cursor, not a credential.
+const TOKEN_DAILY_STATS_REBUILD_CURSOR_KEY: &str = "token_daily_stats_rebuild_cursor";
 /// Same-row ledger revisions must invalidate both resumed and active rebuilds.
 const TOKEN_USAGE_REVISION_GENERATION_META_KEY: &str = "token_usage_revision_generation";
 
@@ -21434,7 +21321,6 @@ fn franken_update_token_daily_stats_batched_in_tx_for_table(
     if entries.is_empty() {
         return Ok(0);
     }
-    // ubs:ignore -- Production callers pass only the live or rebuild-stage table constants, preventing caller-controlled SQL identifiers.
     debug_assert!(
         table == TOKEN_DAILY_STATS_TABLE || table == TOKEN_DAILY_STATS_REBUILD_STAGE_TABLE,
         "token daily stats upsert target must be a known table constant"
@@ -21521,31 +21407,22 @@ fn franken_insert_message_metrics_batched_in_tx(
             ParamValue::from(e.created_at_ms),
             ParamValue::from(e.hour_id),
             ParamValue::from(e.day_id),
-            // ubs:ignore[rust.collections.clone-in-loop] -- The metrics SQL argument owns its agent label while this borrowed batch remains available for rollups.
             ParamValue::from(e.agent_slug.clone()),
             ParamValue::from(e.workspace_id),
-            // ubs:ignore[rust.collections.clone-in-loop] -- Preserve the source dimension in the retained metrics record while binding owned text for insertion.
             ParamValue::from(e.source_id.clone()),
-            // ubs:ignore[rust.collections.clone-in-loop] -- Bind the role without moving it out of the caller's borrowed metrics entry.
             ParamValue::from(e.role.clone()),
             ParamValue::from(e.content_chars),
             ParamValue::from(e.content_tokens_est),
-            // ubs:ignore[rust.collections.clone-in-loop] -- The optional model name is retained for aggregation and separately owned by this SQL argument.
             ParamValue::from(e.model_name.clone()),
-            // ubs:ignore[rust.collections.clone-in-loop] -- The model-family dimension must remain in the borrowed metrics batch after insertion.
             ParamValue::from(e.model_family.clone()),
-            // ubs:ignore[rust.collections.clone-in-loop] -- Supply an owned tier argument while preserving the caller's metrics dimensions.
             ParamValue::from(e.model_tier.clone()),
-            // ubs:ignore[rust.collections.clone-in-loop] -- Preserve provider attribution in the retained metrics entry and bind a separate owned SQL value.
             ParamValue::from(e.provider.clone()),
             ParamValue::from(e.api_input_tokens),
             ParamValue::from(e.api_output_tokens),
             ParamValue::from(e.api_cache_read_tokens),
             ParamValue::from(e.api_cache_creation_tokens),
             ParamValue::from(e.api_thinking_tokens),
-            // ubs:ignore[rust.collections.clone-in-loop] -- The optional API tier cannot be moved from the shared metrics batch used after this insert.
             ParamValue::from(e.api_service_tier.clone()),
-            // ubs:ignore[rust.collections.clone-in-loop] -- Retain API provenance for later rollups while its bound parameter owns the same short label.
             ParamValue::from(e.api_data_source.clone()),
             ParamValue::from(e.tool_call_count),
             ParamValue::from(e.has_tool_calls as i64),
@@ -21573,21 +21450,21 @@ fn franken_insert_message_metrics_batched_in_tx(
 }
 
 /// Flush one rollup table (shared logic for hourly + daily) within a frankensqlite transaction.
-fn franken_flush_rollup_table<'a>(
+fn franken_flush_rollup_table(
     tx: &FrankenTransaction<'_>,
     table: &str,
     bucket_col: &str,
-    deltas: impl IntoIterator<Item = ((i64, &'a str, i64, &'a str), &'a UsageRollupDelta)>,
+    deltas: &HashMap<(i64, String, i64, String), UsageRollupDelta>,
     now: i64,
 ) -> Result<usize> {
-    let mut deltas = deltas.into_iter().peekable();
-    if deltas.peek().is_none() {
+    if deltas.is_empty() {
         return Ok(0);
     }
 
     let mut total_affected = 0;
 
-    let sql = format!(
+    for ((bucket_id, agent, workspace_id, source), d) in deltas {
+        let sql = format!(
             "INSERT INTO {table} (
                 {bucket_col}, agent_slug, workspace_id, source_id,
                 message_count, user_message_count, assistant_message_count,
@@ -21618,16 +21495,15 @@ fn franken_flush_rollup_table<'a>(
                 api_cache_creation_tokens_total = api_cache_creation_tokens_total + excluded.api_cache_creation_tokens_total,
                 api_thinking_tokens_total = api_thinking_tokens_total + excluded.api_thinking_tokens_total,
                 last_updated = excluded.last_updated"
-    );
+        );
 
-    for ((bucket_id, agent, workspace_id, source), d) in deltas {
         total_affected += tx.execute_compat(
             &sql,
             fparams![
-                bucket_id,
-                agent,
-                workspace_id,
-                source,
+                *bucket_id,
+                agent.as_str(),
+                *workspace_id,
+                source.as_str(),
                 d.message_count,
                 d.user_message_count,
                 d.assistant_message_count,
@@ -21654,16 +21530,15 @@ fn franken_flush_rollup_table<'a>(
 }
 
 /// Flush usage_models_daily rollup within a frankensqlite transaction.
-fn franken_flush_model_daily_rollup_table<'a>(
+fn franken_flush_model_daily_rollup_table(
     tx: &FrankenTransaction<'_>,
-    deltas: impl IntoIterator<
-        Item = (
-            (i64, &'a str, i64, &'a str, &'a str, &'a str),
-            &'a UsageRollupDelta,
-        ),
-    >,
+    deltas: &HashMap<(i64, String, i64, String, String, String), UsageRollupDelta>,
     now: i64,
 ) -> Result<usize> {
+    if deltas.is_empty() {
+        return Ok(0);
+    }
+
     let mut total_affected = 0;
 
     for ((day_id, agent, workspace_id, source, model_family, model_tier), d) in deltas {
@@ -21696,12 +21571,12 @@ fn franken_flush_model_daily_rollup_table<'a>(
                 api_thinking_tokens_total = api_thinking_tokens_total + excluded.api_thinking_tokens_total,
                 last_updated = excluded.last_updated",
             fparams![
-                day_id,
-                agent,
-                workspace_id,
-                source,
-                model_family,
-                model_tier,
+                *day_id,
+                agent.as_str(),
+                *workspace_id,
+                source.as_str(),
+                model_family.as_str(),
+                model_tier.as_str(),
                 d.message_count,
                 d.user_message_count,
                 d.assistant_message_count,
@@ -21732,53 +21607,10 @@ fn franken_flush_analytics_rollups_in_tx(
 ) -> Result<(usize, usize, usize)> {
     let now = FrankenStorage::now_millis();
 
-    let hourly_affected = franken_flush_rollup_table(
-        tx,
-        "usage_hourly",
-        "hour_id",
-        agg.hourly
-            .iter()
-            .map(|((bucket, agent, workspace, source), delta)| {
-                (
-                    (*bucket, agent.as_str(), *workspace, source.as_str()),
-                    delta,
-                )
-            }),
-        now,
-    )?;
-    let daily_affected = franken_flush_rollup_table(
-        tx,
-        "usage_daily",
-        "day_id",
-        agg.daily
-            .iter()
-            .map(|((bucket, agent, workspace, source), delta)| {
-                (
-                    (*bucket, agent.as_str(), *workspace, source.as_str()),
-                    delta,
-                )
-            }),
-        now,
-    )?;
-    let models_daily_affected = franken_flush_model_daily_rollup_table(
-        tx,
-        agg.models_daily
-            .iter()
-            .map(|((day, agent, workspace, source, family, tier), delta)| {
-                (
-                    (
-                        *day,
-                        agent.as_str(),
-                        *workspace,
-                        source.as_str(),
-                        family.as_str(),
-                        tier.as_str(),
-                    ),
-                    delta,
-                )
-            }),
-        now,
-    )?;
+    let hourly_affected =
+        franken_flush_rollup_table(tx, "usage_hourly", "hour_id", &agg.hourly, now)?;
+    let daily_affected = franken_flush_rollup_table(tx, "usage_daily", "day_id", &agg.daily, now)?;
+    let models_daily_affected = franken_flush_model_daily_rollup_table(tx, &agg.models_daily, now)?;
 
     Ok((hourly_affected, daily_affected, models_daily_affected))
 }
@@ -21793,9 +21625,8 @@ fn franken_reassociate_provider_analytics_workspace(
 ) -> Result<()> {
     if conv.external_id.is_none()
         || !(shelley_metadata_is_authoritative(conv)
-            || provider_workspace_attribution_is_authoritative(
+            || provider_workspace_is_authoritative(
                 &conv.agent_slug,
-                conv.external_id.as_deref(),
                 conv.workspace.as_deref(),
                 &conv.metadata_json,
             ))
@@ -21820,7 +21651,6 @@ fn franken_reassociate_provider_analytics_workspace(
         let mut params: Vec<ParamValue> = ids.iter().copied().map(ParamValue::from).collect();
         params.push(ParamValue::from(metrics_workspace));
         let entries = tx.query_map_collect(
-            // ubs:ignore[rust.perf.string-alloc-in-loop] -- A capped 128-ID query owns the exact IN-list arity needed to move only this conversation's metrics.
             &format!(
                 "SELECT message_id, created_at_ms, hour_id, day_id,
                 agent_slug, workspace_id, source_id, role, content_chars, content_tokens_est,
@@ -21884,10 +21714,10 @@ fn franken_reassociate_provider_analytics_workspace(
                 tx,
                 table,
                 bucket_col,
-                std::iter::once((
-                    (*bucket, agent.as_str(), metrics_workspace, source.as_str()),
-                    delta,
-                )),
+                &HashMap::from([(
+                    (*bucket, agent.clone(), metrics_workspace, source.clone()),
+                    delta.clone(),
+                )]),
                 destination_updated,
             )?;
         }
@@ -21910,17 +21740,17 @@ fn franken_reassociate_provider_analytics_workspace(
         )?;
         franken_flush_model_daily_rollup_table(
             tx,
-            std::iter::once((
+            &HashMap::from([(
                 (
                     *day,
-                    agent.as_str(),
+                    agent.clone(),
                     metrics_workspace,
-                    source.as_str(),
-                    family.as_str(),
-                    tier.as_str(),
+                    source.clone(),
+                    family.clone(),
+                    tier.clone(),
                 ),
-                delta,
-            )),
+                delta.clone(),
+            )]),
             destination_updated,
         )?;
     }
@@ -21928,12 +21758,10 @@ fn franken_reassociate_provider_analytics_workspace(
         let mut params: Vec<ParamValue> = ids.iter().copied().map(ParamValue::from).collect();
         params.push(ParamValue::from(metrics_workspace));
         let id_slots = (1..=ids.len())
-            // ubs:ignore[rust.perf.string-alloc-in-loop] -- The capped workspace-update batch needs one numbered parameter slot for each actual message ID.
             .map(|idx| format!("?{idx}"))
             .collect::<Vec<_>>()
             .join(", ");
         tx.execute_compat(
-            // ubs:ignore[rust.perf.string-alloc-in-loop] -- Emit one bounded workspace-update statement with its actual parameter count; all IDs and workspace values stay bound.
             &format!("UPDATE message_metrics SET workspace_id = ?{} WHERE message_id IN ({}) AND workspace_id != ?{}",
                 params.len(), id_slots, params.len()),
             &params,
@@ -22029,9 +21857,7 @@ fn franken_relocate_rollup_subtract(
             "Cursor workspace analytics drift: negative {column} contribution"
         );
         params.push(ParamValue::from(amount));
-        // ubs:ignore[rust.perf.string-alloc-in-loop] -- Each fixed rollup counter contributes one distinct parameterized subtraction assignment to the single atomic update.
         assignments.push(format!("{column} = {column} - ?{}", params.len()));
-        // ubs:ignore[rust.perf.string-alloc-in-loop] -- Pair every fixed counter with its non-underflow guard; amount values remain SQL parameters.
         guards.push(format!("{column} >= ?{}", params.len()));
     }
     let changed = tx.execute_compat(
@@ -22315,7 +22141,6 @@ impl FrankenStorage {
                 last_conversation_id = conversation_id;
                 let conversation_day_id = started_at.map(Self::day_id_from_millis).unwrap_or(0);
                 let mut last_token_usage_id = 0_i64;
-                // ubs:ignore[rust.perf.string-alloc-in-loop] -- One owned accumulator survives this conversation's paged usage rows and is replaced only by observed model metadata.
                 let mut session_model_family = String::from("unknown");
 
                 loop {
@@ -22706,7 +22531,6 @@ impl FrankenStorage {
             // Preserve the previous all-table reset for unexpected layouts.
             // This fallback deliberately carries no row-count/RSS bound.
             for (table, _, _) in TABLES {
-                // ubs:ignore[rust.perf.string-alloc-in-loop] -- A one-time reset visits the fixed analytics-table list; SQL identifiers cannot be bound as parameters.
                 tx.execute(&format!("DELETE FROM {table}"))?;
                 if let Some(control) = control {
                     control()?;
@@ -22900,32 +22724,26 @@ impl FrankenStorage {
                         // A stale cursor over existing rows would replay additive
                         // rollups even when metric INSERT OR IGNORE skips them.
                         let mut empty = true;
-                        for (query, context) in [
-                            (
-                                "SELECT 1 FROM message_metrics LIMIT 1",
-                                "validating initial analytics cursor against message_metrics",
-                            ),
-                            (
-                                "SELECT 1 FROM usage_hourly LIMIT 1",
-                                "validating initial analytics cursor against usage_hourly",
-                            ),
-                            (
-                                "SELECT 1 FROM usage_daily LIMIT 1",
-                                "validating initial analytics cursor against usage_daily",
-                            ),
-                            (
-                                "SELECT 1 FROM usage_models_daily LIMIT 1",
-                                "validating initial analytics cursor against usage_models_daily",
-                            ),
+                        for table in [
+                            "message_metrics",
+                            "usage_hourly",
+                            "usage_daily",
+                            "usage_models_daily",
                         ] {
                             if let Some(control) = control {
                                 control()?;
                             }
                             let row: Option<i64> = self
                                 .conn
-                                .query_row_map(query, fparams![], |row| row.get_typed(0))
+                                .query_row_map(
+                                    &format!("SELECT 1 FROM {table} LIMIT 1"),
+                                    fparams![],
+                                    |row| row.get_typed(0),
+                                )
                                 .optional()
-                                .context(context)?;
+                                .with_context(|| {
+                                    format!("validating initial analytics cursor against {table}")
+                                })?;
                             if row.is_some() {
                                 empty = false;
                                 break;
@@ -23202,13 +23020,18 @@ impl FrankenStorage {
                     .model_name
                     .as_deref()
                     .map(crate::connectors::normalize_model);
-                let (model_family, model_tier, inferred_provider) = model_info
-                    .map(|info| (info.family, info.tier, Some(info.provider)))
-                    .unwrap_or_else(|| ("unknown".into(), "unknown".into(), None));
+                let model_family = model_info
+                    .as_ref()
+                    .map(|i| i.family.clone())
+                    .unwrap_or_else(|| "unknown".into());
+                let model_tier = model_info
+                    .as_ref()
+                    .map(|i| i.tier.clone())
+                    .unwrap_or_else(|| "unknown".into());
                 let provider = usage
                     .provider
-                    .take()
-                    .or(inferred_provider)
+                    .clone()
+                    .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
                     .unwrap_or_else(|| "unknown".into());
 
                 let entry = MessageMetricsEntry {
@@ -23219,7 +23042,6 @@ impl FrankenStorage {
                     agent_slug: agent_slug.clone(),
                     workspace_id: workspace_id.unwrap_or(0),
                     source_id: source_id.clone(),
-                    // ubs:ignore[rust.collections.clone-in-loop] -- The retained compact metrics entry owns the role after this canonical source page is dropped.
                     role: role.clone(),
                     content_chars,
                     content_tokens_est,
@@ -23233,7 +23055,6 @@ impl FrankenStorage {
                     api_cache_creation_tokens: usage.cache_creation_tokens,
                     api_thinking_tokens: usage.thinking_tokens,
                     api_service_tier: usage.service_tier,
-                    // ubs:ignore[rust.perf.string-alloc-in-loop] -- Compact metrics own the short provenance label independently of the temporary extracted token-usage value.
                     api_data_source: usage.data_source.as_str().to_string(),
                     tool_call_count: usage.tool_call_count as i64,
                     has_tool_calls: usage.has_tool_calls,
@@ -23288,7 +23109,6 @@ impl FrankenStorage {
                         "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
                         fparams![
                             LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY,
-                            // ubs:ignore[rust.perf.string-alloc-in-loop] -- Serialize one durable processed-row cursor per committed page so interrupted analytics can resume honestly.
                             next_processed.to_string()
                         ],
                     )?;
@@ -23319,8 +23139,8 @@ impl FrankenStorage {
                 last_id,
                 chunk = fetched,
                 inserted = total_inserted,
-                elapsed_secs = %format_args!("{elapsed_secs:.1}"),
-                msgs_per_sec = %format_args!("{rate:.0}"),
+                elapsed_secs = format!("{elapsed_secs:.1}"),
+                msgs_per_sec = format!("{rate:.0}"),
                 "analytics_rebuild_progress"
             );
             if let Some(progress) = progress {
@@ -23497,7 +23317,6 @@ impl FrankenStorage {
                 }
                 Err(err) => {
                     return Err(err).with_context(|| {
-                        // ubs:ignore[rust.perf.string-alloc-in-loop] -- Only a failed conversation scan renders this owned phase/cursor diagnostic; successful pages allocate no error text.
                         format!(
                             "daily_stats phase=conversation_scan last_conversation_id={last_conversation_id} batch_size={conversation_batch_size}"
                         )
@@ -23532,7 +23351,6 @@ impl FrankenStorage {
                     control()?;
                 }
                 let mut batch_tx = self.conn.transaction().with_context(|| {
-                    // ubs:ignore[rust.perf.string-alloc-in-loop] -- Lazy context names the failed conversation-stage begin and its durable cursor only on an error.
                     format!(
                         "daily_stats phase=conversation_stage_begin last_conversation_id={last_conversation_id}"
                     )
@@ -23543,7 +23361,6 @@ impl FrankenStorage {
                     DailyStatsBatchTarget::RebuildStage,
                 )
                 .with_context(|| {
-                    // ubs:ignore[rust.perf.string-alloc-in-loop] -- Failed conversation-stage upserts retain their resume cursor; normal bounded batches do not render this diagnostic.
                     format!(
                         "daily_stats phase=conversation_stage_upsert last_conversation_id={last_conversation_id}"
                     )
@@ -23552,7 +23369,6 @@ impl FrankenStorage {
                     control()?;
                 }
                 batch_tx.commit().with_context(|| {
-                    // ubs:ignore[rust.perf.string-alloc-in-loop] -- A failed conversation-stage commit needs its cursor in the owned error chain, once at termination.
                     format!(
                         "daily_stats phase=conversation_stage_commit last_conversation_id={last_conversation_id}"
                     )
@@ -23634,7 +23450,6 @@ impl FrankenStorage {
                         }
                         Err(err) => {
                             return Err(err).with_context(|| {
-                                // ubs:ignore[rust.perf.string-alloc-in-loop] -- Render message-scan phase and page bounds only when that scan fails, preserving actionable resume evidence.
                                 format!(
                                     "daily_stats phase=message_scan conversation_id={conversation_id} cursor_message_idx={page_start_message_idx} batch_size={message_batch_size}"
                                 )
@@ -23656,7 +23471,6 @@ impl FrankenStorage {
                             control()?;
                         }
                         let mut batch_tx = self.conn.transaction().with_context(|| {
-                            // ubs:ignore[rust.perf.string-alloc-in-loop] -- The failed message-stage transaction begin records its source and cursor through lazy error context.
                             format!(
                                 "daily_stats phase=message_stage_begin conversation_id={conversation_id} cursor_message_idx={cursor_message_idx}"
                             )
@@ -23667,7 +23481,6 @@ impl FrankenStorage {
                             DailyStatsBatchTarget::RebuildStage,
                         )
                         .with_context(|| {
-                            // ubs:ignore[rust.perf.string-alloc-in-loop] -- This allocation occurs only for a failed message-stage upsert and identifies the exact resumable page.
                             format!(
                                 "daily_stats phase=message_stage_upsert conversation_id={conversation_id} cursor_message_idx={cursor_message_idx}"
                             )
@@ -23676,7 +23489,6 @@ impl FrankenStorage {
                             control()?;
                         }
                         batch_tx.commit().with_context(|| {
-                            // ubs:ignore[rust.perf.string-alloc-in-loop] -- Lazy failed-commit context retains the message cursor; successful page commits allocate no diagnostic.
                             format!(
                                 "daily_stats phase=message_stage_commit conversation_id={conversation_id} cursor_message_idx={cursor_message_idx}"
                             )
@@ -24039,7 +23851,6 @@ impl StatsAggregator {
                 if permutations[..idx].contains(&(a, s)) {
                     continue;
                 }
-                // ubs:ignore[rust.perf.string-alloc-in-loop] -- The returned expanded daily-rollup map owns each distinct agent/source key after this borrowed input aggregation ends.
                 let key = (*day_id, a.to_owned(), s.to_owned());
                 let entry = expanded.entry(key).or_default();
                 entry.session_count_delta += delta.session_count_delta;
@@ -24194,7 +24005,6 @@ impl TokenStatsAggregator {
                 if permutations[..idx].contains(&(a, s, m)) {
                     continue;
                 }
-                // ubs:ignore[rust.perf.string-alloc-in-loop] -- Expanded token rollups retain their own agent/source/model keys, including the deduplicated global dimensions.
                 let key = (*day_id, a.to_owned(), s.to_owned(), m.to_owned());
                 let entry = expanded.entry(key).or_default();
                 entry.api_call_count += delta.api_call_count;
@@ -24664,7 +24474,6 @@ impl PricingTable {
                 None => best = Some(entry),
                 Some(current) => {
                     if entry.effective_day_id > current.effective_day_id
-                        // ubs:ignore -- Numeric pricing effective dates select the model-pattern tie-breaker.
                         || (entry.effective_day_id == current.effective_day_id
                             && entry.model_pattern.len() > current.model_pattern.len())
                     {
@@ -24731,7 +24540,7 @@ fn date_str_to_day_id(s: &str) -> Result<i64> {
     use chrono::NaiveDate;
     const EPOCH_2020: NaiveDate = match NaiveDate::from_ymd_opt(2020, 1, 1) {
         Some(d) => d,
-        None => unreachable!(), // ubs:ignore -- Compile-time construction of the valid constant date 2020-01-01, independent of parsed input.
+        None => unreachable!(),
     };
     NaiveDate::parse_from_str(s, "%Y-%m-%d")
         .map(|d| (d - EPOCH_2020).num_days())
@@ -24914,18 +24723,229 @@ pub struct AgentArchivePurgeResult {
     pub messages_deleted: usize,
 }
 
-/// Result of a `cass forget` source-glob prune (#292 ask #2). On a dry run the
+/// Selectors for an explicit `cass forget` operation. Present selectors are
+/// intersected, and an empty selection request is refused. `before_ms` is an
+/// absolute, exclusive cutoff for the latest message timestamp; conversations
+/// with no messages or any unknown message timestamp are kept.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ForgetConversationsFilter<'a> {
+    pub source_glob: Option<&'a str>,
+    pub workspace_glob: Option<&'a str>,
+    pub before_ms: Option<i64>,
+}
+
+/// A durable session identity in a source that can hold multiple conversations.
+/// Agent/source provenance prevents a same-named session in a different store
+/// from inheriting another conversation's tombstone.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct ForgottenConversationKey {
+    pub source_id: String,
+    pub agent_slug: String,
+    pub source_path: String,
+    pub external_id: String,
+}
+
+/// Select already-forgotten identities without inferring the workspace or
+/// message times that v23 never stored. Exact identity predicates intersect;
+/// a literal source path and a source glob are mutually exclusive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ForgetExclusionSelector<'a> {
+    pub source_glob: Option<&'a str>,
+    pub source_path: Option<&'a str>,
+    pub source_id: Option<&'a str>,
+    pub agent_slug: Option<&'a str>,
+    pub external_id: Option<&'a str>,
+}
+
+impl ForgetExclusionSelector<'_> {
+    pub fn validate(&self, require_selector: bool) -> Result<()> {
+        CompiledForgetExclusionSelector::new(self, require_selector).map(|_| ())
+    }
+}
+
+struct CompiledForgetExclusionSelector<'a> {
+    selector: ForgetExclusionSelector<'a>,
+    source_glob: Option<glob::Pattern>,
+}
+
+impl<'a> CompiledForgetExclusionSelector<'a> {
+    fn new(selector: &ForgetExclusionSelector<'a>, require_selector: bool) -> Result<Self> {
+        if selector.source_glob.is_some() && selector.source_path.is_some() {
+            bail!("source-path and source-glob are mutually exclusive exclusion selectors");
+        }
+        let fields = [
+            ("source-glob", selector.source_glob),
+            ("source-path", selector.source_path),
+            ("source-id", selector.source_id),
+            ("agent", selector.agent_slug),
+            ("external-id", selector.external_id),
+        ];
+        if require_selector && fields.iter().all(|(_, value)| value.is_none()) {
+            bail!("reinclude requires at least one exclusion selector");
+        }
+        for (name, value) in fields {
+            if value.is_some_and(|value| value.trim().is_empty()) {
+                bail!("exclusion {name} selector cannot be empty");
+            }
+        }
+        let source_glob = selector
+            .source_glob
+            .map(|pattern| {
+                glob::Pattern::new(pattern.trim())
+                    .with_context(|| format!("invalid exclusion source-glob pattern: {pattern}"))
+            })
+            .transpose()?;
+        Ok(Self {
+            selector: *selector,
+            source_glob,
+        })
+    }
+
+    fn source_only(&self) -> bool {
+        self.selector.source_id.is_none()
+            && self.selector.agent_slug.is_none()
+            && self.selector.external_id.is_none()
+    }
+
+    fn matches_path(&self, path: &str) -> bool {
+        self.selector.source_path.is_none_or(|exact| exact == path)
+            && self
+                .source_glob
+                .as_ref()
+                .is_none_or(|pattern| pattern.matches(path))
+    }
+
+    fn matches_session(&self, key: &ForgottenConversationKey) -> bool {
+        self.matches_path(&key.source_path)
+            && self
+                .selector
+                .source_id
+                .is_none_or(|source_id| source_id == key.source_id)
+            && self
+                .selector
+                .agent_slug
+                .is_none_or(|agent| agent == key.agent_slug)
+            && self
+                .selector
+                .external_id
+                .is_none_or(|external_id| external_id == key.external_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ForgottenConversationExclusion {
+    #[serde(flatten)]
+    pub key: ForgottenConversationKey,
+    pub forgotten_at_ms: i64,
+    /// A separate source-wide stamp also suppresses this path. Releasing one
+    /// session must not implicitly release unnamed siblings covered by it.
+    pub blocked_by_source_stamp: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ForgottenSourceExclusion {
+    pub source_path: String,
+    pub size_bytes: Option<i64>,
+    pub mtime_ms: Option<i64>,
+    pub forgotten_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ForgetExclusionList {
+    pub exclusions: Vec<ForgottenConversationExclusion>,
+    /// Source stamps have no provider/provenance/session metadata. They are
+    /// listed only when no identity predicate asks us to infer those fields.
+    pub legacy_sources: Vec<ForgottenSourceExclusion>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ReincludeForgetExclusionsResult {
+    pub dry_run: bool,
+    pub exclusions_matched: usize,
+    pub exclusions_removed: usize,
+    pub legacy_sources_matched: usize,
+    pub legacy_sources_removed: usize,
+    pub source_observations_matched: usize,
+    pub source_observations_removed: usize,
+    pub blocked_by_source_stamps: Vec<String>,
+    pub sample_sessions: Vec<ForgottenConversationExclusion>,
+    /// Bounded sample of the separately selected legacy source stamps.
+    pub sample_source_paths: Vec<String>,
+}
+
+/// A bounded preview identifies the selected session even when several
+/// conversations share the same source path. `last_message_at` is the latest
+/// known message timestamp; age selection still keeps partly undated sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ForgetSessionSample {
+    pub source_path: Option<String>,
+    pub external_id: Option<String>,
+    pub workspace: Option<String>,
+    pub last_message_at: Option<i64>,
+}
+
+/// Result of a `cass forget` prune (#292 ask #2, GH #537). On a dry run the
 /// `*_deleted` fields are zero and the `*_matched` fields report what WOULD be
 /// removed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ForgetConversationsResult {
+    /// The source glob, retained for existing report consumers; empty when
+    /// selection uses workspace or age alone.
     pub pattern: String,
+    pub source_glob: Option<String>,
+    pub workspace_glob: Option<String>,
+    pub before_ms: Option<i64>,
     pub dry_run: bool,
     pub conversations_matched: usize,
     pub messages_matched: usize,
     pub conversations_deleted: usize,
     /// Bounded (<= 20) sample of matched source paths, for operator review.
     pub sample_source_paths: Vec<String>,
+    /// Bounded (<= 20) sample of the actual sessions selected for deletion.
+    pub sample_sessions: Vec<ForgetSessionSample>,
+}
+
+/// Only the narrow envelope needed to select and tombstone a conversation.
+/// Message bodies and wide metadata never enter a forget preview.
+struct ForgetCandidate {
+    id: i64,
+    source_id: String,
+    agent_slug: String,
+    source_path: Option<String>,
+    external_id: Option<String>,
+    workspace: Option<String>,
+}
+
+fn source_path_is_shared_store(path: &str) -> bool {
+    use std::io::Read as _;
+
+    // Devin uses a virtual `<database>/<session-id>` source path. Inspect
+    // file ancestors as well as the final component, but a real directory
+    // named `project.db` does not make its ordinary transcripts shared stores.
+    Path::new(path).ancestors().any(|candidate| {
+        if candidate.is_dir() {
+            return false;
+        }
+        if candidate
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                ["db", "sqlite", "sqlite3", "vscdb"]
+                    .iter()
+                    .any(|known| extension.eq_ignore_ascii_case(known))
+            })
+        {
+            return true;
+        }
+        if !candidate.is_file() {
+            return false;
+        }
+        let Ok(mut file) = fs::File::open(candidate) else {
+            return false;
+        };
+        let mut header = [0_u8; 16];
+        file.read_exact(&mut header).is_ok() && &header == b"SQLite format 3\0"
+    })
 }
 
 /// A source file's size and modification time, as `cass forget` recorded it
@@ -25398,265 +25418,14 @@ fn agent_kind_str(kind: AgentKind) -> String {
 // =============================================================================
 
 #[cfg(test)]
+#[path = "sqlite/semantic_coverage_tests.rs"]
+mod semantic_coverage_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
     use tempfile::TempDir;
-
-    #[test]
-    fn legacy_codex_projection_admission_is_source_and_agent_qualified() -> Result<()> {
-        let dir = TempDir::new()?;
-        let storage = FrankenStorage::open(&dir.path().join("legacy-admission.db"))?;
-        assert!(!storage.has_legacy_codex_projection("local", Some("shared-id"))?);
-        storage.raw().execute(
-            "INSERT INTO agents(id, slug, name, kind, created_at, updated_at)
-             VALUES(9001, 'codex', 'Codex', 'cli', 1, 1), (9002, 'claude', 'Claude', 'cli', 1, 1)",
-        )?;
-        storage.raw().execute(
-            "INSERT INTO sources(id, kind, created_at, updated_at) VALUES('remote-proof', 'ssh', 1, 1)",
-        )?;
-        for (id, agent, source, external) in [
-            (9003, 9001, "local", "shared-id"),
-            (9004, 9001, "remote-proof", "shared-id"),
-            (9005, 9002, "local", "other-agent-id"),
-        ] {
-            storage.raw().execute_with_params(
-                "INSERT INTO conversations(id, agent_id, source_path, source_id, external_id)
-                 VALUES(?1, ?2, '/proof.jsonl', ?3, ?4)",
-                &[
-                    SqliteValue::Integer(id),
-                    SqliteValue::Integer(agent),
-                    SqliteValue::Text(source.into()),
-                    SqliteValue::Text(external.into()),
-                ],
-            )?;
-            let content = if source == "local" {
-                "[Tool output: retained prefix ... 300 additional chars from tool output]"
-            } else {
-                "complete native tool output"
-            };
-            storage.raw().execute_with_params(
-                "INSERT INTO messages(conversation_id, idx, role, content) VALUES(?1, 0, 'tool', ?2)",
-                &[SqliteValue::Integer(id), SqliteValue::Text(content.into())],
-            )?;
-        }
-        assert!(storage.has_legacy_codex_projection("local", Some("shared-id"))?);
-        assert!(!storage.has_legacy_codex_projection("remote-proof", Some("shared-id"))?);
-        assert!(!storage.has_legacy_codex_projection("local", Some("other-agent-id"))?);
-        assert!(!storage.has_legacy_codex_projection("local", Some("absent-id"))?);
-        assert!(!storage.has_legacy_codex_projection("absent-source", Some("shared-id"))?);
-        assert!(!storage.has_legacy_codex_projection("local", None)?);
-        storage
-            .raw()
-            .execute("UPDATE messages SET role='user' WHERE conversation_id=9003")?;
-        assert!(!storage.has_legacy_codex_projection("local", Some("shared-id"))?);
-        storage.raw().execute(
-            "UPDATE messages SET role='tool', content='[Tool output: complete body' WHERE conversation_id=9003",
-        )?;
-        assert!(!storage.has_legacy_codex_projection("local", Some("shared-id"))?);
-        Ok(())
-    }
-
-    fn semantic_source_authority(storage: &FrankenStorage) -> Result<(String, i64)> {
-        storage.raw().query_row_map(
-            "SELECT database_uuid, change_sequence FROM semantic_source_identity_v1 WHERE singleton = 1",
-            &[] as &[ParamValue],
-            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
-        ).map_err(Into::into)
-    }
-
-    #[test]
-    fn semantic_source_clock_tracks_direct_sql_for_every_canonical_table() -> Result<()> {
-        let dir = TempDir::new()?;
-        let storage = FrankenStorage::open(&dir.path().join("source-clock.db"))?;
-        let (uuid, mut sequence) = semantic_source_authority(&storage)?;
-        assert_eq!(uuid.len(), 32);
-        for sql in [
-            "INSERT INTO agents(id, slug, name, kind, created_at, updated_at) VALUES(9001, 'clock', 'clock', 'cli', 1, 1)",
-            "UPDATE agents SET slug = 'clock-changed' WHERE id = 9001",
-            "INSERT INTO workspaces(id, path) VALUES(9002, '/source-clock')",
-            "UPDATE workspaces SET path = '/source-clock-changed' WHERE id = 9002",
-            "INSERT INTO sources(id, kind, created_at, updated_at) VALUES('source-clock', 'ssh', 1, 1)",
-            "UPDATE sources SET host_label = 'changed' WHERE id = 'source-clock'",
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_path, source_id) VALUES(9003, 9001, 9002, '/clock.jsonl', 'local')",
-            "UPDATE conversations SET source_id = 'source-clock' WHERE id = 9003",
-            "INSERT INTO messages(id, conversation_id, idx, role, content) VALUES(9004, 9003, 0, 'user', 'canonical clock source')",
-            "UPDATE messages SET content = 'edited canonical clock source' WHERE id = 9004",
-            "DELETE FROM messages WHERE id = 9004",
-            "DELETE FROM conversations WHERE id = 9003",
-            "DELETE FROM sources WHERE id = 'source-clock'",
-            "DELETE FROM workspaces WHERE id = 9002",
-            "DELETE FROM agents WHERE id = 9001",
-        ] {
-            storage.raw().execute(sql)?;
-            sequence = sequence.checked_add(1).context("fixture clock overflow")?;
-            let current = semantic_source_authority(&storage)?;
-            assert_eq!(
-                current,
-                (uuid.clone(), sequence),
-                "direct canonical SQL did not advance exactly once: {sql}"
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn semantic_source_clock_rolls_back_with_its_canonical_changes() -> Result<()> {
-        use crate::franken_sync::compat::TransactionExt;
-
-        let dir = TempDir::new()?;
-        let storage = FrankenStorage::open(&dir.path().join("source-clock-rollback.db"))?;
-        let before = semantic_source_authority(&storage)?;
-        let mut transaction = storage.raw().transaction()?;
-        transaction.execute("INSERT INTO workspaces(path) VALUES('/rolled-back-source')")?;
-        let during: i64 = transaction.query_row_map(
-            "SELECT change_sequence FROM semantic_source_identity_v1 WHERE singleton = 1",
-            &[] as &[ParamValue],
-            |row| row.get_typed(0),
-        )?;
-        assert_eq!(during, before.1 + 1);
-        transaction.rollback()?;
-        assert_eq!(semantic_source_authority(&storage)?, before);
-        let count: i64 = storage.raw().query_row_map(
-            "SELECT COUNT(*) FROM workspaces WHERE path = '/rolled-back-source'",
-            &[] as &[ParamValue],
-            |row| row.get_typed(0),
-        )?;
-        assert_eq!(count, 0);
-        let mut committed = storage.raw().transaction()?;
-        committed.execute("INSERT INTO workspaces(path) VALUES('/committed-source')")?;
-        committed.commit()?;
-        assert_eq!(
-            semantic_source_authority(&storage)?,
-            (before.0, before.1 + 1)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn semantic_source_clock_overflow_refuses_the_write_without_wrapping() -> Result<()> {
-        use crate::franken_sync::compat::TransactionExt;
-
-        let dir = TempDir::new()?;
-        let storage = FrankenStorage::open(&dir.path().join("source-clock-overflow.db"))?;
-        storage.raw().execute("UPDATE semantic_source_identity_v1 SET change_sequence = 9223372036854775806 WHERE singleton = 1")?;
-        let before = semantic_source_authority(&storage)?;
-        let mut transaction = storage.raw().transaction()?;
-        transaction.execute("INSERT INTO workspaces(path) VALUES('/last-source-sequence')")?;
-        assert!(
-            transaction
-                .execute("INSERT INTO workspaces(path) VALUES('/overflow-source-sequence')")
-                .is_err()
-        );
-        let failed_count: i64 = transaction.query_row_map(
-            "SELECT COUNT(*) FROM workspaces WHERE path = '/overflow-source-sequence'",
-            &[] as &[ParamValue],
-            |row| row.get_typed(0),
-        )?;
-        assert_eq!(
-            failed_count, 0,
-            "overflow must not acknowledge the canonical statement"
-        );
-        transaction.rollback()?;
-        assert_eq!(semantic_source_authority(&storage)?, before);
-        assert!(
-            storage
-                .raw()
-                .execute(
-                    "UPDATE semantic_source_identity_v1 SET change_sequence = 0 WHERE singleton = 1"
-                )
-                .is_err()
-        );
-        assert!(storage.raw().execute("UPDATE semantic_source_identity_v1 SET database_uuid = 'ffffffffffffffffffffffffffffffff' WHERE singleton = 1").is_err());
-        assert!(
-            storage
-                .raw()
-                .execute("DELETE FROM semantic_source_identity_v1 WHERE singleton = 1")
-                .is_err()
-        );
-        assert_eq!(semantic_source_authority(&storage)?, before);
-        Ok(())
-    }
-
-    #[test]
-    fn semantic_source_clock_refuses_replace_without_recursive_delete_triggers() -> Result<()> {
-        let dir = TempDir::new()?;
-        let storage = FrankenStorage::open(&dir.path().join("source-clock-replace.db"))?;
-        storage.raw().execute("PRAGMA recursive_triggers = OFF")?;
-        storage
-            .raw()
-            .execute("INSERT INTO workspaces(path) VALUES('/before-replacement')")?;
-        let before = semantic_source_authority(&storage)?;
-        for statement in [
-            "INSERT OR REPLACE INTO semantic_source_identity_v1(singleton, database_uuid, change_sequence) VALUES(1, ?1, ?2)",
-            "REPLACE INTO semantic_source_identity_v1(singleton, database_uuid, change_sequence) VALUES(1, ?1, ?2)",
-            "INSERT OR IGNORE INTO semantic_source_identity_v1(singleton, database_uuid, change_sequence) VALUES(1, ?1, ?2)",
-        ] {
-            for uuid in [before.0.as_str(), "ffffffffffffffffffffffffffffffff"] {
-                assert!(
-                    storage
-                        .raw()
-                        .execute_with_params(
-                            statement,
-                            &[SqliteValue::Text(uuid.into()), SqliteValue::Integer(0)],
-                        )
-                        .is_err(),
-                    "an existing source authority cannot be replaced or rewound"
-                );
-                assert_eq!(semantic_source_authority(&storage)?, before);
-            }
-        }
-        storage
-            .raw()
-            .execute("INSERT INTO workspaces(path) VALUES('/after-replacement-refusal')")?;
-        assert_eq!(
-            semantic_source_authority(&storage)?,
-            (before.0, before.1 + 1)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn semantic_source_identity_survives_reopen_and_strict_readonly_queries() -> Result<()> {
-        let dir = TempDir::new()?;
-        let path = dir.path().join("source-clock-reopen.db");
-        let storage = FrankenStorage::open(&path)?;
-        storage
-            .raw()
-            .execute("INSERT INTO workspaces(path) VALUES('/persistent-source')")?;
-        let expected = semantic_source_authority(&storage)?;
-        storage.close()?;
-        let readonly = FrankenStorage::open_strict_readonly(&path)?;
-        assert_eq!(semantic_source_authority(&readonly)?, expected);
-        assert!(
-            readonly
-                .raw()
-                .execute("INSERT INTO workspaces(path) VALUES('/must-remain-readonly')")
-                .is_err()
-        );
-        readonly.close_without_checkpoint()?;
-        let reopened = FrankenStorage::open(&path)?;
-        assert_eq!(semantic_source_authority(&reopened)?, expected);
-        Ok(())
-    }
-
-    #[test]
-    fn message_insert_batch_sql_rejects_out_of_range_sizes() -> Result<()> {
-        let max_batch_size = MESSAGE_INSERT_BATCH_SIZE.max(APPEND_MESSAGE_INSERT_BATCH_SIZE);
-        anyhow::ensure!(
-            message_insert_batch_sql(0).is_err(),
-            "zero-row SQL must be rejected"
-        );
-        anyhow::ensure!(
-            !message_insert_batch_sql(max_batch_size)?.is_empty(),
-            "maximum supported batch must have cached SQL"
-        );
-        anyhow::ensure!(
-            message_insert_batch_sql(max_batch_size + 1).is_err(),
-            "a batch beyond the cached SQL table must be rejected"
-        );
-        Ok(())
-    }
 
     /// The legacy duplicate-FTS-schema repair and historical-bundle seeding
     /// shell out to the `sqlite3` CLI (`Command::new("sqlite3")`). A host
@@ -25673,6 +25442,7 @@ mod tests {
         }
         available
     }
+
     #[test]
     fn sqlite3_cli_launch_error_names_the_missing_tool() {
         let missing = sqlite3_cli_launch_error(
@@ -25696,167 +25466,6 @@ mod tests {
                 && !message.contains("not installed"),
             "{message}"
         );
-    }
-
-    /// Reproduce the historical duplicate `fts_messages` `sqlite_master` rows.
-    ///
-    /// The two rows carry different FTS5 argument lists, which is the legacy
-    /// V13 shape cass's own historical-seed test builds. frankensqlite
-    /// refuses to open a catalog that carries both, which is the condition
-    /// under test.
-    fn inject_duplicate_fts_messages_rows(db_path: &Path) {
-        const LEGACY_V13_FTS_SQL: &str = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, content='', tokenize='porter')";
-        const DUPLICATE_FTS_SQL: &str = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
-        let conn = rusqlite_test_fixture_conn(db_path);
-        conn.execute_batch("PRAGMA writable_schema = ON;").unwrap();
-        for sql in [LEGACY_V13_FTS_SQL, DUPLICATE_FTS_SQL] {
-            conn.execute(
-                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-                 VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-                [sql],
-            )
-            .unwrap();
-        }
-        conn.execute_batch("PRAGMA writable_schema = OFF;").unwrap();
-    }
-
-    fn fts_messages_catalog_row_count(db_path: &Path) -> i64 {
-        let conn = rusqlite_test_fixture_conn(db_path);
-        conn.execute_batch("PRAGMA writable_schema = ON;").unwrap();
-        conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap()
-    }
-
-    /// 2l1b0.65: a read-only open of an archive whose catalog carries
-    /// duplicate `fts_messages` rows reports the typed repair-required
-    /// condition and leaves the archive byte-identical. No external engine is
-    /// spawned and no `sqlite_master` row is rewritten behind the caller's
-    /// back.
-    #[test]
-    fn conflicting_fts_schema_rows_are_reported_without_mutating_the_archive() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("agent_search.db");
-        let storage = SqliteStorage::open(&db_path).unwrap();
-        drop(storage);
-        inject_duplicate_fts_messages_rows(&db_path);
-
-        let before = fs::read(&db_path).unwrap();
-        assert_eq!(
-            probe_conflicting_fts_schema_rows(&db_path),
-            ConflictingFtsSchemaProbe::RepairRequired,
-            "the probe must report the conflicting catalog shape"
-        );
-
-        let err = match SqliteStorage::open_readonly(&db_path) {
-            Ok(_) => panic!("a conflicting catalog must not open"), // ubs:ignore -- Negative test: the read-only open must refuse the conflicting catalog.
-            Err(err) => err,
-        };
-        let marker = conflicting_fts_schema_repair_required_from_error(&err)
-            .expect("the open must carry the typed repair-required marker");
-        assert_eq!(marker.db_path, db_path);
-        assert!(format!("{err:#}").contains("cass doctor --fix"), "{err:#}");
-
-        let after = fs::read(&db_path).unwrap();
-        assert_eq!(
-            before, after,
-            "the read-only open must leave the archive byte-identical"
-        );
-        assert_eq!(
-            fts_messages_catalog_row_count(&db_path),
-            2,
-            "the read-only open must not remove any sqlite_master row"
-        );
-    }
-
-    /// 2l1b0.65: the doctor-owned repair removes the duplicate catalog rows
-    /// and hands the archive back to frankensqlite.
-    #[test]
-    fn sqlite3_repair_removes_the_duplicate_rows_and_reopens_the_archive() {
-        if !sqlite3_cli_available_or_skip(
-            "sqlite3_repair_removes_the_duplicate_rows_and_reopens_the_archive",
-        ) {
-            return;
-        }
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("agent_search.db");
-        let storage = SqliteStorage::open(&db_path).unwrap();
-        drop(storage);
-        inject_duplicate_fts_messages_rows(&db_path);
-        assert_eq!(
-            probe_conflicting_fts_schema_rows(&db_path),
-            ConflictingFtsSchemaProbe::RepairRequired
-        );
-
-        repair_conflicting_fts_schema_rows_via_sqlite3(&db_path).unwrap();
-
-        assert_eq!(
-            fts_messages_catalog_row_count(&db_path),
-            1,
-            "the repair must keep exactly the canonical row"
-        );
-        assert_eq!(
-            probe_conflicting_fts_schema_rows(&db_path),
-            ConflictingFtsSchemaProbe::Clean
-        );
-        let reopened =
-            SqliteStorage::open_readonly(&db_path).expect("the repaired archive must open again");
-        drop(reopened);
-    }
-
-    /// 2l1b0.65: the staged derived-FTS metadata scrub runs on the pinned
-    /// engine (frankensqlite) instead of the external `sqlite3` CLI, and it
-    /// removes every derived row it is asked to remove.
-    #[test]
-    fn staged_derived_fts_metadata_scrub_runs_through_frankensqlite() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("staged.db");
-        let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        conn.execute("CREATE TABLE messages(id INTEGER PRIMARY KEY, content TEXT)")
-            .unwrap();
-        conn.execute("CREATE TABLE fts_messages(id INTEGER PRIMARY KEY, content TEXT)")
-            .unwrap();
-        for shadow in [
-            "fts_messages_config",
-            "fts_messages_content",
-            "fts_messages_data",
-            "fts_messages_docsize",
-            "fts_messages_idx",
-        ] {
-            conn.execute(&format!(
-                "CREATE TABLE {shadow}(id INTEGER PRIMARY KEY, payload TEXT)"
-            ))
-            .unwrap();
-        }
-        drop(conn);
-
-        let before = fts_messages_catalog_row_count(&db_path);
-        assert_eq!(before, 1, "the fixture carries the fts_messages row");
-
-        scrub_staged_derived_fts_metadata(&db_path).unwrap();
-
-        let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        let remaining: i64 = conn
-            .query_row_map(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE name LIKE 'fts_messages%' OR tbl_name LIKE 'fts_messages%'",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(
-            remaining, 0,
-            "the scrub must remove every derived fts_messages row"
-        );
-        let messages: i64 = conn
-            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        assert_eq!(messages, 0, "the canonical table must survive the scrub");
     }
 
     struct EnvGuard {
@@ -26165,49 +25774,40 @@ mod tests {
 
         // The one-shot semantic skip (issue #394) compares this against the
         // embedding watermark; a watermark at max must read back intact.
-        storage.set_last_embedded_message_id(max).unwrap();
-        assert_eq!(storage.get_last_embedded_message_id().unwrap(), Some(max));
-    }
-
-    #[test]
-    fn fts_indexable_count_preserves_legacy_duplicates_without_the_modern_index() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("legacy-count.db");
-        let conn = FrankenConnection::open(db_path.to_string_lossy()).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE conversations(id INTEGER PRIMARY KEY);
-             CREATE TABLE messages(id INTEGER PRIMARY KEY, conversation_id INTEGER, idx INTEGER);
-             INSERT INTO conversations VALUES(1), (2);
-             INSERT INTO messages VALUES
-                 (1, 1, 0), (2, 1, 0), (3, 2, NULL), (4, 999, 0), (5, NULL, 0);",
-        )
-        .unwrap();
-        let storage = FrankenStorage::new(conn, db_path);
-        assert_eq!(storage.count_fts_indexable_messages().unwrap(), 3);
+        storage
+            .set_last_embedded_message_id("fnv1a-384", max)
+            .unwrap();
         assert_eq!(
-            storage.count_fts_indexable_messages().unwrap(),
-            reference_indexable_message_count(&storage),
-            "duplicate positions and null positions are rows; orphan parents are excluded"
+            storage.get_last_embedded_message_id("fnv1a-384").unwrap(),
+            Some(max)
+        );
+        // 962e8: the hash space's watermark certifies nothing about another
+        // vector space, which keeps its own (here absent) watermark.
+        assert_eq!(
+            storage.get_last_embedded_message_id("minilm-384").unwrap(),
+            None
         );
         storage
-            .raw()
-            .execute("DELETE FROM conversations WHERE id = 1")
+            .set_last_embedded_message_id("minilm-384", max - 1)
             .unwrap();
-        assert_eq!(storage.count_fts_indexable_messages().unwrap(), 1);
+        assert_eq!(
+            storage.get_last_embedded_message_id("fnv1a-384").unwrap(),
+            Some(max)
+        );
+        assert_eq!(
+            storage.get_last_embedded_message_id("minilm-384").unwrap(),
+            Some(max - 1)
+        );
+        // The retired single shared key is never read as anyone's coverage.
+        storage
+            .raw()
+            .execute("INSERT OR REPLACE INTO meta(key, value) VALUES('last_embedded_message_id', '999999')")
+            .unwrap();
         assert_eq!(
             storage
-                .raw()
-                .query_row("SELECT COUNT(*) FROM messages")
-                .unwrap()
-                .get_typed::<i64>(0)
+                .get_last_embedded_message_id("all-MiniLM-L6-v2")
                 .unwrap(),
-            5,
-            "counting must not discard legacy rows"
-        );
-        storage.raw().execute("DROP TABLE conversations").unwrap();
-        assert!(
-            storage.count_fts_indexable_messages().is_err(),
-            "other schema errors must propagate"
+            None
         );
     }
 
@@ -26412,18 +26012,15 @@ mod tests {
         );
     }
 
-    /// GH #345: a bounded rebuild publishes each page durably instead of
-    /// holding the whole repopulate in one transaction. Phase 1 dies after the
-    /// registration (empty, resumable Partial shadow); phase 2 dies after the
-    /// first committed page (that page's rows survive). Both re-runs converge
-    /// on exact parity without touching canonical rows.
     #[test]
-    fn bounded_fts_rebuild_interruptions_leave_durable_progress() {
+    fn transactional_fts_rebuild_interruptions_preserve_the_published_shadow() {
         let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("fts-bounded-interruption.db");
+        let db_path = dir.path().join("fts-atomic-interruption.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
         seed_atomic_fts_rebuild_fixture(&storage);
 
+        // Change canonical content without touching the already-published FTS
+        // row so rollback can be distinguished from a leaked replacement.
         storage
             .raw()
             .execute("UPDATE messages SET content = 'replacement canonical content' WHERE idx = 0")
@@ -26441,69 +26038,33 @@ mod tests {
         assert_eq!(search_count("survives"), 1);
         assert_eq!(search_count("replacement"), 0);
 
-        // Phase 1: the drop+CREATE registration is durable, no page committed.
-        arm_fts_rebuild_interruption(1);
-        let error = storage
-            .rebuild_fts()
-            .expect_err("injected rebuild interruption must fail");
-        let error_chain = format!("{error:#}");
-        assert!(
-            error_chain.contains("injected FTS rebuild interruption at test phase 1"),
-            "phase 1 must reach the intended interruption point: {error:#}"
-        );
-        assert_eq!(
-            search_count("survives"),
-            0,
-            "the dropped shadow must not answer the old content"
-        );
-        assert_eq!(search_count("replacement"), 0, "no page was committed yet");
-        let interrupted = storage.inspect_search_fallback_fts_parity().unwrap();
-        assert_eq!(
-            interrupted.status,
-            FtsShadowParityStatus::Partial,
-            "interrupted rebuild must leave a queryable, resumable shadow: {interrupted:?}"
-        );
-        assert_eq!(interrupted.indexed_messages, Some(0));
-
-        // The durable Partial shadow is caught up in place by the same path
-        // `cass doctor --rebuild-canonical-fts --yes` uses.
-        assert_eq!(
-            storage.ensure_search_fallback_fts_consistency().unwrap(),
-            FtsConsistencyRepair::IncrementalCatchUp {
-                inserted_rows: 1,
-                total_rows: 1,
-            }
-        );
-        assert_eq!(
-            storage.inspect_search_fallback_fts_parity().unwrap().status,
-            FtsShadowParityStatus::Healthy
-        );
-        assert_eq!(search_count("replacement"), 1);
-
-        // Phase 2: the first page is committed before the abort, so it must
-        // survive; a re-run still converges on exact parity.
-        arm_fts_rebuild_interruption(2);
-        let error = storage
-            .rebuild_fts()
-            .expect_err("injected rebuild interruption must fail");
-        assert!(
-            format!("{error:#}").contains("injected FTS rebuild interruption at test phase 2"),
-            "phase 2 must reach the intended interruption point: {error:#}"
-        );
-        assert_eq!(
-            search_count("replacement"),
-            1,
-            "the committed page must remain published"
-        );
-        storage
-            .rebuild_fts()
-            .expect("re-run after an interrupted publish must converge");
-        assert_eq!(
-            storage.inspect_search_fallback_fts_parity().unwrap().status,
-            FtsShadowParityStatus::Healthy
-        );
-        assert_eq!(search_count("replacement"), 1);
-        assert_eq!(search_count("survives"), 0);
+        for phase in [1, 2] {
+            arm_fts_rebuild_interruption(phase);
+            let error = storage
+                .rebuild_fts()
+                .expect_err("injected rebuild interruption must fail");
+            let error_chain = format!("{error:#}");
+            assert!(
+                error_chain.contains("rolled back"),
+                "rebuild failure must state rollback semantics: {error:#}"
+            );
+            assert!(
+                error_chain.contains(&format!(
+                    "injected FTS rebuild interruption at test phase {phase}"
+                )),
+                "phase {phase} must reach the intended interruption point: {error:#}"
+            );
+            assert_eq!(
+                search_count("survives"),
+                1,
+                "phase {phase} must preserve the previously published FTS content"
+            );
+            assert_eq!(
+                search_count("replacement"),
+                0,
+                "phase {phase} must not leak the uncommitted replacement shadow"
+            );
+        }
     }
 
     /// GH #369 (bead cb0gl): a rebuild batch whose distinct terms and doclists
@@ -26731,127 +26292,6 @@ mod tests {
             storage
                 .fts_messages_schema_is_canonical_contentless()
                 .unwrap()
-        );
-        assert!(matches!(
-            storage.ensure_search_fallback_fts_consistency().unwrap(),
-            FtsConsistencyRepair::AlreadyHealthy { rows: 1 }
-        ));
-    }
-
-    /// GH #495 Archive B: the reporter's legacy internal-content rows where a
-    /// rowid is missing from `_docsize` but present in `_content`. A canonical
-    /// registration over that leftover `_content` row passes the catalog
-    /// classifier (the DDL is canonical), so parity says Partial. The repair
-    /// must converge on that shape instead of failing: an engine that still
-    /// sees the leftover row collides (the reporter's `PRIMARY KEY constraint
-    /// failed`) and takes the reviewed drop+recreate route; an engine whose
-    /// contentless reload ignores `_content` completes the catch-up. Either
-    /// way the missing `_docsize` row is restored and the shadow reaches
-    /// exact parity without touching canonical history.
-    #[test]
-    fn gh495_legacy_content_row_under_canonical_registration_converges() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("fts-canonical-legacy-content.db");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        seed_atomic_fts_rebuild_fixture(&storage);
-        let message_id: i64 = storage
-            .raw()
-            .query_row_map("SELECT id FROM messages LIMIT 1", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-
-        // Leave the legacy internal-content row behind while the canonical
-        // contentless registration survives; `_docsize` no longer knows it.
-        // fsqlite's canonical contentless shadow does not materialize a
-        // `_content` table, so the leftover shape needs the table first.
-        storage
-            .raw()
-            .execute(
-                "CREATE TABLE IF NOT EXISTS fts_messages_content(
-                    id INTEGER PRIMARY KEY, c0, c1, c2, c3, c4, c5
-                 )",
-            )
-            .unwrap();
-        storage
-            .raw()
-            .execute_compat(
-                "INSERT INTO fts_messages_content(id, c0, c1, c2, c3, c4, c5)
-                 VALUES(?1, 'legacy hidden text', 'legacy', 'codex', '/tmp', '/tmp/legacy', 0)",
-                fparams![message_id],
-            )
-            .unwrap();
-        // Re-hydrate the live vtab instance from the still-intact `_docsize`
-        // (creating the leftover `_content` table above may have invalidated
-        // it) so the catch-up insert sees the rowid the shadow already holds.
-        let _: i64 = storage
-            .raw()
-            .query_row_map(
-                "SELECT rowid FROM fts_messages ORDER BY rowid LIMIT 1",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        storage
-            .raw()
-            .execute_compat(
-                "DELETE FROM fts_messages_docsize WHERE id = ?1",
-                fparams![message_id],
-            )
-            .unwrap();
-
-        assert!(
-            storage
-                .fts_messages_schema_is_canonical_contentless()
-                .unwrap(),
-            "the fixture must keep the canonical registration"
-        );
-        assert_eq!(
-            storage.inspect_search_fallback_fts_parity().unwrap().status,
-            FtsShadowParityStatus::Partial,
-            "an intact canonical registration over leftover `_content` rows is Partial, not Residue"
-        );
-
-        let canonical_rows = || {
-            storage
-                .raw()
-                .query("SELECT id, conversation_id, idx, content FROM messages ORDER BY id")
-                .unwrap()
-                .iter()
-                .map(|row| row.values().to_vec())
-                .collect::<Vec<_>>()
-        };
-        let before_rows = canonical_rows();
-        assert!(matches!(
-            storage.ensure_search_fallback_fts_consistency().unwrap(),
-            FtsConsistencyRepair::IncrementalCatchUp {
-                inserted_rows: 1,
-                ..
-            }
-        ));
-        assert_eq!(
-            storage.inspect_search_fallback_fts_parity().unwrap().status,
-            FtsShadowParityStatus::Healthy,
-            "the repair must converge to exact parity"
-        );
-        assert_eq!(canonical_rows(), before_rows, "canonical rows changed");
-        assert!(
-            storage
-                .fts_messages_schema_is_canonical_contentless()
-                .unwrap(),
-            "the repair must republish one canonical registration"
-        );
-        let indexed_rows: i64 = storage
-            .raw()
-            .query_row_map(
-                "SELECT COUNT(*) FROM fts_messages_docsize",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(
-            indexed_rows, 1,
-            "the repair must restore the missing `_docsize` row"
         );
         assert!(matches!(
             storage.ensure_search_fallback_fts_consistency().unwrap(),
@@ -27415,10 +26855,9 @@ mod tests {
                         |row| row.get_typed(0),
                     )
                     .unwrap();
-                #[rustfmt::skip]
-                panic!( // ubs:ignore -- Recovery test must fail with both observed ID sets.
-                    "resume partial catch-up after reopen failed: {error:#}; canonical={canonical_ids:?}; indexed={indexed_ids:?}" // ubs:ignore -- Retained test failure diagnostic.
-                ); // ubs:ignore -- End of the reviewed test-only failure expression.
+                panic!(
+                    "resume partial catch-up after reopen failed: {error:#}; canonical={canonical_ids:?}; indexed={indexed_ids:?}"
+                );
             }
         };
         assert_eq!(
@@ -27549,34 +26988,21 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("fts-page-snapshot.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        let agent_id = storage
-            .ensure_agent(&Agent {
-                id: None,
-                slug: "codex".into(),
-                name: "Codex".into(),
-                version: None,
-                kind: AgentKind::Cli,
-            })
-            .unwrap();
+        seed_atomic_fts_rebuild_fixture(&storage);
+        let unicode_body = "é🙂";
         storage
-            .insert_conversation_tree(agent_id, None, &frontier_test_conversation(&[]))
+            .raw()
+            .execute_compat(
+                "UPDATE messages SET id = 100, content = ?1 WHERE idx = 0",
+                fparams![unicode_body],
+            )
             .unwrap();
         let conversation_id: i64 = storage
             .raw()
             .query_row_map(
-                "SELECT id FROM conversations WHERE external_id = 'frontier-test'",
+                "SELECT conversation_id FROM messages WHERE id = 100",
                 fparams![],
                 |row| row.get_typed(0),
-            )
-            .unwrap();
-        let unicode_body = "é🙂";
-        // Referenced message IDs are immutable; seed the sparse ID directly.
-        storage
-            .raw()
-            .execute_compat(
-                "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-                 VALUES(100, ?1, 0, 'user', ?2, 1700000000001)",
-                fparams![conversation_id, unicode_body],
             )
             .unwrap();
         let sql_body_bytes: i64 = storage
@@ -28885,7 +28311,10 @@ mod tests {
 
         let max_message_id = storage.max_message_id().unwrap().unwrap();
         storage
-            .set_last_embedded_message_id(max_message_id)
+            .set_last_embedded_message_id("fnv1a-384", max_message_id)
+            .unwrap();
+        storage
+            .set_last_embedded_message_id("minilm-384", max_message_id)
             .unwrap();
 
         // Dry-run: detects the pair, mutates nothing.
@@ -28901,7 +28330,7 @@ mod tests {
         assert_eq!(conv_count(&storage), 2, "dry-run must not delete rows");
         assert_eq!(msg_count(&storage), 4, "dry-run must not delete messages");
         assert_eq!(
-            storage.get_last_embedded_message_id().unwrap(),
+            storage.get_last_embedded_message_id("fnv1a-384").unwrap(),
             Some(max_message_id),
             "dry-run must not invalidate semantic assets"
         );
@@ -28915,8 +28344,16 @@ mod tests {
         assert_eq!(applied.messages_affected, 2);
         assert_eq!(conv_count(&storage), 1, "twin row dropped");
         assert_eq!(msg_count(&storage), 2, "twin's messages dropped");
-        // 2l1b0.78: the twin's vectors remain in the semantic artifact.
-        assert_eq!(storage.get_last_embedded_message_id().unwrap(), None);
+        // 2l1b0.78: the twin's vectors remain in the semantic artifact, and
+        // in every vector space's artifact, so no watermark may survive.
+        assert_eq!(
+            storage.get_last_embedded_message_id("fnv1a-384").unwrap(),
+            None
+        );
+        assert_eq!(
+            storage.get_last_embedded_message_id("minilm-384").unwrap(),
+            None
+        );
 
         let surviving: String = storage
             .conn
@@ -30139,7 +29576,6 @@ if sys.argv[2] == 'writer':
                     let path = case_dir.join("archive.db");
                     let mut fixture = Fixture(
                         Command::new("python3")
-                            // ubs:ignore[rust.security.shell-command] -- This fixed WAL-lock fixture receives its temporary path and fixed modes as separate argv values; no shell parses them.
                             .args(["-c", script])
                             .arg(&path)
                             .arg(if writer { "writer" } else { "idle" })
@@ -30174,7 +29610,6 @@ except BlockingIOError:
 sys.exit('stock writer does not own WAL_WRITE_LOCK')
 "#;
                         let probe_output = Command::new("python3")
-                            // ubs:ignore[rust.security.shell-command] -- The fixed lock probe above reads only the separate temporary SHM-path argument, without a shell.
                             .args(["-c", probe])
                             .arg(database_sidecar_path(&path, "-shm"))
                             .output()
@@ -30980,12 +30415,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             .unwrap();
         let mm_plan_api_total: i64 = conn
             .query_row_map(
-                "SELECT COALESCE(SUM(
-                     COALESCE(api_input_tokens, 0)
-                     + COALESCE(api_output_tokens, 0)
-                     + COALESCE(api_cache_read_tokens, 0)
-                     + COALESCE(api_cache_creation_tokens, 0)
-                     + COALESCE(api_thinking_tokens, 0)), 0)
+                "SELECT COALESCE(SUM(COALESCE(api_input_tokens, 0) + COALESCE(api_output_tokens, 0) + COALESCE(api_cache_read_tokens, 0) + COALESCE(api_cache_creation_tokens, 0) + COALESCE(api_thinking_tokens, 0)), 0)
                  FROM message_metrics WHERE day_id = ? AND has_plan = 1 AND api_data_source = 'api'",
                 fparams![expected_day],
                 |row: &FrankenRow| row.get_typed::<i64>(0),
@@ -32329,7 +31759,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         let interrupt_after_first_chunk = |processed: i64, _total: i64| {
             assert!(processed == 0 || processed >= 2);
             if processed >= 2 {
-                panic!("GH #424 planted interruption after first committed chunk"); // ubs:ignore -- Deliberate interruption tests resuming a committed rebuild chunk.
+                panic!("GH #424 planted interruption after first committed chunk");
             }
         };
         let heartbeat_count = std::cell::Cell::new(0_usize);
@@ -34459,7 +33889,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                     Err(err) => return Err(err),
                 }
             }
-            unreachable!("retry loop must return on success or final failure") // ubs:ignore -- Test helper retries only below 24; the final attempt returns its original result.
+            unreachable!("retry loop must return on success or final failure")
         }
 
         let dir = TempDir::new().unwrap();
@@ -35154,102 +34584,6 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
     }
 
     #[test]
-    fn openwebui_native_message_identity_preserves_identical_content() -> Result<()> {
-        for (agent_slug, schema, native_identity) in [
-            ("openwebui", "openwebui.saved-conversation.v1", true),
-            ("codex", "openwebui.saved-conversation.v1", false),
-            ("openwebui", "unrecognized.snapshot.v1", false),
-        ] {
-            for batched in [false, true] {
-                let directory = TempDir::new()?;
-                let storage = FrankenStorage::open(&directory.path().join("archive.db"))?;
-                let agent_id = storage.ensure_agent(&Agent {
-                    id: None,
-                    slug: agent_slug.to_owned(),
-                    name: agent_slug.to_owned(),
-                    version: None,
-                    kind: AgentKind::Cli,
-                })?;
-                let mut conversation = Conversation {
-                    id: None,
-                    agent_slug: agent_slug.to_owned(),
-                    workspace: None,
-                    external_id: Some("[\"original-instance\",\"original-chat\"]".to_owned()),
-                    title: Some("Repeated original messages".to_owned()),
-                    source_path: directory.path().join("snapshot.json"),
-                    started_at: Some(1_700_000_000_000),
-                    ended_at: None,
-                    approx_tokens: None,
-                    metadata_json: serde_json::json!({
-                        "schema_version": schema,
-                        "instance_id": "original-instance", "conversation_id": "original-chat",
-                        "user_id": "original-owner", "source_database": "/work/webui/webui.db",
-                        "workspace_root": "/work/webui"
-                    }),
-                    messages: (0..2)
-                        .map(|idx| Message {
-                            id: None,
-                            idx,
-                            role: MessageRole::User,
-                            author: Some("original-owner".to_owned()),
-                            created_at: Some(1_700_000_000_000),
-                            content: "Identical content from distinct messages".to_owned(),
-                            extra_json: serde_json::json!({
-                                "openwebui": {"id": format!("original-message-{idx}"), "message": {"id": format!("original-message-{idx}")}},
-                                "instance_id": "original-instance", "conversation_id": "original-chat", "user_id": "original-owner"
-                            }),
-                            snippets: Vec::new(),
-                        })
-                        .collect(),
-                    source_id: "local".to_owned(),
-                    origin_host: None,
-                };
-                let insert = |conversation: &Conversation| -> Result<InsertOutcome> {
-                    if batched {
-                        storage
-                            .insert_conversations_batched(&[(agent_id, None, conversation)])?
-                            .pop()
-                            .context("missing batched outcome")
-                    } else {
-                        storage.insert_conversation_tree(agent_id, None, conversation)
-                    }
-                };
-                let initial = insert(&conversation)?;
-                assert_eq!(
-                    initial.inserted_indices.len(),
-                    if native_identity { 2 } else { 1 }
-                );
-                let replay = insert(&conversation)?;
-                assert_eq!(replay.conversation_id, initial.conversation_id);
-                assert!(replay.inserted_indices.is_empty());
-                let mut appended = conversation
-                    .messages
-                    .first()
-                    .context("first message")?
-                    .clone();
-                appended.idx = 2;
-                appended.extra_json["openwebui"]["id"] = serde_json::json!("appended-message");
-                appended.extra_json["openwebui"]["message"]["id"] =
-                    serde_json::json!("appended-message");
-                conversation.messages.push(appended);
-                let appended_outcome = insert(&conversation)?;
-                assert_eq!(
-                    appended_outcome.inserted_indices,
-                    if native_identity { vec![2] } else { Vec::new() }
-                );
-                assert!(insert(&conversation)?.inserted_indices.is_empty());
-                let count: i64 = storage.raw().query_row_map(
-                    "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
-                    fparams![initial.conversation_id],
-                    |row| row.get_typed(0),
-                )?;
-                assert_eq!(count, if native_identity { 3 } else { 1 });
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
     fn insert_conversation_tree_merges_replay_equivalent_messages_with_shifted_idx() {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
@@ -35369,66 +34703,6 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             )
             .unwrap();
         assert_eq!(stored_indices, vec![0, 1, 12]);
-    }
-
-    #[test]
-    fn message_replay_lookup_preserves_tied_and_missing_timestamps() {
-        for created_at in [None, Some(1_700_000_000_000)] {
-            let dir = TempDir::new().unwrap();
-            let storage = SqliteStorage::open(&dir.path().join("replay.db")).unwrap();
-            let agent_id = storage
-                .ensure_agent(&Agent {
-                    id: None,
-                    slug: "codex".into(),
-                    name: "Codex".into(),
-                    version: None,
-                    kind: AgentKind::Cli,
-                })
-                .unwrap();
-            let mut conversation =
-                frontier_test_conversation(&[(0, created_at), (1, created_at), (2, created_at)]);
-            for message in &mut conversation.messages {
-                message
-                    .content
-                    .push_str(&"large replay payload ".repeat(4096));
-                message.author = Some(format!("author-{}", message.idx));
-            }
-            let stored = storage
-                .insert_conversation_tree(agent_id, None, &conversation)
-                .unwrap();
-            let mut incoming = conversation.messages.clone();
-            for message in &mut incoming {
-                message.idx += 10;
-            }
-            let tx = storage.conn.transaction().unwrap();
-            let lookup =
-                franken_existing_message_lookup(&tx, stored.conversation_id, &incoming).unwrap();
-            assert!(lookup.by_idx.is_empty());
-            assert_eq!(lookup.replay.len(), incoming.len());
-            for message in &incoming {
-                assert!(lookup.replay.contains(&message_replay_fingerprint(message)));
-            }
-            incoming[0].content.push_str(" genuinely new content");
-            assert!(
-                !lookup
-                    .replay
-                    .contains(&message_replay_fingerprint(&incoming[0]))
-            );
-            let empty = franken_existing_message_lookup(&tx, stored.conversation_id, &[]).unwrap();
-            assert!(empty.by_idx.is_empty() && empty.replay.is_empty());
-            assert!(
-                existing_message_lookup_from_query(
-                    &tx,
-                    "SELECT missing_replay_column FROM messages",
-                    fparams![],
-                    0,
-                    2,
-                    None,
-                    true,
-                )
-                .is_err()
-            );
-        }
     }
 
     #[test]
@@ -36675,16 +35949,6 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             );
         }
 
-        let before = std::fs::read(&staged_db).unwrap();
-        let error = match FrankenStorage::open_readonly(&staged_db) {
-            Ok(_) => panic!("the legacy duplicate catalog must require explicit repair"), // ubs:ignore -- Negative control for the doctor-only repair boundary.
-            Err(error) => error,
-        };
-        assert!(conflicting_fts_schema_repair_required_from_error(&error).is_some());
-        assert_eq!(before, std::fs::read(&staged_db).unwrap());
-        // This planner test explicitly admits its private copy through the
-        // same catalog repair used by doctor. Ordinary reads remain inert.
-        repair_conflicting_fts_schema_rows_via_sqlite3(&staged_db).unwrap();
         let storage = FrankenStorage::open_readonly(&staged_db).unwrap();
 
         let footprints = storage
@@ -36829,7 +36093,9 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             .unwrap();
         source.set_last_scan_ts(123).unwrap();
         source.set_last_indexed_at(456).unwrap();
-        source.set_last_embedded_message_id(789).unwrap();
+        source
+            .set_last_embedded_message_id("minilm-384", 789)
+            .unwrap();
         source
             .conn
             .execute_compat(
@@ -36951,7 +36217,10 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             .unwrap();
         assert_eq!(message_count, 1);
         assert_eq!(seeded.get_last_scan_ts().unwrap(), None);
-        assert_eq!(seeded.get_last_embedded_message_id().unwrap(), None);
+        assert_eq!(
+            seeded.get_last_embedded_message_id("minilm-384").unwrap(),
+            None
+        );
 
         let last_indexed: Option<String> = seeded
             .conn
@@ -37195,120 +36464,6 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(lexical[0].content, "indexed text");
         assert_eq!(lexical[0].author.as_deref(), Some("assistant"));
         assert!(lexical[0].extra_json.is_null());
-
-        let rows = std::cell::Cell::new(0usize);
-        let on_row = || rows.set(rows.get() + 1);
-        let observed = storage
-            .fetch_messages_for_lexical_rebuild_with_progress(conversation_id, Some(&on_row))
-            .unwrap();
-        assert_eq!(rows.get(), observed.len());
-        assert_eq!(
-            serde_json::to_value(&observed).unwrap(),
-            serde_json::to_value(&lexical).unwrap(),
-            "progress observation must not change the canonical lexical projection"
-        );
-        let missing = storage
-            .fetch_messages_for_lexical_rebuild_with_progress(-1, Some(&on_row))
-            .unwrap();
-        assert!(missing.is_empty());
-        assert_eq!(rows.get(), observed.len(), "no rows means no callback");
-    }
-
-    #[test]
-    fn lexical_rebuild_message_footprints_pages_preserve_gaps_and_integer_boundaries() {
-        const CHILD_ENV: &str = "CASS_TEST_FOOTPRINT_BOUNDARY_CHILD";
-        if !matches!(dotenvy::var(CHILD_ENV).as_deref(), Ok("1")) {
-            // Scope the tiny cap to a real child. Serializing this test alone
-            // cannot protect parallel readers of the process environment.
-            let test = "storage::sqlite::tests::lexical_rebuild_message_footprints_pages_preserve_gaps_and_integer_boundaries";
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", test, "--nocapture", "--test-threads=1"])
-                .env(CHILD_ENV, "1")
-                .env("CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES", "5")
-                .output()
-                .unwrap();
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                output.status.success(),
-                "footprint child: {stdout}\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(stdout.contains("FOOTPRINT_BOUNDARY_CONTROL=passed"));
-            return;
-        }
-        assert_eq!(lexical_max_message_content_bytes(), 5);
-        for indexed in [true, false] {
-            let dir = TempDir::new().unwrap();
-            let db_path = dir.path().join("footprints.db");
-            let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
-            conn.execute(if indexed {
-                "CREATE TABLE messages (conversation_id INTEGER, idx INTEGER, content TEXT, \
-                 UNIQUE(conversation_id, idx))"
-            } else {
-                "CREATE TABLE messages (conversation_id INTEGER, idx INTEGER, content TEXT)"
-            })
-            .unwrap();
-            let storage = FrankenStorage::new(conn, db_path);
-            let mut indices = vec![i64::MIN];
-            indices.extend((0..4094).map(|idx| idx * 3 - 1000));
-            indices.push(i64::MAX);
-            storage.conn.execute("BEGIN").unwrap();
-            for idx in &indices {
-                storage
-                    .conn
-                    .execute_with_params(
-                        "INSERT INTO messages (conversation_id, idx, content) VALUES (7, ?1, ?2)",
-                        &[SqliteValue::from(*idx), SqliteValue::from("ééé")],
-                    )
-                    .unwrap();
-            }
-            storage
-                .conn
-                .execute(
-                    "INSERT INTO messages (conversation_id, idx, content) VALUES (8, 0, 'other')",
-                )
-                .unwrap();
-            storage.conn.execute("COMMIT").unwrap();
-            let mut expected: Vec<_> = indices.into_iter().map(|idx| (idx, 5)).collect();
-            assert_eq!(
-                storage.lexical_rebuild_message_footprints(7).unwrap(),
-                expected,
-                "exactly full pages preserve every sparse idx, including MIN/MAX; indexed={indexed}"
-            );
-            storage
-                .conn
-                .execute_with_params(
-                    "INSERT INTO messages (conversation_id, idx, content) VALUES (7, ?1, NULL)",
-                    &[SqliteValue::from(i64::MAX - 1)],
-                )
-                .unwrap();
-            expected.insert(expected.len() - 1, (i64::MAX - 1, 0));
-            assert_eq!(
-                storage.lexical_rebuild_message_footprints(7).unwrap(),
-                expected,
-                "a partial final page and NULL content survive the hinted or fallback scan"
-            );
-            assert!(
-                storage
-                    .lexical_rebuild_message_footprints(999)
-                    .unwrap()
-                    .is_empty()
-            );
-        }
-        println!("FOOTPRINT_BOUNDARY_CONTROL=passed");
-    }
-
-    #[test]
-    fn lexical_rebuild_message_footprints_propagates_schema_errors() {
-        let conn = FrankenConnection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE messages (conversation_id INTEGER, idx INTEGER)")
-            .unwrap();
-        let storage = FrankenStorage::new(conn, PathBuf::from(":memory:"));
-        let error = storage
-            .lexical_rebuild_message_footprints(7)
-            .expect_err("missing content must not turn into an empty successful page");
-        let detail = format!("{error:#}");
-        assert!(detail.contains("content"), "unexpected error: {detail}");
     }
 
     #[test]
@@ -38223,8 +37378,9 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         let sql = lexical_rebuild_message_after_id_sql(
             lexical_max_message_content_bytes().min(i32::MAX as usize),
         );
-        // Inspect the compiled program rather than the planner's SCAN label:
-        // the message cursor must seek past historical rows on fsqlite 0.4.13.
+        // Check the compiled program, not just EXPLAIN QUERY PLAN: fsqlite
+        // 0.4.12 can label a rowid range SCAN even when codegen emits SeekGT.
+        // The cursor's entry opcode establishes whether it visits old rows.
         let opcodes: Vec<(String, i64, i64)> = storage.raw().query_map_collect(
             &format!("EXPLAIN {sql}"),
             fparams![after_message_id],
@@ -38678,7 +37834,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             let storage = SqliteStorage::open_deferred_fts5_for_repair(&db_path).unwrap();
             storage
                 .rebuild_fts_shadow_via_drop_recreate()
-                .unwrap_or_else(|e| panic!("drop+recreate rebuild failed: {e:#}")) // ubs:ignore -- Rebuild test fails with its original error diagnostic.
+                .unwrap_or_else(|e| panic!("drop+recreate rebuild failed: {e:#}"))
         };
         assert!(
             inserted >= 1,
@@ -38701,9 +37857,9 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
     }
 
     #[test]
-    fn rebuild_fts_via_rusqlite_requires_the_duplicate_legacy_schema_rows_to_be_repaired_first() {
+    fn rebuild_fts_via_rusqlite_cleans_duplicate_legacy_schema_rows() {
         if !sqlite3_cli_available_or_skip(
-            "rebuild_fts_via_rusqlite_requires_the_duplicate_legacy_schema_rows_to_be_repaired_first",
+            "rebuild_fts_via_rusqlite_cleans_duplicate_legacy_schema_rows",
         ) {
             return;
         }
@@ -38769,36 +37925,6 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             .unwrap();
         assert_eq!(duplicate_rows, 2);
         drop(conn);
-
-        // 2l1b0.65: an ordinary rebuild never repairs the conflicting catalog
-        // behind the caller's back. It reports the typed repair-required
-        // condition and leaves the archive bytes alone; `cass doctor --fix`
-        // performs the one sanctioned mutation.
-        let rebuild_err = match rebuild_fts_via_rusqlite(&db_path) {
-            Ok(inserted) => panic!(
-                // ubs:ignore -- Negative test: the rebuild must refuse the conflicting catalog.
-                "the rebuild must not succeed against a conflicting catalog, inserted {inserted}"
-            ),
-            Err(err) => err,
-        };
-        assert!(
-            conflicting_fts_schema_repair_required_from_error(&rebuild_err).is_some(),
-            "the rebuild must report the typed repair requirement, got: {rebuild_err:#}"
-        );
-
-        assert_eq!(
-            probe_conflicting_fts_schema_rows(&db_path),
-            ConflictingFtsSchemaProbe::RepairRequired,
-            "the failed rebuild must leave the duplicate sqlite_master rows in place"
-        );
-
-        // The doctor repair is the one sanctioned mutation.
-        repair_conflicting_fts_schema_rows_via_sqlite3(&db_path).unwrap();
-        assert_eq!(
-            probe_conflicting_fts_schema_rows(&db_path),
-            ConflictingFtsSchemaProbe::Clean,
-            "the doctor repair must leave exactly one fts_messages catalog row"
-        );
 
         let inserted = rebuild_fts_via_rusqlite(&db_path).unwrap();
         // The frankensqlite loader discards the stale rootpage-zero duplicate
@@ -39386,17 +38512,6 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
     }
 
     #[test]
-    fn native_agy_workspace_repair_preserves_existing_messages_and_replay_identity() -> Result<()> {
-        workspace_repair_preserves_rows_and_requires_explicit_authority("antigravity")
-    }
-
-    #[test]
-    fn gh459_cursor_workspace_repair_preserves_rows_and_requires_explicit_authority() -> Result<()>
-    {
-        workspace_repair_preserves_rows_and_requires_explicit_authority("cursor")
-    }
-
-    #[test]
     fn gh447_native_fifo_retains_history_and_indices_across_restarts() {
         for batched in [false, true] {
             let dir = TempDir::new().unwrap();
@@ -39467,54 +38582,6 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 serde_json::to_value(&saved[..201]).unwrap(),
                 serde_json::to_value(&after).unwrap()
             );
-        }
-    }
-
-    #[test]
-    fn source_conflicts_preserve_stored_bodies_and_withhold_completion() {
-        for timestamp in [Some(1_700_000_000_000), None] {
-            let dir = TempDir::new().unwrap();
-            let storage = FrankenStorage::open(&dir.path().join("conflict.db")).unwrap();
-            let agent = storage
-                .ensure_agent(&Agent {
-                    id: None,
-                    slug: "codex".into(),
-                    name: "Codex".into(),
-                    version: None,
-                    kind: AgentKind::Cli,
-                })
-                .unwrap();
-            let original = frontier_test_conversation(&[(0, timestamp)]);
-            let inserted = storage
-                .insert_conversation_tree(agent, None, &original)
-                .unwrap();
-            assert_eq!(inserted.unresolved_message_conflicts, 0);
-            let mut changed = original.clone();
-            changed.messages[0].content = "different current native source body".into();
-            let completion = SourceIngestLedgerEntry {
-                key: "source_ingest_v1:body-conflict".into(),
-                observation: "changed source observation".into(),
-            };
-            for _ in 0..2 {
-                let outcomes = storage
-                    .insert_conversations_batched_with_source_completion(
-                        &[(agent, None, &changed)],
-                        &completion,
-                    )
-                    .unwrap();
-                assert_eq!(outcomes[0].unresolved_message_conflicts, 1);
-                assert!(outcomes[0].inserted_indices.is_empty());
-                assert!(outcomes[0].updated_indices.is_empty());
-                assert!(storage.source_ingest_ledger_entries().unwrap().is_empty());
-                let saved = storage.fetch_messages(inserted.conversation_id).unwrap();
-                assert_eq!(saved.len(), 1);
-                assert_eq!(saved[0].content, original.messages[0].content);
-            }
-            let replay = storage
-                .insert_conversation_tree(agent, None, &original)
-                .unwrap();
-            assert_eq!(replay.unresolved_message_conflicts, 0);
-            assert!(replay.inserted_indices.is_empty());
         }
     }
 
@@ -39938,7 +39005,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                     .unwrap();
             }
             storage
-                .set_last_embedded_message_id(before[2].id.unwrap())
+                .set_last_embedded_message_id("minilm-384", before[2].id.unwrap())
                 .unwrap();
             gh423_revise(&mut conv);
             let update = gh423_persist(&storage, agent, &conv, route).unwrap();
@@ -39999,7 +39066,10 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 assert!(storage.semantic_identity_rebuild_required(tier).unwrap());
                 storage.complete_semantic_identity_rebuild(tier).unwrap();
             }
-            assert_eq!(storage.get_last_embedded_message_id().unwrap(), None);
+            assert_eq!(
+                storage.get_last_embedded_message_id("minilm-384").unwrap(),
+                None
+            );
             let analytics = gh423_analytics_snapshot(&storage);
             let replay = gh423_persist(&storage, agent, &conv, route).unwrap();
             assert!(replay.inserted_indices.is_empty() && replay.updated_indices.is_empty());
@@ -40625,24 +39695,13 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
     #[serial]
     fn gh423_codebuff_deferred_fts_revision_requires_content_repair() {
         let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
-        let term_count = |storage: &FrankenStorage, term: &str| -> i64 {
-            storage
-                .raw()
-                .query_row_map(
-                    "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH ?1",
-                    fparams![term],
-                    |row| row.get_typed(0),
-                )
-                .unwrap()
-        };
         for suspended in [false, true] {
             let dir = TempDir::new().unwrap();
-            let path = dir.path().join("revision-fts.db");
-            let storage = FrankenStorage::open(&path).unwrap();
+            let storage = FrankenStorage::open(&dir.path().join("revision-fts.db")).unwrap();
             storage.ensure_search_fallback_fts_consistency().unwrap();
             let agent = gh423_agent(&storage);
             let mut conv = gh423_storage_snapshot();
-            let first = storage
+            storage
                 .insert_conversation_tree(agent, None, &conv)
                 .unwrap();
             storage.record_fts_franken_rebuild_generation().unwrap();
@@ -40661,12 +39720,18 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                     .insert_conversation_tree(agent, None, &conv)
                     .unwrap();
             }
-            let canonical =
-                serde_json::to_value(storage.fetch_messages(first.conversation_id).unwrap())
-                    .unwrap();
-            let analytics = gh423_analytics_snapshot(&storage);
-            assert_eq!(term_count(&storage, "oldneedle"), 3);
-            assert_eq!(term_count(&storage, "newneedle"), 0);
+            let term_count = |term: &str| -> i64 {
+                storage
+                    .raw()
+                    .query_row_map(
+                        "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH ?1",
+                        fparams![term],
+                        |row| row.get_typed(0),
+                    )
+                    .unwrap()
+            };
+            assert_eq!(term_count("oldneedle"), 3);
+            assert_eq!(term_count("newneedle"), 0);
             assert_eq!(
                 storage.inspect_search_fallback_fts_parity().unwrap().status,
                 FtsShadowParityStatus::Healthy
@@ -40681,74 +39746,32 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 .ensure_search_fallback_fts_consistency()
                 .unwrap_err();
             assert!(format!("{error:#}").contains("injected FTS rebuild interruption"));
-            // GH345 publishes DROP+CREATE before the first bounded page.
-            // A failed phase1 therefore leaves an empty, resumable shadow;
-            // the canonical revision and its repair obligation must survive.
             assert_eq!(
-                term_count(&storage, "oldneedle"),
-                0,
-                "the retired derived publication must not answer old content"
+                term_count("oldneedle"),
+                3,
+                "failed repair preserves prior publication"
             );
-            assert_eq!(term_count(&storage, "newneedle"), 0);
-            let interrupted = storage.inspect_search_fallback_fts_parity().unwrap();
-            assert_eq!(interrupted.status, FtsShadowParityStatus::Partial);
-            assert_eq!(interrupted.indexed_messages, Some(0));
-            assert_eq!(interrupted.indexable_messages, 3);
-            assert_eq!(
-                serde_json::to_value(storage.fetch_messages(first.conversation_id).unwrap())
-                    .unwrap(),
-                canonical
-            );
-            assert_eq!(gh423_analytics_snapshot(&storage), analytics);
-            drop(storage);
-
-            let storage = FrankenStorage::open(&path).unwrap();
-            assert_eq!(
-                storage.inspect_search_fallback_fts_parity().unwrap().status,
-                FtsShadowParityStatus::Partial
-            );
-            assert_eq!(term_count(&storage, "oldneedle"), 0);
-            assert_eq!(term_count(&storage, "newneedle"), 0);
             assert_eq!(
                 storage.read_fts_franken_rebuild_generation().unwrap(),
                 Some(FTS_FRANKEN_CONTENT_REVISION_PENDING)
             );
-            assert_eq!(
-                serde_json::to_value(storage.fetch_messages(first.conversation_id).unwrap())
-                    .unwrap(),
-                canonical
-            );
-            assert_eq!(gh423_analytics_snapshot(&storage), analytics);
             assert!(matches!(
                 storage.ensure_search_fallback_fts_consistency().unwrap(),
                 FtsConsistencyRepair::Rebuilt { inserted_rows: 3 }
             ));
-            assert_eq!(term_count(&storage, "oldneedle"), 2);
-            assert_eq!(term_count(&storage, "newneedle"), 1);
-            assert_eq!(
-                serde_json::to_value(storage.fetch_messages(first.conversation_id).unwrap())
-                    .unwrap(),
-                canonical
-            );
-            assert_eq!(gh423_analytics_snapshot(&storage), analytics);
+            assert_eq!(term_count("oldneedle"), 2);
+            assert_eq!(term_count("newneedle"), 1);
             assert_eq!(
                 storage.read_fts_franken_rebuild_generation().unwrap(),
                 Some(FTS_FRANKEN_REBUILD_GENERATION)
             );
-            let replay = storage
+            storage
                 .insert_conversation_tree(agent, None, &conv)
                 .unwrap();
-            assert!(replay.updated_indices.is_empty() && replay.inserted_indices.is_empty());
             assert!(matches!(
                 storage.ensure_search_fallback_fts_consistency().unwrap(),
                 FtsConsistencyRepair::AlreadyHealthy { rows: 3 }
             ));
-            assert_eq!(
-                serde_json::to_value(storage.fetch_messages(first.conversation_id).unwrap())
-                    .unwrap(),
-                canonical
-            );
-            assert_eq!(gh423_analytics_snapshot(&storage), analytics);
         }
     }
 
@@ -40872,9 +39895,8 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 Some(FTS_FRANKEN_CONTENT_REVISION_PENDING),
                 "unchanged replay must retain the unfulfilled repair obligation"
             );
-            // GH345 commits each bounded page before the phase2 interruption.
-            // This fixture fits one page: its rows survive, while the pending
-            // generation still requires a successful repair after reopening.
+            // Exercise real absent-table creation and row insertion, then
+            // roll back before publication and reopen the database file.
             arm_fts_rebuild_interruption(2);
             let error = storage
                 .ensure_search_fallback_fts_consistency()
@@ -40882,12 +39904,9 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             assert!(format!("{error:#}").contains("injected FTS rebuild interruption"));
             assert_eq!(
                 storage.inspect_search_fallback_fts_parity().unwrap().status,
-                FtsShadowParityStatus::Healthy,
-                "the committed first page must survive the interrupted repair"
+                FtsShadowParityStatus::Absent,
+                "failed first publication must roll back the created shadow"
             );
-            let interrupted = storage.inspect_search_fallback_fts_parity().unwrap();
-            assert_eq!(interrupted.indexed_messages, Some(3));
-            assert_eq!(interrupted.indexable_messages, 3);
             assert_eq!(
                 storage.read_fts_franken_rebuild_generation().unwrap(),
                 Some(FTS_FRANKEN_CONTENT_REVISION_PENDING)
@@ -40901,21 +39920,6 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             drop(storage);
 
             let storage = FrankenStorage::open(&path).unwrap();
-            assert_eq!(
-                storage.read_fts_franken_rebuild_generation().unwrap(),
-                Some(FTS_FRANKEN_CONTENT_REVISION_PENDING),
-                "row-count parity must not clear an interrupted repair's generation marker"
-            );
-            assert_eq!(
-                storage.inspect_search_fallback_fts_parity().unwrap().status,
-                FtsShadowParityStatus::Healthy
-            );
-            assert_eq!(
-                serde_json::to_value(storage.fetch_messages(first.conversation_id).unwrap())
-                    .unwrap(),
-                canonical
-            );
-            assert_eq!(gh423_analytics_snapshot(&storage), analytics);
             assert!(matches!(
                 storage.ensure_search_fallback_fts_consistency().unwrap(),
                 FtsConsistencyRepair::Rebuilt { inserted_rows: 3 }
@@ -41482,54 +40486,29 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         }
     }
 
-    fn workspace_repair_preserves_rows_and_requires_explicit_authority(
-        agent_slug: &str,
-    ) -> Result<()> {
-        let native_id = "provider-stable-id";
-        let (bound, unresolved, invalid_packets) = match agent_slug {
-            "antigravity" => (
-                serde_json::json!({"workspace_binding": {"state":"bound", "source":"native_conversation_summaries", "native_conversation_id":native_id}, "cass":{"workspace_original":"/remote/my-app"}}),
-                serde_json::json!({"workspace_binding": {"state":"ambiguous", "source":"native_conversation_summaries", "native_conversation_id":native_id}}),
-                [
-                    serde_json::json!({"workspace_binding": {"state":"unavailable", "source":"native_conversation_summaries", "native_conversation_id":native_id}}),
-                    serde_json::json!({"workspace_binding": {"state":"ambiguous", "source":"native_conversation_summaries", "native_conversation_id":"other-session"}}),
-                    serde_json::json!({"workspace_binding": {"state":"missing", "source":"unknown", "native_conversation_id":native_id}}),
-                ],
-            ),
-            _ => (
-                serde_json::json!({"cursor_format":"agent", "cursor_workspace_attribution":"workspace_trusted", "cursor_project_dir":"parent-project-my-app", "cass":{"workspace_original":"/remote/my-app"}}),
-                serde_json::json!({"cursor_format":"agent", "cursor_workspace_attribution":"unresolved"}),
-                [
-                    serde_json::json!({"cursor_format":"agent"}),
-                    serde_json::json!({"cursor_format":"agent", "cursor_workspace_attribution":"workspace_trusted"}),
-                    serde_json::json!({"cursor_format":"ide", "cursor_workspace_attribution":"unresolved"}),
-                ],
-            ),
-        };
+    #[test]
+    fn gh459_cursor_workspace_repair_preserves_rows_and_requires_explicit_authority() {
         for batched in [false, true] {
-            let dir = TempDir::new()?;
-            let storage = FrankenStorage::open(&dir.path().join("provider.db"))?;
-            let agent = storage.ensure_agent(&Agent {
-                id: None,
-                slug: agent_slug.into(),
-                name: agent_slug.into(),
-                version: None,
-                kind: AgentKind::Cli,
-            })?;
+            let dir = TempDir::new().unwrap();
+            let storage = FrankenStorage::open(&dir.path().join("cursor.db")).unwrap();
+            let agent = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "cursor".into(),
+                    name: "Cursor".into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
             let wrong = PathBuf::from("/parent/project/my/app");
             let correct = PathBuf::from("/parent-project/my-app");
-            let wrong_id = storage.ensure_workspace(&wrong, None)?;
-            let correct_id = storage.ensure_workspace(&correct, None)?;
-            let previous_workspace = match agent_slug {
-                "antigravity" => None,
-                _ => Some(wrong),
-            };
-            let previous_id = previous_workspace.as_ref().map(|_| wrong_id);
+            let wrong_id = storage.ensure_workspace(&wrong, None).unwrap();
+            let correct_id = storage.ensure_workspace(&correct, None).unwrap();
             let mut conv = Conversation {
                 id: None,
-                agent_slug: agent_slug.into(),
-                workspace: previous_workspace,
-                external_id: Some(native_id.into()),
+                agent_slug: "cursor".into(),
+                workspace: Some(wrong),
+                external_id: Some("cursor-agent-stable-id".into()),
                 title: Some("unchanged title".into()),
                 source_path: PathBuf::from("/cursor/transcript.jsonl"),
                 started_at: Some(100),
@@ -41549,57 +40528,49 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 source_id: "local".into(),
                 origin_host: None,
             };
-            let original = storage.insert_conversation_tree_with_analytics(
-                agent,
-                previous_id,
-                &conv,
-                false,
-            )?;
-            let messages = serde_json::to_value(storage.fetch_messages(original.conversation_id)?)?;
+            let original = storage
+                .insert_conversation_tree(agent, Some(wrong_id), &conv)
+                .unwrap();
+            let messages =
+                serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
+                    .unwrap();
             storage
-                .set_last_embedded_message_id(storage.max_message_id()?.context("seed message")?)?;
+                .set_last_embedded_message_id(
+                    "fnv1a-384",
+                    storage.max_message_id().unwrap().unwrap(),
+                )
+                .unwrap();
             let mut repair_generation = None;
             conv.workspace = Some(correct.clone());
-            conv.metadata_json = bound.clone();
+            conv.metadata_json = serde_json::json!({"cursor_format":"agent", "cursor_workspace_attribution":"workspace_trusted", "cursor_project_dir":"parent-project-my-app", "cass":{"workspace_original":"/remote/my-app"}});
             for expected_change in [true, false] {
-                assert_eq!(
-                    storage.provider_workspace_repair_needed(
-                        &conv.agent_slug,
-                        &conv.source_id,
-                        conv.external_id.as_deref(),
-                        &conv.source_path,
-                        conv.workspace.as_deref(),
-                        &conv.metadata_json,
-                    )?,
-                    expected_change
-                );
                 let outcome = if batched {
                     storage
-                        .insert_conversations_batched_with_analytics(
-                            &[(agent, Some(correct_id), &conv)],
-                            false,
-                        )?
+                        .insert_conversations_batched(&[(agent, Some(correct_id), &conv)])
+                        .unwrap()
                         .pop()
-                        .context("single batch outcome")?
+                        .unwrap()
                 } else {
-                    storage.insert_conversation_tree_with_analytics(
-                        agent,
-                        Some(correct_id),
-                        &conv,
-                        false,
-                    )?
+                    storage
+                        .insert_conversation_tree(agent, Some(correct_id), &conv)
+                        .unwrap()
                 };
                 assert_eq!(outcome.conversation_id, original.conversation_id);
                 assert!(!outcome.conversation_inserted);
                 assert!(outcome.inserted_indices.is_empty());
                 assert_eq!(outcome.workspace_changed, expected_change);
-                assert_eq!(storage.get_last_embedded_message_id()?, None);
+                assert_eq!(
+                    storage.get_last_embedded_message_id("fnv1a-384").unwrap(),
+                    None
+                );
                 let generation = storage
-                    .semantic_identity_rebuild_generation(SemanticIdentityTier::Fast)?
-                    .context("fast identity debt")?;
+                    .semantic_identity_rebuild_generation(SemanticIdentityTier::Fast)
+                    .unwrap()
+                    .expect("fast identity debt");
                 assert_eq!(
                     storage
-                        .semantic_identity_rebuild_generation(SemanticIdentityTier::Quality)?
+                        .semantic_identity_rebuild_generation(SemanticIdentityTier::Quality)
+                        .unwrap()
                         .as_ref(),
                     Some(&generation)
                 );
@@ -41612,7 +40583,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                         "idempotent replay must retain pending semantic generation"
                     );
                 }
-                let rows = storage.list_conversations(10, 0)?;
+                let rows = storage.list_conversations(10, 0).unwrap();
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].workspace.as_ref(), Some(&correct));
                 assert_eq!(rows[0].metadata_json["keep"]["nested"], 7);
@@ -41622,124 +40593,114 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                     "/remote/my-app"
                 );
                 assert_eq!(
-                    serde_json::to_value(storage.fetch_messages(original.conversation_id)?)?,
+                    serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
+                        .unwrap(),
                     messages
                 );
             }
-            storage.close()?;
-            let storage = FrankenStorage::open(&dir.path().join("provider.db"))?;
+            storage.close().unwrap();
+            let storage = FrankenStorage::open(&dir.path().join("cursor.db")).unwrap();
             for tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
                 assert_eq!(
-                    storage.semantic_identity_rebuild_generation(tier)?,
+                    storage.semantic_identity_rebuild_generation(tier).unwrap(),
                     repair_generation,
                     "identity debt must survive reopen"
                 );
             }
             conv.workspace = None;
-            for metadata in &invalid_packets {
-                conv.metadata_json = metadata.clone();
-                let outcome =
-                    storage.insert_conversation_tree_with_analytics(agent, None, &conv, false)?;
+            for metadata in [
+                serde_json::json!({"cursor_format":"agent"}),
+                serde_json::json!({"cursor_format":"agent", "cursor_workspace_attribution":"workspace_trusted"}),
+                serde_json::json!({"cursor_format":"ide", "cursor_workspace_attribution":"unresolved"}),
+            ] {
+                conv.metadata_json = metadata;
+                let outcome = storage
+                    .insert_conversation_tree(agent, None, &conv)
+                    .unwrap();
                 assert!(!outcome.workspace_changed);
                 assert_eq!(
-                    storage.list_conversations(10, 0)?[0].workspace.as_ref(),
+                    storage.list_conversations(10, 0).unwrap()[0]
+                        .workspace
+                        .as_ref(),
                     Some(&correct)
                 );
             }
-            conv.metadata_json = unresolved.clone();
-            assert!(!provider_workspace_attribution_is_authoritative(
+            conv.metadata_json = serde_json::json!({"cursor_format":"agent", "cursor_workspace_attribution":"unresolved"});
+            assert!(!provider_workspace_is_authoritative(
                 "codex",
-                conv.external_id.as_deref(),
                 None,
                 &conv.metadata_json
             ));
             let cleared = storage
-                .insert_conversations_batched_with_analytics(&[(agent, None, &conv)], false)?
+                .insert_conversations_batched(&[(agent, None, &conv)])
+                .unwrap()
                 .pop()
-                .context("single clear outcome")?;
+                .unwrap();
             assert!(cleared.workspace_changed);
             assert_eq!(cleared.conversation_id, original.conversation_id);
             assert!(cleared.inserted_indices.is_empty());
-            assert_eq!(storage.list_conversations(10, 0)?[0].workspace, None);
             assert_eq!(
-                serde_json::to_value(storage.fetch_messages(original.conversation_id)?)?,
+                storage.list_conversations(10, 0).unwrap()[0].workspace,
+                None
+            );
+            assert_eq!(
+                serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
+                    .unwrap(),
                 messages
             );
-            let cleared_generation =
-                storage.semantic_identity_rebuild_generation(SemanticIdentityTier::Fast)?;
+            let cleared_generation = storage
+                .semantic_identity_rebuild_generation(SemanticIdentityTier::Fast)
+                .unwrap();
             assert_ne!(
                 cleared_generation, repair_generation,
                 "a second change needs a new semantic generation"
             );
             conv.workspace = Some(correct.clone());
-            conv.metadata_json = bound.clone();
+            conv.metadata_json["cursor_workspace_attribution"] =
+                serde_json::json!("workspace_trusted");
             {
-                let mut tx = storage.conn.transaction()?;
-                assert!(franken_reconcile_provider_workspace(
-                    &tx,
-                    agent,
-                    original.conversation_id,
-                    Some(correct_id),
-                    &conv
-                )?);
-                tx.rollback()?;
+                let mut tx = storage.conn.transaction().unwrap();
+                assert!(
+                    franken_reconcile_provider_workspace(
+                        &tx,
+                        agent,
+                        original.conversation_id,
+                        Some(correct_id),
+                        &conv
+                    )
+                    .unwrap()
+                );
+                tx.rollback().unwrap();
             }
-            assert_eq!(storage.list_conversations(10, 0)?[0].workspace, None);
+            assert_eq!(
+                storage.list_conversations(10, 0).unwrap()[0].workspace,
+                None
+            );
             for tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
                 assert_eq!(
-                    storage.semantic_identity_rebuild_generation(tier)?,
+                    storage.semantic_identity_rebuild_generation(tier).unwrap(),
                     cleared_generation,
                     "workspace and both debts must roll back together"
                 );
             }
-            let changed_back = storage.insert_conversation_tree_with_analytics(
-                agent,
-                Some(correct_id),
-                &conv,
-                false,
-            )?;
+            let changed_back = storage
+                .insert_conversation_tree(agent, Some(correct_id), &conv)
+                .unwrap();
             assert!(changed_back.workspace_changed);
-            let returned_generation =
-                storage.semantic_identity_rebuild_generation(SemanticIdentityTier::Fast)?;
+            let returned_generation = storage
+                .semantic_identity_rebuild_generation(SemanticIdentityTier::Fast)
+                .unwrap();
             assert_ne!(
                 returned_generation, repair_generation,
                 "returning to an earlier workspace must not revive an old checkpoint"
             );
             assert_ne!(returned_generation, cleared_generation);
             assert_eq!(
-                serde_json::to_value(storage.fetch_messages(original.conversation_id)?)?,
+                serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
+                    .unwrap(),
                 messages
             );
-            {
-                let mut tx = storage.conn.transaction()?;
-                let malformed_metadata = serde_json::to_string(&serde_json::json!(["legacy"]))?;
-                tx.execute_compat(
-                    "UPDATE conversations SET metadata_json = ?1, metadata_bin = NULL WHERE id = ?2",
-                    fparams![malformed_metadata, original.conversation_id],
-                )?;
-                let error = franken_reconcile_provider_workspace(
-                    &tx,
-                    agent,
-                    original.conversation_id,
-                    Some(correct_id),
-                    &conv,
-                )
-                .err()
-                .context("non-object canonical metadata must fail closed")?;
-                anyhow::ensure!(
-                    error
-                        .to_string()
-                        .contains("canonical metadata is not an object"),
-                    "unexpected metadata reconciliation error: {error:#}"
-                );
-                tx.rollback()?;
-            }
-            anyhow::ensure!(
-                storage.list_conversations(10, 0)?[0].workspace.as_ref() == Some(&correct),
-                "failed metadata reconciliation must not change the workspace"
-            );
         }
-        Ok(())
     }
 
     #[test]
@@ -42639,7 +41600,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         let legacy_message_id = storage
             .max_message_id()?
             .expect("legacy OMP fixture should contain one message");
-        storage.set_last_embedded_message_id(legacy_message_id)?;
+        storage.set_last_embedded_message_id("minilm-384", legacy_message_id)?;
         for tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
             assert!(!storage.semantic_identity_rebuild_required(tier)?);
         }
@@ -42653,7 +41614,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             }
         );
         assert_eq!(
-            storage.get_last_embedded_message_id()?,
+            storage.get_last_embedded_message_id("minilm-384")?,
             None,
             "agent/source identity changes must invalidate the rowid-only semantic watermark"
         );
@@ -42851,7 +41812,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         let imported_message_id = storage
             .max_message_id()?
             .expect("historical OMP fixture should contain messages");
-        storage.set_last_embedded_message_id(imported_message_id)?;
+        storage.set_last_embedded_message_id("fnv1a-384", imported_message_id)?;
         assert_eq!(
             storage.reclassify_legacy_omp_conversations()?,
             LegacyOmpReclassificationResult::default(),
@@ -42865,7 +41826,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 analytics_rebuild_required: true,
             }
         );
-        assert_eq!(storage.get_last_embedded_message_id()?, None);
+        assert_eq!(storage.get_last_embedded_message_id("fnv1a-384")?, None);
         assert!(storage.semantic_identity_rebuild_required(SemanticIdentityTier::Fast)?);
         assert!(storage.semantic_identity_rebuild_required(SemanticIdentityTier::Quality)?);
         let conversations = storage.list_conversations(10, 0)?;
@@ -45702,6 +44663,10 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     }
 
+    /// The V13-era internal-content `fts_messages` CREATE injected by the
+    /// legacy-teardown fixtures (mirrors the catalog row MIGRATION_V14 drops).
+    const LEGACY_V13_FTS_MESSAGES_SQL: &str = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, content='', tokenize='porter')";
+
     #[test]
     fn attributed_migration_steps_report_applied_versions_freshness_and_failing_step() {
         // Virgin connection: exercise the helper directly, without the
@@ -45733,263 +44698,125 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
 
     #[test]
     #[serial]
-    fn legacy_internal_content_fts_migrates_bounded_and_preserves_canonical_messages() {
+    fn legacy_fts_teardown_refusal_names_migration_and_leaves_archive_untouched() {
+        let _budget = set_env_var(LEGACY_FTS_TEARDOWN_BUDGET_ENV, "1");
         let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("legacy-internal-content.db");
+        let db_path = dir.path().join("canonical.db");
 
-        // Seed one canonical conversation/message through the storage API so the
-        // fixture has something the derived-FTS teardown could plausibly lose.
-        {
-            let storage = FrankenStorage::open(&db_path).unwrap();
-            let agent_id = storage
-                .ensure_agent(&Agent {
-                    id: None,
-                    slug: "codex".into(),
-                    name: "Codex".into(),
-                    version: None,
-                    kind: AgentKind::Cli,
-                })
-                .unwrap();
-            let conversation = Conversation {
-                id: None,
-                agent_slug: "codex".into(),
-                workspace: Some(PathBuf::from("/legacy/workspace")),
-                external_id: Some("legacy-internal-content".into()),
-                title: Some("Legacy internal-content FTS".into()),
-                source_path: PathBuf::from("/legacy/session.jsonl"),
-                started_at: Some(1_700_000_000_000),
-                ended_at: Some(1_700_000_000_100),
-                approx_tokens: Some(64),
-                metadata_json: serde_json::Value::Null,
-                messages: vec![Message {
-                    id: None,
-                    idx: 0,
-                    role: MessageRole::User,
-                    author: Some("user".into()),
-                    created_at: Some(1_700_000_000_050),
-                    content: "canonical message must survive the derived-fts teardown".into(),
-                    extra_json: serde_json::Value::Null,
-                    snippets: Vec::new(),
-                }],
-                source_id: LOCAL_SOURCE_ID.into(),
-                origin_host: None,
-            };
-            storage
-                .insert_conversation_tree(agent_id, None, &conversation)
-                .unwrap();
-        }
+        // Seed a fully-migrated archive. No conversation is written, so the
+        // V14 drop leaves no fts_messages catalog row behind.
+        drop(FrankenStorage::open(&db_path).unwrap());
 
-        // Rewind to the 0.2.0 bookkeeping shape: no migration ledger, meta
-        // version 13, and a populated STOCK internal-content FTS5 table (the
-        // `_content`/`_docsize`/`_data`/`_idx` shadows frankensqlite must tear
-        // down). `_schema_migrations` is dropped entirely so the real
-        // transition path backfills 1..=13 and leaves v14 pending.
+        // Downgrade to a V14-pending legacy state and inject the legacy
+        // internal-content fts_messages catalog row (rootpage 0; the refusal
+        // only reads the catalog, so absent shadow tables are fine here).
         {
             let fixture = rusqlite_test_fixture_conn(&db_path);
             fixture
                 .execute_batch(
-                    "DROP TABLE IF EXISTS fts_messages;
-                     DROP TABLE IF EXISTS _schema_migrations;
-                     -- A 0.2.0 archive predates V23. Its re-seed is not
-                     -- idempotent while the authority row exists, because the
-                     -- BEFORE INSERT guard aborts even under OR IGNORE.
-                     DROP TABLE IF EXISTS semantic_source_identity_v1;
-                     DROP TABLE IF EXISTS semantic_source_certificates_v1;
-                     INSERT OR REPLACE INTO meta(key, value)
-                     VALUES ('schema_version', '13');
-                     CREATE VIRTUAL TABLE fts_messages USING fts5(
-                         content, title, agent, workspace, source_path,
-                         created_at UNINDEXED, message_id UNINDEXED,
-                         tokenize='porter');
-                     INSERT INTO fts_messages(
-                         rowid, content, title, agent, workspace, source_path,
-                         created_at, message_id)
-                     SELECT id, content, 'legacy', 'codex', '/legacy/workspace',
-                            '/legacy/session.jsonl', created_at, id
-                       FROM messages;",
+                    "PRAGMA writable_schema = ON;
+                     UPDATE meta SET value = '13' WHERE key = 'schema_version';
+                     DELETE FROM _schema_migrations WHERE version = 14;
+                     DELETE FROM sqlite_master WHERE name = 'fts_messages';",
                 )
                 .unwrap();
-            // Grow the internal-content shadows well past a single page-buffer
-            // batch so the teardown is structurally large, not a toy table.
             fixture
-                .execute_batch(
-                    // ubs:ignore[rust.domain.sql-concat] -- This fixed fixture increments the SQL CTE integer; no Rust or external-input concatenation occurs.
-                    "BEGIN;
-                     WITH RECURSIVE seq(n) AS (
-                         SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 8192
-                     )
-                     INSERT INTO fts_messages(
-                         content, title, agent, workspace, source_path,
-                         created_at, message_id)
-                     SELECT printf('legacy-fts-bulk-%06d ', n) || hex(randomblob(1024)),
-                            'legacy', 'codex', '/legacy/workspace',
-                            '/legacy/session.jsonl', 1700000000000, 100000 + n
-                       FROM seq;
-                     COMMIT;",
+                .execute(
+                    "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                     VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
+                    [LEGACY_V13_FTS_MESSAGES_SQL],
                 )
+                .unwrap();
+            fixture
+                .execute_batch("PRAGMA writable_schema = OFF;")
                 .unwrap();
         }
 
-        // The fixture must be genuinely structural before the migration claim
-        // means anything: real internal-content shadows, populated.
-        {
-            let check = rusqlite_test_fixture_conn(&db_path);
-            let catalog_rows: i64 = check
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(catalog_rows, 1, "fixture needs the legacy fts_messages row");
-            let content_rows: i64 = check
-                .query_row("SELECT COUNT(*) FROM fts_messages_content", [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            assert_eq!(
-                content_rows, 8193,
-                "fixture needs a populated internal `_content` shadow"
-            );
-            let content_bytes: i64 = check
-                .query_row(
-                    "SELECT COALESCE(SUM(LENGTH(c0)), 0) FROM fts_messages_content",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(
-                content_bytes > 8 * 1024 * 1024,
-                "fixture corpus must span multiple bounded teardown batches, got \
-                 {content_bytes} bytes"
-            );
-            let docsize_rows: i64 = check
-                .query_row("SELECT COUNT(*) FROM fts_messages_docsize", [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            assert_eq!(docsize_rows, 8193, "fixture needs real `_docsize` rows");
-            let data_blocks: i64 = check
-                .query_row("SELECT COUNT(*) FROM fts_messages_data", [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            assert!(data_blocks > 1, "fixture needs persisted `_data` segments");
-            let ledger_present: i64 = check
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE name = '_schema_migrations'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(ledger_present, 0, "fixture must take the transition path");
-        }
-
-        // GH #349: this must complete the V14 teardown through the bounded
-        // autocommit lane instead of OOMing inside MigrationRunner's
-        // transaction. The probe below pins the lane: frankensqlite commits
-        // each page-free batch only in autocommit.
-        LEGACY_FTS_TEARDOWN_RAN_IN_AUTOCOMMIT.with(|probe| probe.set(false));
-        let storage = FrankenStorage::open(&db_path)
-            .expect("populated legacy internal-content archive must migrate");
+        let err = match FrankenStorage::open(&db_path) {
+            Ok(_) => panic!("open must refuse the unbounded V14 teardown above the budget"),
+            Err(err) => err,
+        };
+        let rendered = format!("{err:#}");
         assert!(
-            LEGACY_FTS_TEARDOWN_RAN_IN_AUTOCOMMIT.with(|probe| probe.get()),
-            "the legacy fts_messages drop must run on the autocommit lane"
+            rendered.contains("v14") && rendered.contains("fts_contentless"),
+            "refusal should name the failing migration: {rendered}"
         );
-        assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-
-        // Canonical data is untouched.
-        let canonical: i64 = storage
-            .raw()
-            .query_row_map(
-                "SELECT COUNT(*) FROM messages \
-                 WHERE content = 'canonical message must survive the derived-fts teardown'",
-                &[],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(
-            canonical, 1,
-            "the derived-FTS teardown must preserve messages"
+        assert!(
+            rendered.contains(LEGACY_FTS_TEARDOWN_BUDGET_ENV),
+            "refusal should name the budget override: {rendered}"
+        );
+        assert!(
+            rendered.contains("cass doctor check --json"),
+            "refusal should carry the bounded-diagnosis next action: {rendered}"
         );
 
-        // The migration ledger covers the full history, exactly once each.
-        let versions: Vec<i64> = storage
-            .raw()
-            .query("SELECT version FROM _schema_migrations ORDER BY version;")
-            .unwrap()
-            .iter()
-            .map(|row| row.get_typed(0).unwrap())
-            .collect();
-        assert_eq!(
-            versions,
-            (1..=CURRENT_SCHEMA_VERSION).collect::<Vec<i64>>(),
-            "transition plus attributed steps must record the full ledger"
-        );
-
-        // V14 is recorded, the legacy virtual table and every shadow are gone,
-        // and open leaves the derived FTS absent for lazy recreation.
-        let residual: i64 = storage
-            .raw()
-            .query_row_map(
-                "SELECT COUNT(*) FROM sqlite_master \
-                 WHERE name = 'fts_messages' OR name LIKE 'fts_messages!_%' ESCAPE '!';",
-                &[],
-                |row| row.get_typed(0),
+        // The archive is untouched: still V14-pending, still meta version 13.
+        let check = rusqlite_test_fixture_conn(&db_path);
+        let v14_rows: i64 = check
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 14",
+                [],
+                |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(residual, 0, "bounded teardown must remove the whole shadow");
-
-        drop(storage);
-        let reopened = FrankenStorage::open(&db_path).expect("migrated archive must reopen");
-        assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-        let canonical_after_reopen: i64 = reopened
-            .raw()
-            .query_row_map(
-                "SELECT COUNT(*) FROM messages \
-                 WHERE content = 'canonical message must survive the derived-fts teardown'",
-                &[],
-                |row| row.get_typed(0),
+        assert_eq!(v14_rows, 0, "refusal must not record the migration");
+        let meta_version: String = check
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(canonical_after_reopen, 1);
+        assert_eq!(meta_version, "13", "refusal must not modify the archive");
     }
 
     #[test]
-    fn legacy_fts_teardown_skips_current_archives_with_a_live_shadow() {
+    #[serial]
+    fn legacy_fts_teardown_zero_budget_disables_the_refusal() {
         let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("current-contentless.db");
+        let db_path = dir.path().join("canonical.db");
+        drop(FrankenStorage::open(&db_path).unwrap());
 
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        storage
-            .ensure_search_fallback_fts_consistency()
-            .expect("materialize the current contentless fts_messages shadow");
-        let before: i64 = storage
-            .raw()
-            .query_row_map(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                &[],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(before, 1, "fixture needs a live current FTS shadow");
-        drop(storage);
+        {
+            let fixture = rusqlite_test_fixture_conn(&db_path);
+            fixture
+                .execute_batch(
+                    "PRAGMA writable_schema = ON;
+                     UPDATE meta SET value = '13' WHERE key = 'schema_version';
+                     DELETE FROM _schema_migrations WHERE version = 14;
+                     DELETE FROM sqlite_master WHERE name = 'fts_messages';",
+                )
+                .unwrap();
+            fixture
+                .execute(
+                    "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                     VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
+                    [LEGACY_V13_FTS_MESSAGES_SQL],
+                )
+                .unwrap();
+            fixture
+                .execute_batch("PRAGMA writable_schema = OFF;")
+                .unwrap();
+        }
 
-        // V14 is already in the ledger: the pre-drop must not touch a current
-        // contentless shadow, even though `fts_messages` exists.
-        let reopened = FrankenStorage::open(&db_path).unwrap();
-        let after: i64 = reopened
-            .raw()
-            .query_row_map(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                &[],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(
-            after, 1,
-            "current archives keep their contentless fts_messages shadow"
-        );
+        let _budget = set_env_var(LEGACY_FTS_TEARDOWN_BUDGET_ENV, "0");
+        let storage = FrankenStorage::open(&db_path)
+            .expect("zero budget must disable the refusal and allow the migration");
+        assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_fts_teardown_refusal_skips_current_archives_entirely() {
+        let _budget = set_env_var(LEGACY_FTS_TEARDOWN_BUDGET_ENV, "1");
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("canonical.db");
+
+        drop(FrankenStorage::open(&db_path).unwrap());
+        // Reopen: V14 is already applied, so even an absurdly small budget
+        // must never fire the refusal on a current archive.
+        let again = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(again.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
@@ -46320,100 +45147,6 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             "new searchable evidence"
         );
         assert_eq!(fs::read(&marker_path).unwrap(), marker);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn gh515_engine_migration_marker_uses_the_resolved_database_path() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("archive.db");
-        let alias = dir.path().join("archive-alias.db");
-        fs::write(&path, b"database path fixture").unwrap();
-        std::os::unix::fs::symlink(&path, &alias).unwrap();
-        fs::write(
-            path.with_file_name("archive.db.fsqlite-migration-state"),
-            r#"{"last_upgrade_version":1,"last_run_at":1,"repairs_applied":[]}"#,
-        )
-        .unwrap();
-
-        assert!(index_engine_migration_is_complete(&path));
-        assert!(index_engine_migration_is_complete(&alias));
-        assert!(
-            !alias
-                .with_file_name("archive-alias.db.fsqlite-migration-state")
-                .exists()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn gh515_engine_migration_marker_rejects_alias_local_attestations() {
-        for target_marker in [
-            None,
-            Some(r#"{"last_upgrade_version":0,"last_run_at":1,"repairs_applied":[]}"#),
-            Some(r#"{"last_upgrade_version":1}"#),
-            Some("not a migration marker"),
-        ] {
-            let dir = TempDir::new().unwrap();
-            let path = dir.path().join("archive.db");
-            let alias = dir.path().join("archive-alias.db");
-            fs::write(&path, b"database path fixture").unwrap();
-            std::os::unix::fs::symlink(&path, &alias).unwrap();
-            fs::write(
-                alias.with_file_name("archive-alias.db.fsqlite-migration-state"),
-                r#"{"last_upgrade_version":1,"last_run_at":1,"repairs_applied":[]}"#,
-            )
-            .unwrap();
-            if let Some(marker) = target_marker {
-                fs::write(
-                    path.with_file_name("archive.db.fsqlite-migration-state"),
-                    marker,
-                )
-                .unwrap();
-            }
-
-            assert!(!index_engine_migration_is_complete(&path));
-            assert!(!index_engine_migration_is_complete(&alias));
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn gh515_engine_migration_marker_rejects_dangling_database_aliases() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("missing.db");
-        let alias = dir.path().join("missing-alias.db");
-        std::os::unix::fs::symlink(&path, &alias).unwrap();
-        fs::write(
-            alias.with_file_name("missing-alias.db.fsqlite-migration-state"),
-            r#"{"last_upgrade_version":1,"last_run_at":1,"repairs_applied":[]}"#,
-        )
-        .unwrap();
-
-        assert!(!index_engine_migration_is_complete(&path));
-        assert!(!index_engine_migration_is_complete(&alias));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn gh515_engine_migration_marker_resolves_parent_directory_aliases() {
-        let dir = TempDir::new().unwrap();
-        let target_dir = dir.path().join("archive");
-        let alias_dir = dir.path().join("archive-alias");
-        fs::create_dir(&target_dir).unwrap();
-        std::os::unix::fs::symlink(&target_dir, &alias_dir).unwrap();
-        let path = target_dir.join("archive.db");
-        fs::write(&path, b"database path fixture").unwrap();
-        fs::write(
-            path.with_file_name("archive.db.fsqlite-migration-state"),
-            r#"{"last_upgrade_version":1,"last_run_at":1,"repairs_applied":[]}"#,
-        )
-        .unwrap();
-
-        assert!(index_engine_migration_is_complete(&path));
-        assert!(index_engine_migration_is_complete(
-            &alias_dir.join("archive.db")
-        ));
     }
 
     #[test]
@@ -46982,12 +45715,14 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
     }
 
     #[test]
-    fn franken_storage_open_reports_the_duplicate_fts_schema_repair_requirement() {
-        // 2l1b0.65: an ordinary open never repairs a conflicting catalog. It
-        // reports the typed repair-required condition and leaves the archive
-        // alone; `cass doctor --fix` is the one surface that repairs.
+    fn franken_storage_open_repairs_duplicate_fts_messages_schema_rows() {
+        if !sqlite3_cli_available_or_skip(
+            "franken_storage_open_repairs_duplicate_fts_messages_schema_rows",
+        ) {
+            return;
+        }
         let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test_open_reports_duplicate_fts_schema.db");
+        let db_path = dir.path().join("test_open_repairs_duplicate_fts_schema.db");
 
         let storage = FrankenStorage::open(&db_path).unwrap();
         let agent = Agent {
@@ -47056,55 +45791,20 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(duplicate_rows, 2);
         drop(conn);
 
-        // The dedicated-owner readonly open reports the repair requirement
-        // instead of rewriting the archive behind the caller's back.
-        let open_result =
-            open_franken_async_readonly_connection_with_timeout(&db_path, Duration::from_secs(5));
-        let open_err = match open_result {
-            Ok(_) => panic!("the dedicated-owner readonly open must not repair the archive"), // ubs:ignore -- Negative test: the dedicated-owner read-only open must refuse the conflicting catalog.
-            Err(err) => err,
-        };
-        assert!(
-            conflicting_fts_schema_repair_required_from_error(&open_err).is_some(),
-            "the open must report the typed repair requirement, got: {open_err:#}"
-        );
-        let conn = rusqlite_test_fixture_conn(&db_path);
-        conn.execute_batch("PRAGMA writable_schema = ON;").unwrap();
-        let rows_after_open: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        drop(conn);
-        assert_eq!(
-            rows_after_open, 2,
-            "the open must not remove any sqlite_master row"
-        );
-
-        if !sqlite3_cli_available_or_skip(
-            "franken_storage_open_reports_the_duplicate_fts_schema_repair_requirement",
-        ) {
-            return;
-        }
-        // The doctor repair is the one sanctioned mutation.
-        repair_conflicting_fts_schema_rows_via_sqlite3(&db_path).unwrap();
-
         let mut owner_reader =
             open_franken_async_readonly_connection_with_timeout(&db_path, Duration::from_secs(5))
-                .expect("the archive opens once the doctor repaired the schema rows");
+                .expect("dedicated-owner readonly open should repair duplicate FTS schema rows");
         let message_rows = owner_reader
             .query_sync("SELECT COUNT(*) FROM messages")
-            .expect("canonical messages must remain readable after the schema-row repair");
+            .expect("canonical messages must remain readable after schema-row dedupe");
         assert_eq!(
             message_rows[0].get_typed::<i64>(0).unwrap(),
             1,
-            "the repair must preserve canonical archive rows"
+            "dedupe must preserve canonical archive rows"
         );
         owner_reader
             .close_without_checkpoint_sync()
-            .expect("the repaired archive should close cleanly");
+            .expect("dedicated-owner duplicate-schema probe should close cleanly");
 
         let reopened = FrankenStorage::open(&db_path).unwrap();
         assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
@@ -47231,44 +45931,45 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
     }
 
     #[test]
-    fn franken_storage_open_repairs_missing_analytics_tables_when_version_markers_lie() -> Result<()>
-    {
-        let dir = TempDir::new()?;
+    fn franken_storage_open_repairs_missing_analytics_tables_when_version_markers_lie() {
+        let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test_repair_missing_analytics.db");
 
         {
-            let storage = FrankenStorage::open(&db_path)?;
-            // ubs:ignore -- The fixture checks the numeric schema version before damaging analytics tables.
-            anyhow::ensure!(storage.schema_version()? == CURRENT_SCHEMA_VERSION);
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
         }
 
         {
-            let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned())?;
-            for statement in [
-                "DROP TABLE IF EXISTS usage_models_daily",
-                "DROP TABLE IF EXISTS usage_daily",
-                "DROP TABLE IF EXISTS usage_hourly",
-                "DROP TABLE IF EXISTS message_metrics",
-                "DROP TABLE IF EXISTS token_daily_stats",
-                "DROP TABLE IF EXISTS token_usage",
-                "DROP TABLE IF EXISTS model_pricing",
-                "DROP TABLE IF EXISTS embedding_jobs",
-                "DROP TABLE IF EXISTS daily_stats",
+            let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            for table in &[
+                "usage_models_daily",
+                "usage_daily",
+                "usage_hourly",
+                "message_metrics",
+                "token_daily_stats",
+                "token_usage",
+                "model_pricing",
+                "embedding_jobs",
+                "daily_stats",
             ] {
-                conn.execute(statement).context(statement)?;
+                conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+                    .unwrap();
             }
             conn.execute_compat(
                 "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
                 &[ParamValue::from(CURRENT_SCHEMA_VERSION.to_string())],
-            )?;
+            )
+            .unwrap();
         }
 
-        let repaired = FrankenStorage::open(&db_path)?;
-        // ubs:ignore -- The fixture checks the numeric schema version after analytics-table repair.
-        anyhow::ensure!(repaired.schema_version()? == CURRENT_SCHEMA_VERSION);
+        let repaired = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(repaired.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
 
-        let analytics_count: i64 = repaired.raw().query_row_map(
-            "SELECT COUNT(*) FROM sqlite_master
+        let analytics_count: i64 = repaired
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master
                  WHERE type='table'
                    AND name IN (
                      'daily_stats',
@@ -47281,15 +45982,14 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                      'usage_daily',
                      'usage_models_daily'
                    )",
-            &[],
-            |row| row.get_typed(0),
-        )?;
-        anyhow::ensure!(
-            // ubs:ignore -- The fixture checks that all nine expected analytics tables exist.
-            analytics_count == 9,
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            analytics_count, 9,
             "open() should recreate the missing analytics tables even when schema_version already says current"
         );
-        Ok(())
     }
 
     #[test]
@@ -48507,14 +47207,14 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         seed_conversation(&storage, "codex", "keep-target");
         let max_message_id = storage.max_message_id().unwrap().unwrap();
         storage
-            .set_last_embedded_message_id(max_message_id)
+            .set_last_embedded_message_id("minilm-384", max_message_id)
             .unwrap();
 
         // An agent with no archived rows purges nothing and keeps the watermark.
         let noop = storage.purge_agent_archive_data("cursor").unwrap();
         assert_eq!(noop.conversations_deleted, 0);
         assert_eq!(
-            storage.get_last_embedded_message_id().unwrap(),
+            storage.get_last_embedded_message_id("minilm-384").unwrap(),
             Some(max_message_id)
         );
 
@@ -48522,7 +47222,10 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(purge.conversations_deleted, 1);
         assert_eq!(purge.messages_deleted, 2);
         // 2l1b0.78: the purged messages' vectors remain in the semantic artifact.
-        assert_eq!(storage.get_last_embedded_message_id().unwrap(), None);
+        assert_eq!(
+            storage.get_last_embedded_message_id("minilm-384").unwrap(),
+            None
+        );
 
         storage.rebuild_fts().unwrap();
         storage.rebuild_analytics().unwrap();
@@ -48641,7 +47344,10 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         // A semantic embed watermark that covers the whole corpus.
         let max_message_id = storage.max_message_id().unwrap().unwrap();
         storage
-            .set_last_embedded_message_id(max_message_id)
+            .set_last_embedded_message_id("fnv1a-384", max_message_id)
+            .unwrap();
+        storage
+            .set_last_embedded_message_id("minilm-384", max_message_id)
             .unwrap();
 
         // Dry-run: reports matches, deletes nothing.
@@ -48653,11 +47359,13 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(dry.messages_matched, 2);
         assert_eq!(dry.conversations_deleted, 0);
         assert_eq!(storage.total_conversation_count().unwrap(), 3);
-        assert_eq!(
-            storage.get_last_embedded_message_id().unwrap(),
-            Some(max_message_id),
-            "a dry run must not invalidate semantic assets"
-        );
+        for embedder_id in ["fnv1a-384", "minilm-384"] {
+            assert_eq!(
+                storage.get_last_embedded_message_id(embedder_id).unwrap(),
+                Some(max_message_id),
+                "a dry run must not invalidate semantic assets"
+            );
+        }
         assert!(
             storage.forgotten_source_stamps().unwrap().is_empty(),
             "a dry run must not tombstone anything"
@@ -48674,10 +47382,16 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         // The surviving top-level session's message is intact.
         assert_eq!(storage.total_message_count().unwrap(), 1);
         // 2l1b0.78: the deleted messages' vectors are still in the semantic
-        // artifact, so the watermark that covered them must not survive.
-        assert_eq!(storage.get_last_embedded_message_id().unwrap(), None);
+        // artifact, so no vector space's watermark that covered them may
+        // survive.
+        for embedder_id in ["fnv1a-384", "minilm-384"] {
+            assert_eq!(
+                storage.get_last_embedded_message_id(embedder_id).unwrap(),
+                None
+            );
+        }
         storage
-            .set_last_embedded_message_id(max_message_id)
+            .set_last_embedded_message_id("minilm-384", max_message_id)
             .unwrap();
         // 2l1b0.50: each forgotten source is tombstoned with its file stamp
         // (these fixture paths do not exist, so the stamp is empty).
@@ -48717,41 +47431,1470 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(none.conversations_deleted, 0);
         assert_eq!(storage.total_conversation_count().unwrap(), 1);
         assert_eq!(
-            storage.get_last_embedded_message_id().unwrap(),
+            storage.get_last_embedded_message_id("minilm-384").unwrap(),
             Some(max_message_id),
             "a no-op forget must not force a semantic re-embed"
         );
+    }
 
-        // Samples are the first twenty matching conversations in ID order,
-        // including repeated paths. Tombstones still identify unique sources.
-        let samples = FrankenStorage::open(&dir.path().join("forget-samples.db")).unwrap();
-        let paths = [
-            "/sample/雪-last.jsonl",
-            "/sample/a-first.jsonl",
-            "/sample/雪-last.jsonl",
-            "/sample/b.jsonl",
+    fn forget_fixture_conversation(
+        source_path: &str,
+        external_id: Option<&str>,
+        workspace: Option<&str>,
+        timestamps: &[Option<i64>],
+    ) -> Conversation {
+        Conversation {
+            id: None,
+            agent_slug: "opencode".into(),
+            workspace: workspace.map(PathBuf::from),
+            external_id: external_id.map(str::to_owned),
+            title: external_id.map(str::to_owned),
+            source_path: PathBuf::from(source_path),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_001),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: timestamps
+                .iter()
+                .enumerate()
+                .map(|(idx, timestamp)| Message {
+                    id: None,
+                    idx: i64::try_from(idx).unwrap(),
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: *timestamp,
+                    content: format!(
+                        "retained {} message {idx}",
+                        external_id.unwrap_or("unknown")
+                    ),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                })
+                .collect(),
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        }
+    }
+
+    fn seed_forget_fixture(storage: &FrankenStorage, conversation: &Conversation) -> Result<i64> {
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: conversation.agent_slug.clone(),
+            name: conversation.agent_slug.clone(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let workspace_id = conversation
+            .workspace
+            .as_deref()
+            .map(|path| storage.ensure_workspace(path, None))
+            .transpose()?;
+        Ok(storage.insert_conversations_batched_with_analytics(
+            &[(agent_id, workspace_id, conversation)],
+            true,
+        )?[0]
+            .conversation_id)
+    }
+
+    #[test]
+    fn forget_selectors_intersect_and_age_uses_known_message_timestamps() -> Result<()> {
+        let directory = TempDir::new()?;
+        let path = directory.path().join("selectors.db");
+        let storage = FrankenStorage::open(&path)?;
+        let base = 1_700_000_000_000;
+        let fixtures = [
+            (
+                "retire-a",
+                Some("/work/scratch"),
+                vec![Some(base + 20), Some(base + 40)],
+            ),
+            (
+                "recent",
+                Some("/work/scratch"),
+                vec![Some(base + 20), Some(base + 200)],
+            ),
+            ("boundary", Some("/work/scratch"), vec![Some(base + 100)]),
+            ("unknown", Some("/work/scratch"), vec![None]),
+            (
+                "partly-unknown",
+                Some("/work/scratch"),
+                vec![Some(base + 20), None],
+            ),
+            ("empty", Some("/work/scratch"), vec![]),
+            ("no-workspace", None, vec![Some(base + 20)]),
+            (
+                "production",
+                Some("/work/production"),
+                vec![Some(base + 20)],
+            ),
         ];
-        let mut expected_sample = Vec::new();
-        for (number, path) in paths.iter().cycle().take(24).enumerate() {
-            seed(&samples, "claude", path, &format!("sample-{number}"));
-            if number < 20 {
-                expected_sample.push((*path).to_owned());
+        for (id, workspace, timestamps) in &fixtures {
+            seed_forget_fixture(
+                &storage,
+                &forget_fixture_conversation(
+                    &format!("/fixtures/{id}.jsonl"),
+                    Some(id),
+                    *workspace,
+                    timestamps,
+                ),
+            )?;
+        }
+        assert_eq!(storage.total_conversation_count()?, 8);
+        let source = ForgetConversationsFilter {
+            source_glob: Some("**/retire-*.jsonl"),
+            ..Default::default()
+        };
+        let workspace = ForgetConversationsFilter {
+            workspace_glob: Some("/work/scr*"),
+            ..Default::default()
+        };
+        let age = ForgetConversationsFilter {
+            before_ms: Some(base + 100),
+            ..Default::default()
+        };
+        assert_eq!(
+            storage
+                .forget_conversations(&source, true)?
+                .conversations_matched,
+            1
+        );
+        assert_eq!(
+            storage
+                .forget_conversations(&workspace, true)?
+                .conversations_matched,
+            6
+        );
+        assert_eq!(
+            storage
+                .forget_conversations(&age, true)?
+                .conversations_matched,
+            3
+        );
+        assert_eq!(
+            storage
+                .forget_conversations(
+                    &ForgetConversationsFilter {
+                        workspace_glob: Some("*"),
+                        ..Default::default()
+                    },
+                    true
+                )?
+                .conversations_matched,
+            7,
+            "an unknown workspace is not the empty string"
+        );
+        for filter in [
+            ForgetConversationsFilter::default(),
+            ForgetConversationsFilter {
+                source_glob: Some("["),
+                ..Default::default()
+            },
+            ForgetConversationsFilter {
+                workspace_glob: Some("  "),
+                ..Default::default()
+            },
+        ] {
+            assert!(storage.forget_conversations(&filter, true).is_err());
+        }
+        let intersection = ForgetConversationsFilter {
+            source_glob: source.source_glob,
+            workspace_glob: workspace.workspace_glob,
+            before_ms: age.before_ms,
+        };
+        let preview = storage.forget_conversations(&intersection, true)?;
+        assert_eq!(preview.conversations_matched, 1);
+        assert_eq!(preview.messages_matched, 2);
+        assert_eq!(preview.conversations_deleted, 0);
+        assert!(storage.forgotten_source_stamps()?.is_empty());
+        assert!(storage.forgotten_conversation_keys()?.is_empty());
+        assert_eq!(storage.total_conversation_count()?, 8);
+        let applied = storage.forget_conversations(&intersection, false)?;
+        assert_eq!(applied.conversations_deleted, 1);
+        assert_eq!(applied.messages_matched, preview.messages_matched);
+        assert_eq!(applied.before_ms, Some(base + 100));
+        assert_eq!(applied.workspace_glob.as_deref(), Some("/work/scr*"));
+        assert_eq!(storage.total_conversation_count()?, 7);
+        assert_eq!(storage.total_message_count()?, 8);
+        assert_eq!(storage.forgotten_source_stamps()?.len(), 1);
+        assert!(storage.forgotten_conversation_keys()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn forget_derived_rebuild_marker_is_atomic_durable_and_survives_empty_retry() -> Result<()> {
+        let directory = TempDir::new()?;
+        let path = directory.path().join("forget-retry.db");
+        let storage = FrankenStorage::open(&path)?;
+        let source = "/fixture/retry.sqlite";
+        let conversation_id = seed_forget_fixture(
+            &storage,
+            &forget_fixture_conversation(source, Some("retired"), Some("/work/old"), &[Some(10)]),
+        )?;
+        assert!(!storage.forget_derived_rebuild_pending()?);
+        assert_eq!(
+            storage
+                .forget_conversations_by_source_glob(source, true)?
+                .conversations_matched,
+            1
+        );
+        assert!(!storage.forget_derived_rebuild_pending()?);
+
+        // Force failure after the marker and session tombstone were written.
+        // Their rollback must be atomic with the canonical deletion attempt.
+        storage.raw().execute(
+            "CREATE TABLE forget_retry_guard (
+                conversation_id INTEGER PRIMARY KEY
+                    REFERENCES conversations(id) ON DELETE RESTRICT
+             )",
+        )?;
+        storage.raw().execute_compat(
+            "INSERT INTO forget_retry_guard(conversation_id) VALUES (?1)",
+            fparams![conversation_id],
+        )?;
+        assert!(
+            storage
+                .forget_conversations_by_source_glob(source, false)
+                .is_err()
+        );
+        assert_eq!(storage.total_conversation_count()?, 1);
+        assert_eq!(storage.total_message_count()?, 1);
+        assert!(storage.forgotten_conversation_keys()?.is_empty());
+        assert!(storage.forgotten_source_stamps()?.is_empty());
+        assert!(!storage.forget_derived_rebuild_pending()?);
+        storage.raw().execute("DELETE FROM forget_retry_guard")?;
+
+        assert_eq!(
+            storage
+                .forget_conversations_by_source_glob(source, false)?
+                .conversations_deleted,
+            1
+        );
+        assert!(storage.forget_derived_rebuild_pending()?);
+        assert_eq!(storage.forgotten_conversation_keys()?.len(), 1);
+        storage.close()?;
+
+        let reopened = FrankenStorage::open(&path)?;
+        assert!(reopened.forget_derived_rebuild_pending()?);
+        for dry_run in [true, false] {
+            let retry = reopened.forget_conversations_by_source_glob(source, dry_run)?;
+            assert_eq!(retry.conversations_matched, 0);
+            assert_eq!(retry.conversations_deleted, 0);
+            assert!(
+                reopened.forget_derived_rebuild_pending()?,
+                "a no-match retry must preserve unfinished derived work"
+            );
+        }
+        reopened.clear_forget_derived_rebuild_pending()?;
+        assert!(!reopened.forget_derived_rebuild_pending()?);
+        reopened.close()?;
+        let reader = FrankenStorage::open_strict_readonly(&path)?;
+        assert!(!reader.forget_derived_rebuild_pending()?);
+        reader.close_without_checkpoint()?;
+        Ok(())
+    }
+
+    #[test]
+    fn forgotten_source_batch_lookup_is_indexed_bounded_and_observes_changes() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("batch-source-stamps.db"))?;
+        // A nonempty request against an empty table must not cache absence:
+        // this same path is inserted below and must become visible afterward.
+        assert!(
+            storage
+                .forgotten_source_stamps_for(&["/fixture/history/rollout-7.jsonl".into()])?
+                .is_empty()
+        );
+        let mut fixtures = Vec::new();
+        let mut tx = storage.raw().transaction()?;
+        for index in 0..512_i64 {
+            let path = format!("/fixture/history/rollout-{index}.jsonl");
+            let stamp = SourceFileStamp {
+                size_bytes: (index % 3 != 0).then_some(index * 100),
+                mtime_ms: (index % 5 != 0).then_some(1_700_000_000_000 + index),
+            };
+            tx.execute_compat(
+                "INSERT INTO forgotten_sources
+                    (source_path, size_bytes, mtime_ms, forgotten_at_ms)
+                 VALUES (?1, ?2, ?3, 1)",
+                fparams![path.as_str(), stamp.size_bytes, stamp.mtime_ms],
+            )?;
+            fixtures.push((path, stamp));
+        }
+        tx.execute_compat(
+            "UPDATE forgotten_sources SET mtime_ms = 'unreadable unrelated stamp'
+             WHERE source_path = ?1",
+            fparams![fixtures[400].0.as_str()],
+        )?;
+        tx.commit()?;
+        assert!(
+            storage.forgotten_source_stamps().is_err(),
+            "negative control: full-table decoding encounters the unrelated malformed stamp"
+        );
+        assert!(storage.forgotten_source_stamps_for(&[])?.is_empty());
+
+        let request = [
+            fixtures[0].0.clone(),
+            fixtures[7].0.clone(),
+            fixtures[511].0.clone(),
+            fixtures[7].0.clone(),
+            format!("{}.sibling", fixtures[7].0),
+            "/fixture/history/not-archived.jsonl".into(),
+        ];
+        assert_eq!(
+            storage.forgotten_source_stamps_for(&request)?,
+            HashMap::from([
+                fixtures[0].clone(),
+                fixtures[7].clone(),
+                fixtures[511].clone()
+            ])
+        );
+        let many_paths: Vec<_> = fixtures[..260]
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert_eq!(
+            storage.forgotten_source_stamps_for(&many_paths)?,
+            fixtures[..260].iter().cloned().collect(),
+            "large requests must retain every requested nullable stamp"
+        );
+        let plan: Vec<String> = storage.raw().query_map_collect(
+            "EXPLAIN QUERY PLAN SELECT size_bytes, mtime_ms FROM forgotten_sources
+             INDEXED BY sqlite_autoindex_forgotten_sources_1
+             WHERE source_path = ?1 LIMIT 1",
+            fparams![fixtures[7].0.as_str()],
+            |row| row.get_typed(3),
+        )?;
+        assert!(
+            plan.iter().any(|detail| detail.contains("SEARCH")
+                && detail.contains("sqlite_autoindex_forgotten_sources_1")),
+            "ordinary-file admission must use exact source-path seeks: {plan:?}"
+        );
+
+        // Changed-file re-inclusion clears a stamp. The next bounded lookup
+        // must observe that durable removal, with no process-local cache.
+        storage.clear_forgotten_sources(&[fixtures[7].0.clone()])?;
+        assert_eq!(
+            storage.forgotten_source_stamps_for(&request)?,
+            HashMap::from([fixtures[0].clone(), fixtures[511].clone()])
+        );
+        assert!(!storage.forget_derived_rebuild_pending()?);
+        Ok(())
+    }
+
+    #[test]
+    fn forgotten_source_batch_lookup_accepts_readonly_pre_v22_without_migration() -> Result<()> {
+        let directory = TempDir::new()?;
+        let path = directory.path().join("v21-source-stamps.db");
+        let conn = FrankenConnection::open(path.to_string_lossy().into_owned())?;
+        run_attributed_migration_steps(&conn, BASE_MIGRATION_STEPS)?;
+        apply_conversation_tail_state_cache_migration(&conn)?;
+        let old_steps: Vec<_> = POST_TAIL_CACHE_MIGRATION_STEPS
+            .iter()
+            .copied()
+            .filter(|(version, _, _)| *version <= 21)
+            .collect();
+        run_attributed_migration_steps(&conn, &old_steps)?;
+        let storage = FrankenStorage::new(conn, path.clone());
+        storage.apply_config()?;
+        storage.sync_meta_schema_version(21)?;
+        storage.close()?;
+        let before = fs::read(&path)?;
+
+        let reader = FrankenStorage::open_strict_readonly(&path)?;
+        assert!(reader.forgotten_source_stamps_for(&[])?.is_empty());
+        assert_eq!(
+            reader.list_forget_exclusions(&ForgetExclusionSelector::default())?,
+            ForgetExclusionList::default()
+        );
+        let reinclude = reader.reinclude_forget_exclusions(
+            &ForgetExclusionSelector {
+                source_path: Some("/fixture/history/rollout.jsonl"),
+                ..Default::default()
+            },
+            true,
+        )?;
+        assert_eq!(reinclude.exclusions_matched, 0);
+        assert_eq!(reinclude.legacy_sources_matched, 0);
+        assert_eq!(reinclude.source_observations_removed, 0);
+        assert!(
+            reader
+                .forgotten_source_stamps_for(&["/fixture/history/rollout.jsonl".into()])?
+                .is_empty()
+        );
+        assert_eq!(reader.schema_version()?, 21);
+        assert!(
+            reader
+                .raw()
+                .query("SELECT name FROM sqlite_master WHERE name = 'forgotten_sources'")?
+                .is_empty()
+        );
+        reader.close_without_checkpoint()?;
+        assert_eq!(fs::read(&path)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn forgotten_conversation_batch_lookup_uses_exact_indexed_keys() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("batch-exclusions.db"))?;
+        assert!(
+            storage
+                .forgotten_conversation_keys_for(&[ForgottenConversationKey {
+                    source_id: "local".into(),
+                    agent_slug: "opencode".into(),
+                    source_path: "/fixture/store-0/sessions.db".into(),
+                    external_id: "session-7".into(),
+                }])?
+                .is_empty(),
+            "an initially empty table must not hide the same key after insertion below"
+        );
+        let mut keys = Vec::new();
+        let mut tx = storage.raw().transaction()?;
+        for index in 0..512 {
+            let key = ForgottenConversationKey {
+                source_id: "local".into(),
+                agent_slug: "opencode".into(),
+                source_path: format!("/fixture/store-{}/sessions.db", index % 7),
+                external_id: format!("session-{index}"),
+            };
+            tx.execute_compat(
+                "INSERT INTO forgotten_conversations
+                    (source_id, agent_slug, source_path, external_id, forgotten_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, 1)",
+                fparams![
+                    key.source_id.as_str(),
+                    key.agent_slug.as_str(),
+                    key.source_path.as_str(),
+                    key.external_id.as_str()
+                ],
+            )?;
+            keys.push(key);
+        }
+        // An unrelated malformed identity proves that admission does not
+        // decode the rest of the exclusion table to answer a small batch.
+        tx.execute(
+            "INSERT INTO forgotten_conversations
+                (source_id, agent_slug, source_path, external_id, forgotten_at_ms)
+             VALUES (X'FF', 'opencode', '/unrelated/store.db', 'unrelated', 1)",
+        )?;
+        tx.commit()?;
+        assert!(
+            storage.forgotten_conversation_keys().is_err(),
+            "negative control: a full-table decode reaches the malformed identity"
+        );
+        assert!(storage.forgotten_conversation_keys_for(&[])?.is_empty());
+
+        let mut other_source = keys[7].clone();
+        other_source.source_id = "remote-host".into();
+        let mut other_agent = keys[7].clone();
+        other_agent.agent_slug = "devin".into();
+        let mut other_path = keys[7].clone();
+        other_path.source_path.push_str("/sibling");
+        let mut other_session = keys[7].clone();
+        other_session.external_id = "not-archived".into();
+        let request = [
+            keys[7].clone(),
+            keys[511].clone(),
+            keys[7].clone(),
+            other_source,
+            other_agent,
+            other_path,
+            other_session,
+        ];
+        assert_eq!(
+            storage.forgotten_conversation_keys_for(&request)?,
+            HashSet::from([keys[7].clone(), keys[511].clone()])
+        );
+        assert_eq!(
+            storage.forgotten_conversation_keys_for(&keys[..260])?,
+            keys[..260].iter().cloned().collect()
+        );
+        let plan: Vec<String> = storage.raw().query_map_collect(
+            "EXPLAIN QUERY PLAN SELECT 1 FROM forgotten_conversations
+             INDEXED BY sqlite_autoindex_forgotten_conversations_1
+             WHERE source_id = ?1 AND agent_slug = ?2
+               AND source_path = ?3 AND external_id = ?4
+             LIMIT 1",
+            fparams![
+                keys[7].source_id.as_str(),
+                keys[7].agent_slug.as_str(),
+                keys[7].source_path.as_str(),
+                keys[7].external_id.as_str()
+            ],
+            |row| row.get_typed(3),
+        )?;
+        assert!(
+            plan.iter().any(|detail| detail.contains("SEARCH")
+                && detail.contains("sqlite_autoindex_forgotten_conversations_1")),
+            "batch admission must use exact composite-key seeks: {plan:?}"
+        );
+        assert!(!storage.forget_derived_rebuild_pending()?);
+        Ok(())
+    }
+
+    #[test]
+    fn reinclude_exact_session_preserves_provenance_siblings_and_pending_work() -> Result<()> {
+        let directory = TempDir::new()?;
+        let db_path = directory.path().join("reinclude.db");
+        let provider = directory.path().join("project[1]/sessions.db");
+        fs::create_dir_all(provider.parent().context("provider parent")?)?;
+        let provider_bytes = b"unchanged provider evidence";
+        fs::write(&provider, provider_bytes)?;
+        let source = provider.to_string_lossy().into_owned();
+        let storage = FrankenStorage::open(&db_path)?;
+        let local = forget_fixture_conversation(
+            &source,
+            Some("shared-id"),
+            Some("/work/retired"),
+            &[Some(10)],
+        );
+        seed_forget_fixture(&storage, &local)?;
+        let kept_id = seed_forget_fixture(
+            &storage,
+            &forget_fixture_conversation(
+                &source,
+                Some("kept-id"),
+                Some("/work/current"),
+                &[Some(20)],
+            ),
+        )?;
+        let mut remote = local.clone();
+        remote.source_id = "remote-fixture".into();
+        remote.origin_host = Some("remote-fixture".into());
+        seed_forget_fixture(&storage, &remote)?;
+        let mut other_agent = local.clone();
+        other_agent.agent_slug = "devin".into();
+        seed_forget_fixture(&storage, &other_agent)?;
+        assert_eq!(storage.total_conversation_count()?, 4);
+        let retired = ForgetConversationsFilter {
+            workspace_glob: Some("/work/retired"),
+            ..Default::default()
+        };
+        assert_eq!(
+            storage
+                .forget_conversations(&retired, false)?
+                .conversations_deleted,
+            3
+        );
+        // Canonical identity is UNIQUE(source_id, agent_id, external_id), so a
+        // same-session copy in another store file can only exist after the
+        // original row is gone. Its exclusion is then a genuine path sibling of
+        // the first one: same source, agent and external id, different path.
+        let mut other_path = local;
+        other_path.source_path = directory.path().join("other.db");
+        seed_forget_fixture(&storage, &other_path)?;
+        assert_eq!(storage.total_conversation_count()?, 2);
+        assert_eq!(
+            storage
+                .forget_conversations(&retired, false)?
+                .conversations_deleted,
+            1
+        );
+        for (key, path) in [
+            ("source_ingest_v1:shared", source.as_str()),
+            ("source_ingest_v1:other", "/fixture/unrelated.db"),
+        ] {
+            storage.raw().execute_compat(
+                "INSERT INTO meta(key, value) VALUES (?1, ?2)",
+                fparams![
+                    key,
+                    serde_json::json!({"primary": {"path": path}, "dependencies": []}).to_string()
+                ],
+            )?;
+        }
+        storage.set_last_scan_ts(123)?;
+        storage.set_connector_last_scan_ts("opencode", 456)?;
+        storage.set_connector_last_scan_ts("codex", 789)?;
+        let before = storage.list_forget_exclusions(&ForgetExclusionSelector::default())?;
+        assert_eq!(before.exclusions.len(), 4);
+        assert!(before.legacy_sources.is_empty());
+        let selector = ForgetExclusionSelector {
+            source_path: Some(&source),
+            source_id: Some(LOCAL_SOURCE_ID),
+            agent_slug: Some("opencode"),
+            external_id: Some("shared-id"),
+            ..Default::default()
+        };
+        let listed = storage.list_forget_exclusions(&selector)?;
+        assert_eq!(listed.exclusions.len(), 1);
+        assert!(!listed.exclusions[0].blocked_by_source_stamp);
+        assert_eq!(listed.exclusions[0].key.source_path, source);
+        assert!(listed.exclusions[0].forgotten_at_ms > 0);
+        let json = serde_json::to_value(&listed.exclusions[0])?;
+        assert_eq!(json["source_id"], LOCAL_SOURCE_ID);
+        assert!(json.get("workspace").is_none());
+        assert!(json.get("last_message_at").is_none());
+        assert!(
+            storage
+                .list_forget_exclusions(&ForgetExclusionSelector {
+                    source_glob: Some(&source),
+                    ..Default::default()
+                })?
+                .exclusions
+                .is_empty(),
+            "literal bracketed paths must use source-path rather than glob interpretation"
+        );
+        for invalid in [
+            ForgetExclusionSelector::default(),
+            ForgetExclusionSelector {
+                source_glob: Some("*"),
+                source_path: Some(&source),
+                ..Default::default()
+            },
+            ForgetExclusionSelector {
+                source_glob: Some("["),
+                ..Default::default()
+            },
+            ForgetExclusionSelector {
+                external_id: Some(" "),
+                ..Default::default()
+            },
+        ] {
+            for dry_run in [true, false] {
+                assert!(
+                    storage
+                        .reinclude_forget_exclusions(&invalid, dry_run)
+                        .is_err()
+                );
             }
         }
-        let dry = samples
-            .forget_conversations_by_source_glob("/sample/*.jsonl", true)
-            .unwrap();
-        assert_eq!(dry.conversations_matched, 24);
-        assert_eq!(dry.sample_source_paths, expected_sample);
-        assert_eq!(samples.total_conversation_count().unwrap(), 24);
-        assert!(samples.forgotten_source_stamps().unwrap().is_empty());
-        let applied = samples
-            .forget_conversations_by_source_glob("/sample/*.jsonl", false)
-            .unwrap();
-        assert_eq!(applied.conversations_deleted, 24);
-        assert_eq!(applied.sample_source_paths, expected_sample);
-        assert_eq!(samples.total_conversation_count().unwrap(), 0);
-        assert_eq!(samples.forgotten_source_stamps().unwrap().len(), 3);
+        let preview = storage.reinclude_forget_exclusions(&selector, true)?;
+        assert_eq!(preview.exclusions_matched, 1);
+        assert_eq!(preview.exclusions_removed, 0);
+        assert_eq!(preview.source_observations_matched, 1);
+        assert_eq!(preview.source_observations_removed, 0);
+        assert_eq!(preview.sample_sessions, listed.exclusions);
+        assert_eq!(
+            storage.list_forget_exclusions(&ForgetExclusionSelector::default())?,
+            before
+        );
+        assert_eq!(storage.source_ingest_ledger_entries()?.len(), 2);
+        assert!(storage.forget_derived_rebuild_pending()?);
+
+        let applied = storage.reinclude_forget_exclusions(&selector, false)?;
+        assert_eq!(applied.exclusions_removed, 1);
+        assert_eq!(applied.legacy_sources_removed, 0);
+        assert_eq!(applied.source_observations_removed, 1);
+        let remaining_ledger = storage.source_ingest_ledger_entries()?;
+        assert_eq!(remaining_ledger.len(), 1);
+        assert!(remaining_ledger.contains_key("source_ingest_v1:other"));
+        assert!(
+            storage
+                .list_forget_exclusions(&selector)?
+                .exclusions
+                .is_empty()
+        );
+        assert_eq!(storage.forgotten_conversation_keys()?.len(), 3);
+        assert_eq!(storage.total_conversation_count()?, 1);
+        assert_eq!(storage.fetch_messages(kept_id)?.len(), 1);
+        assert_eq!(storage.get_last_scan_ts()?, Some(123));
+        assert_eq!(storage.get_connector_last_scan_ts("opencode")?, Some(0));
+        assert_eq!(storage.get_connector_last_scan_ts("codex")?, Some(789));
+        assert!(storage.forget_derived_rebuild_pending()?);
+        storage.raw().execute(
+            "INSERT INTO meta(key, value) VALUES ('source_ingest_v1:after-release', '{}')",
+        )?;
+        let no_match = storage.reinclude_forget_exclusions(&selector, false)?;
+        assert_eq!(no_match.exclusions_matched, 0);
+        assert_eq!(no_match.exclusions_removed, 0);
+        assert_eq!(no_match.source_observations_removed, 0);
+        assert_eq!(storage.source_ingest_ledger_entries()?.len(), 2);
+        storage.close()?;
+        let reopened = FrankenStorage::open_strict_readonly(&db_path)?;
+        assert_eq!(
+            reopened
+                .list_forget_exclusions(&ForgetExclusionSelector::default())?
+                .exclusions
+                .len(),
+            3
+        );
+        assert!(reopened.forget_derived_rebuild_pending()?);
+        reopened.close_without_checkpoint()?;
+        assert_eq!(fs::read(provider)?, provider_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn reinclude_logical_handles_replay_physical_stores_without_invalidating_siblings() -> Result<()>
+    {
+        for (name, present) in [
+            ("opencode.db", true),
+            ("extensionless-store", true),
+            ("temporarily-missing-store", false),
+        ] {
+            let directory = TempDir::new()?;
+            let storage = FrankenStorage::open(&directory.path().join("archive.db"))?;
+            let source = directory.path().join(name);
+            let source_bytes = b"SQLite format 3\0unchanged source evidence";
+            if present {
+                fs::write(&source, source_bytes)?;
+            }
+            for session in ["ses-restored", "ses-kept"] {
+                storage.raw().execute_compat(
+                    "INSERT INTO forgotten_conversations
+                     (source_id, agent_slug, source_path, external_id, forgotten_at_ms)
+                     VALUES ('local', 'opencode', ?1, ?2, 1)",
+                    fparams![source.join(session).to_string_lossy().as_ref(), session],
+                )?;
+            }
+            let sibling = directory.path().join(format!("{name}-sibling"));
+            fs::write(&sibling, b"unrelated source")?;
+            for (key, observation) in [
+                (
+                    "physical-primary",
+                    serde_json::json!({"primary": {"path": source}, "dependencies": []}),
+                ),
+                (
+                    "physical-dependency",
+                    serde_json::json!({"primary": {"path": "/fixture/consumer"}, "dependencies": [{"path": source}]}),
+                ),
+                (
+                    "same-directory",
+                    serde_json::json!({"primary": {"path": sibling}, "dependencies": [{"path": directory.path()}]}),
+                ),
+                (
+                    "directory-primary",
+                    serde_json::json!({"primary": {"path": directory.path()}, "dependencies": []}),
+                ),
+            ] {
+                storage.record_filtered_source_completion(&SourceIngestLedgerEntry {
+                    key: format!("source_ingest_v1:{key}"),
+                    observation: observation.to_string(),
+                })?;
+            }
+            storage.set_last_scan_ts(900)?;
+            storage.set_connector_last_scan_ts("opencode", 800)?;
+            storage.set_connector_last_scan_ts("codex", 700)?;
+            let logical_path = source.join("ses-restored");
+            let selector = ForgetExclusionSelector {
+                source_path: Some(logical_path.to_str().context("UTF-8 selected source")?),
+                external_id: Some("ses-restored"),
+                ..Default::default()
+            };
+            let before = storage.source_ingest_ledger_entries()?;
+            let preview = storage.reinclude_forget_exclusions(&selector, true)?;
+            assert_eq!(preview.exclusions_matched, 1);
+            assert_eq!(
+                preview.source_observations_matched,
+                if present { 2 } else { 1 }
+            );
+            assert_eq!(preview.source_observations_removed, 0);
+            assert_eq!(storage.source_ingest_ledger_entries()?, before);
+            assert_eq!(storage.get_connector_last_scan_ts("opencode")?, Some(800));
+            let result = storage.reinclude_forget_exclusions(&selector, false)?;
+            assert_eq!(result.exclusions_removed, 1);
+            assert_eq!(
+                result.source_observations_removed,
+                if present { 2 } else { 1 }
+            );
+            let ledger = storage.source_ingest_ledger_entries()?;
+            assert!(!ledger.contains_key("source_ingest_v1:physical-primary"));
+            assert_eq!(
+                ledger.contains_key("source_ingest_v1:physical-dependency"),
+                !present
+            );
+            assert!(ledger.contains_key("source_ingest_v1:same-directory"));
+            assert!(ledger.contains_key("source_ingest_v1:directory-primary"));
+            assert_eq!(storage.get_connector_last_scan_ts("opencode")?, Some(0));
+            assert_eq!(storage.get_connector_last_scan_ts("codex")?, Some(700));
+            assert_eq!(storage.get_last_scan_ts()?, Some(900));
+            let retained = storage.forgotten_conversation_keys()?;
+            assert_eq!(retained.len(), 1);
+            assert!(retained.iter().all(|key| key.external_id == "ses-kept"));
+            if present {
+                assert_eq!(fs::read(&source)?, source_bytes);
+            } else {
+                assert!(!source.exists());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reinclude_logical_alias_resets_provider_aliases_and_only_its_remote_mirror() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("archive.db"))?;
+        let source = directory.path().join("physical-store");
+        let alias = directory.path().join("discovered-store.db");
+        fs::write(&source, b"SQLite format 3\0unchanged store")?;
+        symlink(&source, &alias)?;
+        let logical_path = alias.join("ses-restored");
+        storage.raw().execute_compat(
+            "INSERT INTO forgotten_conversations
+             (source_id, agent_slug, source_path, external_id, forgotten_at_ms)
+             VALUES ('remote-a', 'claude_code', ?1, 'ses-restored', 1)",
+            fparams![logical_path.to_string_lossy().as_ref()],
+        )?;
+        storage.record_filtered_source_completion(&SourceIngestLedgerEntry {
+            key: "source_ingest_v1:physical-store".into(),
+            observation: serde_json::json!({
+                "primary": {"path": source}, "dependencies": []
+            })
+            .to_string(),
+        })?;
+        storage.set_last_scan_ts(900)?;
+        storage.set_connector_last_scan_ts("claude", 800)?;
+        storage.set_connector_last_scan_ts("codex", 700)?;
+        storage.record_mirror_scan_fingerprint("remote-a", "selected-mirror")?;
+        storage.record_mirror_scan_fingerprint("remote-b", "unrelated-mirror")?;
+        let selector = ForgetExclusionSelector {
+            source_path: Some(logical_path.to_str().context("UTF-8 selected alias")?),
+            external_id: Some("ses-restored"),
+            ..Default::default()
+        };
+        let preview = storage.reinclude_forget_exclusions(&selector, true)?;
+        assert_eq!(preview.source_observations_matched, 1);
+        assert_eq!(storage.get_connector_last_scan_ts("claude")?, Some(800));
+        assert_eq!(
+            storage.read_mirror_scan_fingerprint("remote-a")?.as_deref(),
+            Some("selected-mirror")
+        );
+        let result = storage.reinclude_forget_exclusions(&selector, false)?;
+        assert_eq!(result.exclusions_removed, 1);
+        assert_eq!(result.source_observations_removed, 1);
+        assert!(storage.source_ingest_ledger_entries()?.is_empty());
+        for provider in ["claude", "claude-code", "claude_code"] {
+            assert_eq!(storage.get_connector_last_scan_ts(provider)?, Some(0));
+        }
+        assert_eq!(storage.get_connector_last_scan_ts("codex")?, Some(700));
+        assert_eq!(storage.get_last_scan_ts()?, Some(900));
+        assert_eq!(storage.read_mirror_scan_fingerprint("remote-a")?, None);
+        assert_eq!(
+            storage.read_mirror_scan_fingerprint("remote-b")?.as_deref(),
+            Some("unrelated-mirror")
+        );
+        storage.set_connector_last_scan_ts("claude", 1000)?;
+        storage.record_mirror_scan_fingerprint("remote-a", "new-completion")?;
+        assert_eq!(
+            storage
+                .reinclude_forget_exclusions(&selector, false)?
+                .exclusions_removed,
+            0
+        );
+        assert_eq!(storage.get_connector_last_scan_ts("claude")?, Some(1000));
+        assert_eq!(
+            storage.read_mirror_scan_fingerprint("remote-a")?.as_deref(),
+            Some("new-completion")
+        );
+        assert_eq!(fs::read(&alias)?, b"SQLite format 3\0unchanged store");
+        Ok(())
+    }
+
+    #[test]
+    fn reinclude_identity_scope_refuses_source_stamp_overlap_before_any_mutation() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("overlap.db"))?;
+        for (source, session) in [
+            ("/fixture/blocked.db", "blocked"),
+            ("/fixture/free.db", "free"),
+        ] {
+            seed_forget_fixture(
+                &storage,
+                &forget_fixture_conversation(source, Some(session), Some("/work/old"), &[Some(10)]),
+            )?;
+        }
+        storage.forget_conversations_by_source_glob("/fixture/*.db", false)?;
+        storage.raw().execute(
+            "INSERT INTO forgotten_sources(source_path, size_bytes, mtime_ms, forgotten_at_ms)
+             VALUES ('/fixture/blocked.db', 10, 20, 30)",
+        )?;
+        storage.record_filtered_source_completion(&SourceIngestLedgerEntry {
+            key: "source_ingest_v1:overlap".into(),
+            observation: serde_json::json!({
+                "primary": {"path": "/fixture/blocked.db"}, "dependencies": []
+            })
+            .to_string(),
+        })?;
+        storage.set_last_scan_ts(900)?;
+        storage.set_connector_last_scan_ts("opencode", 800)?;
+        storage.set_connector_last_scan_ts("codex", 700)?;
+        storage.record_mirror_scan_fingerprint("remote-fixture", "before-release")?;
+        let selector = ForgetExclusionSelector {
+            agent_slug: Some("opencode"),
+            ..Default::default()
+        };
+        let preview = storage.reinclude_forget_exclusions(&selector, true)?;
+        assert_eq!(preview.exclusions_matched, 2);
+        assert_eq!(preview.legacy_sources_matched, 0);
+        assert_eq!(preview.blocked_by_source_stamps, ["/fixture/blocked.db"]);
+        let before = storage.list_forget_exclusions(&ForgetExclusionSelector::default())?;
+        assert_eq!(before.legacy_sources.len(), 1);
+        assert!(
+            storage
+                .reinclude_forget_exclusions(&selector, false)
+                .unwrap_err()
+                .to_string()
+                .contains("source-wide exclusion")
+        );
+        assert_eq!(
+            storage.list_forget_exclusions(&ForgetExclusionSelector::default())?,
+            before
+        );
+        assert_eq!(storage.source_ingest_ledger_entries()?.len(), 1);
+        assert_eq!(storage.get_last_scan_ts()?, Some(900));
+        assert_eq!(storage.get_connector_last_scan_ts("opencode")?, Some(800));
+        let source_only = ForgetExclusionSelector {
+            source_path: Some("/fixture/blocked.db"),
+            ..Default::default()
+        };
+        let preview = storage.reinclude_forget_exclusions(&source_only, true)?;
+        assert_eq!(preview.exclusions_matched, 1);
+        assert_eq!(preview.legacy_sources_matched, 1);
+        assert!(preview.blocked_by_source_stamps.is_empty());
+        let applied = storage.reinclude_forget_exclusions(&source_only, false)?;
+        assert_eq!(applied.exclusions_removed, 1);
+        assert_eq!(applied.legacy_sources_removed, 1);
+        assert_eq!(applied.source_observations_removed, 1);
+        assert_eq!(storage.get_last_scan_ts()?, Some(0));
+        assert_eq!(storage.get_connector_last_scan_ts("opencode")?, Some(0));
+        assert_eq!(storage.get_connector_last_scan_ts("codex")?, Some(0));
+        assert_eq!(
+            storage.read_mirror_scan_fingerprint("remote-fixture")?,
+            None
+        );
+        assert_eq!(storage.forgotten_conversation_keys()?.len(), 1);
+        assert!(storage.forgotten_source_stamps()?.is_empty());
+        assert!(storage.forget_derived_rebuild_pending()?);
+        Ok(())
+    }
+
+    #[test]
+    fn reinclude_ledger_failure_rolls_back_both_exclusion_kinds() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("reinclude-rollback.db"))?;
+        let source = "/fixture/rollback.db";
+        seed_forget_fixture(
+            &storage,
+            &forget_fixture_conversation(source, Some("session"), None, &[Some(10)]),
+        )?;
+        storage.forget_conversations_by_source_glob(source, false)?;
+        storage.raw().execute_compat(
+            "INSERT INTO forgotten_sources(source_path, forgotten_at_ms) VALUES (?1, 1)",
+            fparams![source],
+        )?;
+        storage.record_filtered_source_completion(&SourceIngestLedgerEntry {
+            key: "source_ingest_v1:guarded".into(),
+            observation: serde_json::json!({
+                "primary": {"path": source}, "dependencies": []
+            })
+            .to_string(),
+        })?;
+        storage.raw().execute(
+            "CREATE TABLE reinclude_ledger_guard (
+                ledger_key TEXT PRIMARY KEY REFERENCES meta(key) ON DELETE RESTRICT
+             )",
+        )?;
+        storage.raw().execute(
+            "INSERT INTO reinclude_ledger_guard(ledger_key) VALUES ('source_ingest_v1:guarded')",
+        )?;
+        let selector = ForgetExclusionSelector {
+            source_path: Some(source),
+            ..Default::default()
+        };
+        let before = storage.list_forget_exclusions(&selector)?;
+        assert_eq!(before.exclusions.len(), 1);
+        assert_eq!(before.legacy_sources.len(), 1);
+        let preview = storage.reinclude_forget_exclusions(&selector, true)?;
+        assert_eq!(preview.exclusions_matched, 1);
+        assert_eq!(preview.legacy_sources_matched, 1);
+        assert_eq!(preview.source_observations_matched, 1);
+        assert!(
+            storage
+                .reinclude_forget_exclusions(&selector, false)
+                .is_err()
+        );
+        assert_eq!(storage.list_forget_exclusions(&selector)?, before);
+        assert_eq!(storage.source_ingest_ledger_entries()?.len(), 1);
+        assert!(storage.forget_derived_rebuild_pending()?);
+        storage
+            .raw()
+            .execute("DELETE FROM reinclude_ledger_guard")?;
+        let applied = storage.reinclude_forget_exclusions(&selector, false)?;
+        assert_eq!(applied.exclusions_removed, 1);
+        assert_eq!(applied.legacy_sources_removed, 1);
+        assert_eq!(applied.source_observations_removed, 1);
+        assert!(storage.source_ingest_ledger_entries()?.is_empty());
+        assert_eq!(storage.schema_version()?, CURRENT_SCHEMA_VERSION);
+        assert!(storage.forget_derived_rebuild_pending()?);
+        Ok(())
+    }
+
+    #[test]
+    fn reinclude_preview_samples_do_not_limit_the_selected_release() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("reinclude-samples.db"))?;
+        let mut tx = storage.raw().transaction()?;
+        for index in 0..25 {
+            tx.execute_compat(
+                "INSERT INTO forgotten_conversations
+                    (source_id, agent_slug, source_path, external_id, forgotten_at_ms)
+                 VALUES ('local', 'opencode', '/fixture/shared.db', ?1, 1)",
+                fparams![format!("session-{index:02}")],
+            )?;
+        }
+        tx.commit()?;
+        let selector = ForgetExclusionSelector {
+            source_glob: Some("/fixture/*.db"),
+            ..Default::default()
+        };
+        assert_eq!(
+            storage.list_forget_exclusions(&selector)?.exclusions.len(),
+            25
+        );
+        let preview = storage.reinclude_forget_exclusions(&selector, true)?;
+        assert_eq!(preview.exclusions_matched, 25);
+        assert_eq!(preview.sample_sessions.len(), 20);
+        assert_eq!(preview.exclusions_removed, 0);
+        assert_eq!(storage.forgotten_conversation_keys()?.len(), 25);
+        let applied = storage.reinclude_forget_exclusions(&selector, false)?;
+        assert_eq!(applied.exclusions_removed, 25);
+        assert!(storage.forgotten_conversation_keys()?.is_empty());
+        assert!(!storage.forget_derived_rebuild_pending()?);
+        Ok(())
+    }
+
+    #[test]
+    fn forget_shared_store_records_session_identity_without_suppressing_siblings() -> Result<()> {
+        let directory = TempDir::new()?;
+        let path = directory.path().join("shared-store.db");
+        let storage = FrankenStorage::open(&path)?;
+        let source = "/fixture/opencode.db";
+        let forgotten = forget_fixture_conversation(
+            source,
+            Some("same-id"),
+            Some("/work/retired"),
+            &[Some(10)],
+        );
+        seed_forget_fixture(&storage, &forgotten)?;
+        let sibling_id = seed_forget_fixture(
+            &storage,
+            &forget_fixture_conversation(
+                source,
+                Some("kept-id"),
+                Some("/work/current"),
+                &[Some(20)],
+            ),
+        )?;
+        let mut remote =
+            forget_fixture_conversation(source, Some("same-id"), Some("/work/remote"), &[Some(30)]);
+        remote.source_id = "remote-fixture".into();
+        remote.origin_host = Some("remote-fixture".into());
+        let remote_id = seed_forget_fixture(&storage, &remote)?;
+        let filter = ForgetConversationsFilter {
+            workspace_glob: Some("/work/retired"),
+            ..Default::default()
+        };
+        let preview = storage.forget_conversations(&filter, true)?;
+        assert_eq!(preview.conversations_matched, 1);
+        assert_eq!(
+            preview.sample_sessions,
+            vec![ForgetSessionSample {
+                source_path: Some(source.into()),
+                external_id: Some("same-id".into()),
+                workspace: Some("/work/retired".into()),
+                last_message_at: Some(10),
+            }]
+        );
+        assert!(storage.forgotten_conversation_keys()?.is_empty());
+        assert_eq!(
+            storage
+                .forget_conversations(&filter, false)?
+                .conversations_deleted,
+            1
+        );
+        assert_eq!(storage.fetch_messages(sibling_id)?.len(), 1);
+        assert_eq!(storage.fetch_messages(remote_id)?.len(), 1);
+        assert!(
+            storage.forgotten_source_stamps()?.is_empty(),
+            "a whole-file stamp would also suppress kept sessions"
+        );
+        let expected = HashSet::from([ForgottenConversationKey {
+            source_id: LOCAL_SOURCE_ID.into(),
+            agent_slug: "opencode".into(),
+            source_path: source.into(),
+            external_id: "same-id".into(),
+        }]);
+        assert_eq!(storage.forgotten_conversation_keys()?, expected);
+        storage.clear_forgotten_sources(&[source.into()])?;
+        storage.close()?;
+        let reopened = FrankenStorage::open(&path)?;
+        assert_eq!(reopened.forgotten_conversation_keys()?, expected);
+        assert_eq!(reopened.total_conversation_count()?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn forget_shared_store_detection_checks_virtual_paths_and_sqlite_headers() -> Result<()> {
+        let directory = TempDir::new()?;
+        let database = directory.path().join("sessions.db");
+        let header_only = directory.path().join("opaque-store");
+        let ordinary_directory = directory.path().join("project.db");
+        fs::create_dir(&ordinary_directory)?;
+        let ordinary_file = ordinary_directory.join("rollout.jsonl");
+        fs::write(&database, b"SQLite format 3\0fixture")?;
+        fs::write(&header_only, b"SQLite format 3\0fixture")?;
+        fs::write(&ordinary_file, b"ordinary session transcript")?;
+
+        for source in [
+            database.clone(),
+            database.join("devin-session"),
+            header_only.clone(),
+            header_only.join("virtual-session"),
+            directory.path().join("missing.SQLITE3"),
+        ] {
+            assert!(
+                source_path_is_shared_store(source.to_str().context("UTF-8 source path")?),
+                "{} must use session identity",
+                source.display()
+            );
+        }
+        for source in [
+            ordinary_directory,
+            ordinary_file,
+            directory.path().join("missing.jsonl"),
+        ] {
+            assert!(
+                !source_path_is_shared_store(source.to_str().context("UTF-8 source path")?),
+                "{} must retain ordinary file behavior",
+                source.display()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn forget_virtual_and_header_only_stores_use_permanent_session_keys() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("archive.db"))?;
+        let database = directory.path().join("sessions.db");
+        let header_only = directory.path().join("opaque-store");
+        let source_bytes = b"SQLite format 3\0source evidence";
+        fs::write(&database, source_bytes)?;
+        fs::write(&header_only, source_bytes)?;
+        let sources = [
+            (database.join("session-devin"), "devin"),
+            (header_only.clone(), "opencode"),
+            (header_only.join("session-virtual"), "devin"),
+        ];
+        for (index, (source, agent)) in sources.iter().enumerate() {
+            let external_id = format!("session-{index}");
+            let mut conversation = forget_fixture_conversation(
+                source.to_str().context("UTF-8 source path")?,
+                Some(&external_id),
+                Some("/work/retired"),
+                &[Some(10)],
+            );
+            conversation.agent_slug = (*agent).into();
+            seed_forget_fixture(&storage, &conversation)?;
+        }
+        let filter = ForgetConversationsFilter {
+            workspace_glob: Some("/work/retired"),
+            ..Default::default()
+        };
+        let preview = storage.forget_conversations(&filter, true)?;
+        assert_eq!(preview.conversations_matched, 3);
+        assert_eq!(preview.sample_sessions.len(), 3);
+        assert!(storage.forgotten_source_stamps()?.is_empty());
+        assert!(storage.forgotten_conversation_keys()?.is_empty());
+        let applied = storage.forget_conversations(&filter, false)?;
+        assert_eq!(applied.conversations_deleted, 3);
+        assert_eq!(applied.sample_sessions, preview.sample_sessions);
+        assert!(storage.forgotten_source_stamps()?.is_empty());
+        let keys = storage.forgotten_conversation_keys()?;
+        assert_eq!(keys.len(), 3);
+        for (index, (source, agent)) in sources.iter().enumerate() {
+            assert!(keys.contains(&ForgottenConversationKey {
+                source_id: LOCAL_SOURCE_ID.into(),
+                agent_slug: (*agent).into(),
+                source_path: source.to_string_lossy().into_owned(),
+                external_id: format!("session-{index}"),
+            }));
+        }
+        assert_eq!(fs::read(database)?, source_bytes);
+        assert_eq!(fs::read(header_only)?, source_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn forget_session_preview_is_bounded_without_truncating_counts() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("preview.db"))?;
+        for index in 0..21 {
+            seed_forget_fixture(
+                &storage,
+                &forget_fixture_conversation(
+                    "/fixture/sessions.db",
+                    Some(&format!("session-{index}")),
+                    Some("/work/retired"),
+                    &[Some(index), Some(index + 1)],
+                ),
+            )?;
+        }
+        let preview = storage.forget_conversations(
+            &ForgetConversationsFilter {
+                workspace_glob: Some("/work/retired"),
+                ..Default::default()
+            },
+            true,
+        )?;
+        assert_eq!(preview.conversations_matched, 21);
+        assert_eq!(preview.messages_matched, 42);
+        assert_eq!(preview.sample_sessions.len(), 20);
+        assert_eq!(
+            preview.sample_sessions[0].external_id.as_deref(),
+            Some("session-0")
+        );
+        assert_eq!(preview.sample_sessions[0].last_message_at, Some(1));
+        assert_eq!(
+            preview.sample_sessions[19].external_id.as_deref(),
+            Some("session-19")
+        );
+        assert_eq!(preview.sample_sessions[19].last_message_at, Some(20));
+        assert_eq!(storage.total_conversation_count()?, 21);
+        assert!(storage.forgotten_conversation_keys()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn forget_recognizes_shared_json_even_after_only_one_session_remains() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("shared-json.db"))?;
+        let source = "/fixture/conversations.json";
+        for (session, workspace) in [("one", "/work/one"), ("two", "/work/two")] {
+            seed_forget_fixture(
+                &storage,
+                &forget_fixture_conversation(source, Some(session), Some(workspace), &[Some(10)]),
+            )?;
+        }
+        storage.forget_conversations(
+            &ForgetConversationsFilter {
+                workspace_glob: Some("/work/one"),
+                ..Default::default()
+            },
+            false,
+        )?;
+        assert_eq!(storage.forgotten_conversation_keys()?.len(), 1);
+        assert_eq!(storage.total_conversation_count()?, 1);
+        storage.forget_conversations_by_source_glob(source, false)?;
+        assert_eq!(storage.forgotten_conversation_keys()?.len(), 2);
+        assert!(storage.forgotten_source_stamps()?.is_empty());
+        assert_eq!(storage.total_conversation_count()?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn forget_partial_shared_source_without_identity_is_refused_atomically() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("missing-identity.db"))?;
+        let source = "/fixture/shared.sqlite";
+        seed_forget_fixture(
+            &storage,
+            &forget_fixture_conversation(source, None, Some("/work/retired"), &[Some(10)]),
+        )?;
+        seed_forget_fixture(
+            &storage,
+            &forget_fixture_conversation(source, Some("kept"), Some("/work/current"), &[Some(20)]),
+        )?;
+        let filter = ForgetConversationsFilter {
+            workspace_glob: Some("/work/retired"),
+            ..Default::default()
+        };
+        for dry_run in [true, false] {
+            let error = storage.forget_conversations(&filter, dry_run).unwrap_err();
+            assert!(error.to_string().contains("no stable external ID"));
+            assert_eq!(storage.total_conversation_count()?, 2);
+            assert_eq!(storage.total_message_count()?, 2);
+            assert!(storage.forgotten_source_stamps()?.is_empty());
+            assert!(storage.forgotten_conversation_keys()?.is_empty());
+        }
+        assert_eq!(
+            storage
+                .forget_conversations_by_source_glob(source, false)?
+                .conversations_deleted,
+            2
+        );
+        assert_eq!(storage.forgotten_source_stamps()?.len(), 1);
+        assert_eq!(storage.forgotten_conversation_keys()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn forget_selection_continues_past_an_unmatched_page() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("paged-forget.db"))?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "fixture".into(),
+            name: "Fixture".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let mut tx = storage.raw().transaction()?;
+        for id in 1..=257_i64 {
+            let source = if id == 257 {
+                "/fixture/selected.jsonl"
+            } else {
+                "/fixture/kept.jsonl"
+            };
+            tx.execute_compat(
+                "INSERT INTO conversations(id, agent_id, source_path, external_id) VALUES(?1, ?2, ?3, ?4)",
+                fparams![id, agent_id, source, id.to_string()],
+            )?;
+            tx.execute_compat(
+                "INSERT INTO messages(conversation_id, idx, role, created_at, content) VALUES(?1, 0, 'user', 1, 'retained fixture')",
+                fparams![id],
+            )?;
+        }
+        tx.commit()?;
+        let preview = storage.forget_conversations_by_source_glob("**/selected.jsonl", true)?;
+        assert_eq!(preview.conversations_matched, 1);
+        assert_eq!(preview.messages_matched, 1);
+        assert_eq!(storage.total_conversation_count()?, 257);
+        let applied = storage.forget_conversations_by_source_glob("**/selected.jsonl", false)?;
+        assert_eq!(applied.conversations_deleted, 1);
+        assert_eq!(storage.total_conversation_count()?, 256);
+        Ok(())
+    }
+
+    #[test]
+    fn forget_v23_migration_preserves_existing_tombstones_and_readonly_preview() -> Result<()> {
+        let directory = TempDir::new()?;
+        let path = directory.path().join("v22-forget.db");
+        let conn = FrankenConnection::open(path.to_string_lossy().into_owned())?;
+        run_attributed_migration_steps(&conn, BASE_MIGRATION_STEPS)?;
+        apply_conversation_tail_state_cache_migration(&conn)?;
+        let old_steps: Vec<_> = POST_TAIL_CACHE_MIGRATION_STEPS
+            .iter()
+            .copied()
+            .filter(|(version, _, _)| *version <= 22)
+            .collect();
+        run_attributed_migration_steps(&conn, &old_steps)?;
+        let storage = FrankenStorage::new(conn, path.clone());
+        storage.apply_config()?;
+        storage.sync_meta_schema_version(22)?;
+        seed_forget_fixture(
+            &storage,
+            &forget_fixture_conversation(
+                "/fixture/current.jsonl",
+                Some("current"),
+                Some("/work/retired"),
+                &[Some(10)],
+            ),
+        )?;
+        storage.raw().execute("INSERT INTO forgotten_sources(source_path, forgotten_at_ms) VALUES('/fixture/already-forgotten.jsonl', 1)")?;
+        storage.close()?;
+
+        let reader = FrankenStorage::open_strict_readonly(&path)?;
+        assert!(
+            reader
+                .forgotten_conversation_keys_for(&[ForgottenConversationKey {
+                    source_id: LOCAL_SOURCE_ID.into(),
+                    agent_slug: "opencode".into(),
+                    source_path: "/fixture/current.jsonl".into(),
+                    external_id: "current".into(),
+                }])?
+                .is_empty()
+        );
+        assert!(!reader.forget_derived_rebuild_pending()?);
+        let listed = reader.list_forget_exclusions(&ForgetExclusionSelector::default())?;
+        assert!(listed.exclusions.is_empty());
+        assert_eq!(listed.legacy_sources.len(), 1);
+        assert_eq!(
+            listed.legacy_sources[0].source_path,
+            "/fixture/already-forgotten.jsonl"
+        );
+        assert_eq!(listed.legacy_sources[0].forgotten_at_ms, 1);
+        let json = serde_json::to_value(&listed.legacy_sources[0])?;
+        assert!(json.get("source_id").is_none());
+        assert!(json.get("workspace").is_none());
+        assert!(
+            reader
+                .list_forget_exclusions(&ForgetExclusionSelector {
+                    source_id: Some(LOCAL_SOURCE_ID),
+                    ..Default::default()
+                })?
+                .legacy_sources
+                .is_empty(),
+            "legacy source stamps must not be assigned invented provenance"
+        );
+        let reinclude = reader.reinclude_forget_exclusions(
+            &ForgetExclusionSelector {
+                source_glob: Some("/fixture/already-*.jsonl"),
+                ..Default::default()
+            },
+            true,
+        )?;
+        assert_eq!(reinclude.exclusions_matched, 0);
+        assert_eq!(reinclude.legacy_sources_matched, 1);
+        assert_eq!(reinclude.legacy_sources_removed, 0);
+        assert_eq!(reader.forgotten_source_stamps()?.len(), 1);
+        let filter = ForgetConversationsFilter {
+            workspace_glob: Some("/work/retired"),
+            ..Default::default()
+        };
+        assert_eq!(
+            reader
+                .forget_conversations(&filter, true)?
+                .conversations_matched,
+            1
+        );
+        assert_eq!(reader.schema_version()?, 22);
+        assert!(
+            reader
+                .raw()
+                .query("SELECT name FROM sqlite_master WHERE name = 'forgotten_conversations'")?
+                .is_empty()
+        );
+        reader.close_without_checkpoint()?;
+
+        let migrated = FrankenStorage::open(&path)?;
+        assert_eq!(migrated.schema_version()?, CURRENT_SCHEMA_VERSION);
+        assert_eq!(migrated.total_conversation_count()?, 1);
+        assert_eq!(migrated.total_message_count()?, 1);
+        assert_eq!(migrated.forgotten_source_stamps()?.len(), 1);
+        assert!(migrated.forgotten_conversation_keys()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn forget_filtered_source_completion_is_durable_and_rejects_foreign_keys() -> Result<()> {
+        let directory = TempDir::new()?;
+        let path = directory.path().join("filtered-source.db");
+        let storage = FrankenStorage::open(&path)?;
+        let completion = SourceIngestLedgerEntry {
+            key: "source_ingest_v1:excluded".into(),
+            observation: "observed and intentionally excluded".into(),
+        };
+        assert!(
+            storage
+                .insert_conversations_batched_with_source_completion(&[], &completion)
+                .is_err()
+        );
+        storage.record_filtered_source_completion(&completion)?;
+        for key in ["schema_version", "source_ingest_v1:"] {
+            assert!(
+                storage
+                    .record_filtered_source_completion(&SourceIngestLedgerEntry {
+                        key: key.into(),
+                        observation: "invalid".into(),
+                    })
+                    .is_err()
+            );
+        }
+        assert_eq!(storage.schema_version()?, CURRENT_SCHEMA_VERSION);
+        storage.close()?;
+        let reopened = FrankenStorage::open(&path)?;
+        assert_eq!(
+            reopened
+                .source_ingest_ledger_entries()?
+                .get(&completion.key),
+            Some(&completion.observation)
+        );
+        assert_eq!(reopened.total_conversation_count()?, 0);
+        Ok(())
     }
 
     /// Regression for cass#202: a `Connection` dropped mid-transaction can
@@ -49039,166 +49182,12 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             1,
             "paged cleanup should aggregate report entries by table: {report:?}"
         );
-    }
-
-    fn gh503_fixture_copy(name: &str, dir: &TempDir) -> std::path::PathBuf {
-        let dest = dir.path().join("agent_search.db");
-        std::fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/gh503")
-                .join(name),
-            &dest,
-        )
-        .unwrap();
-        dest
-    }
-
-    fn gh503_needle_rowids(storage: &FrankenStorage, needle: &str) -> Vec<i64> {
-        storage
+        let metrics_after: i64 = storage
             .raw()
-            .query_map_collect(
-                "SELECT rowid FROM fts_messages WHERE fts_messages MATCH ?1 ORDER BY rowid",
-                &[ParamValue::from(needle)],
-                |row| row.get_typed(0),
-            )
-            .unwrap()
-    }
-
-    /// GH #503: the pre-#434 derived-FTS catalog could not be opened by the
-    /// strict read-only lane at all, so a readable 0.6.24-era archive
-    /// reported `database.opened=false`. It must now be admitted through the
-    /// pinned engine's legacy-tolerant lane, with canonical rows readable and
-    /// the archive bytes unchanged; the derived shadow repair remains
-    /// explicit and is reported separately.
-    #[test]
-    fn gh503_legacy_fts_shadow_catalog_opens_read_only_without_mutating() {
-        let dir = TempDir::new().unwrap();
-        let db_path = gh503_fixture_copy("legacy_fts_config_shadow.db", &dir);
-        let bytes_before = std::fs::read(&db_path).unwrap();
-
-        let readonly = FrankenStorage::open_readonly(&db_path)
-            .expect("the legacy shadow catalog must open for a read-only probe");
-        let detail = readonly
-            .legacy_fts5_shadow_repair_detail()
-            .expect("the tolerant open must record the ordinary open's refusal");
-        assert!(
-            detail.contains("missing implicit autoindex slot 1 for table `fts_messages_config`"),
-            "the recorded refusal must name the #503 shape: {detail}"
-        );
-        let conversations: i64 = readonly
-            .raw()
-            .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |row| {
+            .query_row_map("SELECT COUNT(*) FROM message_metrics", fparams![], |row| {
                 row.get_typed(0)
             })
             .unwrap();
-        assert_eq!(conversations, 1);
-        let messages: i64 = readonly
-            .raw()
-            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        assert_eq!(messages, 2);
-        let contents: Vec<String> = readonly
-            .raw()
-            .query_map_collect(
-                "SELECT content FROM messages ORDER BY idx",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(
-            contents,
-            [
-                "legacyshadowneedle how do I rebuild",
-                "canonicalreplyneedle run the repair"
-            ]
-        );
-        readonly.close_without_checkpoint().unwrap();
-        assert_eq!(
-            bytes_before,
-            std::fs::read(&db_path).unwrap(),
-            "a read-only admission must leave the archive bytes unchanged"
-        );
-
-        let strict = FrankenStorage::open_strict_readonly(&db_path)
-            .expect("the strict read-only lane must tolerate the same catalog");
-        assert!(
-            strict.legacy_fts5_shadow_repair_detail().is_some(),
-            "the strict read-only lane must report the pending shadow repair"
-        );
-        strict.close_without_checkpoint().unwrap();
-        assert_eq!(
-            bytes_before,
-            std::fs::read(&db_path).unwrap(),
-            "the strict read-only admission must leave the archive bytes unchanged"
-        );
-    }
-
-    /// GH #503: the explicit writable repair drops and recreates the derived
-    /// shadow from canonical rows; afterwards the ordinary AND strict
-    /// read-only lanes open with no pending repair and FTS5 answers.
-    #[test]
-    fn gh503_explicit_shadow_repair_makes_the_archive_open_clean_and_searchable() {
-        let dir = TempDir::new().unwrap();
-        let db_path = gh503_fixture_copy("legacy_fts_config_shadow.db", &dir);
-
-        let repair = FrankenStorage::open_deferred_fts5_for_repair(&db_path).unwrap();
-        let inserted = repair.rebuild_fts_shadow_via_drop_recreate().unwrap();
-        assert_eq!(inserted, 2, "both canonical messages must be reindexed");
-        repair.close_without_checkpoint().unwrap();
-
-        let bytes_repaired = std::fs::read(&db_path).unwrap();
-        let readonly = FrankenStorage::open_readonly(&db_path)
-            .expect("the repaired archive must open in the ordinary read-only lane");
-        assert_eq!(readonly.legacy_fts5_shadow_repair_detail(), None);
-        assert_eq!(gh503_needle_rowids(&readonly, "legacyshadowneedle"), [1, 2]);
-        assert_eq!(gh503_needle_rowids(&readonly, "canonicalreplyneedle"), [2]);
-        readonly.close_without_checkpoint().unwrap();
-        assert_eq!(
-            bytes_repaired,
-            std::fs::read(&db_path).unwrap(),
-            "a read-only open of the repaired archive must not mutate it"
-        );
-
-        let strict = FrankenStorage::open_strict_readonly(&db_path)
-            .expect("the repaired archive must open in the strict read-only lane");
-        assert_eq!(strict.legacy_fts5_shadow_repair_detail(), None);
-        assert_eq!(gh503_needle_rowids(&strict, "canonicalreplyneedle"), [2]);
-        strict.close_without_checkpoint().unwrap();
-    }
-
-    /// GH #503 negative: the same catalog defect on a canonical USER table is
-    /// not the repairable derived-shadow shape; both the ordinary and the
-    /// engine's deferred-FTS5 repair open must keep failing closed.
-    #[test]
-    fn gh503_user_table_missing_autoindex_still_fails_closed() {
-        let dir = TempDir::new().unwrap();
-        let db_path = gh503_fixture_copy("legacy_user_table_autoindex.db", &dir);
-        let bytes_before = std::fs::read(&db_path).unwrap();
-
-        let err = FrankenStorage::open_readonly(&db_path)
-            .err()
-            .expect("a user table missing its unique index must not be tolerated");
-        let rendered = format!("{err:#}");
-        assert!(
-            rendered.contains("missing implicit autoindex slot")
-                && rendered.contains("legacy_meta"),
-            "the refusal must name the user table: {rendered}"
-        );
-        assert!(
-            !is_legacy_fts5_shadow_autoindex_open_error(&err),
-            "a user table must not be classified as the FTS5 shadow shape: {rendered}"
-        );
-
-        assert!(
-            FrankenStorage::open_deferred_fts5_for_repair(&db_path).is_err(),
-            "the engine must not tolerate a missing unique index on a user table"
-        );
-        assert_eq!(
-            bytes_before,
-            std::fs::read(&db_path).unwrap(),
-            "refused read-only probes must leave the archive unchanged"
-        );
+        assert_eq!(metrics_after, 0);
     }
 }

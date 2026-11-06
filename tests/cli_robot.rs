@@ -65,11 +65,6 @@ fn is_transient_lexical_build_path(path: &Path) -> bool {
     path.components().any(|component| {
         component.as_os_str().to_str().is_some_and(|name| {
             name.starts_with("cass-lexical-shards.")
-                // Published generations are immutable inputs for these robot
-                // fixtures. The backup tree is created while a concurrent
-                // shared-fixture consumer is publishing a replacement and
-                // must not become part of a copied test namespace.
-                || name == ".lexical-publish-backups"
                 // The lexical self-heal's archive-fingerprint sidecar is a
                 // derived cache written next to the index through a
                 // `.<pid>.tmp` file and a rename. In-place robot tests running
@@ -92,22 +87,6 @@ fn is_fsqlite_runtime_lock_sidecar_path(path: &Path) -> bool {
         .is_some_and(|name| name.ends_with("-fsqlite-ns-gate") || name.ends_with("-fsqlite-ns-use"))
 }
 
-/// Lock files are process-local coordination state, even when they are
-/// zero-byte placeholders after their owner exits. Copying one into a
-/// fixture gives a child command a namespace it did not acquire and lets a
-/// stale shared-fixture owner affect an otherwise isolated test.
-fn is_fixture_runtime_lock_path(path: &Path) -> bool {
-    if is_fsqlite_runtime_lock_sidecar_path(path) {
-        return true;
-    }
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            matches!(name, "index-run.lock" | "index-run.lock.meta" | "LOCK")
-                || name.ends_with(".lock")
-        })
-}
-
 fn safe_fixture_destination(dst_root: &Path, rel: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let mut dst = dst_root.to_path_buf();
     for component in rel.components() {
@@ -125,57 +104,9 @@ fn safe_fixture_destination(dst_root: &Path, rel: &Path) -> Result<PathBuf, Box<
     Ok(dst)
 }
 
-fn copy_search_demo_data() -> Result<TempDir, Box<dyn Error>> {
-    copy_search_demo_data_from(Path::new(SEARCH_DEMO_DATA_DIR), || {}, || {})
-}
-
-fn search_demo_snapshot_lease(
-    src: &Path,
-    on_contention: &impl Fn(),
-) -> std::io::Result<Option<fs::File>> {
-    match fs::File::open(src.join("index-run.lock")) {
-        Ok(lock) => {
-            match FileExt::try_lock_shared(&lock) {
-                Ok(()) => {}
-                Err(error)
-                    if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
-                {
-                    on_contention();
-                    FileExt::lock_shared(&lock)?;
-                }
-                Err(error) => return Err(error),
-            }
-            Ok(Some(lock))
-        }
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-fn copy_search_demo_data_from(
-    src: &Path,
-    after_tentative_copy: impl FnOnce(),
-    on_contention: impl Fn(),
-) -> Result<TempDir, Box<dyn Error>> {
-    // Publishers create this persistent lock before changing a generation and
-    // never unlink it. Readers may lease it, but must not create source state.
-    let lease = search_demo_snapshot_lease(src, &on_contention)?;
-    let copy = copy_search_demo_data_tree(src)?;
-    if lease.is_none() {
-        after_tentative_copy();
-        // A publisher may have appeared during the tentative snapshot. Wait
-        // for it, then start a fresh copy under its shared lock; overlaying the
-        // tentative copy could retain files absent from the new generation.
-        if let Some(_lease) = search_demo_snapshot_lease(src, &on_contention)? {
-            return copy_search_demo_data_tree(src);
-        }
-    }
-    Ok(copy)
-}
-
-fn copy_search_demo_data_tree(src: &Path) -> Result<TempDir, Box<dyn Error>> {
+fn isolated_search_demo_data() -> Result<TempDir, Box<dyn Error>> {
     let tmp = TempDir::new()?;
-
+    let src = Path::new(SEARCH_DEMO_DATA_DIR);
     for entry in WalkDir::new(src) {
         let entry = match entry {
             Ok(entry) => entry,
@@ -189,9 +120,7 @@ fn copy_search_demo_data_tree(src: &Path) -> Result<TempDir, Box<dyn Error>> {
             }
             Err(err) => return Err(Box::new(err)),
         };
-        if is_transient_lexical_build_path(entry.path())
-            || is_fixture_runtime_lock_path(entry.path())
-        {
+        if is_fsqlite_runtime_lock_sidecar_path(entry.path()) {
             continue;
         }
         let rel = entry.path().strip_prefix(src)?;
@@ -220,149 +149,6 @@ fn copy_search_demo_data_tree(src: &Path) -> Result<TempDir, Box<dyn Error>> {
         }
     }
     Ok(tmp)
-}
-
-#[test]
-fn fixture_snapshot_without_publisher_does_not_create_source_lock() -> Result<(), Box<dyn Error>> {
-    let source = TempDir::new()?;
-    fs::write(source.path().join("generation"), b"original")?;
-    let before = fs::metadata(source.path())?.modified()?;
-    let copy = copy_search_demo_data_from(source.path(), || {}, || {})?;
-    assert_eq!(fs::read(copy.path().join("generation"))?, b"original");
-    assert_eq!(fs::read(source.path().join("generation"))?, b"original");
-    assert_eq!(fs::read_dir(source.path())?.count(), 1);
-    assert!(!source.path().join("index-run.lock").exists());
-    assert_eq!(fs::metadata(source.path())?.modified()?, before);
-    Ok(())
-}
-
-#[test]
-fn fixture_snapshot_waits_for_existing_publisher() -> Result<(), Box<dyn Error>> {
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    let source = TempDir::new()?;
-    fs::write(source.path().join("generation"), b"before")?;
-    let lock = fs::OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .open(source.path().join("index-run.lock"))?;
-    FileExt::lock_exclusive(&lock)?;
-    let source_path = source.path().to_owned();
-    let (contended, contention) = mpsc::channel();
-    let (completed, completion) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        let result = copy_search_demo_data_from(
-            &source_path,
-            || {},
-            || {
-                contended
-                    .send(())
-                    .expect("report actual shared-lock contention")
-            },
-        )
-        .map_err(|error| error.to_string());
-        completed.send(result).expect("return snapshot result");
-    });
-    contention.recv_timeout(Duration::from_secs(5))?;
-    let held_result = completion.recv_timeout(Duration::from_millis(100));
-    fs::write(source.path().join("generation"), b"published")?;
-    FileExt::unlock(&lock)?;
-    let result = completion.recv_timeout(Duration::from_secs(5));
-    reader.join().expect("snapshot reader panicked");
-    assert!(
-        matches!(held_result, Err(mpsc::RecvTimeoutError::Timeout)),
-        "a snapshot must not finish while the publisher holds its exclusive lease"
-    );
-    let copy = result??;
-    assert_eq!(fs::read(copy.path().join("generation"))?, b"published");
-    assert!(!copy.path().join("index-run.lock").exists());
-    Ok(())
-}
-
-#[test]
-fn fixture_snapshot_retries_fresh_when_publisher_appears() -> Result<(), Box<dyn Error>> {
-    let source = TempDir::new()?;
-    fs::write(source.path().join("generation"), b"before")?;
-    fs::write(source.path().join("obsolete"), b"old-generation-only")?;
-    let copy = copy_search_demo_data_from(
-        source.path(),
-        || {
-            let lock = fs::OpenOptions::new()
-                .create_new(true)
-                .read(true)
-                .write(true)
-                .open(source.path().join("index-run.lock"))
-                .expect("publisher creates its persistent lock");
-            FileExt::lock_exclusive(&lock).expect("publisher lease");
-            fs::rename(
-                source.path().join("obsolete"),
-                source.path().join("archived"),
-            )
-            .expect("publish replacement generation without deleting source data");
-            fs::write(source.path().join("generation"), b"published").expect("new generation");
-        },
-        || {},
-    )?;
-    assert_eq!(fs::read(copy.path().join("generation"))?, b"published");
-    assert_eq!(
-        fs::read(copy.path().join("archived"))?,
-        b"old-generation-only"
-    );
-    assert!(!copy.path().join("obsolete").exists());
-    assert!(!copy.path().join("index-run.lock").exists());
-    assert!(source.path().join("index-run.lock").exists());
-    Ok(())
-}
-
-fn isolated_search_demo_data() -> Result<TempDir, Box<dyn Error>> {
-    let copy = copy_search_demo_data()?;
-    util::admit_copied_search_fixture(copy.path(), &copy)?;
-    Ok(copy)
-}
-
-#[test]
-fn copied_fixture_repair_stays_inside_its_owned_temporary_directory() -> Result<(), Box<dyn Error>>
-{
-    let checkout = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let owner = tempfile::tempdir_in(checkout)?;
-    let data = owner.path().join("data");
-    fs::create_dir(&data)?;
-    let database = data.join("agent_search.db");
-    fs::write(&database, b"disposable fixture path control")?;
-    assert_eq!(
-        util::copied_search_fixture_db(&data, owner.path())?,
-        database.canonicalize()?,
-        "an owned temporary directory may live inside the checkout"
-    );
-
-    let other = TempDir::new()?;
-    assert!(util::copied_search_fixture_db(&data, other.path()).is_err());
-    let committed = checkout
-        .join("tests")
-        .join("fixtures")
-        .join("search_demo_data");
-    assert!(util::copied_search_fixture_db(&committed, owner.path()).is_err());
-    assert!(util::copied_search_fixture_db(&data, checkout).is_err());
-    assert!(util::copied_search_fixture_db(&committed, &committed).is_err());
-
-    let directory_database = owner.path().join("directory-database");
-    fs::create_dir(&directory_database)?;
-    fs::create_dir(directory_database.join("agent_search.db"))?;
-    assert!(util::copied_search_fixture_db(&directory_database, owner.path()).is_err());
-
-    #[cfg(unix)]
-    {
-        let escaped = owner.path().join("escaped-database");
-        fs::create_dir(&escaped)?;
-        std::os::unix::fs::symlink(
-            committed.join("agent_search.db"),
-            escaped.join("agent_search.db"),
-        )?;
-        assert!(util::copied_search_fixture_db(&escaped, owner.path()).is_err());
-    }
-    Ok(())
 }
 
 fn isolated_search_demo_data_for_current_workspace() -> Result<TempDir, Box<dyn Error>> {
@@ -570,32 +356,6 @@ fn hold_lexical_rebuild_lock_only(data_dir: &Path, db_path: &Path) -> fs::File {
 }
 
 #[test]
-fn isolated_search_demo_data_excludes_runtime_lock_namespace() -> Result<(), Box<dyn Error>> {
-    let fixture = copy_search_demo_data()?;
-
-    let leaked_locks: Vec<PathBuf> = WalkDir::new(fixture.path())
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| is_fixture_runtime_lock_path(entry.path()))
-        .map(|entry| entry.path().to_path_buf())
-        .collect();
-    assert!(
-        leaked_locks.is_empty(),
-        "isolated fixture must not inherit coordination locks: {leaked_locks:?}"
-    );
-    assert!(
-        !fixture
-            .path()
-            .join("index")
-            .join(".lexical-publish-backups")
-            .exists(),
-        "isolated fixture must not inherit a concurrent publish backup namespace"
-    );
-
-    Ok(())
-}
-
-#[test]
 fn robot_help_prints_contract() {
     let mut cmd = base_cmd();
     cmd.arg("--robot-help");
@@ -659,6 +419,7 @@ fn api_version_reports_contract() {
 #[test]
 fn capabilities_are_self_describing_for_agents() {
     let mut cmd = base_cmd();
+    cmd.env("CASS_AUTO_REFRESH_SOURCE_SCAN_SECS", "17");
     cmd.args(["capabilities", "--json"]);
     let output = cmd.assert().success().get_output().clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -751,6 +512,7 @@ fn capabilities_are_self_describing_for_agents() {
         "CASS_SEARCH_BUDGET_MS",
         "CASS_TRIAGE_BUDGET_MS",
         "CASS_PACK_BUDGET_MS",
+        "CASS_AUTO_REFRESH_SOURCE_SCAN_SECS",
         "CASS_FLEET_PER_HOST_BUDGET_MS",
         "CASS_FLEET_BUDGET_MS",
     ] {
@@ -780,6 +542,17 @@ fn capabilities_are_self_describing_for_agents() {
             "capabilities should advertise the runtime default for {name}"
         );
     }
+    let source_scan = env_vars
+        .iter()
+        .find(|entry| entry["name"] == "CASS_AUTO_REFRESH_SOURCE_SCAN_SECS")
+        .expect("source-scan cadence capability");
+    assert_eq!(
+        source_scan["default"]
+            .as_str()
+            .and_then(|value| value.parse::<u64>().ok()),
+        Some(coding_agent_search::indexer::background_refresh::DEFAULT_SOURCE_SCAN_SECS),
+        "discovery must advertise the actual source-scan policy default"
+    );
     let pi_sessions_dir = env_vars
         .iter()
         .find(|env_var| env_var["name"] == "PI_SESSIONS_DIR")
@@ -1021,9 +794,9 @@ fn capabilities_are_self_describing_for_agents() {
     );
     assert!(
         recoveries.iter().any(|recovery| recovery["wrong"]
-            == "cass view source_path=session.jsonl source_id=local line_number=42 message_anchor=<message_anchor> --json"
+            == "cass view source_path=session.jsonl source_id=local line_number=42 --json"
             && recovery["canonical"]
-                == "cass view session.jsonl --source local --message-index 42 --message-anchor <message_anchor> --json"
+                == "cass view session.jsonl --source local --message-index 42 --json"
             && recovery["accepted"] == true),
         "capabilities should advertise search-hit field bundle recovery"
     );
@@ -1521,142 +1294,6 @@ fn current_session_aliases_route_to_sessions_current() -> Result<(), Box<dyn Err
 }
 
 #[test]
-fn sessions_preserve_distinct_archive_identity_for_a_shared_source_path()
--> Result<(), Box<dyn Error>> {
-    use coding_agent_search::franken_sync::compat::ConnectionExt;
-
-    fn require(condition: bool, message: &str) -> Result<(), Box<dyn Error>> {
-        if condition {
-            Ok(())
-        } else {
-            Err(message.into())
-        }
-    }
-
-    let data_dir = isolated_search_demo_data_for_current_workspace()?;
-    let db_path = data_dir.path().join("agent_search.db");
-    let conn = coding_agent_search::franken_sync::Connection::open(
-        db_path.to_string_lossy().into_owned(),
-    )?;
-    conn.execute_compat(
-        "INSERT INTO conversations (id, agent_id, workspace_id, external_id, title, source_path, source_id)
-         SELECT 900001, agent_id, workspace_id, 'shared-path-second-session', title, source_path, source_id
-         FROM conversations WHERE workspace_id = 1 LIMIT 1",
-        &[],
-    )?;
-    conn.execute_compat(
-        "INSERT INTO messages (conversation_id, idx, role, content)
-         VALUES (900001, 0, 'user', 'Distinct shared-path session content')",
-        &[],
-    )?;
-    drop(conn);
-
-    let list = || -> Result<Value, Box<dyn Error>> {
-        let output = base_cmd()
-            .args([
-                "sessions",
-                "--current",
-                "--limit",
-                "0",
-                "--json",
-                "--data-dir",
-            ])
-            .arg(data_dir.path())
-            .output()?;
-        if !output.status.success() {
-            return Err(format!(
-                "sessions failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .into());
-        }
-        Ok(serde_json::from_slice(&output.stdout)?)
-    };
-    let first = list()?;
-    require(
-        first == list()?,
-        "unchanged archive retains identities and hashes",
-    )?;
-    let sessions = first
-        .get("sessions")
-        .and_then(Value::as_array)
-        .ok_or("sessions array missing")?;
-    let [left, right] = sessions.as_slice() else {
-        return Err("expected exactly two shared-path sessions".into());
-    };
-    require(
-        left.get("path").ok_or("left path missing")?
-            == right.get("path").ok_or("right path missing")?,
-        "fixture sessions must share one source path",
-    )?;
-    for key in ["external_id", "conversation_id", "content_hash"] {
-        require(
-            left.get(key).ok_or("left identity field missing")?
-                != right.get(key).ok_or("right identity field missing")?,
-            "distinct sessions must have distinct native and archive identities and content hashes",
-        )?;
-    }
-    for session in sessions {
-        require(
-            session
-                .get("source_path_session_count")
-                .and_then(Value::as_u64)
-                == Some(2),
-            "summary must report both sessions sharing the path",
-        )?;
-        let hash = session
-            .get("content_hash")
-            .and_then(Value::as_str)
-            .ok_or("content hash missing")?;
-        require(
-            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
-            "content hash must be 64 hexadecimal digits",
-        )?;
-    }
-    let second = sessions
-        .iter()
-        // ubs:ignore -- This compares a fixed fixture row ID, not a session credential.
-        .find(|session| session.get("conversation_id").and_then(Value::as_i64) == Some(900001))
-        .ok_or("second session missing")?;
-    let output = base_cmd()
-        .arg("--db")
-        .arg(&db_path)
-        .args(["view", "--json", "--conversation-id", "900001"])
-        .arg("--")
-        .arg(
-            second
-                .get("path")
-                .and_then(Value::as_str)
-                .ok_or("source path missing")?,
-        )
-        .output()?;
-    if !output.status.success() {
-        return Err(format!("view failed: {}", String::from_utf8_lossy(&output.stderr)).into());
-    }
-    let view: Value = serde_json::from_slice(&output.stdout)?;
-    require(
-        view.to_string()
-            .contains("Distinct shared-path session content"),
-        "view must select the exact second session content",
-    )?;
-    let identity = view
-        .get("archive_identity")
-        .ok_or("archive identity missing")?;
-    require(
-        identity.get("conversation_id").and_then(Value::as_i64) == Some(900001),
-        "view must return the requested archive conversation identity",
-    )?;
-    for key in ["external_id", "source_id", "agent"] {
-        require(
-            identity.get(key).ok_or("view identity field missing")?
-                == second.get(key).ok_or("summary identity field missing")?,
-            "view and summary must agree on native source and agent identity",
-        )?;
-    }
-    Ok(())
-}
-
-#[test]
 fn leading_json_search_named_query_flag_combines_recoveries() {
     let tmp = TempDir::new().unwrap();
     let mut cmd = base_cmd();
@@ -1725,7 +1362,7 @@ fn assert_pack_command_returns_evidence(command: &str, extra_args: &[&str]) {
     ] {
         index.env(key, home.join(relative));
     }
-    let indexed = index
+    index
         .env_remove("PI_CONFIG_DIR")
         .env_remove("PI_PROFILE")
         .env("CASS_AUTO_REFRESH", "0")
@@ -1733,17 +1370,8 @@ fn assert_pack_command_returns_evidence(command: &str, extra_args: &[&str]) {
         .arg(&data_dir)
         .timeout(std::time::Duration::from_secs(120))
         .assert()
-        .success()
-        .get_output()
-        .clone();
-    let report: Value = serde_json::from_slice(&indexed.stdout).expect("index fixture JSON");
-    assert_eq!(
-        report["conversations"], 1,
-        "only the seeded session is indexed"
-    );
-    assert_eq!(report["messages"], 1, "only the seeded message is indexed");
+        .success();
     let mut cmd = isolated_cass_cmd(home);
-    cmd.env("CASS_SEMANTIC_EMBEDDER", "hash");
     cmd.args([command, "auth", "--json", "--data-dir"]);
     cmd.arg(&data_dir);
     cmd.args([
@@ -1778,8 +1406,9 @@ fn assert_pack_command_returns_evidence(command: &str, extra_args: &[&str]) {
     );
     assert_eq!(citation["verified"], true);
 
-    // This fixture has no semantic vectors. A hybrid request reports that
-    // actual unavailability; an explicit lexical request is not a fallback.
+    // GH #507: pack selects evidence lexically. A default (hybrid-preferred)
+    // request reports that fallback with its cause; an explicit lexical
+    // request is not a fallback at all.
     let warnings: Vec<&str> = json["_meta"]["warnings"]
         .as_array()
         .expect("pack warnings")
@@ -1803,7 +1432,7 @@ fn assert_pack_command_returns_evidence(command: &str, extra_args: &[&str]) {
     } else {
         assert_eq!(realized["fallback_mode"], "lexical", "{json}");
         assert_eq!(
-            realized["fallback_reason"], "semantic_context_unavailable",
+            realized["fallback_reason"], "pack_enrichment_unavailable",
             "{json}"
         );
         assert!(warnings.contains(&"semantic_fallback_lexical"), "{json}");
@@ -1849,674 +1478,6 @@ fn pack_contract_field_masks_return_real_cited_evidence() {
     for preset in ["standard", "full"] {
         assert_pack_command_returns_evidence("pack", &["--field-mask", preset]);
     }
-}
-
-#[test]
-fn pack_redaction_duration_and_diagnostics_conform_across_all_formats() -> Result<(), Box<dyn Error>>
-{
-    fn assert_snake_case_keys(value: &Value) {
-        match value {
-            Value::Object(object) => {
-                for (key, value) in object {
-                    assert!(
-                        !key.is_empty()
-                            && key.bytes().all(|byte| {
-                                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
-                            }),
-                        "non-snake-case pack key: {key}"
-                    );
-                    assert_snake_case_keys(value);
-                }
-            }
-            Value::Array(items) => items.iter().for_each(assert_snake_case_keys),
-            _ => {}
-        }
-    }
-
-    let fixture = TempDir::new()?;
-    let home = fixture.path();
-    let data_dir = home.join("cass_data");
-    let codex_home = home.join(".codex");
-    let filename = "rollout-pack-policy.jsonl";
-    fs::write(
-        home.join(".env"),
-        "PACK_UNINDEXED_SECRET=disposable-unindexed-env-canary\n",
-    )?;
-    // Disposable synthetic values; ingestion redaction is disabled only for
-    // this private fixture so output policies must do their own work.
-    let credential = format!("sk-{}", "01234567890123456789");
-    let entropy = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let message = format!(
-        "packpolicyneedle café 東京 😀 id=abc123\n{credential}\nCookie: session=disposable-fixture-only\nwebhook_secret=disposable-hook-value\n{entropy}\n/home/private-user/project/a.rs build.internal"
-    );
-    util::seed_codex_session(&codex_home, filename, &message, false);
-    util::seed_codex_session(
-        &codex_home,
-        "rollout-pack-policy-control.jsonl",
-        "packpolicyneedle independent scope control",
-        false,
-    );
-    let source_path = codex_home.join("sessions/2026/04/23").join(filename);
-    let original = fs::read(&source_path)?;
-    let golden: Value = serde_json::from_str(include_str!(
-        "golden/robot/pack_policy_contract.json.golden"
-    ))?;
-    let indexed = isolated_cass_cmd(home)
-        .env("CASS_INDEX_REDACTION", "off")
-        .args(["index", "--full", "--json", "--data-dir"])
-        .arg(&data_dir)
-        .timeout(std::time::Duration::from_secs(120))
-        .output()?;
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
-    let report: Value = serde_json::from_slice(&indexed.stdout)?;
-    assert_eq!(report["conversations"], 2);
-    assert_eq!(report["messages"], 2);
-    for surface in ["health", "status"] {
-        let output = isolated_cass_cmd(home)
-            .args([surface, "--json", "--data-dir"])
-            .arg(&data_dir)
-            .output()?;
-        assert!(output.status.success(), "{surface}: {output:?}");
-        let payload: Value = serde_json::from_slice(&output.stdout)?;
-        let state = if surface == "health" {
-            &payload["state"]
-        } else {
-            &payload
-        };
-        assert_eq!(payload["healthy"], true, "{surface}: {payload}");
-        assert_eq!(state["index"]["fresh"], true, "{surface}: {state}");
-        assert_eq!(state["rebuild"]["active"], false, "{surface}: {state}");
-    }
-    let scope_file = home.join("pack-sessions.txt");
-    fs::write(&scope_file, format!("{}\n", source_path.display()))?;
-    let archive_snapshot =
-        || -> Result<std::collections::BTreeMap<PathBuf, String>, Box<dyn Error>> {
-            WalkDir::new(&data_dir)
-                .into_iter()
-                .filter_map(|entry| match entry {
-                    Ok(entry) if entry.file_type().is_file() => Some(Ok(entry)),
-                    Ok(_) => None,
-                    Err(error) => Some(Err(error)),
-                })
-                .map(|entry| {
-                    let entry = entry?;
-                    Ok((
-                        entry.path().strip_prefix(&data_dir)?.to_path_buf(),
-                        blake3::hash(&fs::read(entry.path())?).to_hex().to_string(),
-                    ))
-                })
-                .collect()
-        };
-    let archive_before = archive_snapshot()?;
-    let unavailable = isolated_cass_cmd(home)
-        .env("CASS_SEMANTIC_EMBEDDER", "hash")
-        .args([
-            "pack",
-            "packpolicyneedle",
-            "--json",
-            "--mode",
-            "semantic",
-            "--data-dir",
-        ])
-        .arg(&data_dir)
-        .output()?;
-    assert_eq!(unavailable.status.code(), Some(15));
-    assert!(unavailable.stdout.is_empty());
-    let error: Value = serde_json::from_slice(&unavailable.stderr)?;
-    assert_eq!(error["error"]["kind"], "semantic-unavailable");
-    assert_eq!(error["error"]["retryable"], false);
-    assert!(error["error"]["hint"].is_string());
-    assert_eq!(archive_snapshot()?, archive_before);
-    let mut evidence_id = None;
-    for policy in ["strict", "balanced", "off"] {
-        let mut canonical_envelope = None;
-        for format in ["json", "compact", "jsonl", "toon", "markdown"] {
-            let mut command = isolated_cass_cmd(home);
-            command
-                .args([
-                    "pack",
-                    "packpolicyneedle",
-                    "--mode",
-                    "lexical",
-                    "--approximate",
-                    "--source",
-                    "local",
-                    "--redaction",
-                    policy,
-                    "--freshness-window",
-                    "30d",
-                    "--explain-selection",
-                    "--require-evidence",
-                    "--max-tokens",
-                    "12000",
-                    "--request-id",
-                    "pack-policy-contract",
-                    "--data-dir",
-                ])
-                .arg(&data_dir);
-            command.args(["--sessions-from"]).arg(&scope_file);
-            command.env("CASS_AUTO_REFRESH", "1");
-            if format == "markdown" {
-                command.args(["--display", "markdown"]);
-            } else {
-                command.args(["--robot-format", format]);
-            }
-            let output = command
-                .timeout(std::time::Duration::from_secs(60))
-                .output()?;
-            assert!(
-                output.status.success(),
-                "{policy}/{format}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let text = std::str::from_utf8(&output.stdout)?;
-            assert!(text.contains("packpolicyneedle"));
-            assert!(text.contains("café 東京 😀"));
-            assert!(!text.contains("/home/private-user"), "{policy}/{format}");
-            assert!(!text.contains("build.internal"), "{policy}/{format}");
-            assert!(!text.contains("disposable-unindexed-env-canary"));
-            assert_eq!(
-                text.contains(&credential),
-                policy == "off",
-                "{policy}/{format}"
-            );
-            assert_eq!(
-                text.contains("disposable-fixture-only"),
-                policy == "off",
-                "{policy}/{format}"
-            );
-            assert_eq!(
-                text.contains("disposable-hook-value"),
-                policy == "off",
-                "{policy}/{format}"
-            );
-            assert_eq!(
-                text.contains(entropy),
-                policy != "strict",
-                "{policy}/{format}"
-            );
-            assert!(text.chars().count().div_ceil(4) <= 12_600);
-            assert_eq!(fs::read(&source_path)?, original);
-            assert_eq!(
-                archive_snapshot()?,
-                archive_before,
-                "pack {policy}/{format} must observe the archive without mutation"
-            );
-            if format == "markdown" {
-                assert!(text.contains("## Evidence"));
-                assert_eq!(text.contains("Sensitive output:"), policy == "off");
-                continue;
-            }
-            let payload: Value = match format {
-                "toon" => Value::from(toon::try_decode(text, None)?),
-                "jsonl" => {
-                    let lines = text
-                        .lines()
-                        .map(serde_json::from_str::<Value>)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    assert_eq!(lines.len(), 5);
-                    serde_json::json!({
-                        "schema_version": lines[0]["schema_version"],
-                        "_meta": lines[0]["_meta"], "selection_debug": lines[0]["selection_debug"],
-                        "evidence": [lines[2]["evidence"]], "privacy": lines[4]["privacy"],
-                    })
-                }
-                _ => serde_json::from_str(text)?,
-            };
-            assert_snake_case_keys(&payload);
-            assert_eq!(payload["_meta"]["request_id"], "pack-policy-contract");
-            assert_eq!(payload["_meta"]["partial"], false);
-            assert_eq!(payload["privacy"]["redaction_policy"], policy);
-            assert_eq!(payload["privacy"]["sensitive_output"], policy == "off");
-            assert_eq!(payload["privacy"]["redaction_applied"], true);
-            let item = &payload["evidence"][0];
-            let projected = serde_json::json!({
-                "schema_version": payload["schema_version"],
-                "excerpt": item["excerpt"].as_str().ok_or("missing golden excerpt")?.replace(&credential, "[SYNTHETIC_CREDENTIAL]"),
-                "citation": {
-                    "agent": item["citation"]["agent"], "source_id": item["citation"]["source_id"],
-                    "message_index": item["citation"]["message_index"], "message_index_base": item["citation"]["message_index_base"],
-                    "line_start": item["citation"]["line_start"], "line_end": item["citation"]["line_end"], "verified": item["citation"]["verified"],
-                },
-                "privacy": {
-                    "redaction_policy": payload["privacy"]["redaction_policy"],
-                    "redaction_applied": payload["privacy"]["redaction_applied"],
-                    "sensitive_output": payload["privacy"]["sensitive_output"],
-                    "skill_content_included": payload["privacy"]["skill_content_included"],
-                },
-            });
-            assert_eq!(
-                toon::JsonValue::from(projected),
-                toon::JsonValue::from(golden[policy].clone()),
-                "reviewed positive contract golden: {policy}/{format}"
-            );
-            assert_eq!(item["rank"].as_f64(), Some(1.0));
-            assert_eq!(item["citation"]["verified"], true);
-            assert_eq!(item["citation"]["message_index"].as_f64(), Some(1.0));
-            assert_eq!(item["citation"]["message_index_base"].as_f64(), Some(1.0));
-            assert_eq!(item["citation"]["line_start"].as_f64(), Some(2.0));
-            assert_eq!(item["citation"]["line_end"].as_f64(), Some(2.0));
-            assert_eq!(
-                item["citation"]["span_hash"],
-                blake3::hash(
-                    original
-                        .split(|byte| *byte == b'\n')
-                        .nth(1)
-                        .ok_or("missing native message line")?
-                )
-                .to_hex()
-                .as_str()
-            );
-            let excerpt = item["excerpt"].as_str().ok_or("missing excerpt")?;
-            assert_eq!(
-                item["estimated_tokens"].as_f64(),
-                Some(excerpt.chars().count().div_ceil(4) as f64)
-            );
-            assert_eq!(
-                item["citation"]["excerpt_sha256"],
-                hex::encode(<sha2::Sha256 as sha2::Digest>::digest(excerpt.as_bytes()))
-            );
-            if let Some(expected) = &evidence_id {
-                assert_eq!(
-                    &item["id"], expected,
-                    "policy/format cannot change source identity"
-                );
-            } else {
-                evidence_id = Some(item["id"].clone());
-            }
-            assert!(
-                payload["selection_debug"]["candidate_fetch_limit"]
-                    .as_f64()
-                    .is_some_and(|limit| limit >= 64.0)
-            );
-            assert_eq!(payload["selection_debug"]["selected"][0]["id"], item["id"]);
-            assert_eq!(
-                payload["selection_debug"]["selected"][0]["selection"],
-                item["selection"]
-            );
-            assert!(payload["selection_debug"]["omitted"].is_array());
-            if format != "jsonl" {
-                assert_eq!(
-                    payload["freshness"]["window_seconds"].as_f64(),
-                    Some(2592000.0)
-                );
-                assert_eq!(payload["realized"]["search_mode"], "lexical");
-                assert_eq!(payload["health"]["healthy"], true);
-                assert_eq!(payload["health"]["index_state"], "ready");
-                assert_eq!(payload["health"]["active_rebuild"], false);
-                assert!(
-                    payload["health"]["source_readiness"][0]
-                        .get("last_sync_at_ms")
-                        .is_some()
-                );
-                assert_eq!(payload["health"]["fallback_mode"], Value::Null);
-                assert_eq!(
-                    payload["health"]["source_readiness"][0]["last_sync_at_ms"],
-                    Value::Null
-                );
-                assert_eq!(
-                    payload["health"]["source_readiness"][0]["last_indexed_at_ms"],
-                    item["citation"]["indexed_at_ms"]
-                );
-                let mut stable = payload.clone();
-                let meta = stable["_meta"].as_object_mut().ok_or("pack metadata")?;
-                for key in ["generated_at_ms", "elapsed_ms", "format"] {
-                    meta.remove(key);
-                }
-                stable["budget"]
-                    .as_object_mut()
-                    .ok_or("pack budget")?
-                    .remove("elapsed_ms");
-                for item in stable["evidence"].as_array_mut().ok_or("pack evidence")? {
-                    item["citation"]
-                        .as_object_mut()
-                        .ok_or("pack citation")?
-                        .remove("freshness_age_seconds");
-                }
-                let stable = toon::JsonValue::from(stable);
-                if let Some(expected) = &canonical_envelope {
-                    assert_eq!(&stable, expected, "complete {policy}/{format} envelope");
-                } else {
-                    canonical_envelope = Some(stable);
-                }
-            }
-        }
-    }
-    let stdin_scoped = isolated_cass_cmd(home)
-        .args([
-            "pack",
-            "packpolicyneedle",
-            "--json",
-            "--mode",
-            "lexical",
-            "--sessions-from",
-            "-",
-            "--data-dir",
-        ])
-        .arg(&data_dir)
-        .write_stdin(format!("{}\n", source_path.display()))
-        .output()?;
-    assert!(stdin_scoped.status.success());
-    let payload: Value = serde_json::from_slice(&stdin_scoped.stdout)?;
-    assert_eq!(
-        payload["evidence"]
-            .as_array()
-            .ok_or("stdin evidence")?
-            .len(),
-        1
-    );
-    assert_eq!(Some(&payload["evidence"][0]["id"]), evidence_id.as_ref());
-    for mask in [
-        "standard",
-        "full",
-        "minimal",
-        "evidence,query,no_such_field",
-        "no_such_field",
-    ] {
-        let output = isolated_cass_cmd(home)
-            .args([
-                "pack",
-                "packpolicyneedle",
-                "--json",
-                "--mode",
-                "lexical",
-                "--explain-selection",
-                "--field-mask",
-                mask,
-                "--sessions-from",
-            ])
-            .arg(&scope_file)
-            .args(["--data-dir"])
-            .arg(&data_dir)
-            .output()?;
-        if mask == "no_such_field" {
-            assert_eq!(output.status.code(), Some(2));
-            assert!(output.stdout.is_empty());
-            let error: Value = serde_json::from_slice(&output.stderr)?;
-            assert_eq!(error["error"]["kind"], "pack-invalid-field");
-            assert_eq!(error["error"]["retryable"], false);
-            continue;
-        }
-        assert!(output.status.success());
-        let payload: Value = serde_json::from_slice(&output.stdout)?;
-        assert_eq!(payload["evidence"][0]["citation"]["verified"], true);
-        assert_eq!(
-            payload["evidence"][0]["citation"]["span_hash"],
-            blake3::hash(
-                original
-                    .split(|byte| *byte == b'\n')
-                    .nth(1)
-                    .ok_or("source line")?
-            )
-            .to_hex()
-            .as_str()
-        );
-        match mask {
-            "full" => assert!(payload["selection_debug"].is_object()),
-            "standard" => {
-                assert!(payload.get("selection_debug").is_none());
-                assert!(payload["budget"].is_object());
-            }
-            "minimal" => {
-                assert_eq!(payload.as_object().ok_or("minimal pack")?.len(), 7);
-                assert!(payload.get("_meta").is_none());
-                assert_eq!(
-                    payload["evidence"][0]
-                        .as_object()
-                        .ok_or("minimal evidence")?
-                        .len(),
-                    2
-                );
-            }
-            _ => assert_eq!(
-                payload["_meta"]["warnings"],
-                serde_json::json!([
-                    "semantic_disabled",
-                    "privacy_redactions_applied",
-                    "unknown_pack_field_mask_ignored:no_such_field"
-                ])
-            ),
-        }
-    }
-    let all = isolated_cass_cmd(home)
-        .args([
-            "pack",
-            "packpolicyneedle",
-            "--json",
-            "--mode",
-            "lexical",
-            "--data-dir",
-        ])
-        .arg(&data_dir)
-        .output()?;
-    assert!(all.status.success());
-    let payload: Value = serde_json::from_slice(&all.stdout)?;
-    assert_eq!(
-        payload["evidence"]
-            .as_array()
-            .ok_or("unscoped evidence")?
-            .len(),
-        2,
-        "scope controls must exclude a real competing record"
-    );
-    let database = data_dir.join("agent_search.db");
-    let filtered = isolated_cass_cmd(home)
-        .args([
-            "pack",
-            "packpolicyneedle",
-            "--json",
-            "--mode",
-            "lexical",
-            "--agent",
-            "codex",
-            "--since",
-            "2020-01-01",
-            "--until",
-            "2030-01-01",
-            "--workspace",
-        ])
-        .arg(&codex_home)
-        .arg("--db")
-        .arg(&database)
-        .arg("--data-dir")
-        .arg(&data_dir)
-        .output()?;
-    assert!(filtered.status.success(), "{filtered:?}");
-    let filtered: Value = serde_json::from_slice(&filtered.stdout)?;
-    let stable_evidence = |pack: &Value| {
-        pack["evidence"]
-            .as_array()
-            .expect("filtered evidence")
-            .iter()
-            .map(|item| {
-                serde_json::json!({
-                    "id": item["id"],
-                    "conversation_id": item["citation"]["conversation_id"],
-                    "message_index": item["citation"]["message_index"],
-                    "excerpt": item["excerpt"],
-                })
-            })
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(stable_evidence(&filtered), stable_evidence(&payload));
-    assert_eq!(filtered["_meta"]["effective"]["db_path_source"], "--db");
-    for flags in [
-        ["--agent", "claude_code"],
-        ["--workspace", "pack-unindexed-workspace"],
-        ["--since", "2030-01-01"],
-        ["--until", "2020-01-01"],
-    ] {
-        let excluded = isolated_cass_cmd(home)
-            .args(["pack", "packpolicyneedle", "--json", "--mode", "lexical"])
-            .args(flags)
-            .arg("--db")
-            .arg(&database)
-            .arg("--data-dir")
-            .arg(&data_dir)
-            .output()?;
-        assert!(excluded.status.success(), "{flags:?}: {excluded:?}");
-        let excluded: Value = serde_json::from_slice(&excluded.stdout)?;
-        assert!(
-            excluded["evidence"].as_array().is_some_and(Vec::is_empty),
-            "{flags:?}: {excluded}"
-        );
-    }
-    let refreshed = isolated_cass_cmd(home)
-        .args([
-            "pack",
-            "packpolicyneedle",
-            "--json",
-            "--mode",
-            "lexical",
-            "--refresh",
-            "--data-dir",
-        ])
-        .arg(&data_dir)
-        .output()?;
-    assert!(refreshed.status.success());
-    let payload: Value = serde_json::from_slice(&refreshed.stdout)?;
-    assert_eq!(payload["_meta"]["partial"], true);
-    assert_eq!(payload["budget"]["timed_out"], false);
-    assert!(
-        payload["budget"]["skipped_sections"]
-            .as_array()
-            .ok_or("refresh sections")?
-            .iter()
-            .any(|section| section == "refresh")
-    );
-    assert!(
-        payload["budget"]["recommended_next_probe"]
-            .as_str()
-            .ok_or("refresh probe")?
-            .contains(" index --json")
-    );
-    fs::write(&scope_file, "")?;
-    for require in [false, true] {
-        let mut command = isolated_cass_cmd(home);
-        command
-            .args([
-                "pack",
-                "packpolicyneedle",
-                "--json",
-                "--mode",
-                "lexical",
-                "--sessions-from",
-            ])
-            .arg(&scope_file)
-            .args(["--data-dir"])
-            .arg(&data_dir);
-        if require {
-            command.arg("--require-evidence");
-        }
-        let output = command.output()?;
-        if require {
-            assert_eq!(output.status.code(), Some(13));
-            assert!(output.stdout.is_empty());
-            let error: Value = serde_json::from_slice(&output.stderr)?;
-            assert_eq!(error["error"]["kind"], "not-found");
-            assert_eq!(error["error"]["retryable"], false);
-        } else {
-            assert!(output.status.success());
-            let empty: Value = serde_json::from_slice(&output.stdout)?;
-            assert!(
-                empty["evidence"]
-                    .as_array()
-                    .ok_or("empty evidence")?
-                    .is_empty()
-            );
-            assert!(
-                empty["warnings"]
-                    .as_array()
-                    .ok_or("empty warnings")?
-                    .iter()
-                    .any(|warning| warning == "no_evidence_found")
-            );
-        }
-    }
-    fs::write(&scope_file, [0xff])?;
-    for path in [&scope_file, &home.join("missing-pack-scope.txt")] {
-        let output = isolated_cass_cmd(home)
-            .args([
-                "pack",
-                "packpolicyneedle",
-                "--json",
-                "--mode",
-                "lexical",
-                "--sessions-from",
-            ])
-            .arg(path)
-            .args(["--data-dir"])
-            .arg(&data_dir)
-            .output()?;
-        assert_eq!(output.status.code(), Some(2));
-        assert!(output.stdout.is_empty());
-        let error: Value = serde_json::from_slice(&output.stderr)?;
-        assert_eq!(error["error"]["kind"], "sessions-from");
-        assert_eq!(error["error"]["retryable"], false);
-        assert!(error["error"]["hint"].is_string());
-    }
-    assert_eq!(archive_snapshot()?, archive_before);
-    assert_eq!(fs::read(&source_path)?, original);
-    Ok(())
-}
-
-#[test]
-fn pack_invalid_policies_and_durations_use_typed_errors() -> Result<(), Box<dyn Error>> {
-    let data_dir = TempDir::new()?;
-    for (args, kind) in [
-        (
-            vec!["--redaction", "unknown"],
-            "pack-invalid-redaction-policy",
-        ),
-        (vec!["--redaction", "off"], "pack-invalid-redaction-policy"),
-        (
-            vec!["--redaction", "off", "--source", "remote"],
-            "pack-invalid-redaction-policy",
-        ),
-        (
-            vec!["--redaction", "off", "--source", "all"],
-            "pack-invalid-redaction-policy",
-        ),
-        (vec!["--freshness-window", "0d"], "pack-invalid-limit"),
-        (vec!["--freshness-window", "1x"], "pack-invalid-limit"),
-        (vec!["--max-sessions", "0"], "pack-invalid-limit"),
-        (vec!["--max-sessions", "65"], "pack-invalid-limit"),
-        (vec!["--max-evidence", "0"], "pack-invalid-limit"),
-        (vec!["--max-evidence", "257"], "pack-invalid-limit"),
-        (vec!["--context-lines", "41"], "pack-invalid-limit"),
-        (vec!["--max-excerpt-chars", "79"], "pack-invalid-limit"),
-        (vec!["--max-excerpt-chars", "8001"], "pack-invalid-limit"),
-        (vec!["--fields", "no_such_field"], "pack-invalid-field"),
-        (
-            vec!["--robot-format", "sessions"],
-            "pack-unsupported-format",
-        ),
-        (vec!["--display", "table"], "pack-unsupported-format"),
-        (
-            vec!["--freshness-window", "9223372036854775807w"],
-            "pack-invalid-limit",
-        ),
-    ] {
-        let output = base_cmd()
-            .args(["pack", "policynegative", "--json", "--data-dir"])
-            .arg(data_dir.path())
-            .args(&args)
-            .output()?;
-        assert_eq!(output.status.code(), Some(2), "{args:?}");
-        assert!(
-            output.stdout.is_empty(),
-            "invalid policy must emit no evidence"
-        );
-        let error: Value = serde_json::from_slice(&output.stderr)?;
-        assert_eq!(error["error"]["kind"], kind);
-        assert_eq!(error["error"]["code"], 2);
-        assert_eq!(error["error"]["retryable"], false);
-    }
-    Ok(())
 }
 
 #[test]
@@ -2629,10 +1590,6 @@ fn view_search_hit_assignments_require_an_archive_instead_of_reading_raw_lines()
             .arg(&missing)
             .arg("view")
             .args(fields)
-            // Keep this probe focused on the absent archive, rather than
-            // the earlier missing-token refusal.
-            .arg("--message-anchor")
-            .arg(format!("v1:{}", "0".repeat(64)))
             .arg("--json");
         let output = cmd.assert().failure().get_output().clone();
         assert!(output.stdout.is_empty(), "must not emit a raw-line target");
@@ -3606,6 +2563,7 @@ fn robot_docs_env_lists_key_vars_and_no_ansi() {
         "CASS_SEARCH_BUDGET_MS",
         "CASS_TRIAGE_BUDGET_MS",
         "CASS_PACK_BUDGET_MS",
+        "CASS_AUTO_REFRESH_SOURCE_SCAN_SECS",
         "CASS_FLEET_PER_HOST_BUDGET_MS",
         "CASS_FLEET_BUDGET_MS",
     ] {
@@ -4963,12 +3921,6 @@ fn binary_dispatched_serve_and_archive_are_discoverable() {
 
         let stdout = |args: &[&str]| -> String {
             let mut cmd = base_cmd();
-            // Clap renders help before normal output preferences initialize.
-            // Keep command registration independent of host terminal styling.
-            cmd.env("NO_COLOR", "1");
-            cmd.env_remove("CLICOLOR_FORCE");
-            cmd.env_remove("FORCE_COLOR");
-            cmd.arg("--color=never");
             cmd.args(args);
             String::from_utf8_lossy(&cmd.assert().success().get_output().stdout).into_owned()
         };
@@ -7586,7 +6538,11 @@ fn global_flags_hoisted_from_after_subcommand() {
     );
 }
 
-/// Unknown flags retain the documented envelope and subcommand examples.
+/// Bead robot-parse-error-envelope-878z7: an unknown flag in robot mode uses
+/// the same `{"error": {code, kind, message, hint, retryable}}` envelope as
+/// every other failure, with examples for the subcommand that failed. Before
+/// the fix the payload had a string `error`, a top-level snake_case
+/// `argument_parsing` kind, and `cass view` examples for `models install`.
 #[test]
 fn parse_error_uses_documented_envelope_and_subcommand_examples() {
     for (args, prefix) in [
@@ -7779,7 +6735,7 @@ fn timed_out_robot_pack_returns_bounded_partial_and_names_shed_work() -> Result<
         )
         .into());
     }
-    if output.status.code() != Some(10) {
+    if !output.status.success() {
         return Err(format!(
             "timed-out pack failed: status={:?}; stderr={}",
             output.status,
@@ -7787,9 +6743,6 @@ fn timed_out_robot_pack_returns_bounded_partial_and_names_shed_work() -> Result<
         )
         .into());
     }
-    let error: Value = serde_json::from_slice(&output.stderr)?;
-    assert_eq!(error["error"]["kind"], "timeout");
-    assert_eq!(error["error"]["retryable"], true);
     let payload: Value = serde_json::from_slice(&output.stdout)?;
     let budget = &payload["budget"];
     let skipped = budget["skipped_sections"]
@@ -7856,7 +6809,7 @@ fn timed_out_robot_pack_setup_returns_bounded_partial_before_asset_validation_fi
     if started.elapsed() >= std::time::Duration::from_millis(1500) {
         return Err("pack waited for the simulated two-second search-setup stall".into());
     }
-    if output.status.code() != Some(10) {
+    if !output.status.success() {
         return Err(format!(
             "timed-out pack setup failed: status={:?}; stderr={}",
             output.status,
@@ -7928,7 +6881,7 @@ fn blocking_sessions_file_pack_returns_bounded_partial_without_fabricated_eviden
         .arg(data_dir.path())
         .output()?;
     let wall = started.elapsed();
-    if output.status.code() != Some(10) {
+    if !output.status.success() {
         return Err(format!(
             "FIFO-scoped pack failed (a kill at the harness timeout means pack waited for the blocking sessions FIFO): status={:?}; wall={wall:?}; stderr={}",
             output.status,
@@ -7975,35 +6928,6 @@ fn blocking_sessions_file_pack_returns_bounded_partial_without_fabricated_eviden
             format!("pack FIFO retry lost its session file scope: {recommendation}").into(),
         );
     }
-    // An explicit human timeout must bound the same blocking input. Without
-    // the budgeted-worker path, Markdown waits on this FIFO until the harness
-    // kills it rather than returning the documented timeout.
-    let output = base_cmd()
-        .timeout(std::time::Duration::from_secs(30))
-        .args([
-            "pack",
-            "hello",
-            "--display",
-            "markdown",
-            "--mode",
-            "lexical",
-            "--timeout",
-            "120",
-            "--sessions-from",
-        ])
-        .arg(&sessions_fifo)
-        .arg("--data-dir")
-        .arg(data_dir.path())
-        .output()?;
-    assert_eq!(output.status.code(), Some(10), "{output:?}");
-    let error = std::str::from_utf8(&output.stderr)?;
-    assert!(
-        error.contains("pack deadline reached before usable evidence could be emitted"),
-        "{error}"
-    );
-    let markdown = String::from_utf8(output.stdout)?;
-    assert!(markdown.contains("# hello"), "{markdown}");
-    assert!(!markdown.contains("ev_"), "{markdown}");
     Ok(())
 }
 
@@ -8090,7 +7014,7 @@ fn timed_out_robot_pack_renderer_emits_fixed_size_partial_fallback() -> Result<(
         )
         .into());
     }
-    if output.status.code() != Some(10) {
+    if !output.status.success() {
         return Err(format!(
             "timed-out pack renderer failed: status={:?}; stderr={}",
             output.status,
@@ -8175,7 +7099,7 @@ fn timed_out_robot_pack_planner_does_not_fabricate_selection() -> Result<(), Box
         )
         .into());
     }
-    if output.status.code() != Some(10) {
+    if !output.status.success() {
         return Err(format!(
             "timed-out pack planner failed: status={:?}; stderr={}",
             output.status,
@@ -9890,12 +8814,6 @@ fn isolated_cass_cmd(temp_home: &std::path::Path) -> Command {
     cmd.env("XDG_DATA_HOME", temp_home.join(".local/share"));
     cmd.env("XDG_CONFIG_HOME", temp_home.join(".config"));
     cmd.env("CODEX_HOME", temp_home.join(".codex"));
-    // These shared native stores do not derive their defaults from HOME.
-    cmd.env("CASS_CLOUDMCP_DATA_ROOT", temp_home.join("cloudmcp-empty"));
-    cmd.env(
-        "CASS_OPENWEBUI_DATA_ROOT",
-        temp_home.join("openwebui-empty"),
-    );
     // HOME does not isolate Claude Code on Windows (its root comes from the
     // profile known folder) or under an inherited CLAUDE_CONFIG_DIR. On wlap
     // the pack alias tests cited the host's own sessions (if17v).

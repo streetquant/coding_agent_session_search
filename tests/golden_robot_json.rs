@@ -37,8 +37,6 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use walkdir::WalkDir;
 
-mod util;
-
 /// Build a `cass` binary invocation with the env knobs required for
 /// deterministic test output (no update check, no ambient data-dir or CWD
 /// connector-discovery surprise).
@@ -300,12 +298,12 @@ fn safe_fixture_destination(dst_root: &Path, rel: &Path) -> io::Result<PathBuf> 
     Ok(dst)
 }
 
-fn isolated_search_demo_data(test_home: &tempfile::TempDir) -> Result<PathBuf, Box<dyn Error>> {
+fn isolated_search_demo_data(test_home: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
         .join("search_demo_data");
-    let dst_root = test_home.path().join("search_demo_data");
+    let dst_root = test_home.join("search_demo_data");
     for entry in WalkDir::new(&src) {
         let entry = entry?;
         // Machine-local frankensqlite namespace lock sidecars (created by
@@ -332,7 +330,6 @@ fn isolated_search_demo_data(test_home: &tempfile::TempDir) -> Result<PathBuf, B
             fs::copy(entry.path(), &dst)?;
         }
     }
-    util::admit_copied_search_fixture(&dst_root, test_home)?;
     Ok(dst_root)
 }
 
@@ -525,22 +522,6 @@ fn normalize_live_robot_values(value: &mut Value) {
                 }
                 if redact_result_content && key == "snippet" && child.is_string() {
                     *child = json!("[RESULT_SNIPPET]");
-                    continue;
-                }
-                // The digest binds the original unsanitized source path and
-                // complete body. Path/text placeholders cannot normalize it.
-                if redact_result_content
-                    && key == "message_anchor"
-                    && child.as_str().is_some_and(|anchor| {
-                        anchor.strip_prefix("v1:").is_some_and(|digest| {
-                            digest.len() == 64
-                                && digest.bytes().all(|byte| {
-                                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
-                                })
-                        })
-                    })
-                {
-                    *child = json!("[MESSAGE_ANCHOR]");
                     continue;
                 }
 
@@ -885,8 +866,7 @@ fn live_value_scrubbing_redacts_repo_paths_and_result_content() -> Result<(), St
                 "line_number": 42,
                 "agent": "aider",
                 "snippet": "private snippet",
-                "content": "private prompt and assistant transcript",
-                "message_anchor": format!("v1:{}", "a".repeat(64))
+                "content": "private prompt and assistant transcript"
             },
             {
                 "source_path": format!("{legacy_fixture_root}/tests/fixtures/aider/session.md"),
@@ -894,26 +874,9 @@ fn live_value_scrubbing_redacts_repo_paths_and_result_content() -> Result<(), St
                 "line_number": 7,
                 "agent": "aider",
                 "snippet": "legacy private snippet",
-                "content": "legacy private prompt and assistant transcript",
-                "message_anchor": null
-            },
-            {
-                "source_path": "missing-proof.jsonl",
-                "line_number": 1,
-                "agent": "codex",
-                "message_anchor": "malformed-proof"
-            },
-            {
-                "source_path": "no-proof.jsonl",
-                "line_number": 1,
-                "agent": "codex"
+                "content": "legacy private prompt and assistant transcript"
             }
-        ],
-        "response_schemas": {
-            "search": {"type": "object", "properties": {
-                "message_anchor": {"type": ["string", "null"]}
-            }}
-        }
+        ]
     }))
     .expect("serialize fixture");
 
@@ -928,7 +891,6 @@ fn live_value_scrubbing_redacts_repo_paths_and_result_content() -> Result<(), St
     require_json_string_eq(&scrubbed, "/results/0/workspace", "[REPO]")?;
     require_json_string_eq(&scrubbed, "/results/0/snippet", "[RESULT_SNIPPET]")?;
     require_json_string_eq(&scrubbed, "/results/0/content", "[RESULT_CONTENT]")?;
-    require_json_string_eq(&scrubbed, "/results/0/message_anchor", "[MESSAGE_ANCHOR]")?;
     require_json_string_eq(
         &scrubbed,
         "/results/1/source_path",
@@ -937,13 +899,6 @@ fn live_value_scrubbing_redacts_repo_paths_and_result_content() -> Result<(), St
     require_json_string_eq(&scrubbed, "/results/1/workspace", "[REPO]")?;
     require_json_string_eq(&scrubbed, "/results/1/snippet", "[RESULT_SNIPPET]")?;
     require_json_string_eq(&scrubbed, "/results/1/content", "[RESULT_CONTENT]")?;
-    assert!(scrubbed["results"][1]["message_anchor"].is_null());
-    assert_eq!(scrubbed["results"][2]["message_anchor"], "malformed-proof");
-    assert!(scrubbed["results"][3].get("message_anchor").is_none());
-    assert_eq!(
-        scrubbed["response_schemas"]["search"]["properties"]["message_anchor"]["type"],
-        json!(["string", "null"])
-    );
     let serialized = serde_json::to_string(&scrubbed).expect("serialize scrubbed fixture");
     if serialized.contains("private prompt") {
         return Err("scrubbed fixture leaked private prompt text".to_string());
@@ -1978,6 +1933,13 @@ fn stats_json_missing_db_error_envelope_matches_golden() {
 
 #[test]
 fn parse_error_robot_envelope_matches_golden() {
+    // Bead robot-parse-error-envelope-878z7: an unknown flag in robot mode is
+    // the most common agent mistake. It exits 2 with the same documented
+    // `{"error": {code, kind, message, hint, retryable}}` envelope on stderr
+    // as every other failure, with the parse guidance (detail, examples,
+    // hints, common mistakes, flag syntax) nested inside `error`. Before the
+    // fix the payload had a string `error`, a top-level snake_case kind and
+    // `cass view` examples for `stats`; no golden pinned it.
     let test_home = tempfile::tempdir().expect("create temp home");
     let out = cass_cmd(test_home.path())
         .args(["stats", "--json", "--nonexistent-flag"])
@@ -2003,7 +1965,7 @@ fn stats_json_happy_path_matches_golden() -> Result<(), Box<dyn Error>> {
     // known conversation/message count), invokes `cass stats --json`,
     // and freezes the scrubbed envelope.
     let test_home = tempfile::tempdir().expect("create temp home");
-    let data_dir = isolated_search_demo_data(&test_home)?;
+    let data_dir = isolated_search_demo_data(test_home.path())?;
     let out = cass_cmd(test_home.path())
         .args([
             "stats",
@@ -2036,7 +1998,7 @@ fn stats_json_happy_path_shape_matches_golden() -> Result<(), Box<dyn Error>> {
     // mask structural regressions. json_value_schema diff tolerates
     // value changes; keys + types must hold.
     let test_home = tempfile::tempdir().expect("create temp home");
-    let data_dir = isolated_search_demo_data(&test_home)?;
+    let data_dir = isolated_search_demo_data(test_home.path())?;
     let out = cass_cmd(test_home.path())
         .args([
             "stats",
@@ -2329,11 +2291,8 @@ fn pack_introspect_contract_matrix_is_current() {
         ("source", "option", Some("string")),
         ("sessions-from", "option", Some("string")),
         ("mode", "option", Some("enum")),
-        ("approximate", "flag", None),
         ("freshness-policy", "option", Some("enum")),
         ("freshness-window-seconds", "option", Some("integer")),
-        ("freshness-window", "option", Some("string")),
-        ("redaction", "option", Some("string")),
         ("require-evidence", "flag", None),
         ("explain-selection", "flag", None),
         ("refresh", "flag", None),
@@ -2357,8 +2316,6 @@ fn pack_introspect_contract_matrix_is_current() {
         "omitted",
         "privacy",
         "warnings",
-        "budget",
-        "selection_debug",
     ] {
         assert!(
             pack_schema.get(field).is_some(),
@@ -2370,7 +2327,7 @@ fn pack_introspect_contract_matrix_is_current() {
 #[test]
 fn search_robot_json_matches_golden() -> Result<(), Box<dyn Error>> {
     let test_home = tempfile::tempdir().expect("create temp home");
-    let data_dir = isolated_search_demo_data(&test_home)?;
+    let data_dir = isolated_search_demo_data(test_home.path())?;
     let output = cass_cmd(test_home.path())
         .args([
             "search",
@@ -2402,7 +2359,7 @@ fn search_robot_json_matches_golden() -> Result<(), Box<dyn Error>> {
 #[test]
 fn search_robot_shape_matches_golden() -> Result<(), Box<dyn Error>> {
     let test_home = tempfile::tempdir().expect("create temp home");
-    let data_dir = isolated_search_demo_data(&test_home)?;
+    let data_dir = isolated_search_demo_data(test_home.path())?;
     let output = cass_cmd(test_home.path())
         .args([
             "search",
@@ -2671,7 +2628,7 @@ fn models_verify_json_not_acquired_shape_matches_golden() {
 }
 
 #[test]
-fn models_check_update_json_not_installed_shape_matches_golden() -> Result<(), Box<dyn Error>> {
+fn models_check_update_json_not_installed_shape_matches_golden() {
     // Empty data_dir ⇒ `cass models check-update --json` returns
     // `reason=model_not_installed` with current_revision=null +
     // latest_revision=<pinned sha>. Shape golden pins the 4-field
@@ -2688,7 +2645,7 @@ fn models_check_update_json_not_installed_shape_matches_golden() -> Result<(), B
         ])
         .output()
         .expect("run cass models check-update --json");
-    let stdout = String::from_utf8(out.stdout)?;
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|err| {
         panic!("models check-update stdout is not JSON: {err}\nstdout:\n{stdout}")
     });
@@ -2698,5 +2655,4 @@ fn models_check_update_json_not_installed_shape_matches_golden() -> Result<(), B
         "robot/models_check_update_not_installed_shape.json.golden",
         &canonical,
     );
-    Ok(())
 }

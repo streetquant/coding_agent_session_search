@@ -1,14 +1,106 @@
 //! Connector for GitHub Copilot Chat session logs.
 //!
-//! Parsing lives in `franken_agent_detection::connectors::copilot`. CASS wraps
-//! it only to widen detection (see [`CopilotConnector::detect`]).
+//! Parsing lives in `franken_agent_detection::connectors::copilot`. CASS
+//! handles detection and preservation of shared VS Code stores here.
 
 use super::{
     Connector, DetectionResult, DiscoveredSourceFile, DiscoveredSourceRole, NormalizedConversation,
-    ScanContext,
+    ScanContext, ScanRoot, file_modified_since,
 };
 use anyhow::Result;
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+/// Omit only VS Code state with no legacy chat key or a known empty JSON
+/// container. Ambiguous data keeps the normal capture-before-parse path.
+pub(crate) fn source_is_proven_chat_free(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    if path.file_name().is_some_and(|name| name == "state.vscdb") {
+        return legacy_store_is_proven_chat_free(path);
+    }
+    if path.file_name().is_none_or(|name| name != "workspace.json") {
+        return false;
+    }
+    let Some(workspace) = path.parent() else {
+        return false;
+    };
+    if workspace
+        .parent()
+        .and_then(Path::file_name)
+        .is_none_or(|name| name != "workspaceStorage")
+        || !legacy_store_is_proven_chat_free(&workspace.join("state.vscdb"))
+    {
+        return false;
+    }
+    // This sidecar also resolves workspaces for native JSON/JSONL history.
+    // Keep it whenever a transcript might exist or the directory is unsafe.
+    let sessions = workspace.join("chatSessions");
+    match std::fs::symlink_metadata(&sessions) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        _ => return false,
+    }
+    let Ok(entries) = std::fs::read_dir(sessions) else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        if entry
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("json") || extension.eq_ignore_ascii_case("jsonl")
+            })
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn legacy_store_is_proven_chat_free(path: &Path) -> bool {
+    use crate::franken_sync::compat::{OpenFlags, RowExt, open_with_flags};
+
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        _ => return false,
+    }
+    let Some(path) = path.to_str() else {
+        return false;
+    };
+    let Ok(connection) = open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return false;
+    };
+    // Inspect only small payloads, using the same BLOB-to-text conversion as
+    // the legacy reader. Never deserialize a whole large history just to
+    // decide whether to preserve it. Two rows prove an ambiguous duplicate
+    // key; no row, NULL, malformed JSON and unknown shapes remain distinct.
+    let query = "SELECT CASE WHEN length(value) <= 4096 THEN CAST(value AS TEXT) ELSE NULL END \
+                 FROM ItemTable WHERE key = 'interactive.sessions' LIMIT 2";
+    let Ok(rows) = connection.query(query) else {
+        return false;
+    };
+    let [row] = rows.as_slice() else {
+        return rows.is_empty();
+    };
+    let Ok(raw) = row.get_typed::<String>(0) else {
+        return false;
+    };
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(serde_json::Value::Array(items)) => items.is_empty(),
+        Ok(serde_json::Value::Object(items)) => items.is_empty(),
+        _ => false,
+    }
+}
 
 /// GitHub Copilot Chat (VS Code, VS Code Insiders, VSCodium).
 #[derive(Default)]
@@ -20,6 +112,43 @@ impl CopilotConnector {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// FAD's native reader filters the primary mtime, but VS Code can commit
+    /// chat changes into a live WAL without touching that file. Discover only
+    /// those skipped stores and their existing metadata; parsing stays in FAD.
+    fn wal_only_sources(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        if ctx.since_ts.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut full = ctx.clone();
+        full.since_ts = None;
+        let mut sources = self.inner.discover_source_files(&full)?;
+        let databases: HashSet<PathBuf> = sources
+            .iter()
+            .filter(|source| {
+                if source.role != DiscoveredSourceRole::SqliteDatabase
+                    || file_modified_since(&source.source_path, ctx.since_ts)
+                {
+                    return false;
+                }
+                let mut wal = source.source_path.as_os_str().to_owned();
+                wal.push("-wal");
+                let wal = PathBuf::from(wal);
+                wal.is_file() && file_modified_since(&wal, ctx.since_ts)
+            })
+            .map(|source| source.source_path.clone())
+            .collect();
+        let parents: HashSet<&Path> = databases.iter().filter_map(|path| path.parent()).collect();
+        sources.retain(|source| {
+            databases.contains(&source.source_path)
+                || (source.role == DiscoveredSourceRole::MetadataSidecar
+                    && source
+                        .source_path
+                        .parent()
+                        .is_some_and(|parent| parents.contains(parent)))
+        });
+        Ok(sources)
     }
 
     /// Native VS Code chat stores the upstream connector would scan in `ctx`:
@@ -76,11 +205,61 @@ impl Connector for CopilotConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        self.inner.scan(ctx)
+        let pending = self.wal_only_sources(ctx)?;
+        let mut conversations = self.inner.scan(ctx)?;
+        if pending.is_empty() {
+            return Ok(conversations);
+        }
+        let mut seen: HashSet<String> = conversations
+            .iter()
+            .filter_map(|conversation| conversation.external_id.clone())
+            .collect();
+        // Ordinary extension/native results outrank these older SQLite
+        // primaries. Full discovery retains FAD's mtime ordering between the
+        // supplemental stores, so deduplication keeps its generation priority.
+        for source in pending {
+            if source.role != DiscoveredSourceRole::SqliteDatabase {
+                continue;
+            }
+            let mut scoped = ctx.clone();
+            scoped.since_ts = None;
+            let root = ctx
+                .scan_roots
+                .iter()
+                .find(|root| root.path == source.scan_root)
+                .cloned()
+                .unwrap_or_else(|| ScanRoot::local(source.scan_root.clone()));
+            scoped.scan_roots = vec![root.with_path(source.source_path)];
+            for conversation in self.inner.scan(&scoped)? {
+                if conversation
+                    .external_id
+                    .as_ref()
+                    .is_some_and(|id| !seen.insert(id.clone()))
+                {
+                    continue;
+                }
+                conversations.push(conversation);
+            }
+        }
+        Ok(conversations)
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        self.inner.discover_source_files(ctx)
+        let pending = self.wal_only_sources(ctx)?;
+        let mut sources = self.inner.discover_source_files(ctx)?;
+        if pending.is_empty() {
+            return Ok(sources);
+        }
+        let mut paths: HashSet<PathBuf> = sources
+            .iter()
+            .map(|source| source.source_path.clone())
+            .collect();
+        for source in pending {
+            if paths.insert(source.source_path.clone()) {
+                sources.push(source);
+            }
+        }
+        Ok(sources)
     }
 }
 
@@ -145,5 +324,179 @@ mod tests {
                 .native_store_detection(&scan_home(home.path()))
                 .detected
         );
+    }
+
+    fn empty_legacy_workspace(home: &Path) -> Result<PathBuf> {
+        let workspace = home.join(".config/Code/User/workspaceStorage/empty-workspace");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::write(
+            workspace.join("workspace.json"),
+            br#"{"folder":"file:///w"}"#,
+        )?;
+        let database = workspace.join("state.vscdb");
+        let connection = crate::franken_sync::Connection::open(database.to_str().unwrap())?;
+        connection.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)")?;
+        connection
+            .execute("INSERT INTO ItemTable VALUES ('unrelated.extension', 'workspace state')")?;
+        connection.close()?;
+        Ok(workspace)
+    }
+
+    #[test]
+    fn chat_free_probe_is_read_only_and_keeps_existing_chat_keys() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let workspace = empty_legacy_workspace(home.path())?;
+        let database = workspace.join("state.vscdb");
+        let before = std::fs::read(&database)?;
+        let modified = std::fs::metadata(&database)?.modified()?;
+        assert!(source_is_proven_chat_free(&database));
+        assert!(source_is_proven_chat_free(
+            &workspace.join("workspace.json")
+        ));
+        assert_eq!(std::fs::read(&database)?, before);
+        assert_eq!(std::fs::metadata(&database)?.modified()?, modified);
+
+        let connection = crate::franken_sync::Connection::open(database.to_str().unwrap())?;
+        connection.execute("INSERT INTO ItemTable VALUES ('interactive.sessions', NULL)")?;
+        connection.close()?;
+        assert!(!source_is_proven_chat_free(&database));
+        assert!(!source_is_proven_chat_free(
+            &workspace.join("workspace.json")
+        ));
+
+        let connection = crate::franken_sync::Connection::open(database.to_str().unwrap())?;
+        connection.execute(
+            "UPDATE ItemTable SET value = 'malformed chat payload' WHERE key = 'interactive.sessions'",
+        )?;
+        connection.close()?;
+        assert!(!source_is_proven_chat_free(&database));
+        Ok(())
+    }
+
+    #[test]
+    fn native_transcript_keeps_its_workspace_sidecar_even_without_legacy_chat() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let workspace = empty_legacy_workspace(home.path())?;
+        let sessions = workspace.join("chatSessions");
+        std::fs::create_dir_all(&sessions)?;
+        let transcript = sessions.join("unparsed.jsonl");
+        std::fs::write(
+            &transcript,
+            b"{malformed transcript preserved before parsing\n",
+        )?;
+        assert!(source_is_proven_chat_free(&workspace.join("state.vscdb")));
+        assert!(!source_is_proven_chat_free(
+            &workspace.join("workspace.json")
+        ));
+        assert!(!source_is_proven_chat_free(&transcript));
+        let database = workspace.join("state.vscdb");
+        let connection = crate::franken_sync::Connection::open(database.to_str().unwrap())?;
+        connection.execute("INSERT INTO ItemTable VALUES ('interactive.sessions', '[]')")?;
+        connection.close()?;
+        assert!(source_is_proven_chat_free(&workspace.join("state.vscdb")));
+        assert!(!source_is_proven_chat_free(
+            &workspace.join("workspace.json")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_legacy_payloads_are_omitted_and_unknown_values_are_preserved() -> Result<()> {
+        use crate::franken_sync::compat::{ConnectionExt, ParamValue};
+
+        let home = tempfile::tempdir()?;
+        let workspace = empty_legacy_workspace(home.path())?;
+        let database = workspace.join("state.vscdb");
+        let oversized = format!("[{}]", " ".repeat(4096));
+        for (payload, chat_free) in [
+            ("[]", true),
+            ("{}", true),
+            ("[ \n\t\r ]", true),
+            ("{ \n\t\r }", true),
+            ("null", false),
+            ("true", false),
+            ("\"[]\"", false),
+            ("[null]", false),
+            ("{\"future\":{}}", false),
+            ("{malformed", false),
+            (oversized.as_str(), false),
+        ] {
+            let connection = crate::franken_sync::Connection::open(database.to_str().unwrap())?;
+            connection.execute_compat(
+                "INSERT OR REPLACE INTO ItemTable VALUES ('interactive.sessions', ?1)",
+                &[ParamValue::from(payload)],
+            )?;
+            connection.close()?;
+            let before = std::fs::read(&database)?;
+            let modified = std::fs::metadata(&database)?.modified()?;
+            assert_eq!(
+                source_is_proven_chat_free(&database),
+                chat_free,
+                "{payload}"
+            );
+            assert_eq!(
+                source_is_proven_chat_free(&workspace.join("workspace.json")),
+                chat_free,
+                "{payload}"
+            );
+            assert_eq!(std::fs::read(&database)?, before);
+            assert_eq!(std::fs::metadata(&database)?.modified()?, modified);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_legacy_chat_keys_remain_ambiguous() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let database = home.path().join("state.vscdb");
+        let connection = crate::franken_sync::Connection::open(database.to_str().unwrap())?;
+        connection.execute("CREATE TABLE ItemTable (key TEXT, value BLOB)")?;
+        connection.execute("INSERT INTO ItemTable VALUES ('interactive.sessions', '[]')")?;
+        connection.execute("INSERT INTO ItemTable VALUES ('interactive.sessions', '{}')")?;
+        connection.close()?;
+        let before = std::fs::read(&database)?;
+        assert!(!source_is_proven_chat_free(&database));
+        assert_eq!(std::fs::read(database)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_and_corrupt_stores_never_prove_an_empty_legacy_database() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let path = home.path().join("state.vscdb");
+        assert!(!source_is_proven_chat_free(&path));
+        let bytes = b"unreadable legacy chat evidence";
+        std::fs::write(&path, bytes)?;
+        assert!(!source_is_proven_chat_free(&path));
+        assert_eq!(std::fs::read(&path)?, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn committed_chat_key_in_a_live_wal_is_never_treated_as_chat_free() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let workspace = empty_legacy_workspace(home.path())?;
+        let database = workspace.join("state.vscdb");
+        let writer = crate::franken_sync::Connection::open(database.to_str().unwrap())?;
+        writer.execute("PRAGMA journal_mode = WAL")?;
+        writer.execute("PRAGMA wal_autocheckpoint = 0")?;
+        let primary_before = std::fs::read(&database)?;
+        writer.execute("INSERT INTO ItemTable VALUES ('interactive.sessions', 'unparsed chat')")?;
+        let wal = workspace.join("state.vscdb-wal");
+        let wal_before = std::fs::read(&wal)?;
+        assert!(
+            wal_before.len() > 32,
+            "the provider must have a committed WAL"
+        );
+        assert_eq!(std::fs::read(&database)?, primary_before);
+        assert!(!source_is_proven_chat_free(&database));
+        assert_eq!(std::fs::read(&database)?, primary_before);
+        assert_eq!(
+            std::fs::read(wal)?,
+            wal_before,
+            "the probe must not rewrite the WAL"
+        );
+        writer.close()?;
+        Ok(())
     }
 }

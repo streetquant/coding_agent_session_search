@@ -26,8 +26,11 @@ async function globalSetup() {
     mkdirSync(pagesPreviewDir, { recursive: true });
   }
 
-  // export-html picks a new name instead of overwriting; use the actual latest
-  // output paths so a prior run cannot qualify the current executable.
+  // Each regeneration writes into a fresh run directory: `cass export-html`
+  // never overwrites (it writes `<name>_1.html` beside an existing file), so a
+  // reused directory left the tests reading the previous run's exports while
+  // this binary's sat unused. latest-exports.json maps each export to the file
+  // the newest run wrote, for the skip-regeneration path.
   const latestExportsFile = path.join(exportDir, "latest-exports.json");
   let latestExports: Record<string, string> = {};
   try {
@@ -35,6 +38,8 @@ async function globalSetup() {
   } catch {
     latestExports = {};
   }
+
+  // Check if we can skip regeneration - if all exports exist and are recent
   const requiredExports = [
     "test-basic",
     "test-encrypted",
@@ -63,10 +68,13 @@ async function globalSetup() {
     );
   }
 
-  // Cargo names Windows executables with .exe.
+  // Find the cass binary - check CARGO_TARGET_DIR or common locations.
+  // Cargo names Windows executables with `.exe`.
   const exe = process.platform === "win32" ? ".exe" : "";
   const possiblePaths = [
-    process.env.CARGO_TARGET_DIR ? path.join(process.env.CARGO_TARGET_DIR, `release/cass${exe}`) : null,
+    process.env.CARGO_TARGET_DIR
+      ? path.join(process.env.CARGO_TARGET_DIR, `release/cass${exe}`)
+      : null,
     `/data/tmp/cargo-target/release/cass${exe}`,
     path.join(projectRoot, `target/release/cass${exe}`),
   ].filter(Boolean) as string[];
@@ -158,9 +166,12 @@ async function globalSetup() {
     TEST_EXPORT_PASSWORD: "test-password-123",
   };
 
-  const runDir = path.join(exportDir, `run-${randomUUID()}`);
-  if (!skipExportRegenerate) mkdirSync(runDir, { recursive: true });
+  const runDir = path.join(exportDir, `run-${new Date().toISOString().replace(/[:.]/g, "-")}`);
+  if (!skipExportRegenerate) {
+    mkdirSync(runDir, { recursive: true });
+  }
   const writtenExports: Record<string, string> = {};
+
   for (const { name, fixture, args, stdin } of exports) {
     const fixturePath = path.join(fixturesDir, fixture);
     const envKey = `TEST_EXPORT_${name.toUpperCase().replace(/-/g, "_")}`;
@@ -170,8 +181,10 @@ async function globalSetup() {
       continue;
     }
 
+    // Always set the env path so tests can fail loudly if exports are missing.
     let outputPath = path.join(runDir, `${name}.html`);
     envContent[envKey] = outputPath;
+
     console.log(`Generating ${name}.html from ${fixture}...`);
 
     const cmdArgs = [
@@ -200,12 +213,16 @@ async function globalSetup() {
         stdio: "pipe",
       });
       stdout = output ? output.toString() : "";
-      const reported = JSON.parse(stdout)?.exported?.output_path;
-      if (typeof reported !== "string" || !reported) {
-        throw new Error(`export-html --json reported no output path for ${name}`);
+      // Test the file cass reports writing, not the name requested.
+      try {
+        const reported = JSON.parse(stdout)?.exported?.output_path;
+        if (typeof reported === "string" && reported) {
+          outputPath = reported;
+          envContent[envKey] = outputPath;
+        }
+      } catch {
+        console.warn(`  export-html --json printed no JSON document for ${name}`);
       }
-      outputPath = reported;
-      envContent[envKey] = outputPath;
       console.log(`  -> ${outputPath}`);
     } catch (err) {
       success = false;
@@ -247,8 +264,7 @@ async function globalSetup() {
   // -----------------------------------------------------------------------------
   const previewPort = parseInt(process.env.TEST_PAGES_PREVIEW_PORT || "8090", 10);
   const previewPassword = process.env.TEST_PAGES_PREVIEW_PASSWORD || "test-password-123";
-  const pagesRunDir = path.join(pagesPreviewDir, `run-${randomUUID()}`);
-  const pagesBundleDir = path.join(pagesRunDir, "bundle");
+  const pagesBundleDir = path.join(pagesPreviewDir, "bundle");
 
   const possibleBundlePaths = [
     path.join(path.dirname(cassPath), `cass-pages-perf-bundle${exe}`),
@@ -273,16 +289,16 @@ async function globalSetup() {
   } else {
     console.log(`Using perf bundle binary: ${bundleBinPath}`);
     try {
-      execFileSync(
-        bundleBinPath,
+      execSync(
         [
+          bundleBinPath,
           "--output",
-          pagesRunDir,
+          pagesPreviewDir,
           "--preset",
           "small",
           "--password",
           previewPassword,
-        ],
+        ].join(" "),
         { cwd: projectRoot, stdio: "pipe" },
       );
       console.log(`Pages bundle ready: ${pagesBundleDir}`);
@@ -291,8 +307,10 @@ async function globalSetup() {
     }
   }
 
-  // Prepare real key slots. A revoked-password check needs proof that this
-  // exact password authenticated its slot before revocation.
+  // Key slots for the unlock specs (bead browser-e2e-lane-bnueb): a recovery
+  // slot, and a second password that is then revoked, so the viewer must
+  // refuse it. A value is exported only once its slot operation succeeded;
+  // otherwise the reason goes to TEST_PAGES_KEY_SLOT_ERROR and the specs fail.
   let recoveryKey = "";
   let revokedPassword = "";
   let keySlotError = "";
@@ -306,13 +324,18 @@ async function globalSetup() {
       try {
         return JSON.parse(stdout);
       } catch {
-        throw new Error(`Pages key ${verb} returned invalid JSON`);
+        throw new Error(`cass pages key ${verb} printed no JSON document: ${stdout.slice(0, 200)}`);
       }
     };
     try {
       recoveryKey = keyVerb("add-recovery", `${previewPassword}\n`).recovery_secret ?? "";
+      // A fresh value per run: the bundle is regenerated, and no fixed
+      // credential lands in the tree.
       const secondPassword = `revoked-${randomUUID()}`;
       const added = keyVerb("add-password", `${previewPassword}\n${secondPassword}\n`);
+      // The refusal spec proves nothing unless the second password opened
+      // its slot before the revoke. revoke refuses to remove the slot that
+      // authenticated the call, so revoking it with its own password must fail.
       let selfRevoke = "";
       try {
         keyVerb("revoke", `${secondPassword}\n`, ["--slot", String(added.slot_id)]);
@@ -320,7 +343,9 @@ async function globalSetup() {
         selfRevoke = String((err as { stderr?: Buffer }).stderr ?? err);
       }
       if (!selfRevoke.includes("used for authentication")) {
-        throw new Error(`the added password did not authenticate slot ${added.slot_id}: ${selfRevoke || "its own revoke succeeded"}`);
+        throw new Error(
+          `the added password did not authenticate slot ${added.slot_id}: ${selfRevoke || "its own revoke succeeded"}`,
+        );
       }
       keyVerb("revoke", `${previewPassword}\n`, ["--slot", String(added.slot_id)]);
       revokedPassword = secondPassword;

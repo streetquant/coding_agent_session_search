@@ -1,4 +1,4 @@
-//! Persisted source reuse through the real CLI, canonical store and search (GH512/GH536).
+//! GH512: persisted source reuse through the real CLI, canonical store and search.
 
 use coding_agent_search::franken_sync::SqliteValue;
 use coding_agent_search::storage::sqlite::SqliteStorage;
@@ -21,11 +21,8 @@ fn cass(home: &Path, streaming: &str) -> assert_cmd::Command {
         .env("XDG_DATA_HOME", home.join(".local/share"))
         .env("CASS_DATA_DIR", home.join("data"))
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
-        .env("CASS_CLOUDMCP_DATA_ROOT", home.join("isolated-cloudmcp"))
-        .env("CASS_OPENWEBUI_DATA_ROOT", home.join("isolated-openwebui"))
         .env("CASS_STREAMING_INDEX", streaming)
         .env("CASS_AUTO_REFRESH", "0")
-        .env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0")
         .env("RUST_MIN_STACK", "134217728")
         .env("NO_COLOR", "1")
         .current_dir(home)
@@ -431,21 +428,7 @@ fn gh536_a_new_device_number_after_a_remount_does_not_reparse_unchanged_sources(
             });
             fs::create_dir_all(&directory).unwrap();
             let first = transcript(&directory, provider, 0);
-            let second = transcript(&directory, provider, 1);
-            // A local incremental shortcut reuses a source whose mtime predates
-            // the previous scan by more than one second before it consults the
-            // ledger, and emits no source_ingest_observation event. A future
-            // fixture mtime keeps the reuse decision on the ledger path even
-            // when a debug CLI takes over a second to start.
-            let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-            for path in [&first, &second] {
-                fs::OpenOptions::new()
-                    .write(true)
-                    .open(path)
-                    .unwrap()
-                    .set_modified(future)
-                    .unwrap();
-            }
+            transcript(&directory, provider, 1);
             index(home, streaming, "initial", 0, 2);
             let initial = archive(home, 2, false);
             // The number an older build saved before the remount; the mount

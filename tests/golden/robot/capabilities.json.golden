@@ -23,6 +23,11 @@
     "request_id",
     "answer_pack_command",
     "dry_run",
+    "session_retention_selectors",
+    "durable_session_exclusions",
+    "exclusion_listing",
+    "explicit_session_reinclusion",
+    "raw_capture_session_exclusions",
     "query_explain",
     "view_command",
     "status_command",
@@ -2629,6 +2634,16 @@
             "true",
             "false"
           ]
+        },
+        {
+          "name": "include-secrets",
+          "description": "Include credentials from the source text (sensitive output). By default exports redact recognized secrets, regardless of index settings",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
         }
       ],
       "has_json_output": false
@@ -2722,6 +2737,16 @@
         {
           "name": "include-skills",
           "description": "Include skill content in export (default: stripped for privacy). Skills injected by Claude Code/Codex contain proprietary SKILL.md content that should not appear in shared/published exports",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "include-secrets",
+          "description": "Include credentials from the source text (sensitive output, even when encrypted). By default exports redact recognized secrets, regardless of index settings",
           "arg_type": "flag",
           "required": false,
           "enum_values": [
@@ -3264,14 +3289,76 @@
     },
     {
       "name": "forget",
-      "description": "Prune an already-indexed subset of conversations by source-path glob (dry-run by default; `--apply` to commit). Removes matching rows from the canonical DB and rebuilds derived search/analytics assets. Source files are kept: a source that changes afterwards is indexed again",
+      "description": "Prune archived conversations by source path, workspace, or age (dry-run by default; `--apply` to commit). At least one selector is required; supplied selectors are ANDed. Rebuilds derived search and analytics assets while keeping source files. Forgotten sessions in shared stores stay forgotten until explicitly released with --reinclude. Use --list to inspect recorded exclusions without changing the archive",
       "arguments": [
         {
           "name": "source-glob",
           "description": "Glob over conversation `source_path` (e.g. `**/subagents/*.jsonl`)",
           "arg_type": "option",
           "value_type": "string",
-          "required": true
+          "required": false
+        },
+        {
+          "name": "workspace-glob",
+          "description": "Glob over the recorded workspace path (e.g. `/work/scratch/**`)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "older-than",
+          "description": "Forget sessions whose last message is older than this duration (e.g. `90d`, `24h`). Sessions with unknown message times are kept",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "list",
+          "description": "List durable session and legacy source exclusions without changing them",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "reinclude",
+          "description": "Preview releasing matching exclusions; add --apply, then index",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "source-path",
+          "description": "Exact stored source path for --list/--reinclude (no glob expansion)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "source-id",
+          "description": "Exact source/provenance ID for --list/--reinclude (e.g. local)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "agent",
+          "description": "Exact provider slug for --list/--reinclude (e.g. opencode)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "external-id",
+          "description": "Exact provider session ID for --list/--reinclude",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
         },
         {
           "name": "db",
@@ -3282,7 +3369,7 @@
         },
         {
           "name": "apply",
-          "description": "Actually delete the matching conversations. Without this, runs as a dry-run (inspect only)",
+          "description": "Apply the selected forget or re-inclusion. Otherwise preview only",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -4475,6 +4562,14 @@
       "description": "Override the SQLite database path."
     },
     {
+      "name": "CASS_EXCLUDE_PATHS",
+      "description": "Comma/newline-separated source files or directory prefixes to exclude from future ingestion and raw capture. Holds scan/watch watermarks; existing archived history remains searchable. Use cass forget to remove indexed copies."
+    },
+    {
+      "name": "CASS_EXCLUDE_WORKSPACES",
+      "description": "Comma/newline-separated workspace globs to exclude from future ingestion. Scan watermarks advance; changing the policy revisits sources. Existing history and shared raw-store captures remain; use cass forget --workspace-glob and cass mirror prune for explicit cleanup."
+    },
+    {
       "name": "CASS_OUTPUT_FORMAT",
       "description": "Default structured output format: json, jsonl, compact, sessions, or toon."
     },
@@ -4608,7 +4703,12 @@
     {
       "name": "CASS_AUTO_REFRESH",
       "default": "1",
-      "description": "Stale-on-read catch-up: search/pack/TUI may spawn a detached low-priority `cass index --background` when the index is stale, partial, or behind. Set 0 to disable globally; `search --no-maintenance` always disables it for that request."
+      "description": "Read-triggered catch-up: search/pack/TUI may spawn a detached low-priority `cass index --background` when the index is stale, partial, behind, or its source scan is overdue. Set 0 to disable globally; `search --no-maintenance` always disables it for that request."
+    },
+    {
+      "name": "CASS_AUTO_REFRESH_SOURCE_SCAN_SECS",
+      "default": "300",
+      "description": "Source-scan age in seconds before an eligible read requests incremental catch-up, including for a healthy lexical index. Set 0 to disable only this cadence; stale/partial/pending catch-up and the daemon timer remain enabled. The spawn cooldown, archive lock and failed-run breaker still apply. This is an on-demand check, not a timer or an indexing-completion deadline."
     },
     {
       "name": "CASS_AUTO_REFRESH_COOLDOWN_SECS",
@@ -4666,7 +4766,53 @@
     },
     {
       "name": "CASS_SEMANTIC_EMBEDDER",
-      "description": "Select the semantic embedder/model implementation when configured."
+      "description": "Select hash, minilm, multilingual-minilm, or external; external also requires CASS_EXTERNAL_EMBEDDINGS=1."
+    },
+    {
+      "name": "CASS_EXTERNAL_EMBEDDINGS",
+      "default": "0",
+      "description": "Explicit consent to send text outside the process when external is selected. Accepts 0/false or 1/true; endpoint configuration alone sends nothing."
+    },
+    {
+      "name": "CASS_EXTERNAL_EMBEDDING_URL",
+      "description": "Required external endpoint ending in /v1/embeddings. HTTPS, or HTTP on loopback only; credentials, query and fragment are refused. Configured values are not emitted by discovery."
+    },
+    {
+      "name": "CASS_EXTERNAL_EMBEDDING_MODEL",
+      "description": "Required provider model, at most 512 bytes without control characters. Every response must identify this model; configured values are not emitted by discovery."
+    },
+    {
+      "name": "CASS_EXTERNAL_EMBEDDING_DIMENSION",
+      "description": "Required provider output dimension, 1..16384. Vectors must be finite, unit-normalized and match this dimension."
+    },
+    {
+      "name": "CASS_EXTERNAL_EMBEDDING_REVISION",
+      "default": "1",
+      "description": "Operator model revision, nonempty and at most 512 bytes without control characters. Endpoint, model, dimension and revision identify a separate vector space."
+    },
+    {
+      "name": "CASS_EXTERNAL_EMBEDDING_API_KEY",
+      "description": "Optional bearer credential. Never emitted by discovery or provider diagnostics; rotating it does not change the embedding-space identity."
+    },
+    {
+      "name": "CASS_EXTERNAL_EMBEDDING_BATCH_SIZE",
+      "default": "64",
+      "description": "Maximum inputs per external request, 1..128; the encoded request byte cap also applies."
+    },
+    {
+      "name": "CASS_EXTERNAL_EMBEDDING_MAX_REQUEST_BYTES",
+      "default": "262144",
+      "description": "Maximum encoded JSON request bytes, 1024..4194304. Oversized inputs are refused before text from that call is sent."
+    },
+    {
+      "name": "CASS_EXTERNAL_EMBEDDING_TIMEOUT_MS",
+      "default": "30000",
+      "description": "Per-request deadline in milliseconds, 1..120000. In-flight cancellation remains bounded by this deadline."
+    },
+    {
+      "name": "CASS_EXTERNAL_EMBEDDING_MAX_RETRIES",
+      "default": "0",
+      "description": "Explicit retries for transient external request failures, 0..5. Redirects are refused; implicit protocol retries are disabled."
     },
     {
       "name": "CASS_SEMANTIC_BATCH_SIZE",

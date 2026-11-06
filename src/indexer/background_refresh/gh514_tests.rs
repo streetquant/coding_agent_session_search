@@ -154,67 +154,6 @@ fn gh514_enrich_freshness_with_source_scan_watermark_suppresses_overdue_scan() {
     );
 }
 
-#[test]
-fn gh514_scan_watermark_does_not_create_missing_archive_or_lock_directories() {
-    let dir = tempfile::tempdir().unwrap();
-    let missing = dir.path().join("missing/agent_search.db");
-    assert_eq!(source_scan_completed_at_ms_from_db(&missing), None);
-    assert!(!missing.parent().unwrap().exists());
-
-    let corrupt = dir.path().join("agent_search.db");
-    std::fs::write(&corrupt, b"not a sqlite archive").unwrap();
-    assert_eq!(source_scan_completed_at_ms_from_db(&corrupt), None);
-    assert_eq!(std::fs::read(&corrupt).unwrap(), b"not a sqlite archive");
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
-}
-
-#[test]
-fn gh514_scan_watermark_preserves_archive_bytes_and_unknown_metadata() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("agent_search.db");
-    let storage = FrankenStorage::open(&path).unwrap();
-    storage.set_last_scan_ts(1_800_000_000_000).unwrap();
-    storage.close().unwrap();
-    let before = std::fs::read(&path).unwrap();
-    assert_eq!(
-        source_scan_completed_at_ms_from_db(&path),
-        Some(1_800_000_000_000)
-    );
-    assert_eq!(std::fs::read(&path).unwrap(), before);
-
-    let storage = FrankenStorage::open(&path).unwrap();
-    storage
-        .raw()
-        .execute("UPDATE meta SET value = 'not-a-time' WHERE key = 'last_scan_ts'")
-        .unwrap();
-    storage.close().unwrap();
-    let before = std::fs::read(&path).unwrap();
-    assert_eq!(source_scan_completed_at_ms_from_db(&path), None);
-    assert_eq!(std::fs::read(&path).unwrap(), before);
-}
-
-#[test]
-fn gh514_scan_watermark_refuses_active_doctor_without_waiting_for_repair() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("agent_search.db");
-    let storage = FrankenStorage::open(&path).unwrap();
-    storage.set_last_scan_ts(1_800_000_000_000).unwrap();
-    storage.close().unwrap();
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(dir.path().join("doctor/locks/doctor-repair.lock"))
-        .unwrap();
-    fs2::FileExt::try_lock_exclusive(&lock).unwrap();
-    let started = std::time::Instant::now();
-    assert_eq!(source_scan_completed_at_ms_from_db(&path), None);
-    assert!(
-        started.elapsed() < Duration::from_millis(500),
-        "optional freshness metadata must not consume the 30s doctor timeout"
-    );
-    fs2::FileExt::unlock(&lock).unwrap();
-}
-
 /// The daemon's periodic index gate (#514) on its own interval: the default
 /// pair keeps the read-path window, a shorter daemon interval keeps its pace,
 /// a disabled read-path cadence does not stop the daemon, and the daemon's

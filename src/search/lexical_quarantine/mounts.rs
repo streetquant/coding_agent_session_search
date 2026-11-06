@@ -104,7 +104,12 @@ fn parse_mountpoint(line: &[u8]) -> io::Result<std::path::PathBuf> {
     {
         return Err(bad());
     }
-    if !root_field_is_well_formed(fields.next().ok_or_else(bad)?) {
+    // The root is a path within the filesystem, except for kernel-object
+    // mounts: nsfs reports e.g. `net:[4026531833]` (Docker and `ip netns`
+    // namespace mounts), and rejecting that line refused retention on every
+    // such host. Accept exactly that shape; other non-path roots stay malformed.
+    let root = fields.next().ok_or_else(bad)?;
+    if !root.starts_with(b"/") && !is_kernel_object_root(root) {
         return Err(bad());
     }
     let encoded = fields.next().ok_or_else(bad)?;
@@ -148,45 +153,22 @@ fn parse_mountpoint(line: &[u8]) -> io::Result<std::path::PathBuf> {
     Ok(path)
 }
 
-/// The kernel publishes a path root for ordinary filesystems and a
-/// `<name>:[<inode>]` token for a pseudo filesystem that has no path root,
-/// for example a network-namespace bind mount (`net:[4026531833]`). Both
-/// forms are valid kernel output, and a container host publishes the second
-/// one, so rejecting it would refuse the whole table.
-///
-/// The root field is not part of the boundary decision: only the mount point
-/// is compared against the bundle, and it stays strictly parsed. This check
-/// therefore keeps the malformed-table refusal for every other shape
-/// without weakening the mount-point comparison.
+/// `<name>:[<digits>]`, the root a kernel-object mount (nsfs) reports in
+/// mountinfo, e.g. `net:[4026531833]`.
 #[cfg(target_os = "linux")]
-fn root_field_is_well_formed(root: &[u8]) -> bool {
-    if root.starts_with(b"/") {
-        return true;
-    }
-    let Some(open) = root.iter().position(|&byte| byte == b'[') else {
+fn is_kernel_object_root(root: &[u8]) -> bool {
+    let Some(colon) = root.iter().position(|&byte| byte == b':') else {
         return false;
     };
-    let Some(close) = root.iter().rposition(|&byte| byte == b']') else {
-        return false;
-    };
-    if close != root.len() - 1 || close <= open + 1 {
-        return false;
-    }
-    // The kernel writes the filesystem name, a colon and the inode.
-    let Some(colon) = root.iter().take(open).rposition(|&byte| byte == b':') else {
-        return false;
-    };
-    if colon == 0 || colon + 1 != open {
-        return false;
-    }
-    root.iter()
-        .take(colon)
-        .all(|&byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-        && root
+    let (name, rest) = root.split_at(colon);
+    !name.is_empty()
+        && name
             .iter()
-            .skip(open + 1)
-            .take(close - open - 1)
-            .all(|&byte| byte.is_ascii_digit())
+            .all(|&byte| byte.is_ascii_lowercase() || byte == b'_')
+        && rest.len() >= 4
+        && rest.starts_with(b":[")
+        && rest.ends_with(b"]")
+        && rest[2..rest.len() - 1].iter().all(u8::is_ascii_digit)
 }
 
 #[cfg(all(test, target_os = "linux"))]

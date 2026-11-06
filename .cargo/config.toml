@@ -21,17 +21,9 @@ rustflags = ["-Z", "threads=4"]
 # applies only to processes cargo launches from this repo, so the shipped
 # binary is unaffected.
 RUST_MIN_STACK = "134217728"
-
-# Linux GNU CASS uses jemalloc. Return unused giant-ingest pages promptly:
-# the real 4 GiB skew fixture exceeded its RSS bound with allocator defaults,
-# while this policy passed twice with canonical integrity and search intact.
-# Embed the policy in the allocator so installed binaries need no environment
-# override; explicit jemalloc runtime configuration can still override it.
-JEMALLOC_SYS_WITH_MALLOC_CONF = "background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000"
-
-# Coverage exclusion patterns for cargo-llvm-cov
-# These paths are excluded from coverage reports
-CARGO_LLVM_COV_EXCLUDE = "tests/*,**/test*.rs,benches/*"
+# dsr's strict release builds refuse any other CARGO_*, RUST* or compiler
+# variable in [env] (RUST_TEST_THREADS and CARGO_INCREMENTAL = "0" excepted).
+# Coverage exclusions are the --ignore-filename-regex flags in the cov aliases.
 
 [target.x86_64-unknown-linux-gnu]
 # Linux x86_64: Use LLD for faster linking (available in CI)

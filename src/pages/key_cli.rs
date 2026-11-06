@@ -261,7 +261,8 @@ fn key_failure(verb: &'static str, archive: &Path, err: &anyhow::Error) -> CliEr
     let hint = if message.contains("last remaining key slot") {
         Some("Add another slot with `key add-password` or `key add-recovery` first".to_string())
     } else if message.contains("used for authentication") {
-        // Authentication succeeded; use another slot to revoke this one.
+        // The password did unlock: it opened the slot being revoked. Checked
+        // before the generic password case, whose hint says the opposite.
         Some("Authenticate with the password of a different slot to revoke this one".to_string())
     } else if message.to_ascii_lowercase().contains("password") {
         Some("The current password did not unlock any slot; check it and retry".to_string())
@@ -570,7 +571,8 @@ mod tests {
         );
         assert_eq!(list(&bundle).slots[2].slot_type, "recovery");
 
-        // A slot cannot revoke itself, even with its correct password.
+        // Planted negative: a slot cannot revoke itself, and the hint must not
+        // claim that its password failed to unlock (it unlocked that slot).
         let err = execute_pages_key_command(
             &PagesKeyCommand::Revoke {
                 common: common(&bundle),

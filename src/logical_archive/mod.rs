@@ -1,6 +1,6 @@
 //! Explicit logical-archive commands. Kept outside the ordinary search startup
 //! path. Only explicit import flags opt into canonical-only lexical rebuilding
-//! or the reviewed v20/v21 -> v22 schema migration; export and verification never do so.
+//! or the reviewed v20/v21/v22/v23 -> v24 schema migrations; export and verification never do so.
 
 mod codec;
 #[cfg(test)]
@@ -16,7 +16,7 @@ mod reimport;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use coding_agent_search::franken_sync::FrankenError;
 use coding_agent_search::indexer::IndexRunBusy;
@@ -153,9 +153,10 @@ enum Operation {
         /// reviewed migration-projection match. This never grants overwrite permission.
         #[arg(long)]
         if_identical: bool,
-        /// Permit only the reviewed storage-schema v20, v21 or v22 -> v23 migration.
-        /// Preserve canonical descriptors and rows, including v22 tombstones.
-        /// Initialize a new semantic source identity without search certificates.
+        /// Permit only reviewed storage-schema v20, v21, v22 or v23 -> v24 migrations.
+        /// Canonical table/column/primary-key descriptors must match the current
+        /// ones, apart from tables added after the archived schema, which start
+        /// empty. Existing source and session tombstones are preserved.
         #[arg(long)]
         allow_compatible_schema: bool,
         /// Rebuild lexical search from the restored DB, without scanning providers.
@@ -548,27 +549,15 @@ pub fn run(args: Vec<String>) -> Result<()> {
         "derived_search_assets": "omitted_rebuild_required",
         "integrity_verified": true
     });
-    let object = receipt
-        .as_object_mut()
-        .context("archive receipt is not a JSON object")?;
     if let Some(status) = destination_status {
-        object.insert(
-            "destination_status".to_owned(),
-            serde_json::Value::String(status.to_owned()),
-        );
+        receipt["destination_status"] = serde_json::Value::String(status.to_owned());
     }
     if let Some(migration) = schema_migration {
-        object.insert(
-            "schema_migration".to_owned(),
-            serde_json::to_value(migration)?,
-        );
+        receipt["schema_migration"] = serde_json::to_value(migration)?;
     }
     if let Some(rebuild) = lexical_rebuild {
-        object.insert(
-            "derived_search_assets".to_owned(),
-            serde_json::json!("lexical_rebuilt_semantic_not_built"),
-        );
-        object.insert("lexical_rebuild".to_owned(), serde_json::to_value(rebuild)?);
+        receipt["derived_search_assets"] = serde_json::json!("lexical_rebuilt_semantic_not_built");
+        receipt["lexical_rebuild"] = serde_json::to_value(rebuild)?;
     }
     println!("{receipt}");
     Ok(())

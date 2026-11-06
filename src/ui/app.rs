@@ -111,6 +111,7 @@ use ftui::runtime::{StopSignal, SubId, Subscription};
 use crate::model::types::MessageRole;
 use crate::search::model_manager::SemanticAvailability;
 use crate::search::query::{MatchType, QuerySuggestion, SearchFilters, SearchHit, SearchMode};
+use crate::search::vector_index::SemanticCoverageSnapshot;
 use crate::sources::config::SourcesConfig;
 use crate::sources::provenance::SourceFilter;
 use crate::storage::sqlite::FrankenStorage;
@@ -5294,6 +5295,10 @@ pub struct CassApp {
     pub suggestions: Vec<QuerySuggestion>,
     /// Elapsed time of the last search (for latency badge).
     pub last_search_ms: Option<u128>,
+    /// Coverage receipt from the most recently applied search request.
+    pub semantic_coverage: Option<SemanticCoverageSnapshot>,
+    /// The displayed window includes partial or mixed-generation semantic pages.
+    semantic_coverage_partial: bool,
     /// Error from the most recent failed search for the current settled query.
     pub search_error_message: Option<String>,
     /// Monotonic generation id for the current query so stale async results can be ignored.
@@ -5680,6 +5685,8 @@ impl Default for CassApp {
             wildcard_fallback: false,
             suggestions: Vec::new(),
             last_search_ms: None,
+            semantic_coverage: None,
+            semantic_coverage_partial: false,
             search_error_message: None,
             search_generation: 0,
             search_page_size: 250,
@@ -7361,6 +7368,7 @@ impl CassApp {
                     elapsed_ms: result.elapsed_ms,
                     suggestions: result.suggestions,
                     wildcard_fallback: result.wildcard_fallback,
+                    semantic_coverage: result.semantic_coverage,
                     append: matches!(pass, SearchPass::Pagination),
                 },
                 Err(e) => CassMsg::SearchFailed {
@@ -11138,10 +11146,10 @@ impl CassApp {
 
         let downloads = get_downloads_dir();
         let fallback_title = if let Some(title) = hit_title_display(hit) {
-            smart_truncate(title, 60)
+            smart_truncate(&crate::indexer::redact_secrets::redact_text(title), 60)
         } else {
             search_hit_snippet_fallback_text_opt(hit)
-                .map(|text| smart_truncate(text, 60))
+                .map(|text| smart_truncate(&crate::indexer::redact_secrets::redact_text(text), 60))
                 .unwrap_or_else(|| "Untitled Session".to_string())
         };
         let created_date = hit
@@ -11154,8 +11162,11 @@ impl CassApp {
             .map(|dt| dt.format("%b %d, %Y at %I:%M %p").to_string())
             .unwrap_or_else(|| "Unknown date".to_string());
 
-        let agent_name = hit.agent.trim().to_string();
-        let workspace = hit.workspace.trim().to_string();
+        let mut agent_name = hit.agent.trim().to_string();
+        let mut workspace = hit.workspace.trim().to_string();
+        let mut privacy = crate::export::ExportPrivacy::new(false);
+        privacy.redact_text(&mut agent_name);
+        privacy.redact_text(&mut workspace);
 
         let metadata = FilenameMetadata {
             agent: (!agent_name.is_empty()).then(|| agent_name.clone()),
@@ -14232,6 +14243,7 @@ pub enum CassMsg {
         elapsed_ms: u128,
         suggestions: Vec<QuerySuggestion>,
         wildcard_fallback: bool,
+        semantic_coverage: Option<SemanticCoverageSnapshot>,
         /// When true, append hits to the existing result set instead of replacing it.
         append: bool,
     },
@@ -15451,6 +15463,7 @@ pub struct SearchResult {
     pub elapsed_ms: u128,
     pub suggestions: Vec<QuerySuggestion>,
     pub wildcard_fallback: bool,
+    pub semantic_coverage: Option<SemanticCoverageSnapshot>,
 }
 
 /// Background indexing with progress reporting.
@@ -15569,6 +15582,7 @@ impl TantivySearchService {
                     elapsed_ms: result.elapsed_ms,
                     suggestions: result.suggestions,
                     wildcard_fallback: result.wildcard_fallback,
+                    semantic_coverage: result.semantic_coverage,
                     append: matches!(params.pass, SearchPass::Pagination),
                 },
                 Err(error) => CassMsg::SearchFailed { generation, error },
@@ -15588,6 +15602,7 @@ impl TantivySearchService {
                     elapsed_ms: result.elapsed_ms,
                     suggestions: result.suggestions,
                     wildcard_fallback: result.wildcard_fallback,
+                    semantic_coverage: result.semantic_coverage,
                     append: matches!(params.pass, SearchPass::Pagination),
                 },
                 Err(error) => CassMsg::SearchFailed { generation, error },
@@ -15650,6 +15665,7 @@ impl TantivySearchService {
                                 elapsed_ms,
                                 suggestions: result.suggestions,
                                 wildcard_fallback: result.wildcard_fallback,
+                                semantic_coverage: None,
                                 append: false,
                             },
                             crate::search::query::ProgressiveSearchEvent::RefinementFailed {
@@ -15728,13 +15744,17 @@ impl SearchService for TantivySearchService {
                 elapsed_ms: started.elapsed().as_millis(),
                 suggestions: Vec::new(),
                 wildcard_fallback: false,
+                semantic_coverage: None,
             });
         }
 
         let sparse_threshold = if interactive { 0 } else { 3 };
         let requested_mode = params.mode;
 
-        let execute_mode = |mode: SearchMode| -> Result<BackendSearchResult, String> {
+        let execute_mode = |mode: SearchMode| -> Result<
+            (BackendSearchResult, Option<SemanticCoverageSnapshot>),
+            String,
+        > {
             match mode {
                 SearchMode::Lexical => self
                     .client
@@ -15746,11 +15766,12 @@ impl SearchService for TantivySearchService {
                         sparse_threshold,
                         field_mask,
                     )
+                    .map(|result| (result, None))
                     .map_err(|e| e.to_string()),
                 SearchMode::Semantic => {
-                    let (hits, ann_stats) = self
+                    let (hits, ann_stats, coverage) = self
                         .client
-                        .search_semantic_with_tier(
+                        .search_semantic_with_tier_and_coverage(
                             &params.query,
                             params.filters.clone(),
                             limit,
@@ -15760,19 +15781,22 @@ impl SearchService for TantivySearchService {
                             semantic_tier_mode,
                         )
                         .map_err(|e| e.to_string())?;
-                    Ok(crate::search::query::SearchResult {
-                        hits,
-                        wildcard_fallback: false,
-                        cache_stats: crate::search::query::CacheStats::default(),
-                        suggestions: Vec::new(),
-                        ann_stats,
-                        ann_unavailable_reason: None,
-                        total_count: None,
-                    })
+                    Ok((
+                        crate::search::query::SearchResult {
+                            hits,
+                            wildcard_fallback: false,
+                            cache_stats: crate::search::query::CacheStats::default(),
+                            suggestions: Vec::new(),
+                            ann_stats,
+                            ann_unavailable_reason: None,
+                            total_count: None,
+                        },
+                        coverage,
+                    ))
                 }
                 SearchMode::Hybrid => self
                     .client
-                    .search_hybrid_with_tier(
+                    .search_hybrid_with_tier_and_coverage(
                         &params.query,
                         &params.query,
                         params.filters.clone(),
@@ -15789,7 +15813,7 @@ impl SearchService for TantivySearchService {
 
         // Semantic/hybrid modes can be unavailable if embedders are not installed.
         // Fall back to lexical so typing always returns results instead of no-op.
-        let backend = match execute_mode(requested_mode) {
+        let (backend, semantic_coverage) = match execute_mode(requested_mode) {
             Ok(result) => result,
             Err(err) if matches!(requested_mode, SearchMode::Semantic | SearchMode::Hybrid) => {
                 execute_mode(SearchMode::Lexical).map_err(|fallback_err| {
@@ -15804,6 +15828,7 @@ impl SearchService for TantivySearchService {
             elapsed_ms: started.elapsed().as_millis(),
             suggestions: backend.suggestions,
             wildcard_fallback: backend.wildcard_fallback,
+            semantic_coverage,
         })
     }
 }
@@ -17016,6 +17041,7 @@ impl super::ftui_adapter::Model for CassApp {
                 elapsed_ms,
                 suggestions,
                 wildcard_fallback,
+                semantic_coverage,
                 append,
             } => {
                 if generation != self.search_generation {
@@ -17029,6 +17055,23 @@ impl super::ftui_adapter::Model for CassApp {
                 self.clear_loading_context(LoadingContext::Search);
                 self.last_search_ms = Some(elapsed_ms);
                 self.search_error_message = None;
+                let partial = semantic_coverage.as_ref().is_some_and(|coverage| {
+                    coverage.status == "partial" || coverage.candidate_window_limited
+                });
+                let mixed_generations = append
+                    && !self.results.is_empty()
+                    && self
+                        .semantic_coverage
+                        .as_ref()
+                        .map(|coverage| &coverage.generation)
+                        != semantic_coverage
+                            .as_ref()
+                            .map(|coverage| &coverage.generation);
+                // Keep the latest receipt unchanged. A separate display flag
+                // remembers earlier partial pages until the window is replaced.
+                self.semantic_coverage_partial =
+                    partial || (append && (self.semantic_coverage_partial || mixed_generations));
+                self.semantic_coverage = semantic_coverage;
                 let page_size = requested_limit.max(1);
                 if append {
                     let backend_returned = hits.len();
@@ -21746,6 +21789,15 @@ impl super::ftui_adapter::Model for CassApp {
                     | ftui::render::budget::DegradationLevel::SkipFrame => status_error_s,
                 };
                 let mut hud_lanes = Vec::with_capacity(8);
+                if self.semantic_coverage_partial {
+                    // Keep coverage ahead of transient status text so narrow
+                    // terminals cannot silently hide an incomplete window.
+                    hud_lanes.push(FooterHudLane {
+                        key: "semantic",
+                        value: "coverage partial".to_string(),
+                        value_style: status_warning_s,
+                    });
+                }
                 if !self.status.is_empty() {
                     // Animate the status text only for active-operation messages
                     // (avoid a spinner on informational or error statuses).
@@ -22769,38 +22821,41 @@ fn export_session_task(
         None
     };
 
-    let messages: Vec<HtmlMessage> = if let Some(view) = indexed_view {
+    let mut messages: Vec<HtmlMessage> = if let Some(view) = indexed_view {
         html_messages_from_view(view)
     } else if allow_direct_file && session_path.exists() {
         match load_local_export_raw_messages(session_path) {
-            Ok((raw_messages, _, _)) => raw_messages
-                .into_iter()
-                .enumerate()
-                .filter_map(|(idx, msg)| {
-                    let role = crate::extract_role(&msg);
-                    let content = crate::extract_text_content(&msg);
-                    if content.is_empty() && !include_tools {
-                        return None;
-                    }
+            Ok((mut raw_messages, _, _)) => {
+                crate::export::ExportPrivacy::new(false).redact_messages(&mut raw_messages);
+                raw_messages
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(idx, msg)| {
+                        let role = crate::extract_role(&msg);
+                        let content = crate::extract_text_content(&msg);
+                        if content.is_empty() && !include_tools {
+                            return None;
+                        }
 
-                    let timestamp = crate::extract_message_timestamp(&msg).and_then(|ts| {
-                        DateTime::from_timestamp_millis(ts).map(|dt| dt.to_rfc3339())
-                    });
-                    let author = msg
-                        .get("author")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_string);
+                        let timestamp = crate::extract_message_timestamp(&msg).and_then(|ts| {
+                            DateTime::from_timestamp_millis(ts).map(|dt| dt.to_rfc3339())
+                        });
+                        let author = msg
+                            .get("author")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string);
 
-                    Some(HtmlMessage {
-                        role,
-                        content,
-                        timestamp,
-                        tool_call: None,
-                        index: Some(idx),
-                        author,
+                        Some(HtmlMessage {
+                            role,
+                            content,
+                            timestamp,
+                            tool_call: None,
+                            index: Some(idx),
+                            author,
+                        })
                     })
-                })
-                .collect(),
+                    .collect()
+            }
             Err(local_err) => match load_indexed_export_view(db_path, hit) {
                 Ok(Some(view)) => html_messages_from_view(view),
                 Ok(None) => return CassMsg::ExportFailed(local_err),
@@ -22818,6 +22873,18 @@ fn export_session_task(
     if messages.is_empty() {
         return CassMsg::ExportFailed("No messages found in session".to_string());
     }
+
+    let mut privacy = crate::export::ExportPrivacy::new(false);
+    for message in &mut messages {
+        privacy.redact_text(&mut message.content);
+        privacy.redact_optional_text(&mut message.author);
+    }
+    let mut title = Some(title.to_string());
+    privacy.redact_optional_text(&mut title);
+    let title = title.as_deref().unwrap_or("Conversation Export");
+    let mut agent_name = Some(agent_name.to_string());
+    privacy.redact_optional_text(&mut agent_name);
+    let agent_name = agent_name.as_deref().unwrap_or("AI Assistant");
 
     let options = HtmlExportOptions {
         title: Some(title.to_string()),
@@ -22883,7 +22950,7 @@ fn export_session_markdown_task(
         )
     };
 
-    let (messages, mut session_title, session_start) = if prefer_direct_file {
+    let (mut messages, mut session_title, session_start) = if prefer_direct_file {
         match load_local_export_raw_messages(session_path) {
             Ok(loaded) => loaded,
             Err(local_err) => match load_indexed_export_view(db_path, hit) {
@@ -22943,6 +23010,10 @@ fn export_session_markdown_task(
     if session_title.is_none() && !hit.title.trim().is_empty() {
         session_title = Some(hit.title.trim().to_string());
     }
+
+    let mut privacy = crate::export::ExportPrivacy::new(false);
+    privacy.redact_messages(&mut messages);
+    privacy.redact_optional_text(&mut session_title);
 
     if session_title.is_none() {
         for message in &messages {
@@ -25327,6 +25398,7 @@ mod tests {
             elapsed_ms: 42,
             suggestions: Vec::new(),
             wildcard_fallback: false,
+            semantic_coverage: None,
         };
     }
 
@@ -27006,6 +27078,7 @@ mod tests {
             elapsed_ms: 42,
             suggestions: vec![],
             wildcard_fallback: false,
+            semantic_coverage: None,
             append: false,
         });
         assert_eq!(app.panes.len(), 2, "should have 2 agent panes");
@@ -27976,6 +28049,7 @@ mod tests {
                     elapsed_ms: 5,
                     suggestions: vec![],
                     wildcard_fallback: false,
+                    semantic_coverage: None,
                 })
             }
         }
@@ -28019,6 +28093,7 @@ mod tests {
                     elapsed_ms: 5,
                     suggestions: vec![],
                     wildcard_fallback: false,
+                    semantic_coverage: None,
                 })
             }
         }
@@ -28081,6 +28156,7 @@ mod tests {
             elapsed_ms: 1,
             suggestions: vec![],
             wildcard_fallback: false,
+            semantic_coverage: None,
             append: false,
         });
         assert!(app.loading_context.is_none());
@@ -28091,6 +28167,128 @@ mod tests {
             error: "boom".into(),
         });
         assert!(app.loading_context.is_none());
+    }
+
+    fn certified_coverage_for_ui(generation: &str, partial: bool) -> SemanticCoverageSnapshot {
+        SemanticCoverageSnapshot {
+            status: if partial { "partial" } else { "complete" },
+            generation: generation.to_string(),
+            published_at_ms: 1,
+            published_mutation_seq: 1,
+            current_mutation_seq: if partial { 2 } else { 1 },
+            published_max_message_id: 1,
+            current_max_message_id: if partial { 2 } else { 1 },
+            indexed_passages: 1,
+            excluded_candidates: 0,
+            candidate_window_limited: false,
+            stale_reason: partial.then_some("archive_changed_since_publication"),
+        }
+    }
+
+    fn search_completion_with_coverage(
+        generation: u64,
+        coverage: Option<SemanticCoverageSnapshot>,
+        append: bool,
+    ) -> CassMsg {
+        CassMsg::SearchCompleted {
+            generation,
+            pass: if append {
+                SearchPass::Pagination
+            } else {
+                SearchPass::Upgrade
+            },
+            requested_limit: 2,
+            hits: vec![make_test_hit()],
+            elapsed_ms: 5,
+            suggestions: Vec::new(),
+            wildcard_fallback: false,
+            semantic_coverage: coverage,
+            append,
+        }
+    }
+
+    #[test]
+    fn semantic_coverage_completion_ignores_stale_receipts_and_keeps_partial_window_visible() {
+        let mut app = CassApp::default();
+        app.search_generation = 9;
+        let partial = certified_coverage_for_ui("retained", true);
+        let _ = app.update(search_completion_with_coverage(
+            8,
+            Some(partial.clone()),
+            false,
+        ));
+        assert!(app.semantic_coverage.is_none());
+        assert!(!app.semantic_coverage_partial);
+
+        let _ = app.update(search_completion_with_coverage(
+            9,
+            Some(partial.clone()),
+            false,
+        ));
+        assert_eq!(app.semantic_coverage.as_ref(), Some(&partial));
+        assert!(app.semantic_coverage_partial);
+        // Transient status messages and narrow layouts cannot hide coverage.
+        app.status = "Workspace filter changed; this status is deliberately long".into();
+        let text = ftui_harness::buffer_to_text(&render_at_degradation(
+            &app,
+            64,
+            24,
+            ftui::render::budget::DegradationLevel::Full,
+        ));
+        assert!(text.contains("semantic coverage partial"), "{text}");
+
+        let complete = certified_coverage_for_ui("replacement", false);
+        let _ = app.update(search_completion_with_coverage(
+            9,
+            Some(complete.clone()),
+            true,
+        ));
+        assert_eq!(app.semantic_coverage.as_ref(), Some(&complete));
+        assert!(
+            app.semantic_coverage_partial,
+            "an appended page cannot certify older pages"
+        );
+
+        let _ = app.update(search_completion_with_coverage(9, Some(complete), false));
+        assert!(!app.semantic_coverage_partial);
+        let text = ftui_harness::buffer_to_text(&render_at_degradation(
+            &app,
+            64,
+            24,
+            ftui::render::budget::DegradationLevel::Full,
+        ));
+        assert!(!text.contains("semantic coverage partial"), "{text}");
+    }
+
+    #[test]
+    fn semantic_coverage_mixed_generations_and_bounded_pages_warn_until_replacement() {
+        let mut app = CassApp::default();
+        let _ = app.update(search_completion_with_coverage(
+            0,
+            Some(certified_coverage_for_ui("first", false)),
+            false,
+        ));
+        assert!(!app.semantic_coverage_partial);
+        let _ = app.update(search_completion_with_coverage(
+            0,
+            Some(certified_coverage_for_ui("second", false)),
+            true,
+        ));
+        assert!(
+            app.semantic_coverage_partial,
+            "a mixed generation window has partial coverage"
+        );
+
+        let mut bounded = certified_coverage_for_ui("second", false);
+        bounded.candidate_window_limited = true;
+        let _ = app.update(search_completion_with_coverage(0, Some(bounded), false));
+        assert!(app.semantic_coverage_partial);
+        let _ = app.update(search_completion_with_coverage(0, None, false));
+        assert!(app.semantic_coverage.is_none());
+        assert!(
+            !app.semantic_coverage_partial,
+            "lexical replacement clears the semantic warning"
+        );
     }
 
     #[test]
@@ -28125,6 +28323,7 @@ mod tests {
             elapsed_ms: 3,
             suggestions: vec![],
             wildcard_fallback: false,
+            semantic_coverage: None,
             append: false,
         });
 
@@ -28184,6 +28383,7 @@ mod tests {
             elapsed_ms: 3,
             suggestions: vec![],
             wildcard_fallback: false,
+            semantic_coverage: None,
             append: false,
         });
 
@@ -28376,6 +28576,7 @@ mod tests {
             elapsed_ms: 10,
             suggestions: vec![],
             wildcard_fallback: false,
+            semantic_coverage: None,
             append: false,
         });
         let state = app.results_list_state.borrow();
@@ -30898,6 +31099,50 @@ mod tests {
     }
 
     #[test]
+    fn export_redaction_tui_html_and_markdown_keep_raw_source_credentials_private() {
+        let temp = tempfile::TempDir::new().expect("isolated TUI export");
+        let session = temp.path().join("privacy.jsonl");
+        let secret = "synthetic-tui-export-credential-84"; // ubs:ignore[rust.security.hardcoded-secrets] — Synthetic regression sentinel, never an authentication credential.
+        let title = format!("Title password={secret}");
+        let events = [
+            serde_json::json!({"role":"user","content":"ordinary-kept-marker café 界"}),
+            serde_json::json!({"role":"assistant","content":format!("Discuss password rotation; password={secret}"),"metadata":{"authorization":secret}}),
+        ];
+        let bytes = events
+            .iter()
+            .map(|event| format!("{event}\n"))
+            .collect::<String>();
+        std::fs::write(&session, &bytes).unwrap();
+        let db = temp.path().join("absent.db");
+        let mut hit = make_exact_hit(&session.display().to_string(), "local", 1, "fixture");
+        hit.title.clone_from(&title);
+        let markdown = export_session_markdown_task(&db, &hit, &temp.path().join("safe.md"), true);
+        let html = export_session_task(
+            &db,
+            &hit,
+            &temp.path().join("safe.html"),
+            false,
+            None,
+            false,
+            true,
+            &title,
+            "Codex",
+        );
+        for result in [markdown, html] {
+            let CassMsg::ExportCompleted { output_path, .. } = result else {
+                panic!("export did not complete: {result:?}");
+            };
+            let output = std::fs::read_to_string(output_path).unwrap();
+            assert!(!output.contains(secret));
+            assert!(output.contains("ordinary-kept-marker"));
+            assert!(output.contains("café 界"));
+            assert!(output.contains("password rotation"));
+        }
+        assert_eq!(std::fs::read_to_string(&session).unwrap(), bytes);
+        assert!(!db.exists());
+    }
+
+    #[test]
     fn export_session_markdown_task_prefers_local_jsonl_over_stale_index() {
         use crate::storage::sqlite::FrankenStorage;
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -33214,6 +33459,22 @@ not jsonl",
                 .contains("export preview content fallback"),
             "export title preview should reuse the same fallback excerpt the user already sees"
         );
+    }
+
+    #[test]
+    fn export_redaction_tui_default_filename_uses_safe_title_and_workspace() {
+        let app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.title = "Session password=synthetic-export-title-84".into();
+        hit.workspace = "/tmp/password=synthetic-export-workspace-84".into();
+        let before = hit.clone();
+        let state = app.detail_export_state_for_hit(&hit);
+        assert!(state.title_preview.contains("[REDACTED]"));
+        for value in [state.title_preview, state.workspace, state.filename_preview] {
+            assert!(!value.contains("synthetic-export"));
+        }
+        assert_eq!(hit.title, before.title);
+        assert_eq!(hit.workspace, before.workspace);
     }
 
     #[test]
@@ -42465,6 +42726,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             elapsed_ms: 7,
             suggestions: Vec::new(),
             wildcard_fallback: false,
+            semantic_coverage: None,
             append: false,
         });
         assert!(
@@ -42509,6 +42771,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             elapsed_ms: 1,
             suggestions: Vec::new(),
             wildcard_fallback: false,
+            semantic_coverage: None,
             append: false,
         });
         let paths = |app: &CassApp| {
@@ -42559,6 +42822,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             elapsed_ms: 1,
             suggestions: Vec::new(),
             wildcard_fallback: false,
+            semantic_coverage: None,
             append: false,
         });
         assert_eq!(paths(&app), ["/day-10", "/day-30"]);
@@ -42573,6 +42837,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             elapsed_ms: 1,
             suggestions: Vec::new(),
             wildcard_fallback: false,
+            semantic_coverage: None,
             append: true,
         });
         assert_eq!(paths(&app), ["/day-1", "/day-10", "/day-30", "/day-40"]);
@@ -42601,6 +42866,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             elapsed_ms: 6,
             suggestions: Vec::new(),
             wildcard_fallback: false,
+            semantic_coverage: None,
             append: false,
         });
         assert!(

@@ -9,8 +9,7 @@ use crate::evidence_bundle::{
     EvidenceBundleKind, EvidenceBundleManifest,
 };
 use crate::model::conversation_packet::{
-    ConversationPacket, ConversationPacketBuilder, ConversationPacketMessage,
-    ConversationPacketProvenance,
+    ConversationPacket, ConversationPacketMessage, ConversationPacketProvenance,
 };
 use crate::search::canonicalize::is_hard_message_noise;
 use crate::sources::provenance::LOCAL_SOURCE_ID;
@@ -308,33 +307,27 @@ fn push_cass_document_into_pending(
 /// [`ConversationPacket`]. Packet builders (raw scan + canonical replay)
 /// already normalized identity, provenance, metadata, and timestamps, so
 /// the lexical builder no longer has to re-walk the raw connector
-/// payload (`coding_agent_session_search-ibuuh.32`). Raw connector packets
-/// retain the legacy `metadata.cass.origin` projection. Canonical replay uses
-/// its bound provenance: canonical rows need not carry connector metadata,
-/// and retained metadata may describe an older source identity.
+/// payload (`coding_agent_session_search-ibuuh.32`). We still re-derive
+/// `source_id`/`origin_kind`/`origin_host` from `metadata.cass.origin`
+/// (rather than trusting `packet.payload.provenance` blindly) so the
+/// packet pipeline produces byte-identical CassDocuments to the legacy
+/// `cass_doc_context` path — that's the equivalence gate covered by
+/// `packet_driven_lexical_pipeline_matches_legacy_for_normalized_conv`.
 fn cass_doc_context_from_packet(packet: &ConversationPacket) -> CassDocContext {
     let payload = &packet.payload;
     let metadata = &payload.metadata_json;
     let cass_origin = metadata.get("cass").and_then(|c| c.get("origin"));
-    let (raw_source_id, raw_origin_kind, raw_origin_host) = match packet.diagnostics.builder {
-        ConversationPacketBuilder::CanonicalReplay => (
-            Some(payload.provenance.source_id.as_str()),
-            Some(payload.provenance.origin_kind.as_str()),
-            payload.provenance.origin_host.as_deref(),
-        ),
-        ConversationPacketBuilder::RawConnectorScan => (
-            cass_origin
-                .and_then(|o| o.get("source_id"))
-                .and_then(|v| v.as_str()),
-            cass_origin
-                .and_then(|o| o.get("kind"))
-                .and_then(|v| v.as_str()),
-            cass_origin
-                .and_then(|o| o.get("host"))
-                .and_then(|v| v.as_str()),
-        ),
-    };
-    let origin_host = normalized_index_origin_host(raw_origin_host);
+    let raw_source_id = cass_origin
+        .and_then(|o| o.get("source_id"))
+        .and_then(|v| v.as_str());
+    let raw_origin_kind = cass_origin
+        .and_then(|o| o.get("kind"))
+        .and_then(|v| v.as_str());
+    let origin_host = normalized_index_origin_host(
+        cass_origin
+            .and_then(|o| o.get("host"))
+            .and_then(|v| v.as_str()),
+    );
     let source_id =
         normalized_index_source_id(raw_source_id, raw_origin_kind, origin_host.as_deref());
     let origin_kind = normalized_index_origin_kind(&source_id, raw_origin_kind);
@@ -507,6 +500,10 @@ fn write_root_schema_hash_file(index_path: &Path) -> Result<()> {
         )
     })?;
     Ok(())
+}
+
+fn manifest_relative_shard_path(shard_idx: usize) -> String {
+    format!("shards/shard-{shard_idx:05}")
 }
 
 fn meta_fingerprint_for_existing_index_dir(index_path: &Path) -> Result<String> {
@@ -1342,6 +1339,121 @@ fn ensure_replaceable_federated_materialization_root(index_path: &Path) -> Resul
     }
 }
 
+pub fn publish_federated_searchable_index_directories<P: AsRef<Path>>(
+    output_path: &Path,
+    input_paths: &[P],
+) -> Result<SearchableIndexSummary> {
+    if input_paths.is_empty() {
+        return Err(anyhow::anyhow!(
+            "cannot publish federated lexical bundle without at least one input shard"
+        ));
+    }
+    let mut input_summaries = Vec::with_capacity(input_paths.len());
+    for input_path in input_paths {
+        let input_path = input_path.as_ref();
+        let summary = searchable_index_summary(input_path)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "federated lexical publish input is not a searchable index: {}",
+                input_path.display()
+            )
+        })?;
+        input_summaries.push((input_path.to_path_buf(), summary));
+    }
+    publish_federated_searchable_index_directories_with_summaries(output_path, &input_summaries)
+}
+
+pub fn publish_federated_searchable_index_directories_with_summaries(
+    output_path: &Path,
+    input_shards: &[(PathBuf, SearchableIndexSummary)],
+) -> Result<SearchableIndexSummary> {
+    if input_shards.is_empty() {
+        return Err(anyhow::anyhow!(
+            "cannot publish federated lexical bundle without at least one input shard"
+        ));
+    }
+    ensure_empty_merge_output_directory(output_path)?;
+
+    let shard_root = output_path.join("shards");
+    fs::create_dir_all(&shard_root).with_context(|| {
+        format!(
+            "creating federated lexical shard root {}",
+            shard_root.display()
+        )
+    })?;
+
+    let mut manifest = FederatedSearchManifest {
+        version: FEDERATED_SEARCH_MANIFEST_VERSION,
+        kind: FEDERATED_SEARCH_MANIFEST_KIND.to_string(),
+        schema_hash: CASS_SCHEMA_HASH.to_string(),
+        shards: Vec::with_capacity(input_shards.len()),
+    };
+    let mut total_docs = 0usize;
+    let mut total_segments = 0usize;
+
+    for (shard_idx, (input_path, summary)) in input_shards.iter().enumerate() {
+        if !searchable_index_exists(input_path) {
+            return Err(anyhow::anyhow!(
+                "federated lexical publish input is not a searchable index: {}",
+                input_path.display()
+            ));
+        }
+        let meta_fingerprint = meta_fingerprint_for_existing_index_dir(input_path)?;
+        let relative_path = manifest_relative_shard_path(shard_idx);
+        let destination_path = output_path.join(&relative_path);
+        if let Some(parent) = destination_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "creating parent directory for federated lexical shard {}",
+                    destination_path.display()
+                )
+            })?;
+        }
+        fs::rename(input_path, &destination_path).with_context(|| {
+            format!(
+                "moving staged lexical shard {} into federated publish bundle {}",
+                input_path.display(),
+                destination_path.display()
+            )
+        })?;
+
+        total_docs = total_docs.checked_add(summary.docs).with_context(|| {
+            format!(
+                "federated lexical publish doc count overflows platform usize for {}",
+                output_path.display()
+            )
+        })?;
+        total_segments = total_segments
+            .checked_add(summary.segments)
+            .with_context(|| {
+                format!(
+                    "federated lexical publish segment count overflows platform usize for {}",
+                    output_path.display()
+                )
+            })?;
+        manifest.shards.push(FederatedSearchShardManifest {
+            relative_path,
+            docs: summary.docs,
+            segments: summary.segments,
+            meta_fingerprint,
+        });
+    }
+
+    let manifest_bytes =
+        serde_json::to_vec_pretty(&manifest).context("serializing federated search manifest")?;
+    fs::write(federated_search_manifest_path(output_path), &manifest_bytes).with_context(|| {
+        format!(
+            "writing federated search manifest {}",
+            federated_search_manifest_path(output_path).display()
+        )
+    })?;
+    write_root_schema_hash_file(output_path)?;
+
+    Ok(SearchableIndexSummary {
+        docs: total_docs,
+        segments: total_segments,
+    })
+}
+
 /// Discard an index whose recorded schema hash is not the current one.
 ///
 /// This is the mismatch-triggered rebuild. The Tantivy backend performed it
@@ -1522,6 +1634,15 @@ impl TantivyIndex {
         self.inner.reader()
     }
 
+    /// The durable generation protected by this writer's native admission.
+    /// Cloning its immutable view avoids a second segment admission and keeps
+    /// rebuild recovery's content audit bound to the generation it will extend.
+    pub fn committed_snapshot(
+        &self,
+    ) -> Result<std::sync::Arc<frankensearch::quill::KeeperSnapshot>> {
+        self.inner.committed_snapshot()
+    }
+
     /// Live segments in the validated published snapshot.
     ///
     /// # Errors
@@ -1557,7 +1678,72 @@ impl TantivyIndex {
     /// Force immediate segment merge and wait for completion.
     /// Use sparingly - blocks until merge finishes.
     pub fn force_merge(&mut self) -> Result<()> {
-        self.inner.force_merge()
+        self.inner.force_merge()?;
+        self.inner.note_merged(now_unix_millis());
+        Ok(())
+    }
+
+    pub fn merge_compatible_index_directories<P: AsRef<Path>>(
+        output_path: &Path,
+        input_paths: &[P],
+    ) -> Result<Self> {
+        if input_paths.is_empty() {
+            return Err(anyhow::anyhow!(
+                "cannot merge Tantivy index directories without at least one input"
+            ));
+        }
+        ensure_empty_merge_output_directory(output_path)?;
+
+        let indices = input_paths
+            .iter()
+            .map(|input_path| {
+                let input_path = input_path.as_ref();
+                let mut index = Index::open_in_dir(input_path).with_context(|| {
+                    format!(
+                        "opening compatible Tantivy index directory for merge: {}",
+                        input_path.display()
+                    )
+                })?;
+                ensure_tokenizer(&mut index);
+                Ok(index)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let output_directory = tantivy_crate::directory::MmapDirectory::open(output_path)
+            .with_context(|| {
+                format!(
+                    "opening Tantivy output directory for merged index: {}",
+                    output_path.display()
+                )
+            })?;
+        let mut merged = tantivy_crate::indexer::merge_indices(&indices, output_directory)
+            .with_context(|| {
+                format!(
+                    "merging {} compatible Tantivy index directories into {}",
+                    indices.len(),
+                    output_path.display()
+                )
+            })?;
+        ensure_tokenizer(&mut merged);
+        fs::write(
+            output_path.join("schema_hash.json"),
+            format!("{{\"schema_hash\":\"{CASS_SCHEMA_HASH}\"}}"),
+        )
+        .with_context(|| {
+            format!(
+                "writing cass schema hash metadata for merged Tantivy index {}",
+                output_path.display()
+            )
+        })?;
+        drop(merged);
+        Self::open_or_create(output_path)
+    }
+
+    pub fn assemble_compatible_index_directories<P: AsRef<Path>>(
+        output_path: &Path,
+        input_paths: &[P],
+    ) -> Result<Self> {
+        Self::assemble_compatible_index_directory_files(output_path, input_paths)?;
+        Self::open_or_create(output_path)
     }
 
     fn assemble_compatible_index_directory_files<P: AsRef<Path>>(
@@ -1949,48 +2135,6 @@ impl TantivyIndex {
             .iter()
             .filter_map(|msg| cass_document_for_packet_message(&context, msg))
             .collect()
-    }
-
-    pub fn reconcile_snapshot_packet(
-        &mut self,
-        packet: &ConversationPacket,
-        conversation_id: i64,
-        historical_indices: &[i64],
-    ) -> Result<usize> {
-        let documents = Self::build_packet_documents(packet, Some(conversation_id));
-        let live_indices: BTreeSet<u64> =
-            documents.iter().map(|document| document.msg_idx).collect();
-        let context = cass_doc_context_from_packet(packet);
-        let mut identity_document = FsCassDocument {
-            agent: context.agent,
-            workspace: context.workspace,
-            workspace_original: context.workspace_original,
-            source_path: context.source_path,
-            msg_idx: 0,
-            created_at: None,
-            title: None,
-            content: String::new(),
-            conversation_id: Some(conversation_id),
-            source_id: context.source_id,
-            origin_kind: context.origin_kind,
-            origin_host: context.origin_host,
-        };
-        let mut retired = Vec::new();
-        for index in historical_indices {
-            let index = u64::try_from(*index).context("negative native snapshot lexical index")?;
-            if !live_indices.contains(&index) {
-                identity_document.msg_idx = index;
-                retired.push(identity_document.to_schema_document().id);
-            }
-        }
-        let upserted = self.upsert_prebuilt_documents_slice(&documents)?;
-        if !retired.is_empty() {
-            self.commit()?;
-            for chunk in retired.chunks(tantivy_prebuilt_add_batch_max_messages()) {
-                self.inner.delete_document_ids(chunk)?;
-            }
-        }
-        Ok(upserted)
     }
 
     /// Upsert prebuilt documents in bounded batches under their stable
@@ -3081,12 +3225,360 @@ mod tests {
         assert_eq!(reader.doc_count().expect("doc count"), expected_docs as u64);
     }
 
+    #[test]
+    // Exercises the Tantivy-only shard-merge / federated-bundle machinery.
+    // Quill has no N-directory merge, and the staged-shard rebuild strategy
+    // that needed one is disabled for the Quill backend (see the comment at
+    // the `staged_shard_plan` binding in indexer/mod.rs). Ignored rather than
+    // deleted or weakened: if an N-directory merge is ever built these are the
+    // tests that must pass, and a weakened assertion would hide that they no
+    // longer run.
+    #[ignore = "Tantivy-only shard merge; unreachable on the Quill backend"]
+    fn merge_compatible_index_directories_roundtrips_docs_into_single_segment() {
+        let root = TempDir::new().expect("temp dir");
+        let shard_a = root.path().join("shard-a");
+        let shard_b = root.path().join("shard-b");
+        let merged = root.path().join("merged");
+
+        let mut shard_a_index = TantivyIndex::open_or_create(&shard_a).expect("create shard a");
+        let mut shard_b_index = TantivyIndex::open_or_create(&shard_b).expect("create shard b");
+
+        let make_conv = |external_id: &str, title: &str, content: &str| NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some(external_id.to_string()),
+            title: Some(title.to_string()),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            metadata: Value::Null,
+            messages: vec![
+                NormalizedMessage {
+                    idx: 0,
+                    role: "user".to_string(),
+                    author: None,
+                    created_at: Some(1_700_000_000_010),
+                    content: format!("{content}-a"),
+                    extra: Value::Null,
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                },
+                NormalizedMessage {
+                    idx: 1,
+                    role: "assistant".to_string(),
+                    author: None,
+                    created_at: Some(1_700_000_000_020),
+                    content: format!("{content}-b"),
+                    extra: Value::Null,
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                },
+            ],
+        };
+
+        let conv_a = make_conv("merge-a", "Merge A", "alpha");
+        let conv_b = make_conv("merge-b", "Merge B", "beta");
+        shard_a_index
+            .add_conversation_with_id(&conv_a, Some(10))
+            .expect("index shard a");
+        shard_b_index
+            .add_conversation_with_id(&conv_b, Some(20))
+            .expect("index shard b");
+        shard_a_index.commit().expect("commit shard a");
+        shard_b_index.commit().expect("commit shard b");
+        drop(shard_a_index);
+        drop(shard_b_index);
+
+        let merged_index =
+            TantivyIndex::merge_compatible_index_directories(&merged, &[&shard_a, &shard_b])
+                .expect("merge shard indices");
+        assert_eq!(
+            merged_index.segment_count().expect("merged segment count"),
+            1,
+            "merged shard indices should collapse into a single searchable segment"
+        );
+        let reader = merged_index.reader().expect("reader");
+        crate::search::quill_bridge::refresh_reader(&reader).expect("reload");
+        assert_eq!(reader.doc_count().expect("doc count"), 4);
+    }
+
+    #[test]
+    // Exercises the Tantivy-only shard-merge / federated-bundle machinery.
+    // Quill has no N-directory merge, and the staged-shard rebuild strategy
+    // that needed one is disabled for the Quill backend (see the comment at
+    // the `staged_shard_plan` binding in indexer/mod.rs). Ignored rather than
+    // deleted or weakened: if an N-directory merge is ever built these are the
+    // tests that must pass, and a weakened assertion would hide that they no
+    // longer run.
+    #[ignore = "Tantivy-only shard merge; unreachable on the Quill backend"]
+    fn merge_compatible_index_directories_rejects_non_empty_output_directory() {
+        let root = TempDir::new().expect("temp dir");
+        let shard = root.path().join("shard");
+        let merged = root.path().join("merged");
+        fs::create_dir_all(&merged).expect("create merged dir");
+        fs::write(merged.join("sentinel.txt"), "occupied").expect("write sentinel");
+
+        let mut shard_index = TantivyIndex::open_or_create(&shard).expect("create shard");
+        let conv = NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some("merge-occupied".to_string()),
+            title: Some("Occupied".to_string()),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            source_path: PathBuf::from("/tmp/merge-occupied.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            metadata: Value::Null,
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "assistant".to_string(),
+                author: None,
+                created_at: Some(1_700_000_000_010),
+                content: "occupied".to_string(),
+                extra: Value::Null,
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            }],
+        };
+        shard_index
+            .add_conversation_with_id(&conv, Some(1))
+            .expect("index shard");
+        shard_index.commit().expect("commit shard");
+        drop(shard_index);
+
+        let result = TantivyIndex::merge_compatible_index_directories(&merged, &[&shard]);
+        assert!(
+            result.is_err(),
+            "non-empty merge output dir should be rejected"
+        );
+        let error = result.err().expect("merge result should contain an error");
+        assert!(
+            format!("{error:#}").contains("must be empty"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    // Exercises the Tantivy-only shard-merge / federated-bundle machinery.
+    // Quill has no N-directory merge, and the staged-shard rebuild strategy
+    // that needed one is disabled for the Quill backend (see the comment at
+    // the `staged_shard_plan` binding in indexer/mod.rs). Ignored rather than
+    // deleted or weakened: if an N-directory merge is ever built these are the
+    // tests that must pass, and a weakened assertion would hide that they no
+    // longer run.
+    #[ignore = "Tantivy-only shard merge; unreachable on the Quill backend"]
+    fn assemble_compatible_index_directories_roundtrips_docs_into_multi_segment_generation() {
+        let root = TempDir::new().expect("temp dir");
+        let shard_a = root.path().join("shard-a");
+        let shard_b = root.path().join("shard-b");
+        let assembled = root.path().join("assembled");
+
+        let mut shard_a_index = TantivyIndex::open_or_create(&shard_a).expect("create shard a");
+        let mut shard_b_index = TantivyIndex::open_or_create(&shard_b).expect("create shard b");
+
+        let make_conv = |external_id: &str, title: &str, content: &str| NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some(external_id.to_string()),
+            title: Some(title.to_string()),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+            started_at: Some(1_700_000_001_000),
+            ended_at: Some(1_700_000_001_100),
+            metadata: Value::Null,
+            messages: vec![
+                NormalizedMessage {
+                    idx: 0,
+                    role: "user".to_string(),
+                    author: None,
+                    created_at: Some(1_700_000_001_010),
+                    content: format!("{content}-a"),
+                    extra: Value::Null,
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                },
+                NormalizedMessage {
+                    idx: 1,
+                    role: "assistant".to_string(),
+                    author: None,
+                    created_at: Some(1_700_000_001_020),
+                    content: format!("{content}-b"),
+                    extra: Value::Null,
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                },
+            ],
+        };
+
+        let conv_a = make_conv("assemble-a", "Assemble A", "alpha");
+        let conv_b = make_conv("assemble-b", "Assemble B", "beta");
+        shard_a_index
+            .add_conversation_with_id(&conv_a, Some(10))
+            .expect("index shard a");
+        shard_b_index
+            .add_conversation_with_id(&conv_b, Some(20))
+            .expect("index shard b");
+        shard_a_index.commit().expect("commit shard a");
+        shard_b_index.commit().expect("commit shard b");
+        drop(shard_a_index);
+        drop(shard_b_index);
+
+        let assembled_index =
+            TantivyIndex::assemble_compatible_index_directories(&assembled, &[&shard_a, &shard_b])
+                .expect("assemble shard indices");
+        let reader = assembled_index.reader().expect("reader");
+        crate::search::quill_bridge::refresh_reader(&reader).expect("reload");
+        assert_eq!(reader.doc_count().expect("doc count"), 4);
+        assert_eq!(
+            assembled_index
+                .segment_count()
+                .expect("assembled segment count"),
+            2,
+            "assembled shard indices should preserve one searchable segment per input artifact"
+        );
+        assert!(
+            assembled.join(".managed.json").exists(),
+            "assembled index generation should persist a Tantivy managed-file manifest"
+        );
+    }
+
+    #[test]
+    // Exercises the Tantivy-only shard-merge / federated-bundle machinery.
+    // Quill has no N-directory merge, and the staged-shard rebuild strategy
+    // that needed one is disabled for the Quill backend (see the comment at
+    // the `staged_shard_plan` binding in indexer/mod.rs). Ignored rather than
+    // deleted or weakened: if an N-directory merge is ever built these are the
+    // tests that must pass, and a weakened assertion would hide that they no
+    // longer run.
+    #[ignore = "Tantivy-only shard merge; unreachable on the Quill backend"]
+    fn publish_federated_searchable_index_directories_writes_manifest_without_root_meta() {
+        let root = TempDir::new().expect("temp dir");
+        let shard_a = root.path().join("shard-a");
+        let shard_b = root.path().join("shard-b");
+        let published = root.path().join("published");
+
+        let mut shard_a_index = TantivyIndex::open_or_create(&shard_a).expect("create shard a");
+        let mut shard_b_index = TantivyIndex::open_or_create(&shard_b).expect("create shard b");
+
+        let make_conv = |external_id: &str, title: &str, content: &str| NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some(external_id.to_string()),
+            title: Some(title.to_string()),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+            started_at: Some(1_700_000_002_000),
+            ended_at: Some(1_700_000_002_100),
+            metadata: Value::Null,
+            messages: vec![
+                NormalizedMessage {
+                    idx: 0,
+                    role: "user".to_string(),
+                    author: None,
+                    created_at: Some(1_700_000_002_010),
+                    content: format!("{content}-a"),
+                    extra: Value::Null,
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                },
+                NormalizedMessage {
+                    idx: 1,
+                    role: "assistant".to_string(),
+                    author: None,
+                    created_at: Some(1_700_000_002_020),
+                    content: format!("{content}-b"),
+                    extra: Value::Null,
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                },
+            ],
+        };
+
+        shard_a_index
+            .add_conversation_with_id(&make_conv("fed-a", "Fed A", "alpha"), Some(10))
+            .expect("index shard a");
+        shard_b_index
+            .add_conversation_with_id(&make_conv("fed-b", "Fed B", "beta"), Some(20))
+            .expect("index shard b");
+        shard_a_index.commit().expect("commit shard a");
+        shard_b_index.commit().expect("commit shard b");
+        drop(shard_a_index);
+        drop(shard_b_index);
+
+        let summary =
+            publish_federated_searchable_index_directories(&published, &[&shard_a, &shard_b])
+                .expect("publish federated bundle");
+        assert_eq!(summary.docs, 4);
+        assert_eq!(summary.segments, 2);
+        assert!(
+            !published.join("meta.json").exists(),
+            "federated publish root should not force a standard single-index meta.json"
+        );
+        assert!(
+            published.join(FEDERATED_SEARCH_MANIFEST_FILE).exists(),
+            "federated publish root should persist its manifest"
+        );
+        let manifest = load_federated_search_manifest_internal(&published)
+            .expect("load manifest")
+            .expect("manifest present");
+        assert_eq!(manifest.shards.len(), 2);
+        assert_eq!(
+            searchable_index_summary(&published)
+                .expect("summary")
+                .expect("searchable summary")
+                .docs,
+            4
+        );
+    }
+
     fn write_federated_manifest_for_test(index_path: &Path, manifest: &FederatedSearchManifest) {
         fs::write(
             federated_search_manifest_path(index_path),
             serde_json::to_vec_pretty(manifest).expect("serialize manifest"),
         )
         .expect("write manifest");
+    }
+
+    fn publish_test_federated_bundle(root: &Path) -> PathBuf {
+        let shard_a = root.join("shard-a");
+        let shard_b = root.join("shard-b");
+        let published = root.join("published");
+
+        let mut shard_a_index = TantivyIndex::open_or_create(&shard_a).expect("create shard a");
+        let mut shard_b_index = TantivyIndex::open_or_create(&shard_b).expect("create shard b");
+
+        let make_conv = |external_id: &str, content: &str| NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some(external_id.to_string()),
+            title: Some(format!("Bundle {external_id}")),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+            started_at: Some(1_700_000_002_000),
+            ended_at: Some(1_700_000_002_100),
+            metadata: Value::Null,
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "assistant".to_string(),
+                author: None,
+                created_at: Some(1_700_000_002_010),
+                content: content.to_string(),
+                extra: Value::Null,
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            }],
+        };
+
+        shard_a_index
+            .add_conversation_with_id(&make_conv("bundle-a", "alpha"), Some(10))
+            .expect("index shard a");
+        shard_b_index
+            .add_conversation_with_id(&make_conv("bundle-b", "beta"), Some(20))
+            .expect("index shard b");
+        shard_a_index.commit().expect("commit shard a");
+        shard_b_index.commit().expect("commit shard b");
+        drop(shard_a_index);
+        drop(shard_b_index);
+
+        publish_federated_searchable_index_directories(&published, &[&shard_a, &shard_b])
+            .expect("publish federated bundle");
+        published
     }
 
     #[test]
@@ -3135,6 +3627,40 @@ mod tests {
         assert!(
             format!("{error:#}").contains("must stay under shards/"),
             "unexpected path error: {error:#}"
+        );
+    }
+
+    #[test]
+    // Exercises the Tantivy-only shard-merge / federated-bundle machinery.
+    // Quill has no N-directory merge, and the staged-shard rebuild strategy
+    // that needed one is disabled for the Quill backend (see the comment at
+    // the `staged_shard_plan` binding in indexer/mod.rs). Ignored rather than
+    // deleted or weakened: if an N-directory merge is ever built these are the
+    // tests that must pass, and a weakened assertion would hide that they no
+    // longer run.
+    #[ignore = "Tantivy-only shard merge; unreachable on the Quill backend"]
+    fn open_federated_search_readers_rejects_corrupt_shard_fingerprint() {
+        let root = TempDir::new().expect("temp dir");
+        let published = publish_test_federated_bundle(root.path());
+        let mut manifest = load_federated_search_manifest_internal(&published)
+            .expect("load manifest")
+            .expect("manifest present");
+        manifest
+            .shards
+            .first_mut()
+            .expect("test manifest should contain a shard")
+            .meta_fingerprint = "0".repeat(64);
+        write_federated_manifest_for_test(&published, &manifest);
+
+        let result = open_federated_search_readers(&published);
+        assert!(
+            result.is_err(),
+            "corrupt federated shard fingerprint should be rejected"
+        );
+        let error = result.err().expect("open result should contain an error");
+        assert!(
+            format!("{error:#}").contains("federated lexical shard fingerprint mismatch"),
+            "unexpected fingerprint error: {error:#}"
         );
     }
 
@@ -3277,6 +3803,184 @@ mod tests {
         assert!(
             format!("{error:#}").contains("unsupported non-file entry"),
             "unexpected symlink error: {error:#}"
+        );
+    }
+
+    #[test]
+    // Exercises the Tantivy-only shard-merge / federated-bundle machinery.
+    // Quill has no N-directory merge, and the staged-shard rebuild strategy
+    // that needed one is disabled for the Quill backend (see the comment at
+    // the `staged_shard_plan` binding in indexer/mod.rs). Ignored rather than
+    // deleted or weakened: if an N-directory merge is ever built these are the
+    // tests that must pass, and a weakened assertion would hide that they no
+    // longer run.
+    #[ignore = "Tantivy-only shard merge; unreachable on the Quill backend"]
+    fn open_or_create_materializes_federated_bundle_back_into_mutable_index() {
+        let root = TempDir::new().expect("temp dir");
+        let shard_a = root.path().join("shard-a");
+        let shard_b = root.path().join("shard-b");
+        let published = root.path().join("published");
+
+        let mut shard_a_index = TantivyIndex::open_or_create(&shard_a).expect("create shard a");
+        let mut shard_b_index = TantivyIndex::open_or_create(&shard_b).expect("create shard b");
+
+        let make_conv = |external_id: &str, title: &str, content: &str| NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some(external_id.to_string()),
+            title: Some(title.to_string()),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+            started_at: Some(1_700_000_003_000),
+            ended_at: Some(1_700_000_003_100),
+            metadata: Value::Null,
+            messages: vec![
+                NormalizedMessage {
+                    idx: 0,
+                    role: "user".to_string(),
+                    author: None,
+                    created_at: Some(1_700_000_003_010),
+                    content: format!("{content}-a"),
+                    extra: Value::Null,
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                },
+                NormalizedMessage {
+                    idx: 1,
+                    role: "assistant".to_string(),
+                    author: None,
+                    created_at: Some(1_700_000_003_020),
+                    content: format!("{content}-b"),
+                    extra: Value::Null,
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                },
+            ],
+        };
+
+        shard_a_index
+            .add_conversation_with_id(&make_conv("mat-a", "Mat A", "alpha"), Some(10))
+            .expect("index shard a");
+        shard_b_index
+            .add_conversation_with_id(&make_conv("mat-b", "Mat B", "beta"), Some(20))
+            .expect("index shard b");
+        shard_a_index.commit().expect("commit shard a");
+        shard_b_index.commit().expect("commit shard b");
+        drop(shard_a_index);
+        drop(shard_b_index);
+
+        publish_federated_searchable_index_directories(&published, &[&shard_a, &shard_b])
+            .expect("publish federated bundle");
+        assert!(
+            published.join(FEDERATED_SEARCH_MANIFEST_FILE).exists(),
+            "test fixture should start in federated bundle form"
+        );
+
+        let mutable_index =
+            TantivyIndex::open_or_create(&published).expect("materialize mutable index");
+        let reader = mutable_index.reader().expect("reader");
+        crate::search::quill_bridge::refresh_reader(&reader).expect("reload");
+        assert_eq!(reader.doc_count().expect("doc count"), 4);
+        assert!(
+            published.join("meta.json").exists(),
+            "writer open should materialize a standard writable Tantivy index"
+        );
+        assert!(
+            !published.join(FEDERATED_SEARCH_MANIFEST_FILE).exists(),
+            "materialization should replace the federated bundle manifest"
+        );
+    }
+
+    /// Materialization-direction counterpart of the publish-direction
+    /// contract test
+    /// `publish_staged_lexical_index_moves_generation_audit_files_with_the_staged_directory`
+    /// (src/indexer/mod.rs): flattening a federated bundle back into a
+    /// mutable index must carry the cass sidecar metadata — most importantly
+    /// the just-persisted completed rebuild checkpoint — into the
+    /// materialized directory instead of wiping it with the federated root
+    /// (#289).
+    #[test]
+    // Exercises the Tantivy-only shard-merge / federated-bundle machinery.
+    // Quill has no N-directory merge, and the staged-shard rebuild strategy
+    // that needed one is disabled for the Quill backend (see the comment at
+    // the `staged_shard_plan` binding in indexer/mod.rs). Ignored rather than
+    // deleted or weakened: if an N-directory merge is ever built these are the
+    // tests that must pass, and a weakened assertion would hide that they no
+    // longer run.
+    #[ignore = "Tantivy-only shard merge; unreachable on the Quill backend"]
+    fn open_or_create_materialization_carries_lexical_sidecar_files() {
+        let root = TempDir::new().expect("temp dir");
+        let shard_a = root.path().join("shard-a");
+        let shard_b = root.path().join("shard-b");
+        let published = root.path().join("published");
+
+        for (shard_path, external_id, conversation_id) in
+            [(&shard_a, "side-a", 10), (&shard_b, "side-b", 20)]
+        {
+            let mut shard_index =
+                TantivyIndex::open_or_create(shard_path).expect("create sidecar shard");
+            let conv = NormalizedConversation {
+                agent_slug: "codex".to_string(),
+                external_id: Some(external_id.to_string()),
+                title: Some(external_id.to_string()),
+                workspace: Some(PathBuf::from("/tmp/workspace")),
+                source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+                started_at: Some(1_700_000_003_000),
+                ended_at: Some(1_700_000_003_100),
+                metadata: Value::Null,
+                messages: vec![NormalizedMessage {
+                    idx: 0,
+                    role: "user".to_string(),
+                    author: None,
+                    created_at: Some(1_700_000_003_010),
+                    content: format!("{external_id} content"),
+                    extra: Value::Null,
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                }],
+            };
+            shard_index
+                .add_conversation_with_id(&conv, Some(conversation_id))
+                .expect("index sidecar shard");
+            shard_index.commit().expect("commit sidecar shard");
+        }
+
+        publish_federated_searchable_index_directories(&published, &[&shard_a, &shard_b])
+            .expect("publish federated bundle");
+        assert!(
+            published.join(FEDERATED_SEARCH_MANIFEST_FILE).exists(),
+            "test fixture should start in federated bundle form"
+        );
+
+        // Simulate the post-publish state from #289: the staged rebuild has
+        // just persisted its completed checkpoint + audit sidecars into the
+        // freshly published (federated) live directory.
+        let sidecar_payloads = LEXICAL_SIDECAR_FILES_CARRIED_ACROSS_MATERIALIZATION
+            .iter()
+            .map(|sidecar| {
+                let payload = format!("{{\"sidecar\":\"{sidecar}\",\"completed\":true}}");
+                fs::write(published.join(sidecar), &payload).expect("write sidecar fixture");
+                (*sidecar, payload)
+            })
+            .collect::<Vec<_>>();
+
+        let mutable_index =
+            TantivyIndex::open_or_create(&published).expect("materialize mutable index");
+        let reader = mutable_index.reader().expect("reader");
+        crate::search::quill_bridge::refresh_reader(&reader).expect("reload");
+        assert_eq!(reader.doc_count().expect("doc count"), 2);
+
+        for (sidecar, payload) in &sidecar_payloads {
+            assert_eq!(
+                fs::read_to_string(published.join(sidecar)).unwrap_or_else(|err| panic!(
+                    "lexical sidecar {sidecar} must survive federated materialization: {err}"
+                )),
+                *payload,
+                "lexical sidecar {sidecar} must be carried byte-for-byte"
+            );
+        }
+        assert!(
+            !published.join(FEDERATED_SEARCH_MANIFEST_FILE).exists(),
+            "the federated manifest must not be carried into the materialized mutable index"
         );
     }
 
@@ -3485,62 +4189,6 @@ mod tests {
             Some("ws-42.example"),
             "metadata.cass.origin.host must surface as origin_host"
         );
-    }
-
-    #[test]
-    fn canonical_packet_lexical_projection_preserves_bound_remote_provenance() {
-        use crate::model::types::{Conversation, Message, MessageRole};
-
-        for metadata_json in [
-            Value::Null,
-            serde_json::json!({}),
-            serde_json::json!({"cass":{"origin":{
-                "source_id":"obsolete-source","kind":"local","host":"obsolete-host"
-            }}}),
-        ] {
-            let conversation = Conversation {
-                id: Some(77),
-                agent_slug: "codex".into(),
-                workspace: None,
-                external_id: Some("canonical-remote".into()),
-                title: None,
-                source_path: PathBuf::from("/shared/session.jsonl"),
-                started_at: Some(1_700_000_000_000),
-                ended_at: None,
-                approx_tokens: None,
-                metadata_json,
-                messages: vec![Message {
-                    id: Some(123),
-                    idx: 5,
-                    role: MessageRole::Agent,
-                    author: None,
-                    created_at: None,
-                    content: "canonical remote evidence".into(),
-                    extra_json: Value::Null,
-                    snippets: Vec::new(),
-                }],
-                source_id: "canonical-remote".into(),
-                origin_host: Some("canonical-host".into()),
-            };
-            let packet = ConversationPacket::from_canonical_replay_owned(
-                conversation,
-                ConversationPacketProvenance {
-                    source_id: " canonical-remote ".into(),
-                    origin_kind: "ssh".into(),
-                    origin_host: Some(" canonical-host ".into()),
-                },
-            );
-            let docs = TantivyIndex::build_packet_documents(&packet, None);
-            assert_eq!(docs.len(), 1);
-            let doc = docs.first().expect("canonical message must be indexed");
-            assert_eq!(doc.source_id, "canonical-remote");
-            assert_eq!(doc.origin_kind, "remote");
-            assert_eq!(doc.origin_host.as_deref(), Some("canonical-host"));
-            assert_eq!(doc.source_path, "/shared/session.jsonl");
-            assert_eq!(doc.conversation_id, Some(77));
-            assert_eq!(doc.msg_idx, 5);
-            assert_eq!(doc.content, "canonical remote evidence");
-        }
     }
 
     /// Pins the `add_conversation_with_id` migration: the convenience

@@ -2,7 +2,6 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::franken_sync::{
@@ -29,27 +28,15 @@ use crate::indexer::semantic_progress::{
 use crate::model::conversation_packet::{ConversationPacket, ConversationPacketProvenance};
 use crate::model::types::{Conversation, Message};
 use crate::search::canonicalize::{canonicalize_for_embedding, content_hash, embedding_passages};
-use crate::search::embedder::CassPassageProducer;
 use crate::search::embedder::Embedder;
 use crate::search::fastembed_embedder::{
     FastEmbedder, MINILM_VECTOR_SPACE_REVISION, MULTILINGUAL_MINILM_VECTOR_SPACE_REVISION,
 };
 use crate::search::hash_embedder::HashEmbedder;
 use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION, SemanticPolicy};
-use crate::search::semantic_manifest::source_snapshot::{
-    SemanticSourceContract, SemanticSourcePassage, SemanticSourceSnapshot,
-    SemanticSourceSnapshotBudget, SemanticSourceVisitError, ordered_source_content_digest,
-    visit_semantic_source_passages_in_transaction,
-};
 use crate::search::semantic_manifest::{
     ArtifactRecord, BuildCheckpoint, SemanticManifest, SemanticShardManifest, SemanticShardRecord,
     TierKind,
-};
-use crate::search::semantic_manifest::{
-    SemanticArtifactRole, SemanticArtifactSealStateV1, SemanticArtifactShardV2,
-    SemanticArtifactValidationEvidence, SemanticExpectedCurrentV1, SemanticGenerationArtifact,
-    SemanticGenerationPurpose, SemanticGenerationTopology,
-    create_semantic_generation_stage_directory,
 };
 use crate::search::tantivy::{
     normalized_index_origin_host, normalized_index_origin_kind, normalized_index_source_id,
@@ -59,8 +46,16 @@ use crate::search::vector_index::{
 };
 use crate::storage::sqlite::FrankenStorage;
 
+mod coverage;
 mod replay_cache;
 
+pub(crate) use coverage::{
+    SemanticBuildSnapshot, semantic_index_document_digest,
+    semantic_index_document_digest_for_canonical_ids,
+};
+
+#[cfg(all(test, unix))]
+mod coverage_tests;
 #[cfg(test)]
 mod gh525_tests;
 #[cfg(test)]
@@ -228,634 +223,6 @@ pub struct EmbeddedMessage {
     pub embedding: Vec<f32>,
 }
 
-/// Explicit producer owners for a new retained publication. The factory is
-/// called only after a complete source scan, and never for an empty source.
-pub struct RetainedSemanticStageProducers {
-    pub fast: Option<Arc<CassPassageProducer>>,
-    pub quality: Option<Arc<CassPassageProducer>>,
-}
-
-/// Admission bounds for source-owned staging, not a total process RSS limit.
-/// Native writer buffers/sort/serialization, model state and allocator scratch
-/// remain explicit resource costs. Pending payload counts actual f32 values and
-/// document-ID bytes before inference; image size is checked before admission.
-#[derive(Debug, Clone, Copy)]
-pub struct RetainedSemanticStagePolicy {
-    pub source: SemanticSourceSnapshotBudget,
-    pub requested_topology: SemanticGenerationTopology,
-    pub max_documents_per_shard: usize,
-    pub max_plan_payload_bytes: usize,
-    pub max_pending_payload_bytes: u64,
-    pub max_image_bytes_per_shard: u64,
-    /// A deterministic lexical prefix of the selected source, never an
-    /// implicit claim that unfinished quality covers the entire corpus.
-    pub quality_document_limit: Option<usize>,
-    pub allow_hash_control: bool,
-}
-
-impl Default for RetainedSemanticStagePolicy {
-    fn default() -> Self {
-        Self {
-            source: SemanticSourceSnapshotBudget::default(),
-            requested_topology: SemanticGenerationTopology::QualityOnly,
-            max_documents_per_shard: 250_000,
-            max_plan_payload_bytes: 256 * 1024 * 1024,
-            max_pending_payload_bytes: 512 * 1024 * 1024,
-            max_image_bytes_per_shard: 512 * 1024 * 1024,
-            quality_document_limit: None,
-            allow_hash_control: false,
-        }
-    }
-}
-
-/// Actual same-image native owner and source-derived immutable descriptor.
-/// Paths are stage/seal inputs; query construction never reopens them.
-pub struct RetainedSemanticVectorStage {
-    owner: Arc<frankensearch::index::ValidatedFsviBytes>,
-    artifact: SemanticGenerationArtifact,
-    path: PathBuf,
-}
-
-impl RetainedSemanticVectorStage {
-    pub fn owner(&self) -> &Arc<frankensearch::index::ValidatedFsviBytes> {
-        &self.owner
-    }
-
-    pub fn artifact(&self) -> &SemanticGenerationArtifact {
-        &self.artifact
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-/// A completed unpublished source/vector cohort. It retains the actual shared
-/// mutation lease through ANN preparation and later final sealing. There is no
-/// publication method here: current.json remains the sole selecting authority.
-/// Failed stages are not deleted, relabelled, installed, or selected on return.
-pub struct RetainedSemanticGenerationStage {
-    _lease: super::artifacts::BackfillArtifacts,
-    source: SemanticSourceSnapshot,
-    expected_current: SemanticExpectedCurrentV1,
-    generation: frankensearch::core::generation::ArtifactGenerationIdentityV1,
-    generation_id: String,
-    directory: PathBuf,
-    purpose: SemanticGenerationPurpose,
-    requested_topology: SemanticGenerationTopology,
-    realized_topology: SemanticGenerationTopology,
-    vectors: Vec<RetainedSemanticVectorStage>,
-}
-
-impl RetainedSemanticGenerationStage {
-    pub fn source(&self) -> &SemanticSourceSnapshot {
-        &self.source
-    }
-    pub fn expected_current(&self) -> &SemanticExpectedCurrentV1 {
-        &self.expected_current
-    }
-    pub fn generation(&self) -> frankensearch::core::generation::ArtifactGenerationIdentityV1 {
-        self.generation
-    }
-    pub fn generation_id(&self) -> &str {
-        &self.generation_id
-    }
-    pub fn directory(&self) -> &Path {
-        &self.directory
-    }
-    pub fn purpose(&self) -> SemanticGenerationPurpose {
-        self.purpose
-    }
-    pub fn requested_topology(&self) -> SemanticGenerationTopology {
-        self.requested_topology
-    }
-    pub fn realized_topology(&self) -> SemanticGenerationTopology {
-        self.realized_topology
-    }
-    pub fn vectors(&self) -> &[RetainedSemanticVectorStage] {
-        &self.vectors
-    }
-}
-
-struct RetainedSourceDocument {
-    id: String,
-    document: SemanticDocId,
-}
-
-struct RetainedShardWriter {
-    writer: FsVectorIndexWriter,
-    path: PathBuf,
-    relative_path: String,
-    first: usize,
-    end: usize,
-}
-
-struct RetainedTierWriter {
-    role: SemanticArtifactRole,
-    producer: Arc<CassPassageProducer>,
-    output_identity: frankensearch::core::EmbeddingIdentityBundleV1,
-    binding: frankensearch::index::FsviV2IdentityBinding,
-    covered: usize,
-    shards: Vec<RetainedShardWriter>,
-}
-
-/// Build genuine new v2 stages from the caller's SAME actual transaction.
-/// This currently performs an honest full build; it claims no retained-row
-/// reuse or incremental ANN win. Those require qualified native row-copy and
-/// transition APIs. The complete source is admitted before invoking the model
-/// factory. Actual bound producer outputs go directly to native create_v2.
-pub fn stage_retained_semantic_generation<F, C>(
-    transaction: &crate::franken_sync::compat::Transaction<'_>,
-    data_dir: &Path,
-    contract: SemanticSourceContract,
-    policy: RetainedSemanticStagePolicy,
-    producer_factory: F,
-    mut check_cancelled: C,
-) -> Result<RetainedSemanticGenerationStage>
-where
-    F: FnOnce(&SemanticSourceSnapshot) -> Result<RetainedSemanticStageProducers>,
-    C: FnMut() -> Result<()>,
-{
-    check_cancelled()?;
-    anyhow::ensure!(
-        policy.max_documents_per_shard > 0,
-        "retained stage shard limit must be positive"
-    );
-    let lease = super::artifacts::BackfillArtifacts::for_shard_publication(data_dir)?;
-    let expected_current = SemanticExpectedCurrentV1::observe(data_dir)?;
-    let mut documents = Vec::new();
-    let mut plan_payload = 0_usize;
-    let source = visit_semantic_source_passages_in_transaction(
-        transaction,
-        contract,
-        policy.source,
-        |passage| {
-            check_cancelled()?;
-            let id = passage.document().to_doc_id_string();
-            plan_payload = plan_payload
-                .checked_add(id.capacity())
-                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<RetainedSourceDocument>()))
-                .context("retained stage plan payload overflow")?;
-            anyhow::ensure!(
-                plan_payload <= policy.max_plan_payload_bytes,
-                "retained stage plan payload budget exceeded"
-            );
-            documents
-                .try_reserve(1)
-                .context("reserve retained source plan")?;
-            documents.push(RetainedSourceDocument {
-                id,
-                document: passage.document(),
-            });
-            Ok::<(), anyhow::Error>(())
-        },
-    )
-    .map_err(retained_source_visit_error)?;
-    check_cancelled()?;
-    documents.sort_unstable_by(|left, right| left.id.cmp(&right.id));
-    anyhow::ensure!(
-        documents.windows(2).all(|pair| pair[0].id != pair[1].id),
-        "duplicate retained source document"
-    );
-    let generation = new_retained_stage_generation(expected_current.successor_epoch()?)?;
-    let generation_id = format!(
-        "semantic-{}-{}",
-        generation.sequence,
-        hex::encode(generation.nonce)
-    );
-    let mut stage = RetainedSemanticGenerationStage {
-        _lease: lease,
-        source,
-        expected_current,
-        generation,
-        generation_id,
-        directory: PathBuf::new(),
-        purpose: SemanticGenerationPurpose::EmptyCorpus,
-        requested_topology: policy.requested_topology,
-        realized_topology: policy.requested_topology,
-        vectors: Vec::new(),
-    };
-    if documents.is_empty() {
-        check_cancelled()?;
-        stage.directory =
-            create_semantic_generation_stage_directory(data_dir, &stage.generation_id)?;
-        return Ok(stage);
-    }
-    let producers = producer_factory(&stage.source)?;
-    check_cancelled()?;
-    let (purpose, realized) = validate_retained_stage_producers(&producers, contract, policy)?;
-    preadmit_retained_stage_payload(&producers, &documents, policy)?;
-    stage.directory = create_semantic_generation_stage_directory(data_dir, &stage.generation_id)?;
-    let mut tiers = create_retained_tier_writers(producers, &documents, &stage, policy)?;
-    let completed = visit_semantic_source_passages_in_transaction(
-        transaction,
-        contract,
-        policy.source,
-        |passage| {
-            check_cancelled()?;
-            let id = passage.document().to_doc_id_string();
-            let position = documents
-                .binary_search_by(|document| document.id.as_str().cmp(&id))
-                .map_err(|_| anyhow::anyhow!("source document changed during retained staging"))?;
-            anyhow::ensure!(
-                documents[position].document == passage.document(),
-                "source identity changed during retained staging"
-            );
-            for tier in &mut tiers {
-                tier.write(
-                    &passage,
-                    &id,
-                    position,
-                    policy.max_documents_per_shard,
-                    &mut check_cancelled,
-                )?;
-            }
-            Ok::<(), anyhow::Error>(())
-        },
-    )
-    .map_err(retained_source_visit_error)?;
-    anyhow::ensure!(
-        completed.identity() == stage.source.identity(),
-        "source snapshot changed during retained staging"
-    );
-    check_cancelled()?;
-    for tier in tiers {
-        stage.vectors.extend(tier.finish(
-            &documents,
-            &stage.source,
-            policy,
-            &mut check_cancelled,
-        )?);
-    }
-    check_cancelled()?;
-    stage.purpose = purpose;
-    stage.realized_topology = realized;
-    tracing::info!(action = "full_build_staged", document_count = stage.source.identity().document_count,
-        artifact_count = stage.vectors.len(), purpose = ?purpose,
-        "prepared unpublished retained semantic generation; no current selection changed");
-    Ok(stage)
-}
-
-fn retained_source_visit_error(error: SemanticSourceVisitError<anyhow::Error>) -> anyhow::Error {
-    match error {
-        SemanticSourceVisitError::Source(error) => error.into(),
-        SemanticSourceVisitError::Consumer(error) => error,
-    }
-}
-
-fn new_retained_stage_generation(
-    sequence: u64,
-) -> Result<frankensearch::core::generation::ArtifactGenerationIdentityV1> {
-    use ring::rand::SecureRandom;
-    let mut nonce = [0_u8; 16];
-    ring::rand::SystemRandom::new()
-        .fill(&mut nonce)
-        .map_err(|_| anyhow::anyhow!("retained generation randomness unavailable"))?;
-    Ok(frankensearch::core::generation::ArtifactGenerationIdentityV1::new(sequence, nonce)?)
-}
-
-fn validate_retained_stage_producers(
-    producers: &RetainedSemanticStageProducers,
-    contract: SemanticSourceContract,
-    policy: RetainedSemanticStagePolicy,
-) -> Result<(SemanticGenerationPurpose, SemanticGenerationTopology)> {
-    anyhow::ensure!(
-        producers.quality.is_some() || policy.quality_document_limit.is_none(),
-        "quality coverage limit requires a selected quality producer"
-    );
-    let realized = match (producers.fast.is_some(), producers.quality.is_some()) {
-        (true, true) => SemanticGenerationTopology::FullProgressive,
-        (true, false) => SemanticGenerationTopology::FastOnly,
-        (false, true) => SemanticGenerationTopology::QualityOnly,
-        (false, false) => {
-            bail!("nonempty retained source requires an explicitly selected producer")
-        }
-    };
-    anyhow::ensure!(
-        policy.requested_topology == SemanticGenerationTopology::FullProgressive
-            || realized == policy.requested_topology,
-        "retained producers contradict requested topology"
-    );
-    let mut hash_control = false;
-    for producer in producers.fast.iter().chain(producers.quality.iter()) {
-        anyhow::ensure!(
-            producer.source_contract() == contract,
-            "retained producer source contract mismatch"
-        );
-        let identity = producer.identity()?;
-        identity.validate()?;
-        hash_control |=
-            identity.space.kind == frankensearch::core::EmbeddingSpaceKindV1::HashControl;
-    }
-    anyhow::ensure!(
-        !hash_control || policy.allow_hash_control,
-        "hash control requires explicit retained control intent"
-    );
-    Ok((
-        if hash_control {
-            SemanticGenerationPurpose::HashControl
-        } else {
-            SemanticGenerationPurpose::Semantic
-        },
-        realized,
-    ))
-}
-
-fn retained_quality_coverage(
-    selected: usize,
-    policy: RetainedSemanticStagePolicy,
-) -> Result<usize> {
-    let covered = policy
-        .quality_document_limit
-        .unwrap_or(selected)
-        .min(selected);
-    anyhow::ensure!(
-        covered > 0,
-        "a selected quality producer must cover a nonempty prefix"
-    );
-    Ok(covered)
-}
-
-fn preadmit_retained_stage_payload(
-    producers: &RetainedSemanticStageProducers,
-    documents: &[RetainedSourceDocument],
-    policy: RetainedSemanticStagePolicy,
-) -> Result<()> {
-    let mut bytes = 0_u64;
-    for (producer, covered) in [
-        (producers.fast.as_ref(), documents.len()),
-        (
-            producers.quality.as_ref(),
-            retained_quality_coverage(documents.len(), policy)?,
-        ),
-    ] {
-        let Some(producer) = producer else { continue };
-        anyhow::ensure!(
-            covered.div_ceil(policy.max_documents_per_shard) <= 256,
-            "retained stage exceeds manifest shard limit"
-        );
-        let vector_bytes = (producer.dimension() as u64)
-            .checked_mul(4)
-            .context("retained vector payload overflow")?;
-        let covered_documents = documents
-            .get(..covered)
-            .context("retained coverage exceeds the actual source document count")?;
-        for document in covered_documents {
-            bytes = bytes
-                .checked_add(vector_bytes)
-                .and_then(|bytes| bytes.checked_add(document.id.len() as u64))
-                .context("retained pending payload overflow")?;
-        }
-    }
-    anyhow::ensure!(
-        bytes <= policy.max_pending_payload_bytes,
-        "retained pending vector/document payload budget exceeded"
-    );
-    Ok(())
-}
-
-fn create_retained_tier_writers(
-    producers: RetainedSemanticStageProducers,
-    documents: &[RetainedSourceDocument],
-    stage: &RetainedSemanticGenerationStage,
-    policy: RetainedSemanticStagePolicy,
-) -> Result<Vec<RetainedTierWriter>> {
-    let mut tiers = Vec::new();
-    for (role, producer, covered, directory) in [
-        (
-            SemanticArtifactRole::FastVector,
-            producers.fast,
-            documents.len(),
-            "fast",
-        ),
-        (
-            SemanticArtifactRole::QualityVector,
-            producers.quality,
-            retained_quality_coverage(documents.len(), policy)?,
-            "quality",
-        ),
-    ] {
-        let Some(producer) = producer else { continue };
-        // ubs:ignore[rust.collections.clone-in-loop] -- Retain the producer's output identity while adapting a separate persisted FSVI identity for this tier.
-        let output_identity = producer.identity()?.clone();
-        let mut persisted = output_identity.clone();
-        persisted.storage.format = "fsvi-v2".into();
-        persisted.storage.quantization = frankensearch::core::generation::QuantizationFormat::F16;
-        persisted.storage.endianness = "little-endian".into();
-        let binding = frankensearch::index::FsviV2IdentityBinding::new(
-            stage.generation,
-            persisted.freeze()?,
-        )?;
-        fs::create_dir(stage.directory.join(directory))?;
-        let mut shards = Vec::new();
-        let [nonce_low, nonce_high, ..] = stage.generation.nonce;
-        let publication_nonce = u16::from_le_bytes([nonce_low, nonce_high]).max(1);
-        for first in (0..covered).step_by(policy.max_documents_per_shard) {
-            // ubs:ignore[rust.perf.string-alloc-in-loop] -- Each retained shard owns a distinct relative path in its publication manifest.
-            let relative_path = format!("{directory}/shard-{:04}.fsvi", shards.len());
-            let path = stage.directory.join(&relative_path);
-            // ubs:ignore[rust.collections.clone-in-loop] -- Every independently finalized shard writer owns the same immutable generation binding.
-            let writer = FsVectorIndex::create_v2(&path, binding.clone())?
-                .with_publication_nonce(publication_nonce);
-            shards.push(RetainedShardWriter {
-                writer,
-                path,
-                relative_path,
-                first,
-                end: first
-                    .saturating_add(policy.max_documents_per_shard)
-                    .min(covered),
-            });
-        }
-        tiers.push(RetainedTierWriter {
-            role,
-            producer,
-            output_identity,
-            binding,
-            covered,
-            shards,
-        });
-    }
-    Ok(tiers)
-}
-
-impl RetainedTierWriter {
-    fn write<C: FnMut() -> Result<()>>(
-        &mut self,
-        passage: &SemanticSourcePassage<'_>,
-        id: &str,
-        position: usize,
-        per_shard: usize,
-        check_cancelled: &mut C,
-    ) -> Result<()> {
-        if position >= self.covered {
-            return Ok(());
-        }
-        check_cancelled()?;
-        anyhow::ensure!(
-            self.producer.identity()? == &self.output_identity,
-            "retained producer changed before inference"
-        );
-        let response = self.producer.embed_bound_sync(passage.raw())?;
-        check_cancelled()?;
-        response.validate()?;
-        anyhow::ensure!(
-            response.identity == self.output_identity
-                && self.producer.identity()? == &self.output_identity,
-            "retained producer changed during inference"
-        );
-        self.shards
-            .get_mut(position / per_shard)
-            .context("retained shard routing mismatch")?
-            .writer
-            .write_record(id, &response.values)?;
-        Ok(())
-    }
-
-    fn finish<C: FnMut() -> Result<()>>(
-        self,
-        documents: &[RetainedSourceDocument],
-        source: &SemanticSourceSnapshot,
-        policy: RetainedSemanticStagePolicy,
-        check_cancelled: &mut C,
-    ) -> Result<Vec<RetainedSemanticVectorStage>> {
-        let shard_count = u32::try_from(self.shards.len())?;
-        let mut stages = Vec::new();
-        for (ordinal, shard) in self.shards.into_iter().enumerate() {
-            check_cancelled()?;
-            shard.writer.finish()?;
-            check_cancelled()?;
-            let bytes = fs::metadata(&shard.path)?.len();
-            anyhow::ensure!(
-                bytes <= policy.max_image_bytes_per_shard,
-                "retained image exceeds admission budget"
-            );
-            let owner = Arc::new(frankensearch::index::ValidatedFsviBytes::open_published(
-                &shard.path,
-                &self.binding,
-            )?);
-            check_cancelled()?;
-            let artifact = retained_stage_artifact(
-                (self.role, &self.binding),
-                &owner,
-                &shard.relative_path,
-                documents
-                    .get(shard.first..shard.end)
-                    .context("retained shard range exceeds the source partition")?,
-                source,
-                ordinal as u32,
-                shard_count,
-            )?;
-            artifact.validate_fsvi_owner(&owner).map_err(|field| {
-                anyhow::anyhow!("retained native owner disagrees with staged {field}")
-            })?;
-            stages.push(RetainedSemanticVectorStage {
-                owner,
-                artifact,
-                path: shard.path,
-            });
-        }
-        Ok(stages)
-    }
-}
-
-fn retained_stage_artifact(
-    tier: (
-        SemanticArtifactRole,
-        &frankensearch::index::FsviV2IdentityBinding,
-    ),
-    owner: &frankensearch::index::ValidatedFsviBytes,
-    relative_path: &str,
-    expected: &[RetainedSourceDocument],
-    source: &SemanticSourceSnapshot,
-    ordinal: u32,
-    shard_count: u32,
-) -> Result<SemanticGenerationArtifact> {
-    use sha2::{Digest, Sha256};
-    let (role, binding) = tier;
-    let witness = owner.witness();
-    anyhow::ensure!(
-        witness.live_count == expected.len() as u64
-            && witness.record_count == witness.live_count
-            && witness.tombstone_count == 0,
-        "retained full-build coverage/count mismatch"
-    );
-    let mut content_rows = Vec::with_capacity(expected.len());
-    for row in 0..owner.record_count() {
-        let id = owner.doc_id_at(row)?;
-        let position = expected
-            .binary_search_by(|document| document.id.as_str().cmp(id))
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "retained owner contains a document outside its actual source partition"
-                )
-            })?;
-        content_rows.push((
-            id,
-            expected
-                .get(position)
-                .context("retained source position is outside its actual partition")?
-                .document
-                .content_hash
-                .context("source passage lacks canonical digest")?,
-        ));
-    }
-    let content = hex::encode(ordered_source_content_digest(content_rows.into_iter()));
-    let artifact_sha256 = hex::encode(witness.whole_image_sha256);
-    let docset = hex::encode(witness.ordered_live_docset_digest);
-    let metadata = owner.metadata();
-    let mut parameters = Sha256::new();
-    parameters.update(b"cass-native-fsvi-stage-layout-v1");
-    parameters.update(metadata.fsvi_version.to_be_bytes());
-    parameters.update([metadata.compaction_gen]);
-    parameters.update(metadata.publication_nonce.to_be_bytes());
-    parameters.update(metadata.vectors_offset.to_be_bytes());
-    let parameters = hex::encode(parameters.finalize());
-    let validated_at_ms = now_ms();
-    let validation = SemanticArtifactValidationEvidence {
-        validator_id: "cass-source-bound-native-fsvi-v2-owner-v1".into(),
-        validated_at_ms,
-        artifact_sha256: artifact_sha256.clone(),
-        size_bytes: witness.byte_len,
-        selected_document_count: source.identity().document_count,
-        covered_document_count: witness.live_count,
-        vector_slot_count: witness.record_count,
-        live_vector_count: witness.live_count,
-        tombstone_vector_count: 0,
-        seal: SemanticArtifactSealStateV1::Vector { wal_entry_count: 0 },
-        generation_corpus_sha256: source.identity().corpus_sha256.clone(),
-        covered_live_docset_sha256: docset.clone(),
-        covered_content_sha256: content.clone(),
-    };
-    Ok(SemanticGenerationArtifact {
-        role,
-        shard: Some(SemanticArtifactShardV2 {
-            ordinal,
-            shard_count,
-            first_document_id: expected.first().context("empty retained shard")?.id.clone(),
-            last_document_id: expected.last().context("empty retained shard")?.id.clone(),
-        }),
-        relative_path: relative_path.into(),
-        artifact_sha256,
-        size_bytes: witness.byte_len,
-        artifact_format: "fsvi-v2".into(),
-        fsvi_generation: Some(binding.generation()),
-        artifact_parameters_sha256: parameters,
-        embedding_identity: binding.frozen_identity().clone(),
-        ann_base: None,
-        selected_document_count: source.identity().document_count,
-        covered_document_count: witness.live_count,
-        vector_slot_count: witness.record_count,
-        live_vector_count: witness.live_count,
-        tombstone_vector_count: 0,
-        seal: SemanticArtifactSealStateV1::Vector { wal_entry_count: 0 },
-        generation_corpus_sha256: source.identity().corpus_sha256.clone(),
-        covered_live_docset_sha256: docset,
-        covered_content_sha256: content,
-        validation,
-    })
-}
-
 #[derive(Debug, Clone)]
 pub struct SemanticBackfillBatchPlan {
     pub tier: TierKind,
@@ -875,10 +242,11 @@ pub struct SemanticBackfillStoragePlan {
     pub max_conversations: usize,
 }
 
-struct BackfillBatchProgress {
+struct BackfillBatchProgress<'a> {
     prior_checkpoint: Option<BuildCheckpoint>,
     embedded_docs: u64,
     last_message_id: Option<i64>,
+    coverage: Option<(&'a FrankenStorage, SemanticBuildSnapshot)>,
 }
 
 #[derive(Debug, Clone)]
@@ -983,6 +351,55 @@ struct CompletedBackfillCache {
     artifact: ArtifactRecord,
     vector_space_revision: String,
     last_offset: i64,
+    #[serde(default)]
+    coverage: Option<crate::search::semantic_manifest::SemanticCoverageCertificate>,
+    #[serde(default)]
+    coverage_files: Option<(BackfillFileStamp, BackfillFileStamp)>,
+}
+
+fn completed_coverage_file_stamps(
+    data_dir: &Path,
+    certificate: &crate::search::semantic_manifest::SemanticCoverageCertificate,
+) -> Option<(BackfillFileStamp, BackfillFileStamp)> {
+    crate::search::semantic_coverage::open_semantic_proof_file(
+        data_dir,
+        &certificate.artifact_path,
+    )
+    .ok()?;
+    crate::search::semantic_coverage::open_semantic_proof_file(data_dir, &certificate.parent_path)
+        .ok()?;
+    Some((
+        backfill_file_stamp(&data_dir.join(&certificate.artifact_path))??,
+        backfill_file_stamp(&data_dir.join(&certificate.parent_path))??,
+    ))
+}
+
+fn completed_coverage_boundary_matches(
+    storage: &FrankenStorage,
+    certificate: &crate::search::semantic_manifest::SemanticCoverageCertificate,
+) -> Result<bool> {
+    Ok(storage.semantic_archive_state()?.is_some_and(|state| {
+        state.archive_id == certificate.archive_id && state.mutation_seq == certificate.mutation_seq
+    }) && storage.max_message_id()?.unwrap_or(0) == certificate.max_message_id)
+}
+
+/// The cache is a skip hint, so failing to save it only costs the next run a
+/// reconcile.
+fn persist_completed_backfill_cache(
+    data_dir: &Path,
+    cache_path: &Path,
+    cache: &CompletedBackfillCache,
+) {
+    let saved = (|| -> Result<()> {
+        let mut staged = tempfile::NamedTempFile::new_in(data_dir.join(VECTOR_INDEX_DIR))?;
+        serde_json::to_writer(staged.as_file_mut(), cache)?;
+        staged.as_file().sync_all()?;
+        staged.persist(cache_path)?;
+        Ok(())
+    })();
+    if let Err(error) = saved {
+        tracing::debug!(%error, "completed backfill cache unavailable; next run will reconcile");
+    }
 }
 
 impl SemanticBackfillBatchOutcome {
@@ -2330,50 +1747,6 @@ fn fetch_canonical_embedding_batch_inner_with_caps_and_total(
     total_conversations: u64,
     sink: Option<&SemanticProgressSink>,
 ) -> Result<CanonicalEmbeddingBatch> {
-    fetch_canonical_embedding_batch_with_loader(
-        storage,
-        CanonicalEmbeddingBatchRequest {
-            after_conversation_id,
-            max_conversations,
-            after_message_id,
-            caps,
-            total_conversations,
-        },
-        sink,
-        &mut load_checkpoint_conversation_messages,
-    )
-}
-
-#[derive(Clone, Copy)]
-struct CanonicalEmbeddingBatchRequest {
-    after_conversation_id: i64,
-    max_conversations: usize,
-    after_message_id: Option<i64>,
-    caps: SemanticCheckpointCaps,
-    total_conversations: u64,
-}
-
-fn fetch_canonical_embedding_batch_with_loader<F>(
-    storage: &FrankenStorage,
-    request: CanonicalEmbeddingBatchRequest,
-    sink: Option<&SemanticProgressSink>,
-    load_messages: &mut F,
-) -> Result<CanonicalEmbeddingBatch>
-where
-    F: FnMut(
-        &FrankenStorage,
-        i64,
-        Option<i64>,
-        Option<SemanticCheckpointCaps>,
-    ) -> Result<Option<Vec<Message>>>,
-{
-    let CanonicalEmbeddingBatchRequest {
-        after_conversation_id,
-        max_conversations,
-        after_message_id,
-        caps,
-        total_conversations,
-    } = request;
     let max_conversations = max_conversations.max(1);
     let query_limit = max_conversations.saturating_add(1);
     if let Some(sink) = sink
@@ -2440,12 +1813,14 @@ where
 
     let conversations = fetch_canonical_embedding_conversations(storage, &conversation_ids)?;
 
-    let (selection, mut grouped_messages) = select_checkpoint_capped_conversations_with_admission(
+    let (selection, mut grouped_messages) = select_checkpoint_capped_conversations_lazily(
         conversations,
         after_message_id,
         caps,
-        |conversation_id, remaining| {
-            load_messages(storage, conversation_id, after_message_id, remaining)
+        |conversation_id| {
+            let mut loaded =
+                storage.fetch_messages_for_lexical_rebuild_batch(&[conversation_id], None, None)?;
+            Ok(loaded.remove(&conversation_id).unwrap_or_default())
         },
     )?;
     let CheckpointCappedSelection {
@@ -2487,103 +1862,6 @@ struct CheckpointCappedSelection {
     stopped_before_candidate: bool,
 }
 
-/// Check record lengths before decoding any body in a subsequent conversation.
-/// The lexical projection truncates at a UTF-8 boundary, so its exact size can
-/// be up to three bytes smaller than this upper bound per truncated message.
-/// A conservative admission can move a checkpoint boundary, never its coverage.
-fn checkpoint_conversation_fits(
-    storage: &FrankenStorage,
-    conversation_id: i64,
-    after_message_id: Option<i64>,
-    remaining: SemanticCheckpointCaps,
-) -> Result<bool> {
-    let message_cap =
-        crate::storage::sqlite::lexical_max_message_content_bytes().min(i32::MAX as usize);
-    let sql = |hinted: bool| {
-        format!(
-            "SELECT COALESCE(octet_length(content), 0) FROM messages{} \
-             WHERE conversation_id = ?1{} ORDER BY idx",
-            if hinted {
-                " INDEXED BY sqlite_autoindex_messages_1"
-            } else {
-                ""
-            },
-            if after_message_id.is_some() {
-                " AND id > ?2"
-            } else {
-                ""
-            },
-        )
-    };
-    let mut params = vec![SqliteValue::from(conversation_id)];
-    if let Some(after) = after_message_id {
-        params.push(SqliteValue::from(after));
-    }
-    let read = |sql: &str| -> Result<bool> {
-        let mut messages = 0usize;
-        let mut bytes = 0u64;
-        storage
-            .raw()
-            .query_with_params_for_each(sql, &params, |row| {
-                messages = messages.saturating_add(1);
-                let source_bytes =
-                    u64::try_from(row.get_typed::<i64>(0)?.max(0)).unwrap_or(u64::MAX);
-                bytes =
-                    bytes.saturating_add(source_bytes.min(saturating_u64_from_usize(message_cap)));
-                Ok(())
-            })?;
-        Ok(
-            (!remaining.message_limited() || messages <= remaining.max_messages)
-                && (!remaining.byte_limited() || bytes <= remaining.max_bytes),
-        )
-    };
-    read(&sql(true))
-        .or_else(|error| {
-            if format!("{error:#}").contains("no such index: sqlite_autoindex_messages_1") {
-                return read(&sql(false));
-            }
-            Err(error)
-        })
-        .with_context(|| {
-            format!("reading semantic checkpoint footprint for conversation {conversation_id}")
-        })
-}
-
-fn load_checkpoint_conversation_messages(
-    storage: &FrankenStorage,
-    conversation_id: i64,
-    after_message_id: Option<i64>,
-    remaining: Option<SemanticCheckpointCaps>,
-) -> Result<Option<Vec<Message>>> {
-    if let Some(remaining) = remaining
-        && (remaining.message_limited() || remaining.byte_limited())
-        && !checkpoint_conversation_fits(storage, conversation_id, after_message_id, remaining)?
-    {
-        return Ok(None);
-    }
-    let mut messages = Vec::new();
-    let mut bytes = 0u64;
-    let completed = storage.for_each_lexical_rebuild_message(conversation_id, None, |message| {
-        if after_message_id.is_some_and(|after| message.id.is_none_or(|id| id <= after)) {
-            return Ok(true);
-        }
-        bytes = bytes.saturating_add(saturating_u64_from_usize(message.content.len()));
-        // Recheck while streaming: a writer may append after the footprint
-        // query. Never collect that newly oversized conversation only to drop
-        // it at the selector. At most one bounded message is transient here.
-        if let Some(remaining) = remaining
-            && ((remaining.message_limited() && messages.len() >= remaining.max_messages)
-                || (remaining.byte_limited() && bytes > remaining.max_bytes))
-        {
-            return Ok(false);
-        }
-        messages.push(message);
-        Ok(true)
-    })?;
-    Ok(completed.then_some(messages))
-}
-
-#[cfg(test)]
 fn select_checkpoint_capped_conversations_lazily<F>(
     conversations: Vec<CanonicalEmbeddingConversationRow>,
     after_message_id: Option<i64>,
@@ -2592,23 +1870,6 @@ fn select_checkpoint_capped_conversations_lazily<F>(
 ) -> Result<(CheckpointCappedSelection, HashMap<i64, Vec<Message>>)>
 where
     F: FnMut(i64) -> Result<Vec<Message>>,
-{
-    select_checkpoint_capped_conversations_with_admission(
-        conversations,
-        after_message_id,
-        caps,
-        |id, _| load_messages(id).map(Some),
-    )
-}
-
-fn select_checkpoint_capped_conversations_with_admission<F>(
-    conversations: Vec<CanonicalEmbeddingConversationRow>,
-    after_message_id: Option<i64>,
-    caps: SemanticCheckpointCaps,
-    mut load_messages: F,
-) -> Result<(CheckpointCappedSelection, HashMap<i64, Vec<Message>>)>
-where
-    F: FnMut(i64, Option<SemanticCheckpointCaps>) -> Result<Option<Vec<Message>>>,
 {
     let mut selected = Vec::new();
     let mut grouped_messages = HashMap::new();
@@ -2628,24 +1889,7 @@ where
             break;
         }
 
-        // The first nonempty conversation is admitted whole even if oversized.
-        // Later candidates must fit before their bodies are materialized.
-        let remaining = (!selected.is_empty()).then_some(SemanticCheckpointCaps {
-            max_messages: if caps.message_limited() {
-                caps.max_messages.saturating_sub(selected_messages)
-            } else {
-                0
-            },
-            max_bytes: if caps.byte_limited() {
-                caps.max_bytes.saturating_sub(selected_bytes)
-            } else {
-                0
-            },
-        });
-        let Some(mut messages) = load_messages(conversation.conversation_id, remaining)? else {
-            stopped_before_candidate = true;
-            break;
-        };
+        let mut messages = load_messages(conversation.conversation_id)?;
         if let Some(min_exclusive) = after_message_id {
             messages.retain(|message| message.id.is_some_and(|id| id > min_exclusive));
         }
@@ -3862,9 +3106,12 @@ impl SemanticIndexer {
         )
         .map_err(|err| anyhow::anyhow!("create fsvi index failed: {err}"))?;
 
+        // The FSVI writer buffers records until finish() publishes its own
+        // temporary file. A rejected row therefore leaves no partial index
+        // at index_path: that path can still own the previous valid generation
+        // and its acknowledged WAL. Drop only the uncommitted writer on error;
+        // never unlink the destination as purported partial-output cleanup.
         let mut records_written = 0_usize;
-        // Records remain buffered until finish. A rejected record must not
-        // remove the destination: it may still name the prior live image.
         for embedded in embedded_messages {
             validate_embedding_vector(
                 &embedded.embedding,
@@ -4295,6 +3542,28 @@ impl SemanticIndexer {
         last_message_id: Option<i64>,
         sink: &SemanticProgressSink,
     ) -> Result<SemanticBackfillBatchOutcome> {
+        self.run_backfill_batch_with_coverage(
+            messages,
+            data_dir,
+            manifest,
+            plan,
+            last_message_id,
+            sink,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_backfill_batch_with_coverage(
+        &self,
+        messages: &[EmbeddingInput],
+        data_dir: &Path,
+        manifest: &mut SemanticManifest,
+        plan: SemanticBackfillBatchPlan,
+        last_message_id: Option<i64>,
+        sink: &SemanticProgressSink,
+        coverage: Option<(&FrankenStorage, SemanticBuildSnapshot)>,
+    ) -> Result<SemanticBackfillBatchOutcome> {
         if plan.db_fingerprint.trim().is_empty() {
             bail!("semantic backfill requires a non-empty DB fingerprint");
         }
@@ -4354,6 +3623,7 @@ impl SemanticIndexer {
                 prior_checkpoint,
                 embedded_docs,
                 last_message_id,
+                coverage,
             },
             sink,
         )
@@ -4365,7 +3635,7 @@ impl SemanticIndexer {
         data_dir: &Path,
         manifest: &mut SemanticManifest,
         plan: SemanticBackfillBatchPlan,
-        progress: BackfillBatchProgress,
+        progress: BackfillBatchProgress<'_>,
         sink: &SemanticProgressSink,
     ) -> Result<SemanticBackfillBatchOutcome> {
         // Cancellation is admitted before the staging write, never halfway
@@ -4376,7 +3646,14 @@ impl SemanticIndexer {
             prior_checkpoint,
             embedded_docs,
             last_message_id,
+            coverage,
         } = progress;
+        // Merge against the complete current ledger, then publish with a
+        // lease. A late builder must never erase another embedder's update.
+        let mut expected_manifest = SemanticManifest::load(data_dir)?;
+        if let Some(current) = &expected_manifest {
+            *manifest = current.clone();
+        }
         let manifest_path = SemanticManifest::path(data_dir);
         let staging_path = semantic_staging_index_path(
             data_dir,
@@ -4403,19 +3680,32 @@ impl SemanticIndexer {
         manifest.refresh_backlog(plan.total_conversations, &plan.db_fingerprint);
 
         if complete {
+            anyhow::ensure!(
+                coverage.is_some() || !manifest.coverage.contains_key(self.embedder_id()),
+                "semantic publication cannot replace a certified owner without canonical coverage"
+            );
             let retained_generation = self.retain_published_generation_during_replacement(
                 manifest,
                 plan.tier,
                 &plan.db_fingerprint,
                 &plan.model_revision,
             );
-            let db_fingerprint = plan.db_fingerprint.clone();
+            let db_fingerprint = coverage.as_ref().map_or_else(
+                || plan.db_fingerprint.clone(),
+                |(_, snapshot)| snapshot.db_fingerprint.clone(),
+            );
             if staged_index.wal_record_count() > 0 {
                 staged_index.compact().map_err(|err| {
                     anyhow::anyhow!("compact staged semantic index failed: {err}")
                 })?;
             }
             let staged_doc_ids = validated_semantic_index_ids(&staged_index)?;
+            let expected_documents = if let Some((storage, snapshot)) = &coverage {
+                snapshot.verify(storage)?;
+                Some(semantic_index_document_digest(&staged_index)?)
+            } else {
+                None
+            };
             drop(staged_index);
             if sink.is_active() {
                 sink.emit(
@@ -4433,8 +3723,11 @@ impl SemanticIndexer {
             // Contract-replacement batches keep the old complete generation
             // published while staging. Retire it only at the actual publication
             // boundary, immediately before the fixed destination is replaced.
-            if retained_generation {
+            if retained_generation && !manifest.coverage.contains_key(self.embedder_id()) {
                 self.revoke_backfill_serving(data_dir, manifest)?;
+                // Compare against our own successful revocation, not the
+                // ledger from before it or a newly loaded unrelated writer.
+                expected_manifest = Some(manifest.clone());
             }
             // Keep the WAL parked even if publication fails: a failure may
             // follow the rename (for example directory fsync), so restoring it
@@ -4455,7 +3748,7 @@ impl SemanticIndexer {
                 .unwrap_or(final_path.as_path())
                 .to_string_lossy()
                 .to_string();
-            manifest.publish_artifact(ArtifactRecord {
+            let artifact = ArtifactRecord {
                 tier: plan.tier,
                 embedder_id: self.embedder_id().to_string(),
                 model_revision: plan.model_revision,
@@ -4472,9 +3765,23 @@ impl SemanticIndexer {
                     .map_or_else(now_ms, |checkpoint| checkpoint.saved_at_ms),
                 completed_at_ms: now_ms(),
                 ready: true,
-            });
+            };
+            if let Some((storage, snapshot)) = &coverage {
+                let (artifact, certificate) = snapshot.seal(
+                    data_dir,
+                    &final_path,
+                    artifact,
+                    expected_documents
+                        .as_deref()
+                        .context("missing canonical document receipt")?,
+                )?;
+                snapshot.verify(storage)?;
+                manifest.publish_covered_artifact(artifact, certificate)?;
+            } else {
+                manifest.publish_artifact(artifact);
+            }
             manifest.refresh_backlog(plan.total_conversations, &db_fingerprint);
-            manifest.save(data_dir)?;
+            manifest.save_if_unchanged(data_dir, expected_manifest.as_ref())?;
             if sink.is_active() {
                 sink.emit(
                     SemanticProgressEvent::PublishDone,
@@ -4526,7 +3833,7 @@ impl SemanticIndexer {
                 last_message_id: last_message_id.or(prior_last_message_id),
                 cursor_exhausted: plan.cursor_exhausted,
             });
-            manifest.save(data_dir)?;
+            manifest.save_if_unchanged(data_dir, expected_manifest.as_ref())?;
             if sink.is_active() {
                 sink.emit(
                     SemanticProgressEvent::CheckpointSaveDone,
@@ -4651,6 +3958,11 @@ impl SemanticIndexer {
         }?;
         let path = vector_index_path(data_dir, self.embedder_id());
         let recorded_path = data_dir.join(&artifact.index_path);
+        let certified = manifest
+            .coverage
+            .get(self.embedder_id())
+            .is_some_and(|certificate| certificate.matches_artifact(artifact));
+        let candidate_path = if certified { &recorded_path } else { &path };
         (artifact.tier == plan.tier
             && artifact.embedder_id == self.embedder_id()
             && artifact.model_revision == plan.model_revision
@@ -4658,9 +3970,9 @@ impl SemanticIndexer {
             && artifact.chunking_version == CHUNKING_STRATEGY_VERSION
             && artifact.dimension == self.embedder_dimension()
             && semantic_backfill_identity_matches(&artifact.db_fingerprint, &plan.db_fingerprint)
-            && recorded_path == path
-            && path.is_file())
-        .then_some(path)
+            && (recorded_path == path || certified)
+            && candidate_path.is_file())
+        .then_some(candidate_path.clone())
     }
 
     fn revoke_backfill_serving(
@@ -4671,6 +3983,26 @@ impl SemanticIndexer {
         // Complete shard metadata can override an unready monolithic record.
         // Revoke both authorities before scanning or changing any candidate.
         invalidate_identity_stale_semantic_shards(data_dir, self.embedder_id())?;
+        let expected = SemanticManifest::load(data_dir)?;
+        if let Some(current) = &expected {
+            *manifest = current.clone();
+        }
+        // The certified owner is immutable and each returned candidate is
+        // checked against the query's canonical transaction. Builder changes
+        // therefore do not revoke that last complete generation.
+        if [&manifest.fast_tier, &manifest.quality_tier]
+            .into_iter()
+            .flatten()
+            .any(|artifact| {
+                artifact.embedder_id == self.embedder_id()
+                    && manifest
+                        .coverage
+                        .get(self.embedder_id())
+                        .is_some_and(|certificate| certificate.matches_artifact(artifact))
+            })
+        {
+            return Ok(());
+        }
         for artifact in [&mut manifest.fast_tier, &mut manifest.quality_tier]
             .into_iter()
             .flatten()
@@ -4684,7 +4016,7 @@ impl SemanticIndexer {
         {
             hnsw.ready = false;
         }
-        manifest.save(data_dir)?;
+        manifest.save_if_unchanged(data_dir, expected.as_ref())?;
         Ok(())
     }
 
@@ -4751,7 +4083,22 @@ impl SemanticIndexer {
         sink: &SemanticProgressSink,
     ) -> Result<SemanticBackfillBatchOutcome> {
         self.check_external_cancelled()?;
+        let mut coverage = SemanticBuildSnapshot::capture(storage, self.embedder_id())?;
         let (candidate_path, caps) = candidate;
+        if let Some(certificate) = manifest.coverage.get(self.embedder_id())
+            && candidate_path == data_dir.join(&certificate.artifact_path)
+        {
+            let mut file = crate::search::semantic_coverage::open_semantic_proof_file(
+                data_dir,
+                &certificate.artifact_path,
+            )?;
+            if crate::search::semantic_coverage::semantic_file_sha256(&mut file)?
+                != certificate.artifact_sha256
+            {
+                return self
+                    .build_backfill_from_storage(storage, data_dir, manifest, plan, caps, sink);
+            }
+        }
         let snapshot_dir = tempfile::Builder::new()
             .prefix(".backfill-reuse-")
             .tempdir_in(data_dir.join(VECTOR_INDEX_DIR))?;
@@ -4819,7 +4166,7 @@ impl SemanticIndexer {
         );
         let (selection, replay_proof) =
             self.replay_cache
-                .select(self, storage, &plan, &existing_ids, caps, sink)?;
+                .select(self, storage, data_dir, &plan, &existing_ids, caps, sink)?;
         let replay_cache::ReconcileSelection {
             current_ids,
             selected_ids,
@@ -4834,6 +4181,9 @@ impl SemanticIndexer {
             existing_ids.intersection(&current_ids).cloned().collect();
         covered_ids.extend(selected_ids);
         let complete = covered_ids == current_ids;
+        if complete && let Some(snapshot) = &mut coverage {
+            snapshot.prepare_parents(storage, data_dir)?;
+        }
         sink.emit(
             SemanticProgressEvent::SelectionDone,
             SemanticProgressFields {
@@ -4844,8 +4194,9 @@ impl SemanticIndexer {
             },
         );
         let embeddings = self.embed_messages_with_sink(&inputs, sink)?;
-        // A cache hit is valid only while the descriptor-bound canonical archive
-        // remains unchanged, including across a potentially long embed batch.
+        // Every descriptor-bound selection, cached or freshly replayed, remains
+        // valid only while the canonical archive is unchanged, including across
+        // a potentially long embedding batch.
         replay_proof.verify(storage)?;
         let embedded_docs = saturating_u64_from_usize(embeddings.len());
         let staging_path = semantic_staging_index_path(
@@ -4880,6 +4231,11 @@ impl SemanticIndexer {
                 prior_checkpoint: None,
                 embedded_docs,
                 last_message_id,
+                coverage: if complete {
+                    coverage.map(|snapshot| (storage, snapshot))
+                } else {
+                    None
+                },
             },
             sink,
         )?;
@@ -4945,6 +4301,14 @@ impl SemanticIndexer {
         manifest: &SemanticManifest,
         plan: &SemanticBackfillStoragePlan,
     ) -> Result<Option<(PathBuf, CompletedBackfillCache)>> {
+        // An old skip hint cannot bootstrap a coverage certificate. Upgrade
+        // once through canonical reconciliation while retaining its vectors.
+        if !crate::search::external_embedder::is_external_identity(self.embedder_id())
+            && storage.semantic_archive_state()?.is_some()
+            && !manifest.coverage.contains_key(self.embedder_id())
+        {
+            return Ok(None);
+        }
         let archive_before = BackfillFilePair::archive(storage);
         let candidate = self.reusable_backfill_candidate(data_dir, manifest, plan);
         let cache_path = data_dir.join(VECTOR_INDEX_DIR).join(format!(
@@ -4965,9 +4329,19 @@ impl SemanticIndexer {
             && let Ok(cache) = serde_json::from_reader::<_, CompletedBackfillCache>(
                 std::io::Read::take(file, 64 * 1024),
             )
-            && cache.version == 1
+            && cache.version == 2
             && cache.archive == *archive
             && cache.artifact == *artifact
+            && cache.coverage.as_ref() == manifest.coverage.get(self.embedder_id())
+            && match &cache.coverage {
+                Some(certificate) => completed_coverage_boundary_matches(storage, certificate)?,
+                None => true,
+            }
+            && cache.coverage.as_ref().is_none_or(|certificate| {
+                certificate.matches_artifact(artifact)
+                    && cache.coverage_files.is_some()
+                    && completed_coverage_file_stamps(data_dir, certificate) == cache.coverage_files
+            })
             && cache.vector_space_revision == self.vector_space_revision()?
             && BackfillFilePair::capture(&path, &fsvi_wal_path_for(&path)).as_ref()
                 == Some(&cache.vectors)
@@ -4989,15 +4363,38 @@ impl SemanticIndexer {
     ) -> Result<SemanticBackfillBatchOutcome> {
         self.check_external_cancelled()?;
         let archive_before = BackfillFilePair::archive(storage);
+        let watermark_boundary = storage
+            .semantic_archive_state()?
+            .map(|state| {
+                storage
+                    .max_message_id()
+                    .map(|maximum| (state, maximum.unwrap_or(0)))
+            })
+            .transpose()?;
         let candidate = self.reusable_backfill_candidate(data_dir, manifest, &plan);
         let cache_path = data_dir.join(VECTOR_INDEX_DIR).join(format!(
             ".completed-backfill-{}-{}.json",
             plan.tier.as_str(),
             self.embedder_id()
         ));
-        if let Some((path, cache)) =
+        if let Some((path, mut cache)) =
             self.completed_backfill_cache(storage, data_dir, manifest, &plan)?
         {
+            // A deletion clears the watermark but also moves the archive, so a
+            // cache hit without one is a tier published before per-embedder
+            // watermarks. Record it once and rebind the cache to the archive
+            // as the write left it, so the next unchanged run still skips.
+            if self.certify_embed_watermark(storage, watermark_boundary.as_ref())
+                && let Some(archive) = BackfillFilePair::archive(storage)
+                && match &cache.coverage {
+                    Some(certificate) => completed_coverage_boundary_matches(storage, certificate)?,
+                    None => true,
+                }
+                && BackfillFilePair::archive(storage).as_ref() == Some(&archive)
+            {
+                cache.archive = archive;
+                persist_completed_backfill_cache(data_dir, &cache_path, &cache);
+            }
             let artifact = cache.artifact;
             sink.emit(
                 SemanticProgressEvent::Complete,
@@ -5038,38 +4435,94 @@ impl SemanticIndexer {
         // Publish a cache only when the entire canonical scan observed a
         // stable archive. This is a skip hint, never serving authority: every
         // manifest, producer and artifact check above must also agree.
+        let archive_stable =
+            archive_before.is_some() && BackfillFilePair::archive(storage) == archive_before;
+        // Certify the published generation's watermark before the cache
+        // captures the archive: a later write would move the WAL and cost the
+        // next unchanged run its cache. An archive seen to move during the
+        // scan proves no coverage.
+        if outcome.published && (archive_stable || archive_before.is_none()) {
+            self.certify_embed_watermark(storage, watermark_boundary.as_ref());
+        }
         if outcome.published
-            && let Some(archive) = archive_before
-            && BackfillFilePair::archive(storage).as_ref() == Some(&archive)
-            && let Some(vectors) = BackfillFilePair::capture(
-                &outcome.index_path,
-                &fsvi_wal_path_for(&outcome.index_path),
-            )
+            && archive_stable
+            && let Some(archive) = BackfillFilePair::archive(storage)
             && let Some(artifact) = match tier {
                 TierKind::Fast => manifest.fast_tier.as_ref(),
                 TierKind::Quality => manifest.quality_tier.as_ref(),
             }
+            && match manifest.coverage.get(self.embedder_id()) {
+                Some(certificate) => completed_coverage_boundary_matches(storage, certificate)?,
+                None => true,
+            }
+            && BackfillFilePair::archive(storage).as_ref() == Some(&archive)
+            && let published_path = data_dir.join(&artifact.index_path)
+            && let Some(vectors) =
+                BackfillFilePair::capture(&published_path, &fsvi_wal_path_for(&published_path))
         {
             let cache = CompletedBackfillCache {
-                version: 1,
+                version: 2,
                 archive,
                 vectors,
                 artifact: artifact.clone(),
                 vector_space_revision: self.vector_space_revision()?.into(),
                 last_offset: outcome.last_offset,
+                coverage: manifest.coverage.get(self.embedder_id()).cloned(),
+                coverage_files: manifest
+                    .coverage
+                    .get(self.embedder_id())
+                    .and_then(|certificate| completed_coverage_file_stamps(data_dir, certificate)),
             };
-            let saved = (|| -> Result<()> {
-                let mut staged = tempfile::NamedTempFile::new_in(data_dir.join(VECTOR_INDEX_DIR))?;
-                serde_json::to_writer(staged.as_file_mut(), &cache)?;
-                staged.as_file().sync_all()?;
-                staged.persist(&cache_path)?;
-                Ok(())
-            })();
-            if let Err(error) = saved {
-                tracing::debug!(%error, "completed backfill cache unavailable; next run will reconcile");
-            }
+            persist_completed_backfill_cache(data_dir, &cache_path, &cache);
         }
         Ok(outcome)
+    }
+
+    /// 962e8: a published or verified-unchanged generation holds every
+    /// canonical row of the archive this batch read under the maintenance
+    /// lock (the build path keeps one fingerprint across batches; reconcile
+    /// compares exact document identities), so it certifies its own vector
+    /// space's embed watermark. Background `cass index` runs can then extend a
+    /// backfill-built tier with a delta. Writes only on change and returns
+    /// whether it wrote. Never fails the batch: the tier is already published,
+    /// and a missing watermark only leaves catch-up to the next backfill.
+    fn certify_embed_watermark(
+        &self,
+        storage: &FrankenStorage,
+        boundary: Option<&(crate::storage::sqlite::SemanticArchiveState, i64)>,
+    ) -> bool {
+        if crate::search::external_embedder::is_external_identity(self.embedder_id()) {
+            return false;
+        }
+        let Some((state, max_id)) = boundary else {
+            return false;
+        };
+        let recorded = (|| {
+            let max_id = *max_id;
+            if storage.get_last_embedded_message_id(self.embedder_id())? == Some(max_id) {
+                return Ok(false);
+            }
+            crate::indexer::persist::with_ephemeral_writer(
+                storage,
+                false,
+                "certifying completed semantic coverage",
+                |writer| {
+                    writer.set_last_embedded_message_id_if_unchanged(
+                        self.embedder_id(),
+                        max_id,
+                        state,
+                    )
+                },
+            )
+        })();
+        recorded.unwrap_or_else(|error| {
+            tracing::warn!(
+                %error,
+                embedder_id = self.embedder_id(),
+                "semantic backfill published but could not record its embed watermark"
+            );
+            false
+        })
     }
 
     fn build_backfill_from_storage(
@@ -5081,12 +4534,27 @@ impl SemanticIndexer {
         caps: SemanticCheckpointCaps,
         sink: &SemanticProgressSink,
     ) -> Result<SemanticBackfillBatchOutcome> {
+        let mut coverage = SemanticBuildSnapshot::capture(storage, self.embedder_id())?;
         // A cursor without its vectors proves no coverage. This includes a
         // crash after moving staging to live but before saving the manifest.
         if manifest.checkpoint.as_ref().is_some_and(|checkpoint| {
             checkpoint.tier == plan.tier && checkpoint.embedder_id == self.embedder_id()
         }) {
-            manifest.checkpoint = None;
+            // A missing staging owner must restart at the beginning. Persist
+            // abandonment before prepare_backfill_serving reloads the ledger;
+            // never resurrect its old cursor or erase a concurrent checkpoint.
+            if let Some(current) = SemanticManifest::load(data_dir)? {
+                anyhow::ensure!(
+                    current.checkpoint == manifest.checkpoint,
+                    "semantic checkpoint changed before missing-staging recovery; retry"
+                );
+                let expected = current.clone();
+                *manifest = current;
+                manifest.checkpoint = None;
+                manifest.save_if_unchanged(data_dir, Some(&expected))?;
+            } else {
+                manifest.checkpoint = None;
+            }
         }
         self.prepare_backfill_serving(data_dir, manifest, &plan)?;
         let prior_checkpoint = manifest.checkpoint.as_ref().filter(|checkpoint| {
@@ -5267,7 +4735,12 @@ impl SemanticIndexer {
             (None, None) => None,
         };
 
-        let outcome = self.run_backfill_batch_with_sink(
+        if batch.cursor_exhausted
+            && let Some(snapshot) = &mut coverage
+        {
+            snapshot.prepare_parents(storage, data_dir)?;
+        }
+        let outcome = self.run_backfill_batch_with_coverage(
             &batch.inputs,
             data_dir,
             manifest,
@@ -5282,6 +4755,11 @@ impl SemanticIndexer {
             },
             next_last_message_id,
             sink,
+            if batch.cursor_exhausted {
+                coverage.map(|snapshot| (storage, snapshot))
+            } else {
+                None
+            },
         );
 
         match &outcome {
@@ -5375,264 +4853,8 @@ mod tests {
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::storage::sqlite::FrankenStorage;
     use serde_json::json;
-    use sha2::Digest;
     use std::path::Path;
     use tempfile::tempdir;
-
-    fn retained_stage_fixture(count: usize) -> Result<(tempfile::TempDir, FrankenStorage)> {
-        let directory = tempdir()?;
-        let storage = FrankenStorage::open(&directory.path().join("actual-stage-source.db"))?;
-        let agent = storage.ensure_agent(&Agent {
-            id: None,
-            slug: "codex".into(),
-            name: "Codex".into(),
-            version: None,
-            kind: AgentKind::Cli,
-        })?;
-        for index in 0..count {
-            storage.insert_conversation_tree(
-                agent,
-                None,
-                &test_conversation(
-                    &format!("retained-source-{index}"),
-                    &format!(
-                        "**Actual passage {index}** describes source-bound transaction staging."
-                    ),
-                ),
-            )?;
-        }
-        Ok((directory, storage))
-    }
-
-    fn retained_stage_contract() -> SemanticSourceContract {
-        use crate::search::semantic_reader::publication::text::hydration::PassageProjection;
-        SemanticSourceContract::new(PassageProjection::RawPassagesV2)
-    }
-
-    #[test]
-    fn retained_stage_empty_source_never_acquires_producers_or_vectors() -> Result<()> {
-        use crate::franken_sync::compat::TransactionExt;
-        let (directory, storage) = retained_stage_fixture(0)?;
-        let mut transaction = storage.raw().transaction()?;
-        let stage = stage_retained_semantic_generation(
-            &transaction,
-            directory.path(),
-            retained_stage_contract(),
-            RetainedSemanticStagePolicy::default(),
-            |_| panic!("an empty source must not acquire or measure a model"),
-            || Ok(()),
-        )?;
-        assert_eq!(stage.purpose(), SemanticGenerationPurpose::EmptyCorpus);
-        assert_eq!(stage.source().identity().document_count, 0);
-        assert!(stage.vectors().is_empty());
-        assert_eq!(fs::read_dir(stage.directory())?.count(), 0);
-        assert!(
-            !crate::search::semantic_manifest::SemanticCurrentPointerV1::path(directory.path())
-                .exists()
-        );
-        assert!(
-            super::super::artifacts::BackfillArtifacts::for_shard_publication(directory.path())
-                .is_err()
-        );
-        drop(stage);
-        let _released =
-            super::super::artifacts::BackfillArtifacts::for_shard_publication(directory.path())?;
-        transaction.rollback()?;
-        Ok(())
-    }
-
-    #[test]
-    fn retained_stage_control_preserves_actual_source_shards_and_partial_quality() -> Result<()> {
-        use crate::franken_sync::compat::TransactionExt;
-        let (directory, storage) = retained_stage_fixture(3)?;
-        let mut transaction = storage.raw().transaction()?;
-        let contract = retained_stage_contract();
-        // Actual hash owners test source/partition/lease mechanics. They never
-        // stand in for semantic models or qualify progressive relevance.
-        let producer = Arc::new(CassPassageProducer::new(
-            Arc::new(HashEmbedder::new(32)),
-            contract,
-        )?);
-        let stage = stage_retained_semantic_generation(
-            &transaction,
-            directory.path(),
-            contract,
-            RetainedSemanticStagePolicy {
-                requested_topology: SemanticGenerationTopology::FullProgressive,
-                max_documents_per_shard: 1,
-                quality_document_limit: Some(1),
-                allow_hash_control: true,
-                ..Default::default()
-            },
-            |source| {
-                assert_eq!(source.identity().document_count, 3);
-                Ok(RetainedSemanticStageProducers {
-                    fast: Some(producer.clone()),
-                    quality: Some(producer.clone()),
-                })
-            },
-            || Ok(()),
-        )?;
-        assert_eq!(stage.purpose(), SemanticGenerationPurpose::HashControl);
-        assert_eq!(
-            stage.realized_topology(),
-            SemanticGenerationTopology::FullProgressive
-        );
-        assert_eq!(stage.vectors().len(), 4);
-        let mut fast_ids = BTreeSet::new();
-        let mut quality_ids = BTreeSet::new();
-        let mut publication_nonce = None;
-        for vector in stage.vectors() {
-            let owner = vector.owner();
-            let artifact = vector.artifact();
-            assert_eq!(owner.witness().generation, stage.generation());
-            assert_eq!(
-                owner.witness().whole_image_sha256.as_slice(),
-                sha2::Sha256::digest(fs::read(vector.path())?).as_slice()
-            );
-            assert_eq!(artifact.selected_document_count, 3);
-            assert_eq!(artifact.covered_document_count, 1);
-            assert!(owner.published_wal_absent());
-            assert!(!fsvi_wal_path_for(vector.path()).exists());
-            assert!(artifact.validate_fsvi_owner(owner).is_ok());
-            let nonce = owner.metadata().publication_nonce;
-            assert_ne!(nonce, 0);
-            if let Some(expected) = publication_nonce {
-                assert_eq!(nonce, expected);
-            }
-            publication_nonce = Some(nonce);
-            let id = owner.doc_id_at(0)?.to_owned();
-            let hits = owner.search_top_k(&owner.vector_at_f32(0)?, 1, None)?;
-            assert_eq!(hits.len(), 1);
-            assert_eq!(hits[0].doc_id, id);
-            match artifact.role {
-                SemanticArtifactRole::FastVector => {
-                    assert!(fast_ids.insert(id));
-                }
-                SemanticArtifactRole::QualityVector => {
-                    assert!(quality_ids.insert(id));
-                }
-                _ => bail!("staging created an unrequested artifact"),
-            }
-        }
-        assert_eq!(fast_ids.len(), 3);
-        assert_eq!(quality_ids.len(), 1);
-        assert!(quality_ids.is_subset(&fast_ids));
-        assert_eq!(quality_ids.first(), fast_ids.first());
-        assert!(
-            !crate::search::semantic_manifest::SemanticCurrentPointerV1::path(directory.path())
-                .exists()
-        );
-        drop(stage);
-        transaction.rollback()?;
-        Ok(())
-    }
-
-    #[test]
-    fn retained_stage_refuses_foreign_contract_control_intent_and_payload() -> Result<()> {
-        use crate::franken_sync::compat::TransactionExt;
-        use crate::search::semantic_reader::publication::text::hydration::PassageProjection;
-        let (directory, storage) = retained_stage_fixture(1)?;
-        let mut transaction = storage.raw().transaction()?;
-        let contract = retained_stage_contract();
-        for (producer_contract, allow_control, payload, expected) in [
-            (
-                SemanticSourceContract::new(PassageProjection::CanonicalPrefixV1),
-                true,
-                u64::MAX,
-                "source contract mismatch",
-            ),
-            (
-                contract,
-                false,
-                u64::MAX,
-                "explicit retained control intent",
-            ),
-            (contract, true, 0, "payload budget exceeded"),
-        ] {
-            let result = stage_retained_semantic_generation(
-                &transaction,
-                directory.path(),
-                contract,
-                RetainedSemanticStagePolicy {
-                    allow_hash_control: allow_control,
-                    max_pending_payload_bytes: payload,
-                    ..Default::default()
-                },
-                |_| {
-                    Ok(RetainedSemanticStageProducers {
-                        fast: None,
-                        quality: Some(Arc::new(CassPassageProducer::new(
-                            Arc::new(HashEmbedder::new(32)),
-                            producer_contract,
-                        )?)),
-                    })
-                },
-                || Ok(()),
-            );
-            let Err(error) = result else {
-                bail!("invalid retained stage was admitted");
-            };
-            assert!(error.to_string().contains(expected), "{error:#}");
-            assert!(!directory.path().join("vector_index/generations").exists());
-            assert!(
-                !crate::search::semantic_manifest::SemanticCurrentPointerV1::path(directory.path())
-                    .exists()
-            );
-        }
-        transaction.rollback()?;
-        Ok(())
-    }
-
-    #[test]
-    fn retained_stage_source_failure_and_cancellation_keep_selection_absent() -> Result<()> {
-        use crate::franken_sync::compat::TransactionExt;
-        use std::cell::Cell;
-        let (directory, storage) = retained_stage_fixture(2)?;
-        let mut transaction = storage.raw().transaction()?;
-        let contract = retained_stage_contract();
-        let bounded = stage_retained_semantic_generation(
-            &transaction,
-            directory.path(),
-            contract,
-            RetainedSemanticStagePolicy {
-                max_plan_payload_bytes: 0,
-                ..Default::default()
-            },
-            |_| panic!("complete source admission must precede the producer factory"),
-            || Ok(()),
-        );
-        assert!(bounded.is_err());
-        let cancelled = Cell::new(false);
-        let interrupted = stage_retained_semantic_generation(
-            &transaction,
-            directory.path(),
-            contract,
-            RetainedSemanticStagePolicy::default(),
-            |_| {
-                cancelled.set(true);
-                Ok(RetainedSemanticStageProducers {
-                    fast: None,
-                    quality: None,
-                })
-            },
-            || {
-                anyhow::ensure!(!cancelled.get(), "operator cancelled retained staging");
-                Ok(())
-            },
-        );
-        let Err(error) = interrupted else {
-            bail!("cancelled retained stage was admitted");
-        };
-        assert!(error.to_string().contains("operator cancelled"));
-        assert!(!directory.path().join("vector_index/generations").exists());
-        assert!(
-            !crate::search::semantic_manifest::SemanticCurrentPointerV1::path(directory.path())
-                .exists()
-        );
-        transaction.rollback()?;
-        Ok(())
-    }
 
     #[test]
     fn hnsw_maintenance_refuses_an_incompatible_vector_contract() -> Result<()> {
@@ -6425,85 +5647,6 @@ mod tests {
             };
             if !error.to_string().contains(expected_message) {
                 bail!("unexpected validation error: {error:#}");
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn failed_build_preserves_destination_and_journal_after_valid_prefix() -> Result<()> {
-        let indexer = SemanticIndexer::new("hash", None)?;
-        for existing_destination in [false, true] {
-            let temp = tempdir()?;
-            let path = vector_index_path(temp.path(), indexer.embedder_id());
-            let parent = path.parent().context("vector parent")?;
-            fs::create_dir_all(parent)?;
-            let wal = fsvi_wal_path_for(&path);
-            if existing_destination {
-                let original = indexer.embed_messages(&[EmbeddingInput::new(1, "prior image")])?;
-                drop(indexer.build_and_save_index(original, temp.path())?);
-                fs::write(&wal, b"owned journal preservation canary")?;
-            }
-            let original_image = existing_destination.then(|| fs::read(&path)).transpose()?;
-            let original_modified = existing_destination
-                .then(|| fs::metadata(&path)?.modified())
-                .transpose()?;
-            let original_wal = existing_destination.then(|| fs::read(&wal)).transpose()?;
-            let original_wal_modified = existing_destination
-                .then(|| fs::metadata(&wal)?.modified())
-                .transpose()?;
-            let entries = || -> std::io::Result<Vec<std::ffi::OsString>> {
-                let mut names = fs::read_dir(parent)?
-                    .map(|entry| entry.map(|entry| entry.file_name()))
-                    .collect::<std::io::Result<Vec<_>>>()?;
-                names.sort();
-                Ok(names)
-            };
-            let original_entries = entries()?;
-            for (replacement, expected_error) in [
-                (vec![f32::NAN; 384], "non-finite"),
-                (vec![f32::INFINITY; 384], "non-finite"),
-                (vec![1.0; 383], "dimension mismatch"),
-                (Vec::new(), "dimension mismatch"),
-                // Finite and correctly shaped, but rejected by the public
-                // writer after CASS's dimension/finite preflight passes.
-                (vec![0.0; 384], "non-zero"),
-            ] {
-                for invalid_position in 0..2 {
-                    let mut candidate = indexer.embed_messages(&[
-                        EmbeddingInput::new(2, "first replacement"),
-                        EmbeddingInput::new(3, "second replacement"),
-                    ])?;
-                    candidate[invalid_position].embedding = replacement.clone();
-                    let mut progress = Vec::new();
-                    let error = indexer
-                        .build_and_save_index_at_path_with_progress(candidate, &path, |count| {
-                            progress.push(count);
-                        })
-                        .expect_err("invalid replacement must not publish");
-                    assert!(error.to_string().contains(expected_error), "{error:#}");
-                    assert_eq!(
-                        progress,
-                        if invalid_position == 0 {
-                            vec![]
-                        } else {
-                            vec![1]
-                        }
-                    );
-                    if let Some(bytes) = &original_image {
-                        assert_eq!(&fs::read(&path)?, bytes);
-                        assert_eq!(Some(fs::metadata(&path)?.modified()?), original_modified);
-                    } else {
-                        assert!(!path.exists(), "failed build exposed a new image");
-                    }
-                    if let Some(bytes) = &original_wal {
-                        assert_eq!(&fs::read(&wal)?, bytes);
-                        assert_eq!(Some(fs::metadata(&wal)?.modified()?), original_wal_modified);
-                    } else {
-                        assert!(!wal.exists(), "failed build created a journal");
-                    }
-                    assert_eq!(entries()?, original_entries);
-                }
             }
         }
         Ok(())
@@ -7897,7 +7040,7 @@ mod tests {
     }
 
     #[test]
-    fn gh458_reconcile_revokes_live_and_shard_readiness_until_complete() -> Result<()> {
+    fn gh458_legacy_reconcile_revokes_live_and_shard_readiness_until_complete() -> Result<()> {
         use crate::search::asset_state::{SemanticPreference, semantic_state_from_availability};
         use crate::search::model_manager::SemanticAvailability;
 
@@ -7929,6 +7072,18 @@ mod tests {
             plan.clone(),
         )?;
         assert!(initial.published);
+        // This regression exercises the original strict, uncertified format.
+        // A newly completed native backfill now seals a separate served owner;
+        // explicitly restore the historical mutable-path ledger for this test.
+        let canonical_path = vector_index_path(temp.path(), indexer.embedder_id());
+        let mut legacy = manifest.fast_tier.clone().context("initial artifact")?;
+        legacy.index_path = canonical_path
+            .strip_prefix(temp.path())?
+            .to_string_lossy()
+            .into_owned();
+        manifest.publish_artifact(legacy);
+        manifest.save(temp.path())?;
+        assert!(!manifest.coverage.contains_key(indexer.embedder_id()));
         indexer.build_and_save_index_shards(
             indexer.embed_messages(&packet_embedding_inputs_from_storage(&storage)?)?,
             temp.path(),
@@ -7963,7 +7118,7 @@ mod tests {
         );
         manifest.fast_tier.as_mut().unwrap().ready = true;
         manifest.save(temp.path())?;
-        let live_before = fs::read(&initial.index_path)?;
+        let live_before = fs::read(&canonical_path)?;
         storage.raw().execute(
             "UPDATE messages SET content = 'changed content under existing rowid' WHERE conversation_id <= 3",
         )?;
@@ -7981,7 +7136,7 @@ mod tests {
             )?;
             assert!(!partial.published);
             assert_eq!(partial.embedded_docs, 1);
-            assert_eq!(fs::read(&initial.index_path)?, live_before);
+            assert_eq!(fs::read(&canonical_path)?, live_before);
             let observed = state();
             assert_eq!(observed.fast_tier.current_db_matches, Some(true));
             assert!(!observed.fast_tier.ready);
@@ -8481,11 +7636,17 @@ mod tests {
             writer.finish()?;
         }
         let prior_live = fs::read(&initial.index_path)?;
-        manifest
-            .fast_tier
-            .as_mut()
-            .context("initial artifact")?
-            .chunking_version = 1;
+        let mut legacy = manifest.fast_tier.clone().context("initial artifact")?;
+        legacy.chunking_version = 1;
+        legacy.index_path = initial
+            .index_path
+            .strip_prefix(temp.path())?
+            .to_string_lossy()
+            .into_owned();
+        legacy.doc_count = u64::try_from(legacy_vectors.len())?;
+        legacy.size_bytes = fs::metadata(&initial.index_path)?.len();
+        manifest.publish_artifact(legacy);
+        assert!(!manifest.coverage.contains_key(indexer.embedder_id()));
         manifest.checkpoint = Some(BuildCheckpoint {
             tier: TierKind::Fast,
             embedder_id: indexer.embedder_id().into(),
@@ -8594,6 +7755,18 @@ mod tests {
         }
         legacy.finish()?;
         let prior_bytes = fs::read(&published.index_path)?;
+        // The rewritten builder is an actual legacy generation, not a change
+        // to the independently sealed current generation created above.
+        let mut artifact = manifest.fast_tier.clone().context("initial artifact")?;
+        artifact.index_path = published
+            .index_path
+            .strip_prefix(temp.path())?
+            .to_string_lossy()
+            .into_owned();
+        artifact.size_bytes = u64::try_from(prior_bytes.len())?;
+        manifest.publish_artifact(artifact);
+        manifest.save(temp.path())?;
+        assert!(!manifest.coverage.contains_key(indexer.embedder_id()));
         let first = run(&mut manifest, 1)?;
         assert_eq!(first.embedded_docs, 1);
         assert!(first.checkpoint_saved);
@@ -9283,60 +8456,54 @@ mod tests {
         drop(bootstrap_storage);
 
         // Fixture construction is deliberately outside the measured region.
-        // Use FrankenSQLite and prepared statements for the entire fixture;
-        // the actual count and selection proof below reopens the same file
-        // through FrankenStorage.
-        use crate::franken_sync::compat::TransactionExt as _;
-        let sqlite = crate::franken_sync::Connection::open(
-            db_path
-                .to_str()
-                .context("fixture database path is not UTF-8")?,
-        )?;
-        sqlite.execute("PRAGMA journal_mode = WAL")?;
-        let mut tx = sqlite.transaction()?;
+        // Use the repo's existing C-SQLite interop dependency and prepared
+        // statements so creating 432k rows does not dominate this ignored
+        // acceptance test. The actual count and selection proof below reopens
+        // the database through FrankenStorage/FrankenSQLite.
+        let mut sqlite = rusqlite::Connection::open(&db_path)?;
+        let tx = sqlite.transaction()?;
         let mut message_id = 1_i64;
         {
-            let insert_conversation = sqlite.prepare(
+            let mut insert_conversation = tx.prepare(
                 "INSERT INTO conversations(
                      id, agent_id, source_id, external_id, source_path
                  ) VALUES(?1, ?2, 'local', ?3, ?4)",
             )?;
-            let insert_message = sqlite.prepare(
+            let mut insert_message = tx.prepare(
                 "INSERT INTO messages(
                      id, conversation_id, idx, role, content
                  ) VALUES(?1, ?2, ?3, 'user', 'semantic acceptance row')",
             )?;
-            let insert_tail = sqlite.prepare(
+            let mut insert_tail = tx.prepare(
                 "INSERT INTO conversation_tail_state(conversation_id, last_message_idx)
                  VALUES(?1, ?2)",
             )?;
             for conversation_id in 1..=CONVERSATION_COUNT {
                 let external_id = format!("cass-343-large-{conversation_id}");
                 let source_path = format!("/tmp/cass-343/{conversation_id}.jsonl");
-                insert_conversation.execute_with_params(&[
-                    SqliteValue::Integer(conversation_id),
-                    SqliteValue::Integer(agent_id),
-                    SqliteValue::Text(external_id.into()),
-                    SqliteValue::Text(source_path.into()),
+                insert_conversation.execute(rusqlite::params![
+                    conversation_id,
+                    agent_id,
+                    external_id,
+                    source_path
                 ])?;
                 let messages_in_conversation =
                     28 + i64::from(conversation_id <= CONVERSATIONS_WITH_EXTRA_MESSAGE);
                 for message_index in 0..messages_in_conversation {
-                    insert_message.execute_with_params(&[
-                        SqliteValue::Integer(message_id),
-                        SqliteValue::Integer(conversation_id),
-                        SqliteValue::Integer(message_index),
+                    insert_message.execute(rusqlite::params![
+                        message_id,
+                        conversation_id,
+                        message_index
                     ])?;
                     message_id = message_id.saturating_add(1);
                 }
-                insert_tail.execute_with_params(&[
-                    SqliteValue::Integer(conversation_id),
-                    SqliteValue::Integer(messages_in_conversation - 1),
+                insert_tail.execute(rusqlite::params![
+                    conversation_id,
+                    messages_in_conversation - 1
                 ])?;
             }
         }
         tx.commit()?;
-        drop(tx);
         drop(sqlite);
         assert_eq!(message_id - 1, MESSAGE_COUNT);
 

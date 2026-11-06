@@ -181,7 +181,11 @@ test.describe("Encrypted Export - Wrong Password", () => {
 });
 
 test.describe("Encrypted Export - Security", () => {
-  // Positive unlock prevents an empty page from satisfying the privacy check.
+  // 2l1b0.67 in a real browser: before unlock, neither the title nor the
+  // session metadata nor any message text is readable; after unlock the same
+  // conversation text appears, so the negative cannot pass on an empty page.
+  // The phrases come from the export's fixture (claude_code_auth_fix.jsonl):
+  // its first prompt, workspace path and git branch.
   test("no plaintext title, metadata or messages before unlock", async ({
     page,
     encryptedExportPath,

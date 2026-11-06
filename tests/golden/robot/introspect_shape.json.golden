@@ -4309,6 +4309,23 @@
                             }
                           }
                         },
+                        "manifest_source": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "enum": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
                         "segment_files": {
                           "type": "object",
                           "properties": {
@@ -4837,6 +4854,143 @@
                                       }
                                     }
                                   }
+                                },
+                                "coverage": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "description": {
+                                      "type": "string"
+                                    },
+                                    "properties": {
+                                      "type": "object",
+                                      "properties": {
+                                        "status": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "enum": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "generation": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "published_at_ms": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "published_mutation_seq": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "current_mutation_seq": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "published_max_message_id": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "current_max_message_id": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "indexed_passages": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "excluded_candidates": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "candidate_window_limited": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "stale_reason": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        }
+                                      }
+                                    },
+                                    "required": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "additionalProperties": {
+                                      "type": "boolean"
+                                    }
+                                  }
                                 }
                               }
                             }
@@ -4952,6 +5106,143 @@
                                       "items": {
                                         "type": "string"
                                       }
+                                    }
+                                  }
+                                },
+                                "coverage": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "description": {
+                                      "type": "string"
+                                    },
+                                    "properties": {
+                                      "type": "object",
+                                      "properties": {
+                                        "status": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "enum": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "generation": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "published_at_ms": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "published_mutation_seq": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "current_mutation_seq": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "published_max_message_id": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "current_max_message_id": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "indexed_passages": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "excluded_candidates": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "candidate_window_limited": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "stale_reason": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        }
+                                      }
+                                    },
+                                    "required": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "additionalProperties": {
+                                      "type": "boolean"
                                     }
                                   }
                                 }
@@ -168350,6 +168641,143 @@
                                       }
                                     }
                                   }
+                                },
+                                "coverage": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "description": {
+                                      "type": "string"
+                                    },
+                                    "properties": {
+                                      "type": "object",
+                                      "properties": {
+                                        "status": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "enum": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "generation": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "published_at_ms": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "published_mutation_seq": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "current_mutation_seq": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "published_max_message_id": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "current_max_message_id": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "indexed_passages": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "excluded_candidates": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "candidate_window_limited": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "stale_reason": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        }
+                                      }
+                                    },
+                                    "required": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "additionalProperties": {
+                                      "type": "boolean"
+                                    }
+                                  }
                                 }
                               }
                             }
@@ -168465,6 +168893,143 @@
                                       "items": {
                                         "type": "string"
                                       }
+                                    }
+                                  }
+                                },
+                                "coverage": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "description": {
+                                      "type": "string"
+                                    },
+                                    "properties": {
+                                      "type": "object",
+                                      "properties": {
+                                        "status": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "enum": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "generation": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "published_at_ms": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "published_mutation_seq": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "current_mutation_seq": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "published_max_message_id": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "current_max_message_id": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "indexed_passages": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "excluded_candidates": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "candidate_window_limited": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "stale_reason": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        }
+                                      }
+                                    },
+                                    "required": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "additionalProperties": {
+                                      "type": "boolean"
                                     }
                                   }
                                 }
@@ -190945,6 +191510,23 @@
                                     }
                                   }
                                 },
+                                "manifest_source": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "enum": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
                                 "segment_files": {
                                   "type": "object",
                                   "properties": {
@@ -191314,6 +191896,17 @@
                                   "properties": {
                                     "type": {
                                       "type": "string"
+                                    }
+                                  }
+                                },
+                                "lexical_replay": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
                                     }
                                   }
                                 },
@@ -191895,6 +192488,143 @@
                                               }
                                             }
                                           }
+                                        },
+                                        "coverage": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "description": {
+                                              "type": "string"
+                                            },
+                                            "properties": {
+                                              "type": "object",
+                                              "properties": {
+                                                "status": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "enum": {
+                                                      "type": "array",
+                                                      "items": {
+                                                        "type": "string"
+                                                      }
+                                                    }
+                                                  }
+                                                },
+                                                "generation": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                },
+                                                "published_at_ms": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                },
+                                                "published_mutation_seq": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "current_mutation_seq": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "published_max_message_id": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "current_max_message_id": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "indexed_passages": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "excluded_candidates": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "candidate_window_limited": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                },
+                                                "stale_reason": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                }
+                                              }
+                                            },
+                                            "required": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            },
+                                            "additionalProperties": {
+                                              "type": "boolean"
+                                            }
+                                          }
                                         }
                                       }
                                     }
@@ -192010,6 +192740,143 @@
                                               "items": {
                                                 "type": "string"
                                               }
+                                            }
+                                          }
+                                        },
+                                        "coverage": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "description": {
+                                              "type": "string"
+                                            },
+                                            "properties": {
+                                              "type": "object",
+                                              "properties": {
+                                                "status": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "enum": {
+                                                      "type": "array",
+                                                      "items": {
+                                                        "type": "string"
+                                                      }
+                                                    }
+                                                  }
+                                                },
+                                                "generation": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                },
+                                                "published_at_ms": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                },
+                                                "published_mutation_seq": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "current_mutation_seq": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "published_max_message_id": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "current_max_message_id": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "indexed_passages": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "excluded_candidates": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "candidate_window_limited": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                },
+                                                "stale_reason": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                }
+                                              }
+                                            },
+                                            "required": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            },
+                                            "additionalProperties": {
+                                              "type": "boolean"
                                             }
                                           }
                                         }
@@ -196684,6 +197551,143 @@
                             }
                           }
                         },
+                        "semantic_coverage": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "description": {
+                              "type": "string"
+                            },
+                            "properties": {
+                              "type": "object",
+                              "properties": {
+                                "status": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "enum": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "generation": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "published_at_ms": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "published_mutation_seq": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "current_mutation_seq": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "published_max_message_id": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "current_max_message_id": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "indexed_passages": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "excluded_candidates": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "candidate_window_limited": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "stale_reason": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                }
+                              }
+                            },
+                            "required": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "additionalProperties": {
+                              "type": "boolean"
+                            }
+                          }
+                        },
                         "semantic_fallback_reason": {
                           "type": "object",
                           "properties": {
@@ -197615,6 +198619,143 @@
                                               "type": "string"
                                             }
                                           }
+                                        },
+                                        "semantic_coverage": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "description": {
+                                              "type": "string"
+                                            },
+                                            "properties": {
+                                              "type": "object",
+                                              "properties": {
+                                                "status": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "enum": {
+                                                      "type": "array",
+                                                      "items": {
+                                                        "type": "string"
+                                                      }
+                                                    }
+                                                  }
+                                                },
+                                                "generation": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                },
+                                                "published_at_ms": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                },
+                                                "published_mutation_seq": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "current_mutation_seq": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "published_max_message_id": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "current_max_message_id": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "indexed_passages": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "excluded_candidates": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "candidate_window_limited": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                },
+                                                "stale_reason": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                }
+                                              }
+                                            },
+                                            "required": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            },
+                                            "additionalProperties": {
+                                              "type": "boolean"
+                                            }
+                                          }
                                         }
                                       }
                                     }
@@ -198289,6 +199430,23 @@
                                             }
                                           }
                                         },
+                                        "manifest_source": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            },
+                                            "enum": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
                                         "segment_files": {
                                           "type": "object",
                                           "properties": {
@@ -198658,6 +199816,17 @@
                                           "properties": {
                                             "type": {
                                               "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "lexical_replay": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
                                             }
                                           }
                                         },
@@ -199239,6 +200408,143 @@
                                                       }
                                                     }
                                                   }
+                                                },
+                                                "coverage": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "description": {
+                                                      "type": "string"
+                                                    },
+                                                    "properties": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "status": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "type": {
+                                                              "type": "string"
+                                                            },
+                                                            "enum": {
+                                                              "type": "array",
+                                                              "items": {
+                                                                "type": "string"
+                                                              }
+                                                            }
+                                                          }
+                                                        },
+                                                        "generation": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "type": {
+                                                              "type": "string"
+                                                            }
+                                                          }
+                                                        },
+                                                        "published_at_ms": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "type": {
+                                                              "type": "string"
+                                                            }
+                                                          }
+                                                        },
+                                                        "published_mutation_seq": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "type": {
+                                                              "type": "string"
+                                                            },
+                                                            "minimum": {
+                                                              "type": "integer"
+                                                            }
+                                                          }
+                                                        },
+                                                        "current_mutation_seq": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "type": {
+                                                              "type": "string"
+                                                            },
+                                                            "minimum": {
+                                                              "type": "integer"
+                                                            }
+                                                          }
+                                                        },
+                                                        "published_max_message_id": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "type": {
+                                                              "type": "string"
+                                                            },
+                                                            "minimum": {
+                                                              "type": "integer"
+                                                            }
+                                                          }
+                                                        },
+                                                        "current_max_message_id": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "type": {
+                                                              "type": "string"
+                                                            },
+                                                            "minimum": {
+                                                              "type": "integer"
+                                                            }
+                                                          }
+                                                        },
+                                                        "indexed_passages": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "type": {
+                                                              "type": "string"
+                                                            },
+                                                            "minimum": {
+                                                              "type": "integer"
+                                                            }
+                                                          }
+                                                        },
+                                                        "excluded_candidates": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "type": {
+                                                              "type": "string"
+                                                            },
+                                                            "minimum": {
+                                                              "type": "integer"
+                                                            }
+                                                          }
+                                                        },
+                                                        "candidate_window_limited": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "type": {
+                                                              "type": "string"
+                                                            }
+                                                          }
+                                                        },
+                                                        "stale_reason": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "type": {
+                                                              "type": "string"
+                                                            }
+                                                          }
+                                                        }
+                                                      }
+                                                    },
+                                                    "required": {
+                                                      "type": "array",
+                                                      "items": {
+                                                        "type": "string"
+                                                      }
+                                                    },
+                                                    "additionalProperties": {
+                                                      "type": "boolean"
+                                                    }
+                                                  }
                                                 }
                                               }
                                             }
@@ -199354,6 +200660,143 @@
                                                       "items": {
                                                         "type": "string"
                                                       }
+                                                    }
+                                                  }
+                                                },
+                                                "coverage": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "description": {
+                                                      "type": "string"
+                                                    },
+                                                    "properties": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "status": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "type": {
+                                                              "type": "string"
+                                                            },
+                                                            "enum": {
+                                                              "type": "array",
+                                                              "items": {
+                                                                "type": "string"
+                                                              }
+                                                            }
+                                                          }
+                                                        },
+                                                        "generation": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "type": {
+                                                              "type": "string"
+                                                            }
+                                                          }
+                                                        },
+                                                        "published_at_ms": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "type": {
+                                                              "type": "string"
+                                                            }
+                                                          }
+                                                        },
+                                                        "published_mutation_seq": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "type": {
+                                                              "type": "string"
+                                                            },
+                                                            "minimum": {
+                                                              "type": "integer"
+                                                            }
+                                                          }
+                                                        },
+                                                        "current_mutation_seq": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "type": {
+                                                              "type": "string"
+                                                            },
+                                                            "minimum": {
+                                                              "type": "integer"
+                                                            }
+                                                          }
+                                                        },
+                                                        "published_max_message_id": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "type": {
+                                                              "type": "string"
+                                                            },
+                                                            "minimum": {
+                                                              "type": "integer"
+                                                            }
+                                                          }
+                                                        },
+                                                        "current_max_message_id": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "type": {
+                                                              "type": "string"
+                                                            },
+                                                            "minimum": {
+                                                              "type": "integer"
+                                                            }
+                                                          }
+                                                        },
+                                                        "indexed_passages": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "type": {
+                                                              "type": "string"
+                                                            },
+                                                            "minimum": {
+                                                              "type": "integer"
+                                                            }
+                                                          }
+                                                        },
+                                                        "excluded_candidates": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "type": {
+                                                              "type": "string"
+                                                            },
+                                                            "minimum": {
+                                                              "type": "integer"
+                                                            }
+                                                          }
+                                                        },
+                                                        "candidate_window_limited": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "type": {
+                                                              "type": "string"
+                                                            }
+                                                          }
+                                                        },
+                                                        "stale_reason": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "type": {
+                                                              "type": "string"
+                                                            }
+                                                          }
+                                                        }
+                                                      }
+                                                    },
+                                                    "required": {
+                                                      "type": "array",
+                                                      "items": {
+                                                        "type": "string"
+                                                      }
+                                                    },
+                                                    "additionalProperties": {
+                                                      "type": "boolean"
                                                     }
                                                   }
                                                 }
@@ -201462,6 +202905,23 @@
                             }
                           }
                         },
+                        "manifest_source": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "enum": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
                         "segment_files": {
                           "type": "object",
                           "properties": {
@@ -201839,6 +203299,17 @@
                           "properties": {
                             "type": {
                               "type": "string"
+                            }
+                          }
+                        },
+                        "lexical_replay": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
                             }
                           }
                         },
@@ -202677,6 +204148,143 @@
                                       }
                                     }
                                   }
+                                },
+                                "coverage": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "description": {
+                                      "type": "string"
+                                    },
+                                    "properties": {
+                                      "type": "object",
+                                      "properties": {
+                                        "status": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "enum": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "generation": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "published_at_ms": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "published_mutation_seq": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "current_mutation_seq": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "published_max_message_id": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "current_max_message_id": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "indexed_passages": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "excluded_candidates": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "candidate_window_limited": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "stale_reason": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        }
+                                      }
+                                    },
+                                    "required": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "additionalProperties": {
+                                      "type": "boolean"
+                                    }
+                                  }
                                 }
                               }
                             }
@@ -202792,6 +204400,143 @@
                                       "items": {
                                         "type": "string"
                                       }
+                                    }
+                                  }
+                                },
+                                "coverage": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "description": {
+                                      "type": "string"
+                                    },
+                                    "properties": {
+                                      "type": "object",
+                                      "properties": {
+                                        "status": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "enum": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "generation": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "published_at_ms": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "published_mutation_seq": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "current_mutation_seq": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "published_max_message_id": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "current_max_message_id": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "indexed_passages": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "excluded_candidates": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "candidate_window_limited": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "stale_reason": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        }
+                                      }
+                                    },
+                                    "required": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "additionalProperties": {
+                                      "type": "boolean"
                                     }
                                   }
                                 }
@@ -206453,6 +208198,23 @@
                             }
                           }
                         },
+                        "manifest_source": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "enum": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
                         "segment_files": {
                           "type": "object",
                           "properties": {
@@ -206830,6 +208592,17 @@
                           "properties": {
                             "type": {
                               "type": "string"
+                            }
+                          }
+                        },
+                        "lexical_replay": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
                             }
                           }
                         },
@@ -207668,6 +209441,143 @@
                                       }
                                     }
                                   }
+                                },
+                                "coverage": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "description": {
+                                      "type": "string"
+                                    },
+                                    "properties": {
+                                      "type": "object",
+                                      "properties": {
+                                        "status": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "enum": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "generation": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "published_at_ms": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "published_mutation_seq": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "current_mutation_seq": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "published_max_message_id": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "current_max_message_id": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "indexed_passages": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "excluded_candidates": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "candidate_window_limited": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "stale_reason": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        }
+                                      }
+                                    },
+                                    "required": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "additionalProperties": {
+                                      "type": "boolean"
+                                    }
+                                  }
                                 }
                               }
                             }
@@ -207783,6 +209693,143 @@
                                       "items": {
                                         "type": "string"
                                       }
+                                    }
+                                  }
+                                },
+                                "coverage": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "description": {
+                                      "type": "string"
+                                    },
+                                    "properties": {
+                                      "type": "object",
+                                      "properties": {
+                                        "status": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "enum": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "generation": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "published_at_ms": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "published_mutation_seq": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "current_mutation_seq": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "published_max_message_id": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "current_max_message_id": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "indexed_passages": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "excluded_candidates": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "candidate_window_limited": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "stale_reason": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        }
+                                      }
+                                    },
+                                    "required": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "additionalProperties": {
+                                      "type": "boolean"
                                     }
                                   }
                                 }
@@ -211399,6 +213446,23 @@
                                     }
                                   }
                                 },
+                                "manifest_source": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "enum": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
                                 "segment_files": {
                                   "type": "object",
                                   "properties": {
@@ -211787,6 +213851,17 @@
                                   "properties": {
                                     "type": {
                                       "type": "string"
+                                    }
+                                  }
+                                },
+                                "lexical_replay": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
                                     }
                                   }
                                 },
@@ -212649,6 +214724,143 @@
                                               }
                                             }
                                           }
+                                        },
+                                        "coverage": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "description": {
+                                              "type": "string"
+                                            },
+                                            "properties": {
+                                              "type": "object",
+                                              "properties": {
+                                                "status": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "enum": {
+                                                      "type": "array",
+                                                      "items": {
+                                                        "type": "string"
+                                                      }
+                                                    }
+                                                  }
+                                                },
+                                                "generation": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                },
+                                                "published_at_ms": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                },
+                                                "published_mutation_seq": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "current_mutation_seq": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "published_max_message_id": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "current_max_message_id": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "indexed_passages": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "excluded_candidates": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "candidate_window_limited": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                },
+                                                "stale_reason": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                }
+                                              }
+                                            },
+                                            "required": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            },
+                                            "additionalProperties": {
+                                              "type": "boolean"
+                                            }
+                                          }
                                         }
                                       }
                                     }
@@ -212764,6 +214976,143 @@
                                               "items": {
                                                 "type": "string"
                                               }
+                                            }
+                                          }
+                                        },
+                                        "coverage": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "description": {
+                                              "type": "string"
+                                            },
+                                            "properties": {
+                                              "type": "object",
+                                              "properties": {
+                                                "status": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "enum": {
+                                                      "type": "array",
+                                                      "items": {
+                                                        "type": "string"
+                                                      }
+                                                    }
+                                                  }
+                                                },
+                                                "generation": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                },
+                                                "published_at_ms": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                },
+                                                "published_mutation_seq": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "current_mutation_seq": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "published_max_message_id": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "current_max_message_id": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "indexed_passages": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "excluded_candidates": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    },
+                                                    "minimum": {
+                                                      "type": "integer"
+                                                    }
+                                                  }
+                                                },
+                                                "candidate_window_limited": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                },
+                                                "stale_reason": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "string"
+                                                    }
+                                                  }
+                                                }
+                                              }
+                                            },
+                                            "required": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            },
+                                            "additionalProperties": {
+                                              "type": "boolean"
                                             }
                                           }
                                         }

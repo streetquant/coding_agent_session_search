@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::env;
 use std::fmt;
 use std::fs;
@@ -7,15 +7,8 @@ use std::process::{self, Command};
 
 use toml::Value;
 
-/// The ingest scope tables are shared verbatim with the crate so the build
-/// script and the runtime resolve the same scope. The module may only use
-/// `std` and `blake3`.
-///
-/// The scope helpers are exercised by the build script and by the crate's
-/// scope tests; the ones this script does not call are allowed to be unused.
-#[allow(dead_code)]
-#[path = "src/connectors/ingest_scope.rs"]
-mod ingest_scope;
+#[path = "build_support/source_ingest_contract.rs"]
+mod source_ingest_contract;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ValidationMode {
@@ -58,7 +51,7 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
         // Exact upstream source pin (established with the fsqlite 0.2.1
-        // migration, bead bo000; now at 0.4.13. 0.3.15 was evaluated on
+        // migration, bead bo000; now at 0.4.12. 0.3.15 was evaluated on
         // 2026-09-02 (bead gh382-fsqlite-pin) and NOT adopted: cass's own
         // writable open still looped on a large archive with a large WAL
         // (reclaim sweep x per-page WAL rescan, cass GH #382 / bead g3zyo).
@@ -102,13 +95,10 @@ const CONTRACTS: &[DependencyContract] = &[
         // explicit-transaction inserts, bd-obwsy), ROLLBACK returning
         // reserved AUTOINCREMENT rowids (bd-gwoit) and reading a WAL a stock
         // writer truncated to zero bytes as empty (bd-yxqs9, cass GH#519).
-        // 0.4.13 includes 58ddae0de: integrity_check inside a read-only
-        // BEGIN walks the durable freelist, unblocking valid logical-archive
-        // publications (svhcf) without weakening the consumer integrity gate.
         // fsqlite resolves from crates.io at the exact version below.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.4.13",
+        expected_version: "0.4.12",
         // `async-api` exposes frankensqlite::AsyncConnection, which
         // src/search/query.rs uses (as SearchSqliteConnection) for the
         // no-hit alternate-agent suggestions without a full storage open.
@@ -126,10 +116,10 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        // The 0.4.13 release publishes the entire family at one version.
+        // The 0.4.12 release publishes the entire family at one version.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.4.13",
+        expected_version: "0.4.12",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -147,7 +137,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // Match the production shared types from the published family.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.4.13",
+        expected_version: "0.4.12",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -162,7 +152,7 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "franken-agent-detection",
         crate_package_name: "franken-agent-detection",
         manifest_package_field: None,
-        // GH#416: registry pin. crates.io 0.2.4 retains the 0.2.3 fixes and
+        // GH#416: registry pin. crates.io 0.2.3 (2026-09-07) probes the
         // Antigravity IDE store as well as the agy CLI store (cass#454),
         // honors CLAUDE_CONFIG_DIR/XDG_CONFIG_HOME for Claude Code (cass#448),
         // and carries the Codex token-usage, Claude tool-result, Cursor/OpenCode
@@ -262,12 +252,13 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensearch",
         crate_package_name: "frankensearch",
         manifest_package_field: None,
-        // Completed upstream retained-mapping repair (2l1b0.72). CASS keeps
-        // full retained-segment byte verification before publication while
-        // the engine reuses the already mapped backing. Preserve native
-        // MiniLM, Quill and cass-compat behavior; a pin alone is not acceptance.
-        expected_git: "https://github.com/Dicklesworthstone/frankensearch",
-        expected_rev: "5ee999fcaba6f85d19c0e3f00883f1d5d4918887",
+        // Registry release on asupersync 0.5. Preserve explicit native
+        // MiniLM, Quill and cass-compat lexical behavior; a manifest pin
+        // alone is not runtime acceptance.
+        // Empty `expected_git` signals `validate_manifest_dependency_spec`
+        // to skip git/rev checks.
+        expected_git: "",
+        expected_rev: "",
         expected_version: "0.7.1",
         // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
         // embedding + reranking are now pure-Rust via frankensearch's `native`
@@ -428,19 +419,13 @@ fn main() {
     validate_path_dependency_contracts(&manifest_dir, &manifest, packaged_manifest);
     emit_vergen_metadata();
     emit_build_commit_metadata(&manifest_dir);
-    emit_source_ingest_contracts(&manifest_dir);
+    emit_source_ingest_contract(&manifest_dir);
 }
 
 /// A completed source is reusable only by the parser/normalizer that read it.
 /// Hash build inputs rather than Git HEAD: release tarballs have no Git metadata,
 /// and two dirty builds at the same commit can contain different parser fixes.
-///
-/// The contract is scoped per provider: an edit to one connector's code
-/// invalidates that connector's completions, while an edit outside the ingest
-/// surface (the TUI, the HTML exporter, a doc comment) leaves every contract
-/// untouched and the next incremental run reuses every completion
-/// (bead `coding_agent_session_search-ayhvu`).
-fn emit_source_ingest_contracts(manifest_dir: &Path) {
+fn emit_source_ingest_contract(manifest_dir: &Path) {
     // Cargo pins registry/git source bytes, but a local path dependency can
     // change its parser without changing this crate's manifest or lockfile.
     // Such development builds must reparse instead of reusing an unproven
@@ -465,10 +450,13 @@ fn emit_source_ingest_contracts(manifest_dir: &Path) {
         packages
             .iter()
             .find(|package| {
-                package.get("source").and_then(Value::as_str).is_none()
-                    && !(package.get("name").and_then(Value::as_str) == Some(crate_name.as_str())
-                        && package.get("version").and_then(Value::as_str)
-                            == Some(crate_version.as_str()))
+                source_ingest_contract::dependency_blocks_reuse(
+                    package.get("name").and_then(Value::as_str),
+                    package.get("version").and_then(Value::as_str),
+                    package.get("source").and_then(Value::as_str),
+                    &crate_name,
+                    &crate_version,
+                )
             })
             .map(|package| {
                 format!(
@@ -487,100 +475,20 @@ fn emit_source_ingest_contracts(manifest_dir: &Path) {
         "cargo:rustc-env=CASS_SOURCE_INGEST_REUSE_BLOCKER={}",
         reuse_blocker.unwrap_or_default()
     );
-
-    // The enabled feature set is a build input of every provider's producer.
-    let features: BTreeSet<_> = env::vars()
-        .filter(|(name, _)| name.starts_with("CARGO_FEATURE_"))
-        .collect();
-    let mut feature_hasher = blake3::Hasher::new();
-    feature_hasher.update(b"cass-source-ingest-features-v1\0");
-    for (name, value) in features {
-        feature_hasher.update(name.as_bytes());
-        feature_hasher.update(b"=");
-        feature_hasher.update(value.as_bytes());
-        feature_hasher.update(b"\0");
-    }
-    let feature_digest = feature_hasher.finalize().to_hex().to_string();
-
-    let core_files = ingest_scope::core_scope(manifest_dir)
-        .unwrap_or_else(|error| fatal(format!("cannot resolve the ingest scope: {error}")));
-    let core_digest = ingest_scope::digest_files(&core_files, manifest_dir, &BTreeMap::new())
-        .unwrap_or_else(|error| fatal(format!("cannot digest the ingest scope: {error}")));
-    for file in &core_files {
-        emit_scope_watch_paths(file);
-    }
-    for entry in ingest_scope::BUILD_INPUTS
-        .iter()
-        .chain(ingest_scope::CORE_SCOPE.iter())
-    {
-        println!("cargo:rerun-if-changed={entry}");
-    }
-
-    let mut scope_digests: BTreeMap<&str, String> = BTreeMap::new();
-    let mut contracts: BTreeMap<&str, String> = BTreeMap::new();
-    for (provider, _) in ingest_scope::PROVIDER_SCOPE {
-        let own_files = ingest_scope::provider_scope(provider, manifest_dir)
-            .unwrap_or_else(|error| fatal(format!("cannot resolve the ingest scope: {error}")));
-        for file in &own_files {
-            emit_scope_watch_paths(file);
-        }
-        let own_digest = ingest_scope::digest_files(&own_files, manifest_dir, &BTreeMap::new())
-            .unwrap_or_else(|error| fatal(format!("cannot digest the ingest scope: {error}")));
-        let scope_digest = ingest_scope::compose_digest(&[&core_digest, &own_digest]);
-        let contract = ingest_scope::compose_digest(&[&scope_digest, &feature_digest]);
-        scope_digests.insert(*provider, scope_digest);
-        contracts.insert(*provider, contract);
-    }
-
-    // A provider slug without a scope entry is unknown: give it the
-    // conservative contract that covers every provider's files, so it can
-    // never be reused on the strength of a narrower scope.
-    let all_files = ingest_scope::all_provider_scopes(manifest_dir)
-        .unwrap_or_else(|error| fatal(format!("cannot resolve the ingest scope: {error}")));
-    let all_digest = ingest_scope::digest_files(&all_files, manifest_dir, &BTreeMap::new())
-        .unwrap_or_else(|error| fatal(format!("cannot digest the ingest scope: {error}")));
-    let fallback_scope = ingest_scope::compose_digest(&[&core_digest, &all_digest]);
-    let fallback_contract = ingest_scope::compose_digest(&[&fallback_scope, &feature_digest]);
-    scope_digests.insert("*", fallback_scope);
-    contracts.insert("*", fallback_contract);
-
+    let mut hasher = blake3::Hasher::new();
+    source_ingest_contract::emit_contract(
+        manifest_dir,
+        env::vars(),
+        |bytes| {
+            hasher.update(bytes);
+        },
+        |input| println!("cargo:rerun-if-changed={}", input.display()),
+    )
+    .unwrap_or_else(|error| fatal(format!("cannot compute source ingest contract: {error}")));
     println!(
-        "cargo:rustc-env=CASS_SOURCE_INGEST_CONTRACTS={}",
-        encode_contracts(&contracts)
+        "cargo:rustc-env=CASS_SOURCE_INGEST_CONTRACT={}",
+        hasher.finalize()
     );
-    println!(
-        "cargo:rustc-env=CASS_SOURCE_INGEST_SCOPE_DIGESTS={}",
-        encode_contracts(&scope_digests)
-    );
-}
-
-/// Encode the contract map the runtime reads back: `slug=digest` pairs in a
-/// stable order, with `*` naming the conservative fallback.
-fn encode_contracts(contracts: &BTreeMap<&str, String>) -> String {
-    let mut encoded = String::from("v2");
-    for (slug, digest) in contracts {
-        encoded.push(';');
-        encoded.push_str(slug);
-        encoded.push('=');
-        encoded.push_str(digest);
-    }
-    encoded
-}
-
-/// Watch a scoped file and the directories above it, so a file added to a
-/// scoped directory is picked up by the next contract computation. Without
-/// the directories, a new module under a scoped directory would enter the
-/// crate without entering the contract.
-fn emit_scope_watch_paths(file: &Path) {
-    println!("cargo:rerun-if-changed={}", file.display());
-    let mut directory = file.parent();
-    while let Some(parent) = directory {
-        if parent.as_os_str().is_empty() {
-            break;
-        }
-        println!("cargo:rerun-if-changed={}", parent.display());
-        directory = parent.parent();
-    }
 }
 
 /// Embed the build commit at compile time (GH #399).
@@ -672,7 +580,7 @@ fn validate_path_dependency_contracts(
 
 fn validate_fsqlite_source_pin(manifest_dir: &Path, manifest: &Value, packaged_manifest: bool) {
     // The fsqlite engine family must resolve exclusively from crates.io at
-    // the uniform published 0.4.13 version, including the shared types.
+    // the uniform published 0.4.12 version, including the shared types.
     // One source per package remains load-bearing for read-only integrity.
     const EXPECTED_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
@@ -741,7 +649,7 @@ fn validate_fsqlite_source_pin(manifest_dir: &Path, manifest: &Value, packaged_m
         if !(name == "fsqlite" || name.starts_with("fsqlite-")) {
             continue;
         }
-        let expected_version = "0.4.13";
+        let expected_version = "0.4.12";
         let version = package.get("version").and_then(Value::as_str).unwrap_or("");
         if !seen.insert(name) {
             violations.push(format!(

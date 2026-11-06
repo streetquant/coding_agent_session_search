@@ -6,7 +6,8 @@
 //! Canonical follow-up requires an explicit --db
 //! and exact source/conversation/message coordinates; it never opens raw files.
 //! Separate opt-in semantic retrieval retains local models and vector assets.
-//! No lane starts writers, automatic refresh, downloads, or detached children.
+//! No lane starts writers, downloads, or detached children. Certified semantic
+//! requests can adopt a newly published retained generation between requests.
 //! Request deadlines terminate the worker, including stalled native calls.
 //! Sampled resident-memory limits terminate an over-budget worker; they are
 //! not kernel allocation limits or a peak-RSS guarantee between samples.
@@ -372,6 +373,9 @@ struct Session {
     open_attempts: u64,
     successful_opens: u64,
     queries_completed: u64,
+    /// MANIFEST slot read beside the snapshot open (mknmt): anything but
+    /// `Current` means the pinned snapshot is older than the newest publish.
+    manifest_source: Option<QuillManifestSource>,
 }
 
 impl Session {
@@ -395,6 +399,7 @@ impl Session {
             open_attempts: 0,
             successful_opens: 0,
             queries_completed: 0,
+            manifest_source: None,
         }
     }
 
@@ -413,6 +418,8 @@ impl Session {
                 searchable_index_live_docs(&self.index).map(|live| live.manifest_source);
             self.snapshot_manifest_source = manifest_source;
             self.client = Some(client);
+            self.manifest_source =
+                searchable_index_live_docs(&self.index).map(|live| live.manifest_source);
             if lease.is_some() {
                 self.reader_lease = lease;
             }
@@ -436,6 +443,7 @@ impl Session {
         self.manifest_source = None;
         self.snapshot_manifest_source = None;
         drop(self.reader_lease.take());
+        self.manifest_source = None;
     }
 
     fn status(&self) -> Value {
@@ -470,6 +478,7 @@ impl Session {
             "manifest_source": self.manifest_source.map(QuillManifestSource::as_str),
             "snapshot_manifest_source": self.snapshot_manifest_source,
             "freshness": "not_checked",
+            "manifest_source": self.manifest_source.map(QuillManifestSource::as_str),
             "canonical_view_enabled": self.archive.is_some(),
             "canonical_database_accessed": self.canonical_read_attempts != 0
                 || self.semantic.archive_access_attempted()

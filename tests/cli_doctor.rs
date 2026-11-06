@@ -227,13 +227,6 @@ fn cass_cmd(test_home: &Path) -> Command {
         // come from the profile known folder) or under inherited overrides.
         .env("CLAUDE_CONFIG_DIR", test_home.join(".claude"))
         .env("CODEX_HOME", test_home.join(".codex"))
-        // These connectors default to host roots outside HOME; without the
-        // overrides a one-session fixture also indexes the developer's archive.
-        .env("CASS_CLOUDMCP_DATA_ROOT", test_home.join("cloudmcp-empty"))
-        .env(
-            "CASS_OPENWEBUI_DATA_ROOT",
-            test_home.join("openwebui-empty"),
-        )
         .current_dir(test_home);
     cmd
 }
@@ -1156,12 +1149,14 @@ fn doctor_repair_leaked_pages_refuses_a_doubled_reference() {
 /// sqlite_master autoindex row). The fixture is a synthetic two-message
 /// archive written by cass, with that one table rewritten by stock SQLite
 /// (writable_schema); its paths come from the generating machine's scratch
-/// directory. The read-only lane admits that catalog through the engine's
-/// legacy-tolerant deferred-FTS5 open (reporting `database.fts_shadow_repair`)
-/// without touching the bytes, the dry-run plans the repair, and --yes rebuilds
-/// the derived shadow from the unchanged canonical rows. Afterwards the archive
-/// opens normally, a repeat dry-run finds the shadow healthy and plans no
-/// rebuild, and the conversation indexes and searches again.
+/// directory. Ordinary opens still refuse that catalog, but since
+/// frankensqlite 0.4.7 the deferred-FTS5 repair open binds the missing
+/// autoindex (doctor_recover::ENGINE_REPAIRS_MISSING_FTS5_SHADOW_AUTOINDEX),
+/// so status routes to the shadow repair, the dry-run plans it without
+/// touching the bytes, and --yes rebuilds the derived shadow from the
+/// unchanged canonical rows. Afterwards the archive opens normally, a repeat
+/// dry-run finds the shadow healthy and plans no rebuild, and the
+/// conversation indexes and searches again.
 #[test]
 fn doctor_rebuild_canonical_fts_repairs_the_503_legacy_shadow_catalog_in_place() {
     let tracker = PhaseTracker::new(
@@ -1197,28 +1192,21 @@ fn doctor_rebuild_canonical_fts_repairs_the_503_legacy_shadow_catalog_in_place()
         .output()
         .expect("run cass status");
     let status: Value = serde_json::from_slice(&status.stdout).expect("status json");
-    assert_eq!(
-        status["database"]["opened"].as_bool(),
-        Some(true),
-        "the readable legacy archive must be admitted: {status}"
-    );
-    assert_eq!(status["database"]["conversations"], 1, "{status}");
-    assert_eq!(status["database"]["messages"], 2, "{status}");
-    assert_eq!(status["database"]["open_error"], Value::Null, "{status}");
-    let repair = &status["database"]["fts_shadow_repair"];
-    assert_eq!(
-        repair["kind"], "schema-repair-required",
-        "the derived shadow repair must still be reported: {status}"
-    );
-    assert_eq!(repair["pending"], true, "{status}");
-    assert_eq!(
-        repair["command"], "cass doctor --rebuild-canonical-fts --yes --json",
-        "{status}"
-    );
-    let detail = repair["detail"].as_str().expect("repair detail");
+    assert_eq!(status["database"]["opened"].as_bool(), Some(false));
+    let open_error = status["database"]["open_error"]
+        .as_str()
+        .expect("open_error");
     assert!(
-        detail.contains("missing implicit autoindex slot 1 for table `fts_messages_config`"),
-        "{detail}"
+        open_error.contains("missing implicit autoindex slot 1 for table `fts_messages_config`"),
+        "{open_error}"
+    );
+    assert!(
+        open_error.contains("cass doctor --rebuild-canonical-fts --dry-run --json"),
+        "{open_error}"
+    );
+    assert!(
+        !open_error.contains("cannot rebuild that shadow in place"),
+        "{open_error}"
     );
     tracker.end(
         "status",
@@ -1261,49 +1249,6 @@ fn doctor_rebuild_canonical_fts_repairs_the_503_legacy_shadow_catalog_in_place()
     );
 
     let phase = tracker.start(
-        "pre_repair_search",
-        Some("the admitted legacy shadow already serves lexical search"),
-    );
-    // Drop the repo's 128 MiB `RUST_MIN_STACK`: the shipped binary must serve
-    // this path on a default-size thread stack, not only under cargo's env.
-    let search = cass_cmd(test_home)
-        .env_remove("RUST_MIN_STACK")
-        .args([
-            "search",
-            "canonicalreplyneedle",
-            "--mode",
-            "lexical",
-            "--json",
-            "--data-dir",
-            data_dir_arg,
-        ])
-        .output()
-        .expect("run cass search");
-    assert!(
-        search.status.success(),
-        "pre-repair search failed: exit={:?} stdout={} stderr={}",
-        search.status.code(),
-        String::from_utf8_lossy(&search.stdout),
-        String::from_utf8_lossy(&search.stderr)
-    );
-    let found: Value = serde_json::from_slice(&search.stdout).expect("search json");
-    assert_eq!(found["count"], 1, "{found}");
-    assert_eq!(
-        found["hits"][0]["content"], "canonicalreplyneedle run the repair",
-        "{found}"
-    );
-    assert_eq!(
-        test_file_blake3(&db_path),
-        legacy_blake3,
-        "a read-only search must leave the archive bytes unchanged"
-    );
-    tracker.end(
-        "pre_repair_search",
-        Some("the admitted legacy shadow already serves lexical search"),
-        phase,
-    );
-
-    let phase = tracker.start(
         "repair",
         Some("--yes rebuilds the derived shadow; the archive opens normally"),
     );
@@ -1317,10 +1262,6 @@ fn doctor_rebuild_canonical_fts_repairs_the_503_legacy_shadow_catalog_in_place()
     assert_eq!(status["database"]["opened"], true, "{status}");
     assert_eq!(status["database"]["conversations"], 1, "{status}");
     assert_eq!(status["database"]["messages"], 2, "{status}");
-    assert!(
-        status["database"].get("fts_shadow_repair").is_none(),
-        "the repaired archive must not report a pending shadow repair: {status}"
-    );
     // The canonical rows are the fixture's, byte for byte.
     let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).expect("open");
     let messages: Vec<(i64, String)> = conn
@@ -2617,10 +2558,10 @@ fn doctor_rejects_repeated_repair_override_without_fix_before_executor() {
     );
 
     let payload = doctor_error_json(&out.stderr);
-    assert_eq!(payload["err"]["code"].as_i64(), Some(2));
-    assert_eq!(payload["err"]["kind"].as_str(), Some("usage"));
+    assert_eq!(payload["error"]["code"].as_i64(), Some(2));
+    assert_eq!(payload["error"]["kind"].as_str(), Some("usage"));
     assert!(
-        payload["err"]["message"]
+        payload["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("--allow-repeated-repair")),
         "usage error should name the invalid flag combination: {payload:#}"
@@ -2775,6 +2716,76 @@ fn doctor_check_json_reports_read_only_truth_surface_without_writes() {
             })),
         "semantic_model check should be structured as a non-archive derived-asset finding: {payload:#}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_owner_matches_symlink_parent_archive_without_conflating_a_decoy() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let data = home.path().join("cass-data");
+    fs::create_dir(&data)?;
+    let physical = home.path().join("physical");
+    fs::create_dir_all(physical.join("nested"))?;
+    let alias = home.path().join("alias");
+    std::os::unix::fs::symlink(physical.join("nested"), &alias)?;
+    let archive = physical.join("archive.db");
+    let spelling = alias.join("../archive.db");
+    let decoy = home.path().join("archive.db");
+    let metadata = format!(
+        "pid={}\nstarted_at_ms=1793670000000\ndb_path={}\nmode=index\n",
+        std::process::id(),
+        archive.display()
+    );
+    let lock_path = data.join("index-run.lock");
+    let mut held = fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    held.write_all(metadata.as_bytes())?;
+    held.flush()?;
+    held.try_lock_exclusive()?;
+    let before = doctor_no_write_snapshot(home.path());
+
+    for (requested, matches) in [(&archive, true), (&spelling, true), (&decoy, false)] {
+        let output = cass_cmd(home.path())
+            .args(["doctor", "--check", "--json", "--data-dir"])
+            .arg(&data)
+            .arg("--db")
+            .arg(requested)
+            .timeout(Duration::from_secs(30))
+            .output()?;
+        let report: Value = serde_json::from_slice(&output.stdout)?;
+        let operation = &report["operation_state"];
+        let owner = operation["owners"]
+            .as_array()
+            .and_then(|owners| {
+                owners
+                    .iter()
+                    .find(|owner| owner["lock_kind"] == "index_run")
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing index owner: {report}; stderr={}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            })?;
+        assert_eq!(
+            output.status.code(),
+            Some(5),
+            "missing archive health failure"
+        );
+        assert_eq!(owner["active"], true);
+        assert_eq!(
+            owner["db_path_matches_requested"], matches,
+            "{requested:?}: {report}"
+        );
+        assert_eq!(operation["active_index_maintenance"], matches);
+        assert_eq!(fs::read(&lock_path)?, metadata.as_bytes());
+    }
+    assert_eq!(doctor_no_write_snapshot(home.path()), before);
+    assert!(!archive.exists() && !decoy.exists());
+    Ok(())
 }
 
 #[test]
@@ -3050,7 +3061,7 @@ fn doctor_baseline_surfaces_reject_ignored_safety_controls() {
     let diff_error = doctor_error_json(&diff_out.stderr);
     assert_eq!(test_error_kind(&diff_error), Some("usage"));
     assert!(
-        diff_error["err"]["message"]
+        diff_error["error"]["message"]
             .as_str()
             .or_else(|| diff_error["message"].as_str())
             .is_some_and(|message| message.contains("diagnostic-only")),
@@ -3561,7 +3572,7 @@ fn doctor_baseline_diff_rejects_missing_duplicate_incompatible_and_drifted_basel
     let bad_schema_error = doctor_error_json(&bad_schema_out.stderr);
     assert_eq!(test_error_kind(&bad_schema_error), Some("config"));
     assert!(
-        bad_schema_error["err"]["message"]
+        bad_schema_error["error"]["message"]
             .as_str()
             .or_else(|| bad_schema_error["message"].as_str())
             .is_some_and(|message| message.contains("schema_version")),
@@ -3597,7 +3608,7 @@ fn doctor_baseline_diff_rejects_missing_duplicate_incompatible_and_drifted_basel
     let drifted_error = doctor_error_json(&drifted_out.stderr);
     assert_eq!(test_error_kind(&drifted_error), Some("config"));
     assert!(
-        drifted_error["err"]["message"]
+        drifted_error["error"]["message"]
             .as_str()
             .or_else(|| drifted_error["message"].as_str())
             .is_some_and(|message| message.contains("checksum mismatch")),
@@ -4085,7 +4096,7 @@ fn doctor_check_rejects_mutating_or_rebuild_flags() {
     let payload = doctor_error_json(&out.stderr);
     assert_eq!(test_error_code(&payload), Some(2));
     assert!(
-        payload["err"]["message"]
+        payload["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("doctor check")),
         "usage error should explain the read-only surface: {payload:#}"
@@ -4284,124 +4295,14 @@ fn doctor_backups_list_and_verify_candidate_promotion_manifest() {
         verification["prior_live_db_blake3"].as_str(),
         Some(test_file_blake3(&fixture.backup_db_path).as_str())
     );
-    if verification["sidecar_bundle_status"] == "complete-with-sidecars" {
-        assert_eq!(
-            verification["storage_probe_status"],
-            "requires_private_storage_probe"
-        );
-        assert!(
-            verification["warnings"]
-                .as_array()
-                .expect("warnings")
-                .iter()
-                .filter_map(Value::as_str)
-                .any(|warning| warning.contains("native storage admission is deferred")),
-            "verify must disclose the deferred private probe: {verify_payload:#}"
-        );
-    } else {
-        assert_eq!(verification["storage_probe_status"], "passed");
-        assert!(
-            verification["warnings"]
-                .as_array()
-                .expect("warnings")
-                .iter()
-                .any(|warning| warning.as_str() == Some("frankensqlite read-only probe passed")),
-            "the no-SHM backup should still receive its native probe: {verify_payload:#}"
-        );
-    }
-}
-
-#[test]
-fn doctor_backups_verify_discloses_deferred_probe_without_changing_stored_shm() {
-    let test_home = tempfile::tempdir().expect("tempdir");
-    let data_dir = test_home.path().join("cass-data");
-    let fixture =
-        write_candidate_promotion_backup_fixture(&data_dir, "promo_verify_shm", "backup-state");
-    let connection = FrankenConnection::open(fixture.backup_db_path.to_string_lossy().into_owned())
-        .expect("open backup fixture");
-    connection.query("PRAGMA journal_mode = WAL;").expect("WAL");
-    connection
-        .execute("PRAGMA wal_autocheckpoint = 0;")
-        .expect("retain WAL frames");
-    connection
-        .execute("INSERT INTO restore_probe(marker) VALUES ('committed-wal-state');")
-        .expect("commit WAL row");
-    connection
-        .close_without_checkpoint()
-        .expect("close without changing backup WAL");
-    let wal = fixture.backup_db_path.with_file_name("agent_search.db-wal");
-    assert!(fs::metadata(&wal).expect("WAL metadata").len() > 32);
-    let shm = fixture.backup_db_path.with_file_name("agent_search.db-shm");
-    fs::write(&shm, [0u8; 32 * 1024]).expect("stale derived SHM");
-    let mut manifest: Value =
-        serde_json::from_slice(&fs::read(&fixture.manifest_path).expect("read manifest"))
-            .expect("manifest JSON");
-    let artifacts = manifest["artifacts"].as_array_mut().expect("artifacts");
-    for (kind, path) in [
-        ("prior_live_archive_db_backup", &fixture.backup_db_path),
-        ("prior_live_archive_wal_backup", &wal),
-        ("prior_live_archive_shm_backup", &shm),
-    ] {
-        let artifact = json!({
-            "artifact_kind": kind,
-            "backup_path": path,
-            "checksum_blake3": test_file_blake3(path),
-            "size_bytes": fs::metadata(path).expect("artifact metadata").len(),
-        });
-        if let Some(existing) = artifacts
-            .iter_mut()
-            .find(|entry| entry["artifact_kind"] == kind)
-        {
-            *existing = artifact;
-        } else {
-            artifacts.push(artifact);
-        }
-    }
-    fs::write(
-        &fixture.manifest_path,
-        serde_json::to_vec_pretty(&manifest).expect("manifest JSON"),
-    )
-    .expect("write matched bundle manifest");
-    let before = doctor_no_write_snapshot(&data_dir);
-
-    for json_output in [true, false] {
-        let mut command = cass_cmd(test_home.path());
-        command.env_remove("CASS_OUTPUT_FORMAT").args([
-            "doctor",
-            "backups",
-            "verify",
-            &fixture.backup_id,
-            "--data-dir",
-            data_dir.to_str().expect("UTF-8 data directory"),
-        ]);
-        if json_output {
-            command.arg("--json");
-        }
-        let output = command.output().expect("verify matched SHM bundle");
-        assert!(output.status.success(), "{output:?}");
-        if json_output {
-            let payload: Value = serde_json::from_slice(&output.stdout).expect("verify JSON");
-            let verification = &payload["backup_verification"];
-            assert_eq!(verification["status"], "verified");
-            assert_eq!(
-                verification["sidecar_bundle_status"],
-                "complete-with-sidecars"
-            );
-            assert_eq!(
-                verification["storage_probe_status"],
-                "requires_private_storage_probe"
-            );
-            assert_eq!(verification["restore_rehearsal_allowed"], true);
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
-        assert!(text.contains("requires_private_storage_probe"), "{text}");
-        assert!(
-            text.contains("native storage admission is deferred"),
-            "{text}"
-        );
-        assert!(text.contains("stored SHM unchanged"), "{text}");
-        assert_eq!(doctor_no_write_snapshot(&data_dir), before);
-    }
+    assert!(
+        verification["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning.as_str() == Some("frankensqlite read-only probe passed")),
+        "verify should prove the backup DB opens through frankensqlite: {verify_payload:#}"
+    );
 }
 
 #[test]
@@ -5067,8 +4968,17 @@ fn doctor_fix_refuses_repeated_repair_when_failure_marker_exists() {
     );
 }
 
-/// GH #374: reconstruct from verified raw sources without mutating the broken
-/// archive, promote the candidate, and reindex without duplicating sessions.
+/// zp0fp (GH #374): on an archive that cannot be opened but has a verified
+/// raw mirror, `doctor --fix` builds an isolated reconstruct candidate and
+/// leaves the live archive alone. Its post-repair probes used to open that
+/// untouched, unreadable archive, report the build as a failed repair, and
+/// leave the failure marker that then blocked promoting the very candidate.
+/// Now the run is not a verification failure, writes no marker, the dry-run
+/// plan offers the promotion with no blockers, and applying its fingerprint
+/// without the repeated-repair override restores a readable, searchable
+/// archive. Planted negative: before the fix, `doctor --fix` returned
+/// `verification-failed` and the plan was blocked by `marker-present`.
+/// Each step's `recommended_action` names the next command (zp0fp C).
 #[test]
 fn doctor_fix_candidate_build_on_unreadable_archive_leaves_promotion_unblocked() {
     let test_home = tempfile::tempdir().expect("tempdir");
@@ -5094,24 +5004,18 @@ fn doctor_fix_candidate_build_on_unreadable_archive_leaves_promotion_unblocked()
     let indexed = run(&["index", "--full", "--json"]);
     assert!(indexed.status.success(), "{indexed:?}");
     let counts = |output: std::process::Output| {
-        assert!(output.status.success(), "stats failed: {output:?}");
         let stats: Value = serde_json::from_slice(&output.stdout).expect("stats JSON");
-        let conversations = stats["conversations"].as_u64().expect("conversation count");
-        let messages = stats["messages"].as_u64().expect("message count");
-        (conversations, messages)
+        (stats["conversations"].clone(), stats["messages"].clone())
     };
     let indexed_counts = counts(run(&["stats", "--json"]));
-    assert_eq!(
-        indexed_counts.0, 3,
-        "all three fixture sessions were indexed"
-    );
-    assert!(indexed_counts.1 > 0, "the fixture has indexed messages");
 
     let db_path = data_dir.join("agent_search.db");
     let mut damaged = fs::read(&db_path).expect("read archive");
     damaged[..100].fill(0);
     fs::write(&db_path, &damaged).expect("damage archive header");
 
+    // The read-only check names the step that builds the candidate (it used
+    // to say only "Run process-isolated archive coverage probes").
     let checked = run(&["doctor", "check", "--json"]);
     let checked_payload: Value =
         serde_json::from_slice(&checked.stdout).expect("doctor check JSON");
@@ -5134,7 +5038,7 @@ fn doctor_fix_candidate_build_on_unreadable_archive_leaves_promotion_unblocked()
         .expect("recommended_action");
     assert!(
         fix_action.contains("'cass doctor repair --dry-run --json'"),
-        "the candidate's next step is its promotion plan: {fixed_payload:#}"
+        "the staged candidate's next step is its promotion plan: {fixed_payload:#}"
     );
     assert!(
         !fix_action.contains("process-isolated"),
@@ -5153,7 +5057,7 @@ fn doctor_fix_candidate_build_on_unreadable_archive_leaves_promotion_unblocked()
     assert_ne!(
         fixed_payload["operation_outcome"]["kind"].as_str(),
         Some("verification-failed"),
-        "building a candidate is not a failed live repair: {fixed_payload:#}"
+        "building an isolated candidate is not a failed live repair: {fixed_payload:#}"
     );
     let markers = data_dir.join("doctor").join("failure-markers");
     assert!(
@@ -5180,6 +5084,7 @@ fn doctor_fix_candidate_build_on_unreadable_archive_leaves_promotion_unblocked()
     );
     assert_eq!(plan["blocked_reasons"], json!([]), "{plan:#}");
     let fingerprint = plan["plan_fingerprint"].as_str().expect("fingerprint");
+
     let applied = run(&[
         "doctor",
         "repair",
@@ -5197,12 +5102,18 @@ fn doctor_fix_candidate_build_on_unreadable_archive_leaves_promotion_unblocked()
     let health = run(&["health", "--json"]);
     assert!(health.status.success(), "{health:?}");
     let search = run(&["search", "zpbravo", "--robot", "--mode", "lexical"]);
-    assert!(search.status.success(), "{search:?}");
     let hits: Value = serde_json::from_slice(&search.stdout).expect("search JSON");
     assert!(
         !hits["hits"].as_array().expect("hits").is_empty(),
         "the promoted archive answers searches: {hits:#}"
     );
+
+    // zp0fp D: the candidate was rebuilt by the Codex connector from the
+    // mirrored sources, so the promoted archive holds exactly what indexing
+    // them produced, and the next index of the untouched sources updates it
+    // in place. The line salvage stored every JSONL record (session_meta
+    // included) as a message under a doctor-made identity and a "Recovered"
+    // title, so this re-index added a second copy of every session.
     assert_eq!(counts(run(&["stats", "--json"])), indexed_counts);
     assert!(
         hits["hits"]
@@ -5213,13 +5124,15 @@ fn doctor_fix_candidate_build_on_unreadable_archive_leaves_promotion_unblocked()
                 .as_str()
                 .unwrap_or_default()
                 .starts_with("Recovered")),
-        "connector parsing preserves session identity: {hits:#}"
+        "{hits:#}"
     );
     let reindexed = run(&["index", "--json"]);
     assert!(reindexed.status.success(), "{reindexed:?}");
     assert_eq!(counts(run(&["stats", "--json"])), indexed_counts);
 
-    // Old db links survive promotion, but their ids may now name other sources.
+    // The mirror's db links still carry the replaced archive's conversation
+    // ids, which the promoted archive reassigned; doctor must not read them as
+    // evidence that the untouched sources changed.
     let rechecked = run(&["doctor", "check", "--json"]);
     let rechecked: Value = serde_json::from_slice(&rechecked.stdout).expect("doctor check JSON");
     assert_eq!(

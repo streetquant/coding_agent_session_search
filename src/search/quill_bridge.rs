@@ -31,14 +31,9 @@ use frankensearch::quill::cass::{
 };
 use frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA;
 use frankensearch::quill::{
-    QuillConfig, QuillIndex, QuillSearchIndex, RecoveredSegment, SchemaDocument,
+    KeeperSnapshot, QuillConfig, QuillIndex, QuillSearchIndex, SchemaDocument,
 };
 
-/// Quill's tier concat merge caps positions for one term at 2^24. The shared
-/// CASS corpus has enough repeated terms that an automatic merge can exceed
-/// that cap and fail an otherwise successful index commit. Keep published
-/// segments separate until Quill can skip an over-limit merge safely.
-const CASS_TIER_FANOUT: usize = usize::MAX;
 #[path = "quill_bridge/fuel_errors.rs"]
 mod fuel_errors;
 
@@ -50,13 +45,11 @@ mod fuel_errors;
 pub const QUILL_INDEX_MARKER: &str = "MANIFEST";
 
 /// Operator override for Quill's deterministic per-query work budget
-/// (`QuillConfig::query_fuel_budget`, default 64,000,000 units). The budget is
+/// (`QuillConfig::query_fuel_budget`, default 10,000,000 units). The budget is
 /// what turns a pathological query into a fast typed refusal instead of an
 /// unbounded scan, so raising it is a diagnostic/escape hatch, not a tuning
 /// knob; the durable fix for fuel exhaustion is a compacted index (#441).
 pub const CASS_QUILL_QUERY_FUEL_BUDGET_ENV: &str = "CASS_QUILL_QUERY_FUEL_BUDGET";
-
-const CASS_QUERY_FUEL_BUDGET: u64 = 64_000_000;
 
 /// Whether `error` is a Quill query-fuel refusal, anywhere in its cause chain.
 /// Concrete engine errors take precedence over diagnostic text. Historical
@@ -84,7 +77,7 @@ pub fn is_engine_invariant_failure(error: &anyhow::Error) -> bool {
 
 /// Engine configuration every CASS reader and writer opens with.
 ///
-/// CASS configures publication, tier merging, and the query budget:
+/// Two deliberate departures from `QuillConfig::default()`:
 ///
 /// * `max_visibility_lag_ms` is effectively infinite. Quill's default (1 s)
 ///   is a cross-process visibility contract: once unpublished changes are a
@@ -115,20 +108,14 @@ pub fn is_engine_invariant_failure(error: &anyhow::Error) -> bool {
 ///   already own merging after incremental runs and at the end of a rebuild,
 ///   under both the byte cap and the document bound.
 /// * `query_fuel_budget` honours [`CASS_QUILL_QUERY_FUEL_BUDGET_ENV`].
-/// * `tier_fanout` disables automatic concat merges that can exceed Quill's
-///   per-term position limit on the shared historical corpus.
-/// * `max_ingest_shards` is one: CASS's wide schema takes Quill's serial
-///   ingest path. Striping serial batches across CPU-count shards retains
-///   one accumulator budget per shard without creating parallel workers.
 ///
-/// Other settings keep the pinned engine defaults.
+/// Everything else keeps the engine default so the on-disk format and the
+/// admission semantics stay exactly what the pinned engine documents.
 #[must_use]
 pub fn cass_quill_config() -> QuillConfig {
     let mut config = QuillConfig {
         max_visibility_lag_ms: u64::MAX,
-        query_fuel_budget: CASS_QUERY_FUEL_BUDGET,
-        tier_fanout: CASS_TIER_FANOUT,
-        max_ingest_shards: 1,
+        tier_fanout: usize::MAX,
         ..QuillConfig::default()
     };
     if let Some(budget) = query_fuel_budget_override(
@@ -142,8 +129,8 @@ pub fn cass_quill_config() -> QuillConfig {
 }
 
 /// Parse the fuel-budget override. Zero, garbage, and absent all mean "keep
-/// CASS's default" — a zero budget would refuse every query, which is never
-/// what an operator setting this variable wants.
+/// the engine default" — a zero budget would refuse every query, which is
+/// never what an operator setting this variable wants.
 fn query_fuel_budget_override(raw: Option<&str>) -> Option<u64> {
     raw.and_then(|value| value.trim().replace('_', "").parse::<u64>().ok())
         .filter(|budget| *budget > 0)
@@ -175,30 +162,17 @@ pub(crate) fn shutdown_driver() -> bool {
 /// deliberate: a `Cx` carries cancellation and deadline state scoped to one
 /// request, and reusing one across independent engine calls would let an
 /// earlier cancellation silently poison a later unrelated call.
-fn drive<T, E, F>(call: impl FnOnce(Cx) -> F) -> Result<T>
+fn drive<T, F>(call: impl FnOnce(Cx) -> F) -> T
 where
-    F: Future<Output = std::result::Result<T, E>>,
-    E: Into<anyhow::Error>,
+    F: Future<Output = T>,
 {
-    drive_with_runtime_factory(call, || {
-        RuntimeBuilder::current_thread()
-            .build()
-            .map_err(|error| anyhow!("building the Quill sync-bridge runtime: {error}"))
-    })
-}
-
-fn drive_with_runtime_factory<T, E, F>(
-    call: impl FnOnce(Cx) -> F,
-    build_runtime: impl FnOnce() -> Result<Runtime>,
-) -> Result<T>
-where
-    F: Future<Output = std::result::Result<T, E>>,
-    E: Into<anyhow::Error>,
-{
-    let runtime = match DRIVER.with(|slot| slot.borrow_mut().take()) {
-        Some(runtime) => runtime,
-        None => build_runtime()?,
-    };
+    let runtime = DRIVER
+        .with(|slot| slot.borrow_mut().take())
+        .unwrap_or_else(|| {
+            RuntimeBuilder::current_thread()
+                .build()
+                .expect("failed to build Quill sync-bridge runtime")
+        });
     // Restore the runtime on the way out even if the driven future panics.
     //
     // The slot is TAKEN for the duration of the call so a reentrant bridge call
@@ -241,7 +215,7 @@ where
             call(cx).await
         });
     drop(guard);
-    output.map_err(Into::into)
+    output
 }
 
 /// Refresh a reader to the latest published snapshot.
@@ -277,14 +251,12 @@ pub fn refresh_reader_or_detect_republish(reader: &QuillSearchIndex) -> Result<O
     use frankensearch::quill::{QuillIndexError, SnapshotError};
     match drive(|cx| async move { reader.refresh(&cx).await }) {
         Ok(_) => Ok(None),
-        Err(error) => match error.downcast_ref::<QuillIndexError>() {
-            Some(QuillIndexError::Snapshot(
-                snapshot @ (SnapshotError::KeeperGenerationRegression { .. }
-                | SnapshotError::KeeperGenerationCollision { .. }
-                | SnapshotError::KeeperTransition { .. }),
-            )) => Ok(Some(snapshot.to_string())),
-            _ => Err(error.context("refreshing the Quill CASS reader")),
-        },
+        Err(QuillIndexError::Snapshot(
+            error @ (SnapshotError::KeeperGenerationRegression { .. }
+            | SnapshotError::KeeperGenerationCollision { .. }
+            | SnapshotError::KeeperTransition { .. }),
+        )) => Ok(Some(error.to_string())),
+        Err(error) => Err(anyhow!("refreshing the Quill CASS reader: {error}")),
     }
 }
 
@@ -348,7 +320,7 @@ pub fn search_paginated(
         // Preserve the engine type for recovery admission, while retaining the
         // full outer display for CLI callers that do not print the cause chain.
         let diagnostic = format!("executing a Quill lexical query: {error}");
-        error.context(diagnostic)
+        anyhow::Error::new(error).context(diagnostic)
     })?;
     Ok(QuillLexicalPage {
         hits: result
@@ -521,71 +493,11 @@ pub(crate) fn open_cass_reader_with_query_fuel_budget(
 const QUILL_SEGMENT_FILE_PREFIX: &str = "seg-";
 const QUILL_SEGMENT_FILE_SUFFIX: &str = ".fslx";
 
-/// Durable receipt written after a successful CASS-owned merge.
-///
-/// Quill's MANIFEST records publication time, but a publication can be a
-/// normal ingest commit as well as a merge.  Keeping the merge timestamp in a
-/// tiny sidecar lets the observation surfaces distinguish those events after
-/// the writer process exits.  The receipt is deliberately outside the engine
-/// manifest: older indexes remain readable and report `null` until this
-/// binary performs a merge.
-pub const QUILL_MERGE_RECEIPT: &str = ".cass-lexical-merge.json";
-const QUILL_MERGE_RECEIPT_VERSION: u32 = 1;
-
-/// Read the timestamp of the last CASS-owned lexical merge.
-///
-/// A missing, malformed, or non-positive receipt is unknown rather than an
-/// invented epoch.  Status and health therefore remain truthful for indexes
-/// created by an older binary or for a merge whose process died before the
-/// receipt could be published.
-#[must_use]
-pub fn last_merge_timestamp(path: &Path) -> Option<i64> {
-    let bytes = std::fs::read(path.join(QUILL_MERGE_RECEIPT)).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    (value.get("version").and_then(serde_json::Value::as_u64)
-        == Some(u64::from(QUILL_MERGE_RECEIPT_VERSION)))
-    .then(|| {
-        value
-            .get("last_merge_at_ms")
-            .and_then(serde_json::Value::as_i64)
-    })
-    .flatten()
-    .filter(|timestamp| *timestamp > 0)
-}
-
-fn write_last_merge_timestamp(path: &Path, timestamp: i64) -> Result<()> {
-    if timestamp <= 0 {
-        return Ok(());
-    }
-    let receipt = path.join(QUILL_MERGE_RECEIPT);
-    let temporary = path.join(format!("{QUILL_MERGE_RECEIPT}.tmp-{}", std::process::id()));
-    let payload = serde_json::json!({
-        "version": QUILL_MERGE_RECEIPT_VERSION,
-        "last_merge_at_ms": timestamp,
-    });
-    // Rename is atomic on the same filesystem.  A reader either sees the
-    // previous complete receipt or the new complete receipt, never a partial
-    // JSON document; an abandoned `.tmp-*` is ignored by all observation
-    // surfaces and overwritten by the next writer in this process.
-    std::fs::write(&temporary, serde_json::to_vec(&payload)?)?;
-    std::fs::rename(&temporary, &receipt)?;
-    Ok(())
-}
-
-fn current_unix_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
-        })
-}
-
 /// Live segment count of a published Quill index, from the engine's own
 /// reader — the number a query actually pays for. Costs an engine open, so
 /// it belongs on surfaces that may spend (`doctor`, tests), not on
-/// `status`/`health`, which report the metadata-only [`manifest_live_doc_count`]
-/// value instead. Folded inputs stay on disk for a while after a merge, so the
-/// manifest count and [`segment_file_count`] can differ.
+/// `status`/`health`, which report [`segment_file_count`] instead. Folded
+/// inputs stay on disk for a while after a merge, so the two can differ.
 #[must_use]
 pub fn live_segment_count(path: &Path) -> Option<usize> {
     if !path.join(QUILL_INDEX_MARKER).is_file() {
@@ -701,31 +613,6 @@ impl QuillManifestSource {
             ManifestSource::PreviousAfterCorruptCurrent => Self::PreviousAfterCorruptCurrent,
         }
     }
-}
-
-/// Manifest authority of the immutable snapshot this reader actually retains.
-///
-/// The pinned Quill release exposes reader snapshots through its production
-/// candidate-hydration context. Requesting zero candidates returns that pin
-/// before parsing a query or traversing postings; no file is reopened.
-///
-/// # Errors
-///
-/// Returns an error if Quill cannot supply its typed snapshot pin.
-pub fn reader_manifest_source(reader: &QuillSearchIndex) -> Result<QuillManifestSource> {
-    let batch = drive(|cx| async move {
-        frankensearch::LexicalRead::search_candidates(reader, &cx, "", 0).await
-    })?;
-    let context = batch
-        .context()
-        .filter(|context| context.backend() == frankensearch::quill::QUILL_LEXICAL_BACKEND)
-        .ok_or_else(|| anyhow!("Quill did not retain a manifest provenance context"))?;
-    let snapshot = context
-        .downcast_ref::<Arc<frankensearch::quill::QuillSearchSnapshot>>()
-        .ok_or_else(|| anyhow!("Quill returned an unsupported manifest provenance pin"))?;
-    Ok(QuillManifestSource::from_engine(
-        snapshot.keeper_snapshot().loaded_manifest().source,
-    ))
 }
 
 /// Read [`QuillManifestLiveDocs`] for the Quill index at `path`.
@@ -924,12 +811,6 @@ const ENGINE_LIVENESS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// #413) burns microseconds per second; a sealing/merging engine burns most
 /// of a core.
 const ENGINE_LIVENESS_MIN_CPU_ADVANCE: Duration = Duration::from_millis(100);
-/// Minimum storage-layer I/O (bytes read+written) within one sample interval
-/// for an I/O-bound interval to count as work. GH #450: the engine's
-/// compatibility repair reads the whole archive at ~2.7 MiB/s and may not
-/// rewrite the main file during the integrity walk; a healthy interval still
-/// moves far more than this, while a wedge moves nothing.
-const ENGINE_LIVENESS_MIN_IO_ADVANCE: u64 = 256 * 1024;
 
 /// GH #446: liveness ticks from inside the Quill sink.
 ///
@@ -1037,13 +918,6 @@ pub(crate) struct EngineLivenessSample {
     pub directory_footprint: (u64, u64),
     /// Process user+system CPU time; `None` where unavailable.
     pub process_cpu_time: Option<Duration>,
-    /// Cumulative storage-layer bytes read+written by the process
-    /// (`/proc/self/io` `read_bytes` + `write_bytes`); `None` where
-    /// unavailable. GH #450: an I/O-bound repair can move gigabytes while
-    /// consuming well under the CPU threshold and, for a read-only integrity
-    /// walk, while changing no watched file's size. Without this signal that
-    /// healthy work looked exactly like a deadlock.
-    pub process_io_bytes: Option<u64>,
 }
 
 impl EngineLivenessSample {
@@ -1051,7 +925,6 @@ impl EngineLivenessSample {
         Self {
             directory_footprint: watch_target_footprint(targets),
             process_cpu_time: process_cpu_time(),
-            process_io_bytes: process_io_bytes(),
         }
     }
 }
@@ -1106,20 +979,14 @@ pub(crate) struct EngineLivenessTracker {
 
 impl EngineLivenessTracker {
     /// Returns `true` when `sample` shows progress relative to the previous
-    /// one: the watched footprint changed, CPU advanced by at least
-    /// [`ENGINE_LIVENESS_MIN_CPU_ADVANCE`], or storage I/O advanced by at
-    /// least [`ENGINE_LIVENESS_MIN_IO_ADVANCE`]. The first sample of an op
-    /// only establishes the baseline.
+    /// one: the directory footprint changed, or CPU advanced by at least
+    /// [`ENGINE_LIVENESS_MIN_CPU_ADVANCE`]. The first sample of an op only
+    /// establishes the baseline.
     pub(crate) fn observe(&mut self, sample: EngineLivenessSample) -> bool {
         let Some(previous) = self.previous.replace(sample) else {
             return false;
         };
         if sample.directory_footprint != previous.directory_footprint {
-            return true;
-        }
-        if let (Some(before), Some(now)) = (previous.process_io_bytes, sample.process_io_bytes)
-            && now.saturating_sub(before) >= ENGINE_LIVENESS_MIN_IO_ADVANCE
-        {
             return true;
         }
         match (previous.process_cpu_time, sample.process_cpu_time) {
@@ -1188,238 +1055,6 @@ fn process_cpu_time() -> Option<Duration> {
     None
 }
 
-/// Cumulative storage-layer I/O (`read_bytes + write_bytes`) from
-/// `/proc/self/io`; `None` where the kernel does not expose it.
-#[cfg(target_os = "linux")]
-fn process_io_bytes() -> Option<u64> {
-    let text = std::fs::read_to_string("/proc/self/io").ok()?;
-    let mut total = 0_u64;
-    let mut saw_field = false;
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
-        if matches!(key, "read_bytes" | "write_bytes")
-            && let Ok(bytes) = value.trim().parse::<u64>()
-        {
-            total = total.saturating_add(bytes);
-            saw_field = true;
-        }
-    }
-    saw_field.then_some(total)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn process_io_bytes() -> Option<u64> {
-    None
-}
-
-/// Bind an exact retained read-only mapping to the descriptor being verified.
-///
-/// The engine does not expose its backing descriptor. Linux's kernel map table
-/// supplies its physical identity without touching the mapped pages. Owned
-/// images, unavailable map tables, and other platforms retain eager verification
-/// of the held bytes instead of assuming that a reopened path is that backing.
-#[cfg(target_os = "linux")]
-fn retained_file_binding(segment: &RecoveredSegment, metadata: &std::fs::Metadata) -> Option<bool> {
-    use std::os::unix::fs::MetadataExt;
-
-    let bytes = segment.source_bytes();
-    let start = bytes.as_ptr().addr();
-    let end = start.checked_add(bytes.len())?;
-    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
-    for line in maps.lines() {
-        let mut fields = line.split_whitespace();
-        let (lo, hi) = fields.next()?.split_once('-')?;
-        let lo = usize::from_str_radix(lo, 16).ok()?;
-        let hi = usize::from_str_radix(hi, 16).ok()?;
-        if lo > start || end > hi {
-            continue;
-        }
-        let permissions = fields.next()?.as_bytes();
-        let offset = u64::from_str_radix(fields.next()?, 16).ok()?;
-        let (major, minor) = fields.next()?.split_once(':')?;
-        let major = u32::from_str_radix(major, 16).ok()?;
-        let minor = u32::from_str_radix(minor, 16).ok()?;
-        let inode: u64 = fields.next()?.parse().ok()?;
-        if inode == 0 || permissions.first() != Some(&b'r') || permissions.get(1) != Some(&b'-') {
-            return None;
-        }
-        return Some(
-            start == lo
-                && offset == 0
-                && libc::makedev(major, minor) == metadata.dev()
-                && inode == metadata.ino(),
-        );
-    }
-    None
-}
-
-#[cfg(not(target_os = "linux"))]
-fn retained_file_binding(
-    _segment: &RecoveredSegment,
-    _metadata: &std::fs::Metadata,
-) -> Option<bool> {
-    None
-}
-
-fn verify_retained_backing(
-    segment: &RecoveredSegment,
-    binding: Option<bool>,
-) -> std::result::Result<(), frankensearch::quill::QuillError> {
-    match binding {
-        Some(true) => Ok(()),
-        Some(false) => Err(frankensearch::quill::QuillError::IndexCorrupted {
-            path: segment.path().to_path_buf(),
-            detail: "retained mapped backing and current file identity differ".into(),
-        }),
-        None => segment.verify(),
-    }
-}
-
-/// Release resident pages without relinquishing an immutable file mapping.
-///
-/// Sealing and identity lookups can populate pages that remain mapped for the
-/// whole rebuild. Streamed verification alone does not release those pages.
-/// Only an exact read-only file binding permits this operation: anonymous and
-/// owned images must keep their bytes, and unsupported platforms do nothing.
-#[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
-fn release_retained_mapping_pages(
-    segment: &RecoveredSegment,
-    metadata: &std::fs::Metadata,
-) -> Result<bool> {
-    if retained_file_binding(segment, metadata) != Some(true) {
-        return Ok(false);
-    }
-    let bytes = segment.source_bytes();
-    // SAFETY: the live segment owns this immutable mapping throughout the
-    // call. The kernel map-table proof above establishes a page-aligned start,
-    // the complete range inside one read-only file VMA, offset zero, and the
-    // exact device/inode. MADV_DONTNEED changes residency, not the mapping or
-    // published file bytes; subsequent access reloads that same immutable
-    // file. Never apply it to an owned/anonymous image: that would lose data.
-    let result = unsafe {
-        libc::madvise(
-            bytes.as_ptr().cast_mut().cast(),
-            bytes.len(),
-            libc::MADV_DONTNEED,
-        )
-    };
-    if result != 0 {
-        return Err(anyhow!(
-            "releasing resident Quill mapping pages: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(true)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn release_retained_mapping_pages(
-    _segment: &RecoveredSegment,
-    _metadata: &std::fs::Metadata,
-) -> Result<bool> {
-    Ok(false)
-}
-
-/// Revalidate the admitted file without faulting its entire retained mapping in.
-///
-/// The immutable MANIFEST and section table were admitted by Quill. Recompute
-/// their witnesses from the current file, including unknown optional sections
-/// and padding, rather than trusting a lazy checksum or a matching file stamp.
-/// The prefix witness also binds the previously validated header and layout.
-fn verify_retained_segment_file(segment: &RecoveredSegment) -> Result<()> {
-    use std::io::Read;
-    use xxhash_rust::xxh3::Xxh3;
-
-    const TRAILER_BYTES: usize = 12;
-    const READ_BYTES: usize = 1024 * 1024;
-    let manifest = segment.manifest();
-    let corrupt = |detail: String| {
-        anyhow::Error::new(frankensearch::quill::QuillError::IndexCorrupted {
-            path: segment.path().to_path_buf(),
-            detail,
-        })
-    };
-    let mut file = std::fs::File::open(segment.path())?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() != manifest.file_len {
-        return Err(corrupt(
-            "retained segment file type or length changed".into(),
-        ));
-    }
-    verify_retained_backing(segment, retained_file_binding(segment, &metadata))?;
-    let prefix_len = manifest
-        .file_len
-        .checked_sub(TRAILER_BYTES as u64)
-        .ok_or_else(|| corrupt("retained segment is shorter than its trailer".into()))?;
-    let mut sections = Vec::with_capacity(segment.section_entries().len());
-    for entry in segment.section_entries() {
-        let end = entry
-            .offset
-            .checked_add(entry.len)
-            .filter(|end| *end <= prefix_len)
-            .ok_or_else(|| corrupt("retained section range exceeds its prefix".into()))?;
-        sections.push((*entry, end, Xxh3::new()));
-    }
-    let mut prefix_hash = Xxh3::new();
-    let mut buffer = vec![0; READ_BYTES];
-    let mut offset = 0;
-    while offset < prefix_len {
-        let count = usize::try_from((prefix_len - offset).min(READ_BYTES as u64))?;
-        let bytes = buffer
-            .get_mut(..count)
-            .ok_or_else(|| corrupt("retained read exceeds its fixed buffer".into()))?;
-        file.read_exact(bytes)?;
-        prefix_hash.update(bytes);
-        let next = offset + count as u64;
-        for (entry, end, hash) in &mut sections {
-            let start = offset.max(entry.offset);
-            let stop = next.min(*end);
-            if start < stop {
-                let start = usize::try_from(start - offset)?;
-                let stop = usize::try_from(stop - offset)?;
-                let section_bytes = bytes
-                    .get(start..stop)
-                    .ok_or_else(|| corrupt("retained section exceeds its read buffer".into()))?;
-                hash.update(section_bytes);
-            }
-        }
-        offset = next;
-    }
-    if let Some((entry, _, _)) = sections
-        .into_iter()
-        .find(|(entry, _, hash)| hash.digest() != entry.xxh3)
-    {
-        return Err(corrupt(format!(
-            "retained section {:?} checksum mismatch",
-            entry.kind
-        )));
-    }
-    let mut trailer_hash = [0; 8];
-    let mut trailer_crc = [0; 4];
-    file.read_exact(&mut trailer_hash)?;
-    file.read_exact(&mut trailer_crc)?;
-    let expected_hash = manifest.file_xxh3.to_le_bytes();
-    if prefix_hash.digest() != manifest.file_xxh3
-        || trailer_hash != expected_hash
-        || trailer_crc != crc32fast::hash(&expected_hash).to_le_bytes()
-    {
-        return Err(corrupt(
-            "retained file-prefix or trailer checksum mismatch".into(),
-        ));
-    }
-    let mut extra = [0];
-    if file.read(&mut extra)? != 0 || file.metadata()?.len() != manifest.file_len {
-        return Err(corrupt(
-            "retained segment length changed during verification".into(),
-        ));
-    }
-    release_retained_mapping_pages(segment, &metadata)?;
-    Ok(())
-}
-
 impl QuillCassIndex {
     /// Open an existing CASS-schema index, creating it when absent.
     ///
@@ -1472,7 +1107,7 @@ impl QuillCassIndex {
         let mut index = Self {
             index,
             directory: path.to_path_buf(),
-            last_merge_ts: last_merge_timestamp(path).unwrap_or(0),
+            last_merge_ts: 0,
             liveness: None,
         };
         // A freshly created index has a writer but no published manifest, so
@@ -1510,56 +1145,6 @@ impl QuillCassIndex {
         }
     }
 
-    /// Recheck every retained file byte before publication.
-    ///
-    /// Upstream 5ee999 reuses unchanged verified backings instead of mapping
-    /// the whole proposed manifest a second time. CASS keeps its full-byte
-    /// maintenance policy: streamed reads recompute every section checksum and
-    /// the file-prefix/trailer witnesses, independently of lazy caches and file
-    /// stamps. A proven Linux mapping identity avoids making the full archive's
-    /// retained mappings resident; other backings also verify their held bytes.
-    /// New or changed bindings are still verified by the engine preflight.
-    /// Disjoint retained segments use at most four scoped CPU workers, each
-    /// with the same fixed-size streaming buffer. Every worker finishes before
-    /// the snapshot is released and the publication is allowed to start.
-    fn with_verified_publication<T>(&self, op: impl FnOnce() -> Result<T>) -> Result<T> {
-        self.with_engine_liveness(|| {
-            {
-                let snapshot = self.index.snapshot()?;
-                let workers = std::thread::available_parallelism()
-                    .map_or(1, std::num::NonZeroUsize::get)
-                    .min(4);
-                let chunk_size = snapshot.segments().len().div_ceil(workers).max(1);
-                std::thread::scope(|scope| -> Result<()> {
-                    let mut handles = Vec::new();
-                    for chunk in snapshot.segments().chunks(chunk_size) {
-                        handles.push(scope.spawn(move || -> Result<()> {
-                            for segment in chunk {
-                                verify_retained_segment_file(segment).map_err(|error| {
-                                    let diagnostic = format!(
-                                        "verifying retained Quill segment {} before publication: {error}",
-                                        segment.path().display()
-                                    );
-                                    error.context(diagnostic)
-                                })?;
-                            }
-                            Ok(())
-                        }));
-                    }
-                    for handle in handles {
-                        handle
-                            .join()
-                            .map_err(|_| anyhow!("retained Quill verification worker panicked"))??;
-                    }
-                    Ok(())
-                })?;
-                // Release the snapshot before publication; keep no extra
-                // reader or mapping alive across the successor installation.
-            }
-            op()
-        })
-    }
-
     /// Index one batch of CASS documents.
     ///
     /// # Errors
@@ -1586,7 +1171,7 @@ impl QuillCassIndex {
             // Preserve the engine cause for retry classification without changing
             // the operator-facing diagnostic.
             let diagnostic = format!("indexing CASS documents into Quill: {error}");
-            error.context(diagnostic)
+            anyhow::Error::new(error).context(diagnostic)
         })?;
         self.tick_heartbeat();
         Ok(())
@@ -1613,7 +1198,7 @@ impl QuillCassIndex {
             .iter()
             .map(QuillCassDocument::to_schema_document)
             .collect();
-        self.with_verified_publication(|| {
+        self.with_engine_liveness(|| {
             drive(|cx| {
                 let projected = &projected;
                 let index = &self.index;
@@ -1622,7 +1207,7 @@ impl QuillCassIndex {
         })
         .map_err(|error| {
             let diagnostic = format!("upserting CASS documents into Quill: {error}");
-            error.context(diagnostic)
+            anyhow::Error::new(error).context(diagnostic)
         })?;
         self.tick_heartbeat();
         Ok(())
@@ -1638,7 +1223,7 @@ impl QuillCassIndex {
         }
         self.commit()?;
         let ids: Vec<&str> = document_ids.iter().map(String::as_str).collect();
-        self.with_verified_publication(|| {
+        self.with_engine_liveness(|| {
             drive(|cx| {
                 let index = &self.index;
                 let ids = &ids;
@@ -1650,31 +1235,13 @@ impl QuillCassIndex {
         Ok(())
     }
 
-    pub fn delete_document_ids(&mut self, document_ids: &[String]) -> Result<usize> {
-        if document_ids.is_empty() {
-            return Ok(0);
-        }
-        let identities: Vec<&str> = document_ids.iter().map(String::as_str).collect();
-        let deleted = self
-            .with_verified_publication(|| {
-                drive(|cx| {
-                    let identities = &identities;
-                    let index = &self.index;
-                    async move { index.delete_documents(&cx, identities).await }
-                })
-            })
-            .map_err(|error| anyhow!("retiring snapshot documents from Quill: {error}"))?;
-        self.tick_heartbeat();
-        Ok(deleted)
-    }
-
     /// Publish everything staged since the last commit.
     ///
     /// # Errors
     ///
     /// Returns an error when publication fails.
     pub fn commit(&mut self) -> Result<()> {
-        self.with_verified_publication(|| {
+        self.with_engine_liveness(|| {
             drive(|cx| {
                 let index = &self.index;
                 async move { index.commit(&cx).await }
@@ -1692,11 +1259,9 @@ impl QuillCassIndex {
     ///
     /// Returns an error when the successor cannot be published.
     pub fn delete_all(&mut self) -> Result<()> {
-        self.with_verified_publication(|| {
-            drive(|cx| {
-                let index = &self.index;
-                async move { index.delete_all(&cx).await }
-            })
+        drive(|cx| {
+            let index = &self.index;
+            async move { index.delete_all(&cx).await }
         })
         .map_err(|error| anyhow!("clearing the Quill CASS index: {error}"))
     }
@@ -1753,6 +1318,16 @@ impl QuillCassIndex {
         }
     }
 
+    /// Share the immutable generation admitted by this writer. Recovery must
+    /// verify these exact segments, rather than independently opening a reader
+    /// before the writer acquires its cross-process admission and runs recovery.
+    /// Uncommitted additions are deliberately absent from this Keeper view.
+    pub(crate) fn committed_snapshot(&self) -> Result<Arc<KeeperSnapshot>> {
+        self.index.snapshot().map_err(|error| {
+            anyhow::Error::new(error).context("reading the admitted Quill CASS generation")
+        })
+    }
+
     /// Durable directory backing this index.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -1778,17 +1353,6 @@ impl QuillCassIndex {
     /// Record that a compaction completed at `now_ms`.
     pub fn note_merged(&mut self, now_ms: i64) {
         self.last_merge_ts = now_ms;
-        if let Err(error) = write_last_merge_timestamp(&self.directory, now_ms) {
-            // The merge itself has completed and remains queryable.  A receipt
-            // write failure must not turn a successful consolidation into a
-            // false index failure; status will truthfully report an unknown
-            // last-merge timestamp if no prior receipt exists.
-            tracing::warn!(
-                error = %error,
-                path = %self.directory.display(),
-                "could not persist the lexical merge receipt"
-            );
-        }
     }
 
     /// Index one batch of borrowed CASS documents.
@@ -1996,14 +1560,10 @@ impl QuillCassIndex {
     pub fn force_merge_with_output_cap(&mut self, max_output_bytes: u64) -> Result<()> {
         let runs =
             plan_capped_merge_runs(&self.published_segment_fold_profile()?, max_output_bytes);
-        let merged = !runs.is_empty();
         for run in runs {
             self.concat_merge_run(&run)?;
         }
-        let compacted = self.compact_tombstones()?;
-        if merged || compacted {
-            self.note_merged(current_unix_millis());
-        }
+        self.compact_tombstones()?;
         Ok(())
     }
 
@@ -2090,7 +1650,7 @@ impl QuillCassIndex {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX))
             .unwrap_or(0);
-        self.with_verified_publication(|| {
+        self.with_engine_liveness(|| {
             drive(|cx| {
                 let index = &self.index;
                 async move {
@@ -2115,7 +1675,7 @@ impl QuillCassIndex {
     /// Density-driven tombstone compaction; a no-op on an append-only index.
     fn compact_tombstones(&mut self) -> Result<bool> {
         let changed = self
-            .with_verified_publication(|| {
+            .with_engine_liveness(|| {
                 drive(|cx| {
                     let index = &self.index;
                     async move {
@@ -2534,26 +2094,16 @@ mod tests {
             "the CASS config must pass engine validation"
         );
         let default = QuillConfig::default();
-        assert_eq!(config.tier_fanout, CASS_TIER_FANOUT);
+        assert_eq!(
+            config.tier_fanout,
+            usize::MAX,
+            "#498: the engine's unbounded tier merge must never run under CASS"
+        );
         assert_eq!(
             config.scribe_shard_budget_bytes,
             default.scribe_shard_budget_bytes
         );
-        assert_eq!(config.query_fuel_budget, CASS_QUERY_FUEL_BUDGET);
-        // The shipped per-query work ceiling is a gate, so its number is
-        // pinned here: a change to it must be deliberate, and the CLI help
-        // text (`cass --help`, src/lib.rs) has to state the same value. The
-        // upstream default is 10,000,000; CASS ships a higher ceiling because
-        // the owner's production snapshot holds 1,157 segments and the
-        // upstream default is spent walking term dictionaries before a valid
-        // hit is reached. The price of that adaptation is that a pathological
-        // query scans up to 6.4x more work before the typed refusal, so the
-        // boundary is exercised with an explicit ceiling in
-        // tests/cli_index.rs rather than by the default.
-        assert_eq!(
-            CASS_QUERY_FUEL_BUDGET, 64_000_000,
-            "the shipped Quill query fuel ceiling changed: update the CLI help text and the BR record"
-        );
+        assert_eq!(config.query_fuel_budget, default.query_fuel_budget);
     }
 
     /// Segments and documents published after `commits` single-document
@@ -2956,11 +2506,10 @@ mod tests {
     // footprint growth OR a real CPU advance counts as engine work; a frozen
     // engine (nothing written, no CPU) never ticks.
     #[test]
-    fn engine_liveness_tracker_ticks_on_footprint_cpu_or_io_advance() {
+    fn engine_liveness_tracker_ticks_on_footprint_or_cpu_advance_only() {
         let sample = |bytes: u64, files: u64, cpu_ms: u64| EngineLivenessSample {
             directory_footprint: (bytes, files),
             process_cpu_time: Some(Duration::from_millis(cpu_ms)),
-            process_io_bytes: None,
         };
         let mut tracker = EngineLivenessTracker::default();
         assert!(!tracker.observe(sample(100, 2, 1_000)), "baseline");
@@ -2988,39 +2537,10 @@ mod tests {
         let no_cpu = |bytes: u64| EngineLivenessSample {
             directory_footprint: (bytes, 1),
             process_cpu_time: None,
-            process_io_bytes: None,
         };
         assert!(!tracker.observe(no_cpu(1)));
         assert!(!tracker.observe(no_cpu(1)));
         assert!(tracker.observe(no_cpu(2)));
-
-        // GH #450: an I/O-bound repair may move no watched file and burn
-        // almost no CPU while it walks the archive. Storage I/O growth is work;
-        // a trickle below the threshold and a frozen counter are not.
-        let io_sample = |bytes: u64, io: u64| EngineLivenessSample {
-            directory_footprint: (bytes, 1),
-            process_cpu_time: Some(Duration::from_millis(1_000)),
-            process_io_bytes: Some(io),
-        };
-        let mut tracker = EngineLivenessTracker::default();
-        assert!(!tracker.observe(io_sample(1, 1_000_000)), "baseline");
-        let trickle = 1_000_000 + ENGINE_LIVENESS_MIN_IO_ADVANCE - 1;
-        assert!(
-            !tracker.observe(io_sample(1, trickle)),
-            "a sub-threshold I/O trickle is not proof of work"
-        );
-        // The tracker compares consecutive samples, so the next sample must
-        // itself advance by the threshold from the trickle, not from the
-        // baseline.
-        let advanced = trickle + ENGINE_LIVENESS_MIN_IO_ADVANCE;
-        assert!(
-            tracker.observe(io_sample(1, advanced)),
-            "a 256 KiB storage-I/O advance is work"
-        );
-        assert!(
-            !tracker.observe(io_sample(1, advanced)),
-            "frozen I/O and CPU is a wedge"
-        );
     }
 
     /// GH #450: a long blocking call that keeps growing a watched file must
@@ -3184,21 +2704,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cass_quill_config_uses_the_bounded_large_corpus_budget() {
-        let config = cass_quill_config();
-        let default_budget = QuillConfig::default().query_fuel_budget;
-        assert_eq!(config.query_fuel_budget, CASS_QUERY_FUEL_BUDGET);
-        assert!(config.query_fuel_budget > 0);
-        assert!(
-            config.query_fuel_budget > default_budget,
-            "CASS needs more bounded query work than Quill's fixture default"
-        );
-        assert_eq!(config.tier_fanout, CASS_TIER_FANOUT);
-        assert_eq!(config.max_visibility_lag_ms, u64::MAX);
-        config.validate().expect("CASS Quill config is valid");
-    }
-
     /// The bridge must drive a full write/commit/read cycle from sync code.
     ///
     /// This is the claim the whole module exists to support: cass's
@@ -3216,32 +2721,6 @@ mod tests {
             .expect("index documents");
         index.commit().expect("commit");
         assert_eq!(index.doc_count().expect("doc count"), 2);
-    }
-
-    #[test]
-    fn serial_batches_share_one_bounded_accumulator() {
-        let directory = tempfile::tempdir().expect("bridge index directory");
-        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open or create");
-        for message in 0..64 {
-            index
-                .add_cass_documents(&[sample("bounded", message, "retained batch content")])
-                .expect("index batch");
-        }
-        index.commit().expect("commit");
-        assert_eq!(index.doc_count().expect("document count"), 64);
-        assert_eq!(
-            index.segment_count().expect("segment count"),
-            1,
-            "serial batches below one accumulator budget must not fan out into per-CPU buffers"
-        );
-        assert_eq!(
-            index
-                .reader()
-                .expect("fresh reader")
-                .doc_count()
-                .expect("reader count"),
-            64
-        );
     }
 
     /// Counting documents on a writer reads its verified snapshot. A reader
@@ -3272,49 +2751,6 @@ mod tests {
         assert_eq!(
             index.reader().expect("reader").doc_count().expect("count"),
             2
-        );
-    }
-
-    /// Maintenance polls the segment count while the writer retains its
-    /// mappings. A separate reader would map and authenticate the whole
-    /// generation again, so even deciding whether to merge inflated RSS.
-    #[test]
-    fn writer_segment_count_tracks_publication_without_opening_a_reader() {
-        let directory = tempfile::tempdir().expect("bridge index directory");
-        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open");
-        let opens = reader_open_count();
-        assert_eq!(index.segment_count().expect("empty segment count"), 0);
-
-        index
-            .add_cass_documents(&[sample("alpha", 0, "first retained document")])
-            .expect("first batch");
-        assert_eq!(
-            index.segment_count().expect("count before commit"),
-            0,
-            "staged rows are not published"
-        );
-        index.commit().expect("first commit");
-        assert_eq!(index.segment_count().expect("count before commit"), 1);
-        index
-            .add_cass_documents(&[sample("beta", 1, "second published document")])
-            .expect("second batch");
-        assert_eq!(index.segment_count().expect("count before commit"), 1);
-        index.commit().expect("second commit");
-        assert_eq!(index.segment_count().expect("count after second commit"), 2);
-
-        index.force_merge().expect("merge published segments");
-        assert_eq!(index.segment_count().expect("count after merge"), 1);
-        assert_eq!(index.doc_count().expect("merged document count"), 2);
-        index.delete_all().expect("publish empty successor");
-        assert_eq!(index.segment_count().expect("count after delete"), 0);
-        assert_eq!(reader_open_count(), opens, "maintenance opened a reader");
-        assert_eq!(
-            index
-                .reader()
-                .expect("independent published reader")
-                .segment_count()
-                .expect("independent segment count"),
-            0
         );
     }
 
@@ -3481,532 +2917,6 @@ mod tests {
         );
     }
 
-    /// Publication must not map the same retained file again while the old
-    /// snapshot is alive: those aliases doubled resident file pages at scale.
-    #[test]
-    fn publication_reuses_retained_segment_mapping() {
-        let directory = tempfile::tempdir().expect("bridge index directory");
-        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open");
-        index
-            .add_cass_documents(&[sample("alpha", 0, "first retained document")])
-            .expect("first batch");
-        index.commit().expect("first commit");
-        let before = index.index.snapshot().expect("first snapshot");
-        assert_eq!(before.segments().len(), 1);
-        let retained = &before.segments()[0];
-
-        index
-            .add_cass_documents(&[sample("beta", 1, "second published document")])
-            .expect("second batch");
-        index.commit().expect("second commit");
-        let after = index.index.snapshot().expect("second snapshot");
-        assert_eq!(after.segments().len(), 2);
-        let successor = after
-            .segments()
-            .iter()
-            .find(|segment| segment.path() == retained.path())
-            .expect("retained segment remains published");
-        assert_eq!(successor.manifest(), retained.manifest());
-        assert_eq!(
-            successor.source_bytes().as_ptr(),
-            retained.source_bytes().as_ptr(),
-            "publication remapped a retained segment while its old mapping was live"
-        );
-        assert_eq!(index.doc_count().expect("published count"), 2);
-        assert_eq!(
-            index
-                .reader()
-                .expect("strict reader")
-                .doc_count()
-                .expect("count"),
-            2
-        );
-    }
-
-    #[test]
-    fn streamed_retained_verification_crosses_buffer_boundaries() {
-        fn reader_snapshot(
-            reader: &QuillSearchIndex,
-        ) -> Arc<frankensearch::quill::QuillSearchSnapshot> {
-            let batch = drive(|cx| async move {
-                frankensearch::LexicalRead::search_candidates(reader, &cx, "", 0).await
-            })
-            .expect("pin the real search reader snapshot");
-            let context = batch
-                .context()
-                .filter(|context| context.backend() == frankensearch::quill::QUILL_LEXICAL_BACKEND)
-                .expect("Quill search reader provenance");
-            Arc::clone(
-                context
-                    .downcast_ref::<Arc<frankensearch::quill::QuillSearchSnapshot>>()
-                    .expect("typed search reader snapshot"),
-            )
-        }
-
-        #[cfg(target_os = "linux")]
-        fn mapped_rss_bytes(segment: &RecoveredSegment) -> usize {
-            let start = format!("{:x}-", segment.source_bytes().as_ptr().addr());
-            let smaps =
-                std::fs::read_to_string("/proc/self/smaps").expect("kernel mapping residency");
-            let mut lines = smaps.lines().skip_while(|line| !line.starts_with(&start));
-            assert!(lines.next().is_some(), "held segment mapping absent");
-            let rss = lines
-                .find_map(|line| line.strip_prefix("Rss:"))
-                .expect("mapping RSS row");
-            rss.split_whitespace()
-                .next()
-                .expect("mapping RSS value")
-                .parse::<usize>()
-                .expect("numeric mapping RSS")
-                * 1024
-        }
-
-        let directory = tempfile::tempdir().expect("streamed verification directory");
-        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open");
-        let documents: Vec<_> = (0..32)
-            .map(|row| {
-                let content = (0..4096)
-                    .map(|term| format!("streamrow{row}term{term} "))
-                    .collect::<String>();
-                sample(&format!("stream-{row}"), row, &content)
-            })
-            .collect();
-        index
-            .add_cass_documents(&documents)
-            .expect("stage documents");
-        index.commit().expect("publish documents");
-        drop(index);
-        let index = QuillCassIndex::open_or_create(directory.path()).expect("reopen held mappings");
-        let reader = index.reader().expect("reader holding the tested mappings");
-        let search_snapshot = reader_snapshot(&reader);
-        let snapshot = search_snapshot.keeper_snapshot();
-        assert!(
-            snapshot
-                .segments()
-                .iter()
-                .any(|segment| segment.manifest().file_len > 1024 * 1024),
-            "the native fixture must cross a streamed read boundary"
-        );
-        for segment in snapshot.segments() {
-            #[cfg(target_os = "linux")]
-            let (address, before_rss, before_hash) = {
-                segment
-                    .verify()
-                    .expect("fault in the complete immutable image");
-                (
-                    segment.source_bytes().as_ptr(),
-                    mapped_rss_bytes(segment),
-                    xxhash_rust::xxh3::xxh3_64(segment.source_bytes()),
-                )
-            };
-            #[cfg(target_os = "linux")]
-            assert_eq!(
-                retained_file_binding(
-                    segment,
-                    &std::fs::metadata(segment.path()).expect("mapped file metadata")
-                ),
-                Some(true),
-                "ordinary mapped segments must use the bounded streaming path"
-            );
-            verify_retained_segment_file(segment).expect("streamed integrity");
-            #[cfg(target_os = "linux")]
-            {
-                let after_rss = mapped_rss_bytes(segment);
-                assert!(before_rss > 0, "control did not populate the held mapping");
-                assert_eq!(after_rss, 0, "verified file pages remained resident");
-                assert_eq!(segment.source_bytes().as_ptr(), address, "mapping moved");
-                assert_eq!(
-                    xxhash_rust::xxh3::xxh3_64(segment.source_bytes()),
-                    before_hash,
-                    "re-faulting the held mapping changed its exact bytes"
-                );
-                eprintln!(
-                    "RETAINED_RESIDENCY_CONTROL case=refault before_rss={before_rss} after_rss={after_rss} bytes_unchanged=true"
-                );
-            }
-            verify_retained_backing(segment, None).expect("conservative held-byte fallback");
-            segment.verify().expect("independent engine integrity");
-        }
-        assert_eq!(index.doc_count().expect("published population"), 32);
-        #[cfg(target_os = "linux")]
-        {
-            let parser = frankensearch::quill::query::CassQueryParser::new(CASS_SEMANTIC_SCHEMA)
-                .expect("concurrent CASS query parser");
-            let parsed = parser.parse(
-                "streamrow0term2048",
-                &frankensearch::quill::query::CassQueryFilters::default(),
-            );
-            let expected = search_paginated(&reader, &parsed.query, 32, 0, true)
-                .expect("baseline real search");
-            assert_eq!(expected.hits.len(), 1);
-            assert_eq!(expected.total_count, Some(1));
-            assert_eq!(expected.doc_count, 32);
-            let hashes: Vec<_> = snapshot
-                .segments()
-                .iter()
-                .map(|segment| xxhash_rust::xxh3::xxh3_64(segment.source_bytes()))
-                .collect();
-            let (start_tx, start_rx) = std::sync::mpsc::sync_channel(0);
-            let (done_tx, done_rx) = std::sync::mpsc::channel();
-            std::thread::scope(|scope| {
-                let reader = &reader;
-                let expected = &expected;
-                let query = &parsed.query;
-                let hashes = &hashes;
-                let searches = scope.spawn(move || {
-                    let held_snapshot = reader_snapshot(reader);
-                    let held = held_snapshot.keeper_snapshot();
-                    for (segment, original) in held.segments().iter().zip(snapshot.segments()) {
-                        assert_eq!(
-                            segment.source_bytes().as_ptr(),
-                            original.source_bytes().as_ptr(),
-                            "the concurrent search must use the advised mapping"
-                        );
-                    }
-                    for round in 0..32 {
-                        assert_eq!(
-                            start_rx.recv_timeout(Duration::from_secs(30)),
-                            Ok(round),
-                            "residency release thread stopped before the search"
-                        );
-                        let page = search_paginated(reader, query, 32, 0, true)
-                            .expect("real search concurrent with residency release");
-                        assert_eq!(&page, expected);
-                        for (segment, hash) in held.segments().iter().zip(hashes) {
-                            assert_eq!(xxhash_rust::xxh3::xxh3_64(segment.source_bytes()), *hash);
-                        }
-                        done_tx.send(round).expect("search completion receiver");
-                        eprintln!(
-                            "RETAINED_RESIDENCY_CONTROL case=concurrent_search round={round} hits=1 total=1 docs=32 bytes_unchanged=true"
-                        );
-                    }
-                });
-                for round in 0..32 {
-                    start_tx.send(round).expect("concurrent search receiver");
-                    for segment in snapshot.segments() {
-                        verify_retained_segment_file(segment)
-                            .expect("verified release concurrent with real search");
-                    }
-                    assert_eq!(
-                        done_rx.recv_timeout(Duration::from_secs(30)),
-                        Ok(round),
-                        "concurrent search stopped during residency release"
-                    );
-                }
-                searches.join().expect("concurrent search thread");
-            });
-            assert_eq!(
-                search_paginated(&reader, &parsed.query, 32, 0, true)
-                    .expect("search after concurrent releases"),
-                expected
-            );
-            assert_eq!(
-                index
-                    .doc_count()
-                    .expect("population after concurrent releases"),
-                32
-            );
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn retained_residency_release_preserves_owned_engine_images() {
-        let index = QuillIndex::in_memory(cass_quill_config()).expect("owned engine");
-        let document = frankensearch::IndexableDocument::new(
-            "owned-image",
-            "owned image residency control ".repeat(4096),
-        );
-        drive(|cx| {
-            let index = &index;
-            let document = &document;
-            async move {
-                index.index_document(&cx, document).await?;
-                index.commit(&cx).await
-            }
-        })
-        .expect("publish owned engine image");
-        let snapshot = index.snapshot().expect("owned snapshot");
-        assert_eq!(snapshot.segments().len(), 1);
-        let file = tempfile::NamedTempFile::new().expect("unrelated file identity");
-        let metadata = file.as_file().metadata().expect("file metadata");
-        for segment in snapshot.segments() {
-            let before = segment.source_bytes().to_vec();
-            assert_eq!(retained_file_binding(segment, &metadata), None);
-            assert!(
-                !release_retained_mapping_pages(segment, &metadata)
-                    .expect("owned image must not be advised")
-            );
-            assert_eq!(segment.source_bytes(), before);
-            segment.verify().expect("owned integrity after no-op");
-        }
-        assert_eq!(index.doc_count().expect("owned document count"), 1);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn publication_rejects_replaced_path_and_corrupt_detached_backing() {
-        publication_replacement_controls(1);
-        publication_replacement_controls(5);
-    }
-
-    #[cfg(target_os = "linux")]
-    fn publication_replacement_controls(segment_count: usize) {
-        use std::io::{Read, Seek, SeekFrom, Write};
-        use std::os::unix::fs::MetadataExt;
-
-        for corrupt_old in [false, true] {
-            for action in ["commit", "upsert", "delete", "clear", "merge", "compact"] {
-                let directory = tempfile::tempdir().expect("replacement control directory");
-                let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open");
-                index
-                    .add_cass_documents(&[sample("alpha", 0, "retained replacement control")])
-                    .expect("stage original");
-                index.commit().expect("publish original");
-                for row in 1..segment_count {
-                    index
-                        .add_cass_documents(&[sample(
-                            &format!("retained-{row}"),
-                            row as u64,
-                            "additional retained worker control",
-                        )])
-                        .expect("stage additional retained segment");
-                    index.commit().expect("publish additional retained segment");
-                }
-                drop(index);
-                let mut index =
-                    QuillCassIndex::open_or_create(directory.path()).expect("reopen mapping");
-                index
-                    .commit()
-                    .expect("ordinary retained publication control");
-                let snapshot = index.index.snapshot().expect("held snapshot");
-                assert_eq!(snapshot.segments().len(), segment_count);
-                let segment = snapshot.segments().last().expect("last retained segment");
-                let manifest_before =
-                    std::fs::read(directory.path().join(QUILL_INDEX_MARKER)).expect("manifest");
-                let mut old_file = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(segment.path())
-                    .expect("old mapped inode");
-                let original = old_file.metadata().expect("original metadata");
-                assert_eq!(retained_file_binding(segment, &original), Some(true));
-                verify_retained_segment_file(segment).expect("ordinary mapped control");
-                verify_retained_backing(segment, None).expect("ordinary fallback control");
-
-                let detached = directory.path().join("detached-original.fslx");
-                std::fs::rename(segment.path(), &detached).expect("retain original inode");
-                std::fs::copy(&detached, segment.path()).expect("valid replacement file");
-                let replacement = std::fs::File::options()
-                    .read(true)
-                    .write(true)
-                    .open(segment.path())
-                    .expect("replacement descriptor");
-                replacement
-                    .set_times(
-                        std::fs::FileTimes::new()
-                            .set_modified(original.modified().expect("original mtime")),
-                    )
-                    .expect("preserve replacement mtime");
-                replacement.sync_all().expect("persist valid replacement");
-                let replaced = replacement.metadata().expect("replacement metadata");
-                assert_eq!(replaced.len(), original.len());
-                assert_eq!(
-                    replaced.modified().expect("replacement mtime"),
-                    original.modified().expect("original mtime")
-                );
-                assert_ne!(replaced.ino(), original.ino());
-                assert_eq!(retained_file_binding(segment, &replaced), Some(false));
-
-                if corrupt_old {
-                    let offset = original.len() / 2;
-                    old_file
-                        .seek(SeekFrom::Start(offset))
-                        .expect("seek old bytes");
-                    let mut byte = [0];
-                    old_file.read_exact(&mut byte).expect("read old bytes");
-                    old_file
-                        .seek(SeekFrom::Start(offset))
-                        .expect("seek old bytes");
-                    old_file
-                        .write_all(&[byte[0] ^ 0x80])
-                        .expect("corrupt detached mapped inode");
-                    old_file.sync_all().expect("persist detached corruption");
-                    old_file
-                        .set_times(
-                            std::fs::FileTimes::new()
-                                .set_modified(original.modified().expect("original mtime")),
-                        )
-                        .expect("preserve detached mtime");
-                    let error = verify_retained_backing(segment, None)
-                        .expect_err("fallback must examine exact detached held bytes");
-                    assert!(matches!(
-                        error,
-                        frankensearch::quill::QuillError::IndexCorrupted { .. }
-                    ));
-                } else {
-                    verify_retained_backing(segment, None)
-                        .expect("valid detached held-byte fallback control");
-                }
-
-                let replacement_index =
-                    open_cass_reader(directory.path()).expect("valid replacement opens");
-                assert_eq!(
-                    replacement_index.doc_count().expect("replacement count"),
-                    segment_count as u64
-                );
-                assert_eq!(
-                    replacement_index
-                        .segment_count()
-                        .expect("replacement segment"),
-                    segment_count
-                );
-                let result = match action {
-                    "commit" => {
-                        index
-                            .add_cass_documents(&[sample("beta", 1, "pending successor")])
-                            .expect("stage successor");
-                        index.commit()
-                    }
-                    "upsert" => index.upsert_cass_documents(&[sample("alpha", 0, "replacement")]),
-                    "delete" => index.delete_document_ids(&["missing".into()]).map(|_| ()),
-                    "clear" => index.delete_all(),
-                    "merge" => index.force_merge(),
-                    "compact" => index.compact_tombstones().map(|_| ()),
-                    _ => unreachable!("declared actions"),
-                };
-                let error = result.expect_err("replacement must refuse retained publication");
-                assert!(format!("{error:#}").contains("current file identity differ"));
-                assert_eq!(
-                    std::fs::read(directory.path().join(QUILL_INDEX_MARKER)).expect("manifest"),
-                    manifest_before,
-                    "{action}, corrupt_old={corrupt_old}: replacement changed publication"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn streamed_retained_verification_rejects_header_trailer_and_length_changes() {
-        use std::io::{Read, Seek, SeekFrom, Write};
-
-        for mutation in ["header", "trailer", "truncate", "append"] {
-            let directory = tempfile::tempdir().expect("streamed corruption directory");
-            let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open");
-            index
-                .add_cass_documents(&[sample("streamed", 0, "integrity control")])
-                .expect("stage control");
-            index.commit().expect("publish control");
-            let snapshot = index.index.snapshot().expect("admitted snapshot");
-            let segment = &snapshot.segments()[0];
-            verify_retained_segment_file(segment).expect("unmodified streamed control");
-            segment.verify().expect("unmodified engine control");
-            let mut file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(segment.path())
-                .expect("open disposable segment");
-            let metadata = file.metadata().expect("original metadata");
-            match mutation {
-                "header" | "trailer" => {
-                    let offset = if mutation == "header" {
-                        16
-                    } else {
-                        metadata.len() - 1
-                    };
-                    file.seek(SeekFrom::Start(offset)).expect("seek witness");
-                    let mut byte = [0];
-                    file.read_exact(&mut byte).expect("read witness");
-                    file.seek(SeekFrom::Start(offset)).expect("seek witness");
-                    file.write_all(&[byte[0] ^ 0x80]).expect("alter witness");
-                }
-                "truncate" => file.set_len(metadata.len() - 1).expect("truncate control"),
-                "append" => {
-                    file.seek(SeekFrom::End(0)).expect("seek end");
-                    file.write_all(&[0]).expect("append control");
-                }
-                _ => unreachable!("declared mutations"),
-            }
-            file.sync_all().expect("persist mutation");
-            file.set_times(
-                std::fs::FileTimes::new().set_modified(metadata.modified().expect("mtime")),
-            )
-            .expect("restore original mtime");
-            let error = verify_retained_segment_file(segment).expect_err(mutation);
-            assert!(
-                matches!(
-                    error.downcast_ref::<frankensearch::quill::QuillError>(),
-                    Some(frankensearch::quill::QuillError::IndexCorrupted { .. })
-                ),
-                "{mutation} must retain the typed corruption cause: {error:#}"
-            );
-        }
-    }
-
-    /// A writer already holding a verified snapshot must detect later byte
-    /// corruption before any maintenance operation publishes its successor.
-    #[test]
-    fn publication_rechecks_corrupt_retained_segment_before_mutation() {
-        use std::io::{Read, Seek, SeekFrom, Write};
-
-        for action in ["commit", "upsert", "delete", "clear", "merge", "compact"] {
-            let directory = tempfile::tempdir().expect("bridge index directory");
-            let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open");
-            index
-                .add_cass_documents(&[sample("alpha", 0, "retained integrity document")])
-                .expect("first batch");
-            index.commit().expect("first commit");
-            let snapshot = index.index.snapshot().expect("verified snapshot");
-            let segment = &snapshot.segments()[0];
-            let manifest_before =
-                std::fs::read(directory.path().join(QUILL_INDEX_MARKER)).expect("manifest");
-            let mut file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(segment.path())
-                .expect("open disposable segment");
-            let metadata = file.metadata().expect("segment metadata");
-            let offset = metadata.len() / 2;
-            file.seek(SeekFrom::Start(offset)).expect("seek payload");
-            let mut byte = [0];
-            file.read_exact(&mut byte).expect("read payload");
-            file.seek(SeekFrom::Start(offset)).expect("seek payload");
-            file.write_all(&[byte[0] ^ 0x80]).expect("corrupt payload");
-            file.sync_all().expect("persist corruption");
-            file.set_times(
-                std::fs::FileTimes::new().set_modified(metadata.modified().expect("mtime")),
-            )
-            .expect("restore mtime");
-            assert_eq!(file.metadata().expect("metadata").len(), metadata.len());
-            drop(file);
-
-            let result = match action {
-                "commit" => {
-                    index
-                        .add_cass_documents(&[sample("beta", 1, "pending successor")])
-                        .expect("stage successor");
-                    index.commit()
-                }
-                "upsert" => index.upsert_cass_documents(&[sample("alpha", 0, "replacement")]),
-                "delete" => index.delete_document_ids(&["missing".into()]).map(|_| ()),
-                "clear" => index.delete_all(),
-                "merge" => index.force_merge(),
-                "compact" => index.compact_tombstones().map(|_| ()),
-                _ => unreachable!("listed action"),
-            };
-            let error = result.expect_err("corrupt retained bytes must refuse publication");
-            assert!(
-                format!("{error:#}").contains("verifying retained Quill segment"),
-                "{action}: {error:#}"
-            );
-            assert_eq!(
-                std::fs::read(directory.path().join(QUILL_INDEX_MARKER)).expect("manifest"),
-                manifest_before,
-                "{action} published despite retained corruption"
-            );
-        }
-    }
-
     /// A reentrant bridge call must not re-enter `block_on` on one runtime.
     ///
     /// The thread-local slot is emptied while a future is in flight precisely
@@ -4021,98 +2931,6 @@ mod tests {
             index.doc_count()
         });
         assert_eq!(nested.expect("nested doc count"), 0);
-    }
-
-    #[test]
-    fn bridge_runtime_creation_failure_returns_error_before_call() {
-        assert!(shutdown_driver());
-        let invoked = std::cell::Cell::new(false);
-        let result = drive_with_runtime_factory(
-            |_cx| {
-                invoked.set(true);
-                async { Ok::<_, anyhow::Error>(42) }
-            },
-            || Err(anyhow!("fixture runtime creation failed")),
-        );
-        assert_eq!(
-            result
-                .expect_err("constructor failure must propagate")
-                .to_string(),
-            "fixture runtime creation failed"
-        );
-        assert!(
-            !invoked.get(),
-            "no engine work may precede runtime admission"
-        );
-        assert!(DRIVER.with(|slot| slot.borrow().is_none()));
-        assert_eq!(
-            drive(|_cx| async { Ok::<_, anyhow::Error>(42) }).unwrap(),
-            42
-        );
-        assert!(shutdown_driver());
-    }
-
-    #[test]
-    fn bridge_cached_runtime_does_not_invoke_fallible_factory() {
-        assert!(shutdown_driver());
-        drive(|_cx| async { Ok::<_, anyhow::Error>(()) }).expect("park runtime");
-        let built = std::cell::Cell::new(false);
-        let result = drive_with_runtime_factory(
-            |_cx| async { Ok::<_, anyhow::Error>(7) },
-            || {
-                built.set(true);
-                Err(anyhow!("cached runtime must bypass this factory"))
-            },
-        );
-        assert_eq!(result.expect("cached call"), 7);
-        assert!(!built.get());
-        assert!(DRIVER.with(|slot| slot.borrow().is_some()));
-        assert!(shutdown_driver());
-    }
-
-    #[test]
-    fn bridge_operation_error_restores_runtime_and_fresh_context() {
-        assert!(shutdown_driver());
-        assert!(Runtime::current_handle().is_none());
-        let result = drive(|cx| async move {
-            assert!(Runtime::current_handle().is_some());
-            cx.cancel_with(
-                asupersync::types::CancelKind::User,
-                Some("fixture cancellation"),
-            );
-            assert!(cx.is_cancel_requested());
-            Err::<(), _>(anyhow!("fixture operation failed"))
-        });
-        assert_eq!(result.unwrap_err().to_string(), "fixture operation failed");
-        assert!(Runtime::current_handle().is_none());
-        let recovered = drive_with_runtime_factory(
-            |cx| async move {
-                assert!(!cx.is_cancel_requested(), "each call needs a fresh context");
-                Ok::<_, anyhow::Error>(19)
-            },
-            || Err(anyhow!("operation error must retain the cached runtime")),
-        );
-        assert_eq!(recovered.expect("call after operation error"), 19);
-        assert!(Runtime::current_handle().is_none());
-        assert!(shutdown_driver());
-    }
-
-    #[test]
-    fn bridge_unwind_restores_cached_runtime_and_ambient_handle() {
-        assert!(shutdown_driver());
-        assert!(Runtime::current_handle().is_none());
-        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drive::<(), anyhow::Error, _>(|_cx| async { panic!("fixture future panic") })
-        }));
-        assert!(unwound.is_err());
-        assert!(Runtime::current_handle().is_none());
-        let recovered = drive_with_runtime_factory(
-            |_cx| async { Ok::<_, anyhow::Error>(23) },
-            || Err(anyhow!("unwind must retain the cached runtime")),
-        );
-        assert_eq!(recovered.expect("call after unwind"), 23);
-        assert!(Runtime::current_handle().is_none());
-        assert!(shutdown_driver());
     }
 
     #[test]
@@ -4157,9 +2975,8 @@ mod tests {
                     assert_eq!(restored.task_id(), mapping.task_id());
                     assert_eq!(restored.region_id(), mapping.region_id());
                     assert_eq!(restored.capabilities(), mapping.capabilities());
-                    Ok::<_, anyhow::Error>(count)
-                })
-                .expect("nested bridge read");
+                    count
+                });
                 assert_eq!(nested, 1);
                 assert_caller();
                 let reader = index.reader().expect("published reader");
@@ -4546,61 +3363,6 @@ mod tests {
         assert_eq!(index.doc_count().expect("engine count"), 0);
     }
 
-    #[test]
-    fn manifest_source_names_current_corrupt_and_missing_slots_without_opening_a_reader() {
-        let directory = tempfile::tempdir().expect("manifest fixture");
-        let mut writer = QuillCassIndex::open_or_create(directory.path()).expect("writer");
-        writer
-            .add_cass_documents(&[sample("first", 0, "priorneedle")])
-            .expect("first doc");
-        writer.commit().expect("first publish");
-        writer
-            .add_cass_documents(&[sample("second", 0, "currentneedle")])
-            .expect("second doc");
-        writer.commit().expect("second publish");
-        drop(writer);
-
-        let opens = reader_open_count();
-        let current = manifest_live_doc_count(directory.path()).expect("current manifest");
-        assert_eq!(current.live_docs, 2);
-        assert_eq!(current.source.as_str(), "current");
-        let manifest = directory.path().join("MANIFEST");
-        let mut damaged = std::fs::read(&manifest).expect("manifest bytes");
-        let middle = damaged.len() / 2;
-        damaged[middle] ^= 0x80;
-        std::fs::write(&manifest, &damaged).expect("damage current fixture slot");
-
-        let corrupt = manifest_live_doc_count(directory.path()).expect("previous manifest");
-        assert_eq!(
-            corrupt.source,
-            QuillManifestSource::PreviousAfterCorruptCurrent
-        );
-        assert_eq!(corrupt.source.as_str(), "previous_after_corrupt_current");
-        assert_eq!(corrupt.live_docs, 1);
-        assert!(corrupt.generation < current.generation);
-        assert_eq!(
-            std::fs::read(&manifest).expect("unchanged corrupt slot"),
-            damaged
-        );
-
-        std::fs::rename(&manifest, directory.path().join("MANIFEST.fixture-corrupt"))
-            .expect("retain fixture slot while simulating crash window");
-        let missing = manifest_live_doc_count(directory.path()).expect("previous after missing");
-        assert_eq!(
-            missing.source,
-            QuillManifestSource::PreviousAfterMissingCurrent
-        );
-        assert_eq!(missing.source.as_str(), "previous_after_missing_current");
-        assert_eq!(missing.generation, corrupt.generation);
-        assert_eq!(missing.live_docs, 1);
-        assert!(!manifest.exists());
-        assert_eq!(
-            reader_open_count(),
-            opens,
-            "metadata probes never open a reader"
-        );
-    }
-
     /// mknmt: the live count names the slot it was read from. A corrupt
     /// current MANIFEST is read through `MANIFEST.prev`, which lacks the
     /// newest publish, and a writer open only retires the corrupt slot:
@@ -4832,64 +3594,6 @@ mod tests {
         assert!(!is_query_fuel_exhausted(&anyhow!(
             "opening the Quill CASS reader: manifest missing"
         )));
-    }
-
-    #[test]
-    fn merge_receipt_survives_reopen_and_rejects_unknown_contents() {
-        let directory = tempfile::tempdir().expect("bridge index directory");
-        assert_eq!(last_merge_timestamp(directory.path()), None);
-
-        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open");
-        for session in 0..4_u64 {
-            index
-                .add_cass_documents(&[sample(
-                    &format!("receipt-{session}"),
-                    0,
-                    "merge receipt fixture",
-                )])
-                .expect("index session");
-            index.commit().expect("commit session");
-        }
-        index
-            .force_merge_with_output_cap(u64::MAX)
-            .expect("force merge");
-
-        let receipt_timestamp = last_merge_timestamp(directory.path())
-            .expect("successful merge must leave a durable receipt");
-        assert!(receipt_timestamp > 0);
-        assert_eq!(
-            index
-                .merge_status(
-                    index.segment_count().expect("segment count"),
-                    receipt_timestamp
-                )
-                .last_merge_ts,
-            receipt_timestamp
-        );
-
-        drop(index);
-        let reopened = QuillCassIndex::open_or_create(directory.path()).expect("reopen");
-        assert_eq!(
-            reopened
-                .merge_status(
-                    reopened.segment_count().expect("segment count"),
-                    receipt_timestamp
-                )
-                .last_merge_ts,
-            receipt_timestamp,
-            "a new process must retain the merge cooldown evidence"
-        );
-
-        std::fs::write(
-            directory.path().join(QUILL_MERGE_RECEIPT),
-            br#"{"version":1,"last_merge_at_ms":"unknown"}"#,
-        )
-        .expect("corrupt receipt");
-        assert_eq!(
-            last_merge_timestamp(directory.path()),
-            None,
-            "malformed evidence must be reported as unknown"
-        );
     }
 
     /// GH #499: the invariant classifier is keyed to the engine's own Display

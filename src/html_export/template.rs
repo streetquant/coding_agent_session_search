@@ -408,24 +408,21 @@ impl HtmlTemplate {
             self.critical_css, SCREEN_ONLY_CSS, CDN_FALLBACK_CSS
         );
         let cdn_scripts = if options.include_cdn {
-            let mut tags = String::from(
-                r#"<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin="anonymous">"#,
+            let mut tags = Vec::new();
+            tags.push(
+                r#"<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin="anonymous">"#
+                    .to_string(),
             );
             if options.syntax_highlighting {
-                tags.push_str(&format!(
-                    r#"
-    <link rel="stylesheet" href="{url}" integrity="{sri}" crossorigin="anonymous" media="print" onload="this.media='all'" onerror="document.documentElement.classList.add('no-prism')">"#,
+                tags.push(format!(
+                    r#"<link rel="stylesheet" href="{url}" integrity="{sri}" crossorigin="anonymous" media="print" onload="this.media='all'" onerror="document.documentElement.classList.add('no-prism')">"#,
                     url = PRISM_THEME_URL,
                     sri = PRISM_THEME_SRI
                 ));
                 for (url, sri) in PRISM_SCRIPTS {
-                    tags.push_str("\n    <script src=\"");
-                    tags.push_str(url);
-                    tags.push_str("\" integrity=\"");
-                    tags.push_str(sri);
-                    tags.push_str(
-                        r#"" crossorigin="anonymous" defer onerror="document.documentElement.classList.add('no-prism')"></script>"#,
-                    );
+                    tags.push(format!(
+                        r#"<script src="{url}" integrity="{sri}" crossorigin="anonymous" defer onerror="document.documentElement.classList.add('no-prism')"></script>"#
+                    ));
                 }
             }
 
@@ -433,7 +430,7 @@ impl HtmlTemplate {
                 r#"
     <!-- CDN enhancement (optional) - degrades gracefully if offline -->
     {}"#,
-                tags
+                tags.join("\n    ")
             )
         } else {
             String::new()
