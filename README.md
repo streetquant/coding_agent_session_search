@@ -3894,7 +3894,7 @@ archive.
 The build guard enforces the reviewed
 uniform SQLite 0.4.13 versions, a single resolution per package, and registry sources.
 
-`cass` pins its contract-critical ecosystem dependencies with exact registry requirements in [`Cargo.toml`](Cargo.toml); other direct dependencies use normal semver requirements, and `Cargo.lock` freezes the complete resolved graph. One dependency currently resolves from git: `franken-agent-detection`, pinned to an exact published-main revision (below). Optional sibling-path overrides stay commented out by default and must never be committed active.
+`cass` pins its contract-critical ecosystem dependencies with exact registry requirements in [`Cargo.toml`](Cargo.toml); other direct dependencies use normal semver requirements, and `Cargo.lock` freezes the complete resolved graph. One direct dependency currently resolves from git: `franken-agent-detection`, pinned to an exact published-main revision (below); one patched transitive crate, `frankensearch-lexical`, resolves from the reviewed `ed0d76e7b48e0bb215b8e0874742ee4573754ee1` tantivy-0.27 revision for the temporary RUSTSEC-2026-0253 workaround. Optional sibling-path overrides stay commented out by default and must never be committed active.
 
 | Dependency | Pinned source |
 |------------|-----------------|
