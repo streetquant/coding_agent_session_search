@@ -49,8 +49,8 @@ fn rusqlite_is_dev_dependency_only() {
 /// silently bifurcate the engine family.
 #[test]
 fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
-    const FACADE_REQUIREMENT: &str = "=0.4.12";
-    const TYPES_REQUIREMENT: &str = "=0.4.12";
+    const FACADE_REQUIREMENT: &str = "=0.4.13";
+    const TYPES_REQUIREMENT: &str = "=0.4.13";
     const EXPECTED_FACADE_FEATURES: &[&str] = &["fts5", "async-api"];
 
     let manifest: toml::Table =
@@ -125,12 +125,21 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
     );
 
     // No [patch] section may redirect the fsqlite family (build.rs rejects
-    // fsqlite-family registry patches too).
-    assert!(
-        manifest.get("patch").is_none(),
-        "a [patch] section bifurcates the fsqlite family; the family must \
-         resolve from crates.io"
-    );
+    // fsqlite-family registry patches too). Non-SQLite patches (the
+    // frankensearch-lexical RUSTSEC workaround) are allowed.
+    if let Some(patches) = manifest.get("patch").and_then(toml::Value::as_table) {
+        for (source, table) in patches {
+            let Some(table) = table.as_table() else {
+                continue;
+            };
+            for name in table.keys() {
+                assert!(
+                    !name.starts_with("frankensqlite") && !name.starts_with("fsqlite"),
+                    "{name} is patched through [{source}]; the fsqlite family must resolve from crates.io"
+                );
+            }
+        }
+    }
 
     let lockfile: toml::Value =
         toml::from_str(include_str!("../Cargo.lock")).expect("parse Cargo.lock");
@@ -154,7 +163,7 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
     let mut seen_names = std::collections::BTreeSet::new();
     for package in resolved_fsqlite {
         let name = package["name"].as_str().expect("locked package name");
-        let expected_version = "0.4.12";
+        let expected_version = "0.4.13";
         assert!(
             seen_names.insert(name.to_string()),
             "Cargo.lock resolves more than one version of {name}"
@@ -162,7 +171,7 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
         assert_eq!(
             package.get("version").and_then(toml::Value::as_str),
             Some(expected_version),
-            "{name} resolved at a different version than the published 0.4.12 family contract"
+            "{name} resolved at a different version than the published 0.4.13 family contract"
         );
         let source = package
             .get("source")
@@ -176,7 +185,8 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
 
     let build_contract = include_str!("../build.rs");
     assert!(
-        build_contract.contains("expected_version: \"0.4.12\"")
+        build_contract.contains("expected_version: \"0.4.13\"")
+            && !build_contract.contains("expected_version: \"0.4.12\"")
             && !build_contract.contains("expected_version: \"0.4.9\"")
             && !build_contract.contains("expected_version: \"0.4.7\"")
             && !build_contract.contains("expected_version: \"0.4.6\"")

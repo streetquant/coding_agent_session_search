@@ -421,4 +421,19 @@ mod tests {
         assert_eq!(drifted_markers(original), vec!["EXIT CODES"]);
         assert!(missing_markers(README, original).contains(&"ENV VARS"));
     }
+
+    #[test]
+    fn tui_keymap_markers_render_markdown_tables() {
+        for marker in ["TUI KEYMAP", "TUI DETAIL KEYMAP", "TUI EXPORT KEYMAP"] {
+            let rendered = render(marker);
+            assert!(
+                rendered.starts_with("| Key | Action |"),
+                "{marker} must render a Markdown table: {rendered}"
+            );
+            assert!(
+                rendered.lines().count() > 2,
+                "{marker} must render at least one row: {rendered}"
+            );
+        }
+    }
 }

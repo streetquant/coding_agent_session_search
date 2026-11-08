@@ -3858,11 +3858,11 @@ Forgetting is always an explicit operation. CASS does not automatically delete o
 ## Dependency Source Contract
 
 The manifests and lockfile pin the entire SQLite family used by CASS (including
-`fsqlite-types`) at `=0.4.12`, with `asupersync =0.5.0`.
+`fsqlite-types`) at `=0.4.13`, with `asupersync =0.5.0`.
 The published SQLite repair covers the reserved-page WAL conflict in GH#462;
 upstream GH#411 is also closed. Neither proves recovery of an already damaged
 archive. `franken-agent-detection` asks for fsqlite `^0.4.1`, so it accepts the
-0.4.12 family. SQLite `0.4.2` adds explicit derived WAL-index recovery for read-only
+0.4.13 family. SQLite `0.4.2` adds explicit derived WAL-index recovery for read-only
 opens (GH#477) and 0.4.4 adds durable pending-freelist repairs. 0.4.6 stops a
 live B-tree page from being freed and granted again across a WAL generation
 (`page N is referenced multiple times`, bd-b5vmw) and fixes a lost-index-entry
@@ -3883,20 +3883,22 @@ append through a stale retained right-edge leaf and corrupt a table b-tree
 (bd-obwsy; 0.4.9 and earlier are affected). It also returns the AUTOINCREMENT
 rowids a rolled-back transaction reserved (bd-gwoit), and reads a WAL that a
 stock SQLite writer truncated to zero bytes as empty instead of corrupt
-(bd-yxqs9, GH#519).
-The lockfile resolves the 20 SQLite packages CASS uses at 0.4.12.
+(bd-yxqs9, GH#519). 0.4.13 includes the durable-freelist integrity repair
+(58ddae0de, svhcf): `PRAGMA integrity_check` inside a read-only `BEGIN` walks
+the durable freelist instead of reporting valid backup pages as never used.
+The lockfile resolves the 20 SQLite packages CASS uses at 0.4.13.
 CASS's runtime qualification of 0.4.12 passed on Linux, macOS and Windows (the
 Windows storage failures predate the pin). The strict UBS gate remains
 pending, and no release of this pin proves recovery of an already damaged
 archive.
 The build guard enforces the reviewed
-uniform SQLite 0.4.12 versions, a single resolution per package, and registry sources.
+uniform SQLite 0.4.13 versions, a single resolution per package, and registry sources.
 
 `cass` pins its contract-critical ecosystem dependencies with exact registry requirements in [`Cargo.toml`](Cargo.toml); other direct dependencies use normal semver requirements, and `Cargo.lock` freezes the complete resolved graph. One dependency currently resolves from git: `franken-agent-detection`, pinned to an exact published-main revision (below). Optional sibling-path overrides stay commented out by default and must never be committed active.
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.12` (tag v0.4.12 = `26aa19afcbd5afdb01658a10bb33417ad0b513be`). Carries 0.4.12's fixes for explicit-transaction inserts corrupting a table b-tree (bd-obwsy, the 0.4.10 advisory), AUTOINCREMENT after ROLLBACK (bd-gwoit) and stock-truncated empty WALs (bd-yxqs9), plus 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477), 0.4.4's durable pending-freelist repairs, 0.4.6's page-referenced-twice (bd-b5vmw) and lost-index-entry (bd-11sz4) fixes, 0.4.7's large multi-row INSERT index fix (bd-2eebi), serialized-DDL race fix (bd-4iaoi), GH#503 shadow-autoindex repair open, bounded page plane and first-`sqlite_master` full-file read fix, and 0.4.9's prompt stale-WAL-index refusal for strict read-only opens (48c6cf6b2) and first-write recovery from stock SQLite's empty WAL index (GH#443 / cass GH#509). The whole family resolves from one exact registry version; `build.rs` rejects any fsqlite-family registry patch, duplicate package resolution, wrong version, or non-crates.io lockfile source. `src/franken_sync.rs` keeps cass's synchronous call shape through a current-thread asupersync `block_on` bridge. |
+| `frankensqlite` / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.13`. Carries 0.4.13's durable-freelist integrity repair (58ddae0de, svhcf) and 0.4.12's fixes for explicit-transaction inserts corrupting a table b-tree (bd-obwsy, the 0.4.10 advisory), AUTOINCREMENT after ROLLBACK (bd-gwoit) and stock-truncated empty WALs (bd-yxqs9), plus 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477), 0.4.4's durable pending-freelist repairs, 0.4.6's page-referenced-twice (bd-b5vmw) and lost-index-entry (bd-11sz4) fixes, 0.4.7's large multi-row INSERT index fix (bd-2eebi), serialized-DDL race fix (bd-4iaoi), GH#503 shadow-autoindex repair open, bounded page plane and first-`sqlite_master` full-file read fix, and 0.4.9's prompt stale-WAL-index refusal for strict read-only opens (48c6cf6b2) and first-write recovery from stock SQLite's empty WAL index (GH#443 / cass GH#509). The whole family resolves from one exact registry version; `build.rs` rejects any fsqlite-family registry patch, duplicate package resolution, wrong version, or non-crates.io lockfile source. `src/franken_sync.rs` keeps cass's synchronous call shape through a current-thread asupersync `block_on` bridge. |
 | `franken-agent-detection` | git `6b337ba434b72c65c6c5a748b7ec47885f840ac0` (package version 0.3.10; `build.rs` checks the repository, revision and version), features `codex-zstd` (compressed Codex rollouts), `pi-durable` and `pi-sqlite` (Pi durable-harness stores, `pi_agent_rust` SQLite sessions) |
 | `asupersync` | crates.io `=0.5.0` (the line fsqlite 0.4.x names in its public API) |
 | `frankensearch` | crates.io `=0.7.1`, resolving `frankensearch-index 0.4.2` (on Windows an open reader no longer blocks replacing the semantic index, and `--build-hnsw` works), `frankensearch-quill 0.4.1` (the GH #499 fix, the standard Boolean query grammar and the nested-union fix, plus concurrent segment verification on open for GH #501; 0.4.1 opens a writer with one verification of each segment instead of four), `frankenhnsw 0.3.5` and the `frankentorch-*` family (features `hash`, `cass-compat`, `quill`, `ann`, `native`; `cass-compat` enables `lexical-tantivy`, the Tantivy-backed `frankensearch-lexical` differential oracle). Exact pins remain required. |
@@ -3905,7 +3907,7 @@ uniform SQLite 0.4.12 versions, a single resolution per package, and registry so
 
 **Build-time validation**
 - `build.rs` validates every named dependency contract against its exact registry requirement, package name, enabled features, and `default-features` policy. It also rejects git/revision fields for these registry-only contracts.
-- The fsqlite-family gate additionally checks `Cargo.lock` for exactly one registry resolution per package at `0.4.12` and rejects every `[patch.crates-io]` redirect for the family, including the facade.
+- The fsqlite-family gate additionally checks `Cargo.lock` for exactly one registry resolution per package at `0.4.13` and rejects every `[patch.crates-io]` redirect for the family, including the facade.
 - Enable optional sibling-manifest validation with `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target cargo check --features strict-path-dep-validation` or `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target CASS_STRICT_PATH_DEP_VALIDATION=1 cargo check`. For sibling checkouts that are present, this verifies package names, versions, and required features before you switch to local path overrides; registry-only contracts do not require a particular sibling branch or clean worktree.
 - Use `cass swarm dependency-drift --json` for a fast read-only preflight. It reports each manifest pin, optional sibling checkout HEAD/dirty state, upstream status as `not_checked`, and the exact strict-validation commands to run; it never fetches remotes or mutates files.
 
@@ -4027,3 +4029,327 @@ rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-e2e-target cargo test --test e2e
 > *About Contributions:* Please don't take this the wrong way, but I do not accept outside contributions for any of my projects. I simply don't have the mental bandwidth to review anything, and it's my name on the thing, so I'm responsible for any problems it causes; thus, the risk-reward is highly asymmetric from my perspective. I'd also have to worry about other "stakeholders," which seems unwise for tools I mostly make for myself for free. Feel free to submit issues, and even PRs if you want to illustrate a proposed fix, but know I won't merge them directly. Instead, I'll have Claude or Codex review submissions via `gh` and independently decide whether and how to address them. Bug reports in particular are welcome. Sorry if this offends, but I want to avoid wasted time and hurt feelings. I understand this isn't in sync with the prevailing open-source ethos that seeks community contributions, but it's the only way I can move at this velocity and keep my sanity.
 
 ---
+
+
+## Generated Registry Reference
+
+The tables below are generated from the live registries by `cargo run --bin cass-docs-tables`; do not edit rows by hand.
+
+<!-- BEGIN GENERATED EXIT CODES -->
+| Code | Meaning | Retryable | Agent action |
+|------|---------|-----------|--------------|
+| `0` | success | no | Read stdout as the command result. |
+| `1` | health check failed | yes | Inspect JSON recommended_action before retrying or indexing. |
+| `2` | usage or parsing error | no | Fix argv syntax; follow the JSON err.hint or examples. |
+| `3` | index or database missing | yes | Run cass index --full when health/status recommends it. |
+| `4` | I/O failure or unsafe operation refused | maybe | Branch on err.kind: fix the path, permissions, or free space for io/output-not-writable; follow err.hint for refused-unsafe. Not a network code: remote sources fail with 12, model downloads with 20-23. |
+| `5` | data corruption | depends | Inspect health/status/doctor JSON and rebuild only derived assets when recommended. |
+| `6` | required input missing | no | Supply the missing input named by err.kind (a password via --password-stdin, or a resume command), then rerun. |
+| `7` | lock or busy | yes | Retry later with bounded backoff; another cass operation owns the lock. |
+| `8` | partial result (sources sync only) | yes | Some sources had path failures: inspect the per-source errors and re-sync the failed sources. Search/pack timeouts exit 0 with budget.timed_out instead. |
+| `9` | unknown error | maybe | Read err.kind, err.message, and trace output before deciding. |
+| `10` | config or timeout | depends | Branch on JSON err.kind; numeric code 10 is intentionally domain-specific. |
+| `11` | config validation | no | Fix the reported configuration field before retrying. |
+| `12` | source or SSH problem | maybe | Inspect source JSON fields and verify the remote host or path. |
+| `13` | mapping or not-found | depends | Branch on err.kind and verify the requested source/session mapping. |
+| `14` | I/O or mapping | maybe | Inspect err.kind and path details; retry only after the path is reachable. |
+| `15` | semantic or embedder unavailable | yes | Install/verify models or continue with lexical fallback when acceptable. |
+| `20-21` | model acquisition failure | maybe | Check err.kind and err.hint; retry download or use --from-file. |
+| `22` | I/O during model handling | maybe | Verify model cache permissions and available disk before retrying. |
+| `23` | download failure | yes | Retry with network available or install from a local model directory. |
+| `24` | I/O during model verify/install | maybe | Fix filesystem permissions or disk space, then retry. |
+| `70` | index stalled and aborted | yes | Read the kind index-stalled envelope on stderr and cass status --json, then rerun cass index; the lock is reaped on the next start. |
+| `130` | interrupted (SIGINT) | yes | Rerun the command; cass sources setup --resume continues an interrupted setup. |
+<!-- END GENERATED EXIT CODES -->
+
+<!-- BEGIN GENERATED ERROR KINDS -->
+The registry defines 92 `err.kind` values; branch on the kind, not the numeric code, for codes >= 10.
+
+| Kind |
+|------|
+| `ambiguous-source` |
+| `archive-analytics-rebuild` |
+| `archive-count` |
+| `archive-daily-stats-rebuild` |
+| `archive-fts-rebuild` |
+| `archive-purge` |
+| `archive-token-daily-stats-rebuild` |
+| `config` |
+| `cursor-decode` |
+| `cursor-parse` |
+| `daemon` |
+| `db-error` |
+| `db-open` |
+| `db-query` |
+| `doctor` |
+| `download` |
+| `embedder-unavailable` |
+| `empty-file` |
+| `empty-session` |
+| `encode-json` |
+| `export-failed` |
+| `failed-seed-bundle-file` |
+| `file-create` |
+| `file-not-found` |
+| `file-open` |
+| `file-read` |
+| `file-write` |
+| `health` |
+| `selftest` |
+| `idempotency-mismatch` |
+| `index` |
+| `index-busy` |
+| `indexed-session-required` |
+| `invalid-agent` |
+| `invalid-filename` |
+| `invalid-line` |
+| `io` |
+| `lexical-rebuild` |
+| `lexical-generation` |
+| `lexical-shard` |
+| `line-not-found` |
+| `line-out-of-range` |
+| `local` |
+| `mapping` |
+| `migration-repair-pending` |
+| `missing-db` |
+| `missing-index` |
+| `model` |
+| `not-found` |
+| `open-index` |
+| `opencode-parse` |
+| `opencode-sqlite-parse` |
+| `output-not-writable` |
+| `pack-budget-too-small` |
+| `pack-empty-query` |
+| `pack-invalid-field` |
+| `pack-invalid-limit` |
+| `pack-no-evidence` |
+| `pack-unsupported-format` |
+| `pages` |
+| `parse-error` |
+| `password-read-error` |
+| `password-required` |
+| `rebuild-error` |
+| `repair-error` |
+| `resume-empty-command` |
+| `resume-exec-failed` |
+| `retained-publish-backup` |
+| `schedule` |
+| `search` |
+| `semantic-backfill` |
+| `semantic-manifest` |
+| `semantic-unavailable` |
+| `serialize-message` |
+| `session-file-unreadable` |
+| `session-id-not-found` |
+| `session-not-found` |
+| `session-parse` |
+| `sessions-from` |
+| `setup` |
+| `source` |
+| `ssh` |
+| `storage` |
+| `storage-fingerprint` |
+| `timeout` |
+| `tui` |
+| `tui-headless-once` |
+| `tui-reset-state` |
+| `unknown` |
+| `unknown-agent` |
+| `usage` |
+| `write-failed` |
+<!-- END GENERATED ERROR KINDS -->
+
+<!-- BEGIN GENERATED ENV VARS -->
+Generated from the env-var registry (`cass capabilities --json | jq .env_vars`). 80 variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CASS_AIDER_DATA_ROOT` | unset | Override Aider session discovery root. |
+| `CASS_AUTO_REFRESH` | 1 | Read-triggered catch-up: search/pack/TUI may spawn a detached low-priority `cass index --background` when the index is stale, partial, behind, or its source scan is overdue. Set 0 to disable globally; `search --no-maintenance` always disables it for that request. |
+| `CASS_AUTO_REFRESH_COOLDOWN_SECS` | 300 | Minimum seconds between two auto-spawned catch-up index runs per data dir. |
+| `CASS_AUTO_REFRESH_SOURCE_SCAN_SECS` | 300 | Source-scan age in seconds before an eligible read requests incremental catch-up, including for a healthy lexical index. Set 0 to disable only this cadence; stale/partial/pending catch-up and the daemon timer remain enabled. The spawn cooldown, archive lock and failed-run breaker still apply. This is an on-demand check, not a timer or an indexing-completion deadline. |
+| `CASS_BACKGROUND_IONICE_CLASS` | 3 | ionice class `cass index --background` applies to itself on Linux (3 = idle). |
+| `CASS_BACKGROUND_NICE` | 15 | nice value `cass index --background` applies to itself (0..=19). |
+| `CASS_DAEMON_INDEX_INTERVAL_SECS` | 0 | While the semantic daemon is resident, spawn a detached incremental `cass index --background` every N seconds (0 = off; 900 recommended). Skipped under severe load and while another index run holds the lock. |
+| `CASS_DAEMON_SOCKET` | unset | Override the semantic daemon Unix socket path. |
+| `CASS_DATA_DIR` | unset | Override the cass data directory. |
+| `CASS_DB_PATH` | unset | Override the SQLite database path. |
+| `CASS_DEFER_ANALYTICS_UPDATES` | 0 | Set to 1 to defer derived analytics writes during indexing. A legacy OMP identity migration keeps its analytics phase and durable cursor pending until a later index run with this unset. |
+| `CASS_DOCTOR_BUDGET_MS` | 8000 | Structured doctor reporting budget in milliseconds. Reports whose elapsed time exceeds it set budget.timed_out. |
+| `CASS_EXCLUDE_PATHS` | unset | Comma/newline-separated source files or directory prefixes to exclude from future ingestion and raw capture. Holds scan/watch watermarks; existing archived history remains searchable. Use cass forget to remove indexed copies. |
+| `CASS_EXCLUDE_WORKSPACES` | unset | Comma/newline-separated workspace globs to exclude from future ingestion. Scan watermarks advance; changing the policy revisits sources. Existing history and shared raw-store captures remain; use cass forget --workspace-glob and cass mirror prune for explicit cleanup. |
+| `CASS_EXTERNAL_EMBEDDINGS` | 0 | Explicit consent to send text outside the process when external is selected. Accepts 0/false or 1/true; endpoint configuration alone sends nothing. |
+| `CASS_EXTERNAL_EMBEDDING_API_KEY` | unset | Optional bearer credential. Never emitted by discovery or provider diagnostics; rotating it does not change the embedding-space identity. |
+| `CASS_EXTERNAL_EMBEDDING_BATCH_SIZE` | 64 | Maximum inputs per external request, 1..128; the encoded request byte cap also applies. |
+| `CASS_EXTERNAL_EMBEDDING_DIMENSION` | unset | Required provider output dimension, 1..16384. Vectors must be finite, unit-normalized and match this dimension. |
+| `CASS_EXTERNAL_EMBEDDING_MAX_REQUEST_BYTES` | 262144 | Maximum encoded JSON request bytes, 1024..4194304. Oversized inputs are refused before text from that call is sent. |
+| `CASS_EXTERNAL_EMBEDDING_MAX_RETRIES` | 0 | Explicit retries for transient external request failures, 0..5. Redirects are refused; implicit protocol retries are disabled. |
+| `CASS_EXTERNAL_EMBEDDING_MODEL` | unset | Required provider model, at most 512 bytes without control characters. Every response must identify this model; configured values are not emitted by discovery. |
+| `CASS_EXTERNAL_EMBEDDING_REVISION` | 1 | Operator model revision, nonempty and at most 512 bytes without control characters. Endpoint, model, dimension and revision identify a separate vector space. |
+| `CASS_EXTERNAL_EMBEDDING_TIMEOUT_MS` | 30000 | Per-request deadline in milliseconds, 1..120000. In-flight cancellation remains bounded by this deadline. |
+| `CASS_EXTERNAL_EMBEDDING_URL` | unset | Required external endpoint ending in /v1/embeddings. HTTPS, or HTTP on loopback only; credentials, query and fragment are refused. Configured values are not emitted by discovery. |
+| `CASS_FLEET_BUDGET_MS` | 60000 | Overall read-only probe budget, in milliseconds, for sources doctor and fleet upgrade rehearsal. |
+| `CASS_FLEET_PER_HOST_BUDGET_MS` | 8000 | Maximum read-only probe budget per host, in milliseconds, for sources doctor and fleet upgrade rehearsal. |
+| `CASS_FTS_DRYRUN_CAP` | 4096 | Row-ID comparison cap for the read-only 'doctor --rebuild-canonical-fts --dry-run' divergence scan (#345). At the cap the dry-run stops and reports a '>= N divergent' floor instead of an exact count; exact parity is deferred to the --yes apply path. Positive integer; invalid values fall back to the default. |
+| `CASS_INDEX_INGEST_WAL_CHECKPOINT_BYTES` | 536870912 | Reset a deferred bulk-ingest WAL after it reaches this many bytes; 0 disables the in-run bound. |
+| `CASS_INDEX_INGEST_WAL_CHECKPOINT_MODE` | TRUNCATE | Checkpoint mode for the single-connection in-run bulk WAL reset: PASSIVE, FULL, RESTART, or TRUNCATE. |
+| `CASS_INDEX_NO_PROGRESS_EVENTS` | 0 | Suppress NDJSON progress events from cass index --json when set to 1. |
+| `CASS_INDEX_STALL_ABORT_ALL_PHASES` | 0 | Opt-in (#437): promote the stall watchdog's report-only warnings to a hard abort (exit 70) in ANY phase — including scribe/accumulate and semantic report-only lanes — once CASS_INDEX_STALL_ABORT_SECS elapses without progress. The finalize/persist grace thresholds still apply; phases whose detection is suppressed (opaque HNSW, quiescent watch idle) never warn and therefore never abort. |
+| `CASS_INDEX_STALL_ABORT_SECS` | 300 | Seconds without progress before an abort-eligible lexical stall exits 70; 0 keeps stalls report-only. Semantic phases are report-only unless CASS_INDEX_STALL_ABORT_ALL_PHASES=1. |
+| `CASS_INDEX_STALL_DETECT_SECS` | 120 | Seconds without measured phase progress before cass index emits diagnostics; 0 disables detection. |
+| `CASS_NO_COLOR` | unset | Force monochrome output. |
+| `CASS_OMP_DATA_ROOT` | unset | Declare an OMP-only archive/store root; CASS assigns OMP identity and resume plans preserve its exact sessions root. |
+| `CASS_OUTPUT_FORMAT` | unset | Default structured output format: json, jsonl, compact, sessions, or toon. |
+| `CASS_PACK_BUDGET_MS` | 10000 | Fallback structured pack execution budget in milliseconds when --timeout, CASS_SEARCH_TIMEOUT_MS, and [search].timeout_ms do not supply a positive effective timeout. |
+| `CASS_RAW_MIRROR` | 1 | Raw-mirror capture of session source files. Set 0, false, no or off to stop copying sources whose provider keeps its own history; existing captures stay until `cass mirror prune`, indexing is unaffected, and doctor reports raw_mirror_capture_disabled because a file its provider deletes then survives only in the archive DB. |
+| `CASS_RESPECT_NO_COLOR` | 0 | Set to 1 to honor the global NO_COLOR convention. |
+| `CASS_RESPONSIVENESS_CALIBRATION` | conformal | Responsiveness-governor threshold policy: conformal or static. |
+| `CASS_RESPONSIVENESS_DISABLE` | 0 | Set to 1 to disable the indexer responsiveness governor. |
+| `CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS` | 0 | Require this many seconds of console idle time (macOS HIDIdleTime) before scheduled semantic backfill / nightly schedule jobs run; 0 disables, unknown idle fails open. |
+| `CASS_SCHEDULE_MAX_BACKFILL_BATCHES` | 200 | Upper bound on `cass models backfill --scheduled` batches one nightly `cass schedule run` will execute. |
+| `CASS_SCHEDULE_MAX_LOAD_DEFERRAL_SECS` | 10800 | Longest severe machine load may keep skipping scheduled incremental runs, measured from the last incremental run that completed; past it the run goes ahead at scheduler priority. 0 = skip for load without limit. |
+| `CASS_SEARCH_BUDGET_MS` | 120000 | Fallback structured search worker budget in milliseconds when --timeout, CASS_SEARCH_TIMEOUT_MS, and [search].timeout_ms do not supply a positive effective timeout. |
+| `CASS_SEARCH_LIMIT` | unset | Default search/pack result limit (0 = no limit, RAM-capped). The --limit flag overrides; also [search].limit in ~/.config/cass/cass.toml. |
+| `CASS_SEARCH_MODE` | unset | Default search/pack mode: lexical, semantic, or hybrid. The --mode flag overrides; also [search].mode in ~/.config/cass/cass.toml. |
+| `CASS_SEARCH_TIMEOUT_MS` | unset | Default search/pack timeout in milliseconds (0 = no timeout). The --timeout flag overrides; also configurable via [search].timeout_ms in ~/.config/cass/cass.toml. Alias: CASS_SEARCH_TIMEOUT. |
+| `CASS_SEMANTIC_BATCH_SIZE` | 128 | Batch size for semantic embedding work. |
+| `CASS_SEMANTIC_EMBEDDER` | unset | Select hash, minilm, multilingual-minilm, or external; external also requires CASS_EXTERNAL_EMBEDDINGS=1. |
+| `CASS_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS` | 300000 | Abort after a returned semantic embedder batch exceeds the cass#257-derived 5m watchdog threshold; 0 disables. |
+| `CASS_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS` | 30000 | Warn when one semantic embedder batch exceeds the cass#257-derived 30s healthy-run threshold. |
+| `CASS_SEMANTIC_MAX_BYTES_PER_CHECKPOINT` | 8388608 | Soft cap for cass models backfill checkpoints at whole-conversation prefixes near 8MiB selected content; 0 disables. |
+| `CASS_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT` | 10000 | Soft cap for cass models backfill checkpoints at whole-conversation prefixes near 10k selected messages; 0 disables. |
+| `CASS_STATUS_BUDGET_MS` | 8000 | Robot status execution budget in milliseconds. After expiry, optional or expensive sections are reported in budget.skipped_sections. |
+| `CASS_STREAMING_CONSUMER_COMBINE` | 1 | Set to 0 to disable flat-combining drain in the streaming consumer. |
+| `CASS_STREAMING_CONSUMER_COMMIT_SECS` | 5 | Base lexical commit cadence for the streaming consumer. |
+| `CASS_TRACE_FILE` | unset | Default cass-trace-v1 JSONL path for bounded diagnostics and command summaries. |
+| `CASS_TRACE_FILTER` | warn,coding_agent_search=debug,cass=debug,cass::redact::memo=warn | Trace-file EnvFilter. The default retains CASS DEBUG plus global WARN/ERROR events, while suppressing routine redaction-memo DEBUG churn. |
+| `CASS_TRACE_MAX_BYTES` | 16777216 | Hard trace-file byte ceiling, clamped to 4096..1073741824 bytes. |
+| `CASS_TRACE_MAX_EVENTS` | 50000 | Hard trace-file diagnostic-event ceiling, clamped to 16..10000000 events. |
+| `CASS_TRIAGE_BUDGET_MS` | 8000 | Robot triage read-only probe budget in milliseconds. On expiry, incomplete readiness sections are reported in budget.skipped_sections. |
+| `CASS_VIEW_BUDGET_MS` | 10000 | Structured view read-only worker deadline in milliseconds. On expiry, view returns a partial budget envelope with an exact retry probe. |
+| `CHATGPT_ENCRYPTION_KEY` | unset | Provide the key used for encrypted ChatGPT conversation imports. |
+| `CODEX_HOME` | unset | Override Codex session discovery root. |
+| `CODING_AGENT_SEARCH_NO_UPDATE_PROMPT` | 0 | Set to 1 to skip update prompts in automation. |
+| `GEMINI_HOME` | unset | Override Gemini session discovery root. |
+| `NO_COLOR` | unset | Global no-color convention when respected. |
+| `OMP_PROFILE` | unset | Select an isolated OMP profile; takes precedence over PI_PROFILE. |
+| `OPENCODE_STORAGE_ROOT` | unset | Override OpenCode session discovery root. |
+| `PI_CODING_AGENT_DIR` | unset | Override the shared Pi-family agent directory; ambiguous paths remain Pi Agent-owned. Use CASS_OMP_DATA_ROOT for OMP-only ownership. |
+| `PI_CODING_AGENT_SESSION_DIR` | unset | Override the OMP session directory exactly; resume plans preserve this root with --session-dir. |
+| `PI_CONFIG_DIR` | .omp | Override the OMP config directory name beneath the user home. |
+| `PI_PROFILE` | unset | Legacy fallback for selecting an isolated OMP profile. |
+| `PI_SESSIONS_DIR` | unset | Override the exact Pi Agent sessions directory. |
+| `TOON_DEFAULT_FORMAT` | unset | Fallback structured output format for tools that support TOON. |
+| `TOON_INDENT` | unset | Pretty-print TOON output with the requested indentation. |
+| `TOON_KEY_FOLDING` | safe | Controls TOON key folding: off or safe. |
+| `TUI_HEADLESS` | 0 | Set to 1 for headless test runs and prompt-free TUI behavior. |
+| `XDG_DATA_HOME` | unset | Select the XDG data root, including OMP v18 session and profile stores. |
+<!-- END GENERATED ENV VARS -->
+
+<!-- BEGIN GENERATED CONNECTORS -->
+The runtime registry registers 34 connectors (`cass capabilities --json | jq .connectors`):
+
+| Connector | Connector | Connector |
+|-----------|-----------|-----------|
+| `codex` | `claude_code` | `gemini` |
+| `clawdbot` | `vibe` | `opencode` |
+| `amp` | `cline` | `aider` |
+| `cursor` | `chatgpt` | `pi_agent` |
+| `omp` | `factory` | `openclaw` |
+| `continue` | `antigravity` | `pi_durable` |
+| `prime_agent` | `kimi` | `kiro` |
+| `muse` | `openhands` | `copilot` |
+| `copilot_cli` | `qwen` | `grok` |
+| `devin` | `grok_bot` | `codebuff` |
+| `goose` | `crush` | `hermes` |
+| `shelley` |  |  |
+<!-- END GENERATED CONNECTORS -->
+
+<!-- BEGIN GENERATED DEPENDENCY PINS -->
+10 exact or git-pinned direct dependencies (generated from `[dependencies]` in `Cargo.toml`):
+
+| Dependency | Requirement | Features |
+|------------|-------------|----------|
+| `asupersync` | crates.io `=0.5.0` | `test-internals`, `tls-native-roots` |
+| `franken-agent-detection` | git `https://github.com/Dicklesworthstone/franken_agent_detection` rev `6b337ba434b72c65c6c5a748b7ec47885f840ac0` (crate 0.3.10) | `connectors`, `cursor`, `chatgpt`, `opencode`, `crush`, `goose`, `hermes`, `devin`, `shelley`, `grok-bot`, `openclaw-sqlite`, `copilot-vscdb`, `codebuff`, `codex-zstd`, `pi-durable`, `pi-sqlite` |
+| `frankensearch` | crates.io `=0.7.1` | `hash`, `cass-compat`, `quill`, `ann`, `native` |
+| `frankensqlite` (`fsqlite`) | crates.io `=0.4.13` | `fts5`, `async-api` |
+| `fsqlite-types` | crates.io `=0.4.13` |  |
+| `ftui` | crates.io `=0.5.0` |  |
+| `ftui-extras` | crates.io `=0.5.0` | `markdown`, `syntax`, `charts`, `canvas`, `theme`, `clipboard`, `clipboard-fallback`, `export`, `visual-fx`, `forms`, `validation`, `help` |
+| `ftui-runtime` | crates.io `=0.5.0` | `native-backend`, `crossterm-compat` |
+| `ftui-tty` | crates.io `=0.5.0` |  |
+| `toon` (`tru`) | crates.io `=0.2.4` |  |
+<!-- END GENERATED DEPENDENCY PINS -->
+
+<!-- BEGIN GENERATED TUI KEYMAP -->
+| Key | Action |
+|-----|--------|
+| `F1` | Toggle help |
+| `F2` | Next theme |
+| `Shift+F2` | Previous theme |
+| `F3` | Filter agent |
+| `Shift+F3` | Scope to agent |
+| `F4` | Filter workspace |
+| `Shift+F4` | Scope to workspace |
+| `F5` | Set from time |
+| `F6` | Set to time |
+| `Shift+F5` | Cycle time presets |
+| `F7` | Cycle context size |
+| `F8` | Open editor |
+| `F9` | Cycle match mode |
+| `Alt+S` | Toggle search mode |
+| `F12` | Cycle ranking |
+| `Alt+F` | Cycle grouping |
+| `Ctrl+P` | Open command palette |
+| `Ctrl+D` | Cycle density |
+| `Ctrl+B` | Toggle borders |
+| `Ctrl+S` | Toggle stats bar |
+| `Ctrl+Shift+R` | Refresh |
+| `Ctrl+Del` | Clear filters |
+| `Ctrl+Shift+Del` | Reset state |
+| `Esc/F10` | Quit |
+| `Alt+Y` | Copy hit |
+| `Ctrl+Y` | Copy path |
+| `Ctrl+Shift+C` | Copy content |
+| `Alt+E` | Toggle bookmark |
+| `Alt+B` | Open bulk actions |
+| `Alt+Shift+J` | Toggle JSON view |
+| `Ctrl+X` | Toggle selection |
+| `Alt+/` | Cycle pane filter |
+| `Ctrl+E` | Export HTML |
+| `Ctrl+Shift+E` | Export Markdown |
+| `Ctrl+Shift+S` | Manage sources |
+| `Ctrl+Shift+I` | Toggle inspector |
+| `Alt+M` | Toggle macro recording |
+| `Alt+A` | Open analytics surface |
+| `Tab` | Move focus |
+| `Alt+h/j/k/l` | Move selection |
+| `Home` | Jump to first hit |
+| `End` | Jump to last hit |
+<!-- END GENERATED TUI KEYMAP -->
+
+<!-- BEGIN GENERATED TUI DETAIL KEYMAP -->
+| Key | Action |
+|-----|--------|
+| `Enter` | Open the focused hit |
+| `Esc` | Close the detail view |
+| `Tab/Shift+Tab` | Cycle focus |
+| `/` | Find in detail |
+| `n` | Next match |
+| `N` | Previous match |
+| `Ctrl+n` | Next history entry |
+| `Ctrl+p` | Previous history entry |
+| `Ctrl+R` | Cycle history |
+<!-- END GENERATED TUI DETAIL KEYMAP -->
+
+<!-- BEGIN GENERATED TUI EXPORT KEYMAP -->
+| Key | Action |
+|-----|--------|
+| `Ctrl+E` | Export HTML |
+| `Ctrl+Shift+E` | Export Markdown |
+| `Ctrl+Shift+C` | Copy content |
+| `Esc` | Close the export tab |
+<!-- END GENERATED TUI EXPORT KEYMAP -->

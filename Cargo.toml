@@ -102,12 +102,15 @@ notify = "8.2.0"
 # rowids it reserved (bd-gwoit), reading a WAL a stock writer truncated to zero
 # bytes as empty (bd-yxqs9, cass GH#519), and index seeks for IN lists and
 # k = ? ORDER BY id (GH#497/#498).
-# All family packages use 0.4.12 and build.rs checks each resolved package
+# 0.4.13 includes the durable-freelist integrity repair (58ddae0de, svhcf):
+# read-only BEGIN no longer reports valid backup pages as unused. Qualification
+# still uses CASS's existing archive tests and stock SQLite as the file oracle.
+# All family packages use 0.4.13 and build.rs checks each resolved package
 # exactly.
-frankensqlite = { version = "=0.4.12", package = "fsqlite", features = ["fts5", "async-api"] }
+frankensqlite = { version = "=0.4.13", package = "fsqlite", features = ["fts5", "async-api"] }
 # The production storage-integrity probe calls FrankenSQLite's public VFS API
 # directly so it can inspect native writer locks without opening the pager.
-fsqlite-types = { version = "=0.4.12", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.4.13", package = "fsqlite-types" }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
@@ -276,7 +279,7 @@ tokenizers = { version = "*", default-features = false, features = ["fancy-regex
 rusqlite = { version = "0.40.2", features = ["bundled", "modern_sqlite"] }
 # The manifest-policy build gate requires this explicit dev entry for compat
 # fixture assertions, even though production also uses the same pinned crate.
-fsqlite-types = { version = "=0.4.12", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.4.13", package = "fsqlite-types" }
 
 # The fsqlite family resolves from exact reviewed registry versions for every
 # direct and transitive consumer. build.rs rejects duplicates and mixed sources.
@@ -440,3 +443,20 @@ path = "tests/upgrade/mod.rs"
 [[test]]
 name = "recovery"
 path = "tests/recovery/mod.rs"
+
+# Temporary owner-migration patch for RUSTSEC-2026-0253 (lru 0.16.4).
+# tantivy 0.26.2 (the crates.io frankensearch 0.7.1 graph) requires lru
+# ^0.16.3, which cannot resolve the advisory's patched lru >= 0.18.2. The
+# owning Frankensearch migration to tantivy 0.27 lives on the public
+# `tantivy-0.27` branch (frankensearch-lexical 0.4.1) and has not been
+# published to crates.io. Its lexical source is published 0.4.0 plus one
+# added test and the tantivy requirement, so patch only that crate. The
+# source-scoped core pin links the branch crate to the SAME reviewed
+# registry frankensearch-core 0.4.0 the facade/index/quill pins use, instead
+# of dragging the branch workspace's unreleased core into the graph. Remove
+# both patches when frankensearch-lexical 0.4.1+ ships on crates.io.
+[patch.crates-io]
+frankensearch-lexical = { git = "https://github.com/streetquant/frankensearch", rev = "ed0d76e7b48e0bb215b8e0874742ee4573754ee1" }
+
+[patch."https://github.com/streetquant/frankensearch"]
+frankensearch-core = { version = "=0.4.0" }

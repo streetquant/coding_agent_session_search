@@ -1,3 +1,4 @@
+pub mod archive_count;
 mod archive_lease;
 pub mod background_refresh;
 mod checkpoint_deadline;

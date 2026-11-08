@@ -178,14 +178,51 @@ pub fn archive_count_budget() -> Duration {
 /// "missing metadata" state, and it must never be reported as a zero count.
 pub fn archive_count_identity(db_path: &Path) -> Option<ArchiveCountIdentity> {
     let raw = super::lexical_storage_physical_identity(db_path)?;
+    let epoch: serde_json::Value = serde_json::from_str(&raw.source_epoch).ok()?;
+    let (db_len, db_mtime_secs, db_mtime_nanos) = observation_parts(epoch.get("database"));
+    let (wal_len, wal_mtime_secs, wal_mtime_nanos) = observation_parts(epoch.get("wal"));
     Some(ArchiveCountIdentity {
-        db_len: raw.db_len,
-        db_mtime_secs: raw.db_mtime_secs,
-        db_mtime_nanos: raw.db_mtime_nanos,
-        wal_len: raw.wal_len,
-        wal_mtime_secs: raw.wal_mtime_secs,
-        wal_mtime_nanos: raw.wal_mtime_nanos,
+        db_len,
+        db_mtime_secs,
+        db_mtime_nanos,
+        wal_len,
+        wal_mtime_secs,
+        wal_mtime_nanos,
     })
+}
+
+/// Split one archive-epoch file observation into `(len, mtime_secs, mtime_nanos)`.
+///
+/// The epoch stores `size` and `mtime_ns` (a string) for a present file and
+/// `{"absent": true}` for a missing sidecar. A missing sidecar has length and
+/// mtime zero, matching the identity the count memo has always used.
+fn observation_parts(observation: Option<&serde_json::Value>) -> (u64, u64, u32) {
+    let Some(observation) = observation else {
+        return (0, 0, 0);
+    };
+    if observation
+        .get("absent")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return (0, 0, 0);
+    }
+    let len = observation
+        .get("size")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let mtime_ns = observation
+        .get("mtime_ns")
+        .and_then(|value| {
+            value
+                .as_u64()
+                .map(u128::from)
+                .or_else(|| value.as_str()?.parse::<u128>().ok())
+        })
+        .unwrap_or(0);
+    let secs = mtime_ns / 1_000_000_000;
+    let nanos = (mtime_ns % 1_000_000_000) as u32;
+    (len, secs.min(u128::from(u64::MAX)) as u64, nanos)
 }
 
 /// Count the canonical messages of `storage` inside a wall-clock budget.

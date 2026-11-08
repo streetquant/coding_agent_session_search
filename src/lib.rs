@@ -18,6 +18,7 @@ pub mod daemon;
 pub mod daemon_runtime_state;
 pub mod dependency_drift;
 pub mod dependency_pin_correlation;
+pub mod docs_tables;
 pub mod doctor;
 #[cfg(test)]
 mod doctor_candidate_wal_tests;
@@ -99233,7 +99234,7 @@ fn env_var_capability(name: &str, default: Option<&str>, description: &str) -> E
     }
 }
 
-fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
+pub fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
     vec![
         env_var_capability(
             "CODING_AGENT_SEARCH_NO_UPDATE_PROMPT",

@@ -72,6 +72,97 @@ pub const VIM_NAV: &str = "Alt+h/j/k/l";
 pub const JUMP_TOP: &str = "Home";
 pub const JUMP_BOTTOM: &str = "End";
 
+/// Render the global keymap as the Markdown table embedded in generated
+/// documentation (`docs_tables::render("TUI KEYMAP")`).
+#[must_use]
+pub fn markdown_reference() -> String {
+    markdown_table(&[
+        (HELP, "Toggle help"),
+        (THEME, "Next theme"),
+        (THEME_PREV, "Previous theme"),
+        (FILTER_AGENT, "Filter agent"),
+        (SCOPE_AGENT, "Scope to agent"),
+        (FILTER_WORKSPACE, "Filter workspace"),
+        (SCOPE_WORKSPACE, "Scope to workspace"),
+        (FILTER_DATE_FROM, "Set from time"),
+        (FILTER_DATE_TO, "Set to time"),
+        (CYCLE_TIME_PRESETS, "Cycle time presets"),
+        (CONTEXT_WINDOW, "Cycle context size"),
+        (EDITOR, "Open editor"),
+        (MATCH_MODE, "Cycle match mode"),
+        (SEARCH_MODE, "Toggle search mode"),
+        (RANKING, "Cycle ranking"),
+        (GROUPING, "Cycle grouping"),
+        (PALETTE, "Open command palette"),
+        (DENSITY, "Cycle density"),
+        (BORDERS, "Toggle borders"),
+        (STATS_BAR, "Toggle stats bar"),
+        (REFRESH, "Refresh"),
+        (CLEAR_FILTERS, "Clear filters"),
+        (RESET_STATE, "Reset state"),
+        (QUIT, "Quit"),
+        (COPY, "Copy hit"),
+        (COPY_PATH, "Copy path"),
+        (COPY_CONTENT, "Copy content"),
+        (BOOKMARK, "Toggle bookmark"),
+        (BULK_MENU, "Open bulk actions"),
+        (JSON_VIEW, "Toggle JSON view"),
+        (TOGGLE_SELECT, "Toggle selection"),
+        (PANE_FILTER, "Cycle pane filter"),
+        (EXPORT_HTML, "Export HTML"),
+        (EXPORT_MARKDOWN, "Export Markdown"),
+        (SOURCES, "Manage sources"),
+        (INSPECTOR, "Toggle inspector"),
+        (MACRO_TOGGLE, "Toggle macro recording"),
+        (SURFACE_ANALYTICS, "Open analytics surface"),
+        (TAB_FOCUS, "Move focus"),
+        (VIM_NAV, "Move selection"),
+        (JUMP_TOP, "Jump to first hit"),
+        (JUMP_BOTTOM, "Jump to last hit"),
+    ])
+}
+
+/// Render the detail-view keymap as the Markdown table embedded in generated
+/// documentation (`docs_tables::render("TUI DETAIL KEYMAP")`).
+#[must_use]
+pub fn markdown_detail_reference() -> String {
+    markdown_table(&[
+        (DETAIL_OPEN, "Open the focused hit"),
+        (DETAIL_CLOSE, "Close the detail view"),
+        (FOCUS_QUERY, "Cycle focus"),
+        (DETAIL_FIND, "Find in detail"),
+        (DETAIL_FIND_NEXT, "Next match"),
+        (DETAIL_FIND_PREV, "Previous match"),
+        (HISTORY_NEXT, "Next history entry"),
+        (HISTORY_PREV, "Previous history entry"),
+        (HISTORY_CYCLE, "Cycle history"),
+    ])
+}
+
+/// Render the detail export keymap as the Markdown table embedded in generated
+/// documentation (`docs_tables::render("TUI EXPORT KEYMAP")`).
+#[must_use]
+pub fn markdown_export_reference() -> String {
+    markdown_table(&[
+        (EXPORT_HTML, "Export HTML"),
+        (EXPORT_MARKDOWN, "Export Markdown"),
+        (COPY_CONTENT, "Copy content"),
+        (DETAIL_CLOSE, "Close the export tab"),
+    ])
+}
+
+fn markdown_table(rows: &[(&str, &str)]) -> String {
+    let mut out = String::from("| Key | Action |\n|-----|--------|\n");
+    for (key, action) in rows {
+        out.push_str("| `");
+        out.push_str(key);
+        out.push_str("` | ");
+        out.push_str(action);
+        out.push_str(" |\n");
+    }
+    out
+}
+
 // =============================================================================
 // Unit Tests
 // =============================================================================

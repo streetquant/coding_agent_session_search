@@ -106,6 +106,9 @@ pub enum IngestFailureKind {
     /// The source is larger than the connector's per-source read budget, so it
     /// was not indexed; raising the budget admits it on the next run.
     SourceOverReadBudget,
+    /// The source declares a schema/format version this build does not read;
+    /// the bytes are quarantined at their source path and left untouched.
+    UnsupportedSchema,
     /// The store uses a layout or format version this build's connector does
     /// not read (a newer Pi durable schema, a Pi Session Store V2 sidecar).
     /// It was not indexed from that store, and the store is left untouched.
@@ -126,6 +129,7 @@ impl IngestFailureKind {
             IngestFailureKind::UnreadableSource => "unreadable-source",
             IngestFailureKind::UnparseableSource => "unparseable-source",
             IngestFailureKind::SourceOverReadBudget => "source-over-read-budget",
+            IngestFailureKind::UnsupportedSchema => "unsupported-schema",
             IngestFailureKind::UnsupportedStoreFormat => "unsupported-store-format",
         }
     }
@@ -220,6 +224,71 @@ pub struct ConnectorIngestDiagnostic {
     /// safe re-run; never a destructive cleanup.
     pub safe_next_action: String,
 }
+
+/// A connector source whose declared schema/version this build does not read.
+///
+/// The typed cause preserves the exact publication path (and, for a record
+/// inside a file, its line/row) so the ingest report can quarantine the right
+/// source instead of attributing the failure to the fallback scan root. The
+/// source bytes are not modified; the error is a limitation, not corruption.
+#[derive(Debug)]
+pub struct UnsupportedSourceSchema {
+    path: PathBuf,
+    context: String,
+    line: Option<u64>,
+}
+
+impl UnsupportedSourceSchema {
+    /// Record an unsupported schema at `path`.
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>, context: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            context: context.into(),
+            line: None,
+        }
+    }
+
+    /// Attach the 1-based record line/row that declared the unsupported schema.
+    #[must_use]
+    pub fn with_line(mut self, line: u64) -> Self {
+        self.line = Some(line);
+        self
+    }
+
+    /// The publication path of the unsupported source.
+    #[must_use]
+    pub fn source_path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The record line/row, when the failure is inside a multi-record source.
+    #[must_use]
+    pub fn line_or_row(&self) -> Option<u64> {
+        self.line
+    }
+}
+
+impl std::fmt::Display for UnsupportedSourceSchema {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.line {
+            Some(line) => write!(
+                formatter,
+                "{} at {}:{line} declares an unsupported schema",
+                self.context,
+                self.path.display()
+            ),
+            None => write!(
+                formatter,
+                "{} at {} declares an unsupported schema",
+                self.context,
+                self.path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UnsupportedSourceSchema {}
 
 /// The classification of a failure kind for a provider: severity, retryability,
 /// the disposition it implies, and the safe next action. Pure.
@@ -316,6 +385,17 @@ fn classify_kind(
                  bytes), then re-index"
             ),
         ),
+        IngestFailureKind::UnsupportedSchema => (
+            IngestSeverity::Warning,
+            false, // the same bytes fail the same way until the schema is supported
+            SourceIngestDisposition::Quarantined,
+            format!(
+                "{provider} found a source whose declared schema this build does not read; the \
+                 source bytes are retained at their publication path and the source is \
+                 quarantined, never silently indexed as empty. Upgrade cass or report the schema \
+                 version, then re-index"
+            ),
+        ),
         IngestFailureKind::UnsupportedStoreFormat => (
             IngestSeverity::Warning,
             false, // the same build reads the same store the same way
@@ -391,6 +471,12 @@ fn is_database_lock_message(message: &str) -> bool {
 fn connector_scan_failure_kind(error: &anyhow::Error) -> IngestFailureKind {
     use crate::franken_sync::FrankenError;
 
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<UnsupportedSourceSchema>().is_some())
+    {
+        return IngestFailureKind::UnsupportedSchema;
+    }
     if let Some(io) = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<std::io::Error>())
@@ -712,6 +798,29 @@ impl ConnectorIngestRun {
     /// file, with the setting that admits it; it used to surface as one
     /// "unreadable, check permissions" entry naming the cass data directory.
     pub fn observe_connector_scan_error(&mut self, fallback_path: &Path, error: &anyhow::Error) {
+        // A typed unsupported-schema failure names its exact publication path
+        // (and line, for a record); quarantine that source instead of
+        // attributing the failure to the fallback scan root.
+        if let Some(unsupported) = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<UnsupportedSourceSchema>())
+        {
+            let path = unsupported.source_path().to_path_buf();
+            let mut diagnostic =
+                classify_path(&self.provider, &path, IngestFailureKind::UnsupportedSchema);
+            if let Some(line) = unsupported.line_or_row() {
+                diagnostic = diagnostic.with_line(line);
+            }
+            self.sources.insert(
+                path,
+                ObservedSource {
+                    disposition: diagnostic.disposition,
+                    malformed: false,
+                },
+            );
+            self.diagnostics.push(diagnostic);
+            return;
+        }
         if let Some(over) = crate::connectors::codex::over_budget_sources(error) {
             for path in &over.sampled_paths {
                 let diagnostic = classify_path(
