@@ -71,10 +71,11 @@ use crate::connectors::{
     Connector, DiscoveredSourceFile, ScanContext, ScanRoot, aider::AiderConnector,
     amp::AmpConnector, antigravity::AntigravityConnector, chatgpt::ChatGptConnector,
     claude_code::ClaudeCodeConnector, clawdbot::ClawdbotConnector, cline::ClineConnector,
-    codex::CodexConnector, copilot::CopilotConnector, copilot_cli::CopilotCliConnector,
-    cursor::CursorConnector, factory::FactoryConnector, gemini::GeminiConnector,
-    grok::GrokConnector, kimi::KimiConnector, muse::MuseConnector, omp::OmpConnector,
-    openclaw::OpenClawConnector, opencode::OpenCodeConnector, pi_agent::PiAgentConnector,
+    cloudmcp::CloudMcpConnector, codex::CodexConnector, copilot::CopilotConnector,
+    copilot_cli::CopilotCliConnector, cursor::CursorConnector, factory::FactoryConnector,
+    gemini::GeminiConnector, grok::GrokConnector, kilo::KiloConnector, kimi::KimiConnector,
+    muse::MuseConnector, omp::OmpConnector, openclaw::OpenClawConnector,
+    opencode::OpenCodeConnector, openwebui::OpenWebUiConnector, pi_agent::PiAgentConnector,
     qwen::QwenConnector, vibe::VibeConnector,
 };
 use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
@@ -10844,6 +10845,22 @@ fn semantic_index_has_current_contract(data_dir: &Path, requested_embedder: &str
         return false;
     }
     FsVectorIndex::open_read_only(&index_path).is_ok_and(|index| {
+        semantic_vector_matches_current_contract(&index, &embedder_id, dimension)
+    })
+}
+
+/// The watch reconcile/append paths publish through the *canonical* per-embedder
+/// builder at `vector_index_path`. A certified served generation can back reads
+/// while that builder is absent, but it is not the base those paths append to.
+fn canonical_semantic_index_has_current_contract(
+    data_dir: &Path,
+    requested_embedder: &str,
+) -> bool {
+    let Some((embedder_id, dimension)) = semantic_local_embedder_metadata(requested_embedder)
+    else {
+        return false;
+    };
+    FsVectorIndex::open_read_only(&vector_index_path(data_dir, &embedder_id)).is_ok_and(|index| {
         semantic_vector_matches_current_contract(&index, &embedder_id, dimension)
     })
 }
@@ -21847,7 +21864,8 @@ impl WatchSemanticMaintenance {
         prepare_progress_for_semantic_build(progress);
         let result = (|| {
             if self.pre_watch_conversations > 0
-                && !semantic_index_has_current_contract(data_dir, embedder)
+                && !(semantic_index_has_current_contract(data_dir, embedder)
+                    && canonical_semantic_index_has_current_contract(data_dir, embedder))
             {
                 anyhow::bail!(
                     "watch semantic base is missing or incompatible; rebuild with cass index --semantic before retrying"
@@ -32692,6 +32710,9 @@ impl ConnectorKind {
             "vibe" => Some(Self::Vibe),
             "amp" => Some(Self::Amp),
             "opencode" => Some(Self::OpenCode),
+            "kilo" => Some(Self::Kilo),
+            "cloudmcp" => Some(Self::CloudMcp),
+            "openwebui" => Some(Self::OpenWebUi),
             "aider" => Some(Self::Aider),
             "cursor" => Some(Self::Cursor),
             "chatgpt" => Some(Self::ChatGpt),
@@ -32732,6 +32753,9 @@ impl ConnectorKind {
             Self::Vibe => "vibe",
             Self::Amp => "amp",
             Self::OpenCode => "opencode",
+            Self::Kilo => "kilo",
+            Self::CloudMcp => "cloudmcp",
+            Self::OpenWebUi => "openwebui",
             Self::Aider => "aider",
             Self::Cursor => "cursor",
             Self::ChatGpt => "chatgpt",
@@ -32776,6 +32800,9 @@ impl ConnectorKind {
             Self::Vibe => Box::new(VibeConnector::new()),
             Self::Amp => Box::new(AmpConnector::new()),
             Self::OpenCode => Box::new(OpenCodeConnector::new()),
+            Self::Kilo => Box::new(KiloConnector::new()),
+            Self::CloudMcp => Box::new(CloudMcpConnector::new()),
+            Self::OpenWebUi => Box::new(OpenWebUiConnector::new()),
             Self::Aider => Box::new(AiderConnector::new()),
             Self::Cursor => Box::new(CursorConnector::new()),
             Self::ChatGpt => Box::new(ChatGptConnector::new()),
@@ -35638,6 +35665,19 @@ fn reindex_paths_with_semantic_delta(
         let mut published_conversations = absent_source_recovery.published_conversations;
         let mut remaining_conversations = conv_count;
         let current_debt = WatchLexicalReplayDebt::for_root(kind, &root);
+        // GH #515: the scan above admitted this source's batch. A stop requested
+        // during the scan (or a callback) must not discard conversations that
+        // were already selected; it is honored again after the batch is
+        // ingested and published, so an explicit watch-once run finishes the
+        // admitted work and then reports the interruption. Consume the request
+        // here: receipt invalidation below is the first stop-aware write of the
+        // admitted batch and would otherwise abort it before any canonical row.
+        let finish_admitted_batch = explicit_watch_once;
+        let mut deferred_stop = finish_admitted_batch
+            && opts
+                .progress
+                .as_ref()
+                .is_some_and(|progress| progress.stop_requested.swap(false, Ordering::AcqRel));
         {
             let storage = storage
                 .lock()
@@ -35659,8 +35699,19 @@ fn reindex_paths_with_semantic_delta(
         let mut convs = convs.into_sorted_batches()?;
         let mut connector_name = None;
         loop {
+            // GH #515: every chunk of the admitted batch is held through its
+            // ingest and publication; only a request that arrives between
+            // chunks is deferred again here.
+            let chunk_deferred_stop = finish_admitted_batch
+                && (std::mem::take(&mut deferred_stop)
+                    || opts.progress.as_ref().is_some_and(|progress| {
+                        progress.stop_requested.swap(false, Ordering::AcqRel)
+                    }));
             let mut chunk = convs.next_batch(opts.progress.as_deref())?;
             if chunk.is_empty() {
+                if chunk_deferred_stop && let Some(progress) = &opts.progress {
+                    progress.stop_requested.store(true, Ordering::Release);
+                }
                 break;
             }
             remaining_conversations = remaining_conversations.saturating_sub(chunk.len());
@@ -35901,6 +35952,9 @@ fn reindex_paths_with_semantic_delta(
                     active_sources_skipped,
                     "preserving partial watch watermark because a source failed or was excluded"
                 );
+            }
+            if chunk_deferred_stop && let Some(progress) = &opts.progress {
+                progress.stop_requested.store(true, Ordering::Release);
             }
             if let Some(progress) = &opts.progress {
                 progress.tick_activity();
@@ -37223,6 +37277,12 @@ enum ConnectorKind {
     Vibe,
     #[serde(rename = "am", alias = "Amp")]
     Amp,
+    #[serde(rename = "kl", alias = "Kilo")]
+    Kilo,
+    #[serde(rename = "mc", alias = "CloudMcp")]
+    CloudMcp,
+    #[serde(rename = "wu", alias = "OpenWebUi")]
+    OpenWebUi,
     #[serde(rename = "oc", alias = "OpenCode")]
     OpenCode,
     #[serde(rename = "ai", alias = "Aider")]
@@ -37540,7 +37600,24 @@ fn explicit_watch_once_connector_hint(path: &Path) -> Option<ConnectorKind> {
             .any(|window| window[0] == left && window[1] == right)
     };
 
-    if has_pair(".codex", "sessions") {
+    if crate::connectors::openwebui::owns_source_path(path) {
+        Some(ConnectorKind::OpenWebUi)
+    } else if crate::connectors::cloudmcp::rollout_header(path).is_some() {
+        Some(ConnectorKind::CloudMcp)
+    // ubs:ignore -- This compares a public database filename, not a credential.
+    } else if path.file_name().is_some_and(|name| name == "kilo.db")
+        // ubs:ignore -- This compares a public extension directory name, not a credential.
+        || components.iter().any(|name| name == "kilocode.kilo-code")
+    {
+        Some(ConnectorKind::Kilo)
+    } else if has_pair("contextos", "transcripts")
+        && path
+            .file_name()
+            // ubs:ignore -- These are public transcript filenames, not credentials.
+            .is_some_and(|name| name == "manifest.json" || name == "transcript.jsonl")
+    {
+        Some(ConnectorKind::CloudMcp)
+    } else if has_pair(".codex", "sessions") {
         Some(ConnectorKind::Codex)
     } else if has_pair(".claude", "projects") {
         Some(ConnectorKind::Claude)
@@ -78716,6 +78793,28 @@ c.close()
         assert!(status.has_pending_resume);
         assert!(!status.has_completed_checkpoint);
 
+        let resumable_index_path = tmp.path().join("resumable-index");
+        fs::create_dir_all(&resumable_index_path).unwrap();
+        // A checkpoint that resumes its durable cursor must still prove the
+        // current archive count through the exact-fingerprint path; only
+        // restart-from-zero checkpoints can skip that count. Shared-writer
+        // checkpoints are restart-from-zero (GH #496), so use the resumable
+        // staged mode to keep this contrast meaningful.
+        let mut resumable_state =
+            LexicalRebuildState::new(checkpoint_db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
+        resumable_state.set_execution_mode(LexicalRebuildExecutionMode::StagedSingleIndex);
+        persist_lexical_rebuild_state(&resumable_index_path, &resumable_state).unwrap();
+        assert!(
+            nonresumable_pending_lexical_rebuild_status_without_fingerprint(
+                &resumable_index_path,
+                &db_path,
+                400,
+            )
+            .unwrap()
+            .is_none(),
+            "resumable staged checkpoints still require the exact fingerprint path"
+        );
+
         let shared_index_path = tmp.path().join("shared-index");
         fs::create_dir_all(&shared_index_path).unwrap();
         let shared_state = LexicalRebuildState::new(checkpoint_db_state, LEXICAL_REBUILD_PAGE_SIZE);
@@ -78727,8 +78826,8 @@ c.close()
                 400,
             )
             .unwrap()
-            .is_none(),
-            "shared-writer checkpoints still require the exact fingerprint path"
+            .is_some(),
+            "an incomplete shared-writer checkpoint restarts without an exact archive count"
         );
 
         let legacy_index_path = tmp.path().join("legacy-index");
@@ -79313,18 +79412,36 @@ c.close()
         assert_eq!(names, vec!["codex"]);
     }
 
-    /// The cass registry mirrors the upstream one entry for entry: the three
-    /// cass adapters (codex, omp, pi_agent) replace the upstream factory, and
-    /// every other entry behaves like the upstream connector. The pass-through
-    /// half is asserted behaviorally — same detection result and streaming
-    /// capability from both factories — because function-pointer identity
-    /// (`fn_addr_eq`) is not guaranteed across codegen units and failed on two
-    /// otherwise-green fleet runs (bead zgzva).
+    /// Upstream entries retain their routing, and CASS-native providers append
+    /// explicit factories. The pass-through half is asserted behaviorally —
+    /// same detection result and streaming capability from both factories —
+    /// because function-pointer identity (`fn_addr_eq`) is not guaranteed
+    /// across codegen units and failed on two otherwise-green fleet runs
+    /// (bead zgzva).
     #[test]
     fn cass_connector_registry_installs_every_cass_adapter() {
         let upstream = franken_agent_detection::get_connector_factories();
         let configured = get_connector_factories();
-        assert_eq!(configured.len(), upstream.len());
+        assert_eq!(configured.len(), upstream.len() + 3);
+
+        for native in ["kilo", "cloudmcp", "openwebui"] {
+            assert_eq!(
+                configured
+                    .iter()
+                    .filter(|(name, _)| *name == native)
+                    .count(),
+                1,
+                "native connector {native} must be registered exactly once"
+            );
+            let kind = ConnectorKind::from_slug(native)
+                .unwrap_or_else(|| panic!("missing native watch route {native}"));
+            assert_eq!(kind.slug(), native);
+            let serialized = serde_json::to_string(&kind).expect("serialize native connector");
+            assert_eq!(
+                serde_json::from_str::<ConnectorKind>(&serialized).expect("read native route"),
+                kind
+            );
+        }
 
         for ((configured_name, configured_factory), (upstream_name, upstream_factory)) in
             configured.into_iter().zip(upstream)

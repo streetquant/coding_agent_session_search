@@ -93,6 +93,18 @@ fn open_complete_fs_index_with_retry(
     dir: &Path,
     config: &FsTwoTierConfig,
 ) -> std::result::Result<(FsTwoTierIndex, usize), FsSearchError> {
+    open_complete_fs_index_with_retry_hook(dir, config, &mut |_retry: usize| ())
+}
+
+/// The hook runs after a transient reader-lock failure and before the retry
+/// backoff. Production installs a no-op; the reopen regression uses it to drop
+/// its held writer only once the failed reader attempt is real, instead of
+/// racing a sleep against an unrelated scheduler.
+fn open_complete_fs_index_with_retry_hook(
+    dir: &Path,
+    config: &FsTwoTierConfig,
+    on_transient_failure: &mut dyn FnMut(usize),
+) -> std::result::Result<(FsTwoTierIndex, usize), FsSearchError> {
     let paths = FsTwoTierIndexPaths::new(fs_index_artifact_path(dir, VECTOR_INDEX_FAST_FILENAME))
         .with_quality_index(fs_index_artifact_path(dir, VECTOR_INDEX_QUALITY_FILENAME))
         .with_fast_ann(fs_index_artifact_path(dir, VECTOR_ANN_FAST_FILENAME))
@@ -107,8 +119,9 @@ fn open_complete_fs_index_with_retry(
             Err(error)
                 if retries < FSVI_REOPEN_MAX_RETRIES && is_transient_fsvi_reader_lock(&error) =>
             {
-                std::thread::sleep(backoff);
                 retries += 1;
+                on_transient_failure(retries);
+                std::thread::sleep(backoff);
                 backoff = backoff.saturating_mul(2).min(FSVI_REOPEN_MAX_BACKOFF);
             }
             Err(error) => return Err(error),
@@ -928,30 +941,32 @@ mod tests {
         quality_writer.write_record("s:session-0", &[1.0, 0.0])?;
         quality_writer.finish()?;
 
-        let live_writer = frankensearch::VectorIndex::open_writer(&fast_path)?;
-        let start = Arc::new(std::sync::Barrier::new(2));
-        let release_start = Arc::clone(&start);
-        let releaser = std::thread::spawn(move || {
-            release_start.wait();
-            std::thread::sleep(Duration::from_millis(20));
-            drop(live_writer);
-        });
-        start.wait();
+        let mut live_writer = Some(frankensearch::VectorIndex::open_writer(&fast_path)?);
 
         let config = TwoTierConfig {
             fast_dimension: 2,
             quality_dimension: 2,
             ..TwoTierConfig::default()
         };
-        let (index, retries) =
-            open_complete_fs_index_with_retry(dir.path(), &config.to_fs_config())?;
-        releaser
-            .join()
-            .map_err(|_| anyhow::anyhow!("writer-release thread panicked"))?;
+        let mut released_live_writer = false;
+        let (index, retries) = open_complete_fs_index_with_retry_hook(
+            dir.path(),
+            &config.to_fs_config(),
+            &mut |_| {
+                if let Some(writer) = live_writer.take() {
+                    drop(writer);
+                    released_live_writer = true;
+                }
+            },
+        )?;
 
         anyhow::ensure!(
             retries > 0,
             "the live writer should force at least one retry"
+        );
+        anyhow::ensure!(
+            released_live_writer,
+            "the retry hook must release the writer that forced it"
         );
         anyhow::ensure!(index.has_quality_index(), "quality tier must be present");
         anyhow::ensure!(index.doc_count() == 1, "reopened index lost its document");

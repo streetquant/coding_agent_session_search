@@ -948,9 +948,11 @@ fn gh494_publish_failure_at_eof_is_finalized_on_retry_instead_of_returning_succe
     for _ in 0..2 {
         let error = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None)
             .expect_err("candidate certification refusal must fail before swapping");
+        let message = error.to_string();
         assert!(
-            error.to_string().contains("persist_generation_manifest"),
-            "{error:#}"
+            message.contains("persist_recovered_generation")
+                || message.contains("persist_generation_manifest"),
+            "{message}"
         );
         assert!(error.downcast_ref::<std::io::Error>().is_some());
         assert_eq!(

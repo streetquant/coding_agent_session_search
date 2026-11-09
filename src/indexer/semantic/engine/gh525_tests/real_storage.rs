@@ -69,8 +69,7 @@ fn fixture(path: &Path, histories: &[&[&str]]) -> Result<(FrankenStorage, Vec<i6
 }
 
 fn body(storage: &FrankenStorage, id: i64) -> Result<Vec<Message>> {
-    let mut rows = storage.fetch_messages_for_lexical_rebuild_batch(&[id], None, None)?;
-    Ok(rows.remove(&id).unwrap_or_default())
+    crate::indexer::semantic::replay::canonical_messages(storage, id)
 }
 
 // Adapt the production helper's tuple only for readable assertions. All body
@@ -291,7 +290,7 @@ fn gh525_unlimited_and_partially_filled_selection_match_the_incumbent_encoder() 
             max_bytes: 12,
         },
     ] {
-        let mut eager = storage.fetch_messages_for_lexical_rebuild_batch(&ids, None, None)?;
+        let mut eager = crate::indexer::semantic::replay::canonical_messages_batch(&storage, &ids)?;
         let old = select_checkpoint_capped_conversations(
             fetch_canonical_embedding_conversations(&storage, &ids)?,
             &mut eager,

@@ -19,6 +19,7 @@ use crate::search::tantivy::{
 };
 use crate::storage::sqlite::FrankenStorage;
 use anyhow::{Context, Result, ensure};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 mod pages;
@@ -32,6 +33,46 @@ pub(crate) use selected::{
     packet_embedding_inputs_from_storage_for_message_ids,
     packet_embedding_inputs_from_storage_since,
 };
+
+/// Read one conversation's canonical messages through the same paged,
+/// full-body projection the direct replay uses.
+///
+/// The lexical rebuild fetch truncates each body at
+/// `CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES`; that is a bound on the lexical
+/// index, not on a semantic document. Reusing it here made a configured
+/// lexical cap change semantic doc ids and split the materialized and direct
+/// build paths. One oversized message is admitted whole, exactly as in the
+/// direct paged replay.
+pub(crate) fn canonical_messages(
+    storage: &FrankenStorage,
+    conversation_id: i64,
+) -> Result<Vec<Message>> {
+    let mut messages = Vec::new();
+    pages::messages(storage.raw(), conversation_id, &mut |message| {
+        messages.push(message);
+        Ok(())
+    })?;
+    Ok(messages)
+}
+
+/// [`canonical_messages`] for a batch of conversations. Duplicate ids are
+/// read once and conversations without messages are omitted.
+pub(crate) fn canonical_messages_batch(
+    storage: &FrankenStorage,
+    conversation_ids: &[i64],
+) -> Result<HashMap<i64, Vec<Message>>> {
+    let mut grouped = HashMap::with_capacity(conversation_ids.len());
+    for conversation_id in conversation_ids {
+        if grouped.contains_key(conversation_id) {
+            continue;
+        }
+        let messages = canonical_messages(storage, *conversation_id)?;
+        if !messages.is_empty() {
+            grouped.insert(*conversation_id, messages);
+        }
+    }
+    Ok(grouped)
+}
 
 const PARENT_PAGE_SIZE: usize = 64;
 

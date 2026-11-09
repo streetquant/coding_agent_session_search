@@ -221,7 +221,24 @@ fn capped_storage_rollover_reuses_vectors_retires_prior_checkpoints_and_preserve
     let artifact = saved.quality_tier.as_ref().unwrap();
     assert!(artifact.ready);
     assert_eq!(artifact.doc_count, 5);
-    assert_eq!(data.join(&artifact.index_path), done.index_path);
+    // Publication seals the completed builder destination into an immutable
+    // served generation; the ledger records that copy rather than the mutable
+    // destination, and both describe the same published documents.
+    let certificate = saved
+        .coverage
+        .get(artifact.embedder_id.as_str())
+        .context("published generation certificate")?;
+    assert!(certificate.matches_artifact(artifact));
+    assert_eq!(certificate.artifact_path, artifact.index_path);
+    assert_eq!(
+        artifact.index_path,
+        format!("vector_index/served/{}.fsvi", certificate.artifact_sha256)
+    );
+    assert_eq!(
+        fs::read(data.join(&artifact.index_path))?,
+        fs::read(&done.index_path)?,
+        "the sealed generation must carry the published bytes"
+    );
     let reader = VectorIndex::open_read_only(&done.index_path)?;
     assert_eq!(reader.search_top_k(&query, 10, None)?.len(), 5);
     Ok(())

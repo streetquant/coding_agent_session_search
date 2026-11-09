@@ -169,6 +169,12 @@ impl Inventory {
                 if self.should_skip(&file, exclusions) || !seen_files.insert(leaf_key(&file)) {
                     continue;
                 }
+                // CloudMCP exports deliberately reuse Codex's rollout layout.
+                // They belong to the CloudMCP connector, which verifies the
+                // adjacent manifest; never index them a second time as Codex.
+                if crate::connectors::cloudmcp::rollout_header(&file).is_some() {
+                    continue;
+                }
                 let metadata = match fs::metadata(&file) {
                     Ok(metadata) => metadata,
                     Err(error) => {

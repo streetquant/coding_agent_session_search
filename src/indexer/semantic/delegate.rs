@@ -169,9 +169,6 @@ impl SemanticIndexer {
                 })
                 .transpose()?
         };
-        if let Some(snapshot) = &mut coverage {
-            snapshot.prepare_parents(storage, data_dir)?;
-        }
         let published = self.build_and_save_index_with_producer(
             data_dir,
             |emit| {
@@ -239,8 +236,14 @@ impl SemanticIndexer {
                             &on_progress,
                         )?);
                 self.inner.check_external_cancelled()?;
-                if let Some(snapshot) = &coverage {
-                    snapshot.verify(storage)?;
+                if let Some(snapshot) = &mut coverage {
+                    // Replay and its embedding batches are the fallible work:
+                    // a corrupt canonical row must fail after useful embedded
+                    // work, not before it. The publish boundary re-verifies
+                    // the captured archive before any certificate is sealed,
+                    // so a concurrent append may land while this builder
+                    // finishes and the next maintenance pass retries.
+                    snapshot.prepare_parents_after_replay(storage, data_dir)?;
                 }
                 (on_progress.borrow_mut())(
                     SemanticStorageBuildPhase::VectorPublish,
@@ -259,8 +262,7 @@ impl SemanticIndexer {
                 "semantic replay crossed its captured message boundary"
             );
         }
-        if let Some(snapshot) = &coverage {
-            snapshot.verify(storage)?;
+        if coverage.is_some() {
             outcome.document_digest = Some(engine::semantic_index_document_digest(&published)?);
         }
         outcome.coverage = coverage;

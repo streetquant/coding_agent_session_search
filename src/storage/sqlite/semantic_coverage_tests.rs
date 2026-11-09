@@ -185,6 +185,19 @@ fn gh458_forget_and_reused_ids_keep_durable_invalidation() -> Result<()> {
     replacement.external_id = Some("replacement".to_owned());
     replacement.source_path = PathBuf::from("/fixture/replacement.jsonl");
     replacement.messages.truncate(1);
+    // fsqlite's `BEGIN CONCURRENT` rowid allocator never hands a deleted
+    // rowid back out within one process (a restarted process re-initialises it
+    // from `MAX(messages.id)`), so this reuse scenario is only reachable with
+    // stock/serialized rowid allocation. The archive is otherwise idle here,
+    // so switch that one connection's default transaction mode to serialized
+    // and keep exercising the production insert path. Set both pragma aliases
+    // that `apply_config` enables.
+    for pragma in [
+        "PRAGMA fsqlite.concurrent_mode = OFF",
+        "PRAGMA concurrent_mode = OFF",
+    ] {
+        fixture.storage.raw().execute(pragma)?;
+    }
     let outcome = fixture.storage.insert_conversation_tree_with_analytics(
         fixture.agent,
         None,

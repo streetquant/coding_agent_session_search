@@ -42,6 +42,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::info;
 
+mod openwebui_snapshot;
+
 const DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const DOCTOR_MUTATION_LOCK_MAX_METADATA_READ: u64 = 64 * 1024;
 
@@ -8520,6 +8522,105 @@ fn delete_duplicate_conversation_rows(
     Ok(())
 }
 
+/// Refresh native snapshot provenance only when its entire source
+/// snapshot matches the canonical messages. A stale or partial replay cannot
+/// describe the newer archive or replace its existing provenance hash.
+fn franken_reconcile_native_snapshot_provenance(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    conv: &Conversation,
+) -> Result<()> {
+    let Some(native_id) = conv.external_id.as_deref().filter(|id| !id.is_empty()) else {
+        return Ok(());
+    };
+    let matches_identity = |metadata: &serde_json::Value| match conv.agent_slug.as_str() {
+        "opencode" => {
+            metadata["harness"] == "opencode2"
+                && metadata["native_format"] == "session_v2/session_message"
+                && metadata["native_session_id"].as_str() == Some(native_id)
+        }
+        "cloudmcp" => {
+            metadata["source"] == "cloudmcp"
+                && metadata["schema_version"] == "cloudmcp.conversation-manifest.v1"
+                && metadata["conversation_id"].as_str() == Some(native_id)
+        }
+        _ => false,
+    };
+    if !matches_identity(&conv.metadata_json) {
+        return Ok(());
+    }
+    let Some(content_hash) = conv.metadata_json["content_hash"]
+        .as_str()
+        .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    else {
+        return Ok(());
+    };
+    let (external_id, source_path, mut metadata): (Option<String>, String, serde_json::Value) = tx
+        .query_row_map(
+            "SELECT external_id, source_path, metadata_json, metadata_bin
+         FROM conversations WHERE id = ?1",
+            fparams![conversation_id],
+            |row| {
+                Ok((
+                    row.get_typed(0)?,
+                    row.get_typed(1)?,
+                    franken_read_metadata_compat(row, 2, 3),
+                ))
+            },
+        )?;
+    if external_id != conv.external_id
+        || source_path != path_to_string(&conv.source_path)
+        || !matches_identity(&metadata)
+        || metadata["content_hash"].as_str() == Some(content_hash)
+    {
+        return Ok(());
+    }
+    let matches: Vec<bool> = tx.query_map_collect(
+        "SELECT idx, role, author, created_at, content, extra_json, extra_bin
+         FROM messages WHERE conversation_id = ?1 ORDER BY idx",
+        fparams![conversation_id],
+        |row| {
+            let idx: i64 = row.get_typed(0)?;
+            let Some(message) = usize::try_from(idx)
+                .ok()
+                .and_then(|index| conv.messages.get(index))
+            else {
+                return Ok(false);
+            };
+            let role: String = row.get_typed(1)?;
+            Ok(message.idx == idx
+                && message.role == role_from_str(&role)
+                && message.author == row.get_typed::<Option<String>>(2)?
+                && message.created_at == row.get_typed::<Option<i64>>(3)?
+                && message.content == row.get_typed::<String>(4)?
+                && message.extra_json == franken_read_message_extra_compat(row, 5, 6))
+        },
+    )?;
+    if matches.len() != conv.messages.len() || !matches.into_iter().all(|matched| matched) {
+        return Ok(());
+    }
+    metadata["content_hash"] = serde_json::Value::String(content_hash.to_owned());
+    if conv.agent_slug == "cloudmcp" {
+        // The verified manifest and transcript describe the same complete
+        // canonical snapshot. Keep local attribution while advancing all
+        // producer-owned provenance together; stale/partial packets fail the
+        // exact message comparison above.
+        if let Some(fields) = conv.metadata_json.as_object() {
+            for (key, value) in fields {
+                if key != "cass" {
+                    metadata[key] = value.clone();
+                }
+            }
+        }
+    }
+    let (json, binary) = franken_metadata_insert_payload(&metadata)?;
+    tx.execute_compat(
+        "UPDATE conversations SET metadata_json = ?1, metadata_bin = ?2 WHERE id = ?3",
+        fparams![json.as_deref(), binary.as_deref(), conversation_id],
+    )?;
+    Ok(())
+}
+
 /// Reconcile only the provider-owned attribution fields. A missing workspace
 /// in an ordinary partial packet must never erase a known association.
 fn franken_reconcile_provider_workspace(
@@ -8994,6 +9095,15 @@ fn replay_fingerprints_from_merge_set(
         .collect()
 }
 
+pub(crate) fn is_openwebui_saved_snapshot(conv: &Conversation) -> bool {
+    conv.agent_slug == "openwebui"
+        && conv
+            .metadata_json
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+            == Some("openwebui.saved-conversation.v1")
+}
+
 fn collect_new_messages_for_existing_conversation<'a>(
     conversation_id: i64,
     conv: &'a Conversation,
@@ -9020,7 +9130,9 @@ fn collect_new_messages_for_existing_conversation<'a>(
         }
 
         let incoming_replay = replay_fingerprint_from_merge(&incoming_fingerprint);
-        if existing_replay_fingerprints.contains(&incoming_replay) {
+        if !is_openwebui_saved_snapshot(conv)
+            && existing_replay_fingerprints.contains(&incoming_replay)
+        {
             tracing::debug!(
                 conversation_id,
                 idx = msg.idx,
@@ -12778,14 +12890,15 @@ impl FrankenStorage {
         // the doc>plan invariant during rebuild. Trusting complete tail
         // coverage without checking is therefore not safe.
         //
-        // This raise reads MAX(idx) straight from the covering index
-        // `idx_messages_conv_idx(conversation_id, idx)` — a per-conversation
-        // seek, and the same query `fill_missing_lexical_rebuild_footprint_
-        // tails` already runs in production. It is deliberately NOT the
-        // exact-count pass below: that one is an unindexed
-        // `COUNT(*) ... GROUP BY conversation_id`, which is what thrashed for
-        // 10-20+ minutes on multi-GB archives during plan_lexical_shards (the
-        // 0.6.23 prepare wedge).
+        // This raise reads MAX(idx) straight from the covering UNIQUE
+        // autoindex `sqlite_autoindex_messages_1(conversation_id, idx)` — a
+        // per-conversation seek, and the same query `fill_missing_lexical_
+        // rebuild_footprint_tails` already runs in production. (V16 dropped
+        // the redundant explicit `idx_messages_conv_idx` copy of this key.)
+        // It is deliberately NOT the exact-count pass below: that one is an
+        // unindexed `COUNT(*) ... GROUP BY conversation_id`, which is what
+        // thrashed for 10-20+ minutes on multi-GB archives during
+        // plan_lexical_shards (the 0.6.23 prepare wedge).
         //
         // MAX(idx)+1 over-estimates when idx values are sparse. That is the
         // safe direction: over-planning costs shards, under-planning corrupts
@@ -12825,15 +12938,12 @@ impl FrankenStorage {
             footprints,
             &positions_by_conversation,
             "SELECT conversation_id, MAX(idx) AS last_message_idx
-             FROM messages INDEXED BY idx_messages_conv_idx
+             FROM messages INDEXED BY sqlite_autoindex_messages_1
              GROUP BY conversation_id
              ORDER BY conversation_id ASC",
         )
         .or_else(|err| {
-            if err
-                .to_string()
-                .contains("no such index: idx_messages_conv_idx")
-            {
+            if format!("{err:#}").contains("no such index: sqlite_autoindex_messages_1") {
                 return self.raise_lexical_rebuild_footprints_from_grouped_max_idx(
                     footprints,
                     &positions_by_conversation,
@@ -13007,15 +13117,12 @@ impl FrankenStorage {
             footprints,
             missing_tail_positions,
             "SELECT conversation_id, MAX(idx) AS last_message_idx
-             FROM messages INDEXED BY idx_messages_conv_idx
+             FROM messages INDEXED BY sqlite_autoindex_messages_1
              GROUP BY conversation_id
              ORDER BY conversation_id ASC",
         )
         .or_else(|err| {
-            if err
-                .to_string()
-                .contains("no such index: idx_messages_conv_idx")
-            {
+            if format!("{err:#}").contains("no such index: sqlite_autoindex_messages_1") {
                 return self.fill_missing_lexical_rebuild_footprint_tails_from_grouped_messages(
                     footprints,
                     missing_tail_positions,
@@ -13132,9 +13239,8 @@ impl FrankenStorage {
                     let source_path: String = row.get_typed(5)?;
                     let raw_source_id: Option<String> = row.get_typed(8)?;
                     let raw_origin_host: Option<String> = row.get_typed(9)?;
-                    let (source_id, _, origin_host) = normalized_storage_source_parts(
+                    let (source_id, origin_host) = lexical_rebuild_source_parts(
                         raw_source_id.as_deref(),
-                        None,
                         raw_origin_host.as_deref(),
                     );
                     Ok(LexicalRebuildConversationRow {
@@ -13187,9 +13293,8 @@ impl FrankenStorage {
                     let source_path: String = row.get_typed(5)?;
                     let raw_source_id: Option<String> = row.get_typed(8)?;
                     let raw_origin_host: Option<String> = row.get_typed(9)?;
-                    let (source_id, _, origin_host) = normalized_storage_source_parts(
+                    let (source_id, origin_host) = lexical_rebuild_source_parts(
                         raw_source_id.as_deref(),
-                        None,
                         raw_origin_host.as_deref(),
                     );
                     Ok(LexicalRebuildConversationRow {
@@ -13251,9 +13356,8 @@ impl FrankenStorage {
                     let source_path: String = row.get_typed(5)?;
                     let raw_source_id: Option<String> = row.get_typed(8)?;
                     let raw_origin_host: Option<String> = row.get_typed(9)?;
-                    let (source_id, _, origin_host) = normalized_storage_source_parts(
+                    let (source_id, origin_host) = lexical_rebuild_source_parts(
                         raw_source_id.as_deref(),
-                        None,
                         raw_origin_host.as_deref(),
                     );
                     Ok(LexicalRebuildConversationRow {
@@ -13277,6 +13381,54 @@ impl FrankenStorage {
                     "listing conversations for lexical rebuild after id {after_conversation_id} through id {through_conversation_id}"
                 )
             })
+    }
+
+    /// Fetch a native projection conversation together with its canonical
+    /// messages for lexical rebuilding. Native projection metadata carries the
+    /// index ledger (`openwebui_lexical_indices` /
+    /// `codex_projection_lexical_indices`) that the rebuild has to retain.
+    pub(crate) fn fetch_native_projection_lexical_snapshot(
+        &self,
+        conversation_id: i64,
+    ) -> Result<Conversation> {
+        let mut conversation = self.conn.query_row_map(
+            "SELECT c.id, (SELECT a.slug FROM agents a WHERE a.id=c.agent_id),
+                    (SELECT w.path FROM workspaces w WHERE w.id=c.workspace_id),
+                    c.external_id, c.title, c.source_path, c.started_at, c.ended_at,
+                    c.approx_tokens, c.metadata_json, c.metadata_bin, c.source_id, c.origin_host
+             FROM conversations c WHERE c.id=?1",
+            fparams![conversation_id],
+            |row| {
+                let workspace: Option<String> = row.get_typed(2)?;
+                let path: String = row.get_typed(5)?;
+                Ok(Conversation {
+                    id: Some(row.get_typed(0)?),
+                    agent_slug: row.get_typed(1)?,
+                    workspace: workspace.map(PathBuf::from),
+                    external_id: row.get_typed(3)?,
+                    title: row.get_typed(4)?,
+                    source_path: PathBuf::from(path),
+                    started_at: row.get_typed(6)?,
+                    ended_at: row.get_typed(7)?,
+                    approx_tokens: row.get_typed(8)?,
+                    metadata_json: franken_read_metadata_compat(row, 9, 10),
+                    source_id: row.get_typed(11)?,
+                    origin_host: row.get_typed(12)?,
+                    messages: Vec::new(),
+                })
+            },
+        )?;
+        anyhow::ensure!(
+            is_openwebui_saved_snapshot(&conversation)
+                || (conversation.agent_slug == "codex"
+                    && conversation
+                        .metadata_json
+                        .get("codex_projection_lexical_indices")
+                        .is_some()),
+            "not a native projection snapshot"
+        );
+        conversation.messages = self.fetch_messages_for_lexical_rebuild(conversation_id)?;
+        Ok(conversation)
     }
 
     /// Fetch messages for a conversation.
@@ -14873,14 +15025,16 @@ impl FrankenStorage {
         conv: &Conversation,
         defer_analytics_updates: bool,
     ) -> Result<InsertOutcome> {
-        if conv.agent_slug == "codebuff" {
+        if is_openwebui_saved_snapshot(conv)
+            || matches!(conv.agent_slug.as_str(), "codebuff" | "codex")
+        {
             return self
                 .insert_conversations_batched_with_analytics(
                     &[(agent_id, workspace_id, conv)],
                     defer_analytics_updates,
                 )?
                 .pop()
-                .context("Codebuff / Freebuff insert returned no outcome");
+                .context("native snapshot insert returned no outcome");
         }
         let normalized_conv = normalized_conversation_for_storage(conv);
         let conv = normalized_conv.as_ref();
@@ -14912,6 +15066,7 @@ impl FrankenStorage {
                 workspace_id,
                 conv,
             )?;
+            franken_reconcile_native_snapshot_provenance(&tx, existing.id, conv)?;
             franken_reassociate_provider_analytics_workspace(&tx, existing.id, conv)?;
             tx.commit()?;
             return Ok(outcome);
@@ -15035,6 +15190,7 @@ impl FrankenStorage {
                     workspace_id,
                     conv,
                 )?;
+                franken_reconcile_native_snapshot_provenance(&tx, existing_id, conv)?;
                 franken_reassociate_provider_analytics_workspace(&tx, existing_id, conv)?;
                 tx.commit()?;
                 return Ok(InsertOutcome {
@@ -15066,7 +15222,8 @@ impl FrankenStorage {
                 continue;
             }
             let incoming_replay = message_replay_fingerprint(msg);
-            if conv.agent_slug != "grok_bot"
+            if !is_openwebui_saved_snapshot(conv)
+                && conv.agent_slug != "grok_bot"
                 && pending_replay_fingerprints.contains(&incoming_replay)
             {
                 tracing::debug!(
@@ -15221,7 +15378,8 @@ impl FrankenStorage {
             }
 
             let incoming_replay = message_replay_fingerprint(msg);
-            if conv.agent_slug != "grok_bot"
+            if !is_openwebui_saved_snapshot(conv)
+                && conv.agent_slug != "grok_bot"
                 && pending_replay_fingerprints.contains(&incoming_replay)
             {
                 tracing::debug!(
@@ -18210,6 +18368,7 @@ impl FrankenStorage {
             return Ok(Vec::new());
         }
 
+        openwebui_snapshot::validate_batch(conversations)?;
         self.ensure_sources_for_batch(conversations)?;
 
         let defer_lexical_updates = defer_storage_lexical_updates_enabled();
@@ -18253,14 +18412,38 @@ impl FrankenStorage {
 
         for &(agent_id, workspace_id, raw_conv) in conversations {
             let normalized_conv = normalized_conversation_for_storage(raw_conv);
+            let native_snapshot = if is_openwebui_saved_snapshot(normalized_conv.as_ref()) {
+                Some(openwebui_snapshot::reconcile(
+                    self,
+                    &tx,
+                    agent_id,
+                    workspace_id,
+                    normalized_conv.as_ref(),
+                    defer_lexical_updates,
+                    defer_analytics_updates,
+                )?)
+            } else {
+                openwebui_snapshot::reconcile_codex_projection(
+                    self,
+                    &tx,
+                    agent_id,
+                    workspace_id,
+                    normalized_conv.as_ref(),
+                    defer_lexical_updates,
+                    defer_analytics_updates,
+                )?
+            };
+            let snapshot_conv = native_snapshot
+                .as_ref()
+                .map_or(normalized_conv.as_ref(), |snapshot| &snapshot.conversation);
             let revision_start = codebuff_revisions.len();
             let codebuff_conv = franken_reconcile_codebuff_messages(
                 &tx,
                 agent_id,
-                normalized_conv.as_ref(),
+                snapshot_conv,
                 &mut codebuff_revisions,
             )?;
-            let updated_indices = codebuff_revisions[revision_start..]
+            let revised_indices: Vec<_> = codebuff_revisions[revision_start..]
                 .iter()
                 .map(|revision| revision.message.idx)
                 .collect();
@@ -18269,14 +18452,15 @@ impl FrankenStorage {
             let conv = reconciled_conv.as_ref();
             let mut total_chars: i64 = 0;
             let mut inserted_indices = Vec::with_capacity(conv.messages.len());
+            let mut updated_indices = revised_indices;
             let mut inserted_messages: Vec<(i64, &Message)> =
                 Vec::with_capacity(conv.messages.len());
             let mut session_count_delta = 1_i64;
             let conversation_key = conversation_merge_key(agent_id, conv);
 
-            let existing_conv_id = if let Some(existing_id) =
-                pending_conversation_ids.get(&conversation_key)
-            {
+            let existing_conv_id = if native_snapshot.is_some() {
+                None
+            } else if let Some(existing_id) = pending_conversation_ids.get(&conversation_key) {
                 Some(*existing_id)
             } else {
                 let existing_id =
@@ -18287,7 +18471,35 @@ impl FrankenStorage {
                 existing_id
             };
 
-            let conv_id = if let Some(existing_id) = existing_conv_id {
+            let conv_id = if let Some(snapshot) = &native_snapshot {
+                session_count_delta = i64::from(snapshot.conversation_inserted);
+                inserted_indices.clone_from(&snapshot.inserted_indices);
+                updated_indices.clone_from(&snapshot.updated_indices);
+                if snapshot.messages_changed {
+                    for message in &conv.messages {
+                        let message_id = message.id.context("native canonical message ID")?;
+                        inserted_messages.push((message_id, message));
+                        if !defer_lexical_updates {
+                            fts_entries.push(FtsEntry::from_message(message_id, message, conv));
+                            fts_count_total += 1;
+                            fts_pending_chars =
+                                fts_pending_chars.saturating_add(message.content.len());
+                            if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                                || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                            {
+                                flush_pending_fts_entries(
+                                    self,
+                                    &tx,
+                                    &mut fts_entries,
+                                    &mut fts_pending_chars,
+                                    &mut fts_inserted_total,
+                                )?;
+                            }
+                        }
+                    }
+                }
+                snapshot.conversation_id
+            } else if let Some(existing_id) = existing_conv_id {
                 session_count_delta = 0;
                 let (
                     ExistingConversationNewMessages {
@@ -18530,7 +18742,10 @@ impl FrankenStorage {
             } else {
                 workspace_id
             };
-            if !defer_analytics_updates
+            if (!defer_analytics_updates
+                || native_snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.rebuild_analytics))
                 && (conv.agent_slug != "codebuff"
                     || session_count_delta > 0
                     || !inserted_messages.is_empty())
@@ -18545,14 +18760,16 @@ impl FrankenStorage {
                 let day_id = effective_started_at
                     .map(FrankenStorage::day_id_from_millis)
                     .unwrap_or(0);
-                stats.record_delta(
-                    &conv.agent_slug,
-                    &conv.source_id,
-                    day_id,
-                    delta.session_count_delta,
-                    delta.message_count_delta,
-                    delta.total_chars_delta,
-                );
+                if native_snapshot.is_none() {
+                    stats.record_delta(
+                        &conv.agent_slug,
+                        &conv.source_id,
+                        day_id,
+                        delta.session_count_delta,
+                        delta.message_count_delta,
+                        delta.total_chars_delta,
+                    );
+                }
 
                 let conv_day_id = day_id;
                 let mut session_model_family = String::from("unknown");
@@ -18704,7 +18921,11 @@ impl FrankenStorage {
                     metrics_entries.push(mm);
                 }
 
-                if session_count_delta > 0 {
+                if session_count_delta > 0
+                    || native_snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.messages_changed)
+                {
                     token_stats.record_session(
                         &conv.agent_slug,
                         &conv.source_id,
@@ -18713,11 +18934,16 @@ impl FrankenStorage {
                     );
                 }
 
-                if has_any_tokens {
+                if has_any_tokens
+                    || native_snapshot.as_ref().is_some_and(|snapshot| {
+                        snapshot.messages_changed && snapshot.rebuild_analytics
+                    })
+                {
                     conv_ids_to_summarize.push(conv_id);
                 }
             }
 
+            franken_reconcile_native_snapshot_provenance(&tx, conv_id, conv)?;
             outcomes.push(InsertOutcome {
                 conversation_id: conv_id,
                 conversation_inserted: session_count_delta > 0,
@@ -18758,7 +18984,7 @@ impl FrankenStorage {
         }
 
         // Batched daily_stats update
-        if !defer_analytics_updates && !stats.is_empty() {
+        if !stats.is_empty() {
             let entries = stats.expand();
             let affected = franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
             tracing::debug!(
@@ -18771,7 +18997,7 @@ impl FrankenStorage {
         }
 
         // Batch insert token_usage rows
-        if !defer_analytics_updates && !token_entries.is_empty() {
+        if !token_entries.is_empty() {
             let token_count = token_entries.len();
             let inserted = franken_insert_token_usage_batched_in_tx(&tx, &token_entries)?;
             tracing::debug!(
@@ -18783,7 +19009,7 @@ impl FrankenStorage {
         }
 
         // Batched token_daily_stats update
-        if !defer_analytics_updates && !token_stats.is_empty() {
+        if !token_stats.is_empty() {
             let entries = token_stats.expand();
             let affected = franken_update_token_daily_stats_batched_in_tx(&tx, &entries)?;
             tracing::debug!(
@@ -18796,7 +19022,7 @@ impl FrankenStorage {
         }
 
         // Batch insert message_metrics rows
-        if !defer_analytics_updates && !metrics_entries.is_empty() {
+        if !metrics_entries.is_empty() {
             let mm_count = metrics_entries.len();
             let inserted = franken_insert_message_metrics_batched_in_tx(&tx, &metrics_entries)?;
             tracing::debug!(
@@ -18808,7 +19034,7 @@ impl FrankenStorage {
         }
 
         // Flush usage_hourly + usage_daily rollups
-        if !defer_analytics_updates && !rollup_agg.is_empty() {
+        if !rollup_agg.is_empty() {
             let (hourly, daily, models_daily) =
                 franken_flush_analytics_rollups_in_tx(&tx, &rollup_agg)?;
             tracing::debug!(
@@ -18824,7 +19050,7 @@ impl FrankenStorage {
         }
 
         // Update conversation-level token summaries
-        if !defer_analytics_updates {
+        if !conv_ids_to_summarize.is_empty() {
             for conv_id in &conv_ids_to_summarize {
                 franken_update_conversation_token_summaries_in_tx(&tx, *conv_id)?;
             }
@@ -18919,6 +19145,22 @@ fn normalized_storage_source_parts(
     } else {
         (source_id, SourceKind::Ssh, host_label)
     }
+}
+
+/// The lexical rebuild projects the canonical `origin_host` column verbatim.
+/// Registry classification may drop a stray host from a local row, but a
+/// document identity that silently ignored a stored host would let an edited
+/// archive reuse the candidate it was staged from: the staged prefix keeps the
+/// host the row had when it was indexed, so the current projection must keep
+/// the column the archive actually stores.
+fn lexical_rebuild_source_parts(
+    source_id: Option<&str>,
+    origin_host: Option<&str>,
+) -> (String, Option<String>) {
+    let (source_id, _, classified_host) =
+        normalized_storage_source_parts(source_id, None, origin_host);
+    let stored_host = crate::search::tantivy::normalized_index_origin_host(origin_host);
+    (source_id, stored_host.or(classified_host))
 }
 
 fn conversation_origin_kind(conv: &Conversation) -> Option<&str> {
@@ -26990,13 +27232,18 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         seed_atomic_fts_rebuild_fixture(&storage);
         let unicode_body = "é🙂";
-        storage
-            .raw()
-            .execute_compat(
-                "UPDATE messages SET id = 100, content = ?1 WHERE idx = 0",
-                fparams![unicode_body],
-            )
-            .unwrap();
+        // Derived analytics rows reference their message through non-deferrable
+        // foreign keys without ON UPDATE CASCADE, while the production reuse
+        // path drops a message together with its children. This fixture
+        // adversarially rewrites only the parent key, so relax enforcement for
+        // that rewrite and restore it afterward.
+        storage.raw().execute("PRAGMA foreign_keys = OFF").unwrap();
+        let rewritten = storage.raw().execute_compat(
+            "UPDATE messages SET id = 100, content = ?1 WHERE idx = 0",
+            fparams![unicode_body],
+        );
+        storage.raw().execute("PRAGMA foreign_keys = ON").unwrap();
+        rewritten.unwrap();
         let conversation_id: i64 = storage
             .raw()
             .query_row_map(

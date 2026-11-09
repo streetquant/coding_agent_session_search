@@ -1817,11 +1817,7 @@ fn fetch_canonical_embedding_batch_inner_with_caps_and_total(
         conversations,
         after_message_id,
         caps,
-        |conversation_id| {
-            let mut loaded =
-                storage.fetch_messages_for_lexical_rebuild_batch(&[conversation_id], None, None)?;
-            Ok(loaded.remove(&conversation_id).unwrap_or_default())
-        },
+        |conversation_id| super::replay::canonical_messages(storage, conversation_id),
     )?;
     let CheckpointCappedSelection {
         conversations,
@@ -2087,8 +2083,7 @@ where
     }
 
     let conversations = fetch_canonical_embedding_conversations(storage, conversation_ids)?;
-    let mut grouped_messages =
-        storage.fetch_messages_for_lexical_rebuild_batch(conversation_ids, None, None)?;
+    let mut grouped_messages = super::replay::canonical_messages_batch(storage, conversation_ids)?;
     Ok(
         packet_embedding_inputs_from_materialized_canonical_messages(
             &conversations,
@@ -3767,6 +3762,10 @@ impl SemanticIndexer {
                 ready: true,
             };
             if let Some((storage, snapshot)) = &coverage {
+                let prior_served = manifest
+                    .coverage
+                    .get(self.embedder_id())
+                    .map(|certificate| certificate.artifact_sha256.clone());
                 let (artifact, certificate) = snapshot.seal(
                     data_dir,
                     &final_path,
@@ -3777,6 +3776,20 @@ impl SemanticIndexer {
                 )?;
                 snapshot.verify(storage)?;
                 manifest.publish_covered_artifact(artifact, certificate)?;
+                // Serving retained the previous certified owner through this
+                // build, but the accelerator was built from that owner. A
+                // publication that seals different vectors must revoke it
+                // before the new ledger can serve a stale graph.
+                let published_served = manifest
+                    .coverage
+                    .get(self.embedder_id())
+                    .map(|certificate| certificate.artifact_sha256.clone());
+                if published_served != prior_served
+                    && let Some(hnsw) = manifest.hnsw.as_mut()
+                    && hnsw.embedder_id == self.embedder_id()
+                {
+                    hnsw.ready = false;
+                }
             } else {
                 manifest.publish_artifact(artifact);
             }
@@ -9351,8 +9364,10 @@ mod tests {
             |row| row.get_typed(0),
         )?;
         let envelopes = fetch_canonical_embedding_conversations(&storage, &conversation_ids)?;
-        let mut grouped_messages =
-            storage.fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)?;
+        let mut grouped_messages = crate::indexer::semantic::replay::canonical_messages_batch(
+            &storage,
+            &conversation_ids,
+        )?;
         let mut packets: Vec<ConversationPacket> = Vec::with_capacity(envelopes.len());
         let mut contexts: Vec<SemanticPacketContext> = Vec::with_capacity(envelopes.len());
         for envelope in &envelopes {

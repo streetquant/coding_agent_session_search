@@ -1309,6 +1309,18 @@ pub enum Commands {
         /// Resolve the current workspace automatically and return the most recent match
         #[arg(long, default_value_t = false)]
         current: bool,
+        /// Select native identities from this literal stored source ID; requires agent and external ID
+        #[arg(long, requires_all = ["exact_agent", "exact_external_id"], conflicts_with_all = ["workspace", "current", "limit", "since"])]
+        exact_source_id: Option<String>,
+        /// Original stored agent slug for exact native identity selection
+        #[arg(long, requires_all = ["exact_source_id", "exact_external_id"])]
+        exact_agent: Option<String>,
+        /// Native external session ID to select (repeatable, at most 256; ambiguous identities fail)
+        #[arg(long, requires_all = ["exact_source_id", "exact_agent"], action = clap::ArgAction::Append)]
+        exact_external_id: Vec<String>,
+        /// Require the exact literal stored workspace; no path normalization or ancestor matching
+        #[arg(long, requires_all = ["exact_source_id", "exact_agent", "exact_external_id"])]
+        exact_workspace: Option<String>,
         /// Maximum sessions to return (defaults: 10, or 1 with --current)
         #[arg(long)]
         limit: Option<usize>,
@@ -9433,6 +9445,10 @@ async fn execute_cli(
                 Commands::Sessions {
                     workspace,
                     current,
+                    exact_source_id,
+                    exact_agent,
+                    exact_external_id,
+                    exact_workspace,
                     limit,
                     since,
                     json,
@@ -9440,8 +9456,16 @@ async fn execute_cli(
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_sessions(
-                        workspace.as_ref(),
-                        current,
+                        SessionSelection {
+                            workspace: workspace.as_ref(),
+                            current,
+                            exact: SessionExactSelection::from_args(
+                                exact_source_id,
+                                exact_agent,
+                                exact_external_id,
+                                exact_workspace,
+                            )?,
+                        },
                         limit,
                         since.as_deref(),
                         &data_dir,
@@ -23543,7 +23567,14 @@ fn state_meta_json_inner(
     {
         assets.lexical.fresh = false;
         assets.lexical.stale = true;
-        if matches!(assets.lexical.status, "ready" | "stale" | "unverified") {
+        // `missing` is not a stronger verdict here: a scan watermark ahead of
+        // the projection means the last publish is already behind the scan,
+        // including when the index it described is no longer on disk. Keep
+        // error/building/legacy/hollow verdicts intact.
+        if matches!(
+            assets.lexical.status,
+            "ready" | "stale" | "unverified" | "missing"
+        ) {
             assets.lexical.status = "stale";
             assets.lexical.status_reason = Some(
                 "last_scan_ts is newer than last_indexed_at; a prior scan advanced without a completed projection into the searchable index"
@@ -30012,6 +30043,20 @@ fn search_lexical_repair_failed_error(reason: &str, err: anyhow::Error) -> CliEr
     }
 }
 
+/// Whether the canonical archive starts like a SQLite database, read from a
+/// bounded header instead of a `FrankenStorage` open. A strict
+/// `--no-maintenance` read must not let the recovery-capable opener rewrite a
+/// dirty WAL; this only classifies the bytes it would find.
+fn canonical_archive_header_is_sqlite(db_path: &Path) -> bool {
+    use std::io::Read;
+
+    let Ok(mut file) = std::fs::File::open(db_path) else {
+        return false;
+    };
+    let mut header = [0_u8; 16];
+    file.read_exact(&mut header).is_ok() && header.as_slice() == b"SQLite format 3\0"
+}
+
 /// Validate the lexical assets needed by `search --no-maintenance` without
 /// waiting for, joining, spawning, or performing any maintenance. A readable
 /// existing index may fail open when only its checkpoint metadata is stale;
@@ -30087,6 +30132,15 @@ fn search_lexical_read_only_diagnosis(
         return Ok(Some(SearchLexicalSelfHealDiagnosis::existing_index(
             "lexical checkpoint fingerprint is incomplete or malformed",
         )));
+    }
+
+    // A recovery-capable opener would reject or try to recover bytes that are
+    // not a SQLite database, so their epoch evidence cannot be compared. The
+    // strict lane must not open the archive at all: an unreadable header means
+    // serve the already-published generation from its immutable
+    // checkpoint/contract metadata instead of claiming a maintenance verdict.
+    if !canonical_archive_header_is_sqlite(db_path) {
+        return Ok(None);
     }
 
     // Deliberately do not compute the current canonical storage fingerprint.
@@ -58275,46 +58329,62 @@ fn verify_doctor_backup_record(
     if verification.blocked_reasons.is_empty()
         && let Some(db_path) = verification.prior_live_db_path.as_ref()
     {
-        match open_franken_with_flags(
-            &db_path.to_string_lossy(),
-            FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
-        ) {
-            Ok(mut connection) => {
-                if let Err(err) = connection.close_without_checkpoint_in_place() {
-                    connection.close_best_effort_in_place();
-                    verification.storage_probe_status = "failed";
-                    verification.blocked_reasons.push(format!(
-                        "closing the prior-live backup read-only probe failed: {err}"
-                    ));
-                } else {
-                    verification.storage_probe_status = "passed";
-                    verification
-                        .warnings
-                        .push("frankensqlite read-only probe passed".to_string());
+        // A WAL-mode read-only open maintains the derived WAL index beside
+        // the source: it creates a missing -shm and repairs a stale one in
+        // place. Either write mutates the backup bundle this verification is
+        // hashing, so a recorded nonempty WAL defers admission to rehearsal,
+        // which recovers the index only on its private candidate copy.
+        if verification
+            .prior_live_wal_path
+            .as_ref()
+            .is_some_and(|path| std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 32))
+        {
+            verification.storage_probe_status = "requires_private_wal_index_recovery";
+            verification.warnings.push(
+                "manifest checksums matched; bytes retained in a nonempty WAL are admitted through private WAL-index recovery on a restore candidate so the stored bundle stays byte-identical".to_string(),
+            );
+        } else {
+            match open_franken_with_flags(
+                &db_path.to_string_lossy(),
+                FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
+            ) {
+                Ok(mut connection) => {
+                    if let Err(err) = connection.close_without_checkpoint_in_place() {
+                        connection.close_best_effort_in_place();
+                        verification.storage_probe_status = "failed";
+                        verification.blocked_reasons.push(format!(
+                            "closing the prior-live backup read-only probe failed: {err}"
+                        ));
+                    } else {
+                        verification.storage_probe_status = "passed";
+                        verification
+                            .warnings
+                            .push("frankensqlite read-only probe passed".to_string());
+                    }
                 }
-            }
-            Err(err)
-                if matches!(
-                    err,
-                    crate::franken_sync::FrankenError::BusyRecovery
-                        | crate::franken_sync::FrankenError::ReadOnly
-                ) && verification
-                    .prior_live_wal_path
-                    .as_ref()
-                    .is_some_and(|path| {
-                        std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 32)
-                    }) =>
-            {
-                verification.storage_probe_status = "requires_private_wal_index_recovery";
-                verification.warnings.push(
+                Err(err)
+                    if matches!(
+                        err,
+                        crate::franken_sync::FrankenError::BusyRecovery
+                            | crate::franken_sync::FrankenError::ReadOnly
+                    ) && verification
+                        .prior_live_wal_path
+                        .as_ref()
+                        .is_some_and(|path| {
+                            std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 32)
+                        }) =>
+                {
+                    verification.storage_probe_status = "requires_private_wal_index_recovery";
+                    verification.warnings.push(
                     "manifest checksums matched; storage admission requires WAL-index recovery on a private restore candidate before restore can succeed".to_string(),
                 );
-            }
-            Err(err) => {
-                verification.storage_probe_status = "failed";
-                verification.blocked_reasons.push(format!(
-                    "frankensqlite read-only probe failed for prior-live backup DB: {err}"
-                ));
+                }
+                Err(err) => {
+                    verification.storage_probe_status = "failed";
+                    verification.blocked_reasons.push(format!(
+                        "frankensqlite read-only probe failed for prior-live backup DB: {err}"
+                    ));
+                }
             }
         }
     }
@@ -97914,8 +97984,249 @@ pub(crate) fn run_doctor_impl(
     }
 }
 
+struct SessionSelection<'a> {
+    workspace: Option<&'a PathBuf>,
+    current: bool,
+    exact: Option<SessionExactSelection>,
+}
+
+struct SessionExactSelection {
+    source_id: String,
+    agent: String,
+    external_ids: Vec<String>,
+    workspace: Option<String>,
+}
+
+impl SessionExactSelection {
+    fn from_args(
+        source_id: Option<String>,
+        agent: Option<String>,
+        external_ids: Vec<String>,
+        workspace: Option<String>,
+    ) -> CliResult<Option<Self>> {
+        if source_id.is_none() && agent.is_none() && external_ids.is_empty() && workspace.is_none()
+        {
+            return Ok(None);
+        }
+        let invalid = |message: &str| CliError {
+            code: 2,
+            kind: CliErrorKind::Usage.kind_str(),
+            message: message.to_owned(),
+            hint: Some(
+                "Use --exact-source-id SOURCE --exact-agent AGENT --exact-external-id ID \
+                 (repeat ID at most 256 times)."
+                    .to_owned(),
+            ),
+            retryable: false,
+        };
+        let (Some(source_id), Some(agent)) = (source_id, agent) else {
+            return Err(invalid(
+                "Exact sessions selection requires source, agent, and external ID together.",
+            ));
+        };
+        if external_ids.is_empty() || external_ids.len() > 256 {
+            return Err(invalid(
+                "Exact sessions selection requires between 1 and 256 external IDs.",
+            ));
+        }
+        // Validate without normalizing: native IDs and historical root spellings
+        // are archive identity, including punctuation and internal whitespace.
+        if std::iter::once(source_id.as_str())
+            .chain(std::iter::once(agent.as_str()))
+            .chain(external_ids.iter().map(String::as_str))
+            .chain(workspace.as_deref())
+            .any(|value| value.trim().is_empty() || value.len() > 16_384 || value.contains('\0'))
+        {
+            return Err(invalid(
+                "Exact sessions selectors must be nonblank, contain no NUL, and fit within 16 KiB each.",
+            ));
+        }
+        let mut seen = HashSet::new();
+        if external_ids.iter().any(|id| !seen.insert(id.as_str())) {
+            return Err(invalid(
+                "Exact sessions selection contains a duplicate external ID.",
+            ));
+        }
+        Ok(Some(Self {
+            source_id,
+            agent,
+            external_ids,
+            workspace,
+        }))
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SessionCoverage {
+    NotObserved,
+    Partial,
+    PartialLegacyProjection,
+    PartialHostBridge,
+    HostTurnsObserved,
+    ClientContextSyncComplete,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SessionCoverageSource {
+    None,
+    ConnectorObservation,
+    ClientContextSync,
+    Mixed,
+    SavedDatabaseSnapshot,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SessionCoverageAuthority {
+    HistoricalEvidenceOnly,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+enum SessionCoverageSchema {
+    #[serde(rename = "cloudmcp.conversation-manifest.v1")]
+    CloudMcpManifestV1,
+    #[serde(rename = "openwebui.saved-conversation.v1")]
+    OpenWebUiSavedConversationV1,
+}
+
+/// Reported provenance only: none of these fields grants memory trust. Unknown
+/// or unsupported values stay null, and absence never implies completeness.
+#[derive(Debug, Serialize)]
+struct SessionCoverageProvenance {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema_version: Option<SessionCoverageSchema>,
+    coverage: Option<SessionCoverage>,
+    coverage_source: Option<SessionCoverageSource>,
+    authority: Option<SessionCoverageAuthority>,
+    all_transcript_complete: Option<bool>,
+    transcript_sha256: Option<String>,
+    manifest_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_rows_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    catalog_sha256: Option<String>,
+}
+
+const MAX_SESSION_METADATA_BYTES: usize = 1_048_576;
+
+fn session_coverage_provenance(
+    agent: &str,
+    metadata_json: Option<&str>,
+    metadata_bin: Option<&[u8]>,
+) -> Option<SessionCoverageProvenance> {
+    // Match the archive's binary-first precedence. A malformed binary payload
+    // must not resurrect stale JSON that claims more complete coverage.
+    let metadata: serde_json::Value = if let Some(bytes) = metadata_bin.filter(|v| !v.is_empty()) {
+        if bytes.len() > MAX_SESSION_METADATA_BYTES {
+            return None;
+        }
+        let mut decoder = rmp_serde::Deserializer::new(std::io::Cursor::new(bytes));
+        let value = serde_json::Value::deserialize(&mut decoder).ok()?;
+        if usize::try_from(decoder.position()).ok()? != bytes.len() {
+            return None;
+        }
+        value
+    } else {
+        let text = metadata_json.filter(|v| v.len() <= MAX_SESSION_METADATA_BYTES)?;
+        serde_json::from_str(text).ok()?
+    };
+    let metadata = metadata.as_object()?;
+    // Only reviewed producer schemas may describe coverage. Missing schema is
+    // retained for historical CloudMCP projections; future schemas stay unknown.
+    let schema_version = match metadata.get("schema_version") {
+        Some(version) => Some(serde_json::from_value(version.clone()).ok()?),
+        None => None,
+    };
+    let is_saved_snapshot = matches!(
+        &schema_version,
+        Some(SessionCoverageSchema::OpenWebUiSavedConversationV1)
+    );
+    if is_saved_snapshot
+        && (agent != "openwebui"
+            || metadata.get("source").and_then(serde_json::Value::as_str) != Some("openwebui")
+            || metadata.get("coverage").and_then(serde_json::Value::as_str) != Some("partial")
+            || metadata
+                .get("coverage_source")
+                .and_then(serde_json::Value::as_str)
+                != Some("saved_database_snapshot")
+            || metadata
+                .get("authority")
+                .and_then(serde_json::Value::as_str)
+                != Some("historical_evidence_only")
+            || metadata
+                .get("all_transcript_complete")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false))
+    {
+        return None;
+    }
+    let hash_anchor = |name| {
+        metadata
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .map(str::to_owned)
+    };
+    let provenance = SessionCoverageProvenance {
+        schema_version,
+        coverage: metadata
+            .get("coverage")
+            .and_then(|value| serde_json::from_value(value.clone()).ok()),
+        coverage_source: metadata
+            .get("coverage_source")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .filter(|source| {
+                is_saved_snapshot || !matches!(source, SessionCoverageSource::SavedDatabaseSnapshot)
+            }),
+        authority: metadata
+            .get("authority")
+            .and_then(|value| serde_json::from_value(value.clone()).ok()),
+        all_transcript_complete: metadata
+            .get("all_transcript_complete")
+            .and_then(serde_json::Value::as_bool),
+        transcript_sha256: (!is_saved_snapshot)
+            .then(|| hash_anchor("transcript_sha256"))
+            .flatten(),
+        manifest_sha256: (!is_saved_snapshot)
+            .then(|| hash_anchor("manifest_sha256"))
+            .flatten(),
+        // Connector content_hash is the original snapshot SHA-256; the session
+        // response's separate content_hash describes normalized archived text.
+        snapshot_sha256: if is_saved_snapshot {
+            Some(hash_anchor("content_hash")?)
+        } else {
+            None
+        },
+        source_rows_sha256: if is_saved_snapshot {
+            Some(hash_anchor("source_rows_sha256")?)
+        } else {
+            None
+        },
+        catalog_sha256: if is_saved_snapshot {
+            Some(hash_anchor("catalog_sha256")?)
+        } else {
+            None
+        },
+    };
+    (provenance.coverage.is_some()
+        || provenance.coverage_source.is_some()
+        || provenance.authority.is_some()
+        || provenance.all_transcript_complete.is_some()
+        || provenance.transcript_sha256.is_some()
+        || provenance.manifest_sha256.is_some())
+    .then_some(provenance)
+}
+
 #[derive(Debug)]
 struct SessionSummaryRecord {
+    conversation_id: i64,
+    external_id: Option<String>,
+    content_hash: Option<String>,
+    source_path_session_count: Option<usize>,
     agent: String,
     workspace: Option<PathBuf>,
     workspace_match_distance: Option<usize>,
@@ -97928,10 +98239,15 @@ struct SessionSummaryRecord {
     size_bytes: Option<u64>,
     message_count: i64,
     human_turns: i64,
+    coverage_provenance: Option<SessionCoverageProvenance>,
 }
 
 #[derive(Debug, Serialize)]
 struct SessionSummaryEntry {
+    conversation_id: i64,
+    external_id: Option<String>,
+    content_hash: Option<String>,
+    source_path_session_count: Option<usize>,
     path: String,
     workspace: Option<String>,
     agent: String,
@@ -97942,6 +98258,8 @@ struct SessionSummaryEntry {
     size_bytes: Option<u64>,
     message_count: i64,
     human_turns: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage_provenance: Option<SessionCoverageProvenance>,
 }
 
 fn normalize_session_filter_path(path: &Path) -> CliResult<PathBuf> {
@@ -98020,8 +98338,7 @@ mod path_spelling_tests {
 }
 
 fn run_sessions(
-    workspace: Option<&PathBuf>,
-    current: bool,
+    selection: SessionSelection<'_>,
     limit: Option<usize>,
     since: Option<&str>,
     data_dir_override: &Option<PathBuf>,
@@ -98029,6 +98346,12 @@ fn run_sessions(
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
+
+    let SessionSelection {
+        workspace,
+        current,
+        exact,
+    } = selection;
 
     // Parse flags before opening anything, so a bad value is a usage error
     // even where no archive exists.
@@ -98072,10 +98395,9 @@ fn run_sessions(
     } else {
         ""
     };
-    let sessions_sql = format!(
-        // LEFT JOIN + COALESCE on agents so list_sessions still reports
-        // legacy conversations with NULL agent_id.
-        "SELECT c.id,
+    // LEFT JOIN + COALESCE on agents so list_sessions still reports
+    // legacy conversations with NULL agent_id.
+    let sessions_select = "SELECT c.id,
                 COALESCE(a.slug, 'unknown') AS agent_slug,
                 w.path,
                 c.title,
@@ -98084,18 +98406,13 @@ fn run_sessions(
                 c.origin_host,
                 s.kind,
                 c.started_at,
-                c.ended_at
+                c.ended_at,
+                c.external_id
          FROM conversations c
          LEFT JOIN agents a ON c.agent_id = a.id
          LEFT JOIN workspaces w ON c.workspace_id = w.id
-         LEFT JOIN sources s ON c.source_id = s.id
-         {since_filter}
-         ORDER BY CASE WHEN c.started_at IS NULL THEN 1 ELSE 0 END, c.started_at DESC, c.id DESC"
-    );
-    let since_params: Vec<ParamValue> = since_ms.map(ParamValue::from).into_iter().collect();
-    let params: &[ParamValue] = &since_params;
-    #[allow(clippy::type_complexity)]
-    let rows: Vec<(
+         LEFT JOIN sources s ON c.source_id = s.id";
+    type SessionRow = (
         i64,
         String,
         Option<String>,
@@ -98106,8 +98423,11 @@ fn run_sessions(
         Option<String>,
         Option<i64>,
         Option<i64>,
-    )> = conn
-        .query_map_collect(&sessions_sql, params, |row: &crate::franken_sync::Row| {
+        Option<String>,
+    );
+    let query_sessions = |predicate: &str, params: &[ParamValue], order: &str| {
+        let sql = format!("{sessions_select} {predicate} {order}");
+        conn.query_map_collect(&sql, params, |row: &crate::franken_sync::Row| {
             Ok((
                 row.get_typed(0)?,
                 row.get_typed(1)?,
@@ -98119,15 +98439,138 @@ fn run_sessions(
                 row.get_typed(7)?,
                 row.get_typed(8)?,
                 row.get_typed(9)?,
+                row.get_typed(10)?,
             ))
         })
-        .map_err(|e| CliError {
-            code: 9,
-            kind: CliErrorKind::DbQuery.kind_str(),
-            message: format!("Failed to list sessions: {e}"),
-            hint: None,
+    };
+    let query_error = |e| CliError {
+        code: 9,
+        kind: CliErrorKind::DbQuery.kind_str(),
+        message: format!("Failed to list sessions: {e}"),
+        hint: None,
+        retryable: false,
+    };
+    let rows: Vec<SessionRow> = if let Some(exact) = exact.as_ref() {
+        // Resolve the agent once, then seek the native provenance key before
+        // reading any session metadata. This does not enumerate the archive.
+        let agent_ids: Vec<i64> = conn
+            .query_map_collect(
+                "SELECT id FROM agents WHERE slug = ?1 LIMIT 2",
+                &[ParamValue::from(exact.agent.as_str())],
+                |row: &crate::franken_sync::Row| row.get_typed(0),
+            )
+            .map_err(query_error)?;
+        if agent_ids.len() > 1 {
+            return Err(CliError {
+                code: 2,
+                kind: CliErrorKind::Usage.kind_str(),
+                message: "Exact sessions selection found an ambiguous stored agent slug."
+                    .to_owned(),
+                hint: Some(
+                    "Resolve the archive identity conflict before importing this session."
+                        .to_owned(),
+                ),
+                retryable: false,
+            });
+        }
+        let agent_id = agent_ids.first().ok_or_else(|| CliError {
+            code: 2,
+            kind: CliErrorKind::Usage.kind_str(),
+            message: format!(
+                "Exact sessions selection found no stored agent {:?}.",
+                exact.agent
+            ),
+            hint: Some(
+                "Check the original agent and native identity; \
+                 exact selection never returns partial results."
+                    .to_owned(),
+            ),
             retryable: false,
         })?;
+        let mut selected = Vec::with_capacity(exact.external_ids.len());
+        for external_id in &exact.external_ids {
+            let ids: Vec<i64> = conn
+                .query_map_collect(
+                    "SELECT id FROM conversations
+                     WHERE source_id = ?1 AND agent_id = ?2 AND external_id = ?3 LIMIT 2",
+                    &[
+                        ParamValue::from(exact.source_id.as_str()),
+                        ParamValue::from(*agent_id),
+                        ParamValue::from(external_id.as_str()),
+                    ],
+                    |row: &crate::franken_sync::Row| row.get_typed(0),
+                )
+                .map_err(query_error)?;
+            // Check globally before the optional workspace constraint: a
+            // root must not conceal two rows with one native identity.
+            if ids.len() > 1 {
+                return Err(CliError {
+                    code: 2,
+                    kind: CliErrorKind::Usage.kind_str(),
+                    message: format!(
+                        "Ambiguous exact native session identity for source {:?}, \
+                         agent {:?}, external ID {:?}.",
+                        exact.source_id, exact.agent, external_id
+                    ),
+                    hint: Some(
+                        "Resolve the archive identity conflict; \
+                         a limit or workspace filter cannot disambiguate a native identity."
+                            .to_owned(),
+                    ),
+                    retryable: false,
+                });
+            }
+            let id = ids.first().ok_or_else(|| CliError {
+                code: 2,
+                kind: CliErrorKind::Usage.kind_str(),
+                message: format!(
+                    "No exact native session identity for source {:?}, \
+                     agent {:?}, external ID {:?}.",
+                    exact.source_id, exact.agent, external_id
+                ),
+                hint: Some(
+                    "Check every requested native identity; \
+                     exact selection never returns partial results."
+                        .to_owned(),
+                ),
+                retryable: false,
+            })?;
+            let mut params = vec![ParamValue::from(*id)];
+            let predicate = if let Some(workspace) = exact.workspace.as_deref() {
+                params.push(ParamValue::from(workspace));
+                "WHERE c.id = ?1 AND w.path = ?2"
+            } else {
+                "WHERE c.id = ?1"
+            };
+            let rows = query_sessions(predicate, &params, "").map_err(query_error)?;
+            if rows.len() != 1 {
+                return Err(CliError {
+                    code: 2,
+                    kind: CliErrorKind::Usage.kind_str(),
+                    message: format!(
+                        "Exact native session {:?} did not resolve once with literal workspace {:?}.",
+                        external_id, exact.workspace
+                    ),
+                    hint: Some(
+                        "Use the original stored workspace spelling; \
+                         exact selection never normalizes paths or returns partial results."
+                            .to_owned(),
+                    ),
+                    retryable: false,
+                });
+            }
+            selected.extend(rows);
+        }
+        selected
+    } else {
+        let since_params: Vec<ParamValue> = since_ms.map(ParamValue::from).into_iter().collect();
+        query_sessions(
+            since_filter,
+            &since_params,
+            "ORDER BY CASE WHEN c.started_at IS NULL THEN 1 ELSE 0 END, c.started_at DESC, c.id DESC",
+        )
+        .map_err(query_error)?
+    };
 
     let mut sessions: Vec<(i64, bool, SessionSummaryRecord)> = rows
         .into_iter()
@@ -98143,14 +98586,21 @@ fn run_sessions(
                 origin_kind,
                 started_at,
                 ended_at,
+                external_id,
             )| {
                 let source_path_buf = PathBuf::from(&source_path);
                 let origin_host = normalized_provenance_origin_host(origin_host.as_deref());
-                let source_id = normalized_provenance_source_id(
-                    source_id.as_str(),
-                    origin_kind.as_deref(),
-                    origin_host.as_deref(),
-                );
+                // Exact selection reports the literal stored source spelling;
+                // broad listing keeps its historical normalization.
+                let source_id = if exact.is_some() {
+                    source_id
+                } else {
+                    normalized_provenance_source_id(
+                        source_id.as_str(),
+                        origin_kind.as_deref(),
+                        origin_host.as_deref(),
+                    )
+                };
                 let normalized_origin_kind =
                     normalized_provenance_origin_kind(source_id.as_str(), origin_kind.as_deref());
                 let metadata =
@@ -98169,6 +98619,10 @@ fn run_sessions(
                     conversation_id,
                     has_recorded_timestamp,
                     SessionSummaryRecord {
+                        conversation_id,
+                        external_id,
+                        content_hash: None,
+                        source_path_session_count: None,
                         agent,
                         workspace: workspace.map(PathBuf::from),
                         workspace_match_distance: None,
@@ -98181,11 +98635,50 @@ fn run_sessions(
                         size_bytes: metadata.as_ref().map(std::fs::Metadata::len),
                         message_count: 0,
                         human_turns: 0,
+                        coverage_provenance: None,
                     },
                 )
             },
         )
         .collect();
+
+    // Importers may already have a legacy path-keyed record. Report whether
+    // that path is unambiguous across this archive, before workspace/limit
+    // filtering. A date-filtered SQL result cannot establish uniqueness.
+    if exact.is_some() {
+        // Exact selection cannot establish path uniqueness from its selected
+        // subset. Query every row sharing each selected path, across all roots,
+        // agents and sources, using the archive's source-path index.
+        let mut path_counts = std::collections::HashMap::new();
+        for (_, _, session) in &mut sessions {
+            let source_path = session.source_path.to_string_lossy();
+            let count = if let Some(count) = path_counts.get(source_path.as_ref()) {
+                *count
+            } else {
+                let ids: Vec<i64> = conn
+                    .query_map_collect(
+                        "SELECT id FROM conversations WHERE source_path = ?1",
+                        &[ParamValue::from(source_path.as_ref())],
+                        |row: &crate::franken_sync::Row| row.get_typed(0),
+                    )
+                    .map_err(query_error)?;
+                let count = ids.len();
+                path_counts.insert(source_path.into_owned(), count);
+                count
+            };
+            session.source_path_session_count = Some(count);
+        }
+    } else if since_ms.is_none() {
+        let mut path_counts = std::collections::HashMap::new();
+        for (_, _, session) in &sessions {
+            *path_counts
+                .entry(session.source_path.clone()) // ubs:ignore -- Counts own path keys before the subsequent mutable session pass.
+                .or_insert(0_usize) += 1;
+        }
+        for (_, _, session) in &mut sessions {
+            session.source_path_session_count = path_counts.get(&session.source_path).copied();
+        }
+    }
 
     if let Some(since_ms) = since_ms {
         // Rows with a recorded timestamp already satisfied the SQL window
@@ -98221,7 +98714,9 @@ fn run_sessions(
             .then_with(|| left.source_path.cmp(&right.source_path))
     });
 
-    if let Some(limit) = effective_limit {
+    if exact.is_none()
+        && let Some(limit) = effective_limit
+    {
         sessions.truncate(limit);
     }
 
@@ -98234,24 +98729,59 @@ fn run_sessions(
     // PLAN contract test in storage::sqlite), so each lookup is an indexed
     // range scan on messages(conversation_id, idx) and the roles are
     // tallied in Rust — cost scales with the returned page, not the corpus.
-    let count_session_messages =
-        |conversation_id: i64| -> Result<(i64, i64), crate::franken_sync::FrankenError> {
+    let summarize_session_messages =
+        |conversation_id: i64| -> Result<(i64, i64, String), crate::franken_sync::FrankenError> {
+            let mut content_hash = blake3::Hasher::new();
+            content_hash.update(b"cass-archived-message-content-v1\0");
             let roles: Vec<String> = conn.query_map_collect(
-                "SELECT role
+                "SELECT idx, role, content
                  FROM messages INDEXED BY sqlite_autoindex_messages_1
-                 WHERE conversation_id = ?1",
+                 WHERE conversation_id = ?1 ORDER BY idx",
                 &[ParamValue::from(conversation_id)],
-                |row: &crate::franken_sync::Row| row.get_typed::<String>(0),
+                |row: &crate::franken_sync::Row| {
+                    let index: i64 = row.get_typed(0)?;
+                    let role: String = row.get_typed(1)?;
+                    let content: String = row.get_typed(2)?;
+                    content_hash.update(&index.to_le_bytes());
+                    for field in [&role, &content] {
+                        content_hash.update(&(field.len() as u64).to_le_bytes()); // ubs:ignore -- Byte lengths fit u64 on every supported 32/64-bit target; the hash format uses fixed-width lengths.
+                        content_hash.update(field.as_bytes());
+                    }
+                    Ok(role)
+                },
             )?;
             let message_count = roles.len() as i64;
             let human_turns = roles.iter().filter(|role| role.as_str() == "user").count() as i64;
-            Ok((message_count, human_turns))
+            Ok((
+                message_count,
+                human_turns,
+                content_hash.finalize().to_hex().to_string(),
+            ))
         };
+    // Read coverage only for surviving sessions, with a byte ceiling before
+    // hydration. Legacy stores without metadata columns retain their output.
+    let columns = doctor_table_columns(&conn, "conversations");
+    let json_column = if columns.contains("metadata_json") {
+        "metadata_json"
+    } else {
+        "NULL"
+    };
+    let bin_column = if columns.contains("metadata_bin") {
+        "metadata_bin"
+    } else {
+        "NULL"
+    };
+    let coverage_sql = format!(
+        "SELECT CASE WHEN length(CAST({json_column} AS BLOB)) <= {MAX_SESSION_METADATA_BYTES} THEN {json_column} ELSE NULL END,
+                CASE WHEN length(CAST({bin_column} AS BLOB)) <= {MAX_SESSION_METADATA_BYTES} THEN {bin_column} ELSE NULL END,
+                length(CAST({bin_column} AS BLOB))
+         FROM conversations WHERE id = ?1"
+    );
     let sessions: Vec<SessionSummaryRecord> = sessions
         .into_iter()
         .map(|(conversation_id, _, mut session)| {
-            let (message_count, human_turns) =
-                count_session_messages(conversation_id).map_err(|e| CliError {
+            let (message_count, human_turns, content_hash) =
+                summarize_session_messages(conversation_id).map_err(|e| CliError {
                     code: 9,
                     kind: CliErrorKind::DbQuery.kind_str(),
                     message: format!("Failed to count session messages: {e}"),
@@ -98260,6 +98790,30 @@ fn run_sessions(
                 })?;
             session.message_count = message_count;
             session.human_turns = human_turns;
+            session.content_hash = Some(content_hash);
+            session.coverage_provenance = conn
+                .query_row_map(
+                    &coverage_sql,
+                    &[ParamValue::from(conversation_id)],
+                    |row: &crate::franken_sync::Row| {
+                        let binary_size = row.get_typed::<Option<i64>>(2)?;
+                        if binary_size.is_some_and(|size| size > MAX_SESSION_METADATA_BYTES as i64)
+                        {
+                            return Ok(None);
+                        }
+                        let json = row.get_typed::<Option<String>>(0).ok().flatten();
+                        let binary = row.get_typed::<Option<Vec<u8>>>(1).ok().flatten();
+                        if binary_size.is_some_and(|size| size > 0) && binary.is_none() {
+                            return Ok(None);
+                        }
+                        Ok(session_coverage_provenance(
+                            &session.agent,
+                            json.as_deref(),
+                            binary.as_deref(),
+                        ))
+                    },
+                )
+                .map_err(query_error)?;
             Ok(session)
         })
         .collect::<CliResult<Vec<_>>>()?;
@@ -98267,6 +98821,10 @@ fn run_sessions(
     let entries: Vec<SessionSummaryEntry> = sessions
         .into_iter()
         .map(|session| SessionSummaryEntry {
+            conversation_id: session.conversation_id,
+            external_id: session.external_id,
+            content_hash: session.content_hash,
+            source_path_session_count: session.source_path_session_count,
             path: session.source_path.to_string_lossy().into_owned(),
             workspace: session
                 .workspace
@@ -98281,6 +98839,7 @@ fn run_sessions(
             size_bytes: session.size_bytes,
             message_count: session.message_count,
             human_turns: session.human_turns,
+            coverage_provenance: session.coverage_provenance,
         })
         .collect();
 

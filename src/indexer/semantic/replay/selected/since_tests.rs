@@ -190,10 +190,17 @@ fn negative_raw_message_ids_keep_progress_even_when_projection_skips_them() -> R
     let temp = tempfile::tempdir()?;
     let storage = fixture(temp.path(), 1, 1)?;
     let row = coordinates(&storage)?[0];
-    storage.raw().execute_compat(
+    // A legacy/corrupt archive can carry a negative rowid. Derived analytics
+    // rows (`token_usage`, `message_metrics`) reference the positive id, so
+    // construct that raw state without the engine's foreign-key checks rather
+    // than rewriting every derived table too.
+    storage.raw().execute("PRAGMA foreign_keys = OFF")?;
+    let rewrite = storage.raw().execute_compat(
         "UPDATE messages SET id = -5 WHERE id = ?1",
         &[ParamValue::from(row.0)],
-    )?;
+    );
+    storage.raw().execute("PRAGMA foreign_keys = ON")?;
+    rewrite?;
     let actual = packet_embedding_inputs_from_storage_since(&storage, i64::MIN)?;
     assert!(actual.inputs.is_empty());
     assert_eq!(actual.conversations_in_batch, 1);

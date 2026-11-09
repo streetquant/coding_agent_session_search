@@ -76,7 +76,11 @@ fn gh496_insert_conversation(
 }
 
 fn gh496_documents(db_path: &Path) -> Vec<frankensearch::quill::cass::CassDocument> {
-    let storage = FrankenStorage::open_strict_readonly(db_path).unwrap();
+    // The producer reads the canonical projection through the ordinary
+    // recovery-capable reader, because a raw external edit can leave a dirty
+    // WAL that only that opener may recover. A strict reader here would model
+    // a different archive than the rebuild actually indexed.
+    let storage = FrankenStorage::open_readonly(db_path).unwrap();
     let (agents, workspaces) = storage.build_lexical_rebuild_lookups().unwrap();
     let mut documents = Vec::new();
     let mut after = 0;
@@ -212,29 +216,75 @@ fn gh496_assert_segments_retained(index_path: &Path, segments: &[(PathBuf, Vec<u
 }
 
 fn gh496_assert_exact(fixture: &Gh496Fixture, expected_conversations: usize) {
+    gh496_assert_exact_after(fixture, expected_conversations, "completed rebuild");
+}
+
+/// Same audit, but names the mutation that produced the canonical projection
+/// so a stale document identifies the failing case, not just the identity.
+fn gh496_assert_exact_after(
+    fixture: &Gh496Fixture,
+    expected_conversations: usize,
+    context: &str,
+) {
     let documents = gh496_documents(&fixture.db_path);
     let snapshot =
         lexical_reconcile::canary::exact::PublishedSnapshot::open(&fixture.index_path).unwrap();
-    assert_eq!(snapshot.doc_count() as usize, documents.len());
+    assert_eq!(
+        snapshot.doc_count() as usize,
+        documents.len(),
+        "{context}: published document count"
+    );
     for document in &documents {
-        assert!(
-            snapshot.verify_content(document).unwrap(),
-            "missing or stale full document {:?}/{}",
-            document.conversation_id,
-            document.msg_idx
-        );
+        match snapshot
+            .classify_content_ref(document.as_ref())
+            .unwrap_or_else(|error| panic!("{context}: classify document: {error:#}"))
+        {
+            lexical_reconcile::canary::exact::ContentMatch::Matching => {}
+            mismatch => {
+                let token = document
+                    .content
+                    .split_whitespace()
+                    .last()
+                    .unwrap_or("growthproof");
+                let hits = gh496_search_signature(&fixture.index_path, token);
+                panic!(
+                    "document {:?}/{} is {mismatch:?} after {context}: \
+                     agent={:?} source_id={:?} origin_kind={:?} origin_host={:?} \
+                     source_path={:?} conversation_id={:?} msg_idx={} title={:?} created_at={:?}; \
+                     indexed={hits:?}",
+                    document.conversation_id,
+                    document.msg_idx,
+                    document.agent,
+                    document.source_id,
+                    document.origin_kind,
+                    document.origin_host,
+                    document.source_path,
+                    document.conversation_id,
+                    document.msg_idx,
+                    document.title,
+                    document.created_at,
+                )
+            }
+        }
     }
     let state = load_lexical_rebuild_state(&fixture.index_path)
         .unwrap()
         .unwrap();
-    assert!(state.completed);
-    assert!(state.pending.is_none());
-    assert_eq!(state.processed_conversations, expected_conversations);
-    assert_eq!(state.indexed_docs, documents.len());
-    assert!(has_usable_lexical_publication_receipt(
-        &fixture.index_path,
-        &fixture.db_path
-    ));
+    assert!(state.completed, "{context}: checkpoint must be completed");
+    assert!(state.pending.is_none(), "{context}: pending commit");
+    assert_eq!(
+        state.processed_conversations, expected_conversations,
+        "{context}: processed conversations"
+    );
+    assert_eq!(
+        state.indexed_docs,
+        documents.len(),
+        "{context}: indexed documents"
+    );
+    assert!(
+        has_usable_lexical_publication_receipt(&fixture.index_path, &fixture.db_path),
+        "{context}: publication receipt"
+    );
 }
 
 fn gh496_search_signature(index_path: &Path, query: &str) -> Vec<String> {
@@ -805,7 +855,7 @@ fn gh496_edits_deletions_and_identity_changes_refuse_prefix_reuse() {
         // The public entry point may quarantine incompatible work and rebuild;
         // success must then agree with every current canonical projection.
         rebuild_tantivy_from_db(&fixture.db_path, &fixture.data_dir, 2, None).unwrap();
-        gh496_assert_exact(&fixture, 2);
+        gh496_assert_exact_after(&fixture, 2, mutation);
     }
 }
 
@@ -1081,11 +1131,28 @@ fn gh496_replaced_archive_at_same_path_is_not_the_checkpoint_archive() {
     assert!(lexical_resume::eligible(&state, &fixture.db_path));
     let preserved = fixture._tmp.path().join("old-archive");
     fs::create_dir_all(&preserved).unwrap();
-    for suffix in ["", "-wal", "-shm"] {
-        let source = PathBuf::from(format!("{}{suffix}", fixture.db_path.display()));
-        if source.exists() {
-            fs::rename(&source, preserved.join(source.file_name().unwrap())).unwrap();
-        }
+    // A replacement archive replaces the whole path family, not just the main
+    // file. The certified-WAL sidecars and the VFS lock/namespace files must
+    // move with it: a stale sidecar named after a database that no longer
+    // exists either makes the next open fail or drives the pager into a stale
+    // shared-lock snapshot that faults instead of creating a fresh archive.
+    let archive_name = fixture
+        .db_path
+        .file_name()
+        .expect("archive fixture has a file name")
+        .to_string_lossy()
+        .into_owned();
+    let mut family = fs::read_dir(&fixture.data_dir)
+        .expect("archive fixture data dir is readable")
+        .map(|entry| entry.expect("archive fixture dir entry").path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&archive_name))
+        })
+        .collect::<Vec<_>>();
+    family.sort();
+    for source in family {
+        fs::rename(&source, preserved.join(source.file_name().unwrap())).unwrap();
     }
     let replacement = FrankenStorage::open(&fixture.db_path).unwrap();
     ensure_fts_schema(&replacement);

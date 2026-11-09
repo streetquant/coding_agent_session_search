@@ -359,6 +359,35 @@ fn certified_semantic_opening_seal_detects_ancestor_rename_restore_through_paren
 }
 
 #[test]
+fn certified_semantic_opening_seal_fences_archive_parent_but_not_shared_ancestor_churn()
+-> Result<()> {
+    let root = tempfile::tempdir()?;
+    let archive_dir = root.path().join("archive");
+    std::fs::create_dir(&archive_dir)?;
+    let path = archive_dir.join("archive.db");
+    std::fs::write(&path, b"database opening shared ancestor fixture")?;
+
+    // Churn above the archive directory (a shared temporary root gains
+    // neighbors from other work) must not invalidate an otherwise stable
+    // opening.
+    let opening = CanonicalDatabaseOpening::capture(&path)?;
+    let root_before = std::fs::metadata(root.path())?;
+    std::fs::write(root.path().join("unrelated-opening-neighbor"), b"unrelated")?;
+    std::fs::File::open(root.path())?.set_times(
+        std::fs::FileTimes::new().set_modified(root_before.modified()? + Duration::from_secs(2)),
+    )?;
+    opening.finish()?;
+
+    // The archive's immediate parent still fences sibling churn, preserving
+    // the retry that notices archive-adjacent activity.
+    let opening = CanonicalDatabaseOpening::capture(&path)?;
+    std::fs::write(archive_dir.join("unrelated-opening-neighbor"), b"unrelated")?;
+    let error = opening.finish().unwrap_err();
+    assert!(error.to_string().contains("ancestor changed"));
+    Ok(())
+}
+
+#[test]
 fn certified_semantic_opening_retries_transient_sibling_churn_before_first_query() -> Result<()> {
     for strict_read_only in [false, true] {
         let fixture = Fixture::new(&["retained semantic coverage transient opening race"])?;
@@ -640,10 +669,17 @@ fn certified_semantic_row_id_reuse_never_transfers_a_vector_to_another_conversat
         .context("fixture replacement message id")?;
     // Exercise adversarial ID reuse explicitly; ordinary inserts need not reuse
     // deleted IDs. Keep the replacement's distinct parent and identical body.
+    // Analytics rows reference their message through non-deferrable foreign
+    // keys, while the production reuse path drops a message with its children.
+    // This fixture rewrites only the parent, so relax enforcement for the
+    // adversarial rewrite and restore it afterward.
+    fixture.storage.raw().execute("PRAGMA foreign_keys = OFF")?;
     let updated = fixture.storage.raw().execute_compat(
         "UPDATE messages SET id = ?1 WHERE id = ?2 AND conversation_id = ?3",
         params![deleted, allocated, replacement],
-    )?;
+    );
+    fixture.storage.raw().execute("PRAGMA foreign_keys = ON")?;
+    let updated = updated?;
     assert_eq!(updated, 1, "reuse must update the replacement's actual row");
     let replacement_id = fixture.storage.fetch_messages(replacement)?[0].id;
     assert_eq!(

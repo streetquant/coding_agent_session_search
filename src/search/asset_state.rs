@@ -835,7 +835,9 @@ pub(crate) fn inspect_semantic_assets(
     if availability.can_search()
         && let Some(embedder_id) = semantic_embedder_id(&availability, preference)
     {
-        let observation = FrankenStorage::open_readonly(db_path)
+        let opened = FrankenStorage::open_readonly(db_path);
+        let open_failed = opened.is_err();
+        let observation = opened
             .map_err(|error| error.to_string())
             .and_then(|storage| {
                 crate::search::model_manager::observe_covered_semantic_artifact(
@@ -887,6 +889,11 @@ pub(crate) fn inspect_semantic_assets(
                 return state;
             }
             Ok(None) => {}
+            // An archive that could not be opened for coverage observation
+            // cannot prove the identity marker either. Fall through to the
+            // identity-invalidation probe below, which reports the canonical
+            // unreadable-marker context for the same read failure.
+            Err(_) if open_failed => {}
             Err(context) => {
                 return semantic_state_from_availability(
                     data_dir,
@@ -1510,6 +1517,17 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
         compute_lexical_fingerprint,
     } = input;
     let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+    // The checkpoint loader deliberately ignores a non-regular state path so
+    // a FIFO or directory cannot stall a rebuild read. Observation surfaces
+    // must still report the unusable derived asset instead of presenting an
+    // active lock as an ordinary in-progress build.
+    let checkpoint_path = index_path.join(".lexical-rebuild-state.json");
+    if std::fs::symlink_metadata(&checkpoint_path).is_ok_and(|metadata| !metadata.is_file()) {
+        return Err(anyhow::anyhow!(
+            "lexical rebuild state {} is not a regular file",
+            checkpoint_path.display()
+        ));
+    }
     let checkpoint = load_lexical_rebuild_checkpoint(&index_path)
         .with_context(|| format!("loading lexical checkpoint from {}", index_path.display()))?;
     let completion_freshness = checkpoint.as_ref().filter(|state| state.completed).map(|state| {

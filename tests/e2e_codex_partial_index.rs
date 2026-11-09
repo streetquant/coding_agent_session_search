@@ -19,6 +19,10 @@ fn cass(home: &Path, streaming: &str) -> Command {
         .env("XDG_CACHE_HOME", home.join(".cache"))
         .env("CODEX_HOME", home.join(".codex"))
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        // Native readers that default to absolute host roots would otherwise
+        // index `/warp/cloudmcp/...` and the host raw mirror into this archive.
+        .env("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .env("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"))
         .env("CASS_STREAMING_INDEX", streaming)
         .env("CASS_AUTO_REFRESH", "0")
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
@@ -323,6 +327,8 @@ fn compressed_empty_rollout_cli(streaming: &str) {
                 .env("APPDATA", home.join("AppData/Roaming"))
                 .env("LOCALAPPDATA", home.join("AppData/Local"))
                 .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+                .env("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+                .env("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"))
                 .env("CASS_STREAMING_INDEX", streaming)
                 .env("CASS_RAW_MIRROR", "0")
                 .env("CASS_AUTO_REFRESH", "0")

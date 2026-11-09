@@ -512,7 +512,9 @@ pub fn agent_css_class(slug: &str) -> &'static str {
         "amp" => "agent-amp",
         "grok" | "grok_bot" => "agent-grok",
         "cline" | "clawdbot" | "kimi" => "agent-gemini",
-        "opencode" | "qwen" => "agent-codex",
+        "opencode" | "qwen" | "kilo" => "agent-codex",
+        "cloudmcp" => "agent-cody",
+        "openwebui" => "agent-chatgpt",
         "pi_agent" | "pi_durable" | "omp" | "factory" | "droid" => "agent-aider",
         "openclaw" => "agent-copilot",
         "vibe" | "mistral" => "agent-chatgpt",
@@ -553,6 +555,9 @@ pub fn agent_display_name(slug: &str) -> &'static str {
         "grok" => "Grok",
         "cline" => "Cline",
         "opencode" => "OpenCode",
+        "kilo" => "Kilo",
+        "cloudmcp" => "CloudMCP",
+        "openwebui" => "Open WebUI",
         "pi_agent" => "Pi Agent",
         "pi_durable" => "Pi Durable",
         "omp" => "Oh My Pi",
@@ -1607,6 +1612,9 @@ mod tests {
         assert_eq!(agent_css_class("opencode"), "agent-codex");
         assert_eq!(agent_css_class("copilot-cli"), "agent-copilot");
         assert_eq!(agent_css_class("qwen"), "agent-codex");
+        assert_eq!(agent_css_class("kilo"), "agent-codex");
+        assert_eq!(agent_css_class("cloudmcp"), "agent-cody");
+        assert_eq!(agent_css_class("openwebui"), "agent-chatgpt");
         for alias in ["omp", "Oh My Pi", "oh-my-pi", "oh_my_pi", "ohmypi"] {
             assert_eq!(agent_css_class(alias), "agent-aider", "OMP alias {alias:?}");
         }
@@ -1628,6 +1636,9 @@ mod tests {
         assert_eq!(agent_display_name("github_copilot"), "GitHub Copilot");
         assert_eq!(agent_display_name("copilot-cli"), "GitHub Copilot CLI");
         assert_eq!(agent_display_name("opencode"), "OpenCode");
+        assert_eq!(agent_display_name("kilo"), "Kilo");
+        assert_eq!(agent_display_name("cloudmcp"), "CloudMCP");
+        assert_eq!(agent_display_name("openwebui"), "Open WebUI");
         assert_eq!(agent_display_name("pi_agent"), "Pi Agent");
         assert_eq!(agent_display_name("pi_durable"), "Pi Durable");
         for alias in ["omp", "Oh My Pi", "oh-my-pi", "oh_my_pi", "ohmypi"] {

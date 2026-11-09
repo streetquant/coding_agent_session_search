@@ -172,12 +172,13 @@ impl SourceIngestDisposition {
     }
 
     /// Whether this disposition reflects an explicit, non-silent limitation
-    /// (locked / unsupported-encrypted / skipped) — the thing that must never be
-    /// reported as a successful zero-message import.
+    /// (quarantined / locked / unsupported-encrypted / skipped) — the thing
+    /// that must never be reported as a successful zero-message import.
     pub const fn is_explicit_limitation(self) -> bool {
         matches!(
             self,
-            SourceIngestDisposition::Locked
+            SourceIngestDisposition::Quarantined
+                | SourceIngestDisposition::Locked
                 | SourceIngestDisposition::UnsupportedEncrypted
                 | SourceIngestDisposition::Skipped
         )
@@ -274,13 +275,13 @@ impl std::fmt::Display for UnsupportedSourceSchema {
         match self.line {
             Some(line) => write!(
                 formatter,
-                "{} at {}:{line} declares an unsupported schema",
+                "unsupported {} schema at {}:{line}",
                 self.context,
                 self.path.display()
             ),
             None => write!(
                 formatter,
-                "{} at {} declares an unsupported schema",
+                "unsupported {} schema at {}",
                 self.context,
                 self.path.display()
             ),

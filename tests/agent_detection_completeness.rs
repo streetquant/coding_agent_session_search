@@ -51,7 +51,12 @@ fn probe_slugs() -> HashSet<String> {
 
 /// Detection-only connectors: have probe paths and detection entries but
 /// no parser implementation (no entry in `get_connector_factories()`).
-const DETECTION_ONLY: &[&str] = &["continue", "windsurf"];
+const DETECTION_ONLY: &[&str] = &["windsurf"];
+
+/// CASS-native readers appended to the upstream registry. They have no FAD
+/// probe path or detection entry: local detection and explicit exported roots
+/// are supported, and they are excluded from the upstream parity assertions.
+const CASS_NATIVE: &[&str] = &["kilo", "cloudmcp", "openwebui"];
 
 /// Extract a function body from source code, including the braces.
 fn extract_function_body(source: &str, fn_prefix: &str) -> String {
@@ -166,7 +171,17 @@ fn feature_gated_connectors_available() {
              Check Cargo.toml enables the feature for franken-agent-detection"
         );
     }
-    assert_eq!(slugs.len(), 33, "Expected 33 connector factories");
+    assert_eq!(
+        slugs.len(),
+        franken_agent_detection::get_connector_factories().len() + CASS_NATIVE.len(),
+        "Expected every FAD and native CASS factory"
+    );
+    for native in CASS_NATIVE {
+        assert!(
+            slugs.contains(*native),
+            "Native CASS connector {native} missing"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +199,7 @@ fn probe_paths_cover_all_factory_connectors() {
     // Note: "copilot" factory slug maps to "github-copilot" in KNOWN_CONNECTORS.
     let factory_mapped: HashSet<String> = factory
         .iter()
+        .filter(|s| !CASS_NATIVE.contains(&s.as_str()))
         .map(|s| match s.as_str() {
             "copilot" => "github-copilot".to_string(),
             other => other.to_string(),
@@ -343,6 +359,7 @@ fn agent_counts_consistent_across_apis() {
     // Factory must be a strict subset of detection (after slug mapping)
     let factory_mapped: HashSet<String> = factory
         .iter()
+        .filter(|s| !CASS_NATIVE.contains(&s.as_str()))
         .map(|s| match s.as_str() {
             "copilot" => "github-copilot".to_string(),
             other => other.to_string(),
@@ -501,6 +518,11 @@ mod prime_ingestion {
             .env("XDG_DATA_HOME", home.join(".local/share"))
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            // Native CASS readers default to absolute host roots (`/warp/cloudmcp/...`,
+            // the archive's raw mirror). Point them at absent temp paths so a full
+            // index inside `home` does not pull the host's real conversations.
+            .env("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+            .env("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"))
             .env("CASS_DATA_DIR", data)
             .env("CASS_AUTO_REFRESH", "0")
             .env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0")
@@ -769,6 +791,8 @@ mod prime_ingestion {
                 .env("XDG_DATA_HOME", home.path().join(".local/share"))
                 .env("XDG_CONFIG_HOME", home.path().join(".config"))
                 .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+                .env("CASS_CLOUDMCP_DATA_ROOT", home.path().join("no-cloudmcp"))
+                .env("CASS_OPENWEBUI_DATA_ROOT", home.path().join("no-openwebui"))
                 .env("CASS_AUTO_REFRESH", "0")
                 .env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0")
                 .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
@@ -954,6 +978,10 @@ mod devin_ingestion {
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("CASS_DEVIN_DATA_ROOT", home.join("sessions.db"))
             .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            // The CloudMCP and OpenWebUI readers default to absolute host roots;
+            // absent temp paths keep a full index scoped to this fixture.
+            .env("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+            .env("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"))
             .env("CASS_AUTO_REFRESH", "0")
             .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
             .env("RUST_MIN_STACK", "134217728")

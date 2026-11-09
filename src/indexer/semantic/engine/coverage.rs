@@ -175,6 +175,28 @@ impl SemanticBuildSnapshot {
         Ok(())
     }
 
+    /// Freeze parent provenance after a fallible replay has consumed the
+    /// snapshot. A direct builder embeds one read snapshot but may outlive a
+    /// concurrent append: publication re-verifies the captured archive before
+    /// sealing, so this variant does not reject that append. The caller must
+    /// still call [`Self::verify`] before the certificate is published.
+    pub(crate) fn prepare_parents_after_replay(
+        &mut self,
+        storage: &FrankenStorage,
+        data_dir: &Path,
+    ) -> Result<()> {
+        ensure!(
+            !storage.raw().as_async().in_transaction(),
+            "semantic parent preparation requires a committed archive snapshot"
+        );
+        self.parents = Some(write_semantic_parents_with_base(
+            storage.raw(),
+            data_dir,
+            self.base.as_ref(),
+        )?);
+        Ok(())
+    }
+
     /// Seal a compact completed artifact without replacing an existing served
     /// inode. The final document sequence must be the one admitted by the
     /// canonical build or by the append's writer-lease receipt.

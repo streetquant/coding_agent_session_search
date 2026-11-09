@@ -374,7 +374,7 @@ pub(crate) fn get_connector_factories_for_archive(
 pub(crate) fn get_connector_registrations() -> Vec<source_dependencies::ConnectorRegistration> {
     use source_dependencies::ConnectorRegistration;
 
-    franken_agent_detection::get_connector_factories()
+    let mut registrations: Vec<_> = franken_agent_detection::get_connector_factories()
         .into_iter()
         .map(|(name, factory)| {
             let mut registration = match name {
@@ -396,7 +396,17 @@ pub(crate) fn get_connector_registrations() -> Vec<source_dependencies::Connecto
             registration.factory = openclaw::with_wal_freshness(name, registration.factory);
             registration
         })
-        .collect()
+        .collect();
+    registrations.push(ConnectorRegistration::new("kilo", || {
+        Box::new(kilo::KiloConnector::new())
+    }));
+    registrations.push(ConnectorRegistration::new("cloudmcp", || {
+        Box::new(cloudmcp::CloudMcpConnector::new())
+    }));
+    registrations.push(ConnectorRegistration::new("openwebui", || {
+        Box::new(openwebui::OpenWebUiConnector::new())
+    }));
+    registrations
 }
 
 /// The provider slug a registered connector's conversations carry, which the

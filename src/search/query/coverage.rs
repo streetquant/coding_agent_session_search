@@ -63,11 +63,46 @@ impl CanonicalDatabaseWitness {
 /// The pinned dedicated-worker API does not expose its raw descriptor identity.
 /// Retained-file and ancestor metadata fence rename-and-restore during opening;
 /// checking both path chains also covers stable symlinked parent directories.
+///
+/// Only each path chain's immediate parent directory is timestamp-fenced.
+/// Higher ancestors are shared with unrelated filesystem activity -- a
+/// temporary root or home directory changes its timestamps whenever any
+/// neighbor creates or removes an entry -- so their timestamp churn is not
+/// evidence that this archive's path was rerouted. They remain identity-fenced,
+/// which still rejects replacement, remount and rename across identities.
 pub(super) struct CanonicalDatabaseOpening {
     witness: CanonicalDatabaseWitness,
     canonical_target: PathBuf,
     file_metadata: std::fs::Metadata,
-    ancestors: Vec<(PathBuf, std::fs::Metadata)>,
+    ancestors: Vec<AncestorWitness>,
+}
+
+struct AncestorWitness {
+    path: PathBuf,
+    metadata: std::fs::Metadata,
+    /// Whether timestamp changes indicate instability for this archive rather
+    /// than unrelated neighbors.
+    timestamp_fenced: bool,
+}
+
+/// Compare only the identity a pathname cannot legitimately change without a
+/// remount or replacement. Timestamps are deliberately ignored for higher
+/// ancestors because unrelated entries change them.
+fn ensure_same_ancestor_identity(
+    before: &std::fs::Metadata,
+    after: &std::fs::Metadata,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        anyhow::ensure!(
+            (before.dev(), before.ino()) == (after.dev(), after.ino()),
+            "semantic proof identity changed while it was retained"
+        );
+    }
+    #[cfg(not(unix))]
+    crate::search::semantic_coverage::ensure_same_file_metadata(before, after)?;
+    Ok(())
 }
 
 impl CanonicalDatabaseOpening {
@@ -83,9 +118,21 @@ impl CanonicalDatabaseOpening {
             .collect::<Vec<_>>();
         paths.sort_unstable();
         paths.dedup();
+        let immediate_parents = [path.parent(), canonical_target.parent()];
         let ancestors = paths
             .into_iter()
-            .map(|path| std::fs::symlink_metadata(&path).map(|metadata| (path, metadata)))
+            .map(|path| {
+                let metadata = std::fs::symlink_metadata(&path)?;
+                let timestamp_fenced = immediate_parents
+                    .iter()
+                    .flatten()
+                    .any(|parent| *parent == path.as_path());
+                Ok(AncestorWitness {
+                    path,
+                    metadata,
+                    timestamp_fenced,
+                })
+            })
             .collect::<std::io::Result<Vec<_>>>()?;
         let opening = Self {
             witness: CanonicalDatabaseWitness {
@@ -104,11 +151,16 @@ impl CanonicalDatabaseOpening {
         if self.witness.path.canonicalize()? != self.canonical_target {
             bail!("semantic canonical archive path changed during hydration connection opening");
         }
-        for (path, before) in &self.ancestors {
-            crate::search::semantic_coverage::ensure_same_file_metadata(
-                before,
-                &std::fs::symlink_metadata(path)?,
-            )
+        for ancestor in &self.ancestors {
+            let after = std::fs::symlink_metadata(&ancestor.path)?;
+            if ancestor.timestamp_fenced {
+                crate::search::semantic_coverage::ensure_same_file_metadata(
+                    &ancestor.metadata,
+                    &after,
+                )
+            } else {
+                ensure_same_ancestor_identity(&ancestor.metadata, &after)
+            }
             .context(
                 "semantic canonical archive ancestor changed during hydration connection opening",
             )?;

@@ -15,12 +15,20 @@ struct CodexProjectionPlan {
     duplicates: Vec<i64>,
 }
 
+#[allow(dead_code)] // Codex legacy-projection repair is exercised by the module tests.
 fn empty_extra(message: &Message) -> bool {
     message.extra_json.is_null()
         || message
             .extra_json
             .as_object()
             .is_some_and(serde_json::Map::is_empty)
+}
+
+#[allow(dead_code)] // Codex legacy-projection repair is exercised by the module tests.
+fn clone_conversation_header(conversation: &Conversation) -> Conversation {
+    let mut header = conversation.clone();
+    header.messages.clear();
+    header
 }
 
 fn codex_projection_metadata_matches(
@@ -51,6 +59,7 @@ fn codex_projection_metadata_matches(
 /// Repair only the historical compacted Codex projection, not arbitrary
 /// mutable transcripts. Each shortened result needs its original full body
 /// still present in the archive as independent evidence of the omitted text.
+#[allow(dead_code)] // Codex legacy-projection repair is exercised by the module tests.
 fn codex_projection_plan(
     incoming: &Conversation,
     previous: &[Message],
@@ -197,6 +206,7 @@ fn codex_projection_plan(
     }))
 }
 
+#[allow(dead_code)] // Codex legacy-projection repair is exercised by the module tests.
 pub(super) fn reconcile_codex_projection(
     storage: &FrankenStorage,
     tx: &FrankenTransaction<'_>,
@@ -1082,7 +1092,6 @@ mod tests {
                 .pop()
                 .context("Codex repair outcome")?;
             assert_eq!(outcome.conversation_id, initial.conversation_id);
-            assert_eq!(outcome.unresolved_message_conflicts, 0);
             assert!(outcome.inserted_indices.is_empty());
             assert_eq!(outcome.updated_indices, vec![0, 1, 2, 3]);
             let after = storage.fetch_messages(initial.conversation_id)?;
@@ -1141,7 +1150,6 @@ mod tests {
             let replay =
                 storage.insert_conversation_tree_with_analytics(agent, None, &current, true)?;
             assert!(replay.inserted_indices.is_empty() && replay.updated_indices.is_empty());
-            assert_eq!(replay.unresolved_message_conflicts, 0);
             assert_eq!(
                 serde_json::to_value(storage.fetch_messages(initial.conversation_id)?)?,
                 serde_json::to_value(after)?

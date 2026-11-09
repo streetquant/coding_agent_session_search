@@ -99,10 +99,10 @@ fn envelopes(storage: &FrankenStorage, ids: &[i64]) -> Result<Vec<Envelope>> {
 
 #[cfg(test)]
 fn messages(storage: &FrankenStorage, id: i64) -> Result<Vec<Message>> {
-    // Use the SAME uncapped projection as engine replay. The lexical-only
-    // single-conversation helper truncates content and cannot prove semantics.
-    let mut grouped = storage.fetch_messages_for_lexical_rebuild_batch(&[id], None, None)?;
-    Ok(grouped.remove(&id).unwrap_or_default())
+    // Use the SAME uncapped projection as engine replay. The lexical rebuild
+    // helpers truncate content at `CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES`
+    // and cannot prove semantic identity.
+    crate::indexer::semantic::replay::canonical_messages(storage, id)
 }
 
 pub(super) fn visit(

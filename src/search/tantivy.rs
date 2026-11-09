@@ -307,30 +307,45 @@ fn push_cass_document_into_pending(
 /// [`ConversationPacket`]. Packet builders (raw scan + canonical replay)
 /// already normalized identity, provenance, metadata, and timestamps, so
 /// the lexical builder no longer has to re-walk the raw connector
-/// payload (`coding_agent_session_search-ibuuh.32`). We still re-derive
+/// payload (`coding_agent_session_search-ibuuh.32`). We re-derive
 /// `source_id`/`origin_kind`/`origin_host` from `metadata.cass.origin`
-/// (rather than trusting `packet.payload.provenance` blindly) so the
-/// packet pipeline produces byte-identical CassDocuments to the legacy
-/// `cass_doc_context` path — that's the equivalence gate covered by
+/// whenever a normalized scan embedded it (rather than trusting
+/// `packet.payload.provenance` blindly) so the packet pipeline produces
+/// byte-identical CassDocuments to the legacy `cass_doc_context` path
+/// — that's the equivalence gate covered by
 /// `packet_driven_lexical_pipeline_matches_legacy_for_normalized_conv`.
+/// Canonical-replay contracts carry no metadata origin at all, so they
+/// fall back to the packet's already-normalized provenance: the lexical
+/// producer builds every document identity from that same provenance,
+/// and a mismatch here would report stable canonical rows as drift.
 fn cass_doc_context_from_packet(packet: &ConversationPacket) -> CassDocContext {
     let payload = &packet.payload;
     let metadata = &payload.metadata_json;
     let cass_origin = metadata.get("cass").and_then(|c| c.get("origin"));
-    let raw_source_id = cass_origin
-        .and_then(|o| o.get("source_id"))
-        .and_then(|v| v.as_str());
-    let raw_origin_kind = cass_origin
-        .and_then(|o| o.get("kind"))
-        .and_then(|v| v.as_str());
-    let origin_host = normalized_index_origin_host(
-        cass_origin
-            .and_then(|o| o.get("host"))
-            .and_then(|v| v.as_str()),
+    let (raw_source_id, raw_origin_kind, origin_host) = match cass_origin {
+        Some(origin) => (
+            origin
+                .get("source_id")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned),
+            origin
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned),
+            normalized_index_origin_host(origin.get("host").and_then(|v| v.as_str())),
+        ),
+        None => (
+            Some(payload.provenance.source_id.clone()),
+            Some(payload.provenance.origin_kind.clone()),
+            normalized_index_origin_host(payload.provenance.origin_host.as_deref()),
+        ),
+    };
+    let source_id = normalized_index_source_id(
+        raw_source_id.as_deref(),
+        raw_origin_kind.as_deref(),
+        origin_host.as_deref(),
     );
-    let source_id =
-        normalized_index_source_id(raw_source_id, raw_origin_kind, origin_host.as_deref());
-    let origin_kind = normalized_index_origin_kind(&source_id, raw_origin_kind);
+    let origin_kind = normalized_index_origin_kind(&source_id, raw_origin_kind.as_deref());
 
     CassDocContext {
         agent: payload.identity.agent_slug.clone(),
