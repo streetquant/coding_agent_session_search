@@ -13387,6 +13387,7 @@ impl FrankenStorage {
     /// messages for lexical rebuilding. Native projection metadata carries the
     /// index ledger (`openwebui_lexical_indices` /
     /// `codex_projection_lexical_indices`) that the rebuild has to retain.
+    #[cfg(test)]
     pub(crate) fn fetch_native_projection_lexical_snapshot(
         &self,
         conversation_id: i64,
