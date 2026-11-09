@@ -357,6 +357,7 @@ pub(super) fn certify_after_index(
     db_path: &Path,
     index_path: &Path,
     allow_full_audit: bool,
+    settle_own_run_epoch_drift: bool,
     progress: Option<Arc<IndexingProgress>>,
     progress_bump: Option<Arc<AtomicI64>>,
 ) -> Result<bool> {
@@ -371,6 +372,18 @@ pub(super) fn certify_after_index(
     {
         return Ok(true);
     }
+    // An inline run refreshed this checkpoint from the archive it scanned and
+    // then invalidated its own physical epoch with final metadata writes and
+    // the closing WAL checkpoint. When every content projection still matches,
+    // settle that self-inflicted drift without replaying the corpus. The
+    // caller only sets this after a completed full scan, so this is not the
+    // unexamined-content shortcut the complete audit exists to prevent.
+    if allow_full_audit
+        && settle_own_run_epoch_drift
+        && settle_completed_source_epoch_if_content_matches(db_path, index_path, state.clone())?
+    {
+        return Ok(true);
+    }
     // Routine indexing on a large archive must retain its existing bounded
     // maintenance policy. A deferred audit leaves freshness unverified; it
     // never copies the current epoch onto unexamined content.
@@ -378,6 +391,52 @@ pub(super) fn certify_after_index(
         return Ok(false);
     }
     Ok(revalidate_completed(db_path, index_path, state, progress, progress_bump)?.is_some())
+}
+
+/// Copy the settled archive epoch into a completed checkpoint whose stored
+/// projections already describe the current archive. This is only used by the
+/// final certification of a run that performed a completed full scan and
+/// refreshed its checkpoint inline; the caller has already established that
+/// the generation belongs to this run's observations.
+fn settle_completed_source_epoch_if_content_matches(
+    db_path: &Path,
+    index_path: &Path,
+    mut state: LexicalRebuildState,
+) -> Result<bool> {
+    let storage = FrankenStorage::open_strict_readonly(db_path)
+        .context("opening canonical archive to settle completed lexical epoch")?;
+    let total_conversations = super::count_total_conversations_exact(&storage)?;
+    let total_messages = super::count_total_messages_exact(&storage)?;
+    let db_state = super::lexical_rebuild_db_state_with_exact_totals(
+        &storage,
+        db_path,
+        total_conversations,
+        total_messages,
+    )?;
+    let Some(binding) = Binding::capture(db_path)? else {
+        return Ok(false);
+    };
+    if state.resume_binding.as_ref() != Some(&binding)
+        || state.db != db_state
+        || !crate::stored_path_identity_matches(&state.db.db_path, db_path)
+        || super::index_meta_fingerprint(index_path)? != state.committed_meta_fingerprint
+    {
+        return Ok(false);
+    }
+    let published = PublishedSnapshot::open(index_path)
+        .map_err(|error| candidate_failure(error, "completed lexical generation is unreadable"))?;
+    if usize::try_from(published.doc_count()).ok() != Some(state.indexed_docs)
+        || !completed_artifacts_match(index_path, &state)?
+    {
+        return Ok(false);
+    }
+    let settled_epoch = ArchiveEpoch::capture(db_path)?;
+    if state.completed_source_epoch.as_ref() == Some(&settled_epoch) {
+        return Ok(true);
+    }
+    state.completed_source_epoch = Some(settled_epoch);
+    super::persist_lexical_rebuild_state(index_path, &state)?;
+    Ok(true)
 }
 
 #[cfg(test)]

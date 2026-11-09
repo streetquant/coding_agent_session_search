@@ -222,7 +222,12 @@ mod gh472 {
                 .tracker
                 .command_environment()
                 .with_home(&self.home)
-                .with_codex_home(self.home.join(".codex"));
+                .with_codex_home(self.home.join(".codex"))
+                // The cloudmcp/openwebui connectors default to absolute host
+                // roots that ignore HOME; route them at absent fixture paths
+                // so only the generated sessions are admitted.
+                .with_var("CASS_CLOUDMCP_DATA_ROOT", self.home.join("no-cloudmcp"))
+                .with_var("CASS_OPENWEBUI_DATA_ROOT", self.home.join("no-openwebui"));
             let mut command = environment.cass_assert_command();
             command.env_clear();
             for key in ["PATH", "SystemRoot", "WINDIR"] {
@@ -1346,7 +1351,9 @@ fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
     let command_env = tracker
         .command_environment()
         .with_home(home)
-        .with_codex_home(&codex_home);
+        .with_codex_home(&codex_home)
+        .with_var("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .with_var("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"));
 
     let ts = 1_732_118_400_000u64;
     make_codex_session(
@@ -1560,7 +1567,9 @@ fn concurrent_search_processes_do_not_block_incremental_index_json() {
     let command_env = tracker
         .command_environment()
         .with_home(&home)
-        .with_codex_home(&codex_home);
+        .with_codex_home(&codex_home)
+        .with_var("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .with_var("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"));
 
     tracker.phase(
         "seed_initial_fixture",
@@ -1888,7 +1897,9 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
     let command_env = tracker
         .command_environment()
         .with_home(&home)
-        .with_codex_home(&codex_home);
+        .with_codex_home(&codex_home)
+        .with_var("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .with_var("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"));
 
     const QUERY: &str = "atomicswapsearchanchor";
 
@@ -2243,7 +2254,9 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
     let command_env = tracker
         .command_environment()
         .with_home(&home)
-        .with_codex_home(&codex_home);
+        .with_codex_home(&codex_home)
+        .with_var("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .with_var("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"));
 
     const QUERY: &str = "federatedatomicswapsearchanchor";
     for (filename, content, ts) in [
@@ -2617,7 +2630,9 @@ fn repeated_force_rebuild_preserves_federated_reader_and_search_stability() {
     let command_env = tracker
         .command_environment()
         .with_home(&home)
-        .with_codex_home(&codex_home);
+        .with_codex_home(&codex_home)
+        .with_var("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .with_var("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"));
 
     const QUERY: &str = "federatedrebuildstabilityanchor";
     const REBUILD_CYCLES: usize = 20;
@@ -2842,7 +2857,9 @@ fn force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain() 
     let command_env = tracker
         .command_environment()
         .with_home(&home)
-        .with_codex_home(&codex_home);
+        .with_codex_home(&codex_home)
+        .with_var("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .with_var("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"));
 
     const QUERY: &str = "killrelaunchpublishanchor";
 
@@ -3143,7 +3160,9 @@ fn index_full_creates_artifacts() {
     let command_env = tracker
         .command_environment()
         .with_home(home)
-        .with_codex_home(&codex_home);
+        .with_codex_home(&codex_home)
+        .with_var("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .with_var("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"));
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
     verbose!("Data directory: {:?}", data_dir);
@@ -3241,7 +3260,9 @@ fn incremental_reindex_preserves_and_appends_messages() {
     let command_env = tracker
         .command_environment()
         .with_home(home)
-        .with_codex_home(&codex_home);
+        .with_codex_home(&codex_home)
+        .with_var("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .with_var("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"));
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
@@ -3417,7 +3438,9 @@ fn reindex_does_not_drop_messages_in_db_or_search() {
     let command_env = tracker
         .command_environment()
         .with_home(home)
-        .with_codex_home(&codex_home);
+        .with_codex_home(&codex_home)
+        .with_var("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .with_var("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"));
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
     let xdg_data = home.join(".local/share");
@@ -3514,7 +3537,9 @@ fn search_returns_hits_with_match_type() {
     let command_env = tracker
         .command_environment()
         .with_home(home)
-        .with_codex_home(&codex_home);
+        .with_codex_home(&codex_home)
+        .with_var("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .with_var("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"));
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
@@ -3595,7 +3620,9 @@ fn search_aggregations_include_agents() {
     let command_env = tracker
         .command_environment()
         .with_home(home)
-        .with_codex_home(&codex_home);
+        .with_codex_home(&codex_home)
+        .with_var("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .with_var("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"));
     let claude_home = home.join(".claude");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
@@ -3681,7 +3708,9 @@ fn watch_once_indexes_specified_path() {
     let command_env = tracker
         .command_environment()
         .with_home(home)
-        .with_codex_home(&codex_home);
+        .with_codex_home(&codex_home)
+        .with_var("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .with_var("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"));
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
@@ -3762,7 +3791,9 @@ fn search_with_filters() {
     let command_env = tracker
         .command_environment()
         .with_home(home)
-        .with_codex_home(&codex_home);
+        .with_codex_home(&codex_home)
+        .with_var("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .with_var("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"));
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
@@ -3833,7 +3864,9 @@ fn search_returns_pagination_info() {
     let command_env = tracker
         .command_environment()
         .with_home(home)
-        .with_codex_home(&codex_home);
+        .with_codex_home(&codex_home)
+        .with_var("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .with_var("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"));
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
@@ -3911,7 +3944,9 @@ fn force_rebuild_recreates_index() {
     let command_env = tracker
         .command_environment()
         .with_home(home)
-        .with_codex_home(&codex_home);
+        .with_codex_home(&codex_home)
+        .with_var("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .with_var("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"));
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
@@ -4038,7 +4073,9 @@ fn index_json_output_mode() {
     let command_env = tracker
         .command_environment()
         .with_home(home)
-        .with_codex_home(&codex_home);
+        .with_codex_home(&codex_home)
+        .with_var("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .with_var("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"));
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
@@ -4151,7 +4188,9 @@ fn search_wildcard_query() {
     let command_env = tracker
         .command_environment()
         .with_home(home)
-        .with_codex_home(&codex_home);
+        .with_codex_home(&codex_home)
+        .with_var("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .with_var("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"));
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
@@ -4219,7 +4258,9 @@ fn trace_logging_to_file() {
     let command_env = tracker
         .command_environment()
         .with_home(home)
-        .with_codex_home(&codex_home);
+        .with_codex_home(&codex_home)
+        .with_var("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .with_var("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"));
     let data_dir = home.join("cass_data");
     let trace_dir = home.join("traces");
     fs::create_dir_all(&data_dir).unwrap();
@@ -4260,7 +4301,9 @@ fn empty_query_returns_recent() {
     let command_env = tracker
         .command_environment()
         .with_home(home)
-        .with_codex_home(&codex_home);
+        .with_codex_home(&codex_home)
+        .with_var("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .with_var("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"));
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
@@ -4332,7 +4375,9 @@ fn large_message_minimal_search_stays_on_the_tantivy_fast_path() {
     let command_env = tracker
         .command_environment()
         .with_home(home)
-        .with_codex_home(&codex_home);
+        .with_codex_home(&codex_home)
+        .with_var("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .with_var("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"));
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
@@ -4441,7 +4486,9 @@ fn incremental_index_repairs_sparse_tantivy_from_canonical_db_before_scanning_ne
     let command_env = tracker
         .command_environment()
         .with_home(&home)
-        .with_codex_home(&codex_home);
+        .with_codex_home(&codex_home)
+        .with_var("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .with_var("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"));
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 

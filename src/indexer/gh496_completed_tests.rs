@@ -538,6 +538,7 @@ fn gh496_final_certification_respects_deferred_audit_and_settled_epoch() {
             &fixture.db_path,
             &fixture.index_path,
             false,
+            false,
             None,
             None,
         )
@@ -550,6 +551,7 @@ fn gh496_final_certification_respects_deferred_audit_and_settled_epoch() {
             &fixture.db_path,
             &fixture.index_path,
             true,
+            false,
             None,
             None,
         )

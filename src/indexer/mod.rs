@@ -3021,6 +3021,68 @@ fn matching_completed_lexical_rebuild_state_status_without_fingerprint(
     }))
 }
 
+/// Admission for a full scan that held the canonical shared writer, used both
+/// before the source census and after it.
+///
+/// A full scan makes bookkeeping-only writes of its own (raw-mirror capture,
+/// the writable preflight, the closing WAL checkpoint) that move the physical
+/// archive epoch without touching indexed content. The ordinary admission
+/// already binds to the content projection, so re-derive that projection from
+/// the same open storage instead of re-reading the noisy file epoch.
+///
+/// `require_live_publication` is false for the pre-scan admission so a
+/// checkpoint whose native receipt no longer matches still reaches the sparse
+/// planner, which is what repairs that mismatch. The post-scan skip requires
+/// the receipt because skipping is only safe for the generation it admitted.
+fn matching_completed_lexical_rebuild_state_status_without_epoch(
+    storage: &FrankenStorage,
+    index_path: &Path,
+    db_path: &Path,
+    total_conversations: usize,
+    require_live_publication: bool,
+) -> Result<Option<MatchingLexicalRebuildStateStatus>> {
+    let Some(state) = load_lexical_rebuild_state(index_path)? else {
+        return Ok(Some(MatchingLexicalRebuildStateStatus::default()));
+    };
+    if state.is_incomplete() {
+        return Ok(None);
+    }
+
+    let normalized_db_path = crate::normalize_path_identity(db_path)
+        .to_string_lossy()
+        .into_owned();
+    if state.version != LEXICAL_REBUILD_STATE_VERSION
+        || state.schema_hash != crate::search::tantivy::SCHEMA_HASH
+        || state
+            .resume_binding
+            .as_ref()
+            .is_some_and(|binding| !binding.matches(db_path))
+        || state.db.total_conversations != total_conversations
+        || !lexical_rebuild_db_paths_match(&state.db.db_path, &normalized_db_path)
+        || !lexical_rebuild_page_size_is_compatible(state.page_size)
+    {
+        return Ok(Some(MatchingLexicalRebuildStateStatus::default()));
+    }
+
+    let current_fingerprint = lexical_rebuild_content_fingerprint(storage, total_conversations)?;
+    let has_completed_checkpoint = state.completed
+        && state.pending.is_none()
+        && state.effective_execution_mode() == LexicalRebuildExecutionMode::SharedWriter
+        && !state.runtime.is_observed()
+        && state.db.storage_fingerprint == current_fingerprint
+        && (!require_live_publication
+            || lexical_publication_receipt_matches_live(index_path, &state)?);
+    Ok(Some(MatchingLexicalRebuildStateStatus {
+        has_pending_resume: false,
+        has_completed_checkpoint,
+        completed_indexed_docs: has_completed_checkpoint.then_some(state.indexed_docs),
+        completed_exact_totals: has_completed_checkpoint
+            .then_some((state.db.total_conversations, state.db.total_messages)),
+        completed_storage_fingerprint: has_completed_checkpoint
+            .then_some(state.db.storage_fingerprint),
+    }))
+}
+
 fn matching_lexical_rebuild_state_status_for_loaded_state(
     state: LexicalRebuildState,
     db_state: &LexicalRebuildDbState,
@@ -3427,6 +3489,7 @@ fn try_readonly_canonical_force_rebuild(
             &opts.db_path,
             &index_path,
             true,
+            false,
             opts.progress.clone(),
             Some(Arc::clone(progress_bump)),
         )?,
@@ -18457,12 +18520,13 @@ fn run_index_with_storage_ownership(
     preflight_phase!("watch_startup:writable_preflight");
     // CASS #162 item 2: Verify the connection is writable early, before the
     // code reaches deep batch-insert paths where a readonly failure is hard
-    // to diagnose.  A benign no-op UPDATE catches "attempt to write a readonly
-    // database" from frankensqlite.
-    if let Err(err) = storage
-        .raw()
-        .execute("UPDATE meta SET value = value WHERE key = 'schema_version'")
-    {
+    // to diagnose.  A write-transaction probe catches "attempt to write a
+    // readonly database" from frankensqlite without dirtying the archive:
+    // `UPDATE meta SET value = value` still rewrites its page, and the WAL
+    // checkpoint that follows rewrites the WAL write epoch. Completed
+    // checkpoints compare that epoch exactly, so the write made a healthy
+    // archive ineligible for GH #472 nightly reconciliation.
+    if let Err(err) = storage.raw().execute_batch("BEGIN IMMEDIATE; ROLLBACK;") {
         tracing::warn!(
             db_path = %opts.db_path.display(),
             error = %err,
@@ -18761,14 +18825,35 @@ fn run_index_with_storage_ownership(
                     })?;
             }
         } else {
-            initial_matching_lexical_checkpoint =
-                matching_lexical_rebuild_state_status_if_present(&index_path, || {
+            // A preserved healthy nightly no-op leaves the completed
+            // checkpoint byte-identical, so its recorded physical epoch goes
+            // stale even though its content projection still describes the
+            // archive. Nightly admission already retains the full source
+            // census and only admits a checkpoint whose content matches, so
+            // bind to that projection instead of the bookkeeping epoch.
+            let nightly_content_match =
+                if opts.full && dotenvy_truthy("CASS_NIGHTLY_RECONCILIATION") {
+                    matching_completed_lexical_rebuild_state_status_without_epoch(
+                        &storage,
+                        &index_path,
+                        &opts.db_path,
+                        initial_canonical_sessions_before_salvage,
+                        false,
+                    )?
+                    .filter(|status| status.has_completed_checkpoint)
+                } else {
+                    None
+                };
+            initial_matching_lexical_checkpoint = match nightly_content_match {
+                Some(status) => status,
+                None => matching_lexical_rebuild_state_status_if_present(&index_path, || {
                     lexical_rebuild_db_state_with_total_conversations(
                         &storage,
                         &opts.db_path,
                         initial_canonical_sessions_before_salvage,
                     )
-                })?;
+                })?,
+            };
         }
         initial_matching_lexical_checkpoint.has_pending_resume
     } else {
@@ -19813,10 +19898,12 @@ fn run_index_with_storage_ownership(
                         &initial_matching_lexical_checkpoint,
                         scan_canonical_mutations,
                         post_scan_observed_tantivy_docs,
-                    ) && matching_completed_lexical_rebuild_state_status_without_fingerprint(
+                    ) && matching_completed_lexical_rebuild_state_status_without_epoch(
+                        &storage,
                         &index_path,
                         &opts.db_path,
                         initial_canonical_sessions_before_salvage,
+                        true,
                     )?
                     .as_ref()
                         == Some(&initial_matching_lexical_checkpoint)
@@ -20427,10 +20514,25 @@ fn run_index_with_storage_ownership(
         }
     }
 
+    // A full scan that preserved a matching completed checkpoint and made no
+    // canonical changes must leave the archive's physical write epoch alone.
+    // Completed-checkpoint reuse compares that epoch exactly, so status-only
+    // metadata writes here would force the settled-archive content audit on
+    // every healthy nightly no-op (and rewrite a proof that did not change).
+    let preserved_noop_full_scan_settled_state = opts.full
+        && performed_scan
+        && skipped_noop_full_scan_authoritative_rebuild
+        && !scan_canonical_mutations.changed()
+        && !scan_had_errors;
     if targeted_watch_once_only_run {
         tracing::info!(
             db_path = %opts.db_path.display(),
             "deferring final index-run metadata update until targeted watch-once paths are evaluated"
+        );
+    } else if preserved_noop_full_scan_settled_state {
+        tracing::info!(
+            db_path = %opts.db_path.display(),
+            "preserving final index-run metadata because the full scan made no canonical changes and kept a matching completed checkpoint"
         );
     } else {
         let now_ms = FrankenStorage::now_millis();
@@ -21285,18 +21387,34 @@ fn run_index_with_storage_ownership(
     drop(t_index);
     close_storage_after_index(storage, &opts.db_path, "index run")?;
     work_phase!("lexical:certify");
-    let allow_final_content_audit = should_defer_incremental_authoritative_lexical_repair(
-        &opts,
-        canonical_storage_rebuilt,
-        initial_canonical_sessions_before_salvage,
-        true,
-        None,
-    )
-    .is_none();
+    // A preserved no-op full scan intentionally wrote neither archive metadata
+    // nor a checkpoint epoch, so its settled proof is byte-identical to the
+    // one it admitted. Auditing here would rewrite that proof for no content
+    // change and defeat the preservation.
+    //
+    // The same applies to a run that admitted a completed checkpoint and
+    // applied only this run's inline delta: the final refresh described the
+    // new native generation, and the last authoritative equivalence evidence
+    // belongs to the pre-delta generation until the next real rebuild. A
+    // content audit there replays the whole corpus solely to rewrite that
+    // sidecar. Runs that rebuilt canonical storage, repaired a sparse index,
+    // or had no matching checkpoint still audit.
+    let allow_final_content_audit = !preserved_noop_full_scan_settled_state
+        && !(initial_matching_lexical_checkpoint.has_completed_checkpoint
+            && !canonical_storage_rebuilt)
+        && should_defer_incremental_authoritative_lexical_repair(
+            &opts,
+            canonical_storage_rebuilt,
+            initial_canonical_sessions_before_salvage,
+            true,
+            None,
+        )
+        .is_none();
     if !lexical_resume::certify_after_index(
         &opts.db_path,
         &index_path,
         allow_final_content_audit,
+        opts.full && performed_scan && !preserved_noop_full_scan_settled_state,
         opts.progress.clone(),
         Some(Arc::clone(&progress_bump)),
     )
