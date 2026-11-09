@@ -1,5 +1,5 @@
 use coding_agent_search::connectors::cline::ClineConnector;
-use coding_agent_search::connectors::{Connector, ScanContext};
+use coding_agent_search::connectors::{Connector, ScanContext, ScanRoot};
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -534,7 +534,8 @@ fn cline_handles_empty_directory() {
     let conn = ClineConnector::new();
     let ctx = ScanContext {
         data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        // This test selects an empty fixture, not default discovery of the host.
+        scan_roots: vec![ScanRoot::local(dir.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -552,7 +553,8 @@ fn cline_skips_task_without_messages() {
     let conn = ClineConnector::new();
     let ctx = ScanContext {
         data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        // This test selects an empty fixture, not default discovery of the host.
+        scan_roots: vec![ScanRoot::local(dir.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
