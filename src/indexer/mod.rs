@@ -78097,6 +78097,7 @@ c.close()
                 db_available: true,
                 compute_lexical_fingerprint: false,
                 inspect_semantic: false,
+                probe_semantic_ann: crate::search::asset_state::SemanticAnnProbeMode::Bounded,
             },
         )
         .unwrap();
@@ -78205,6 +78206,7 @@ c.close()
                 db_available: true,
                 compute_lexical_fingerprint: false,
                 inspect_semantic: false,
+                probe_semantic_ann: crate::search::asset_state::SemanticAnnProbeMode::Bounded,
             },
         )
         .unwrap();

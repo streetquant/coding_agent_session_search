@@ -165,6 +165,29 @@ fn build_corpus(tracker: &PhaseTracker) -> Corpus {
         .arg(&corpus.data_dir)
         .assert()
         .success();
+    // A fresh `cass index` seals a certified `vector_index/served/` copy and
+    // records a coverage certificate. Certified owners deliberately serve
+    // exact native vectors with *no* paired ANN sidecar, so the ANN surface
+    // is only exercised by the canonical legacy-manifest cohort. Drop the
+    // certificate exactly like the other real-binary ANN fixtures do; the
+    // published fast-tier artifact and its sidecar stay untouched.
+    let manifest_path = corpus.data_dir.join("vector_index/semantic_manifest.json");
+    let bytes = fs::read(&manifest_path).expect("read semantic manifest");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("parse semantic manifest");
+    let coverage = manifest
+        .as_object_mut()
+        .expect("semantic manifest must be an object")
+        .remove("coverage");
+    assert!(
+        coverage.is_some(),
+        "a fresh semantic index must certify its served generation"
+    );
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).expect("encode legacy semantic manifest"),
+    )
+    .expect("write legacy semantic manifest");
     corpus
 }
 

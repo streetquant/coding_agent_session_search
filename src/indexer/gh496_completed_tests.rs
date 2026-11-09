@@ -253,6 +253,7 @@ fn gh496_metadata_finalization_reports_unverified_without_forcing_catch_up() {
                 db_available: true,
                 compute_lexical_fingerprint,
                 inspect_semantic: false,
+                probe_semantic_ann: crate::search::asset_state::SemanticAnnProbeMode::Bounded,
             },
         )
         .unwrap();

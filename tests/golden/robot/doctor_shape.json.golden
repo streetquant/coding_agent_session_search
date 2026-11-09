@@ -961,6 +961,9 @@
         "hnsw_ready": {
           "type": "boolean"
         },
+        "hnsw_reason_code": {
+          "type": "null"
+        },
         "progressive_ready": {
           "type": "boolean"
         },
@@ -1229,6 +1232,9 @@
             "present": {
               "type": "null"
             },
+            "reason_code": {
+              "type": "null"
+            },
             "note": {
               "type": "string"
             }
@@ -1275,6 +1281,9 @@
             },
             "present": {
               "type": "boolean"
+            },
+            "reason_code": {
+              "type": "null"
             },
             "note": {
               "type": "string"
@@ -1323,6 +1332,9 @@
             "present": {
               "type": "boolean"
             },
+            "reason_code": {
+              "type": "null"
+            },
             "note": {
               "type": "string"
             }
@@ -1368,6 +1380,9 @@
               "type": "null"
             },
             "present": {
+              "type": "null"
+            },
+            "reason_code": {
               "type": "null"
             },
             "note": {

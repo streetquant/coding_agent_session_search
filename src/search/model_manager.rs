@@ -514,6 +514,37 @@ fn select_existing_ann_candidate(path: PathBuf) -> Option<PathBuf> {
     }
 }
 
+/// Resolve the production-selected exact cohort and its explicitly paired ANN
+/// sidecars for a readiness probe.
+///
+/// This mirrors the serving selection exactly: the complete shard generation
+/// named by the shard manifest when it matches the current database,
+/// otherwise the monolithic artifact with its paired sidecar. It never loads
+/// an embedding model, never writes, and never rediscovers an artifact beside
+/// a vector the way a filename guess would.
+pub(crate) fn selected_semantic_ann_cohort(
+    data_dir: &Path,
+    embedder_id: &str,
+    expected_dimension: usize,
+    db_fingerprint: Option<&str>,
+) -> Vec<SemanticIndexArtifact> {
+    if let Some(fingerprint) = db_fingerprint
+        && let Some(artifacts) =
+            load_complete_shard_artifacts(data_dir, embedder_id, expected_dimension, fingerprint)
+                .ok()
+                .flatten()
+    {
+        return artifacts;
+    }
+    // Monolithic fallback: the conventional sidecar path is the pairing the
+    // serving path uses for a non-sharded generation.
+    let index_path = vector_index_path(data_dir, embedder_id);
+    let ann_path = select_existing_ann_candidate(hnsw_index_path(data_dir, embedder_id));
+    open_validated_semantic_artifact(&index_path, ann_path, embedder_id, expected_dimension)
+        .map(|artifact| vec![artifact])
+        .unwrap_or_default()
+}
+
 fn complete_shard_generation_candidate_exists(data_dir: &Path, embedder_id: &str) -> bool {
     let manifest = match SemanticShardManifest::load(data_dir) {
         Ok(Some(manifest)) => manifest,

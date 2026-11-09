@@ -152,6 +152,7 @@
     "hnsw_present": false,
     "hnsw_state": "not_inspected",
     "hnsw_ready": false,
+    "hnsw_reason_code": null,
     "progressive_ready": false,
     "progressive_reason_code": null,
     "feature_compiled_in": true,

@@ -3168,6 +3168,18 @@ fn open_fs_semantic_ann_index(
     }
 }
 
+/// The exact native-admission verdict for one selected exact FSVI cohort.
+///
+/// Readiness surfaces call this instead of inspecting paths, so
+/// `hnsw_ready` is true only when the very decision the serving path makes
+/// would admit native ANN. The probe loads and validates the graph but never
+/// rebuilds it, never writes, and reports only bounded reason codes.
+pub fn semantic_ann_readiness(
+    artifacts: &[SemanticIndexArtifact],
+) -> crate::search::ann_index::SemanticAnnReadiness {
+    ann_shards::SemanticAnnShardSet::admission(artifacts)
+}
+
 struct SemanticSearchState {
     context_token: Arc<()>,
     embedder: Arc<dyn Embedder>,

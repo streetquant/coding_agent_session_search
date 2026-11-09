@@ -4414,6 +4414,25 @@ fn string_value(value: &serde_json::Value, key: &str, fallback: &str) -> String 
         .to_string()
 }
 
+/// Project the shared ANN readiness token out of a health state snapshot.
+///
+/// The TUI reads the same bounded health envelope the JSON surfaces publish,
+/// so it repeats their vocabulary and their stable reason code instead of
+/// inventing one. An uninspected cohort keeps the "not_inspected" token: the
+/// absence of a verdict is not a verdict.
+fn ann_readiness_from_state(state: &serde_json::Value) -> (String, Option<String>) {
+    let ann_state = state
+        .pointer("/semantic/hnsw_state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("not_inspected")
+        .to_string();
+    let ann_reason_code = state
+        .pointer("/semantic/hnsw_reason_code")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    (ann_state, ann_reason_code)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DoctorHudSummary {
     pub status: String,
@@ -4429,6 +4448,15 @@ pub struct DoctorHudSummary {
     pub repair_previously_failed: bool,
     pub remote_source_state: Option<String>,
     pub sole_copy_conversation_count: u64,
+    /// Shared ANN readiness token (`absent`, `present_unverified`,
+    /// `native_ready`, `rejected`).
+    ///
+    /// The TUI projects the same vocabulary the JSON and doctor surfaces use,
+    /// so the human views can never claim a readiness the machine surfaces do
+    /// not.
+    pub ann_state: String,
+    /// Stable reason code for a refused ANN cohort.
+    pub ann_reason_code: Option<String>,
 }
 
 impl DoctorHudSummary {
@@ -4468,6 +4496,11 @@ impl DoctorHudSummary {
                 .pointer("/sole_copy_conversation_count")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0),
+            // The runtime summary is a doctor-shaped envelope and carries no
+            // semantic block; the caller fills the ANN readiness from the
+            // health state it already holds.
+            ann_state: "not_inspected".to_string(),
+            ann_reason_code: None,
         })
     }
 
@@ -4487,6 +4520,17 @@ impl DoctorHudSummary {
         }
         if self.coverage_source_status == "stale" {
             return "summary stale".to_string();
+        }
+        // A refused native ANN cohort is worth naming: the exact FSVI still
+        // answers every query, but the accelerator is not serving.
+        if self.ann_state == "rejected" {
+            return match self.ann_reason_code.as_deref() {
+                Some(code) => format!("ann {}", Self::token(code)),
+                None => "ann rejected".to_string(),
+            };
+        }
+        if self.ann_state == "native_ready" {
+            return "ann native".to_string();
         }
         if self.sole_copy_conversation_count > 0 {
             return format!("sole-copy {}", self.sole_copy_conversation_count);
@@ -4533,6 +4577,7 @@ impl DoctorHudSummary {
             || self.risk_level == "medium"
             || self.risk_level == "low"
             || self.fallback_mode == "lexical"
+            || self.ann_state == "rejected"
             || self.archive_coverage_state == "not_checked"
             || self.coverage_source_status == "not_checked"
             || self.remote_source_state.as_deref().is_some_and(|state| {
@@ -6052,7 +6097,13 @@ impl CassApp {
             recommended_action: recommended_action.as_ref(),
             data_dir: &self.data_dir,
         });
-        DoctorHudSummary::from_runtime_summary(&summary)
+        let mut hud = DoctorHudSummary::from_runtime_summary(&summary)?;
+        // Project the shared ANN readiness token so the TUI can never claim a
+        // readiness the JSON and doctor surfaces do not report.
+        let (ann_state, ann_reason_code) = ann_readiness_from_state(&state);
+        hud.ann_state = ann_state;
+        hud.ann_reason_code = ann_reason_code;
+        Some(hud)
     }
 
     fn max_detail_scroll(&self) -> u32 {
@@ -47543,6 +47594,8 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             repair_previously_failed: false,
             remote_source_state: Some("ok".to_string()),
             sole_copy_conversation_count: 0,
+            ann_state: "not_inspected".to_string(),
+            ann_reason_code: None,
         }
     }
 

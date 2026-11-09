@@ -10,7 +10,76 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use frankensearch::index::{HnswConfig, HnswIndex, VectorIndex};
 
-use crate::search::vector_index::VECTOR_INDEX_DIR;
+use crate::search::vector_index::{SemanticAnnUnavailableReason, VECTOR_INDEX_DIR};
+
+/// Bounded ANN readiness for one selected exact FSVI cohort.
+///
+/// This is the single readiness vocabulary shared by the status, health,
+/// doctor, TUI and query-diagnostic surfaces. `Absent` and
+/// `PresentUnverified` come from cheap inspection that never deserializes a
+/// graph. `NativeReady` requires exact native admission of the paired sidecar
+/// against the retained exact owner; nothing else may report it. `Rejected`
+/// carries the same stable reason code the serving path reports when it
+/// falls back to exact search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticAnnReadiness {
+    /// No ANN artifact is paired with the selected exact artifact.
+    Absent,
+    /// A bounded inspection found an ANN artifact but did not admit it.
+    ///
+    /// The sidecar exists; nothing about its graph integrity, completeness or
+    /// source identity has been proven yet.
+    PresentUnverified,
+    /// Exact native admission against the retained exact owner succeeded.
+    NativeReady,
+    /// Native admission was attempted and refused for a stable reason.
+    Rejected(SemanticAnnUnavailableReason),
+}
+
+impl SemanticAnnReadiness {
+    /// Stable state token projected by every readiness surface.
+    #[must_use]
+    pub const fn state(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::PresentUnverified => "present_unverified",
+            Self::NativeReady => "native_ready",
+            Self::Rejected(_) => "rejected",
+        }
+    }
+
+    /// True only after exact native admission against the retained owner.
+    #[must_use]
+    pub const fn is_ready(self) -> bool {
+        matches!(self, Self::NativeReady)
+    }
+
+    /// The stable reason code, when this readiness has one.
+    ///
+    /// An absent cohort reports the same `ann_sidecar_missing` code the
+    /// serving path reports when it has no paired sidecar, so a bounded
+    /// surface and a real search never disagree about the reason.
+    #[must_use]
+    pub const fn reason_code(self) -> Option<&'static str> {
+        match self {
+            Self::Absent => Some(SemanticAnnUnavailableReason::SidecarMissing.code()),
+            Self::PresentUnverified => None,
+            Self::NativeReady => None,
+            Self::Rejected(reason) => Some(reason.code()),
+        }
+    }
+
+    /// The stable reason, when this readiness has one.
+    #[must_use]
+    pub const fn reason(self) -> Option<SemanticAnnUnavailableReason> {
+        match self {
+            Self::Absent => Some(SemanticAnnUnavailableReason::SidecarMissing),
+            Self::PresentUnverified => None,
+            Self::NativeReady => None,
+            Self::Rejected(reason) => Some(reason),
+        }
+    }
+}
 
 /// Why native retrieval was replaced by the complete exact cohort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]

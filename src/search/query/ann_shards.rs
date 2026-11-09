@@ -9,7 +9,7 @@
 use super::*;
 use crate::search::ann_index::{
     AnnExactFallbackReason, AnnExactFallbackStats, AnnExactShardFallback, AnnPartialExactStats,
-    AnnSearchStats,
+    AnnSearchStats, SemanticAnnReadiness,
 };
 
 mod execution;
@@ -53,6 +53,32 @@ impl std::fmt::Display for NativeAnnSearchFailure {
 impl std::error::Error for NativeAnnSearchFailure {}
 
 impl SemanticAnnShardSet {
+    /// The cohort's native-admission verdict.
+    ///
+    /// This is the *same* decision the serving path makes, so a readiness
+    /// surface and a real approximate search can never disagree:
+    /// `NativeReady` means the cohort would serve native ANN right now, and
+    /// `Rejected` carries the exact reason a search would fall back to exact
+    /// retrieval. The probe never rebuilds a graph and never writes.
+    pub(super) fn admission(artifacts: &[SemanticIndexArtifact]) -> SemanticAnnReadiness {
+        if artifacts.is_empty() {
+            return SemanticAnnReadiness::Absent;
+        }
+        // The cheap pairing check runs first: a cohort without a paired
+        // sidecar never allocates a native graph, so it is absent rather than
+        // rejected.
+        if let Some(reason) = Self::unavailable_reason(artifacts) {
+            return match reason {
+                SemanticAnnUnavailableReason::SidecarMissing => SemanticAnnReadiness::Absent,
+                other => SemanticAnnReadiness::Rejected(other),
+            };
+        }
+        match Self::open(Arc::new(artifacts.to_vec())) {
+            Ok(_) => SemanticAnnReadiness::NativeReady,
+            Err(failure) => SemanticAnnReadiness::Rejected(failure.reason),
+        }
+    }
+
     /// Cheap whole-cohort unavailability, before allocating any native graph.
     /// One potentially usable pairing keeps mixed admission possible.
     pub(super) fn unavailable_reason(

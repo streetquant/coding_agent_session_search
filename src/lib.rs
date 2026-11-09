@@ -1015,6 +1015,12 @@ pub enum Commands {
         /// avoid opening the configured archive entirely (#398).
         #[arg(long, default_value_t = false)]
         binary_only: bool,
+        /// Deep readiness probe: admit the optional native ANN graph against
+        /// the selected exact owner so the report can state `ready` or
+        /// `rejected` with its stable reason code. Off by default: the bounded
+        /// surface is the documented sub-50ms probe and never loads a graph.
+        #[arg(long, default_value_t = false)]
+        deep: bool,
     },
     /// Verify this executable without reading or writing the configured archive.
     /// Intended for package installation and binary-promotion gates.
@@ -1101,6 +1107,13 @@ pub enum Commands {
         /// Run the bounded read-only doctor truth surface (`cass doctor check --json`)
         #[arg(long, default_value_t = false, conflicts_with = "fix")]
         check: bool,
+
+        /// Deep readiness probe: admit the optional native ANN graph against
+        /// the selected exact owner so the report can state `ready` or
+        /// `rejected` with its stable reason code. Off by default: the bounded
+        /// surface stays fast and never loads a graph.
+        #[arg(long, default_value_t = false)]
+        deep: bool,
 
         /// Legacy safe auto-run: apply only contract-declared safe repairs, preserving archive/source evidence.
         #[arg(long, conflicts_with = "repair")]
@@ -7682,6 +7695,7 @@ pub fn try_run_with_parsed_fast(parsed: ParsedCli) -> Result<CliResult<()>, Box<
             robot_meta,
             stale_threshold,
             binary_only,
+            deep,
             json,
         } => {
             let structured_format = resolve_subcommand_structured_format(&cli, json);
@@ -7692,6 +7706,7 @@ pub fn try_run_with_parsed_fast(parsed: ParsedCli) -> Result<CliResult<()>, Box<
                 stale_threshold,
                 binary_only,
                 robot_meta,
+                deep,
             )
         }
         Commands::Selftest { json } => {
@@ -9092,6 +9107,7 @@ async fn execute_cli(
                     robot_meta,
                     stale_threshold,
                     binary_only,
+                    deep,
                     json,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
@@ -9102,6 +9118,7 @@ async fn execute_cli(
                         stale_threshold,
                         binary_only,
                         robot_meta,
+                        deep,
                     )?;
                 }
                 Commands::Selftest { json } => {
@@ -9145,6 +9162,7 @@ async fn execute_cli(
                     data_dir,
                     json,
                     check,
+                    deep,
                     fix,
                     repair,
                     cleanup,
@@ -9401,27 +9419,29 @@ async fn execute_cli(
                             wrap,
                         )?;
                     } else {
-                        let request = doctor::DoctorCommandRequest::from_cli_flags_with_backups(
-                            data_dir,
-                            cli.db.clone(),
-                            structured_format,
-                            check,
-                            fix,
-                            repair,
-                            cleanup,
-                            archive_scan,
-                            archive_normalize,
-                            backups_list,
-                            backups_verify,
-                            backups_restore,
-                            backup_id,
-                            dry_run,
-                            yes,
-                            plan_fingerprint,
-                            verbose,
-                            force_rebuild,
-                            allow_repeated_repair,
-                        )?;
+                        let mut request =
+                            doctor::DoctorCommandRequest::from_cli_flags_with_backups(
+                                data_dir,
+                                cli.db.clone(),
+                                structured_format,
+                                check,
+                                fix,
+                                repair,
+                                cleanup,
+                                archive_scan,
+                                archive_normalize,
+                                backups_list,
+                                backups_verify,
+                                backups_restore,
+                                backup_id,
+                                dry_run,
+                                yes,
+                                plan_fingerprint,
+                                verbose,
+                                force_rebuild,
+                                allow_repeated_repair,
+                            )?;
+                        request.deep_probe = deep;
                         doctor::execute_doctor_command_with_wrap(request, wrap)?;
                     }
                 }
@@ -23032,6 +23052,7 @@ fn state_meta_json_with_counts(
         false,
         allow_db_open,
         false,
+        crate::search::asset_state::SemanticAnnProbeMode::Bounded,
     )
 }
 
@@ -23050,6 +23071,7 @@ fn state_meta_json_full(
     skip_db_open: bool,
     inspect_semantic: bool,
     passive_db_probe: bool,
+    probe_semantic_ann: crate::search::asset_state::SemanticAnnProbeMode,
 ) -> serde_json::Value {
     state_meta_json_inner(
         data_dir,
@@ -23060,6 +23082,7 @@ fn state_meta_json_full(
         skip_db_open,
         inspect_semantic,
         passive_db_probe,
+        probe_semantic_ann,
     )
 }
 
@@ -23081,6 +23104,30 @@ fn state_meta_json_for_health(
         true,
         true,
         false,
+        crate::search::asset_state::SemanticAnnProbeMode::Bounded,
+    )
+}
+
+/// Deep health: the same envelope with the archive opened so the exact
+/// native ANN admission can run against the production-selected cohort.
+///
+/// The bounded health surface stays a documented sub-50ms probe and never
+/// loads a graph. Only this opt-in lane may report `hnsw_ready`.
+fn state_meta_json_for_deep_health(
+    data_dir: &Path,
+    db_path: &Path,
+    stale_threshold: u64,
+) -> serde_json::Value {
+    state_meta_json_full(
+        data_dir,
+        db_path,
+        stale_threshold,
+        true,
+        Some(false),
+        false,
+        true,
+        false,
+        crate::search::asset_state::SemanticAnnProbeMode::Deep,
     )
 }
 
@@ -23098,6 +23145,7 @@ fn state_meta_json_for_status(
         false,
         true,
         false,
+        crate::search::asset_state::SemanticAnnProbeMode::Bounded,
     )
 }
 
@@ -23120,6 +23168,7 @@ fn state_meta_json_for_strict_read(
         false,
         false,
         true,
+        crate::search::asset_state::SemanticAnnProbeMode::Bounded,
     )
 }
 
@@ -23297,6 +23346,7 @@ fn state_meta_json_inner(
     skip_db_open: bool,
     inspect_semantic: bool,
     passive_db_probe: bool,
+    probe_semantic_ann: crate::search::asset_state::SemanticAnnProbeMode,
 ) -> serde_json::Value {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -23475,6 +23525,7 @@ fn state_meta_json_inner(
             // are unchanged.
             compute_lexical_fingerprint: include_counts || (db_opened && !open_skipped),
             inspect_semantic,
+            probe_semantic_ann,
         },
     )
     .unwrap_or_else(|err| {
@@ -23543,6 +23594,7 @@ fn state_meta_json_inner(
                 hnsw_present: false,
                 hnsw_state: "not_inspected",
                 hnsw_ready: false,
+                hnsw_reason_code: None,
                 progressive_ready: false,
                 progressive_reason_code: None,
                 quality_tier_published: false,
@@ -23989,6 +24041,11 @@ fn state_meta_json_inner(
             "hnsw_present": semantic.hnsw_present,
             "hnsw_state": semantic.hnsw_state,
             "hnsw_ready": semantic.hnsw_ready,
+            // The stable reason a native ANN cohort was refused. It is the
+            // same code the serving path reports when a search falls back to
+            // exact retrieval, so a readiness surface and a real search can
+            // never disagree about the reason.
+            "hnsw_reason_code": semantic.hnsw_reason_code,
             "progressive_ready": semantic.progressive_ready,
             "progressive_reason_code": semantic.progressive_reason_code,
             // Always true since bead tg5o9 retired the `semantic` Cargo
@@ -24585,6 +24642,31 @@ fn print_human_readiness_section(
     for line in summary.render_lines() {
         println!("{line}");
     }
+}
+
+/// The bounded ANN readiness line for the human surfaces.
+///
+/// The human projection reuses the exact state token and the exact stable
+/// reason code the JSON surfaces report, so an operator reading the text and
+/// an agent reading the JSON can never draw different conclusions about
+/// whether native ANN is admitted. An uninspected cohort prints nothing:
+/// "not inspected" is the absence of a verdict, not a verdict.
+fn human_ann_readiness_line(state: &serde_json::Value) -> Option<String> {
+    let semantic = state.get("semantic")?;
+    let ann_state = semantic
+        .get("hnsw_state")
+        .and_then(serde_json::Value::as_str)?;
+    if ann_state.is_empty() || ann_state == "not_inspected" {
+        return None;
+    }
+    let reason = semantic
+        .get("hnsw_reason_code")
+        .and_then(serde_json::Value::as_str)
+        .filter(|code| !code.is_empty());
+    Some(match reason {
+        Some(code) => format!("  ANN: {ann_state} ({code})"),
+        None => format!("  ANN: {ann_state}"),
+    })
 }
 
 fn lexical_readiness_from_state(
@@ -41076,6 +41158,7 @@ struct DoctorDerivedSemanticComponentReport {
     current_db_matches: Option<bool>,
     ready: Option<bool>,
     present: Option<bool>,
+    reason_code: Option<String>,
     note: String,
 }
 
@@ -48149,6 +48232,7 @@ struct DoctorDerivedSemanticComponentInput {
     current_db_matches: Option<bool>,
     ready: Option<bool>,
     present: Option<bool>,
+    reason_code: Option<String>,
     safe_to_rebuild: bool,
     safe_for_auto_repair: bool,
     note: String,
@@ -48165,6 +48249,7 @@ fn doctor_derived_semantic_component_report(
         current_db_matches,
         ready,
         present,
+        reason_code,
         safe_to_rebuild,
         safe_for_auto_repair,
         note,
@@ -48187,6 +48272,7 @@ fn doctor_derived_semantic_component_report(
         current_db_matches,
         ready,
         present,
+        reason_code,
         note,
     }
 }
@@ -48413,17 +48499,18 @@ fn doctor_build_derived_semantic_asset_report(
     };
     let hnsw_status = if !archive_db_usable {
         "skipped-archive-unavailable"
-    } else if hnsw_ready {
-        "ready"
     } else {
         match state
             .pointer("/semantic/hnsw_state")
             .and_then(serde_json::Value::as_str)
         {
+            Some("native_ready") => "ready",
+            Some("rejected") => "rejected",
             Some("present_unverified") => "present-unverified",
             Some("absent") => "not-present",
             Some("inspection_failed") => "inspection-failed",
             Some("not_inspected") => "not-inspected",
+            _ if hnsw_ready => "ready",
             _ if hnsw_path.is_some() => "missing-or-unreadable",
             _ => "not-present",
         }
@@ -48452,6 +48539,7 @@ fn doctor_build_derived_semantic_asset_report(
                     | "update_available"
             )),
             present: None,
+            reason_code: None,
             safe_to_rebuild: false,
             safe_for_auto_repair: false,
             note: "model cache is opt-in; doctor reports state without downloading or deleting model files".to_string(),
@@ -48466,6 +48554,7 @@ fn doctor_build_derived_semantic_asset_report(
             current_db_matches: vector_matches,
             ready: vector_ready,
             present: vector_present,
+            reason_code: None,
             safe_to_rebuild,
             safe_for_auto_repair: false,
             note: "semantic/vector indexes are derived from the canonical archive and explicit model policy".to_string(),
@@ -48480,6 +48569,12 @@ fn doctor_build_derived_semantic_asset_report(
             current_db_matches: None,
             ready: Some(hnsw_ready),
             present: doctor_json_pointer_bool(state, "/semantic/hnsw_present"),
+            // The same stable code the serving path reports when an
+            // approximate search falls back to exact retrieval.
+            reason_code: state
+                .pointer("/semantic/hnsw_reason_code")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
             safe_to_rebuild,
             safe_for_auto_repair: false,
             note: "HNSW/mmap accelerators are optional derived assets and must not block lexical search".to_string(),
@@ -48494,6 +48589,7 @@ fn doctor_build_derived_semantic_asset_report(
             current_db_matches: None,
             ready: None,
             present: None,
+            reason_code: None,
             safe_to_rebuild: archive_db_usable,
             safe_for_auto_repair: false,
             note: "memoization caches are derived and can be rebuilt or reclaimed only through explicit safe plans".to_string(),
@@ -88778,6 +88874,11 @@ fn run_status(
     println!("Semantic:");
     println!("  Status: {semantic_status}");
     println!("  Summary: {semantic_summary}");
+    // Same ANN readiness vocabulary as the JSON surface: the human copy
+    // never claims a native accelerator the machine contract does not.
+    if let Some(line) = human_ann_readiness_line(&state) {
+        println!("{line}");
+    }
     if let Some(hint) = semantic_hint {
         println!("  Hint: {hint}");
     }
@@ -89733,6 +89834,7 @@ fn run_health(
     stale_threshold: u64,
     binary_only: bool,
     _robot_meta: bool,
+    deep: bool,
 ) -> CliResult<()> {
     use std::time::Instant;
 
@@ -89746,7 +89848,11 @@ fn run_health(
     // detection is `cass doctor`'s responsibility, not the
     // fast-surface probe's. Envelope reports counts_skipped=true +
     // open_skipped=true so callers know both elisions happened.
-    let state = state_meta_json_for_health(&data_dir, &db_path, stale_threshold);
+    let state = if deep {
+        state_meta_json_for_deep_health(&data_dir, &db_path, stale_threshold)
+    } else {
+        state_meta_json_for_health(&data_dir, &db_path, stale_threshold)
+    };
 
     let index_exists = state
         .get("index")
@@ -90148,6 +90254,12 @@ fn run_health(
     // Health surface renders a compact partial — the projection is pure over
     // the snapshot already built above, so health stays the <50ms fast surface.
     if structured_format.is_none() {
+        // The ANN readiness line uses the same state token and reason code as
+        // the JSON surface, so the human verdict can never disagree with the
+        // machine contract about native admission.
+        if let Some(line) = human_ann_readiness_line(&state) {
+            println!("{line}");
+        }
         print_human_readiness_section(
             &state,
             crate::search::readiness_projection::SurfaceKind::Health,
@@ -94300,6 +94412,7 @@ pub(crate) fn run_doctor_impl(
     command_surface: doctor::DoctorCommandSurface,
     execution_mode: doctor::DoctorExecutionMode,
     requested_plan_fingerprint: Option<String>,
+    deep_probe: bool,
     wrap: WrapConfig,
 ) -> CliResult<()> {
     use colored::*;
@@ -96277,6 +96390,14 @@ pub(crate) fn run_doctor_impl(
         true,
         // passive_db_probe: doctor's readiness probe must stay read-only.
         true,
+        // The deep lane admits the native ANN graph against the selected
+        // exact owner so doctor can report `ready`/`rejected` with the same
+        // reason code a search would. The bounded lane never loads a graph.
+        if deep_probe {
+            crate::search::asset_state::SemanticAnnProbeMode::Deep
+        } else {
+            crate::search::asset_state::SemanticAnnProbeMode::Bounded
+        },
     );
     doctor_push_timing_span(
         &mut timing_spans,
@@ -101990,6 +102111,7 @@ fn response_schema_semantic_state() -> serde_json::Value {
             "hnsw_present": { "type": "boolean" },
             "hnsw_state": { "type": "string" },
             "hnsw_ready": { "type": "boolean" },
+            "hnsw_reason_code": { "type": ["string", "null"] },
             "progressive_ready": { "type": "boolean" },
             "progressive_reason_code": { "type": ["string", "null"] },
             "feature_compiled_in": { "type": "boolean" },
@@ -102077,6 +102199,7 @@ fn response_schema_doctor_derived_semantic_component() -> serde_json::Value {
             "current_db_matches": { "type": ["boolean", "null"] },
             "ready": { "type": ["boolean", "null"] },
             "present": { "type": ["boolean", "null"] },
+            "reason_code": { "type": ["string", "null"] },
             "note": { "type": "string" }
         }
     })
