@@ -16,7 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 mod util;
-use util::e2e_log::PhaseTracker;
+use util::e2e_log::{E2eCommandEnvironment, PhaseTracker};
 
 // =============================================================================
 // E2E Logger Support
@@ -24,6 +24,28 @@ use util::e2e_log::PhaseTracker;
 
 fn tracker_for(test_name: &str) -> PhaseTracker {
     PhaseTracker::new("e2e_semantic_search", test_name)
+}
+
+/// Build the child environment for one fixture.
+///
+/// The native `cloudmcp` and `openwebui` connectors fall back to machine-global
+/// capture roots under `/warp` when their roots are not configured. An index
+/// built here (or a read-triggered catch-up) would then absorb the host's
+/// sessions and rewrite the fixture's semantic artifacts mid-test. Point both
+/// roots at absent paths inside the fixture home so the child sees only the
+/// sessions this test wrote.
+fn isolated_environment(
+    tracker: &PhaseTracker,
+    home: impl Into<PathBuf>,
+    codex_home: impl Into<PathBuf>,
+) -> E2eCommandEnvironment {
+    let home = home.into();
+    tracker
+        .command_environment()
+        .with_home(&home)
+        .with_codex_home(codex_home)
+        .with_var("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .with_var("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"))
 }
 
 fn codex_iso_timestamp(ts_millis: u64) -> String {
@@ -137,6 +159,36 @@ fn selected_hnsw_index_path(data_dir: &Path) -> PathBuf {
     let exact_path = first_vector_index_path(data_dir);
     let exact = VectorIndex::open(&exact_path).expect("open selected exact FSVI");
     hnsw_index_path(data_dir, exact.embedder_id())
+}
+
+/// Demote a freshly indexed fixture to the uncertified legacy-manifest cohort.
+///
+/// A fresh `cass index` seals an immutable `vector_index/served/` copy and
+/// records a coverage certificate. A certified owner serves exact native vectors
+/// only: its ANN accelerator is not paired, and serving authenticates the
+/// served copy rather than the canonical writer artifact. These tests alias and
+/// rewrite the canonical `index-<embedder>.fsvi` beside `hnsw-<embedder>.chsw`,
+/// so the fixture must not carry the certificate; dropping it leaves a
+/// supported legacy manifest whose serving cohort is exactly the canonical
+/// artifact this file inspects.
+fn demote_to_legacy_manifest(data_dir: &Path) {
+    let manifest_path = data_dir.join("vector_index/semantic_manifest.json");
+    let bytes = fs::read(&manifest_path).expect("read semantic manifest");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("parse semantic manifest");
+    let coverage = manifest
+        .as_object_mut()
+        .expect("semantic manifest must be an object")
+        .remove("coverage");
+    assert!(
+        coverage.is_some(),
+        "a fresh semantic index must certify its served generation"
+    );
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).expect("encode legacy semantic manifest"),
+    )
+    .expect("write legacy semantic manifest");
 }
 
 fn write_same_doc_ids_different_vectors(source_path: &Path, replacement_path: &Path) {
@@ -281,10 +333,7 @@ fn parallel_cass_children_keep_corpus_and_trace_artifacts_isolated() {
             own_token,
             timestamp,
         );
-        let command_env = tracker
-            .command_environment()
-            .with_home(&home)
-            .with_codex_home(&codex_home);
+        let command_env = isolated_environment(&tracker, &home, &codex_home);
 
         let index = command_env
             .cass_assert_command()
@@ -497,10 +546,7 @@ fn semantic_index_builds_vector_file() {
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-    let command_env = tracker
-        .command_environment()
-        .with_home(home)
-        .with_codex_home(&codex_home);
+    let command_env = isolated_environment(&tracker, home, &codex_home);
 
     let ps = tracker.start(
         "create_fixtures",
@@ -611,10 +657,7 @@ fn semantic_index_builds_hnsw() {
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-    let command_env = tracker
-        .command_environment()
-        .with_home(home)
-        .with_codex_home(&codex_home);
+    let command_env = isolated_environment(&tracker, home, &codex_home);
 
     let ps = tracker.start("create_fixtures", Some("Create sessions for HNSW index"));
     // Create enough sessions for meaningful HNSW testing
@@ -686,10 +729,7 @@ fn search_semantic_mode_returns_results() {
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-    let command_env = tracker
-        .command_environment()
-        .with_home(home)
-        .with_codex_home(&codex_home);
+    let command_env = isolated_environment(&tracker, home, &codex_home);
 
     // Setup: Create and index content
     let ps = tracker.start("setup", Some("Create and index semantic content"));
@@ -792,10 +832,7 @@ fn exact_artifact_contract_restart_uses_writer_path_and_ignores_decoys() {
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).expect("create CASS data directory");
-    let command_env = tracker
-        .command_environment()
-        .with_home(home)
-        .with_codex_home(&codex_home);
+    let command_env = isolated_environment(&tracker, home, &codex_home);
 
     let target_phrase = "cobalt narwhal exact artifact rendezvous";
     let ps = tracker.start(
@@ -1026,10 +1063,7 @@ fn fsvi_symlink_is_rejected_by_readiness_and_serving_without_mutation() {
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).expect("create CASS data directory");
-    let command_env = tracker
-        .command_environment()
-        .with_home(home)
-        .with_codex_home(&codex_home);
+    let command_env = isolated_environment(&tracker, home, &codex_home);
 
     let ps = tracker.start(
         "build_exact_source",
@@ -1055,6 +1089,7 @@ fn fsvi_symlink_is_rejected_by_readiness_and_serving_without_mutation() {
         .arg(&data_dir)
         .assert()
         .success();
+    demote_to_legacy_manifest(&data_dir);
     tracker.end(
         "build_exact_source",
         Some("Build the authoritative hash FSVI with the real CASS writer"),
@@ -1195,10 +1230,7 @@ fn search_hybrid_mode_combines_results() {
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-    let command_env = tracker
-        .command_environment()
-        .with_home(home)
-        .with_codex_home(&codex_home);
+    let command_env = isolated_environment(&tracker, home, &codex_home);
 
     // Setup
     let ps = tracker.start("setup", Some("Create and index hybrid content"));
@@ -1292,10 +1324,7 @@ fn search_approximate_uses_hnsw() {
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-    let command_env = tracker
-        .command_environment()
-        .with_home(home)
-        .with_codex_home(&codex_home);
+    let command_env = isolated_environment(&tracker, home, &codex_home);
 
     // Setup: Create sessions and build HNSW index
     let ps = tracker.start("setup", Some("Create sessions and build HNSW"));
@@ -1323,6 +1352,7 @@ fn search_approximate_uses_hnsw() {
         .arg(&data_dir)
         .assert()
         .success();
+    demote_to_legacy_manifest(&data_dir);
     tracker.end("setup", Some("Create sessions and build HNSW"), ps);
 
     // Verify HNSW file exists
@@ -1410,10 +1440,7 @@ fn semantic_without_index_reports_error() {
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-    let command_env = tracker
-        .command_environment()
-        .with_home(home)
-        .with_codex_home(&codex_home);
+    let command_env = isolated_environment(&tracker, home, &codex_home);
 
     // Setup: Index WITHOUT semantic
     let ps = tracker.start("setup", Some("Index without --semantic"));
@@ -1498,10 +1525,7 @@ fn approximate_without_hnsw_falls_back_exact_with_typed_reason() {
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-    let command_env = tracker
-        .command_environment()
-        .with_home(home)
-        .with_codex_home(&codex_home);
+    let command_env = isolated_environment(&tracker, home, &codex_home);
 
     // Setup: Index with semantic but WITHOUT HNSW
     let ps = tracker.start("setup", Some("Index with semantic but no HNSW"));
@@ -1653,10 +1677,7 @@ fn approximate_stale_same_doc_ids_falls_back_exact_without_mutation() {
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-    let command_env = tracker
-        .command_environment()
-        .with_home(home)
-        .with_codex_home(&codex_home);
+    let command_env = isolated_environment(&tracker, home, &codex_home);
 
     let ps = tracker.start(
         "build_selected_generation",
@@ -1685,6 +1706,7 @@ fn approximate_stale_same_doc_ids_falls_back_exact_without_mutation() {
         .arg(&data_dir)
         .assert()
         .success();
+    demote_to_legacy_manifest(&data_dir);
     tracker.end(
         "build_selected_generation",
         Some("Build the selected exact FSVI and native ANN from corpus A"),
@@ -1796,10 +1818,7 @@ fn exercise_invalid_ann_fresh_process_fallback(case: InvalidAnnInstallation) {
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-    let command_env = tracker
-        .command_environment()
-        .with_home(home)
-        .with_codex_home(&codex_home);
+    let command_env = isolated_environment(&tracker, home, &codex_home);
 
     let ps = tracker.start(
         "build_exact_source",
@@ -1825,6 +1844,7 @@ fn exercise_invalid_ann_fresh_process_fallback(case: InvalidAnnInstallation) {
         .arg(&data_dir)
         .assert()
         .success();
+    demote_to_legacy_manifest(&data_dir);
     tracker.end(
         "build_exact_source",
         Some("Build the authoritative exact FSVI without an ANN"),
@@ -1976,10 +1996,7 @@ fn semantic_search_emits_timing() {
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-    let command_env = tracker
-        .command_environment()
-        .with_home(home)
-        .with_codex_home(&codex_home);
+    let command_env = isolated_environment(&tracker, home, &codex_home);
 
     // Setup
     let ps = tracker.start("setup", Some("Create and index content"));
