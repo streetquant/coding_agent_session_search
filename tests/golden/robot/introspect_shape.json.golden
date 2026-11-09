@@ -4598,6 +4598,17 @@
                             }
                           }
                         },
+                        "hnsw_reason_code": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
                         "progressive_ready": {
                           "type": "object",
                           "properties": {
@@ -5697,6 +5708,17 @@
                                     }
                                   }
                                 },
+                                "reason_code": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
                                 "note": {
                                   "type": "object",
                                   "properties": {
@@ -5827,6 +5849,17 @@
                                   }
                                 },
                                 "present": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "reason_code": {
                                   "type": "object",
                                   "properties": {
                                     "type": {
@@ -5977,6 +6010,17 @@
                                     }
                                   }
                                 },
+                                "reason_code": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
                                 "note": {
                                   "type": "object",
                                   "properties": {
@@ -6107,6 +6151,17 @@
                                   }
                                 },
                                 "present": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "reason_code": {
                                   "type": "object",
                                   "properties": {
                                     "type": {
@@ -48880,6 +48935,17 @@
                             }
                           }
                         },
+                        "hnsw_reason_code": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
                         "progressive_ready": {
                           "type": "object",
                           "properties": {
@@ -49979,6 +50045,17 @@
                                     }
                                   }
                                 },
+                                "reason_code": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
                                 "note": {
                                   "type": "object",
                                   "properties": {
@@ -50109,6 +50186,17 @@
                                   }
                                 },
                                 "present": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "reason_code": {
                                   "type": "object",
                                   "properties": {
                                     "type": {
@@ -50259,6 +50347,17 @@
                                     }
                                   }
                                 },
+                                "reason_code": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
                                 "note": {
                                   "type": "object",
                                   "properties": {
@@ -50389,6 +50488,17 @@
                                   }
                                 },
                                 "present": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "reason_code": {
                                   "type": "object",
                                   "properties": {
                                     "type": {
@@ -56221,6 +56331,17 @@
                                   "properties": {
                                     "type": {
                                       "type": "string"
+                                    }
+                                  }
+                                },
+                                "hnsw_reason_code": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
                                     }
                                   }
                                 },
@@ -63427,6 +63548,17 @@
                                             }
                                           }
                                         },
+                                        "hnsw_reason_code": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
                                         "progressive_ready": {
                                           "type": "object",
                                           "properties": {
@@ -66772,6 +66904,17 @@
                           "properties": {
                             "type": {
                               "type": "string"
+                            }
+                          }
+                        },
+                        "hnsw_reason_code": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
                             }
                           }
                         },
@@ -71705,6 +71848,17 @@
                             }
                           }
                         },
+                        "hnsw_reason_code": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
                         "progressive_ready": {
                           "type": "object",
                           "properties": {
@@ -76622,6 +76776,17 @@
                                   "properties": {
                                     "type": {
                                       "type": "string"
+                                    }
+                                  }
+                                },
+                                "hnsw_reason_code": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
                                     }
                                   }
                                 },

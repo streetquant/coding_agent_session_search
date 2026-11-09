@@ -189,6 +189,21 @@
       "name": "shelley",
       "path": "(not detected)",
       "found": false
+    },
+    {
+      "name": "kilo",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "cloudmcp",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "openwebui",
+      "path": "(not detected)",
+      "found": false
     }
   ],
   "quarantine": {

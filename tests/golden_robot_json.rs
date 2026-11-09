@@ -86,6 +86,16 @@ fn cass_cmd(test_home: &std::path::Path) -> Command {
         // must observe only its synthetic HOME.
         .env("CASS_DAEMON_SOCKET", test_home.join("cass-daemon.sock"))
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        // Native connectors default to host-absolute roots (CloudMCP under
+        // /warp/cloudmcp, Open WebUI under the raw mirror); pin both to
+        // absent paths so `diag`/`doctor` goldens never observe the host's
+        // real transcripts.
+        .env("CASS_CLOUDMCP_DATA_ROOT", test_home.join("no-cloudmcp"))
+        .env("CASS_OPENWEBUI_DATA_ROOT", test_home.join("no-openwebui"))
+        // The archive location must come from the synthetic HOME, never from
+        // an ambient override on the host running the golden suite.
+        .env_remove("CASS_DATA_DIR")
+        .env_remove("CASS_HOME")
         // Keep resource-policy goldens stable across hosts; dynamic default
         // scaling is covered by responsiveness unit tests.
         .env("CASS_RESPONSIVENESS_MAX_INFLIGHT_BYTES", "536870912");

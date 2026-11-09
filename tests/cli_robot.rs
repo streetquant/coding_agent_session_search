@@ -30,6 +30,19 @@ fn base_cmd() -> Command {
     // `isolated_search_demo_data`); these tests observe an archive and never
     // want a live refresh.
     cmd.env("CASS_AUTO_REFRESH", "0");
+    // Native connectors default to host-absolute roots (CloudMCP under
+    // /warp/cloudmcp, Open WebUI under the raw mirror). Pin them to an
+    // absent path so no command run from a fixture can ingest the host's
+    // sessions.
+    let absent_native_roots = std::env::temp_dir().join("cass-cli-robot-native-roots-absent");
+    cmd.env(
+        "CASS_CLOUDMCP_DATA_ROOT",
+        absent_native_roots.join("cloudmcp"),
+    );
+    cmd.env(
+        "CASS_OPENWEBUI_DATA_ROOT",
+        absent_native_roots.join("openwebui"),
+    );
     cmd
 }
 
@@ -8818,6 +8831,12 @@ fn isolated_cass_cmd(temp_home: &std::path::Path) -> Command {
     // profile known folder) or under an inherited CLAUDE_CONFIG_DIR. On wlap
     // the pack alias tests cited the host's own sessions (if17v).
     cmd.env("CLAUDE_CONFIG_DIR", temp_home.join(".claude"));
+    // CloudMCP and Open WebUI resolve host-absolute default roots, so
+    // `index --full` in an otherwise isolated HOME used to scan the fleet
+    // worker's real transcripts until it hit the disk quota. Pin both to
+    // absent paths inside the fixture home.
+    cmd.env("CASS_CLOUDMCP_DATA_ROOT", temp_home.join("no-cloudmcp"));
+    cmd.env("CASS_OPENWEBUI_DATA_ROOT", temp_home.join("no-openwebui"));
     cmd
 }
 

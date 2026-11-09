@@ -2207,6 +2207,17 @@
           ]
         },
         {
+          "name": "deep",
+          "description": "Deep readiness probe: admit the optional native ANN graph against the selected exact owner so the report can state `ready` or `rejected` with its stable reason code. Off by default: the bounded surface is the documented sub-50ms probe and never loads a graph",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",
@@ -2441,6 +2452,17 @@
           ]
         },
         {
+          "name": "deep",
+          "description": "Deep readiness probe: admit the optional native ANN graph against the selected exact owner so the report can state `ready` or `rejected` with its stable reason code. Off by default: the bounded surface stays fast and never loads a graph",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "fix",
           "description": "Legacy safe auto-run: apply only contract-declared safe repairs, preserving archive/source evidence",
           "arg_type": "flag",
@@ -2648,6 +2670,35 @@
             "true",
             "false"
           ]
+        },
+        {
+          "name": "exact-source-id",
+          "description": "Select native identities from this literal stored source ID; requires agent and external ID",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "exact-agent",
+          "description": "Original stored agent slug for exact native identity selection",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "exact-external-id",
+          "description": "Native external session ID to select (repeatable, at most 256; ambiguous identities fail)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "exact-workspace",
+          "description": "Require the exact literal stored workspace; no path normalization or ancestor matching",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
         },
         {
           "name": "limit",
@@ -6466,6 +6517,12 @@
             "hnsw_ready": {
               "type": "boolean"
             },
+            "hnsw_reason_code": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "progressive_ready": {
               "type": "boolean"
             },
@@ -6967,6 +7024,12 @@
                     "null"
                   ]
                 },
+                "reason_code": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "note": {
                   "type": "string"
                 }
@@ -7026,6 +7089,12 @@
                 "present": {
                   "type": [
                     "boolean",
+                    "null"
+                  ]
+                },
+                "reason_code": {
+                  "type": [
+                    "string",
                     "null"
                   ]
                 },
@@ -7091,6 +7160,12 @@
                     "null"
                   ]
                 },
+                "reason_code": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "note": {
                   "type": "string"
                 }
@@ -7150,6 +7225,12 @@
                 "present": {
                   "type": [
                     "boolean",
+                    "null"
+                  ]
+                },
+                "reason_code": {
+                  "type": [
+                    "string",
                     "null"
                   ]
                 },
@@ -27171,6 +27252,12 @@
             "hnsw_ready": {
               "type": "boolean"
             },
+            "hnsw_reason_code": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "progressive_ready": {
               "type": "boolean"
             },
@@ -27672,6 +27759,12 @@
                     "null"
                   ]
                 },
+                "reason_code": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "note": {
                   "type": "string"
                 }
@@ -27731,6 +27824,12 @@
                 "present": {
                   "type": [
                     "boolean",
+                    "null"
+                  ]
+                },
+                "reason_code": {
+                  "type": [
+                    "string",
                     "null"
                   ]
                 },
@@ -27796,6 +27895,12 @@
                     "null"
                   ]
                 },
+                "reason_code": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "note": {
                   "type": "string"
                 }
@@ -27855,6 +27960,12 @@
                 "present": {
                   "type": [
                     "boolean",
+                    "null"
+                  ]
+                },
+                "reason_code": {
+                  "type": [
+                    "string",
                     "null"
                   ]
                 },
@@ -30708,6 +30819,12 @@
                 },
                 "hnsw_ready": {
                   "type": "boolean"
+                },
+                "hnsw_reason_code": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "progressive_ready": {
                   "type": "boolean"
@@ -33857,6 +33974,12 @@
                     "hnsw_ready": {
                       "type": "boolean"
                     },
+                    "hnsw_reason_code": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
                     "progressive_ready": {
                       "type": "boolean"
                     },
@@ -35423,6 +35546,12 @@
             },
             "hnsw_ready": {
               "type": "boolean"
+            },
+            "hnsw_reason_code": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "progressive_ready": {
               "type": "boolean"
@@ -37706,6 +37835,12 @@
             },
             "hnsw_ready": {
               "type": "boolean"
+            },
+            "hnsw_reason_code": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "progressive_ready": {
               "type": "boolean"
@@ -40005,6 +40140,12 @@
                 },
                 "hnsw_ready": {
                   "type": "boolean"
+                },
+                "hnsw_reason_code": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "progressive_ready": {
                   "type": "boolean"
