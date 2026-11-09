@@ -227,6 +227,11 @@ fn cass_cmd(test_home: &Path) -> Command {
         // come from the profile known folder) or under inherited overrides.
         .env("CLAUDE_CONFIG_DIR", test_home.join(".claude"))
         .env("CODEX_HOME", test_home.join(".codex"))
+        // These connectors default to absolute host roots; point them at
+        // absent fixture paths so a developer machine's live archives never
+        // leak into the seeded index.
+        .env("CASS_CLOUDMCP_DATA_ROOT", test_home.join("no-cloudmcp"))
+        .env("CASS_OPENWEBUI_DATA_ROOT", test_home.join("no-openwebui"))
         .current_dir(test_home);
     cmd
 }

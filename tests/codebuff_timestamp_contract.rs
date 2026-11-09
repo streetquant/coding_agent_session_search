@@ -30,6 +30,8 @@ fn cass(home: &Path, data: &Path, streaming: &str) -> Command {
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("CASS_DATA_DIR", data)
+        .env("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .env("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"))
         .env("CASS_STREAMING_INDEX", streaming)
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         .env("CASS_AUTO_REFRESH", "0")

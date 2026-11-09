@@ -41,6 +41,10 @@ fn cass_cmd(home: &Path) -> Command {
     cmd.env("XDG_DATA_HOME", home.join(".local/share"));
     cmd.env("CLAUDE_CONFIG_DIR", home.join(".claude"));
     cmd.env("CODEX_HOME", home.join(".codex"));
+    // CloudMCP and Open WebUI default to absolute host roots; point them at
+    // absent fixture paths so live archives never leak into scheduled runs.
+    cmd.env("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"));
+    cmd.env("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"));
     cmd.env("RUST_MIN_STACK", "134217728");
     cmd.env("TUI_HEADLESS", "1");
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");

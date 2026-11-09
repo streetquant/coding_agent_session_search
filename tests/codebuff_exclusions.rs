@@ -93,6 +93,8 @@ impl Fixture {
             .env("APPDATA", home.join("AppData/Roaming"))
             .env("LOCALAPPDATA", home.join("AppData/Local"))
             .env("CASS_DATA_DIR", self.data())
+            .env("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+            .env("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"))
             .env("CASS_STREAMING_INDEX", mode)
             .env("CASS_EXCLUDE_PATHS", exclusions)
             .env("CASS_IGNORE_SOURCES_CONFIG", "1")

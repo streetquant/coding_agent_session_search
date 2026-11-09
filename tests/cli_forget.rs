@@ -72,6 +72,16 @@ impl Archive {
                 "CASS_DEVIN_DATA_ROOT",
                 self.home.path().join(".local/share/devin/cli"),
             )
+            // CloudMCP and Open WebUI default to absolute host roots; point
+            // them at absent fixture paths so live archives never leak in.
+            .env(
+                "CASS_CLOUDMCP_DATA_ROOT",
+                self.home.path().join("no-cloudmcp"),
+            )
+            .env(
+                "CASS_OPENWEBUI_DATA_ROOT",
+                self.home.path().join("no-openwebui"),
+            )
             .env_remove("CASS_EXCLUDE_PATHS")
             .env_remove("CASS_EXCLUDE_WORKSPACES")
             .env("CASS_DATA_DIR", &self.data_dir)
