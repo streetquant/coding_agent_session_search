@@ -44,6 +44,10 @@ fn base_cmd(temp_home: &std::path::Path) -> Command {
     // profile known folder) or under an inherited CLAUDE_CONFIG_DIR; either
     // way the host's real sessions would be indexed into the test archive.
     cmd.env("CLAUDE_CONFIG_DIR", temp_home.join(".claude"));
+    // CloudMCP and OpenWebUI default to absolute host roots that ignore HOME
+    // and XDG; point them at absent temp paths so only the fixture is indexed.
+    cmd.env("CASS_CLOUDMCP_DATA_ROOT", temp_home.join("no-cloudmcp"));
+    cmd.env("CASS_OPENWEBUI_DATA_ROOT", temp_home.join("no-openwebui"));
     // Once the data dir holds agent_search.db, the Aider connector's default
     // roots are the working directory (depth 5) and HOME. Inheriting the test
     // runner's cwd, the checkout root, indexed its Aider histories
@@ -66,6 +70,16 @@ fn index_help_prints_usage() {
         .stdout(contains("--watch"))
         .stdout(contains("--semantic"))
         .stdout(contains("--embedder"));
+}
+
+/// The readiness index block: `status` reports it at the top level, while
+/// `health` keeps the full nested state under `state`.
+fn readiness_index<'a>(state: &'a serde_json::Value, surface: &str) -> &'a serde_json::Value {
+    if surface == "health" {
+        &state["state"]["index"]
+    } else {
+        &state["index"]
+    }
 }
 
 /// GH #450: a background run (stale-on-read refresh, scheduled job) must not
@@ -250,6 +264,8 @@ fn cdzcl_index_idempotency_rejects_invalid_cached_payloads() {
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
             .env("CODEX_HOME", home.join(".codex"))
+            .env("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+            .env("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"))
             .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
             .env("RUST_MIN_STACK", "134217728")
             .args(["--db"])
@@ -412,6 +428,8 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
             // On Windows the default ~/.cursor/projects is the profile known
             // folder, which ignores HOME and USERPROFILE.
             .env("CASS_CURSOR_PROJECTS_ROOT", home.join(".cursor/projects"))
+            .env("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+            .env("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"))
             .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
             .env("RUST_MIN_STACK", "134217728");
         cmd
@@ -704,16 +722,45 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
             assert_eq!(debts, trusted_debts);
         }
         let setup = load_hash_semantic_context_strict(&data_dir, &db_path);
-        assert!(setup.context.is_none());
+        // A certified generation stays admitted with partial coverage after
+        // the workspace repair; per-query validation excludes the changed
+        // identity, which the workspace-filtered assertions below prove.
+        let context = setup
+            .context
+            .expect("certified semantic generation stays admitted");
         assert!(
-            setup.availability.is_index_stale(),
-            "old workspace vectors must not remain admitted: {:?}",
+            setup.availability.can_search(),
+            "certified generation must remain searchable: {:?}",
             setup.availability
+        );
+        assert_eq!(
+            context
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.index().record_count())
+                .sum::<usize>(),
+            1
         );
         let fallback = search_payload("hybrid", Some(&correct));
         assert_eq!(fallback["hits"].as_array().unwrap().len(), 1);
-        assert_eq!(fallback["_meta"]["search_mode"], "lexical");
-        assert_eq!(fallback["_meta"]["semantic_refinement"], false);
+        assert_eq!(fallback["_meta"]["search_mode"], "hybrid", "{fallback}");
+        assert_eq!(
+            fallback["_meta"]["semantic_refinement"], true,
+            "the certified fast tier ran for the hybrid request; {fallback}"
+        );
+        // The certified generation is admitted with partial coverage, but the
+        // changed workspace identity is excluded from semantic candidates
+        // until a new generation is published.
+        for workspace in [&correct, &wrong] {
+            assert_eq!(
+                search_payload("semantic", Some(workspace))["hits"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                0,
+                "changed workspace identity must not be served from the certified generation"
+            );
+        }
     }
     run_index(false, true);
     assert_hash_ready();
@@ -786,8 +833,22 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
             assert_eq!(debts, unresolved_debts);
         }
         let setup = load_hash_semantic_context_strict(&data_dir, &db_path);
-        assert!(setup.context.is_none());
-        assert!(setup.availability.is_index_stale());
+        let context = setup
+            .context
+            .expect("certified semantic generation stays admitted after an unresolved repair");
+        assert!(
+            setup.availability.can_search(),
+            "certified generation must remain searchable: {:?}",
+            setup.availability
+        );
+        assert_eq!(
+            context
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.index().record_count())
+                .sum::<usize>(),
+            1
+        );
     }
     run_index(false, true);
     assert_hash_ready();
@@ -1603,6 +1664,8 @@ fn index_publishes_fresh_lexical_authority_after_full_incremental_noop_and_force
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
             .env("CODEX_HOME", &codex_home)
+            .env("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+            .env("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"))
             .env("CASS_AUTO_REFRESH", "0")
             .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
             .env("RUST_MIN_STACK", "134217728")
@@ -1658,11 +1721,9 @@ fn index_publishes_fresh_lexical_authority_after_full_incremental_noop_and_force
             );
             let state: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(state["healthy"], true, "{stage} {surface}: {state}");
-            assert_eq!(
-                state["index"]["status"], "ready",
-                "{stage} {surface}: {state}"
-            );
-            assert_eq!(state["index"]["fresh"], true, "{stage} {surface}: {state}");
+            let index = readiness_index(&state, surface);
+            assert_eq!(index["status"], "ready", "{stage} {surface}: {state}");
+            assert_eq!(index["fresh"], true, "{stage} {surface}: {state}");
         }
         let keyword = if stage == "full" {
             "freshlexicalinitial"
@@ -1710,7 +1771,7 @@ fn index_publishes_fresh_lexical_authority_after_full_incremental_noop_and_force
         .unwrap();
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let state: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(state["index"]["status"], "unverified", "{state}");
+    assert_eq!(state["state"]["index"]["status"], "unverified", "{state}");
 
     // An explicit full index remains able to certify the same archive even
     // when automatic incremental auditing is disabled.
@@ -1729,8 +1790,8 @@ fn index_publishes_fresh_lexical_authority_after_full_incremental_noop_and_force
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let state: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(state["index"]["status"], "ready", "{state}");
-    assert_eq!(state["index"]["fresh"], true, "{state}");
+    assert_eq!(state["state"]["index"]["status"], "ready", "{state}");
+    assert_eq!(state["state"]["index"]["fresh"], true, "{state}");
 
     // A same-count canonical edit outside indexing must still invalidate the
     // published proof. Fixing the successful journey must not certify by counts
@@ -1759,8 +1820,9 @@ fn index_publishes_fresh_lexical_authority_after_full_incremental_noop_and_force
         );
         let state: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(state["healthy"], false, "{surface}: {state}");
-        assert_eq!(state["index"]["status"], "unverified", "{surface}: {state}");
-        assert_eq!(state["index"]["fresh"], false, "{surface}: {state}");
+        let index = readiness_index(&state, surface);
+        assert_eq!(index["status"], "unverified", "{surface}: {state}");
+        assert_eq!(index["fresh"], false, "{surface}: {state}");
     }
 }
 
@@ -1894,6 +1956,8 @@ fn gh478_watch_once_retains_codex_hint_when_symlink_target_has_no_provider_marke
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
             .env("CODEX_HOME", home.join(".codex"))
+            .env("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+            .env("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"))
             .env("CASS_AUTO_REFRESH", "0")
             .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
             .env("RUST_MIN_STACK", "134217728");
@@ -2140,19 +2204,21 @@ fn repeat_full_json_preserves_exact_totals_when_noop_scan_underreports() {
         .get("messages")
         .and_then(|value| value.as_i64())
         .expect("initial message count");
-    // Bead cxhqb: capture the checkpoint file's BYTES instead of its
+    // Bead cxhqb: compare the checkpoint file's JSON content instead of its
     // filesystem mtime. Comparing mtimes is fragile on filesystems
     // with coarse (≥2s) granularity — the previous approach paired a
     // 5ms sleep with a "same mtime" assertion, which was always a
-    // happy-path-only signal. The checkpoint JSON's own content (plus
-    // embedded updated_at_ms field) changes ONLY when cass rewrites
-    // the file, independent of filesystem mtime resolution, so a
-    // byte-for-byte comparison is both tighter and portable.
+    // happy-path-only signal. The certification fields (totals, document
+    // count, committed fingerprint, completed flag) change ONLY when cass
+    // re-ingests the corpus; the source epoch and heartbeat necessarily
+    // advance whenever a run touches the archive.
     let checkpoint_path = coding_agent_search::search::tantivy::index_dir(&data_dir)
         .unwrap()
         .join(".lexical-rebuild-state.json");
     let checkpoint_bytes_before =
         fs::read(&checkpoint_path).expect("initial lexical checkpoint must be readable");
+    let checkpoint_before: serde_json::Value =
+        serde_json::from_slice(&checkpoint_bytes_before).expect("parse initial lexical checkpoint");
     assert!(
         !checkpoint_bytes_before.is_empty(),
         "precondition: initial checkpoint must be non-empty"
@@ -2200,13 +2266,27 @@ fn repeat_full_json_preserves_exact_totals_when_noop_scan_underreports() {
         stats.get("total_messages").and_then(|value| value.as_i64()),
         Some(expected_messages)
     );
-    let checkpoint_bytes_after =
-        fs::read(&checkpoint_path).expect("preserved lexical checkpoint must be readable");
+    let checkpoint_bytes_after = fs::read(&checkpoint_path).expect("re-read lexical checkpoint");
+    let checkpoint_after: serde_json::Value =
+        serde_json::from_slice(&checkpoint_bytes_after).expect("parse preserved checkpoint");
+    let normalized = |checkpoint: &serde_json::Value| {
+        let mut checkpoint = checkpoint.clone();
+        let object = checkpoint
+            .as_object_mut()
+            .expect("lexical checkpoint is a JSON object");
+        // The epoch binds the certification to the physical DB/WAL capture
+        // and the heartbeat records this verification; both advance on every
+        // run that opens the archive. Everything else is the certification.
+        object.remove("completed_source_epoch");
+        object.remove("updated_at_ms");
+        checkpoint
+    };
     assert_eq!(
-        checkpoint_bytes_after, checkpoint_bytes_before,
+        normalized(&checkpoint_after),
+        normalized(&checkpoint_before),
         "repeat no-op full runs should preserve the matching lexical checkpoint instead \
-         of deleting and recreating it (content byte-for-byte identical; file mtime is \
-         fragile on coarse-granularity filesystems, content is not)"
+         of deleting and recreating it (certification content identical; source epoch and \
+         heartbeat necessarily advance with the archive epoch)"
     );
 }
 
@@ -2982,6 +3062,8 @@ fn gh413_full_rebuild_drains_when_one_conversation_exceeds_the_inflight_budget()
     .env("HOME", tmp.path())
     .env("XDG_DATA_HOME", tmp.path().join(".local/share"))
     .env("CODEX_HOME", data_dir.join(".codex"))
+    .env("CASS_CLOUDMCP_DATA_ROOT", tmp.path().join("no-cloudmcp"))
+    .env("CASS_OPENWEBUI_DATA_ROOT", tmp.path().join("no-openwebui"))
     // Far below the oversized conversation's ~4 MiB page: after the huge
     // page is retained by the sink, every later budget acquisition must
     // depend on the starvation flush releasing retained bytes, which is
@@ -3049,6 +3131,8 @@ fn gh413_full_rebuild_drains_when_one_conversation_exceeds_the_inflight_budget()
             .env("XDG_DATA_HOME", tmp.path().join(".local/share"))
             .env("XDG_CONFIG_HOME", tmp.path().join(".config"))
             .env("CODEX_HOME", data_dir.join(".codex"))
+            .env("CASS_CLOUDMCP_DATA_ROOT", tmp.path().join("no-cloudmcp"))
+            .env("CASS_OPENWEBUI_DATA_ROOT", tmp.path().join("no-openwebui"))
             .output()
             .expect("run cass search");
         assert!(
@@ -4727,6 +4811,8 @@ fn assert_plain_index_recovers_killed_lexical_commit(final_tail: bool) {
         .env("XDG_DATA_HOME", home.join(".local/share"))
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("CODEX_HOME", &codex_root)
+        .env("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+        .env("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"))
         .env(
             "CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMIT_SENTINEL",
             &sentinel,
@@ -5772,6 +5858,8 @@ fn background_index_keeps_an_existing_semantic_index_current() {
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
             .env("CODEX_HOME", home.join(".codex"))
+            .env("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
+            .env("CASS_OPENWEBUI_DATA_ROOT", home.join("no-openwebui"))
             .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
             .env("CASS_AUTO_REFRESH", "0")
             .env("CASS_IGNORE_SOURCES_CONFIG", "1")
@@ -5833,13 +5921,15 @@ fn background_index_keeps_an_existing_semantic_index_current() {
     assert!(first.contains("zzbgalpha"), "top hit: {first}");
 
     append(2, "zzbgomega appended after the semantic index was built");
-    // Foreground incremental run: unchanged, so the semantic index now lags
-    // the archive and semantic search refuses it.
+    // Foreground incremental run: unchanged, so the semantic index still
+    // serves only its certified generation. The new message is canonical and
+    // lexically indexed, but absent from semantic results until catch-up.
     index(&data_dir, &["index", "--embedder", "hash", "--json"]);
-    assert_eq!(
-        semantic_top(&data_dir, "zzbgomega"),
-        Err(Some(15)),
-        "a foreground run must not extend the semantic index"
+    let certified = semantic_top(&data_dir, "zzbgomega")
+        .expect("a certified generation stays servable after a foreground run");
+    assert!(
+        certified.contains("zzbgalpha") && !certified.contains("zzbgomega"),
+        "a foreground run must not extend the semantic index: top hit {certified}"
     );
 
     // Background run (what auto-refresh, the scheduler and the daemon spawn):
@@ -5915,10 +6005,11 @@ fn background_index_keeps_an_existing_semantic_index_current() {
 
     append(3, "zzbgdelta appended after the backfill published");
     index(&backfilled, &["index", "--embedder", "hash", "--json"]);
-    assert_eq!(
-        semantic_top(&backfilled, "zzbgdelta"),
-        Err(Some(15)),
-        "a foreground run must not extend the backfilled tier"
+    let certified = semantic_top(&backfilled, "zzbgdelta")
+        .expect("the backfilled generation stays servable after a foreground run");
+    assert!(
+        certified.contains("zzbgalpha") && !certified.contains("zzbgdelta"),
+        "a foreground run must not extend the backfilled tier: top hit {certified}"
     );
     index(
         &backfilled,

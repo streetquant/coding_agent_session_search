@@ -33,6 +33,10 @@ fn base_cmd(temp_home: &Path) -> Command {
     cmd.env("CASS_DATA_DIR", data_dir);
     cmd.env("XDG_CONFIG_HOME", temp_home.join(".config"));
     cmd.env("CODEX_HOME", temp_home.join(".codex"));
+    // CloudMCP and OpenWebUI default to absolute host roots that ignore HOME
+    // and XDG; point them at absent temp paths so only the fixture is read.
+    cmd.env("CASS_CLOUDMCP_DATA_ROOT", temp_home.join("no-cloudmcp"));
+    cmd.env("CASS_OPENWEBUI_DATA_ROOT", temp_home.join("no-openwebui"));
     // Disable TTY detection
     cmd.env("NO_COLOR", "1");
     cmd
@@ -56,6 +60,8 @@ fn simple_cmd() -> Command {
 
     cmd.env("XDG_DATA_HOME", tmp.path());
     cmd.env("CASS_DATA_DIR", &db_dir);
+    cmd.env("CASS_CLOUDMCP_DATA_ROOT", tmp.path().join("no-cloudmcp"));
+    cmd.env("CASS_OPENWEBUI_DATA_ROOT", tmp.path().join("no-openwebui"));
 
     // Leak the temp dir so it survives the command execution
     std::mem::forget(tmp);
