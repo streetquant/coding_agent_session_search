@@ -17,6 +17,29 @@ use crate::metric_integrity::{MetricOutcome, classify_aggregate};
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Stored message roles use the canonical `agent` spelling (see
+/// `role_as_str` in storage), but historical archives and external feeds still
+/// carry `assistant`. Raw analytics buckets must count both as the assistant
+/// role; otherwise they disagree with the rollup deltas, which already accept
+/// `"assistant" | "agent"`.
+fn is_assistant_role(role: &str) -> bool {
+    role == "assistant" || role == "agent"
+}
+
+/// Raw Track A sums must only count token columns for API-backed messages.
+/// Rollup deltas gate every `api_*_tokens_total` accumulator on
+/// `api_data_source = 'api'`; an estimated row's inferred token columns must
+/// not leak into the API totals.
+fn api_token_expr(column: &str, has_column: bool, has_data_source: bool) -> String {
+    match (has_column, has_data_source) {
+        (false, _) => "0".to_string(),
+        (true, true) => {
+            format!("CASE WHEN mm.api_data_source = 'api' THEN COALESCE(mm.{column}, 0) ELSE 0 END")
+        }
+        (true, false) => format!("COALESCE(mm.{column}, 0)"),
+    }
+}
+
 /// Check whether a table exists in the database.
 pub fn table_exists(conn: &Connection, name: &str) -> bool {
     // Basic validation to prevent SQL injection in table name.
@@ -1931,31 +1954,31 @@ fn query_track_a_timeseries_from_raw(
     } else {
         "0"
     };
-    let api_input_expr = if has_api_input_tokens {
-        "COALESCE(mm.api_input_tokens, 0)"
-    } else {
-        "0"
-    };
-    let api_output_expr = if has_api_output_tokens {
-        "COALESCE(mm.api_output_tokens, 0)"
-    } else {
-        "0"
-    };
-    let api_cache_read_expr = if has_api_cache_read_tokens {
-        "COALESCE(mm.api_cache_read_tokens, 0)"
-    } else {
-        "0"
-    };
-    let api_cache_creation_expr = if has_api_cache_creation_tokens {
-        "COALESCE(mm.api_cache_creation_tokens, 0)"
-    } else {
-        "0"
-    };
-    let api_thinking_expr = if has_api_thinking_tokens {
-        "COALESCE(mm.api_thinking_tokens, 0)"
-    } else {
-        "0"
-    };
+    let api_input_expr = api_token_expr(
+        "api_input_tokens",
+        has_api_input_tokens,
+        has_api_data_source,
+    );
+    let api_output_expr = api_token_expr(
+        "api_output_tokens",
+        has_api_output_tokens,
+        has_api_data_source,
+    );
+    let api_cache_read_expr = api_token_expr(
+        "api_cache_read_tokens",
+        has_api_cache_read_tokens,
+        has_api_data_source,
+    );
+    let api_cache_creation_expr = api_token_expr(
+        "api_cache_creation_tokens",
+        has_api_cache_creation_tokens,
+        has_api_data_source,
+    );
+    let api_thinking_expr = api_token_expr(
+        "api_thinking_tokens",
+        has_api_thinking_tokens,
+        has_api_data_source,
+    );
     let api_covered_expr = if has_api_data_source {
         "CASE WHEN mm.api_data_source = 'api' THEN 1 ELSE 0 END"
     } else {
@@ -2022,7 +2045,7 @@ fn query_track_a_timeseries_from_raw(
             let mut bucket = UsageBucket {
                 message_count: 1,
                 user_message_count: i64::from(role == "user"),
-                assistant_message_count: i64::from(role == "assistant"),
+                assistant_message_count: i64::from(is_assistant_role(&role)),
                 tool_call_count,
                 plan_message_count: has_plan,
                 api_coverage_message_count: api_covered,
@@ -2032,7 +2055,7 @@ fn query_track_a_timeseries_from_raw(
                 } else {
                     0
                 },
-                content_tokens_est_assistant: if role == "assistant" {
+                content_tokens_est_assistant: if is_assistant_role(&role) {
                     content_tokens_est
                 } else {
                     0
@@ -2274,7 +2297,7 @@ fn query_cost_timeseries_from_token_usage(
                 UsageBucket {
                     message_count: 1,
                     user_message_count: i64::from(role == "user"),
-                    assistant_message_count: i64::from(role == "assistant"),
+                    assistant_message_count: i64::from(is_assistant_role(&role)),
                     tool_call_count: tool_calls,
                     api_coverage_message_count: 1,
                     content_tokens_est_total: content_chars / 4,
@@ -2587,7 +2610,12 @@ fn query_track_b_breakdown_from_token_usage(
     };
     let count_role = |role: &str| {
         if has_role {
-            format!("SUM(CASE WHEN tu.role = '{}' THEN 1 ELSE 0 END)", role)
+            let roles = if role == "assistant" {
+                "'assistant','agent'".to_string()
+            } else {
+                format!("'{role}'")
+            };
+            format!("SUM(CASE WHEN tu.role IN ({roles}) THEN 1 ELSE 0 END)")
         } else {
             "SUM(0)".to_string()
         }
@@ -2861,31 +2889,31 @@ fn query_track_a_breakdown_from_raw(
     } else {
         "0"
     };
-    let api_input_expr = if join_message_metrics {
-        "COALESCE(mm.api_input_tokens, 0)"
-    } else {
-        "0"
-    };
-    let api_output_expr = if join_message_metrics {
-        "COALESCE(mm.api_output_tokens, 0)"
-    } else {
-        "0"
-    };
-    let api_cache_read_expr = if join_message_metrics {
-        "COALESCE(mm.api_cache_read_tokens, 0)"
-    } else {
-        "0"
-    };
-    let api_cache_creation_expr = if join_message_metrics {
-        "COALESCE(mm.api_cache_creation_tokens, 0)"
-    } else {
-        "0"
-    };
-    let api_thinking_expr = if join_message_metrics {
-        "COALESCE(mm.api_thinking_tokens, 0)"
-    } else {
-        "0"
-    };
+    let api_input_expr = api_token_expr(
+        "api_input_tokens",
+        join_message_metrics,
+        has_api_data_source,
+    );
+    let api_output_expr = api_token_expr(
+        "api_output_tokens",
+        join_message_metrics,
+        has_api_data_source,
+    );
+    let api_cache_read_expr = api_token_expr(
+        "api_cache_read_tokens",
+        join_message_metrics,
+        has_api_data_source,
+    );
+    let api_cache_creation_expr = api_token_expr(
+        "api_cache_creation_tokens",
+        join_message_metrics,
+        has_api_data_source,
+    );
+    let api_thinking_expr = api_token_expr(
+        "api_thinking_tokens",
+        join_message_metrics,
+        has_api_data_source,
+    );
     let api_covered_expr = if has_api_data_source {
         "CASE WHEN mm.api_data_source = 'api' THEN 1 ELSE 0 END"
     } else {
@@ -2940,7 +2968,7 @@ fn query_track_a_breakdown_from_raw(
             let mut bucket = UsageBucket {
                 message_count: 1,
                 user_message_count: i64::from(role == "user"),
-                assistant_message_count: i64::from(role == "assistant"),
+                assistant_message_count: i64::from(is_assistant_role(&role)),
                 tool_call_count,
                 plan_message_count: has_plan,
                 api_coverage_message_count: api_covered,
@@ -2950,7 +2978,7 @@ fn query_track_a_breakdown_from_raw(
                 } else {
                     0
                 },
-                content_tokens_est_assistant: if role == "assistant" {
+                content_tokens_est_assistant: if is_assistant_role(&role) {
                     content_tokens_est
                 } else {
                     0
@@ -3570,6 +3598,7 @@ fn query_tools_from_raw(
     let has_api_cache_creation_tokens =
         table_has_column(conn, "message_metrics", "api_cache_creation_tokens");
     let has_api_thinking_tokens = table_has_column(conn, "message_metrics", "api_thinking_tokens");
+    let has_api_data_source = table_has_column(conn, "message_metrics", "api_data_source");
 
     let source_id_sql = "TRIM(COALESCE(c.source_id, ''))";
     let origin_host_sql = if has_origin_host {
@@ -3618,31 +3647,31 @@ fn query_tools_from_raw(
     } else {
         "0"
     };
-    let api_input_expr = if has_api_input_tokens {
-        "COALESCE(mm.api_input_tokens, 0)"
-    } else {
-        "0"
-    };
-    let api_output_expr = if has_api_output_tokens {
-        "COALESCE(mm.api_output_tokens, 0)"
-    } else {
-        "0"
-    };
-    let api_cache_read_expr = if has_api_cache_read_tokens {
-        "COALESCE(mm.api_cache_read_tokens, 0)"
-    } else {
-        "0"
-    };
-    let api_cache_creation_expr = if has_api_cache_creation_tokens {
-        "COALESCE(mm.api_cache_creation_tokens, 0)"
-    } else {
-        "0"
-    };
-    let api_thinking_expr = if has_api_thinking_tokens {
-        "COALESCE(mm.api_thinking_tokens, 0)"
-    } else {
-        "0"
-    };
+    let api_input_expr = api_token_expr(
+        "api_input_tokens",
+        has_api_input_tokens,
+        has_api_data_source,
+    );
+    let api_output_expr = api_token_expr(
+        "api_output_tokens",
+        has_api_output_tokens,
+        has_api_data_source,
+    );
+    let api_cache_read_expr = api_token_expr(
+        "api_cache_read_tokens",
+        has_api_cache_read_tokens,
+        has_api_data_source,
+    );
+    let api_cache_creation_expr = api_token_expr(
+        "api_cache_creation_tokens",
+        has_api_cache_creation_tokens,
+        has_api_data_source,
+    );
+    let api_thinking_expr = api_token_expr(
+        "api_thinking_tokens",
+        has_api_thinking_tokens,
+        has_api_data_source,
+    );
     let api_tokens_expr = format!(
         "({api_input_expr} + {api_output_expr} + {api_cache_read_expr} + {api_cache_creation_expr} + {api_thinking_expr})"
     );
@@ -3807,7 +3836,7 @@ pub fn query_tools(
             total_api_tokens: 0,
             source_table: table.into(),
             elapsed_ms: query_start.elapsed().as_millis() as u64,
-            metric_outcome: if table_exists(conn, "message_metrics") {
+            metric_outcome: if table_exists(conn, "messages") {
                 MetricOutcome::RebuildRequired
             } else {
                 MetricOutcome::NoData
@@ -4006,7 +4035,11 @@ pub fn query_session_scatter(
         ));
     }
 
-    let has_conv_rollup = table_has_column(conn, "conversations", "grand_total_tokens");
+    // The conversation rollup is an analytics aggregate. Without a token
+    // ledger (message_metrics/token_usage) the scatter's detailed sum is
+    // truthfully zero, and a stale rollup must not resurrect inferred tokens.
+    let has_conv_rollup = (has_message_metrics || has_token_usage)
+        && table_has_column(conn, "conversations", "grand_total_tokens");
     let has_mm_api_source =
         has_message_metrics && table_has_column(conn, "message_metrics", "api_data_source");
 
