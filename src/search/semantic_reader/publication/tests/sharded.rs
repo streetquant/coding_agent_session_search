@@ -5,6 +5,7 @@ use super::*;
 use crate::search::semantic_manifest::{
     SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION, SemanticArtifactShardV2,
 };
+use asupersync::Cx;
 
 const FAST: &[Row] = &[
     (1, [0.0, 1.0, 0.0, 0.0], true),
@@ -108,7 +109,8 @@ fn attach_graphs(root: &Path, m: &mut SemanticGenerationManifestV1, sequence: u6
             ef_construction: 16,
             ef_search: 16,
         };
-        let graph = ValidatedNativeHnsw::build(owner, params, 17).unwrap();
+        let cx = Cx::for_testing();
+        let graph = ValidatedNativeHnsw::build(&cx, owner, params, 17).unwrap();
         let relative = format!("{}/graph-{ordinal}.fshnsw", base.role.as_str());
         let receipt = graph.save(&directory.join(&relative)).unwrap();
         m.artifacts

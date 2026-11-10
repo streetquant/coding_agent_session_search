@@ -435,7 +435,7 @@ Ingests history from 34 local agent connectors, normalizing them into a unified 
 - **Oh My Pi (`omp`)**: OMP v18's default `~/.omp/agent/sessions`, named profiles under `~/.omp/profiles/<name>/agent/sessions`, XDG stores under `$XDG_DATA_HOME/omp`, and explicit OMP-only archive roots via `CASS_OMP_DATA_ROOT` (pi-family JSONL, including per-session sub-agent transcripts)
 - **GitHub Copilot Chat**: VS Code global storage under `github.copilot-chat` (JSON)
 - **Copilot CLI**: `~/.copilot/session-state`, legacy `~/.copilot/history-session-state`, and `gh copilot` config paths (JSONL/JSON)
-- **OpenClaw**: `~/.openclaw/agents/*/sessions` (Session JSONL)
+- **OpenClaw**: `~/.openclaw/agents/*/agent/openclaw-agent.sqlite` (native SQLite transcripts) and `~/.openclaw/agents/*/sessions` (legacy JSONL). `OPENCLAW_STATE_DIR` selects a different state directory. Watch mode polls database/WAL/SHM bundles under selected database files, state directories, and remote mirrors, and enrolls native stores created after startup. Discovery checks supported paths and immediate agent directories without walking session logs. Mirrors of `.openclaw` or `.openclaw/agents` support both retained-basename and contents-copy layouts. Native history suppresses a legacy migration copy only within the same physical agent directory, so another mirror's same-named session remains searchable.
 - **Goose**: `~/.local/share/goose/sessions/sessions.db` (SQLite, v1.20+), plus the earlier per-session `*.jsonl` layout under `~/.goose/sessions`
 - **Crush**: `~/.crush/crush.db` and per-project `.crush/crush.db` (SQLite)
 - **Hermes**: `~/.hermes/state.db` and project-local `.hermes/state.db` (SQLite)
@@ -617,9 +617,10 @@ offers it only to hosts above those floors.
 
 > **crates.io lags the releases:** the newest version on crates.io is 0.7.0
 > (2026-08-25), so `cargo install coding-agent-search` builds 0.7.0. Later
-> versions depend on `franken-agent-detection` at a git revision, and crates.io
-> does not accept git dependencies, so they cannot be published there until FAD
-> is (bead zztql). Use the installer or the GitHub Release binaries for a
+> versions depend on `franken-agent-detection` and `frankensearch` at exact git
+> revisions. Their required APIs must be published before CASS can return to
+> registry-only dependencies (bead zztql; GH #548). Use the installer or the
+> GitHub Release binaries for a
 > current version.
 
 **Resource Requirements**:
@@ -854,15 +855,21 @@ cass sources agents exclude openclaw
 cass sources agents include openclaw
 ```
 
-`cass` stores this preference in `sources.toml` (`~/.config/cass/sources.toml` on Linux, `~/Library/Application Support/cass/sources.toml` on macOS), so future scans, syncs, and watch-mode updates remember it automatically.
+`cass` stores this preference in `sources.toml` (`~/.config/cass/sources.toml` on Linux, `~/Library/Application Support/cass/sources.toml` on macOS). New scans, syncs, and watcher processes read the saved exclusion.
 
 By default, `cass sources agents exclude <agent>` also removes already archived local data for that agent and rebuilds the lexical index so the exclusion frees space instead of only blocking future imports.
+
+A purging exclusion requires exclusive access to the selected archive and search data. If an indexer, watcher, or maintenance operation already holds that access, the command exits with code 7 and leaves configuration and archive data unchanged. Stop the active process, then retry the exclusion. Once admitted, the command retains exclusive access through deletion and publication of the rebuilt lexical index.
+
+Exclusions apply to a whole connector. Excluding `openclaw` also removes archived conversations for named agents such as `openclaw/alice` and `openclaw/bob`. Qualified names such as `openclaw/alice` are rejected by `exclude`; they are never silently widened to the whole connector. Use `cass forget --agent openclaw/alice` to preview removing only that named agent's archived conversations, then add `--apply` to confirm the deletion.
 
 If you want to block future indexing but keep the data already archived:
 
 ```bash
 cass sources agents exclude openclaw --keep-indexed-data
 ```
+
+This option saves only the configuration change and can run while indexing is active. Restart any running watcher for the new exclusion to take effect; its current selection of connectors remains active until it exits.
 
 #### Sync Engine Internals
 
@@ -1660,7 +1667,13 @@ Edits or deletions affecting retained search documents, a replaced archive,
 incompatible projection settings, and damaged or inconsistent index evidence
 reject reuse. The rejected candidate is retained in a
 `.lexical-rebuild-quarantine-*` directory and a fresh replacement is built
-off-live. Explicit `--force-rebuild` still requests a fresh pass.
+off-live. Explicit `--force-rebuild` still requests a fresh pass: it never
+reuses a generation from before it started. If that pass is itself
+interrupted, rerunning `cass index --force-rebuild` with the same cass build
+continues it, provided the archive has not been written since the pass began.
+The rerun reads the archive from the start again but indexes only the
+conversations the pass had not committed, or only finishes its final merge.
+Any archive write, another cass build, or `--full` starts over.
 
 The audit shares the immutable native snapshot admitted by the candidate's
 writer. It does not independently open an earlier generation and then assume
@@ -1875,7 +1888,30 @@ Phrases match their words adjacent and in order (no slop). Useful for error mess
 | `*config*` | Substring | "reconfigure", "config.json", "misconfigured" | Slowest (term-dictionary expansion) |
 | `test_*` | Prefix on `test` | anything whose token starts with "test" | Fast |
 
-**Tip**: Prefix wildcards (`foo*`) use edge n-grams computed at index time: prefixes of 2–20 characters of every alphanumeric word, taken from titles and from the first 4 KiB of each message. Suffix and substring wildcards expand over the index's term dictionary, at most 16,384 terms per pattern; a pattern matching more terms fails rather than scanning. The tokenizer splits on anything that is not a letter or digit: `test_*` is a prefix match on `test`, `c++` searches for `c`, and `foo.bar` means `foo` AND `bar` anywhere in the message, not the literal string. Phrases (`"..."`) match adjacent words in order (slop 0).
+**Tip**: Ordinary ASCII prefix wildcards (`foo*`) retain the existing edge n-grams: prefixes of 2–20 characters, taken from titles and from the first 4 KiB of each message. Suffix and substring wildcards expand over the index's term dictionary, at most 16,384 terms per pattern; a pattern matching more terms fails rather than scanning. ASCII punctuation separates terms: `test_*` is a prefix match on `test`, `c++` searches for `c`, and `foo.bar` means `foo` AND `bar` anywhere in the message. Phrases (`"..."`) match adjacent words in order (slop 0).
+
+Accented Latin queries use the same fragments as the existing index. For example,
+`"kérlek"` requires adjacent exact `k` and `rlek` terms in one field. Bare words
+of 2–20 Unicode scalars retain the existing implicit final-token prefix:
+`kérlek` also matches `kérleknek`, while `"kérlek"` does not. An explicit
+`kérl*` requires `k` followed by a term starting with `rl`. These prefixes search the full
+dictionary, including text beyond the first 4 KiB and prefixes longer than 20
+characters. They allow up to 1,024 matching terms per field and immutable index
+segment; exceeding that budget returns an error instead of a partial result.
+If a final accented character was discarded by the original tokenizer, the last
+surviving fragment stays exact: `café*` searches for `caf`, not `cafeteria`.
+
+This correction reads the existing `v9-quill` index without a schema rebuild.
+The existing ingestion fingerprint policy may revalidate source files on the
+next incremental indexing run after the dependency update.
+It preserves the old tokenizer's limits: adjacent literal `k rlek` can match
+`kérlek`, and canonically equivalent Unicode spellings can produce different
+terms. Mixed CJK queries require the analyzer's actual terms in one field, with
+the existing conjunction behavior for overlapping bigrams. Unsupported scripts
+or an operand with no indexed terms refuse the whole nonempty query, including
+under `OR` and `NOT`; they cannot turn into an empty browse query. Accented
+suffix, substring and interior wildcard patterns are unsupported. A quoted
+phrase ignores edge stars under the existing syntax but rejects interior stars.
 
 ### Query Modifiers
 
@@ -3259,7 +3295,7 @@ Other subcommands (all present in the `Commands` enum in `src/lib.rs`):
 | `state` | Quick state/health check (alias of `status`) |
 | `onboarding` | Read-only first-run source onboarding + readiness wizard; `--json` for scripts, never launches the TUI |
 | `quarantine` | Inspect and manage the conversation-ingest quarantine: `list` (each excluded conversation, plus a `status` grouping by cause, version and retry eligibility with the next command), `retry` (bounded re-ingest plan; `--apply` runs it), `clear` |
-| `forget` | Prune archived conversations with `--source-glob '<glob>'`, `--workspace-glob '<glob>'`, and/or `--older-than 90d`; at least one selector is required, and supplied selectors are ANDed. Preview is strictly read-only; add `--apply` to delete canonical rows and rebuild FTS, analytics and the lexical index under the indexing maintenance lock. Age means the last message time, strictly before the reported `before_ms` cutoff; sessions with missing message times are kept. Shared stores such as OpenCode/Devin SQLite databases use durable session identities, so forgotten sessions stay out when siblings change while retained siblings keep updating. Single-session files retain size/mtime tombstones: an unchanged file stays forgotten across incremental/full indexing, and a changed file is indexed again. Source files and raw-mirror captures remain. Use `CASS_EXCLUDE_PATHS` or `CASS_EXCLUDE_WORKSPACES` for prospective exclusion, and `cass mirror prune` for explicit raw-capture retention. Semantic vectors are not rewritten: explicit semantic search reports `semantic-unavailable` and hybrid falls back to lexical until `cass index --semantic` catches up. A previously opened `cass serve` keeps its pinned snapshot until `reload`; the TUI drops forgotten hits on its next search. If lexical rebuilding fails, forget exits 5 (`lexical-rebuild`) and the next index repairs the derived data |
+| `forget` | Prune archived conversations with repeatable literal `--source-path PATH` or `--source-glob '<glob>'`, `--workspace-glob '<glob>'`, and/or `--older-than 90d`; at least one selector is required. Source paths/globs form a union, intersected with workspace and age. Preview is strictly read-only; add `--apply` to delete the batch in one transaction and rebuild FTS, analytics and the lexical index once under the indexing maintenance lock. Empty matches skip rebuilding unless an earlier forget needs repair. Age means the last message time, strictly before the reported `before_ms` cutoff; sessions with missing message times are kept. Shared stores such as OpenCode/Devin SQLite databases use durable session identities, so forgotten sessions stay out when siblings change while retained siblings keep updating. Single-session files retain size/mtime tombstones: an unchanged file stays forgotten across incremental/full indexing, and a changed file is indexed again. Source files and raw-mirror captures remain. Use `CASS_EXCLUDE_PATHS` or `CASS_EXCLUDE_WORKSPACES` for prospective exclusion, and `cass mirror prune` for explicit raw-capture retention. Semantic vectors are not rewritten: explicit semantic search reports `semantic-unavailable` and hybrid falls back to lexical until `cass index --semantic` catches up. A previously opened `cass serve` keeps its pinned snapshot until `reload`; the TUI adopts the replacement generation on a search after its reload interval. If lexical rebuilding fails, forget exits 5 (`lexical-rebuild`); retry the same forget (even if it now matches nothing) or run `cass index --full` to repair derived data |
 | `forget --list` / `forget --reinclude` | Inspect recorded exclusions or explicitly release matching records. Use literal `--source-path`, `--source-glob`, or exact `--source-id`, `--agent`, and `--external-id` selectors; supplied selectors are ANDed. Re-inclusion requires a selector and previews by default; add `--apply`, then run `cass index`. Other exclusions and current workspace/path policies remain in force. Historical exclusion records cannot be selected by workspace or age. |
 | `fleet upgrade-rehearsal` | Fleet-safe upgrade rehearsal (dry run) with bounded post-upgrade verification; `--live` opts in to SSH probes of configured remotes |
 | `lessons list\|search` | Mine and query durable, redacted lessons from local evidence (commits, closed beads, proof manifests) |
@@ -3680,7 +3716,18 @@ CASS_EXCLUDE_WORKSPACES='/work/scratch/*' cass index --json
 cass mirror prune --older-than 90d --json
 ```
 
-**Selection and previews.** All supplied selectors must match. Globs are case-sensitive and `*` also matches `/`; quote them so the shell passes them unchanged. They match the stored path, which for a shared store may be a logical handle such as `.../opencode.db/<session-id>`. A missing workspace never matches `--workspace-glob`. Age uses the maximum message timestamp, strictly before the reported `before_ms` cutoff; equality, empty sessions and sessions with even one missing message timestamp are kept. Each invocation resolves the duration once. JSON previews include up to 20 `sample_sessions`, each with `source_path`, `external_id`, `workspace` and `last_message_at`, alongside the existing counts and `sample_source_paths`. Human output shows the same session details, so sessions in one shared store can be distinguished before applying.
+**Exact-file batches.** Repeat `--source-path` to select exact stored paths without interpreting glob characters or trimming whitespace. This also works for archived files that no longer exist on disk. Preview the complete batch, then repeat it with `--apply`:
+
+```bash
+cass forget --source-path '/logs/session[1].jsonl' \
+  --source-path '/other/project/session-two.jsonl' --json
+cass forget --source-path '/logs/session[1].jsonl' \
+  --source-path '/other/project/session-two.jsonl' --apply --json
+```
+
+Repeated `--source-glob` patterns are also supported. All source paths and globs form a union; workspace and age filters intersect that union. Duplicate paths and overlapping globs select each conversation once. The entire request is validated before opening the archive, then selection, tombstones and deletion share one transaction. A successful mutating batch rebuilds derived assets once. A zero-match apply creates no new tombstones and skips that rebuild unless an earlier interrupted forget left a repair pending. JSON reports the deduplicated `source_paths` and `source_globs`, plus `derived_rebuilt` to distinguish a completed rebuild from a preview or no-op. When there is exactly one distinct glob and no literal paths, `pattern` and `source_glob` identify that glob; otherwise they are empty/null. There is no deferred-rebuild mode.
+
+**Selection and previews.** Globs are case-sensitive and `*` also matches `/`; quote them so the shell passes them unchanged. Use `--source-path` for literal filenames instead of widening a glob to group unrelated paths. Selectors match the stored path, which for a shared store may be a logical handle such as `.../opencode.db/<session-id>`. A missing workspace never matches `--workspace-glob`. Age uses the maximum message timestamp, strictly before the reported `before_ms` cutoff; equality, empty sessions and sessions with even one missing message timestamp are kept. Each invocation resolves the duration once. JSON previews include up to 20 `sample_sessions`, each with `source_path`, `external_id`, `workspace` and `last_message_at`, alongside the existing counts and `sample_source_paths`. Human output shows the same session details, so sessions in one shared store can be distinguished before applying.
 
 **Changed sessions and re-inclusion.** A forgotten shared-store session remains suppressed for the same source provenance, agent, stored source path and external session ID until its exclusion is explicitly released. Appending to or editing the forgotten session itself does not restore it, and neither do sibling changes, a full rescan or changes to workspace exclusions. Removing `CASS_EXCLUDE_WORKSPACES` only changes prospective admission; it does not undo an applied forget.
 
@@ -3715,10 +3762,11 @@ release. Its `next_command_argv` binds the follow-up index to the same database
 and data directory. Previews and repeated releases with no matches do not
 request reindexing or clear replay state.
 
-Both management modes accept either literal `--source-path` or `--source-glob`,
+Both management modes accept one literal `--source-path` or one `--source-glob`,
 plus exact `--source-id`, `--agent` and `--external-id` filters. Supplied filters
-are ANDed. These exact selectors are available only with `--list` or
-`--reinclude`. Workspace and age selectors are rejected in these modes because
+are ANDed. Source/provenance, agent and external-ID selectors are available only
+with `--list` or `--reinclude`; repeating a source selector in these modes is
+rejected. Workspace and age selectors are rejected in these modes because
 the existing v23 exclusion records do not store that metadata. Preview JSON
 reports matched and removed counts separately; a dry run always removes zero.
 
@@ -3894,19 +3942,19 @@ archive.
 The build guard enforces the reviewed
 uniform SQLite 0.4.13 versions, a single resolution per package, and registry sources.
 
-`cass` pins its contract-critical ecosystem dependencies with exact registry requirements in [`Cargo.toml`](Cargo.toml); other direct dependencies use normal semver requirements, and `Cargo.lock` freezes the complete resolved graph. One direct dependency currently resolves from git: `franken-agent-detection`, pinned to an exact published-main revision (below); one patched transitive crate, `frankensearch-lexical`, resolves from the reviewed `ed0d76e7b48e0bb215b8e0874742ee4573754ee1` tantivy-0.27 revision for the temporary RUSTSEC-2026-0253 workaround. Optional sibling-path overrides stay commented out by default and must never be committed active.
+`cass` pins its contract-critical ecosystem dependencies with exact versions in [`Cargo.toml`](Cargo.toml); other direct dependencies use normal semver requirements, and `Cargo.lock` freezes the complete resolved graph. `franken-agent-detection` and the complete `frankensearch` family pin immutable Git revisions (below). Optional sibling-path overrides stay commented out by default and must never be committed active.
 
 | Dependency | Pinned source |
 |------------|-----------------|
 | `frankensqlite` / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.13`. Carries 0.4.13's durable-freelist integrity repair (58ddae0de, svhcf) and 0.4.12's fixes for explicit-transaction inserts corrupting a table b-tree (bd-obwsy, the 0.4.10 advisory), AUTOINCREMENT after ROLLBACK (bd-gwoit) and stock-truncated empty WALs (bd-yxqs9), plus 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477), 0.4.4's durable pending-freelist repairs, 0.4.6's page-referenced-twice (bd-b5vmw) and lost-index-entry (bd-11sz4) fixes, 0.4.7's large multi-row INSERT index fix (bd-2eebi), serialized-DDL race fix (bd-4iaoi), GH#503 shadow-autoindex repair open, bounded page plane and first-`sqlite_master` full-file read fix, and 0.4.9's prompt stale-WAL-index refusal for strict read-only opens (48c6cf6b2) and first-write recovery from stock SQLite's empty WAL index (GH#443 / cass GH#509). The whole family resolves from one exact registry version; `build.rs` rejects any fsqlite-family registry patch, duplicate package resolution, wrong version, or non-crates.io lockfile source. `src/franken_sync.rs` keeps cass's synchronous call shape through a current-thread asupersync `block_on` bridge. |
-| `franken-agent-detection` | git `6b337ba434b72c65c6c5a748b7ec47885f840ac0` (package version 0.3.10; `build.rs` checks the repository, revision and version), features `codex-zstd` (compressed Codex rollouts), `pi-durable` and `pi-sqlite` (Pi durable-harness stores, `pi_agent_rust` SQLite sessions) |
+| `franken-agent-detection` | git `0ea083ea4c470a6b7e7607cdeff335cb14690cdc` (package version 0.3.10; narrow OpenClaw explicit-file isolation, historical sessions, opaque mirror discovery, and physical-store migration backports; native qualification pending; `build.rs` checks the repository, revision and version), features `codex-zstd` (compressed Codex rollouts), `pi-durable` and `pi-sqlite` (Pi durable-harness stores, `pi_agent_rust` SQLite sessions) |
 | `asupersync` | crates.io `=0.5.0` (the line fsqlite 0.4.x names in its public API) |
-| `frankensearch` | crates.io `=0.7.1`, resolving `frankensearch-index 0.4.2` (on Windows an open reader no longer blocks replacing the semantic index, and `--build-hnsw` works), `frankensearch-quill 0.4.1` (the GH #499 fix, the standard Boolean query grammar and the nested-union fix, plus concurrent segment verification on open for GH #501; 0.4.1 opens a writer with one verification of each segment instead of four), `frankenhnsw 0.3.5` and the `frankentorch-*` family (features `hash`, `cass-compat`, `quill`, `ann`, `native`; `cass-compat` enables `lexical-tantivy`, the Tantivy-backed `frankensearch-lexical` differential oracle). Exact pins remain required. |
+| `frankensearch` | `=0.7.1` at Git revision `e463dcadcbf2abd2ba9651bad3e2f7ad1bfa6965` (`streetquant/frankensearch`, branch `feat/tantivy-0.27-legacy-v9`), with the entire Frankensearch family from that revision. The revision is upstream `b103f2edb167d14e8eac9307a8b99432749acd10` plus tantivy `=0.27.0` (lru >= 0.18.2 clears RUSTSEC-2026-0253) and `frankensearch-lexical` 0.4.1. Carries GH #548 tokenizer-aligned queries, complete bounded positional prefixes and the explicit `cass::legacy_v9` adapter. CASS retains v9 paths, sentinels and every write/delete identity; upstream v10 defaults remain unchanged. Features remain `hash`, `cass-compat`, `quill`, `ann`, `native`; `cass-compat` enables `lexical-tantivy`, the retained Tantivy-backed differential oracle. The new APIs are not yet in a registry release. |
 | `frankentui` (`ftui`, `ftui-runtime`, `ftui-tty`, `ftui-extras`) | crates.io `=0.5.0` (2026-08-21; previously git `5f78cfa0` / 0.3.1 — the 0.5 API compiled with zero call-site changes) |
 | `toon` (`tru`) | crates.io `=0.2.4` (2026-08-24; production sources byte-identical to the previously pinned git rev `d7185c78` — registry 0.2.3 was rejected because its tree differs from the rev in real source despite the matching version field) |
 
 **Build-time validation**
-- `build.rs` validates every named dependency contract against its exact registry requirement, package name, enabled features, and `default-features` policy. It also rejects git/revision fields for these registry-only contracts.
+- `build.rs` validates every named dependency contract against its exact version, package name, enabled features, and `default-features` policy. Registry-only contracts reject Git fields; Git contracts require the exact repository and revision.
 - The fsqlite-family gate additionally checks `Cargo.lock` for exactly one registry resolution per package at `0.4.13` and rejects every `[patch.crates-io]` redirect for the family, including the facade.
 - Enable optional sibling-manifest validation with `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target cargo check --features strict-path-dep-validation` or `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target CASS_STRICT_PATH_DEP_VALIDATION=1 cargo check`. For sibling checkouts that are present, this verifies package names, versions, and required features before you switch to local path overrides; registry-only contracts do not require a particular sibling branch or clean worktree.
 - Use `cass swarm dependency-drift --json` for a fast read-only preflight. It reports each manifest pin, optional sibling checkout HEAD/dirty state, upstream status as `not_checked`, and the exact strict-validation commands to run; it never fetches remotes or mutates files.
@@ -3914,7 +3962,7 @@ uniform SQLite 0.4.13 versions, a single resolution per package, and registry so
 **Expected interface contract**
 - `frankensqlite` (`fsqlite`): `Connection`, `params!`, and `compat::{ConnectionExt, RowExt}` with `row.get_typed(...)`.
 - `franken-agent-detection`: `AgentDetectOptions` and `detect_installed_agents(...)`.
-- `frankensearch`: the Quill CASS document/reader/writer surface used by the active lexical backend, the retained `lexical_tantivy` compatibility surface used by legacy federated assembly and differential checks, plus `ModelCategory` and `ModelTier`.
+- `frankensearch`: the Quill CASS document/reader/writer surface, explicit `cass::legacy_v9` identity and schema policy, bounded positional-prefix execution, retained `lexical_tantivy` compatibility surface, plus `ModelCategory` and `ModelTier`.
 - `frankentui`: `ftui::Frame`, `GraphemePool`, `Style`, `ftui-runtime`, `ftui-tty`, and the `ftui-extras` features enabled by cass.
 - `asupersync`: `runtime::RuntimeBuilder` and `http::h1::HttpClient::builder()`.
 - `toon` (`tru`): `toon::encode(...)`.

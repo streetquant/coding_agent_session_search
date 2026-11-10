@@ -1,17 +1,38 @@
-import { execFileSync, execSync, spawn } from "child_process";
+import { execFileSync, spawn } from "child_process";
 import { randomUUID } from "crypto";
+import { once } from "events";
 import { createWriteStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import path from "path";
+import { finished } from "stream/promises";
 import { fileURLToPath } from "url";
+import { stripVTControlCharacters } from "util";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+let previewProcess: ReturnType<typeof spawn> | undefined;
+let previewLogStream: ReturnType<typeof createWriteStream> | undefined;
 
 /**
  * Global setup for HTML export E2E tests.
  * Generates test HTML exports from fixture JSONL files before tests run.
  */
 async function globalSetup() {
+  await cleanupPreview();
+  try {
+    await generateFixtures();
+  } catch (error) {
+    try {
+      await cleanupPreview();
+    } catch (cleanupError) {
+      if (cleanupError !== error) {
+        throw new AggregateError([error, cleanupError], "Preview setup and cleanup failed");
+      }
+    }
+    throw error;
+  }
+}
+
+async function generateFixtures() {
   const startedAt = new Date();
   const projectRoot = path.resolve(__dirname, "../../..");
   const exportDir = path.resolve(__dirname, "../exports");
@@ -71,10 +92,11 @@ async function globalSetup() {
   // Find the cass binary - check CARGO_TARGET_DIR or common locations.
   // Cargo names Windows executables with `.exe`.
   const exe = process.platform === "win32" ? ".exe" : "";
+  const cargoTargetDir = process.env.CARGO_TARGET_DIR
+    ? path.resolve(process.env.CARGO_TARGET_DIR)
+    : undefined;
   const possiblePaths = [
-    process.env.CARGO_TARGET_DIR
-      ? path.join(process.env.CARGO_TARGET_DIR, `release/cass${exe}`)
-      : null,
+    cargoTargetDir ? path.join(cargoTargetDir, `release/cass${exe}`) : null,
     `/data/tmp/cargo-target/release/cass${exe}`,
     path.join(projectRoot, `target/release/cass${exe}`),
   ].filter(Boolean) as string[];
@@ -87,12 +109,29 @@ async function globalSetup() {
     }
   }
 
-  // Browser CI downloads the release binary from the setup job. Rebuilding it
-  // inside every Playwright shard wastes most of the job timeout.
+  // The browser lane builds both binaries. Standalone setup uses the same
+  // shared build helper when no existing cass executable is available.
   if (!cassPath) {
     console.log("Building cass CLI...");
     try {
-      execSync("cargo build --release", { cwd: projectRoot, stdio: "inherit", timeout: 600000 });
+      execFileSync(
+        "bash",
+        [
+          "-c",
+          'set -euo pipefail; source "$1"; run_cargo build --locked --release --bin cass --bin cass-pages-perf-bundle',
+          "cass-e2e-build",
+          path.join(projectRoot, "scripts/lib/run_cargo.sh"),
+        ],
+        {
+          cwd: projectRoot,
+          stdio: "inherit",
+          timeout: 600000,
+          env: {
+            ...process.env,
+            RCH_TARGET_DIR: cargoTargetDir ?? path.join(projectRoot, "target"),
+          },
+        },
+      );
     } catch {
       console.warn("Cargo build failed or timed out, trying with existing binary...");
     }
@@ -268,8 +307,8 @@ async function globalSetup() {
 
   const possibleBundlePaths = [
     path.join(path.dirname(cassPath), `cass-pages-perf-bundle${exe}`),
-    process.env.CARGO_TARGET_DIR
-      ? path.join(process.env.CARGO_TARGET_DIR, `release/cass-pages-perf-bundle${exe}`)
+    cargoTargetDir
+      ? path.join(cargoTargetDir, `release/cass-pages-perf-bundle${exe}`)
       : null,
     path.join(projectRoot, `target/release/cass-pages-perf-bundle${exe}`),
   ].filter(Boolean) as string[];
@@ -283,27 +322,27 @@ async function globalSetup() {
   }
 
   if (!bundleBinPath) {
-    console.warn(
+    throw new Error(
       `Could not find cass-pages-perf-bundle binary. Checked: ${possibleBundlePaths.join(", ")}`,
     );
   } else {
     console.log(`Using perf bundle binary: ${bundleBinPath}`);
     try {
-      execSync(
+      execFileSync(
+        bundleBinPath,
         [
-          bundleBinPath,
           "--output",
           pagesPreviewDir,
           "--preset",
           "small",
           "--password",
           previewPassword,
-        ].join(" "),
+        ],
         { cwd: projectRoot, stdio: "pipe" },
       );
       console.log(`Pages bundle ready: ${pagesBundleDir}`);
     } catch (err) {
-      console.warn("Failed to generate pages preview bundle:", err);
+      throw new Error("Failed to generate a fresh pages preview bundle", { cause: err });
     }
   }
 
@@ -373,25 +412,39 @@ async function globalSetup() {
     ];
 
     console.log(`Starting preview server on port ${previewPort}...`);
+    const logStream = createWriteStream(previewLog, { flags: "a" });
+    previewLogStream = logStream;
+    // An unusable destination must reject before there is a child to orphan.
+    await once(logStream, "open");
     const previewProc = spawn(cassPath, previewArgs, {
       cwd: projectRoot,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    previewProcess = previewProc;
+    const logFailure = new Promise<never>((_, reject) => logStream.once("error", reject));
 
     if (previewProc.stdout && previewProc.stderr) {
-      const logStream = createWriteStream(previewLog, { flags: "a" });
-      previewProc.stdout.pipe(logStream);
-      previewProc.stderr.pipe(logStream);
+      previewProc.stdout.pipe(logStream, { end: false });
+      previewProc.stderr.pipe(logStream, { end: false });
+      previewProc.once("close", () => logStream.end());
     }
 
     previewPid = String(previewProc.pid ?? "");
 
-    const ready = await waitForUrl(`http://127.0.0.1:${previewPort}/index.html`, 8000);
+    const ready = await Promise.race([
+      waitForUrl(`http://127.0.0.1:${previewPort}/index.html`, 8000, previewProc),
+      logFailure,
+    ]);
     if (ready) {
+      // Drain writes queued by the startup acknowledgement before declaring
+      // readiness: the file may open successfully but fail its first write.
+      await new Promise<void>((resolve, reject) => {
+        logStream.write("", error => error ? reject(error) : resolve());
+      });
       previewUrl = `http://127.0.0.1:${previewPort}/index.html`;
       console.log(`Preview server ready at ${previewUrl}`);
     } else {
-      console.warn("Preview server failed to respond in time. Tests will skip preview checks.");
+      throw new Error(`The preview child did not become ready on port ${previewPort}; see ${previewLog}`);
     }
   }
 
@@ -444,18 +497,117 @@ async function globalSetup() {
 
 export default globalSetup;
 
-async function waitForUrl(url: string, timeoutMs: number): Promise<boolean> {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    try {
-      const res = await fetch(url, { method: "GET" });
-      if (res.ok) {
-        return true;
-      }
-    } catch {
-      // ignore
+// Keep the ChildProcess handle: a PID persisted by a previous run may now
+// identify an unrelated process. Playwright calls this through global teardown.
+export async function cleanupPreview(): Promise<void> {
+  const child = previewProcess;
+  const logStream = previewLogStream;
+  previewProcess = undefined;
+  previewLogStream = undefined;
+  try {
+    const running = child?.exitCode === null && child.signalCode === null;
+    // Exit precedes stdio close; ending the log in that interval loses output.
+    const pipesOpen = [child?.stdout, child?.stderr].some(stream => stream && !stream.closed);
+    if (child?.pid && (running || pipesOpen)) {
+      await new Promise<void>((resolve, reject) => {
+        let timer = setTimeout(() => {
+          if (child.exitCode === null && child.signalCode === null) {
+            timer = setTimeout(() => {
+              onError(new Error("Preview output did not close after SIGKILL"));
+            }, 2000);
+            child.kill("SIGKILL");
+          } else {
+            onError(new Error("Preview output did not close after process exit"));
+          }
+        }, 2000);
+        const onClose = () => {
+          clearTimeout(timer);
+          child.off("error", onError);
+          resolve();
+        };
+        const onError = (error: Error) => {
+          clearTimeout(timer);
+          child.off("close", onClose);
+          child.off("error", onError);
+          // An inherited writer can outlive the child. Once draining fails,
+          // release our read handles so they cannot keep teardown alive.
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+          reject(error);
+        };
+        child.once("close", onClose);
+        child.once("error", onError);
+        if (running) child.kill("SIGTERM");
+      });
     }
-    await new Promise((resolve) => setTimeout(resolve, 200));
+  } finally {
+    if (logStream) {
+      if (!logStream.writableEnded) logStream.end();
+      await finished(logStream, { cleanup: true });
+    }
   }
-  return false;
+}
+
+async function waitForUrl(
+  url: string,
+  timeoutMs: number,
+  previewProc?: ReturnType<typeof spawn>,
+): Promise<boolean> {
+  const start = Date.now();
+  const controller = new AbortController();
+  let bound = !previewProc;
+  let pendingLine = "";
+  let wake: () => void = () => {};
+  const startup = new Promise<void>(resolve => { wake = resolve; });
+  const onStopped = () => controller.abort();
+  const target = new URL(url);
+  const port = target.port || (target.protocol === "https:" ? "443" : "80");
+  const expected = `Preview server running at http://localhost:${port}`;
+  const onOutput = (chunk: Buffer) => {
+    const lines = (pendingLine + chunk.toString()).split("\n");
+    pendingLine = (lines.pop() ?? "").slice(-65536);
+    if (lines.some(line => stripVTControlCharacters(line).trimEnd().endsWith(expected))) {
+      bound = true;
+      wake();
+    }
+  };
+  controller.signal.addEventListener("abort", wake, { once: true });
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    if (previewProc) {
+      previewProc.once("error", onStopped);
+      previewProc.once("exit", onStopped);
+      previewProc.stderr?.on("data", onOutput);
+      if (!previewProc.pid || previewProc.exitCode !== null || previewProc.signalCode !== null) {
+        controller.abort();
+      }
+      if (!controller.signal.aborted) {
+        await startup;
+      }
+    }
+    while (bound && !controller.signal.aborted && Date.now() - start < timeoutMs) {
+      try {
+        const res = await fetch(url, { method: "GET", signal: controller.signal });
+        if (res.ok && !controller.signal.aborted) {
+          return true;
+        }
+      } catch {
+        if (controller.signal.aborted) {
+          return false;
+        }
+      }
+      const remaining = timeoutMs - (Date.now() - start);
+      if (remaining > 0) {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(200, remaining)));
+      }
+    }
+    return false;
+  } finally {
+    clearTimeout(timer);
+    controller.abort();
+    controller.signal.removeEventListener("abort", wake);
+    previewProc?.off("error", onStopped);
+    previewProc?.off("exit", onStopped);
+    previewProc?.stderr?.off("data", onOutput);
+  }
 }

@@ -1731,7 +1731,8 @@ pub enum Commands {
     Quarantine(QuarantineCommand),
     /// Prune archived conversations by source path, workspace, or age
     /// (dry-run by default; `--apply` to commit). At least one selector is
-    /// required; supplied selectors are ANDed. Rebuilds derived search and
+    /// required; source selectors form a union, intersected with workspace
+    /// and age. Rebuilds derived search and
     /// analytics assets while keeping source files. Forgotten sessions in
     /// shared stores stay forgotten until explicitly released with --reinclude.
     /// Use --list to inspect recorded exclusions without changing the archive.
@@ -1739,16 +1740,16 @@ pub enum Commands {
         group(clap::ArgGroup::new("forget_selectors")
             .required(true)
             .multiple(true)
-            .args(["source_glob", "workspace_glob", "older_than", "list", "reinclude"])),
+            .args(["source_glob", "source_path", "workspace_glob", "older_than", "list", "reinclude"])),
         group(clap::ArgGroup::new("exclusion_action")
             .multiple(false)
             .args(["list", "reinclude"])),
-        after_long_help = "Globs match stored paths case-sensitively; * also matches /. A source path can be a logical database/session handle. Missing workspaces do not match --workspace-glob. Age uses the latest message timestamp, strictly before the reported cutoff; sessions with no messages or any missing message timestamp are kept.\n\nShared stores use durable per-session tombstones scoped by source provenance, agent, source path and external session ID. Edits, appends, sibling changes, --full and changes to CASS_EXCLUDE_WORKSPACES do not restore that identity. Inspect exclusions with --list, then preview an explicit release with --reinclude and --source-path, --source-glob, --source-id, --agent and/or --external-id. Add --apply to release the reviewed exclusions, then run cass index. Current workspace/path policies still apply.\n\nHistorical exclusions have no recorded workspace or message-age metadata, so --workspace-glob and --older-than cannot select --list or --reinclude records. Exact identity selectors never silently release a path-wide source exclusion; preview a source-only release if such an overlap is reported.\n\nOrdinary single-session files retain size/mtime tombstones: unchanged files stay forgotten, and a changed stamp makes the file eligible for indexing again. Source files and existing raw-mirror captures are kept. All deletion and re-inclusion is explicit; there is no automatic age pruning."
+        after_long_help = "Repeat --source-path for a batch of exact stored paths; glob metacharacters and whitespace are literal. Repeat --source-glob for a union of patterns. The union of all source paths and globs is intersected with workspace and age, then deleted in one transaction with one derived rebuild. Duplicates and overlaps select each conversation once. A zero-match apply skips rebuilding unless an interrupted forget still needs repair.\n\nGlobs match stored paths case-sensitively; * also matches /. A source path can be a logical database/session handle. Missing workspaces do not match --workspace-glob. Age uses the latest message timestamp, strictly before the reported cutoff; sessions with no messages or any missing message timestamp are kept.\n\nShared stores use durable per-session tombstones scoped by source provenance, agent, source path and external session ID. Edits, appends, sibling changes, --full and changes to CASS_EXCLUDE_WORKSPACES do not restore that identity. Inspect exclusions with --list, then preview an explicit release with --reinclude and --source-path, --source-glob, --source-id, --agent and/or --external-id. These management modes accept only one source path or glob. Add --apply to release the reviewed exclusions, then run cass index. Current workspace/path policies still apply.\n\nHistorical exclusions have no recorded workspace or message-age metadata, so --workspace-glob and --older-than cannot select --list or --reinclude records. Exact identity selectors never silently release a path-wide source exclusion; preview a source-only release if such an overlap is reported.\n\nOrdinary single-session files retain size/mtime tombstones: unchanged files stay forgotten, and a changed stamp makes the file eligible for indexing again. Source files and existing raw-mirror captures are kept. All deletion and re-inclusion is explicit; there is no automatic age pruning."
     )]
     Forget {
-        /// Glob over conversation `source_path` (e.g. `**/subagents/*.jsonl`).
+        /// Glob over conversation `source_path`; repeat to select a union.
         #[arg(long = "source-glob")]
-        source_glob: Option<String>,
+        source_glob: Vec<String>,
 
         /// Glob over the recorded workspace path (e.g. `/work/scratch/**`).
         #[arg(long = "workspace-glob", conflicts_with_all = ["list", "reinclude"])]
@@ -1767,9 +1768,9 @@ pub enum Commands {
         #[arg(long, conflicts_with = "list")]
         reinclude: bool,
 
-        /// Exact stored source path for --list/--reinclude (no glob expansion).
-        #[arg(long, requires = "exclusion_action", conflicts_with = "source_glob")]
-        source_path: Option<String>,
+        /// Exact stored source path (no glob expansion); repeat to batch forget.
+        #[arg(long)]
+        source_path: Vec<String>,
 
         /// Exact source/provenance ID for --list/--reinclude (e.g. local).
         #[arg(long, requires = "exclusion_action")]
@@ -2710,6 +2711,12 @@ pub enum ModelsCommand {
         /// Skip confirmation prompt
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Preview the installation without downloading, writing files, or prompting
+        #[arg(long)]
+        dry_run: bool,
+        /// Output the installation preview as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot", requires = "dry_run")]
+        json: bool,
         /// Override data dir
         #[arg(long)]
         data_dir: Option<PathBuf>,
@@ -2952,7 +2959,7 @@ pub enum AgentsAction {
     },
     /// Exclude an agent/connector from future indexing runs
     Exclude {
-        /// Agent slug to exclude (e.g. openclaw, claude_code, codex)
+        /// Connector slug to exclude, including all named agents (e.g. openclaw)
         agent: String,
         /// Persist the exclusion but leave already indexed archive data untouched
         #[arg(long, default_value_t = false)]
@@ -10235,37 +10242,46 @@ fn run_quarantine_clear(
 /// must never turn a selective forget into a broader deletion or trigger a
 /// storage migration. Resolve relative age exactly once for this invocation.
 fn forget_filter<'a>(
-    source_glob: Option<&'a str>,
+    source_globs: &'a [String],
+    source_paths: &'a [String],
     workspace_glob: Option<&'a str>,
     older_than: Option<&str>,
     now_ms: i64,
 ) -> CliResult<crate::storage::sqlite::ForgetConversationsFilter<'a>> {
-    if source_glob.is_none() && workspace_glob.is_none() && older_than.is_none() {
+    if source_globs.is_empty()
+        && source_paths.is_empty()
+        && workspace_glob.is_none()
+        && older_than.is_none()
+    {
         return Err(CliError::usage(
             "cass forget requires at least one selector",
-            Some("Pass --source-glob, --workspace-glob, or --older-than. Supplied selectors are ANDed; preview with --json before adding --apply.".to_string()),
+            Some("Pass --source-path, --source-glob, --workspace-glob, or --older-than. Source selectors form a union, intersected with workspace and age; preview with --json before adding --apply.".to_string()),
         ));
     }
-    let source_glob = source_glob.map(str::trim);
     let workspace_glob = workspace_glob.map(str::trim);
-    for (name, pattern) in [
-        ("source-glob", source_glob),
-        ("workspace-glob", workspace_glob),
-    ] {
-        if let Some(pattern) = pattern {
-            if pattern.is_empty() {
-                return Err(CliError::usage(
-                    format!("forget --{name} must not be empty"),
-                    None,
-                ));
-            }
-            glob::Pattern::new(pattern).map_err(|error| {
-                CliError::usage(
-                    format!("invalid forget --{name} glob: {error}"),
-                    Some("Quote the glob so your shell passes it to cass unchanged.".to_string()),
-                )
-            })?;
+    for (name, pattern) in source_globs
+        .iter()
+        .map(|pattern| ("source-glob", pattern.trim()))
+        .chain(workspace_glob.map(|pattern| ("workspace-glob", pattern)))
+    {
+        if pattern.is_empty() {
+            return Err(CliError::usage(
+                format!("forget --{name} must not be empty"),
+                None,
+            ));
         }
+        glob::Pattern::new(pattern).map_err(|error| {
+            CliError::usage(
+                format!("invalid forget --{name} glob: {error}"),
+                Some("Quote the glob so your shell passes it to cass unchanged.".to_string()),
+            )
+        })?;
+    }
+    if source_paths.iter().any(|path| path.trim().is_empty()) {
+        return Err(CliError::usage(
+            "forget --source-path must not be empty",
+            None,
+        ));
     }
     let before_ms = older_than
         .map(|duration| {
@@ -10276,7 +10292,8 @@ fn forget_filter<'a>(
         })
         .transpose()?;
     Ok(crate::storage::sqlite::ForgetConversationsFilter {
-        source_glob,
+        source_globs,
+        source_paths,
         workspace_glob,
         before_ms,
     })
@@ -10291,13 +10308,25 @@ mod forget_selector_tests {
         for args in [vec!["cass", "forget"], vec!["cass", "forget", "--apply"]] {
             assert!(Cli::try_parse_from(args).is_err());
         }
-        assert!(forget_filter(None, None, None, 0).is_err());
+        assert!(forget_filter(&[], &[], None, None, 0).is_err());
     }
 
     #[test]
     fn forget_accepts_each_selector_and_intersections() {
         for selectors in [
             vec!["--source-glob", "**/rollout-*.jsonl"],
+            vec![
+                "--source-path",
+                "/logs/one[1].jsonl",
+                "--source-path",
+                "/logs/two.jsonl",
+            ],
+            vec![
+                "--source-glob",
+                "**/one.jsonl",
+                "--source-glob",
+                "**/two.jsonl",
+            ],
             vec!["--workspace-glob", "/work/scratch/**"],
             vec!["--older-than", "90d"],
             vec![
@@ -10318,14 +10347,18 @@ mod forget_selector_tests {
                 Some(Commands::Forget { apply: false, .. })
             ));
         }
+        let source_globs = [" **/*.jsonl ".to_string()];
+        let source_paths = [" /logs/literal[1].jsonl ".to_string()];
         let filter = forget_filter(
-            Some(" **/*.jsonl "),
+            &source_globs,
+            &source_paths,
             Some("/work/*"),
             Some("2d"),
             200_000_000,
         )
         .expect("valid selection");
-        assert_eq!(filter.source_glob, Some("**/*.jsonl"));
+        assert_eq!(filter.source_globs, source_globs);
+        assert_eq!(filter.source_paths, source_paths);
         assert_eq!(filter.workspace_glob, Some("/work/*"));
         assert_eq!(filter.before_ms, Some(27_200_000));
     }
@@ -10333,9 +10366,23 @@ mod forget_selector_tests {
     #[test]
     fn forget_rejects_invalid_selectors_before_storage() {
         for pattern in ["", "   ", "["] {
-            assert!(forget_filter(Some(pattern), None, None, 0).is_err());
-            assert!(forget_filter(None, Some(pattern), None, 0).is_err());
+            assert!(forget_filter(&[pattern.to_owned()], &[], None, None, 0).is_err());
+            assert!(forget_filter(&[], &[], Some(pattern), None, 0).is_err());
+            assert!(
+                forget_filter(
+                    &["/valid.jsonl".to_owned(), pattern.to_owned()],
+                    &[],
+                    None,
+                    None,
+                    0
+                )
+                .is_err()
+            );
         }
+        for path in ["", "   "] {
+            assert!(forget_filter(&[], &[path.to_owned()], None, None, 0).is_err());
+        }
+        assert!(forget_filter(&[], &["/literal[1]?*.jsonl".to_owned()], None, None, 0).is_ok());
         for duration in [
             "",
             "yesterday",
@@ -10344,11 +10391,11 @@ mod forget_selector_tests {
             "90fortnights",
             "9223372036854775807d",
         ] {
-            assert!(forget_filter(None, None, Some(duration), 0).is_err());
+            assert!(forget_filter(&[], &[], None, Some(duration), 0).is_err());
         }
-        assert!(forget_filter(None, None, Some("1s"), i64::MIN).is_err());
+        assert!(forget_filter(&[], &[], None, Some("1s"), i64::MIN).is_err());
         assert_eq!(
-            forget_filter(None, None, Some("0s"), 42)
+            forget_filter(&[], &[], None, Some("0s"), 42)
                 .expect("explicit zero age")
                 .before_ms,
             Some(42)
@@ -10358,12 +10405,12 @@ mod forget_selector_tests {
 
 #[derive(Default)]
 struct ForgetCommandOptions {
-    source_glob: Option<String>,
+    source_glob: Vec<String>,
     workspace_glob: Option<String>,
     older_than: Option<String>,
     list: bool,
     reinclude: bool,
-    source_path: Option<String>,
+    source_path: Vec<String>,
     source_id: Option<String>,
     agent: Option<String>,
     external_id: Option<String>,
@@ -10374,8 +10421,8 @@ struct ForgetCommandOptions {
 impl ForgetCommandOptions {
     fn exclusion_selector(&self) -> crate::storage::sqlite::ForgetExclusionSelector<'_> {
         crate::storage::sqlite::ForgetExclusionSelector {
-            source_glob: self.source_glob.as_deref(),
-            source_path: self.source_path.as_deref(),
+            source_glob: self.source_glob.first().map(String::as_str),
+            source_path: self.source_path.first().map(String::as_str),
             source_id: self.source_id.as_deref(),
             agent_slug: self.agent.as_deref(),
             external_id: self.external_id.as_deref(),
@@ -10397,6 +10444,12 @@ fn run_forget_command(
     let older_than = &options.older_than;
     let exclusion_action = options.list || options.reinclude;
     let filter = if exclusion_action {
+        if options.source_glob.len() > 1 || options.source_path.len() > 1 {
+            return Err(CliError::usage(
+                "--list/--reinclude accept only one --source-glob or --source-path",
+                Some("Repeated source selectors are supported for forgetting conversations. Review and release exclusions separately.".to_string()),
+            ));
+        }
         if (options.list && (options.reinclude || apply))
             || options.workspace_glob.is_some()
             || older_than.is_some()
@@ -10412,18 +10465,15 @@ fn run_forget_command(
             .map_err(|error| CliError::usage(error.to_string(), None))?;
         None
     } else {
-        if options.source_path.is_some()
-            || options.source_id.is_some()
-            || options.agent.is_some()
-            || options.external_id.is_some()
-        {
+        if options.source_id.is_some() || options.agent.is_some() || options.external_id.is_some() {
             return Err(CliError::usage(
                 "exact exclusion identity selectors require --list or --reinclude",
                 None,
             ));
         }
         Some(forget_filter(
-            options.source_glob.as_deref(),
+            &options.source_glob,
+            &options.source_path,
             options.workspace_glob.as_deref(),
             older_than.as_deref(),
             chrono::Utc::now().timestamp_millis(),
@@ -10591,11 +10641,12 @@ fn run_forget_command(
         None
     };
 
-    // WS-B.5 (z2uon): an applied forget deletes rows and rewrites FTS,
+    // WS-B.5 (z2uon): an actual forget deletes rows and rewrites FTS,
     // analytics and daily-stats tables; close through the checkpointing path
     // so the next opener does not replay all of that from the WAL. A dry run
-    // wrote nothing and must not checkpoint anything.
-    if apply {
+    // and an empty apply without a pending repair wrote nothing in the
+    // forget transaction. Neither needs to checkpoint the archive.
+    if remaining_conversations.is_some() {
         if let Err(err) =
             crate::indexer::close_storage_with_wal_checkpoint(storage, &db_path, "forget")
         {
@@ -10612,7 +10663,7 @@ fn run_forget_command(
             .map_err(|error| CliError {
                 code: 5,
                 kind: "forget",
-                message: format!("failed to close forget preview: {error}"),
+                message: format!("failed to close forget inspection: {error}"),
                 hint: None,
                 retryable: false,
             })?;
@@ -10691,6 +10742,10 @@ fn run_forget_command(
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("schema_version".to_string(), serde_json::json!(1));
             obj.insert("applied".to_string(), serde_json::json!(apply));
+            obj.insert(
+                "derived_rebuilt".to_string(),
+                serde_json::json!(remaining_conversations.is_some()),
+            );
             obj.insert("older_than".to_string(), serde_json::json!(older_than));
             obj.insert(
                 "db_path".to_string(),
@@ -10711,7 +10766,10 @@ fn run_forget_command(
             "dry-run (inspect only)"
         }
     );
-    if let Some(pattern) = &report.source_glob {
+    for path in &report.source_paths {
+        println!("Exact source path: {path}");
+    }
+    for pattern in &report.source_globs {
         println!("Source glob: {pattern}");
     }
     if let Some(pattern) = &report.workspace_glob {
@@ -10723,7 +10781,17 @@ fn run_forget_command(
             .unwrap_or_else(|| format!("{cutoff} ms since the Unix epoch"));
         println!("Last message before: {cutoff} (unknown message times are kept)");
     }
-    println!("All supplied selectors must match.");
+    println!("Source paths/globs form a union; workspace and age must also match.");
+    if apply {
+        println!(
+            "Derived rebuild: {}",
+            if remaining_conversations.is_some() {
+                "completed"
+            } else {
+                "skipped (no deletion or pending repair)"
+            }
+        );
+    }
     println!();
     println!(
         "Matched conversations: {} ({} messages)",
@@ -10762,11 +10830,13 @@ fn run_forget_command(
         }
     }
     println!();
-    if apply {
+    if remaining_conversations.is_some() {
         println!(
             "Deleted {} conversation(s) from the canonical DB and rebuilt derived assets.",
             report.conversations_deleted
         );
+    } else if apply {
+        println!("No conversations matched and no derived repair was pending. Nothing to rebuild.");
     } else if report.conversations_matched > 0 {
         println!("Re-run with --apply to delete these conversations.");
     } else {
@@ -10943,8 +11013,8 @@ fn run_forget_exclusion_action(
         object.insert(
             "selector".to_string(),
             serde_json::json!({
-                "source_glob": options.source_glob,
-                "source_path": options.source_path,
+                "source_glob": options.source_glob.first(),
+                "source_path": options.source_path.first(),
                 "source_id": options.source_id,
                 "agent_slug": options.agent,
                 "external_id": options.external_id,
@@ -27754,7 +27824,8 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Swarm(SwarmCommand::Dashboard { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
-        Commands::Models(ModelsCommand::Status { json }) => {
+        Commands::Models(ModelsCommand::Install { json, .. })
+        | Commands::Models(ModelsCommand::Status { json }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::Models(ModelsCommand::Verify { json, .. }) => {
@@ -28240,7 +28311,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass expand <path> --message-index N [--source ID] [--conversation-id ID] [-C CONTEXT] [--json]  Follow search line_number; --line is for raw JSONL.".to_string(),
             "  cass resume <path> [--shell]     Resolve a session path into its native-harness resume command.".to_string(),
             "  cass timeline [--since DATE] [--until DATE] [--json]  Activity timeline over a time range.".to_string(),
-            "  cass forget [--source-glob '<glob>'] [--workspace-glob '<glob>'] [--older-than 90d] [--apply] [--json]  Require at least one selector; combine with AND. Preview matching sessions; --apply removes indexed copies and keeps source files. Shared-session tombstones persist until explicitly released.".to_string(),
+            "  cass forget [--source-path PATH]... [--source-glob '<glob>']... [--workspace-glob '<glob>'] [--older-than 90d] [--apply] [--json]  Require at least one selector. Source paths/globs form a union, intersected with workspace and age. Apply deletes the batch atomically and rebuilds once; no-match skips rebuilding unless a repair is pending. Shared-session tombstones persist until explicitly released.".to_string(),
             "  cass forget --list [--source-glob '<glob>' | --source-path PATH] [--source-id ID] [--agent SLUG] [--external-id ID] --json  Inspect recorded exclusions; historical records have no workspace or message-age metadata.".to_string(),
             "  cass forget --reinclude [identity selectors] [--apply] --json  Preview explicit exclusion release; at least one selector is required. After apply, run cass index; current indexing policies still apply.".to_string(),
             "  cass mirror prune [--older-than 90d] [--max-size 100GB] [--keep-latest 1] [--keep-tag important] [--apply] [--json]  Plan or apply raw-mirror retention with an audit log.".to_string(),
@@ -45010,6 +45081,32 @@ fn doctor_forensic_bundle_failed(reason: impl Into<String>) -> DoctorForensicBun
     }
 }
 
+/// Reference a captured bundle without copying its potentially archive-sized inventory.
+/// The owning report and the checksum-bound manifest retain the full artifact list;
+/// per-source/action receipts need only its identity, counts and safety outcome.
+fn doctor_forensic_bundle_receipt_ref(
+    bundle: &DoctorForensicBundleMetadata,
+) -> DoctorForensicBundleMetadata {
+    DoctorForensicBundleMetadata {
+        bundle_id: bundle.bundle_id.clone(),
+        path: bundle.path.clone(),
+        redacted_path: bundle.redacted_path.clone(),
+        manifest_path: bundle.manifest_path.clone(),
+        redacted_manifest_path: bundle.redacted_manifest_path.clone(),
+        checksum_blake3: bundle.checksum_blake3.clone(),
+        status: bundle.status.clone(),
+        created_at_ms: bundle.created_at_ms,
+        artifact_count: bundle.artifact_count,
+        copied_artifact_count: bundle.copied_artifact_count,
+        missing_artifact_count: bundle.missing_artifact_count,
+        failed_artifact_count: bundle.failed_artifact_count,
+        sidecar_complete: bundle.sidecar_complete,
+        redaction_status: bundle.redaction_status.clone(),
+        blocked_reason: bundle.blocked_reason.clone(),
+        artifacts: Vec::new(),
+    }
+}
+
 fn doctor_forensic_bundle_root(data_dir: &Path) -> PathBuf {
     data_dir.join("doctor").join("forensic-bundles")
 }
@@ -54573,7 +54670,8 @@ fn collect_doctor_raw_mirror_backfill_report(
                     if doctor_raw_mirror_backfill_receipt_would_mutate(&receipt) {
                         receipt.action = "blocked_forensic_bundle_capture_failed".to_string();
                         receipt.warnings.push(blocked_reason.clone());
-                        receipt.forensic_bundle = report.forensic_bundle.clone();
+                        receipt.forensic_bundle =
+                            doctor_forensic_bundle_receipt_ref(&report.forensic_bundle);
                     }
                     accumulate_doctor_raw_mirror_backfill_receipt(&mut report, receipt);
                 }
@@ -54597,7 +54695,7 @@ fn collect_doctor_raw_mirror_backfill_report(
             || receipt.action == "capture_live_source_failed"
             || receipt.action == "existing_raw_manifest_link_failed";
         if report.forensic_bundle.status == "captured" && mutating_receipt {
-            receipt.forensic_bundle = report.forensic_bundle.clone();
+            receipt.forensic_bundle = doctor_forensic_bundle_receipt_ref(&report.forensic_bundle);
         }
         accumulate_doctor_raw_mirror_backfill_receipt(&mut report, receipt);
     }
@@ -68884,7 +68982,7 @@ fn build_cleanup_doctor_plan(
         actions,
         artifact_manifest: doctor_artifact_manifest(artifacts),
         event_log: DoctorEventLogMetadata::default(),
-        forensic_bundle: result.forensic_bundle.clone(),
+        forensic_bundle: doctor_forensic_bundle_receipt_ref(&result.forensic_bundle),
         selected_authorities,
         rejected_authorities: Vec::new(),
         blocked_reasons: result.blocked_reasons.clone(),
@@ -70585,7 +70683,7 @@ fn finalize_cleanup_apply_contract(
         verification_outcomes,
         remaining_risk,
         event_log,
-        forensic_bundle: plan.forensic_bundle.clone(),
+        forensic_bundle: doctor_forensic_bundle_receipt_ref(&plan.forensic_bundle),
         artifact_manifest: artifact_manifest.clone(),
         artifact_checksums,
         drift_detection_status: artifact_manifest.drift_detection_status,
@@ -71669,7 +71767,8 @@ fn apply_diag_quarantine_cleanup(
             required_min_age_seconds: None,
         });
         let mutation_ended_at_ms = doctor_now_ms();
-        mutation_receipt.forensic_bundle = result.forensic_bundle.clone();
+        mutation_receipt.forensic_bundle =
+            doctor_forensic_bundle_receipt_ref(&result.forensic_bundle);
         match mutation_receipt.status {
             DoctorActionStatus::Applied => {
                 let reclaimed_bytes = mutation_receipt.affected_bytes;
@@ -71786,7 +71885,8 @@ fn apply_diag_quarantine_cleanup(
                 required_min_age_seconds: None,
             });
             let mutation_ended_at_ms = doctor_now_ms();
-            mutation_receipt.forensic_bundle = result.forensic_bundle.clone();
+            mutation_receipt.forensic_bundle =
+                doctor_forensic_bundle_receipt_ref(&result.forensic_bundle);
             match mutation_receipt.status {
                 DoctorActionStatus::Applied => {
                     let reclaimed_bytes = mutation_receipt.affected_bytes;
@@ -78992,6 +79092,18 @@ mod doctor_asset_taxonomy_tests {
             file_blake3_hex(&manifest_path).expect("manifest hash"),
             bundle.checksum_blake3.clone().expect("metadata checksum")
         );
+        let mut expected_reference = serde_json::to_value(&bundle).expect("bundle metadata");
+        expected_reference["artifacts"] = serde_json::json!([]);
+        assert_eq!(
+            serde_json::to_value(doctor_forensic_bundle_receipt_ref(&bundle))
+                .expect("receipt reference"),
+            expected_reference,
+            "receipts must retain all identity and safety fields without duplicating the inventory"
+        );
+        assert!(
+            !bundle.artifacts.is_empty(),
+            "referencing a bundle must leave its owning inventory intact"
+        );
         let env_metadata_path = PathBuf::from(bundle.path.as_deref().expect("bundle path"))
             .join("metadata")
             .join("env-metadata.json");
@@ -79032,6 +79144,53 @@ mod doctor_asset_taxonomy_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn doctor_forensic_bundle_receipt_ref_bounds_inventory_fanout() {
+        let artifact = DoctorForensicBundleArtifact {
+            artifact_kind: "raw_mirror_manifest".to_string(),
+            source_path: "/archive/raw-mirror/manifest.json".to_string(),
+            redacted_source_path: "[cass-data]/raw-mirror/manifest.json".to_string(),
+            checksum_blake3: Some("ab".repeat(32)),
+            copied: true,
+            ..DoctorForensicBundleArtifact::default()
+        };
+        let bundle = DoctorForensicBundleMetadata {
+            bundle_id: Some("archive-backfill".to_string()),
+            manifest_path: Some("/archive/doctor/manifest.json".to_string()),
+            checksum_blake3: Some("cd".repeat(32)),
+            status: "captured".to_string(),
+            artifact_count: 4096,
+            copied_artifact_count: 4096,
+            sidecar_complete: true,
+            redaction_status: "redacted".to_string(),
+            artifacts: vec![artifact; 4096],
+            ..DoctorForensicBundleMetadata::default()
+        };
+        let references = (0..256)
+            .map(|_| doctor_forensic_bundle_receipt_ref(&bundle))
+            .collect::<Vec<_>>();
+        assert!(references.iter().all(|reference| {
+            reference.artifacts.is_empty()
+                && reference.artifact_count == 4096
+                && reference.checksum_blake3 == bundle.checksum_blake3
+        }));
+        let reference_bytes = serde_json::to_vec(&references).expect("serialize references");
+        let bundle_bytes = serde_json::to_vec(&bundle).expect("serialize full bundle");
+        assert!(
+            reference_bytes.len() < bundle_bytes.len(),
+            "hundreds of receipts must not multiply the archive-sized inventory in robot output"
+        );
+        assert_eq!(bundle.artifacts.len(), 4096);
+
+        let failed = doctor_forensic_bundle_failed("required SQLite sidecar could not be captured");
+        assert_eq!(
+            serde_json::to_value(doctor_forensic_bundle_receipt_ref(&failed))
+                .expect("failed reference"),
+            serde_json::to_value(&failed).expect("failed bundle"),
+            "failure and sidecar refusal must survive reference projection"
+        );
     }
 
     fn test_doctor_raw_mirror_report_for_candidate(data_dir: &Path) -> DoctorRawMirrorReport {
@@ -105225,6 +105384,7 @@ fn response_schema_search_meta() -> serde_json::Value {
                     "index_over_automatic_limit",
                     "automatic_retry_disabled",
                     "long_query_term",
+                    "query_normalization",
                     "query_fuel_exhausted",
                     null
                 ],
@@ -107248,7 +107408,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "model_acquisition": {
                     "type": "object",
                     "additionalProperties": true,
-                    "description": "Hardened acquisition contract: state (absent|partial_download|ready|checksum_mismatch|quarantined_corrupt|budget_blocked|offline_blocked|disabled_by_policy|baseline_no_semantic|incompatible_runtime|runtime_load_failed), runtime, source, cost_class, expected_download_bytes, fallback_mode, next_step, next_command, state_detail, rollback_guidance, fingerprint{revision,content_digest,marker_token}, and skipped_network_reason (the typed proof cass never auto-downloads outside `cass models install`)."
+                    "description": "Hardened acquisition contract: state (absent|partial_download|ready|checksum_mismatch|incompatible_version|quarantined_corrupt|budget_blocked|offline_blocked|disabled_by_policy|baseline_no_semantic|incompatible_runtime|runtime_load_failed), runtime, source, cost_class, expected_download_bytes, fallback_mode, next_step, next_command, state_detail, rollback_guidance, fingerprint{revision,content_digest,marker_token}, and skipped_network_reason (the typed proof cass never auto-downloads outside `cass models install`)."
                 },
                 "files": response_schema_opaque_object_array()
             },
@@ -107544,6 +107704,37 @@ mod response_schema_tests {
         assert_eq!(
             meta["explanation_cards"]["items"]["properties"]["fallback_contract"]["type"],
             serde_json::json!(["object", "null"])
+        );
+    }
+
+    #[test]
+    fn search_schema_accepts_emitted_wildcard_fallback_skip_reasons() {
+        use crate::search::query::{
+            WILDCARD_FALLBACK_SKIPPED_DISABLED, WILDCARD_FALLBACK_SKIPPED_LARGE_INDEX,
+            WILDCARD_FALLBACK_SKIPPED_LONG_TERM, WILDCARD_FALLBACK_SKIPPED_QUERY_FUEL_EXHAUSTED,
+            WILDCARD_FALLBACK_SKIPPED_QUERY_NORMALIZATION,
+        };
+
+        let schemas = build_response_schemas();
+        let meta = &schemas["search"]["properties"]["_meta"]["properties"];
+        let published = meta["wildcard_fallback_skipped"]["enum"]
+            .as_array()
+            .expect("public search schema enumerates wildcard fallback skip reasons");
+        for reason in [
+            WILDCARD_FALLBACK_SKIPPED_DISABLED,
+            WILDCARD_FALLBACK_SKIPPED_LARGE_INDEX,
+            WILDCARD_FALLBACK_SKIPPED_LONG_TERM,
+            WILDCARD_FALLBACK_SKIPPED_QUERY_FUEL_EXHAUSTED,
+            WILDCARD_FALLBACK_SKIPPED_QUERY_NORMALIZATION,
+        ] {
+            assert!(
+                published.contains(&serde_json::json!(reason)),
+                "public search schema rejects emitted skip reason {reason:?}"
+            );
+        }
+        assert!(
+            published.contains(&serde_json::Value::Null),
+            "a search without a skipped retry must remain valid"
         );
     }
 
@@ -126738,6 +126929,8 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
             mirror,
             from_file,
             yes,
+            dry_run,
+            json,
             data_dir,
         } => run_models_install(
             &model,
@@ -126745,6 +126938,8 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
             from_file.as_deref(),
             yes,
             data_dir,
+            dry_run,
+            resolve_subcommand_structured_format(cli, json),
         ),
         ModelsCommand::Verify {
             model,
@@ -127633,7 +127828,7 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
     let active_status =
         active_registry_name.and_then(|name| statuses.iter().find(|s| s.registry_name == name));
 
-    if let Some(_fmt) = structured_format {
+    if let Some(fmt) = structured_format {
         let models_json: Vec<serde_json::Value> = statuses
             .iter()
             .map(|s| {
@@ -127645,7 +127840,7 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
                     "installed": s.cache_report.is_usable(),
                     "state": s.cache_report.state_code(),
                     "state_detail": s.cache_report.state.summary(),
-                    "next_step": s.cache_report.state.next_step(),
+                    "next_step": s.cache_report.state.next_step(s.registry_name),
                     "revision": s.manifest.revision,
                     "license": s.manifest.license,
                     "total_size_bytes": s.total_size,
@@ -127674,7 +127869,7 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
                 "installed": s.cache_report.is_usable(),
                 "state": s.cache_report.state_code(),
                 "state_detail": s.cache_report.state.summary(),
-                "next_step": s.cache_report.state.next_step(),
+                "next_step": s.cache_report.state.next_step(s.registry_name),
                 "revision": s.manifest.revision,
                 "license": s.manifest.license,
                 "total_size_bytes": s.total_size,
@@ -127700,10 +127895,7 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
                 obj.insert(k.clone(), v.clone());
             }
         }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&output).unwrap_or_default()
-        );
+        output_structured_value(output, fmt)?;
     } else {
         use colored::Colorize;
 
@@ -127781,7 +127973,7 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
                 "{} ok / {} partial / {} missing",
                 installed, partial, missing
             );
-            if let Some(next_step) = s.cache_report.state.next_step() {
+            if let Some(next_step) = s.cache_report.state.next_step(s.registry_name) {
                 println!("  Next:     {}", next_step);
             }
             println!();
@@ -127924,9 +128116,11 @@ fn run_models_install(
     from_file: Option<&Path>,
     skip_confirm: bool,
     data_dir_override: Option<PathBuf>,
+    dry_run: bool,
+    output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     use crate::search::model_download::{
-        ModelDownloader, check_model_installed, normalize_mirror_base_url,
+        ModelAcquisitionPolicy, ModelDownloader, classify_model_cache, normalize_mirror_base_url,
     };
     use colored::Colorize;
     use indicatif::{ProgressBar, ProgressStyle};
@@ -127966,9 +128160,65 @@ fn run_models_install(
             retryable: false,
         })?;
 
+    if dry_run {
+        use crate::search::model_acquisition::{
+            OnDiskPolicyInputs, RuntimeLoadability, installation_preview,
+        };
+        use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
+
+        // Resolve and inspect only. The installer, acquisition lease, staging,
+        // parent-directory creation and confirmation prompt are all below.
+        let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
+        let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&policy);
+        let plan = installation_preview(
+            &model_dir,
+            &manifest,
+            RuntimeLoadability::probe_cheap_host(),
+            OnDiskPolicyInputs {
+                policy_enabled: acquisition_policy.downloads_enabled,
+                offline: acquisition_policy.offline,
+                budget_max_bytes: acquisition_policy.max_model_bytes,
+            },
+            registry_name,
+            from_file,
+            mirror_base_url.is_some(),
+        );
+        if let Some(format) = output_format {
+            output_structured_value(plan, format)?;
+        } else {
+            println!("{}", "Model installation preview".bold());
+            println!("  Model: {} ({})", manifest.id, manifest.revision);
+            println!(
+                "  Source: {}",
+                plan["source_kind"].as_str().unwrap_or("unknown")
+            );
+            let action = match plan["action"].as_str() {
+                Some("reuse_verified_cache") => {
+                    "Reuse verified installed files; no download needed."
+                }
+                Some("install_from_file") => "Install files from the local source.",
+                _ => "Download and install model files.",
+            };
+            println!("  Action: {action}");
+            if let Some(source_path) = from_file {
+                println!("  Local source: {}", source_path.display());
+            }
+            println!("  Destination: {}", model_dir.display());
+            for file in &manifest.files {
+                println!(
+                    "  {}: {} bytes, expected SHA256 {}",
+                    file.local_name(),
+                    file.size,
+                    file.sha256,
+                );
+            }
+        }
+        return Ok(());
+    }
+
     // Install from local directory (for air-gapped environments)
     if let Some(source_path) = from_file {
-        use crate::search::model_download::compute_sha256;
+        use crate::search::model_download::DownloadError;
 
         if !source_path.is_dir() {
             return Err(CliError {
@@ -127991,7 +128241,9 @@ fn run_models_install(
             source_path.display()
         );
 
-        // Verify all required files exist and match checksums
+        // Preserve the actionable missing-file envelope before staging. The
+        // shared installer verifies the bytes it actually copies, rather than
+        // trusting a checksum computed before the source could change.
         for mfile in &manifest.files {
             let local_name = mfile.local_name();
             let src = source_path.join(local_name);
@@ -128016,74 +128268,43 @@ fn run_models_install(
                     retryable: false,
                 });
             }
+        }
 
-            // Verify SHA256
-            println!("  Verifying {}...", local_name);
-            let actual_hash = compute_sha256(&src).map_err(|e| CliError {
-                code: 22,
-                kind: CliErrorKind::Io.kind_str(),
-                message: format!("Failed to hash {}: {}", local_name, e),
-                hint: None,
-                retryable: false,
-            })?;
-            if actual_hash != mfile.sha256 {
-                return Err(CliError {
+        let downloader = ModelDownloader::new(model_dir.clone());
+        downloader
+            .install_from_directory(&manifest, source_path, None)
+            .map_err(|error| match error {
+                DownloadError::VerificationFailed {
+                    file,
+                    expected,
+                    actual,
+                } => CliError {
                     code: 21,
                     kind: CliErrorKind::Model.kind_str(),
                     message: format!(
                         "SHA256 mismatch for '{}': expected {}, got {}",
-                        local_name, mfile.sha256, actual_hash
+                        file, expected, actual
                     ),
                     hint: Some(
-                        "The file may be corrupted or from a different model version".into(),
+                        "The copied file may be corrupted or from a different model version; the previous installation was preserved".into(),
                     ),
                     retryable: false,
-                });
-            }
-        }
-
-        // All verified -- copy to model directory
-        std::fs::create_dir_all(&model_dir).map_err(|e| CliError {
-            code: 22,
-            kind: CliErrorKind::Io.kind_str(),
-            message: format!("Failed to create model directory: {}", e),
-            hint: None,
-            retryable: false,
-        })?;
-
-        for mfile in &manifest.files {
-            let local_name = mfile.local_name();
-            let src = source_path.join(local_name);
-            let dst = model_dir.join(local_name);
-            std::fs::copy(&src, &dst).map_err(|e| CliError {
-                code: 22,
-                kind: CliErrorKind::Io.kind_str(),
-                message: format!("Failed to copy {}: {}", local_name, e),
-                hint: None,
-                retryable: false,
+                },
+                DownloadError::InstallInProgress { .. } => CliError {
+                    code: 21,
+                    kind: CliErrorKind::Model.kind_str(),
+                    message: error.to_string(),
+                    hint: Some("Retry after the other model installation finishes".into()),
+                    retryable: true,
+                },
+                error => CliError {
+                    code: 22,
+                    kind: CliErrorKind::Io.kind_str(),
+                    message: format!("Failed to stage and install local model: {error}"),
+                    hint: Some("Check the local bundle and available disk space, then retry".into()),
+                    retryable: false,
+                },
             })?;
-        }
-
-        // Write verified marker. The hardened marker records the install
-        // source provenance (`from-file`), the local source path, and the
-        // model fingerprint so an air-gapped install is auditable and
-        // distinguishable from a network download (bead
-        // cass-fleet-resilience-20260608-uojcg.5.5). Byte-compatible with the
-        // legacy reader: `revision=` stays first and unknown lines are ignored.
-        let marker_path = model_dir.join(crate::search::model_acquisition::VERIFIED_MARKER_NAME);
-        let content = crate::search::model_acquisition::VerifiedMarker::for_from_file(
-            &manifest,
-            source_path,
-            chrono::Utc::now().to_rfc3339(),
-        )
-        .render();
-        std::fs::write(&marker_path, content).map_err(|e| CliError {
-            code: 22,
-            kind: CliErrorKind::Io.kind_str(),
-            message: format!("Failed to write verified marker: {}", e),
-            hint: None,
-            retryable: false,
-        })?;
 
         println!();
         println!(
@@ -128091,14 +128312,16 @@ fn run_models_install(
             "✓".green()
         );
         println!("  Location: {}", model_dir.display());
+        println!(
+            "Model files are verified. Semantic search also requires a working embedder and a completed backfill."
+        );
         return Ok(());
     }
 
-    // Check current state — pass the resolved manifest so the
-    // file-presence check matches the model the user asked to install
-    // (bead coding_agent_session_search-odbnh).
-    let state = check_model_installed(&model_dir, &manifest);
-    if state.is_ready() {
+    // Presence alone cannot make a corrupt or revision-incompatible cache a
+    // successful install. Verify the selected manifest before skipping work.
+    let state = classify_model_cache(&model_dir, &manifest, &ModelAcquisitionPolicy::default());
+    if state.is_usable() {
         println!(
             "{} Model files are already installed and verified.",
             "✓".green()
@@ -128258,7 +128481,8 @@ fn run_models_verify(
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     use crate::search::model_download::{
-        ModelAcquisitionPolicy, classify_model_cache, compute_sha256, model_file_path,
+        ModelAcquisitionPolicy, ModelCacheState, ModelDownloader, classify_model_cache,
+        compute_sha256, model_file_path,
     };
     use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
     use colored::Colorize;
@@ -128272,9 +128496,9 @@ fn run_models_verify(
 
     // Hardened model-acquisition projection (bead 0qxwg): the same probe-based
     // block `cass models status` emits, so verify and status agree. The probe
-    // is filesystem-only — `skipped_network_reason` proves verify never
-    // auto-downloads. `probe_cheap_host()` never loads ONNX, so it is safe even
-    // on a corrupt/incompatible cache.
+    // reports its filesystem-only decision; observing the whole command is
+    // required to establish whether other paths attempted networking.
+    // `probe_cheap_host()` never initializes a model runtime.
     let acquisition_block = crate::search::model_acquisition::live_acquisition_block(
         &model_dir,
         &manifest,
@@ -128295,28 +128519,27 @@ fn run_models_verify(
         }
     });
 
-    if !model_dir.is_dir() {
-        if let Some(_fmt) = structured_format {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
+    if !model_dir.is_dir() && !repair {
+        if let Some(fmt) = structured_format {
+            output_structured_value(
+                serde_json::json!({
                     "status": cache_report.state_code(),
                     "state_detail": cache_report.state.summary(),
-                    "next_step": cache_report.state.next_step(),
+                    "next_step": cache_report.state.next_step(registry_name),
                     "lexical_fail_open": true,
                     "model_dir": model_dir.display().to_string(),
                     "all_valid": false,
                     "cache_lifecycle": &cache_report,
                     "model_acquisition": &acquisition_block,
                     "error": "model directory does not exist",
-                }))
-                .unwrap_or_default()
-            );
+                }),
+                fmt,
+            )?;
         } else {
             println!("{} {}", "✗".red(), cache_report.state.summary());
             println!("  Expected location: {}", model_dir.display());
             println!();
-            if let Some(next_step) = cache_report.state.next_step() {
+            if let Some(next_step) = cache_report.state.next_step(registry_name) {
                 println!("{}", next_step);
             }
         }
@@ -128386,22 +128609,49 @@ fn run_models_verify(
         }
     }
 
-    if let Some(_fmt) = structured_format {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
+    // Explicit repair must run in robot mode too. Use the same staged,
+    // verified downloader directly so installation progress cannot corrupt a
+    // JSON response, then report the post-repair state without another repair.
+    if repair
+        && (!all_valid
+            || matches!(
+                &cache_report.state,
+                ModelCacheState::IncompatibleVersion { .. }
+                    | ModelCacheState::QuarantinedCorrupt { .. }
+            ))
+    {
+        if !is_robot {
+            println!("Repairing by re-downloading model files...");
+        }
+        ModelDownloader::new(model_dir.clone())
+            .download(&manifest, None)
+            .map_err(|error| CliError {
+                code: 21,
+                kind: CliErrorKind::Model.kind_str(),
+                message: format!("Failed to repair model '{registry_name}': {error}"),
+                hint: Some(format!(
+                    "Retry with cass models install --model {registry_name}; lexical search remains available"
+                )),
+                retryable: error.is_retryable(),
+            })?;
+        return run_models_verify(registry_name, false, data_dir_override, output_format);
+    }
+
+    if let Some(fmt) = structured_format {
+        output_structured_value(
+            serde_json::json!({
                 "model_dir": model_dir.display().to_string(),
                 "status": cache_report.state_code(),
                 "state_detail": cache_report.state.summary(),
-                "next_step": cache_report.state.next_step(),
+                "next_step": cache_report.state.next_step(registry_name),
                 "lexical_fail_open": true,
                 "all_valid": all_valid,
                 "cache_lifecycle": &cache_report,
                 "model_acquisition": &acquisition_block,
                 "files": results,
-            }))
-            .unwrap_or_default()
-        );
+            }),
+            fmt,
+        )?;
     } else {
         println!();
         if all_valid {
@@ -128412,19 +128662,11 @@ fn run_models_verify(
                 "✗".red(),
                 files_to_repair.len()
             );
-            if repair {
-                println!();
-                println!("Repairing by re-downloading model files...");
-                println!();
-                // Actually perform the repair by re-running install
-                return run_models_install(registry_name, None, None, true, data_dir_override);
-            } else {
-                println!();
-                println!("To repair corrupted files, run:");
-                println!("  cass models verify --model {registry_name} --repair");
-                println!("Or reinstall:");
-                println!("  cass models install --model {registry_name} -y");
-            }
+            println!();
+            println!("To repair corrupted files, run:");
+            println!("  cass models verify --model {registry_name} --repair");
+            println!("Or reinstall:");
+            println!("  cass models install --model {registry_name} -y");
         }
     }
 
@@ -129688,18 +129930,12 @@ fn run_agents_command(action: AgentsAction, cli: &Cli) -> CliResult<()> {
 }
 
 fn archive_agent_slug_for_exclusion(agent: &str) -> String {
-    match agent.trim().to_ascii_lowercase().as_str() {
-        "claude" | "claude-code" | "claude_code" => "claude_code".to_string(),
-        "oh-my-pi" | "oh_my_pi" | "ohmypi" => "omp".to_string(),
-        other => other.to_string(),
-    }
+    let connector = crate::sources::config::normalize_agent_config_name(agent).unwrap_or_default();
+    crate::connectors::archive_provider_slug(&connector).to_string()
 }
 
 fn archive_data_dir_for_agents_command(cli: &Cli) -> PathBuf {
-    cli.db
-        .as_ref()
-        .and_then(|db_path| db_path.parent().map(Path::to_path_buf))
-        .unwrap_or_else(default_data_dir)
+    resolve_data_dir(&None, cli.db.as_ref())
 }
 
 /// What `sources agents exclude` did with rows already archived for the agent.
@@ -129713,17 +129949,55 @@ enum ExcludedAgentPurge {
     ArchiveUnavailable { db_path: PathBuf, error: String },
 }
 
-fn purge_excluded_agent_archive_data(agent: &str, cli: &Cli) -> CliResult<ExcludedAgentPurge> {
+fn acquire_agent_exclusion_mutation_lock(
+    data_dir: &Path,
+    db_path: &Path,
+) -> CliResult<crate::indexer::SearchMaintenanceMutationGuard> {
+    crate::indexer::acquire_search_maintenance_mutation_lock(
+        data_dir,
+        db_path,
+        crate::search::asset_state::SearchMaintenanceJobKind::LexicalRefresh,
+    )
+    .map_err(|error| {
+        let rendered = format!("{error:#}");
+        if error_chain_indicates_active_cass_index(&rendered) {
+            let mut error = active_index_run_details(data_dir, db_path)
+                .map(|details| details.to_cli_error())
+                .unwrap_or_else(|| index_storage_contention_cli_error(&rendered));
+            error.hint = Some(
+                "The exclusion command left configuration and archive data unchanged. Stop the active index/watch or maintenance process, then retry the exclusion."
+                    .to_string(),
+            );
+            return error;
+        }
+        CliError {
+            code: 5,
+            kind: CliErrorKind::ArchivePurge.kind_str(),
+            message: format!("Failed to acquire agent exclusion maintenance lock: {rendered}"),
+            hint: Some(format!(
+                "The exclusion was not saved. Check permissions under {} and beside {}, then retry.",
+                data_dir.display(),
+                db_path.display()
+            )),
+            retryable: true,
+        }
+    })
+}
+
+fn purge_excluded_agent_archive_data(
+    agent: &str,
+    db_path: &Path,
+    data_dir: &Path,
+    mutation_guard: &crate::indexer::SearchMaintenanceMutationGuard,
+) -> CliResult<ExcludedAgentPurge> {
     use crate::storage::sqlite::FrankenStorage;
 
-    let db_path = cli.db.clone().unwrap_or_else(default_db_path);
     if !db_path.is_file() {
-        return Ok(ExcludedAgentPurge::NoArchive(db_path));
+        return Ok(ExcludedAgentPurge::NoArchive(db_path.to_path_buf()));
     }
 
-    let data_dir = archive_data_dir_for_agents_command(cli);
     let archive_agent_slug = archive_agent_slug_for_exclusion(agent);
-    let storage = match FrankenStorage::open(&db_path) {
+    let storage = match FrankenStorage::open(db_path) {
         Ok(storage) => storage,
         Err(err) => {
             tracing::warn!(
@@ -129732,14 +130006,14 @@ fn purge_excluded_agent_archive_data(agent: &str, cli: &Cli) -> CliResult<Exclud
                 "skipping excluded-agent archive purge because the local archive could not be opened"
             );
             return Ok(ExcludedAgentPurge::ArchiveUnavailable {
-                db_path,
+                db_path: db_path.to_path_buf(),
                 error: format!("{err:#}"),
             });
         }
     };
 
     let purge = storage
-        .purge_agent_archive_data(&archive_agent_slug)
+        .purge_connector_archive_data(&archive_agent_slug)
         .map_err(|e| CliError {
             code: 5,
             kind: CliErrorKind::ArchivePurge.kind_str(),
@@ -129747,6 +130021,7 @@ fn purge_excluded_agent_archive_data(agent: &str, cli: &Cli) -> CliResult<Exclud
             hint: Some("The exclusion was still saved; run 'cass index --full' after fixing the archive if needed".into()),
             retryable: false,
         })?;
+    mutation_guard.mark_progress();
     if purge.conversations_deleted == 0 {
         return Ok(ExcludedAgentPurge::Purged(purge));
     }
@@ -129758,6 +130033,7 @@ fn purge_excluded_agent_archive_data(agent: &str, cli: &Cli) -> CliResult<Exclud
         hint: Some("Run 'cass index --full' to refresh derived search data".into()),
         retryable: false,
     })?;
+    mutation_guard.mark_progress();
     storage.rebuild_analytics().map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::ArchiveAnalyticsRebuild.kind_str(),
@@ -129767,6 +130043,7 @@ fn purge_excluded_agent_archive_data(agent: &str, cli: &Cli) -> CliResult<Exclud
         hint: Some("Run 'cass index --full' to refresh derived analytics data".into()),
         retryable: false,
     })?;
+    mutation_guard.mark_progress();
     storage.rebuild_daily_stats().map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::ArchiveDailyStatsRebuild.kind_str(),
@@ -129774,6 +130051,7 @@ fn purge_excluded_agent_archive_data(agent: &str, cli: &Cli) -> CliResult<Exclud
         hint: Some("Run 'cass index --full' to refresh derived daily stats".into()),
         retryable: false,
     })?;
+    mutation_guard.mark_progress();
     storage.rebuild_token_daily_stats().map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::ArchiveTokenDailyStatsRebuild.kind_str(),
@@ -129783,6 +130061,7 @@ fn purge_excluded_agent_archive_data(agent: &str, cli: &Cli) -> CliResult<Exclud
         hint: Some("Run 'cass index --full' to refresh token analytics".into()),
         retryable: false,
     })?;
+    mutation_guard.mark_progress();
     let remaining_conversations = storage.total_conversation_count().map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::ArchiveCount.kind_str(),
@@ -129794,16 +130073,22 @@ fn purge_excluded_agent_archive_data(agent: &str, cli: &Cli) -> CliResult<Exclud
     })?;
     drop(storage);
 
-    crate::indexer::rebuild_tantivy_from_db(&db_path, &data_dir, remaining_conversations, None)
-        .map_err(|e| CliError {
-            code: 5,
-            kind: CliErrorKind::LexicalRebuild.kind_str(),
-            message: format!(
-                "Purged '{archive_agent_slug}' but failed to rebuild the lexical search index: {e}"
-            ),
-            hint: Some("Run 'cass index --full' to refresh lexical search data".into()),
-            retryable: false,
-        })?;
+    crate::indexer::rebuild_tantivy_from_db_with_progress_bump(
+        db_path,
+        data_dir,
+        remaining_conversations,
+        None,
+        mutation_guard.progress_atomic(),
+    )
+    .map_err(|e| CliError {
+        code: 5,
+        kind: CliErrorKind::LexicalRebuild.kind_str(),
+        message: format!(
+            "Purged '{archive_agent_slug}' but failed to rebuild the lexical search index: {e}"
+        ),
+        hint: Some("Run 'cass index --full' to refresh lexical search data".into()),
+        retryable: false,
+    })?;
 
     Ok(ExcludedAgentPurge::Purged(purge))
 }
@@ -129852,6 +130137,31 @@ fn run_agents_list(output_format: Option<RobotFormat>) -> CliResult<()> {
 fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliResult<()> {
     use crate::sources::config::SourcesConfig;
 
+    let apply_exclusion = |config: &mut SourcesConfig| {
+        config
+            .exclude_agent_from_indexing(agent)
+            .map_err(|e| CliError {
+                code: 11,
+                kind: CliErrorKind::Config.kind_str(),
+                message: format!("Failed to update excluded agents: {e}"),
+                hint: Some("Provide a connector slug such as 'openclaw'; qualified names such as 'openclaw/alice' are not connector-wide exclusions".into()),
+                retryable: false,
+            })
+    };
+    // Validate before admission creates any lock files. Load the configuration
+    // used for the actual update only after admission, so another completed
+    // exclusion cannot be overwritten by a pre-lock snapshot.
+    apply_exclusion(&mut SourcesConfig::default())?;
+    let db_path = cli.db.clone().unwrap_or_else(default_db_path);
+    let data_dir = archive_data_dir_for_agents_command(cli);
+    // An already-running indexer/watch keeps its selected connectors. Saving
+    // new configuration cannot revoke that writer's in-flight batches. Own
+    // both the data-dir and archive leases before saving a purging exclusion,
+    // and retain them through the canonical deletion and lexical publication.
+    // Config-only exclusions deliberately apply to future indexing runs.
+    let mutation_guard = (!keep_indexed_data)
+        .then(|| acquire_agent_exclusion_mutation_lock(&data_dir, &db_path))
+        .transpose()?;
     let mut config = SourcesConfig::load().map_err(|e| CliError {
         code: 9,
         kind: CliErrorKind::Config.kind_str(),
@@ -129860,15 +130170,7 @@ fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliRes
         retryable: false,
     })?;
 
-    let changed = config
-        .exclude_agent_from_indexing(agent)
-        .map_err(|e| CliError {
-            code: 11,
-            kind: CliErrorKind::Config.kind_str(),
-            message: format!("Failed to update excluded agents: {e}"),
-            hint: Some("Provide a non-empty agent slug such as 'openclaw'".into()),
-            retryable: false,
-        })?;
+    let changed = apply_exclusion(&mut config)?;
 
     config.save().map_err(|e| CliError {
         code: 11,
@@ -129878,11 +130180,10 @@ fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliRes
         retryable: false,
     })?;
 
-    let purge = if keep_indexed_data {
-        None
-    } else {
-        Some(purge_excluded_agent_archive_data(agent, cli)?)
-    };
+    let purge = mutation_guard
+        .as_ref()
+        .map(|guard| purge_excluded_agent_archive_data(agent, &db_path, &data_dir, guard))
+        .transpose()?;
 
     let agent_slug = agent.trim().to_ascii_lowercase();
     if changed {
@@ -129892,7 +130193,10 @@ fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliRes
         println!("'{agent_slug}' was already excluded from indexing.");
     }
     match purge {
-        None => println!("Existing indexed archive data was left untouched."),
+        None => {
+            println!("Existing indexed archive data was left untouched.");
+            println!("Restart any active index/watch process to apply the updated exclusions.");
+        }
         Some(ExcludedAgentPurge::Purged(purge)) if purge.conversations_deleted > 0 => {
             println!(
                 "Purged {} conversations and {} messages already archived for that agent.",
@@ -130891,6 +131195,7 @@ mod subcommand_robot_output_tests {
                 ],
                 vec!["cass", "export-html", "session.jsonl", "--json"],
                 vec!["cass", "sources", "setup", "--json"],
+                vec!["cass", "models", "install", "--dry-run", "--json"],
             ];
 
             for args in cases {
@@ -130922,6 +131227,9 @@ mod subcommand_robot_output_tests {
                         | AnalyticsCommand::Validate { common, .. },
                     ) => resolve_subcommand_structured_format(&cli, common.json),
                     Commands::Sources(SourcesCommand::Setup { json, .. }) => {
+                        resolve_subcommand_structured_format(&cli, *json)
+                    }
+                    Commands::Models(ModelsCommand::Install { json, .. }) => {
                         resolve_subcommand_structured_format(&cli, *json)
                     }
                     other => panic!("unexpected command variant for args {args:?}: {other:?}"),

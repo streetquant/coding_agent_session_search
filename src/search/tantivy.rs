@@ -31,8 +31,12 @@ use frankensearch::lexical_tantivy::{
     Index, Schema, cass_build_schema as fs_build_schema,
     cass_ensure_tokenizer as fs_ensure_tokenizer, tantivy_crate,
 };
-use frankensearch::quill::cass::{CASS_SCHEMA_HASH, CASS_SCHEMA_VERSION};
-use frankensearch::quill::cass::{cass_index_dir as fs_index_dir, cass_schema_hash_matches};
+// Query-engine upgrades must retain the released v9 directory and identity
+// contract. Upstream's default v10 namespace is an independent migration.
+use frankensearch::quill::cass::legacy_v9::{
+    CASS_SCHEMA_HASH, CASS_SCHEMA_VERSION, cass_document_identity, cass_index_dir as fs_index_dir,
+    cass_schema_hash_matches,
+};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
@@ -960,6 +964,15 @@ pub fn validate_searchable_index_contract(index_path: &Path) -> Result<()> {
 /// opened the index twice, and every Quill open hashes every live segment.
 pub fn validated_searchable_index_summary(index_path: &Path) -> Result<SearchableIndexSummary> {
     let opened = open_validated_lexical_index(index_path)?;
+    opened_lexical_index_summary(&opened)
+}
+
+/// The [`SearchableIndexSummary`] of a generation that
+/// [`open_validated_lexical_index`] already opened, read from its own reader
+/// rather than from another open.
+pub(crate) fn opened_lexical_index_summary(
+    opened: &OpenedLexicalIndex,
+) -> Result<SearchableIndexSummary> {
     if let Some((reader, _)) = opened.reader.as_ref() {
         return Ok(SearchableIndexSummary {
             docs: usize::try_from(reader.doc_count()?).unwrap_or(usize::MAX),
@@ -968,10 +981,10 @@ pub fn validated_searchable_index_summary(index_path: &Path) -> Result<Searchabl
     }
     // A federated bundle validated each shard above; its summary comes from
     // the bundle manifest without another open.
-    searchable_index_summary(index_path)?.ok_or_else(|| {
+    searchable_index_summary(&opened.path)?.ok_or_else(|| {
         anyhow::anyhow!(
             "validated lexical index has no summary: {}",
-            index_path.display()
+            opened.path.display()
         )
     })
 }
@@ -1698,6 +1711,12 @@ impl TantivyIndex {
         Ok(())
     }
 
+    /// Test-only: stop [`Self::force_merge`] after its first `runs` merges.
+    #[cfg(test)]
+    pub(crate) fn force_merge_first_runs_for_test(&mut self, runs: usize) -> Result<()> {
+        self.inner.force_merge_first_runs_for_test(runs)
+    }
+
     pub fn merge_compatible_index_directories<P: AsRef<Path>>(
         output_path: &Path,
         input_paths: &[P],
@@ -2099,7 +2118,7 @@ impl TantivyIndex {
                 pending_bytes = pending_bytes.saturating_add(doc.content.len());
                 docs.push(doc);
             } else {
-                let identity = frankensearch::quill::cass::cass_document_identity(
+                let identity = cass_document_identity(
                     &context.source_id,
                     frankensearch::quill::cass::CassConversationKey {
                         source_path: &context.source_path,
@@ -2832,7 +2851,7 @@ mod tests {
         conversation_id: i64,
     ) -> String {
         let context = cass_doc_context_from_packet(packet);
-        frankensearch::quill::cass::cass_document_identity(
+        cass_document_identity(
             &context.source_id,
             frankensearch::quill::cass::CassConversationKey {
                 source_path: &context.source_path,

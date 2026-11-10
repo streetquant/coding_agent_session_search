@@ -54,8 +54,7 @@ mod retrieval;
 // Frankensearch types for vector storage and search delegation.
 use frankensearch::TwoTierConfig as FsTwoTierConfig;
 use frankensearch::index::{
-    VECTOR_ANN_FAST_FILENAME, VECTOR_ANN_QUALITY_FILENAME, VECTOR_INDEX_FAST_FILENAME,
-    VECTOR_INDEX_QUALITY_FILENAME,
+    VECTOR_ANN_FAST_FILENAME, VECTOR_INDEX_FAST_FILENAME, VECTOR_INDEX_QUALITY_FILENAME,
 };
 use frankensearch::{
     SearchError as FsSearchError, TwoTierIndex as FsTwoTierIndex,
@@ -107,8 +106,7 @@ fn open_complete_fs_index_with_retry_hook(
 ) -> std::result::Result<(FsTwoTierIndex, usize), FsSearchError> {
     let paths = FsTwoTierIndexPaths::new(fs_index_artifact_path(dir, VECTOR_INDEX_FAST_FILENAME))
         .with_quality_index(fs_index_artifact_path(dir, VECTOR_INDEX_QUALITY_FILENAME))
-        .with_fast_ann(fs_index_artifact_path(dir, VECTOR_ANN_FAST_FILENAME))
-        .with_quality_ann(fs_index_artifact_path(dir, VECTOR_ANN_QUALITY_FILENAME));
+        .with_fast_ann(fs_index_artifact_path(dir, VECTOR_ANN_FAST_FILENAME));
     let mut retries = 0;
     let mut backoff = FSVI_REOPEN_INITIAL_BACKOFF;
     let clone_config = || config.clone();

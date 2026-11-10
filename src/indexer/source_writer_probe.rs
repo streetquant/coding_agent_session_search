@@ -12,16 +12,20 @@
 //! owner keeps cached positives deferred until a new filter is captured.
 //! Linux keeps descriptor witnesses so a still-open writer costs only a few
 //! procfs reads. The census reads each writable descriptor's link without
-//! following it. It follows (stats) a session-named descriptor, and, only
-//! while refreshing a cached positive, other descriptors on local
-//! filesystems; a stat of a file on a network or FUSE mount is answered by
-//! that mount's server or daemon and can block for as long as it is down.
+//! following it. Network and FUSE file identities come from fdinfo and
+//! mountinfo, without contacting the mount's server or userspace daemon.
+//! Missing procfs identity fields leave an inspection gap, never a fallback
+//! stat on a potentially hung mount. Only proven local descriptors are
+//! followed, including non-session hardlinks while refreshing a positive.
 //! One refresh replaces evidence for every source, amortizing closed writers.
 //! A newly incomplete refresh retains all prior positives for the filter's life.
 //! macOS lsof can silently omit inaccessible processes; its captured positives
 //! therefore remain deferred for the entire filter lifetime without reinspection.
+//! Its device/inode fields supply identities without statting descriptor paths.
+//! A bounded, nonblocking census keeps a hung mount or inherited output stream
+//! from stalling indexing; incomplete output still contributes observed positives.
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
@@ -50,8 +54,15 @@ pub(crate) struct SourceWriterProbe {
 #[cfg(target_os = "macos")]
 impl SourceWriterProbe {
     pub(crate) fn capture(is_session_source: SourcePredicate) -> Self {
+        let census = collect_writers(is_session_source);
+        if census.visibility_gap {
+            tracing::debug!(
+                observed_writers = census.writers.len(),
+                "source writer census has visibility gaps; retaining observed positives"
+            );
+        }
         Self {
-            writers: collect_writers(is_session_source),
+            writers: census.writers,
         }
     }
 
@@ -224,28 +235,45 @@ impl DescriptorWitness {
             Self::Proc {
                 descriptor, info, ..
             } => {
-                match file_identity(descriptor) {
-                    Ok(observed) if observed == identity => {}
+                let observed = match read_descriptor_info(info) {
+                    Ok(observed) if observed.writable => observed,
                     Ok(_) => return DescriptorState::Closed,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         return DescriptorState::Closed;
                     }
                     Err(_) => return DescriptorState::Uncertain,
-                }
-                match read_descriptor_access(info) {
-                    Ok(true) => DescriptorState::Open,
-                    Ok(false) => DescriptorState::Closed,
+                };
+                let Some(process_path) = info.parent().and_then(Path::parent) else {
+                    return DescriptorState::Uncertain;
+                };
+                // A descriptor number may have been reused or its owner may
+                // have changed mount namespaces since capture. Re-read procfs
+                // authority instead of following a formerly local descriptor.
+                let mount = descriptor_mount(process_path, &observed, &mut None);
+                let current = match descriptor_identity(descriptor, &observed, mount) {
+                    Ok(current) => current,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        DescriptorState::Closed
+                        return DescriptorState::Closed;
                     }
-                    Err(_) => DescriptorState::Uncertain,
+                    Err(_) => return DescriptorState::Uncertain,
+                };
+                // Never combine an old writer's access flags with a reused
+                // descriptor's identity. Changed evidence cannot clear a
+                // cached positive until a complete census finds its successor.
+                if read_descriptor_info(info).ok() != Some(observed) {
+                    return DescriptorState::Uncertain;
+                }
+                if current == identity {
+                    DescriptorState::Open
+                } else {
+                    DescriptorState::Closed
                 }
             }
         }
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", all(target_os = "macos", test)))]
 fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
     use std::os::unix::fs::MetadataExt;
     let metadata = std::fs::metadata(path)?;
@@ -253,7 +281,15 @@ fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
 }
 
 #[cfg(target_os = "linux")]
-fn read_descriptor_access(path: &Path) -> std::io::Result<bool> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DescriptorInfo {
+    writable: bool,
+    mount_id: Option<u64>,
+    inode: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+fn read_descriptor_info(path: &Path) -> std::io::Result<DescriptorInfo> {
     let contents = std::fs::read_to_string(path)?;
     let flags = contents
         .lines()
@@ -265,57 +301,112 @@ fn read_descriptor_access(path: &Path) -> std::io::Result<bool> {
                 "unreadable procfs access flags",
             )
         })?;
-    match flags & 0o3 {
-        0 => Ok(false),
-        1 | 2 => Ok(true),
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "unknown procfs access mode",
-        )),
-    }
-}
-
-/// Whether a descriptor's file is on a network or FUSE filesystem, judged
-/// from procfs alone: the mount ID in the descriptor's fdinfo, looked up in
-/// the owning process's mount table (read once per process into
-/// `mount_types`). A descriptor not proven local counts as remote.
-#[cfg(target_os = "linux")]
-fn descriptor_on_remote_filesystem(
-    process: &Path,
-    info: &Path,
-    mount_types: &mut Option<HashMap<u64, bool>>,
-) -> bool {
-    let Some(mount_id) = std::fs::read_to_string(info).ok().and_then(|contents| {
+    let writable = match flags & 0o3 {
+        0 => false,
+        1 | 2 => true,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unknown procfs access mode",
+            ));
+        }
+    };
+    let decimal_field = |prefix: &str| {
         contents
             .lines()
-            .find_map(|line| line.strip_prefix("mnt_id:"))
+            .find_map(|line| line.strip_prefix(prefix))
             .and_then(|value| value.trim().parse::<u64>().ok())
-    }) else {
-        return true;
     };
-    mount_types
+    Ok(DescriptorInfo {
+        writable,
+        mount_id: decimal_field("mnt_id:"),
+        inode: decimal_field("ino:"),
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MountIdentity {
+    device: u64,
+    remote: bool,
+}
+
+/// Resolve the descriptor's mount in its owner's namespace, using procfs
+/// alone. A missing or malformed record never establishes local access.
+#[cfg(target_os = "linux")]
+fn descriptor_mount(
+    process: &Path,
+    info: &DescriptorInfo,
+    mounts: &mut Option<HashMap<u64, MountIdentity>>,
+) -> Option<MountIdentity> {
+    let mount_id = info.mount_id?;
+    mounts
         .get_or_insert_with(|| {
             std::fs::read_to_string(process.join("mountinfo"))
-                .map(|table| parse_mount_remoteness(&table))
+                .map(|table| parse_mount_identities(&table))
                 .unwrap_or_default()
         })
         .get(&mount_id)
         .copied()
-        .unwrap_or(true)
 }
 
-/// Map each mount ID in a `/proc/<pid>/mountinfo` table to whether its
-/// filesystem type is a network or FUSE one. Mount paths escape spaces, so
-/// the first " - " always ends the optional fields.
+/// Only local mounts permit metadata I/O. Since Linux 5.14, regular-file
+/// fdinfo supplies `ino`; mountinfo supplies the major/minor of `st_dev`.
+/// Older kernels or an opaque namespace cannot supply a remote identity,
+/// so preserve the gap instead of potentially blocking the whole index run.
 #[cfg(target_os = "linux")]
-fn parse_mount_remoteness(table: &str) -> HashMap<u64, bool> {
+fn descriptor_identity(
+    descriptor: &Path,
+    info: &DescriptorInfo,
+    mount: Option<MountIdentity>,
+) -> std::io::Result<FileIdentity> {
+    match mount {
+        Some(mount) if !mount.remote => file_identity(descriptor),
+        Some(mount) => info
+            .inode
+            .map(|inode| (mount.device, inode))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "remote session descriptor has no procfs inode",
+                )
+            }),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "session descriptor mount identity is unverified",
+        )),
+    }
+}
+
+/// Linux's userspace dev_t encoding, also used by makedev(3). Mountinfo
+/// prints decimal major/minor components, rather than this packed value.
+#[cfg(target_os = "linux")]
+fn linux_device_id(major: u32, minor: u32) -> u64 {
+    let major = u64::from(major);
+    let minor = u64::from(minor);
+    (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & !0xff) << 12) | ((major & !0xfff) << 32)
+}
+
+/// Map mount IDs to their device and filesystem type. Mount paths escape
+/// spaces, so the first " - " always ends the optional fields.
+#[cfg(target_os = "linux")]
+fn parse_mount_identities(table: &str) -> HashMap<u64, MountIdentity> {
     table
         .lines()
         .filter_map(|line| {
-            let mount_id = line.split_whitespace().next()?.parse::<u64>().ok()?;
-            let (_, after_separator) = line.split_once(" - ")?;
+            let (before_separator, after_separator) = line.split_once(" - ")?;
+            let mut fields = before_separator.split_whitespace();
+            let mount_id = fields.next()?.parse::<u64>().ok()?;
+            let (major, minor) = fields.nth(1)?.split_once(':')?;
+            let device = linux_device_id(major.parse().ok()?, minor.parse().ok()?);
             let filesystem_type = after_separator.split_whitespace().next()?;
-            Some((mount_id, filesystem_type_is_remote(filesystem_type)))
+            Some((
+                mount_id,
+                MountIdentity {
+                    device,
+                    remote: filesystem_type_is_remote(filesystem_type),
+                },
+            ))
         })
         .collect()
 }
@@ -424,11 +515,20 @@ fn collect_writers(
     is_session_source: SourcePredicate,
     known_writers: &HashMap<FileIdentity, Vec<DescriptorWitness>>,
 ) -> WriterCensus {
+    collect_writers_in(Path::new("/proc"), is_session_source, known_writers)
+}
+
+#[cfg(target_os = "linux")]
+fn collect_writers_in(
+    proc_root: &Path,
+    is_session_source: SourcePredicate,
+    known_writers: &HashMap<FileIdentity, Vec<DescriptorWitness>>,
+) -> WriterCensus {
     let mut census = WriterCensus {
         complete: true,
         ..WriterCensus::default()
     };
-    let processes = match std::fs::read_dir("/proc") {
+    let processes = match std::fs::read_dir(proc_root) {
         Ok(processes) => processes,
         Err(_) => return WriterCensus::default(),
     };
@@ -450,7 +550,7 @@ fn collect_writers(
         let process_id = process_identity(&process.path(), pid).ok();
         // This process's mount table, read at most once and only if a
         // descriptor needs it.
-        let mut mount_types = None;
+        let mut mounts = None;
         let descriptors = match std::fs::read_dir(process.path().join("fd")) {
             Ok(descriptors) => descriptors,
             Err(error) => {
@@ -467,9 +567,9 @@ fn collect_writers(
                 }
             };
             let info = process.path().join("fdinfo").join(descriptor.file_name());
-            match read_descriptor_access(&info) {
-                Ok(true) => {}
-                Ok(false) => continue,
+            let observed = match read_descriptor_info(&info) {
+                Ok(observed) if observed.writable => observed,
+                Ok(_) => continue,
                 Err(error) => {
                     census.observe_error(
                         error,
@@ -479,7 +579,7 @@ fn collect_writers(
                     );
                     continue;
                 }
-            }
+            };
             let path = descriptor.path();
             // Read the link before following it. readlink on a procfs
             // descriptor is answered by the kernel, while a stat that follows
@@ -499,21 +599,24 @@ fn collect_writers(
                 }
             };
             let session_named = is_session_source(&target);
+            if !session_named && known_writers.is_empty() {
+                continue;
+            }
+            let mount = descriptor_mount(&process.path(), &observed, &mut mounts);
             // A known positive can have a writable successor reached through
             // a hardlink with a non-session suffix, so while positives are
             // cached a non-session descriptor is followed and matched against
             // their inodes. Only a local one: a session source on a network
             // or FUSE mount is still found under its session name, but not
             // through such a hardlink.
-            if !session_named
-                && (known_writers.is_empty()
-                    || descriptor_on_remote_filesystem(&process.path(), &info, &mut mount_types))
-            {
+            if !session_named && mount.is_none_or(|mount| mount.remote) {
                 continue;
             }
             #[cfg(test)]
-            census.followed.push(target);
-            let identity = match file_identity(&path) {
+            if mount.is_some_and(|mount| !mount.remote) {
+                census.followed.push(target);
+            }
+            let identity = match descriptor_identity(&path, &observed, mount) {
                 Ok(identity) => identity,
                 Err(error) => {
                     census.observe_error(
@@ -526,6 +629,23 @@ fn collect_writers(
                 }
             };
             if !session_named && !known_writers.contains_key(&identity) {
+                continue;
+            }
+            let unchanged = match read_descriptor_info(&info) {
+                Ok(after) if after == observed => Ok(()),
+                Ok(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "descriptor changed during writer census",
+                )),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = unchanged {
+                census.observe_error(
+                    error,
+                    process_id,
+                    Some(descriptor.file_name()),
+                    Inspection::Identity,
+                );
                 continue;
             }
             census
@@ -550,27 +670,244 @@ fn collect_writers(
 }
 
 #[cfg(target_os = "macos")]
-fn collect_writers(is_session_source: SourcePredicate) -> HashMap<FileIdentity, Vec<(u32, u32)>> {
-    let Ok(output) = std::process::Command::new("lsof")
-        .args(["-nP", "-F", "pfna0"])
-        .output()
-    else {
-        return HashMap::new();
+fn collect_writers(is_session_source: SourcePredicate) -> LsofWriterCensus {
+    // One retained child bounds both concurrent censuses and an OS-stalled
+    // teardown. Later calls only try to reap it; they never wait or spawn more.
+    static CHILD: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
+    match capture_lsof_output(
+        &mut lsof_command(),
+        &CHILD,
+        std::time::Duration::from_secs(5),
+        16 * 1024 * 1024,
+    ) {
+        Ok(output) => lsof_writer_census(&output.stdout, output.complete, is_session_source),
+        Err(error) => {
+            tracing::debug!(%error, "source writer census could not complete");
+            LsofWriterCensus {
+                visibility_gap: true,
+                ..LsofWriterCensus::default()
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Default)]
+struct LsofWriterCensus {
+    writers: HashMap<FileIdentity, Vec<(u32, u32)>>,
+    visibility_gap: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn lsof_writer_census(
+    output: &[u8],
+    complete: bool,
+    is_session_source: SourcePredicate,
+) -> LsofWriterCensus {
+    let parsed = parse_lsof(output);
+    let mut census = LsofWriterCensus {
+        visibility_gap: !complete || !parsed.complete,
+        ..LsofWriterCensus::default()
     };
-    let parsed = parse_lsof(&output.stdout);
-    let mut writers: HashMap<FileIdentity, Vec<(u32, u32)>> = HashMap::new();
     for record in parsed.records {
         if !record.writable || !is_session_source(&record.path) {
             continue;
         }
-        if let Ok(identity) = file_identity(&record.path) {
-            writers
+        if let Some(identity) = record.identity {
+            census
+                .writers
                 .entry(identity)
                 .or_default()
                 .push((record.process, record.descriptor));
+        } else {
+            // A missing identity is an inspection gap, never permission to
+            // stat a potentially unresponsive remote path as a fallback.
+            census.visibility_gap = true;
         }
     }
-    writers
+    census
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn lsof_command() -> std::process::Command {
+    let mut command = std::process::Command::new("/usr/sbin/lsof");
+    // -b avoids lsof's own stat/lstat/readlink calls. D is the packed device
+    // in hex, i the decimal inode; neither requires following the n field.
+    command.args(["-b", "-nP", "-F", "pfnaDi0"]);
+    command
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+#[derive(Debug)]
+struct LsofOutput {
+    stdout: Vec<u8>,
+    complete: bool,
+}
+
+/// Collect the available prefix without a blocking read, wait, or reader thread.
+/// The slot also owns children that cannot be reaped within the cleanup grace.
+/// Those are retried on the next census, limiting retained direct children to one.
+/// Process creation itself is synchronous; the deadline cannot preempt spawn.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn capture_lsof_output(
+    command: &mut std::process::Command,
+    slot: &std::sync::Mutex<Option<std::process::Child>>,
+    timeout: std::time::Duration,
+    max_bytes: usize,
+) -> std::io::Result<LsofOutput> {
+    use std::io::{self, Read};
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let mut slot = slot
+        .try_lock()
+        .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "lsof census already active"))?;
+    if let Some(child) = slot.as_mut() {
+        if child.try_wait()?.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "previous lsof census is still exiting",
+            ));
+        }
+        *slot = None;
+    }
+    if timeout.is_zero() {
+        return Ok(LsofOutput {
+            stdout: Vec::new(),
+            complete: false,
+        });
+    }
+
+    let (mut reader, writer) = UnixStream::pair()?;
+    reader.set_nonblocking(true)?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .stderr(Stdio::null())
+        .process_group(0);
+    let started = Instant::now();
+    let spawned = command.spawn();
+    // Command retains its stdout descriptor after spawn. Close that copy so
+    // EOF depends only on the child and any descendants that inherited it.
+    command.stdout(Stdio::null());
+    *slot = Some(spawned?);
+
+    let mut output = LsofOutput {
+        stdout: Vec::new(),
+        complete: false,
+    };
+    let mut eof = false;
+    let mut buffer = [0_u8; 8 * 1024];
+    'capture: loop {
+        if started.elapsed() >= timeout {
+            break;
+        }
+        let mut progressed = false;
+        // A continuously writable stream cannot starve the deadline check.
+        for _ in 0..4 {
+            if eof || started.elapsed() >= timeout {
+                break;
+            }
+            let remaining = max_bytes.saturating_sub(output.stdout.len());
+            let read_len = remaining.saturating_add(1).min(buffer.len());
+            match reader.read(&mut buffer[..read_len]) {
+                Ok(0) => {
+                    eof = true;
+                    break;
+                }
+                Ok(count) => {
+                    let retained = count.min(remaining);
+                    let total = output.stdout.len() + retained;
+                    if total > output.stdout.capacity() {
+                        let capacity = output
+                            .stdout
+                            .capacity()
+                            .saturating_mul(2)
+                            .max(total)
+                            .min(max_bytes);
+                        if output
+                            .stdout
+                            .try_reserve_exact(capacity - output.stdout.len())
+                            .is_err()
+                        {
+                            break 'capture;
+                        }
+                    }
+                    output.stdout.extend_from_slice(&buffer[..retained]);
+                    if count > remaining {
+                        break 'capture;
+                    }
+                    progressed = true;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) => break 'capture,
+            }
+        }
+        // Keep the direct child unreaped while descendants could retain the
+        // socket: its PID must not be recycled before failure group cleanup.
+        if eof && let Some(child) = slot.as_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    output.complete = status.success();
+                    *slot = None;
+                    return Ok(output);
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
+        }
+        if !progressed {
+            std::thread::sleep(
+                timeout
+                    .saturating_sub(started.elapsed())
+                    .min(Duration::from_millis(5)),
+            );
+        }
+    }
+    drop(reader);
+    stop_lsof_child(&mut slot, Duration::from_millis(100));
+    Ok(output)
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn stop_lsof_child(child: &mut Option<std::process::Child>, grace: std::time::Duration) {
+    let Some(owned) = child.as_mut() else {
+        return;
+    };
+    kill_lsof_process_group(owned.id());
+    let _ = owned.kill();
+    let started = std::time::Instant::now();
+    loop {
+        match owned.try_wait() {
+            Ok(Some(_)) => {
+                *child = None;
+                return;
+            }
+            Ok(None) if started.elapsed() < grace => std::thread::sleep(
+                grace
+                    .saturating_sub(started.elapsed())
+                    .min(std::time::Duration::from_millis(5)),
+            ),
+            _ => return,
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+#[allow(unsafe_code)]
+fn kill_lsof_process_group(pid: u32) {
+    if let Ok(pid) = i32::try_from(pid)
+        && pid > 1
+    {
+        // SAFETY: capture_lsof_output creates a new group for this child and
+        // keeps it unreaped until here. Its PID cannot be reused for another
+        // process group. kill takes an integer ID, no pointers or ownership.
+        let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -580,6 +917,7 @@ struct LsofRecord {
     descriptor: u32,
     writable: bool,
     path: PathBuf,
+    identity: Option<FileIdentity>,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -602,45 +940,83 @@ fn parse_lsof(output: &[u8]) -> ParsedLsof {
     let mut descriptor = None;
     let mut writable = None;
     let mut path = None;
+    let mut identity_fields = (None, None);
+    let mut record_valid = true;
     let finish_record = |parsed: &mut ParsedLsof,
                          process: Option<u32>,
                          descriptor: Option<u32>,
                          writable: Option<bool>,
-                         path: Option<PathBuf>| {
+                         path: Option<PathBuf>,
+                         identity_fields: (Option<u64>, Option<u64>),
+                         record_valid: bool| {
         if let Some(descriptor) = descriptor {
-            if let (Some(process), Some(writable), Some(path)) = (process, writable, path) {
+            if let (Some(process), Some(writable), Some(path)) = (process, writable, path)
+                && record_valid
+            {
                 parsed.records.push(LsofRecord {
                     process,
                     descriptor,
                     writable,
                     path,
+                    identity: identity_fields.0.zip(identity_fields.1),
                 });
             } else {
                 parsed.complete = false;
             }
         }
     };
-    for field in output.split(|byte| *byte == 0) {
+    for field in output.split_inclusive(|byte| *byte == 0) {
+        let Some(field) = field.strip_suffix(b"\0") else {
+            // Only NUL-terminated fields are evidence. A final NL is the
+            // documented set terminator; any other suffix is truncated.
+            parsed.complete &= field == b"\n";
+            break;
+        };
         let field = field.strip_prefix(b"\n").unwrap_or(field);
         let Some((&kind, value)) = field.split_first() else {
             continue;
         };
+        // Boundaries apply even if the next PID/descriptor is malformed or
+        // not UTF-8. Never attach its following fields to the previous owner.
+        if matches!(kind, b'p' | b'f') {
+            finish_record(
+                &mut parsed,
+                process,
+                descriptor,
+                writable,
+                path.take(),
+                identity_fields,
+                record_valid,
+            );
+            descriptor = None;
+            writable = None;
+            identity_fields = (None, None);
+            record_valid = true;
+            if kind == b'p' {
+                process = None;
+            }
+        }
         let Ok(value) = std::str::from_utf8(value) else {
             parsed.complete = false;
+            record_valid = false;
             continue;
         };
         match kind {
             b'p' => {
-                finish_record(&mut parsed, process, descriptor, writable, path.take());
-                process = value.parse::<u32>().ok();
+                process = value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit())
+                    .then(|| value.parse::<u32>().ok())
+                    .flatten()
+                    .filter(|pid| *pid > 0);
                 parsed.complete &= process.is_some();
-                descriptor = None;
-                writable = None;
             }
             b'f' => {
-                finish_record(&mut parsed, process, descriptor, writable, path.take());
-                descriptor = value.parse::<u32>().ok();
-                writable = None;
+                descriptor = value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit())
+                    .then(|| value.parse::<u32>().ok())
+                    .flatten();
                 // Named pseudo descriptors are not open numeric descriptors.
                 // Unknown/error values (including a human-format `3w`) cannot
                 // certify a complete field-output census.
@@ -656,26 +1032,67 @@ fn parse_lsof(output: &[u8]) -> ParsedLsof {
             b'a' if descriptor.is_some() => {
                 if writable.is_some() {
                     parsed.complete = false;
+                    record_valid = false;
                 }
                 writable = match value {
                     "r" => Some(false),
                     "w" | "u" => Some(true),
                     _ => None,
                 };
+                record_valid &= writable.is_some();
             }
             b'n' if descriptor.is_some() => {
                 if path.is_some() || value.is_empty() {
                     parsed.complete = false;
+                    record_valid = false;
                 }
                 path = Some(PathBuf::from(value));
             }
-            b'a' | b'n' => {}
+            b'D' if descriptor.is_some() => {
+                if identity_fields.0.is_some() {
+                    record_valid = false;
+                }
+                identity_fields.0 = parse_lsof_device(value);
+                record_valid &= identity_fields.0.is_some();
+            }
+            b'i' if descriptor.is_some() => {
+                if identity_fields.1.is_some() {
+                    record_valid = false;
+                }
+                identity_fields.1 = if value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    value.parse::<u64>().ok()
+                } else {
+                    None
+                };
+                record_valid &= identity_fields.1.is_some();
+            }
+            b'a' | b'n' | b'D' | b'i' => {}
             _ => parsed.complete = false,
         }
     }
-    finish_record(&mut parsed, process, descriptor, writable, path);
+    finish_record(
+        &mut parsed,
+        process,
+        descriptor,
+        writable,
+        path,
+        identity_fields,
+        record_valid,
+    );
     parsed.complete &= process.is_some();
     parsed
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_lsof_device(value: &str) -> Option<u64> {
+    let digits = value.strip_prefix("0x")?;
+    if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    // Apple's lsof/proc.c prints dev_t after casting to unsigned int. Rust's
+    // Darwin MetadataExt::st_dev casts the signed 32-bit dev_t directly to
+    // u64. Restore that sign extension so high-bit devices match the caller.
+    Some((u32::from_str_radix(digits, 16).ok()? as i32) as u64)
 }
 
 #[cfg(test)]

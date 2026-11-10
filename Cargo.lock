@@ -1874,7 +1874,7 @@ dependencies = [
 [[package]]
 name = "franken-agent-detection"
 version = "0.3.10"
-source = "git+https://github.com/Dicklesworthstone/franken_agent_detection?rev=6b337ba434b72c65c6c5a748b7ec47885f840ac0#6b337ba434b72c65c6c5a748b7ec47885f840ac0"
+source = "git+https://github.com/Dicklesworthstone/franken_agent_detection?rev=0ea083ea4c470a6b7e7607cdeff335cb14690cdc#0ea083ea4c470a6b7e7607cdeff335cb14690cdc"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1954,8 +1954,7 @@ dependencies = [
 [[package]]
 name = "frankensearch"
 version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdaa5082458ba4fcb1baaa96c16da45b11dab35ec060c631677df56c77a73022"
+source = "git+https://github.com/streetquant/frankensearch?rev=e463dcadcbf2abd2ba9651bad3e2f7ad1bfa6965#e463dcadcbf2abd2ba9651bad3e2f7ad1bfa6965"
 dependencies = [
  "asupersync",
  "frankensearch-core",
@@ -1974,8 +1973,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-core"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d1643f2349b0356e67b989c8c060ef44bc41928bd1841bb20fc36a33fe91c74"
+source = "git+https://github.com/streetquant/frankensearch?rev=e463dcadcbf2abd2ba9651bad3e2f7ad1bfa6965#e463dcadcbf2abd2ba9651bad3e2f7ad1bfa6965"
 dependencies = [
  "asupersync",
  "compact_str 0.10.0",
@@ -1991,8 +1989,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-embed"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5adce183bf36045697d35d32646e71e34f13345c52a1f515600b77ecbc19dc9"
+source = "git+https://github.com/streetquant/frankensearch?rev=e463dcadcbf2abd2ba9651bad3e2f7ad1bfa6965#e463dcadcbf2abd2ba9651bad3e2f7ad1bfa6965"
 dependencies = [
  "asupersync",
  "frankensearch-core",
@@ -2007,8 +2004,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-fusion"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2331270af5dd29774f392c35f66dbb45c121ace4bbf4d8e748cd0d1c92d1265"
+source = "git+https://github.com/streetquant/frankensearch?rev=e463dcadcbf2abd2ba9651bad3e2f7ad1bfa6965#e463dcadcbf2abd2ba9651bad3e2f7ad1bfa6965"
 dependencies = [
  "ahash",
  "asupersync",
@@ -2027,9 +2023,8 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-index"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d77c69bcd01b50ab4c6fa4b52c20c3f4ce1d15050c37314f90cda358a5cc3ddb"
+version = "0.4.0"
+source = "git+https://github.com/streetquant/frankensearch?rev=e463dcadcbf2abd2ba9651bad3e2f7ad1bfa6965#e463dcadcbf2abd2ba9651bad3e2f7ad1bfa6965"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2054,7 +2049,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-lexical"
 version = "0.4.1"
-source = "git+https://github.com/streetquant/frankensearch?rev=ed0d76e7b48e0bb215b8e0874742ee4573754ee1#ed0d76e7b48e0bb215b8e0874742ee4573754ee1"
+source = "git+https://github.com/streetquant/frankensearch?rev=e463dcadcbf2abd2ba9651bad3e2f7ad1bfa6965#e463dcadcbf2abd2ba9651bad3e2f7ad1bfa6965"
 dependencies = [
  "asupersync",
  "frankensearch-core",
@@ -2067,9 +2062,8 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-quill"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95c1655504a8ad2fe3cfad7e92bce948f28dddad07bc3a5a127660414c853ec5"
+version = "0.4.0"
+source = "git+https://github.com/streetquant/frankensearch?rev=e463dcadcbf2abd2ba9651bad3e2f7ad1bfa6965#e463dcadcbf2abd2ba9651bad3e2f7ad1bfa6965"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2096,13 +2090,13 @@ dependencies = [
 [[package]]
 name = "frankensearch-rerank"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e330de21d71047f2bef5c4a11312d03f12fa249fd652e6faf98b8a4f7315819"
+source = "git+https://github.com/streetquant/frankensearch?rev=e463dcadcbf2abd2ba9651bad3e2f7ad1bfa6965#e463dcadcbf2abd2ba9651bad3e2f7ad1bfa6965"
 dependencies = [
  "asupersync",
  "bytemuck",
  "frankensearch-core",
  "frankensearch-embed",
+ "frankensearch-index",
  "frankentorch-api",
  "frankentorch-autograd",
  "frankentorch-core",

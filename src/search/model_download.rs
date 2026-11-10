@@ -301,33 +301,33 @@ impl ModelCacheState {
         }
     }
 
-    /// Suggested next operator action.
-    pub fn next_step(&self) -> Option<&'static str> {
+    /// Suggested next operator action for the model being inspected.
+    pub fn next_step(&self, model_name: &str) -> Option<String> {
         match self {
-            Self::NotAcquired { .. } => {
-                Some("Run `cass models install`, or keep using lexical search.")
-            }
+            Self::NotAcquired { .. } => Some(format!(
+                "Run `cass models install --model {model_name}`, or keep using lexical search."
+            )),
             Self::Acquiring { .. } => {
-                Some("Wait for model acquisition to finish, or keep using lexical search.")
+                Some("Wait for model acquisition to finish, or keep using lexical search.".into())
             }
             Self::Acquired { .. } | Self::PreseededLocal { .. } | Self::MirrorSourced { .. } => {
                 None
             }
-            Self::ChecksumMismatch { .. } | Self::QuarantinedCorrupt { .. } => Some(
-                "Run `cass models verify --repair`, or reinstall with `cass models install -y`.",
-            ),
-            Self::IncompatibleVersion { .. } => {
-                Some("Run `cass models install -y` to refresh the model cache.")
-            }
+            Self::ChecksumMismatch { .. } | Self::QuarantinedCorrupt { .. } => Some(format!(
+                "Run `cass models verify --model {model_name} --repair`, or reinstall with `cass models install --model {model_name} -y`."
+            )),
+            Self::IncompatibleVersion { .. } => Some(format!(
+                "Run `cass models install --model {model_name} -y` to refresh the model cache."
+            )),
             Self::DisabledByPolicy { .. } => {
-                Some("Use lexical search or re-enable semantic model acquisition in policy.")
+                Some("Use lexical search or re-enable semantic model acquisition in policy.".into())
             }
             Self::BudgetBlocked { .. } => {
-                Some("Increase the semantic model budget or keep using lexical search.")
+                Some("Increase the semantic model budget or keep using lexical search.".into())
             }
-            Self::OfflineBlocked { .. } => Some(
-                "Reconnect or install from local files with `cass models install --from-file`.",
-            ),
+            Self::OfflineBlocked { .. } => Some(format!(
+                "Reconnect or install from local files with `cass models install --model {model_name} --from-file <dir>`."
+            )),
         }
     }
 
@@ -1002,14 +1002,20 @@ pub enum DownloadError {
     /// Mirror URL failed validation.
     #[error("invalid mirror URL '{url}': {reason}")]
     InvalidMirrorUrl { url: String, reason: String },
+    /// Another process owns the model's acquisition/publication lease.
+    #[error(
+        "another model installation is in progress (lock: {lock_path}); retry after it finishes"
+    )]
+    InstallInProgress { lock_path: PathBuf },
 }
 
 impl DownloadError {
-    fn is_retryable(&self) -> bool {
+    pub(crate) fn is_retryable(&self) -> bool {
         match self {
-            DownloadError::NetworkError(_) | DownloadError::IoError(_) | DownloadError::Timeout => {
-                true
-            }
+            DownloadError::NetworkError(_)
+            | DownloadError::IoError(_)
+            | DownloadError::Timeout
+            | DownloadError::InstallInProgress { .. } => true,
             DownloadError::HttpError { status, .. } => {
                 *status == 408 || *status == 429 || (500..=599).contains(status)
             }
@@ -1027,6 +1033,20 @@ impl DownloadError {
 
 const MODEL_HTTP_BODY_SIZE_FLOOR_BYTES: u64 = 500 * 1024 * 1024;
 const MODEL_HTTP_BODY_SIZE_MARGIN_BYTES: u64 = 32 * 1024 * 1024;
+const MODEL_ACQUISITION_RECORD: &str = ".acquisition.json";
+// Lifecycle markers contain text metadata, never model payloads. Leave room
+// for extended-length Unicode source paths in from-file provenance.
+const MODEL_MARKER_MAX_BYTES: u64 = 256 * 1024;
+
+/// Keep the stable lock file in place: unlinking it would let a new installer
+/// lock a different inode while another process still owns the original lease.
+struct ModelInstallLease(File);
+
+impl Drop for ModelInstallLease {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
 
 /// Flatten an error and its `source()` chain into one message.
 ///
@@ -1106,7 +1126,7 @@ fn model_http_max_body_size(expected_size: u64) -> usize {
 pub struct ModelDownloader {
     /// Target directory for model files.
     target_dir: PathBuf,
-    /// Temporary download directory.
+    /// Uniquely owned staging directory on the target filesystem.
     temp_dir: PathBuf,
     /// Cancellation flag.
     cancelled: Arc<AtomicBool>,
@@ -1121,18 +1141,7 @@ pub struct ModelDownloader {
 impl ModelDownloader {
     /// Create a new model downloader.
     pub fn new(target_dir: PathBuf) -> Self {
-        // Use parent + modified filename to avoid with_extension() replacing dots in dir names
-        // e.g., "model.v2" should become "model.v2.downloading", not "model.downloading"
-        let temp_dir = if let Some(parent) = target_dir.parent() {
-            let dir_name = target_dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("model");
-            parent.join(format!("{}.downloading", dir_name))
-        } else {
-            // Fallback for root paths (unlikely)
-            target_dir.with_extension("downloading")
-        };
+        let temp_dir = unique_model_sidecar_path(&target_dir, "downloading", "model");
         Self {
             target_dir,
             temp_dir,
@@ -1189,28 +1198,15 @@ impl ModelDownloader {
         mirror_base_url: Option<&str>,
         on_progress: Option<ProgressCallback>,
     ) -> Result<(), DownloadError> {
-        // Validate manifest is production-ready before downloading
-        // This prevents downloading models with placeholder checksums that can't be verified
-        if !manifest.is_production_ready() {
-            let unverified_files: Vec<String> = manifest
-                .files
-                .iter()
-                .filter(|f| f.sha256 == PLACEHOLDER_CHECKSUM)
-                .map(|f| f.name.clone())
-                .collect();
-            return Err(DownloadError::ManifestNotVerified {
-                model_id: manifest.id.clone(),
-                unverified_files,
-                revision_unpinned: !manifest.has_pinned_revision(),
-            });
-        }
-
-        // Reset cancellation flag
+        self.validate_install_manifest(manifest)?;
+        let mirror_base_url = mirror_base_url.map(normalize_mirror_base_url).transpose()?;
+        let mirror_base_url = mirror_base_url.as_deref();
+        let _lease = self.acquire_install_lease()?;
         self.cancelled.store(false, Ordering::SeqCst);
-
-        // Prepare the temp directory for a safe resume. Keep partials for the
-        // current manifest, but remove stale or unsafe entries from older runs.
-        self.prepare_temp_dir(manifest)?;
+        let source = mirror_base_url
+            .map(|url| format!("mirror:{url}"))
+            .unwrap_or_else(|| "registry".to_string());
+        self.prepare_acquisition(manifest, &source, true)?;
 
         let grand_total = manifest.total_size();
         let total_files = manifest.files.len();
@@ -1240,6 +1236,7 @@ impl ModelDownloader {
                 if attempt > 0 {
                     let delay = Duration::from_secs(5 * (1 << (attempt - 1)));
                     std::thread::sleep(delay);
+                    self.fail_if_cancelled()?;
                 }
 
                 match self.download_file(
@@ -1274,27 +1271,265 @@ impl ModelDownloader {
                 return Err(err);
             }
 
-            // Verify SHA256
-            self.fail_if_cancelled()?;
-
-            let actual_hash = compute_sha256(&file_path)?;
-            if actual_hash != file.sha256 {
-                let err = DownloadError::VerificationFailed {
-                    file: file.name.clone(),
-                    expected: file.sha256.clone(),
-                    actual: actual_hash,
-                };
-                self.cleanup_temp_for_error(&err);
-                return Err(err);
-            }
+            self.verify_staged_file(file)?;
         }
 
-        // Atomic install: rename temp -> target
-        self.atomic_install()?;
-
-        // Write verified marker
+        // The marker belongs to the same staged generation as the verified
+        // bytes. A marker write failure must never replace the live model.
         self.write_verified_marker(manifest, mirror_base_url)?;
+        self.fail_if_cancelled()?;
+        self.atomic_install()
+    }
 
+    /// Install an explicitly supplied local bundle through the same staged,
+    /// serialized publication path as downloads. Verification reads the copied
+    /// bytes, so changes to the source cannot invalidate a pre-copy checksum.
+    pub fn install_from_directory(
+        &self,
+        manifest: &ModelManifest,
+        source_dir: &Path,
+        on_progress: Option<ProgressCallback>,
+    ) -> Result<(), DownloadError> {
+        self.validate_install_manifest(manifest)?;
+        let _lease = self.acquire_install_lease()?;
+        self.cancelled.store(false, Ordering::SeqCst);
+        self.prepare_acquisition(
+            manifest,
+            &format!("from-file:{}", source_dir.display()),
+            false,
+        )?;
+
+        let mut total_bytes = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        for (idx, file) in manifest.files.iter().enumerate() {
+            self.fail_if_cancelled()?;
+            let source_path = source_dir.join(file.local_name());
+            if !fs::metadata(&source_path)?.is_file() {
+                return Err(std::io::Error::other(format!(
+                    "model source is not a regular file: {}",
+                    source_path.display()
+                ))
+                .into());
+            }
+            let mut options = fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                // Keep regular-file symlinks usable for local snapshots, but
+                // never wait for a pipe writer if the source changes on open.
+                options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+            }
+            let source = options.open(&source_path)?;
+            if !source.metadata()?.is_file() {
+                return Err(std::io::Error::other(format!(
+                    "model source is not a regular file: {}",
+                    source_path.display()
+                ))
+                .into());
+            }
+            // A concurrently growing source cannot make an offline install
+            // copy forever. One excess byte is enough for the pinned digest
+            // to reject an oversized or changing artifact.
+            let mut source = source.take(file.size.saturating_add(1));
+            let mut staged = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(self.temp_dir.join(file.local_name()))?;
+            let mut file_bytes = 0_u64;
+            loop {
+                self.fail_if_cancelled()?;
+                let read = source.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                staged.write_all(&buffer[..read])?;
+                file_bytes = file_bytes.saturating_add(read as u64);
+                total_bytes = total_bytes.saturating_add(read as u64);
+                if let Some(callback) = on_progress.as_ref() {
+                    callback(DownloadProgress {
+                        current_file: file.local_name().to_string(),
+                        file_index: idx + 1,
+                        total_files: manifest.files.len(),
+                        file_bytes,
+                        file_total: file.size,
+                        total_bytes,
+                        grand_total: manifest.total_size(),
+                        progress_pct: if manifest.total_size() == 0 {
+                            0
+                        } else {
+                            ((total_bytes as f64 / manifest.total_size() as f64) * 100.0).min(100.0)
+                                as u8
+                        },
+                    });
+                }
+            }
+            staged.sync_all()?;
+            drop(staged);
+            self.verify_staged_file(file)?;
+        }
+
+        let marker = crate::search::model_acquisition::VerifiedMarker::for_from_file(
+            manifest,
+            source_dir,
+            chrono::Utc::now().to_rfc3339(),
+        )
+        .render();
+        self.write_staged_marker(&marker)?;
+        self.fail_if_cancelled()?;
+        self.atomic_install()
+    }
+
+    fn validate_install_manifest(&self, manifest: &ModelManifest) -> Result<(), DownloadError> {
+        if !manifest.is_production_ready() {
+            let unverified_files: Vec<String> = manifest
+                .files
+                .iter()
+                .filter(|f| f.sha256 == PLACEHOLDER_CHECKSUM)
+                .map(|f| f.name.clone())
+                .collect();
+            return Err(DownloadError::ManifestNotVerified {
+                model_id: manifest.id.clone(),
+                unverified_files,
+                revision_unpinned: !manifest.has_pinned_revision(),
+            });
+        }
+        if manifest.files.is_empty() {
+            return Err(std::io::Error::other("model manifest contains no artifacts").into());
+        }
+
+        // Portable bundles cannot contain basenames that alias under ASCII
+        // case folding, even when installed on a case-sensitive filesystem.
+        let mut names = HashSet::new();
+        for file in &manifest.files {
+            let name = file.local_name();
+            // Payloads must never become lifecycle metadata, including on
+            // case-insensitive filesystems used by portable model bundles.
+            let lifecycle_marker = [
+                crate::search::model_acquisition::VERIFIED_MARKER_NAME,
+                crate::search::model_acquisition::QUARANTINE_MARKER_NAME,
+                MODEL_ACQUISITION_RECORD,
+            ]
+            .iter()
+            .any(|marker| name.eq_ignore_ascii_case(marker));
+            // Win32 can trim trailing ASCII dots and spaces, aliasing a
+            // payload to another artifact or to lifecycle metadata.
+            if name.is_empty()
+                || matches!(name, "." | "..")
+                || lifecycle_marker
+                || name.ends_with(['.', ' '])
+                || name.contains(['/', '\\', ':'])
+                || !names.insert(name.to_ascii_lowercase())
+            {
+                return Err(std::io::Error::other(format!(
+                    "unsafe or duplicate model artifact filename: {}",
+                    file.name
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    fn acquire_install_lease(&self) -> Result<ModelInstallLease, DownloadError> {
+        if let Some(parent) = self.target_dir.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        ensure_replaceable_model_dir(&self.target_dir)?;
+        let lock_path = model_install_lock_path(&self.target_dir);
+        match fs::symlink_metadata(&lock_path) {
+            Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::other(format!(
+                    "model install lock is not a regular file: {}",
+                    lock_path.display()
+                ))
+                .into());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let file = options.open(&lock_path)?;
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(ModelInstallLease(file)),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+            {
+                Err(DownloadError::InstallInProgress { lock_path })
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn prepare_acquisition(
+        &self,
+        manifest: &ModelManifest,
+        source: &str,
+        allow_resume: bool,
+    ) -> Result<(), DownloadError> {
+        let receipt = serde_json::json!({
+            "version": 1,
+            "model": manifest.id,
+            "revision": manifest.revision,
+            "manifest_digest": crate::search::model_acquisition::ModelFingerprint::from_manifest(manifest).content_digest,
+            "source": source,
+        })
+        .to_string();
+        if fs::symlink_metadata(&self.temp_dir).is_ok() {
+            ensure_model_download_temp_dir(&self.temp_dir)?;
+            let same_acquisition = allow_resume
+                && acquisition_record_matches(
+                    &self.temp_dir.join(MODEL_ACQUISITION_RECORD),
+                    &receipt,
+                );
+            if !same_acquisition {
+                // Preserve an earlier attempt when this downloader is reused
+                // for another source or manifest; never blend its partials.
+                fs::rename(
+                    &self.temp_dir,
+                    unique_model_sidecar_path(&self.target_dir, "downloading", "model"),
+                )?;
+            }
+        }
+        if !self.temp_dir.exists() && allow_resume {
+            for candidate in model_download_staging_dirs(&self.target_dir) {
+                self.fail_if_cancelled()?;
+                if acquisition_record_matches(&candidate.join(MODEL_ACQUISITION_RECORD), &receipt) {
+                    // The lease makes this an exclusive transfer of ownership
+                    // to a fresh name, including across process restarts.
+                    fs::rename(candidate, &self.temp_dir)?;
+                    break;
+                }
+            }
+        }
+        self.prepare_temp_dir(manifest)?;
+        let mut file = File::create(self.temp_dir.join(MODEL_ACQUISITION_RECORD))?;
+        file.write_all(receipt.as_bytes())?;
+        file.sync_all()?;
+        sync_parent_directory(&self.temp_dir.join(MODEL_ACQUISITION_RECORD))?;
+        Ok(())
+    }
+
+    fn verify_staged_file(&self, file: &ModelFile) -> Result<(), DownloadError> {
+        self.fail_if_cancelled()?;
+        let actual_hash = compute_sha256(&self.temp_dir.join(file.local_name()))?;
+        if actual_hash != file.sha256 {
+            let error = DownloadError::VerificationFailed {
+                file: file.local_name().to_string(),
+                expected: file.sha256.clone(),
+                actual: actual_hash,
+            };
+            self.cleanup_temp_for_error(&error);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -1357,8 +1592,9 @@ impl ModelDownloader {
             existing_size = 0;
         }
 
-        // If already complete, skip download
-        if existing_size == expected_size {
+        // A missing zero-byte artifact still needs to be downloaded and
+        // materialized. Only an actual complete file can skip the request.
+        if existing_size == expected_size && path.is_file() {
             bytes_downloaded.fetch_add(expected_size, Ordering::SeqCst);
             return Ok(());
         }
@@ -1496,17 +1732,32 @@ impl ModelDownloader {
 
     /// Atomically install downloaded files.
     ///
-    /// Uses a backup-rename-cleanup pattern to minimize the window where no model exists:
+    /// Uses a backup-rename pattern to minimize the window where no model exists:
     /// 1. Move existing target to backup (if present)
     /// 2. Rename temp to target
-    /// 3. Remove backup on success, or restore on failure
+    /// 3. Retain the prior generation for recovery, or restore it on failure
+    ///
+    /// The portable two-rename replacement is not an atomic directory exchange.
+    /// A process/power failure between renames leaves the prior complete model
+    /// at the unique backup path; it must never be deleted as staging cleanup.
     fn atomic_install(&self) -> Result<(), DownloadError> {
         let backup_dir = unique_model_backup_dir(&self.target_dir);
         sync_tree(&self.temp_dir)?;
+        self.fail_if_cancelled()?;
 
         // Move existing target to backup (preserves it until new install succeeds)
         let had_existing = if ensure_replaceable_model_dir(&self.target_dir)? {
             fs::rename(&self.target_dir, &backup_dir)?;
+            if let Err(error) = sync_parent_directory(&backup_dir) {
+                let rollback = fs::rename(&backup_dir, &self.target_dir)
+                    .map_err(DownloadError::from)
+                    .and_then(|()| sync_parent_directory(&self.target_dir));
+                return Err(std::io::Error::other(format!(
+                    "could not sync prior model backup {}: {error}; rollback: {rollback:?}",
+                    backup_dir.display()
+                ))
+                .into());
+            }
             true
         } else {
             false
@@ -1515,11 +1766,19 @@ impl ModelDownloader {
         // Rename temp to target
         match fs::rename(&self.temp_dir, &self.target_dir) {
             Ok(()) => {
-                sync_parent_directory(&self.target_dir)?;
-                // Success: remove backup
+                if let Err(error) = sync_parent_directory(&self.target_dir) {
+                    return Err(std::io::Error::other(format!(
+                        "installed model at {} but could not sync its parent: {error}; prior model retained at {}",
+                        self.target_dir.display(),
+                        backup_dir.display()
+                    ))
+                    .into());
+                }
                 if had_existing {
-                    let _ = fs::remove_dir_all(&backup_dir);
-                    sync_parent_directory(&self.target_dir)?;
+                    tracing::info!(
+                        backup = %backup_dir.display(),
+                        "retained prior model generation for recovery"
+                    );
                 }
             }
             Err(e) => {
@@ -1537,9 +1796,10 @@ impl ModelDownloader {
                         }
                         Err(restore_err) => {
                             return Err(std::io::Error::other(format!(
-                                "failed installing {} from {}: {e}; restore error: {restore_err}; temp model retained at {}",
+                                "failed installing {} from {}: {e}; restore error: {restore_err}; prior model retained at {}; staged model retained at {}",
                                 self.target_dir.display(),
                                 self.temp_dir.display(),
+                                backup_dir.display(),
                                 self.temp_dir.display()
                             ))
                             .into());
@@ -1553,22 +1813,41 @@ impl ModelDownloader {
         Ok(())
     }
 
-    /// Write .verified marker file.
+    /// Write the network provenance marker into the staged generation.
     fn write_verified_marker(
         &self,
         manifest: &ModelManifest,
         mirror_base_url: Option<&str>,
     ) -> Result<(), DownloadError> {
-        let marker_path = self.target_dir.join(".verified");
         let source = mirror_base_url
             .map(|url| format!("mirror:{url}"))
             .unwrap_or_else(|| "registry".to_string());
         let content = format!(
-            "revision={}\nverified_at={}\nsource={}\n",
+            "revision={}\nverified_at={}\nsource={}\nfingerprint={}\n",
             manifest.revision,
             chrono::Utc::now().to_rfc3339(),
-            source
+            source,
+            crate::search::model_acquisition::ModelFingerprint::from_manifest(manifest)
+                .marker_token()
         );
+        self.write_staged_marker(&content)
+    }
+
+    fn write_staged_marker(&self, content: &str) -> Result<(), DownloadError> {
+        self.fail_if_cancelled()?;
+        let marker_path = self.temp_dir.join(".verified");
+        match fs::symlink_metadata(&marker_path) {
+            Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::other(format!(
+                    "staged model verification marker is not a regular file: {}",
+                    marker_path.display()
+                ))
+                .into());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let temp_path = unique_model_sidecar_path(&marker_path, "tmp", ".verified");
         let mut file = File::create(&temp_path)?;
         file.write_all(content.as_bytes())?;
@@ -1598,6 +1877,55 @@ impl ModelDownloader {
             Ok(())
         }
     }
+}
+
+/// Read lifecycle metadata without opening a pipe or allocating for an
+/// arbitrarily large file. Regular-file symlinks remain usable.
+pub(crate) fn read_model_marker(path: &Path) -> Result<String, DownloadError> {
+    if !fs::metadata(path)?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("model marker is not a regular file: {}", path.display()),
+        )
+        .into());
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("model marker is not a regular file: {}", path.display()),
+        )
+        .into());
+    }
+    let oversized = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "model marker exceeds {MODEL_MARKER_MAX_BYTES} bytes: {}",
+                path.display()
+            ),
+        )
+    };
+    if metadata.len() > MODEL_MARKER_MAX_BYTES {
+        return Err(oversized().into());
+    }
+    // The extra byte detects a file growing after inspection while keeping
+    // the actual read bounded, regardless of its reported size.
+    let mut reader = file.take(MODEL_MARKER_MAX_BYTES + 1);
+    let mut content = String::new();
+    reader.read_to_string(&mut content)?;
+    if reader.limit() == 0 {
+        return Err(oversized().into());
+    }
+    Ok(content)
 }
 
 /// Compute SHA256 hash of a file.
@@ -1688,7 +2016,7 @@ fn classify_model_cache_state(
 
     let quarantine_marker = model_dir.join(".quarantined");
     if quarantine_marker.is_file() {
-        let reason = fs::read_to_string(&quarantine_marker)
+        let reason = read_model_marker(&quarantine_marker)
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -1706,9 +2034,12 @@ fn classify_model_cache_state(
     // install as not-installed — even after `install --from-file` succeeded and
     // verified all files (#370). A valid install outranks leftover staging
     // debris; the marker/checksum logic below decides the concrete ready state.
-    let staging_dir = model_download_temp_dir(model_dir);
-    let install_looks_complete = missing_files.is_empty() && model_dir.join(".verified").is_file();
-    if staging_dir.is_dir() && !install_looks_complete {
+    // Preseeded bundles need no marker. Complete payloads still pass the
+    // integrity/revision checks below before being considered usable.
+    let install_looks_complete = missing_files.is_empty();
+    if !install_looks_complete
+        && let Some(staging_dir) = model_download_staging_dirs(model_dir).into_iter().next()
+    {
         return ModelCacheState::Acquiring {
             bytes_present: directory_size_bytes(&staging_dir),
             staging_dir,
@@ -1775,7 +2106,7 @@ fn classify_model_cache_state(
         };
     }
 
-    let marker = match fs::read_to_string(&verified_marker) {
+    let marker = match read_model_marker(&verified_marker) {
         Ok(marker) => marker,
         Err(err) => {
             return ModelCacheState::QuarantinedCorrupt {
@@ -1847,7 +2178,7 @@ pub fn check_version_mismatch(model_dir: &Path, manifest: &ModelManifest) -> Opt
     }
 
     // Read installed revision
-    let content = fs::read_to_string(&verified_marker).ok()?;
+    let content = read_model_marker(&verified_marker).ok()?;
     let installed_revision = content
         .lines()
         .find(|l| l.starts_with("revision="))
@@ -1955,6 +2286,39 @@ fn ensure_real_model_directory_metadata(
     Ok(())
 }
 
+/// An acquisition record is a small, exact identity match, never model data.
+/// Bound reads by the expected record even if a file grows after inspection.
+fn acquisition_record_matches(path: &Path, expected: &str) -> bool {
+    let expected_len = expected.len() as u64;
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() != expected_len {
+        return false;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let Ok(file) = options.open(path) else {
+        return false;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() != expected_len {
+        return false;
+    }
+    let mut content = Vec::with_capacity(expected.len());
+    file.take(expected_len.saturating_add(1))
+        .read_to_end(&mut content)
+        .is_ok()
+        && content == expected.as_bytes()
+}
+
 fn model_download_temp_dir(target_dir: &Path) -> PathBuf {
     if let Some(parent) = target_dir.parent() {
         let dir_name = target_dir
@@ -1965,6 +2329,51 @@ fn model_download_temp_dir(target_dir: &Path) -> PathBuf {
     } else {
         target_dir.with_extension("downloading")
     }
+}
+
+fn model_install_lock_path(target_dir: &Path) -> PathBuf {
+    let name = target_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("model");
+    target_dir.with_file_name(format!(".{name}.install.lock"))
+}
+
+/// Recognize legacy resumable directories and uniquely owned new attempts.
+/// Never follow symlinks while discovering staging or count recovery backups as
+/// active acquisition. A complete installed model continues to outrank debris.
+pub(crate) fn model_download_staging_dirs(target_dir: &Path) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    let legacy = model_download_temp_dir(target_dir);
+    if model_dir_is_real_directory(&legacy).unwrap_or(false) {
+        directories.push(legacy);
+    }
+    let parent = target_dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = target_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("model");
+    let prefix = format!(".{name}.downloading.");
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_str().is_some_and(|name| {
+                name.strip_prefix(&prefix).is_some_and(|suffix| {
+                    !suffix.is_empty()
+                        && suffix
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+                })
+            }) && entry.file_type().is_ok_and(|kind| kind.is_dir())
+            {
+                directories.push(entry.path());
+            }
+        }
+    }
+    directories.sort();
+    directories
 }
 
 /// Resolve a manifest file on disk.
@@ -2147,6 +2556,13 @@ fn sync_parent_directory(path: &Path) -> Result<(), DownloadError> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
+    // A bare relative name has an empty parent, which denotes the current
+    // directory to Path but is not a valid filename for File::open.
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
     File::open(parent)?.sync_all()?;
     Ok(())
 }
@@ -2319,11 +2735,8 @@ mod tests {
             .and_then(|line| line.split_whitespace().nth(1))
             .unwrap_or("/");
         let path = target
-            .split_once('?')
-            .map(|(path, _)| path)
-            .unwrap_or(target)
-            .split_once('#')
-            .map(|(path, _)| path)
+            .split(['?', '#'])
+            .next()
             .unwrap_or(target)
             .to_string();
         let range_start = lines.find_map(parse_range_start_header);
@@ -2348,7 +2761,7 @@ mod tests {
         let start = range_start.unwrap_or(0) as usize;
         let mut status = "200 OK";
         let mut content_range = None;
-        let body = if start >= route.body.len() {
+        let body = if range_start.is_some() && start >= route.body.len() {
             status = "416 Range Not Satisfiable";
             &[][..]
         } else if start > 0 {
@@ -2756,6 +3169,74 @@ mod tests {
     }
 
     #[test]
+    fn cache_next_steps_preserve_the_selected_model_in_every_command() {
+        for model_name in ["all-minilm-l6-v2", "multilingual-minilm", "ms-marco"] {
+            let states = [
+                ModelCacheState::NotAcquired {
+                    missing_files: vec!["weights".into()],
+                    needs_consent: true,
+                },
+                ModelCacheState::ChecksumMismatch {
+                    file: "weights".into(),
+                    expected: "expected".into(),
+                    actual: "corrupt".into(),
+                },
+                ModelCacheState::QuarantinedCorrupt {
+                    marker_path: PathBuf::from(".quarantined"),
+                    reason: "integrity failure".into(),
+                },
+                ModelCacheState::IncompatibleVersion {
+                    current_revision: "old".into(),
+                    expected_revision: "pinned".into(),
+                },
+                ModelCacheState::OfflineBlocked {
+                    missing_files: vec!["weights".into()],
+                },
+            ];
+            for state in states {
+                let advice = state
+                    .next_step(model_name)
+                    .expect("explicit operator action");
+                let commands: Vec<_> = advice.split('`').skip(1).step_by(2).collect();
+                let needs_repair = matches!(
+                    state,
+                    ModelCacheState::ChecksumMismatch { .. }
+                        | ModelCacheState::QuarantinedCorrupt { .. }
+                );
+                assert_eq!(commands.len(), if needs_repair { 2 } else { 1 });
+                for command in commands {
+                    let cli =
+                        <crate::Cli as clap::Parser>::try_parse_from(command.split_whitespace())
+                            .expect("accepted model command");
+                    match cli.command {
+                        Some(crate::Commands::Models(crate::ModelsCommand::Install {
+                            model,
+                            from_file,
+                            ..
+                        })) => {
+                            assert_eq!(model, model_name);
+                            assert_eq!(
+                                from_file.as_deref(),
+                                matches!(state, ModelCacheState::OfflineBlocked { .. })
+                                    .then_some(Path::new("<dir>"))
+                            );
+                        }
+                        Some(crate::Commands::Models(crate::ModelsCommand::Verify {
+                            model,
+                            repair,
+                            ..
+                        })) => {
+                            assert!(needs_repair && repair);
+                            assert_eq!(model, model_name);
+                        }
+                        other => panic!("unexpected model action: {other:?}"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn classify_cache_distinguishes_offline_and_budget_blocks() {
         let tmp = tempfile::tempdir().unwrap();
         let manifest = build_test_manifest("repo/model", "rev1", &[("model.onnx", b"model")]);
@@ -2898,6 +3379,113 @@ mod tests {
             report.state,
             ModelCacheState::QuarantinedCorrupt { reason, .. } if reason == "bad checksum"
         ));
+    }
+
+    #[test]
+    fn test_model_marker_read_limit_and_invalid_inputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join(".verified");
+        let source_path = format!(r"\\?\C:\{}", vec!["界".repeat(200); 140].join("\\"));
+        assert!(source_path.encode_utf16().count() < 32_767);
+        let manifest = build_test_manifest("repo/model", "rev1", &[("model.onnx", b"model")]);
+        let long_provenance = crate::search::model_acquisition::VerifiedMarker::for_from_file(
+            &manifest,
+            Path::new(&source_path),
+            "2026-06-15T00:00:00Z".into(),
+        )
+        .render();
+        assert!(long_provenance.len() > 64 * 1024);
+        fs::write(&marker, &long_provenance).unwrap();
+        assert_eq!(read_model_marker(&marker).unwrap(), long_provenance);
+
+        let content = "x".repeat(256 * 1024);
+        fs::write(&marker, &content).unwrap();
+        assert_eq!(read_model_marker(&marker).unwrap(), content);
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&marker)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        assert!(matches!(
+            read_model_marker(&marker),
+            Err(DownloadError::IoError(error))
+                if error.kind() == std::io::ErrorKind::InvalidData
+                    && error.to_string().contains("exceeds 262144 bytes")
+        ));
+        assert_eq!(fs::metadata(&marker).unwrap().len(), 262_145);
+
+        fs::write(&marker, [0xff]).unwrap();
+        assert!(matches!(
+            read_model_marker(&marker),
+            Err(DownloadError::IoError(error))
+                if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+        assert!(read_model_marker(&tmp.path().join("missing")).is_err());
+        assert!(matches!(
+            read_model_marker(tmp.path()),
+            Err(DownloadError::IoError(error))
+                if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+    }
+
+    #[test]
+    fn classify_cache_bounds_verified_and_quarantine_markers() {
+        for name in [".verified", ".quarantined"] {
+            let tmp = tempfile::tempdir().unwrap();
+            fs::write(tmp.path().join("model.onnx"), b"model").unwrap();
+            fs::write(
+                tmp.path().join(".verified"),
+                "revision=rev1\nsource=registry\n",
+            )
+            .unwrap();
+            let manifest = build_test_manifest("repo/model", "rev1", &[("model.onnx", b"model")]);
+            let policy = ModelAcquisitionPolicy::default();
+            assert!(classify_model_cache(tmp.path(), &manifest, &policy).is_usable());
+
+            let marker = tmp.path().join(name);
+            File::create(&marker)
+                .unwrap()
+                .set_len(64 * 1024 * 1024)
+                .unwrap();
+            let full = classify_model_cache(tmp.path(), &manifest, &policy);
+            let metadata = classify_model_cache_metadata(tmp.path(), &manifest, &policy);
+            assert_eq!(full.state_code(), "quarantined_corrupt");
+            assert_eq!(metadata.state_code(), "quarantined_corrupt");
+            assert!(!full.is_usable());
+            assert!(!metadata.is_usable());
+            let acquisition = crate::search::model_acquisition::live_acquisition_block(
+                tmp.path(),
+                &manifest,
+                crate::search::model_acquisition::RuntimeLoadability::NotProbed,
+                crate::search::model_acquisition::OnDiskPolicyInputs {
+                    policy_enabled: true,
+                    offline: false,
+                    budget_max_bytes: None,
+                },
+                "minilm",
+            );
+            assert_eq!(acquisition["state"], "quarantined_corrupt");
+            assert_eq!(acquisition["usable"], false);
+            assert_eq!(acquisition["fallback_mode"], "lexical");
+            assert_eq!(fs::metadata(&marker).unwrap().len(), 64 * 1024 * 1024);
+            assert_eq!(fs::read(tmp.path().join("model.onnx")).unwrap(), b"model");
+            if name == ".verified" {
+                assert!(check_version_mismatch(tmp.path(), &manifest).is_none());
+                assert!(matches!(
+                    full.state,
+                    ModelCacheState::QuarantinedCorrupt { reason, .. }
+                        if reason.contains("exceeds 262144 bytes")
+                ));
+            } else {
+                assert!(matches!(
+                    full.state,
+                    ModelCacheState::QuarantinedCorrupt { reason, .. }
+                        if reason == "model cache quarantined after integrity failure"
+                ));
+            }
+        }
     }
 
     #[test]
@@ -3045,20 +3633,587 @@ mod tests {
     }
 
     #[test]
-    fn test_write_verified_marker_overwrites_existing_marker() {
+    fn test_write_verified_marker_changes_only_staged_generation() {
         let tmp = tempfile::tempdir().unwrap();
         let target_dir = tmp.path().join("model");
         fs::create_dir_all(&target_dir).unwrap();
         fs::write(target_dir.join(".verified"), "revision=old\n").unwrap();
 
         let downloader = ModelDownloader::new(target_dir.clone());
+        fs::create_dir_all(&downloader.temp_dir).unwrap();
+        fs::write(downloader.temp_dir.join(".verified"), "revision=partial\n").unwrap();
         let manifest = ModelManifest::minilm_v2();
         downloader.write_verified_marker(&manifest, None).unwrap();
 
-        let marker = fs::read_to_string(target_dir.join(".verified")).unwrap();
+        let marker = fs::read_to_string(downloader.temp_dir.join(".verified")).unwrap();
         assert!(marker.contains(&format!("revision={}", manifest.revision)));
         assert!(marker.contains("verified_at="));
         assert!(marker.contains("source=registry"));
+        assert!(marker.contains("fingerprint="));
+        assert_eq!(
+            fs::read_to_string(target_dir.join(".verified")).unwrap(),
+            "revision=old\n"
+        );
+    }
+
+    fn offline_install_fixture(root: &Path) -> (ModelDownloader, PathBuf, ModelManifest) {
+        let target = root.join("model");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("model.safetensors"), b"previous-weights").unwrap();
+        fs::write(target.join(".verified"), "revision=previous\n").unwrap();
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let files = [
+            ("model.safetensors", b"next-weights".as_slice()),
+            ("tokenizer.json", b"next-tokenizer".as_slice()),
+        ];
+        for (name, bytes) in files {
+            fs::write(source.join(name), bytes).unwrap();
+        }
+        let manifest = build_test_manifest("test/local-model", "next-revision", &files);
+        (ModelDownloader::new(target), source, manifest)
+    }
+
+    fn assert_prior_install_unchanged(downloader: &ModelDownloader) {
+        assert_eq!(
+            fs::read(downloader.target_dir.join("model.safetensors")).unwrap(),
+            b"previous-weights"
+        );
+        assert_eq!(
+            fs::read_to_string(downloader.target_dir.join(".verified")).unwrap(),
+            "revision=previous\n"
+        );
+        assert!(!downloader.target_dir.join("tokenizer.json").exists());
+    }
+
+    #[test]
+    fn test_offline_install_publishes_verified_generation_and_retains_previous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (downloader, source, manifest) = offline_install_fixture(tmp.path());
+
+        downloader
+            .install_from_directory(&manifest, &source, None)
+            .unwrap();
+
+        for file in &manifest.files {
+            assert_eq!(
+                compute_sha256(&downloader.target_dir.join(file.local_name())).unwrap(),
+                file.sha256
+            );
+        }
+        let marker = fs::read_to_string(downloader.target_dir.join(".verified")).unwrap();
+        assert!(marker.contains("revision=next-revision\n"));
+        assert!(marker.contains("source=from-file\n"));
+        assert!(marker.contains(&format!("source_path={}\n", source.display())));
+        assert!(marker.contains("fingerprint="));
+        assert!(!downloader.temp_dir.exists());
+        let backups: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".model.bak.")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            fs::read(backups[0].path().join("model.safetensors")).unwrap(),
+            b"previous-weights"
+        );
+        assert_eq!(
+            fs::read_to_string(backups[0].path().join(".verified")).unwrap(),
+            "revision=previous\n"
+        );
+    }
+
+    #[test]
+    fn test_offline_install_bad_later_file_preserves_entire_previous_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (downloader, source, manifest) = offline_install_fixture(tmp.path());
+        fs::write(source.join("tokenizer.json"), b"corrupt-tokenizer").unwrap();
+
+        let error = downloader
+            .install_from_directory(&manifest, &source, None)
+            .unwrap_err();
+
+        assert!(matches!(error, DownloadError::VerificationFailed { .. }));
+        assert_prior_install_unchanged(&downloader);
+        assert!(!downloader.temp_dir.exists());
+    }
+
+    #[test]
+    fn test_offline_install_missing_later_file_preserves_entire_previous_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (downloader, source, mut manifest) = offline_install_fixture(tmp.path());
+        manifest.files[1].name = "missing-tokenizer.json".to_string();
+
+        let error = downloader
+            .install_from_directory(&manifest, &source, None)
+            .unwrap_err();
+
+        assert!(matches!(error, DownloadError::IoError(_)));
+        assert_prior_install_unchanged(&downloader);
+        assert!(!downloader.temp_dir.join(".verified").exists());
+    }
+
+    #[test]
+    fn test_offline_install_verifies_copied_bytes_after_source_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (downloader, source, manifest) = offline_install_fixture(tmp.path());
+        let mutable_source = source.clone();
+
+        downloader
+            .install_from_directory(
+                &manifest,
+                &source,
+                Some(Arc::new(move |progress| {
+                    if progress.file_index == 1 {
+                        // Change the source after its bytes were copied but
+                        // before the installer's integrity check.
+                        fs::write(mutable_source.join("model.safetensors"), b"changed-data")
+                            .unwrap();
+                    }
+                })),
+            )
+            .unwrap();
+
+        assert_eq!(
+            fs::read(downloader.target_dir.join("model.safetensors")).unwrap(),
+            b"next-weights"
+        );
+        assert_eq!(
+            fs::read(source.join("model.safetensors")).unwrap(),
+            b"changed-data"
+        );
+    }
+
+    #[test]
+    fn test_offline_install_marker_failure_preserves_previous_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (downloader, source, manifest) = offline_install_fixture(tmp.path());
+        let blocked_marker = downloader.temp_dir.join(".verified");
+
+        let error = downloader
+            .install_from_directory(
+                &manifest,
+                &source,
+                Some(Arc::new(move |_| {
+                    fs::create_dir_all(&blocked_marker).unwrap();
+                })),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, DownloadError::IoError(_)));
+        assert_prior_install_unchanged(&downloader);
+        assert!(downloader.temp_dir.join("model.safetensors").is_file());
+    }
+
+    #[test]
+    fn test_offline_install_cancellation_preserves_previous_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (downloader, source, manifest) = offline_install_fixture(tmp.path());
+        let cancellation = downloader.cancellation_handle();
+
+        let error = downloader
+            .install_from_directory(
+                &manifest,
+                &source,
+                Some(Arc::new(move |_| {
+                    cancellation.store(true, Ordering::SeqCst);
+                })),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, DownloadError::Cancelled));
+        assert_prior_install_unchanged(&downloader);
+        assert!(!downloader.temp_dir.join(".verified").exists());
+    }
+
+    #[test]
+    fn test_offline_and_network_installs_share_exclusive_model_lease() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (owner, source, manifest) = offline_install_fixture(tmp.path());
+        let contender = ModelDownloader::new(owner.target_dir.clone());
+        assert_ne!(owner.temp_dir, contender.temp_dir);
+        let lease = owner.acquire_install_lease().unwrap();
+
+        assert!(matches!(
+            contender.install_from_directory(&manifest, &source, None),
+            Err(DownloadError::InstallInProgress { .. })
+        ));
+        assert!(matches!(
+            contender.download(&manifest, None),
+            Err(DownloadError::InstallInProgress { .. })
+        ));
+        assert!(!contender.temp_dir.exists());
+        assert_prior_install_unchanged(&owner);
+
+        drop(lease);
+        contender
+            .install_from_directory(&manifest, &source, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_acquisition_resume_does_not_mix_model_or_source_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (first, _, manifest) = offline_install_fixture(tmp.path());
+        first
+            .prepare_acquisition(&manifest, "registry", true)
+            .unwrap();
+        fs::write(first.temp_dir.join("model.safetensors"), b"partial").unwrap();
+        let other = ModelDownloader::new(first.target_dir.clone());
+
+        other
+            .prepare_acquisition(&manifest, "mirror:https://different.example", true)
+            .unwrap();
+
+        assert!(first.temp_dir.join("model.safetensors").exists());
+        assert!(!other.temp_dir.join("model.safetensors").exists());
+        let resumed = ModelDownloader::new(first.target_dir.clone());
+        resumed
+            .prepare_acquisition(&manifest, "registry", true)
+            .unwrap();
+        assert!(!first.temp_dir.exists());
+        assert_eq!(
+            fs::read(resumed.temp_dir.join("model.safetensors")).unwrap(),
+            b"partial"
+        );
+    }
+
+    #[test]
+    fn test_offline_install_supports_bare_relative_destination() {
+        const CHILD_ROOT: &str = "CASS_TEST_MODEL_RELATIVE_INSTALL_CHILD_ROOT";
+        let Some(root) = std::env::var_os(CHILD_ROOT) else {
+            let tmp = tempfile::tempdir().unwrap();
+            let full_name = concat!(
+                module_path!(),
+                "::test_offline_install_supports_bare_relative_destination"
+            );
+            let (_, test_name) = full_name.split_once("::").unwrap();
+            assert_cmd::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD_ROOT, tmp.path())
+                .current_dir(tmp.path())
+                .timeout(Duration::from_secs(10))
+                .assert()
+                .success()
+                .stdout(predicates::str::contains("1 passed; 0 failed"));
+            return;
+        };
+        let root = PathBuf::from(root);
+        let (prior, source, manifest) = offline_install_fixture(&root);
+        let relative = ModelDownloader::new(PathBuf::from("model"));
+        let mut invalid = manifest.clone();
+        invalid.files[1].sha256 = "0".repeat(64);
+        assert!(matches!(
+            relative.install_from_directory(&invalid, &source, None),
+            Err(DownloadError::VerificationFailed { .. })
+        ));
+        assert_prior_install_unchanged(&prior);
+
+        let interrupted = ModelDownloader::new(PathBuf::from("model"));
+        interrupted
+            .prepare_acquisition(&manifest, "registry", true)
+            .unwrap();
+        fs::write(interrupted.temp_dir.join("model.safetensors"), b"partial").unwrap();
+        assert_eq!(
+            classify_model_cache(
+                Path::new("model"),
+                &manifest,
+                &ModelAcquisitionPolicy::default(),
+            )
+            .state_code(),
+            "acquiring"
+        );
+        relative
+            .prepare_acquisition(&manifest, "registry", true)
+            .unwrap();
+        assert!(!interrupted.temp_dir.exists());
+        assert_eq!(
+            fs::read(relative.temp_dir.join("model.safetensors")).unwrap(),
+            b"partial"
+        );
+        assert_prior_install_unchanged(&prior);
+
+        relative
+            .install_from_directory(&manifest, &source, None)
+            .unwrap();
+        for file in &manifest.files {
+            assert_eq!(
+                compute_sha256(&prior.target_dir.join(file.local_name())).unwrap(),
+                file.sha256
+            );
+        }
+        let marker = fs::read_to_string(prior.target_dir.join(".verified")).unwrap();
+        assert!(marker.contains("revision=next-revision\n"));
+        assert!(marker.contains("source=from-file\n"));
+        assert_eq!(
+            fs::read_dir(&root)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".model.bak."))
+                .count(),
+            1,
+            "only the successful install may replace the prior generation"
+        );
+    }
+
+    #[test]
+    fn test_acquisition_receipt_requires_exact_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = tmp.path().join(MODEL_ACQUISITION_RECORD);
+        let expected = r#"{"version":1,"source":"registry"}"#;
+
+        assert!(!acquisition_record_matches(&record, expected));
+        fs::write(&record, expected).unwrap();
+        assert!(acquisition_record_matches(&record, expected));
+        fs::write(&record, expected.replace("registry", "modified")).unwrap();
+        assert!(!acquisition_record_matches(&record, expected));
+        fs::write(&record, format!("{expected}\n")).unwrap();
+        assert!(!acquisition_record_matches(&record, expected));
+        let file = File::create(&record).unwrap();
+        file.set_len(512 * 1024 * 1024).unwrap();
+        drop(file);
+        assert!(!acquisition_record_matches(&record, expected));
+        fs::write(&record, expected).unwrap();
+        assert!(acquisition_record_matches(&record, expected));
+        assert_eq!(fs::read(&record).unwrap(), expected.as_bytes());
+        assert!(!acquisition_record_matches(tmp.path(), expected));
+    }
+
+    #[test]
+    fn test_acquisition_resume_preserves_malformed_candidates_without_adopting_them() {
+        for malformed in ["different-same-size", "trailing-byte", "oversized"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (first, _, manifest) = offline_install_fixture(tmp.path());
+            first
+                .prepare_acquisition(&manifest, "registry", true)
+                .unwrap();
+            let record = first.temp_dir.join(MODEL_ACQUISITION_RECORD);
+            let mut contents = fs::read(&record).unwrap();
+            match malformed {
+                "different-same-size" => contents[0] = b'!',
+                "trailing-byte" => contents.push(b'\n'),
+                "oversized" => {}
+                _ => unreachable!(),
+            }
+            fs::write(&record, &contents).unwrap();
+            if malformed == "oversized" {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&record)
+                    .unwrap()
+                    .set_len(512 * 1024 * 1024)
+                    .unwrap();
+            }
+            let record_len = fs::metadata(&record).unwrap().len();
+            fs::write(first.temp_dir.join("model.safetensors"), b"partial").unwrap();
+            let next = ModelDownloader::new(first.target_dir.clone());
+
+            next.prepare_acquisition(&manifest, "registry", true)
+                .unwrap();
+
+            assert_eq!(
+                fs::read(first.temp_dir.join("model.safetensors")).unwrap(),
+                b"partial"
+            );
+            assert_eq!(fs::metadata(&record).unwrap().len(), record_len);
+            assert!(!next.temp_dir.join("model.safetensors").exists());
+            assert_prior_install_unchanged(&next);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_acquisition_ignores_symlink_receipts_but_accepts_regular_source_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (downloader, source, manifest) = offline_install_fixture(tmp.path());
+        downloader
+            .prepare_acquisition(&manifest, "registry", true)
+            .unwrap();
+        let receipt_path = downloader.temp_dir.join(MODEL_ACQUISITION_RECORD);
+        let original_receipt = fs::read(&receipt_path).unwrap();
+        let external_receipt = tmp.path().join("external-receipt.json");
+        fs::rename(&receipt_path, &external_receipt).unwrap();
+        symlink(&external_receipt, &receipt_path).unwrap();
+        fs::write(downloader.temp_dir.join("model.safetensors"), b"partial").unwrap();
+
+        let next = ModelDownloader::new(downloader.target_dir.clone());
+        next.prepare_acquisition(&manifest, "registry", true)
+            .unwrap();
+        assert!(downloader.temp_dir.join("model.safetensors").exists());
+        assert!(!next.temp_dir.join("model.safetensors").exists());
+        assert_eq!(fs::read(&external_receipt).unwrap(), original_receipt);
+        assert_prior_install_unchanged(&downloader);
+
+        let actual_weights = tmp.path().join("actual-weights");
+        let source_weights = source.join("model.safetensors");
+        fs::rename(&source_weights, &actual_weights).unwrap();
+        symlink(&actual_weights, &source_weights).unwrap();
+        next.install_from_directory(&manifest, &source, None)
+            .unwrap();
+        for file in &manifest.files {
+            assert_eq!(
+                compute_sha256(&next.target_dir.join(file.local_name())).unwrap(),
+                file.sha256
+            );
+        }
+        assert_eq!(fs::read(&actual_weights).unwrap(), b"next-weights");
+        assert_eq!(fs::read(&external_receipt).unwrap(), original_receipt);
+        assert!(downloader.temp_dir.join("model.safetensors").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_model_acquisition_fifo_inputs_do_not_block() {
+        // Isolate the actual calls in a subprocess so a blocking regression
+        // fails this test without wedging the entire library harness.
+        const CHILD_ROOT: &str = "CASS_TEST_MODEL_ACQUISITION_FIFO_CHILD_ROOT";
+        let Some(root) = std::env::var_os(CHILD_ROOT) else {
+            let tmp = tempfile::tempdir().unwrap();
+            let full_name = concat!(
+                module_path!(),
+                "::test_model_acquisition_fifo_inputs_do_not_block"
+            );
+            // libtest names omit the crate component from module_path!().
+            let (_, test_name) = full_name.split_once("::").unwrap();
+            assert_cmd::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD_ROOT, tmp.path())
+                .timeout(Duration::from_secs(5))
+                .assert()
+                .success()
+                .stdout(predicates::str::contains("1 passed; 0 failed"));
+            return;
+        };
+        let root = PathBuf::from(root);
+        let (downloader, source, mut manifest) = offline_install_fixture(&root);
+        manifest.files[0].name = "pipe.safetensors".to_string();
+        let pipe = source.join("pipe.safetensors");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&pipe)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let error = downloader
+            .install_from_directory(&manifest, &source, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("not a regular file"));
+        assert_prior_install_unchanged(&downloader);
+
+        let staging = ModelDownloader::new(downloader.target_dir.clone());
+        fs::create_dir_all(&staging.temp_dir).unwrap();
+        let record = staging.temp_dir.join(MODEL_ACQUISITION_RECORD);
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&record)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(staging.temp_dir.join("model.safetensors"), b"partial").unwrap();
+        let next = ModelDownloader::new(downloader.target_dir.clone());
+        next.prepare_acquisition(&manifest, "registry", true)
+            .unwrap();
+        assert!(staging.temp_dir.join("model.safetensors").exists());
+        assert!(!next.temp_dir.join("model.safetensors").exists());
+        assert_prior_install_unchanged(&downloader);
+    }
+
+    #[test]
+    fn test_offline_install_rejects_unsafe_or_duplicate_artifact_names_before_staging() {
+        for invalid_name in ["..", ".verified", "C:\\outside", "tokenizer.json"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (downloader, source, mut manifest) = offline_install_fixture(tmp.path());
+            manifest.files[0].name = invalid_name.to_string();
+
+            assert!(
+                downloader
+                    .install_from_directory(&manifest, &source, None)
+                    .is_err()
+            );
+            assert_prior_install_unchanged(&downloader);
+            assert!(!downloader.temp_dir.exists());
+        }
+    }
+
+    #[test]
+    fn test_install_rejects_artifact_name_collisions_before_staging() {
+        for invalid_name in [
+            ".verified",
+            ".VERIFIED",
+            ".quarantined",
+            ".QUARANTINED",
+            ".acquisition.json",
+            ".ACQUISITION.JSON",
+            "onnx/.quarantined",
+            "TOKENIZER.JSON",
+            "onnx/TOKENIZER.JSON",
+            ".verified.",
+            ".VERIFIED ",
+            ".quarantined.",
+            ".QUARANTINED ",
+            ".acquisition.json.",
+            ".ACQUISITION.JSON ",
+            "onnx/.verified. ",
+            "tokenizer.json.",
+            "TOKENIZER.JSON ",
+            "onnx/tokenizer.json. ",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (downloader, source, manifest) = offline_install_fixture(tmp.path());
+            let mut invalid = manifest.clone();
+            invalid.files[0].name = invalid_name.into();
+            let source_path = source.join(invalid.files[0].local_name());
+            // Supply the renamed artifact's pinned bytes: a missing-file
+            // error must not stand in for rejecting the filename collision.
+            fs::write(&source_path, b"next-weights").unwrap();
+
+            let error = downloader
+                .install_from_directory(&invalid, &source, None)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                DownloadError::IoError(error)
+                    if error.to_string().contains("unsafe or duplicate model artifact filename")
+            ));
+            assert_prior_install_unchanged(&downloader);
+            assert!(!downloader.temp_dir.exists());
+            assert!(!model_install_lock_path(&downloader.target_dir).exists());
+            assert_eq!(fs::read(&source_path).unwrap(), b"next-weights");
+
+            // Case folding or Win32 suffix trimming can overwrite the
+            // tokenizer source. Restore the valid bundle before the
+            // positive-control install.
+            fs::write(source.join("tokenizer.json"), b"next-tokenizer").unwrap();
+            downloader
+                .install_from_directory(&manifest, &source, None)
+                .unwrap();
+            assert!(
+                classify_model_cache(
+                    &downloader.target_dir,
+                    &manifest,
+                    &ModelAcquisitionPolicy::default(),
+                )
+                .is_usable()
+            );
+            for file in &manifest.files {
+                assert_eq!(
+                    compute_sha256(&downloader.target_dir.join(file.local_name())).unwrap(),
+                    file.sha256
+                );
+            }
+        }
     }
 
     #[test]
@@ -3403,6 +4558,126 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_mirror_artifact_is_downloaded_unless_a_complete_file_exists() {
+        for preexisting in [false, true] {
+            let manifest = build_test_manifest(
+                "mirror/empty-model",
+                "empty-revision",
+                &[("empty.bin", b"")],
+            );
+            let server = start_mirror_fixture_server(vec![(
+                mirror_route_path("/cache", &manifest, &manifest.files[0]),
+                MirrorRoute {
+                    body: Vec::new(),
+                    content_type: "application/octet-stream",
+                    chunk_size: 64,
+                    chunk_delay: Duration::ZERO,
+                },
+            )]);
+            let tmp = tempfile::tempdir().unwrap();
+            let downloader = ModelDownloader::new(tmp.path().join("model"));
+            let mirror_base = format!("{}/cache", server.base_url);
+            if preexisting {
+                downloader
+                    .prepare_acquisition(&manifest, &format!("mirror:{mirror_base}"), true)
+                    .unwrap();
+                fs::write(downloader.temp_dir.join("empty.bin"), b"").unwrap();
+            }
+
+            downloader
+                .download_with_mirror(&manifest, Some(&mirror_base), None)
+                .unwrap();
+
+            let installed = downloader.target_dir.join("empty.bin");
+            assert!(installed.is_file());
+            assert_eq!(fs::metadata(&installed).unwrap().len(), 0);
+            assert_eq!(
+                compute_sha256(&installed).unwrap(),
+                manifest.files[0].sha256
+            );
+            let marker = fs::read_to_string(downloader.target_dir.join(".verified")).unwrap();
+            assert!(marker.contains("revision=empty-revision\n"));
+            assert!(marker.contains(&format!("source=mirror:{mirror_base}\n")));
+            let requests = server.requests();
+            assert_eq!(requests.len(), if preexisting { 0 } else { 1 });
+            assert!(requests.iter().all(|request| request.range_start.is_none()));
+        }
+    }
+
+    #[test]
+    fn test_empty_mirror_artifact_rejects_unexpected_payload_without_replacing_model() {
+        let manifest = build_test_manifest(
+            "mirror/empty-model",
+            "empty-revision",
+            &[("empty.bin", b"")],
+        );
+        let server = start_mirror_fixture_server(vec![(
+            mirror_route_path("/cache", &manifest, &manifest.files[0]),
+            MirrorRoute {
+                body: b"unexpected payload".to_vec(),
+                content_type: "application/octet-stream",
+                chunk_size: 64,
+                chunk_delay: Duration::ZERO,
+            },
+        )]);
+        let tmp = tempfile::tempdir().unwrap();
+        let (downloader, _, _) = offline_install_fixture(tmp.path());
+        let mirror_base = format!("{}/cache", server.base_url);
+
+        assert!(matches!(
+            downloader.download_with_mirror(&manifest, Some(&mirror_base), None),
+            Err(DownloadError::VerificationFailed { .. })
+        ));
+
+        assert_prior_install_unchanged(&downloader);
+        assert!(!downloader.target_dir.join("empty.bin").exists());
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn test_empty_mirror_route_accepts_plain_get_and_rejects_unsatisfiable_range() {
+        let server = start_mirror_fixture_server(vec![(
+            "/empty".to_string(),
+            MirrorRoute {
+                body: Vec::new(),
+                content_type: "application/octet-stream",
+                chunk_size: 64,
+                chunk_delay: Duration::ZERO,
+            },
+        )]);
+        crate::ensure_rustls_crypto_provider();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("{}/empty", server.base_url);
+        let ordinary = client.get(&url).send().unwrap();
+        assert_eq!(ordinary.status().as_u16(), 200);
+        assert!(ordinary.bytes().unwrap().is_empty());
+        let ranged = client.get(&url).header("Range", "bytes=0-").send().unwrap();
+        assert_eq!(ranged.status().as_u16(), 416);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].range_start, None);
+        assert_eq!(requests[1].range_start, Some(0));
+
+        let queried = client.get(format!("{url}?download=1")).send().unwrap();
+        assert_eq!(queried.status().as_u16(), 200);
+        assert!(queried.bytes().unwrap().is_empty());
+        let missing = client
+            .get(format!("{}/missing?download=1", server.base_url))
+            .send()
+            .unwrap();
+        assert_eq!(missing.status().as_u16(), 404);
+        assert_eq!(missing.text().unwrap(), "not found");
+        let requests = server.requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[2].path, "/empty");
+        assert_eq!(requests[2].range_start, None);
+        assert_eq!(requests[3].path, "/missing");
+    }
+
+    #[test]
     fn test_download_with_mirror_installs_verified_model_from_http_mirror() {
         let files = [
             ("onnx/model.onnx", b"mirror-model".as_slice()),
@@ -3591,15 +4866,18 @@ mod tests {
             "cancelled run should preserve a partial download for resume; got {partial_size} bytes"
         );
 
-        downloader
+        let resumed = ModelDownloader::new(downloader.target_dir.clone());
+        assert_ne!(resumed.temp_dir, downloader.temp_dir);
+        resumed
             .download_with_mirror(&manifest, Some(&mirror_base), None)
             .unwrap();
 
         assert_eq!(
-            fs::read(downloader.target_dir.join("model.onnx")).unwrap(),
+            fs::read(resumed.target_dir.join("model.onnx")).unwrap(),
             large_payload,
-            "rerun after cancellation should finish the mirrored download and install the exact payload"
+            "new installer after cancellation should adopt the partial and install the exact payload"
         );
+        assert!(!downloader.temp_dir.exists());
         let requests = server.requests();
         assert!(
             requests

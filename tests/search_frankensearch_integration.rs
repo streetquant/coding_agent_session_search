@@ -13,7 +13,7 @@ use coding_agent_search::search::tantivy::TantivyIndex;
 use coding_agent_search::search::vector_index::{
     SemanticFilter, VectorIndex, parse_semantic_doc_id,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use tempfile::TempDir;
 
 mod util;
@@ -112,46 +112,72 @@ fn cass_selects_only_the_explicit_tantivy_compatibility_surface() {
         "CASS must not select the facade's swappable generic lexical feature: {dependency}"
     );
 
-    // gh#416: frankensearch resolves from crates.io behind an EXACT version
-    // pin (the registry holds stale same-version twins from an older tree, so
-    // a caret req could resolve wrong source; `=` fences that off). The old
-    // form of this contract pinned a git revision — that shape is now itself
-    // a defect, checked below via the absence of any git source.
+    // GH #548 needs APIs not yet in the registry release. Retain the exact
+    // version and select one immutable Git revision for the entire family;
+    // same-version registry packages are not equivalent source contracts.
     let pinned_version = dependency
         .split_once("version = \"=")
         .and_then(|(_, suffix)| suffix.split_once('"'))
         .map(|(version, _)| version.to_owned())
-        .expect("frankensearch dependency must pin an exact registry version (= prefix)");
+        .expect("frankensearch dependency must pin an exact version (= prefix)");
+    let pinned_revision = dependency
+        .split_once("rev = \"")
+        .and_then(|(_, suffix)| suffix.split_once('"'))
+        .map(|(revision, _)| revision.to_owned())
+        .expect("frankensearch dependency must pin an immutable Git revision");
     assert!(
-        !dependency.contains("git ="),
-        "frankensearch must not resolve from git; crates.io publishing forbids it: {dependency}"
+        pinned_revision.len() == 40 && pinned_revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "the Frankensearch revision must be a complete commit SHA"
+    );
+    assert!(
+        dependency.contains("git = \"https://github.com/Dicklesworthstone/frankensearch\""),
+        "frankensearch must resolve from the reviewed repository: {dependency}"
     );
     let lockfile = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"),
     )
     .expect("read Cargo.lock");
+    let expected_source = format!(
+        "git+https://github.com/Dicklesworthstone/frankensearch?rev={pinned_revision}#{pinned_revision}"
+    );
     let expected_lock = format!(
-        "name = \"frankensearch\"\nversion = \"{pinned_version}\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\""
+        "name = \"frankensearch\"\nversion = \"{pinned_version}\"\nsource = \"{expected_source}\""
     );
     assert!(
         lockfile.contains(&expected_lock),
-        "Cargo.lock must resolve frankensearch {pinned_version} from the crates.io registry"
+        "Cargo.lock must resolve the exact Frankensearch version and Git revision"
     );
+    let lock: toml::Value = toml::from_str(&lockfile).expect("parse Cargo.lock");
+    let packages = lock["package"].as_array().expect("lockfile packages");
+    for package in packages.iter().filter(|package| {
+        package["name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("frankensearch"))
+    }) {
+        assert_eq!(
+            package["source"].as_str(),
+            Some(expected_source.as_str()),
+            "all Frankensearch packages must share one source: {}",
+            package["name"]
+        );
+    }
     let build_contract =
         std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("build.rs"))
             .expect("read build.rs");
     assert!(
-        build_contract.contains(&format!("expected_version: \"{pinned_version}\"")),
-        "build.rs must enforce the same exact FrankenSearch version as Cargo.toml"
+        build_contract.contains(&format!("expected_version: \"{pinned_version}\""))
+            && build_contract.contains(&format!("expected_rev: \"{pinned_revision}\"")),
+        "build.rs must enforce the same exact Frankensearch version and revision as Cargo.toml"
     );
     let readme =
         std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
             .expect("read README.md");
     assert!(
         readme.contains(&format!("={pinned_version}"))
+            && readme.contains(&pinned_revision)
             && readme.contains("cass-compat")
             && readme.contains("lexical-tantivy"),
-        "README dependency contract must name the pinned registry version and explicit compatibility lane"
+        "README must name the exact source pin and explicit compatibility lane"
     );
     assert!(
         lockfile.contains("name = \"frankensearch-lexical\""),
@@ -482,6 +508,793 @@ fn lexical_search_through_frankensearch_pipeline() {
         .search("token refresh", filters, 10, 0, FieldMask::FULL)
         .unwrap();
     assert!(!hits.is_empty(), "should find multi-term query");
+}
+
+fn assert_lexical_sources(
+    client: &SearchClient,
+    query: &str,
+    filters: SearchFilters,
+    expected: &[&str],
+) {
+    let hits = client
+        .search(query, filters, 100, 0, FieldMask::FULL)
+        .unwrap_or_else(|error| panic!("search {query:?}: {error:#}"));
+    let actual: BTreeSet<String> = hits
+        .iter()
+        .map(|hit| {
+            std::path::Path::new(&hit.source_path)
+                .file_stem()
+                .expect("fixture source filename")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    let expected: BTreeSet<String> = expected.iter().map(|name| (*name).to_owned()).collect();
+    assert_eq!(actual, expected, "query {query:?}");
+    assert_eq!(hits.len(), expected.len(), "duplicate hits for {query:?}");
+}
+
+fn durable_index_hashes(root: &std::path::Path) -> BTreeMap<std::path::PathBuf, blake3::Hash> {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .map(|entry| entry.expect("read index directory"))
+        .filter(|entry| entry.file_type().is_file())
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            !name.contains("lock")
+                && (entry.path().extension().is_some_and(|ext| ext == "fslx")
+                    || name.contains("manifest")
+                    || name.contains("schema"))
+        })
+        .map(|entry| {
+            let bytes = std::fs::read(entry.path()).expect("read immutable index artifact");
+            (
+                entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                blake3::hash(&bytes),
+            )
+        })
+        .collect()
+}
+
+/// GH #548 must be fixed in the engine actually used by CASS, including the
+/// application's raw query spelling, filtering, cache, and fresh reopen.
+/// This receipt deliberately pins the released generation: a dependency update
+/// that moves to a new namespace does not establish the no-reindex correction.
+#[test]
+fn accented_latin_queries_reopen_the_released_cass_generation() {
+    use coding_agent_search::sources::provenance::SourceFilter;
+
+    assert_eq!(
+        frankensearch::quill::cass::legacy_v9::CASS_SCHEMA_VERSION,
+        "v9-quill"
+    );
+    assert_eq!(
+        coding_agent_search::search::tantivy::SCHEMA_HASH,
+        "quill-fslx-schema-v9-hyphen-cjk-bigrams-bounded-content-prefix-preview-stored-content-external"
+    );
+    let dir = TempDir::new().expect("accented corpus directory");
+    let mut index = TantivyIndex::open_or_create(dir.path()).expect("create CASS index");
+    for (name, agent, timestamp, text) in [
+        (
+            "hu",
+            "claude_code",
+            1_700_000_000_000,
+            "Kérlek nézd ellenőrizd a mentést İstanbulban",
+        ),
+        ("de", "codex", 1_700_000_001_000, "größere Straße München"),
+        ("fr", "codex", 1_700_000_002_000, "français déjà reçu"),
+        ("pl", "codex", 1_700_000_003_000, "zażółć gęślą jaźń"),
+        ("cs", "codex", 1_700_000_004_000, "příliš žluťoučký kůň"),
+        ("ascii", "codex", 1_700_000_005_000, "plain backup"),
+    ] {
+        let workspace = if name == "hu" {
+            "/work/árvíz".to_owned()
+        } else {
+            format!("/work/{name}")
+        };
+        let conversation = util::ConversationFixtureBuilder::new(agent)
+            .title("fixture")
+            .source_path(dir.path().join(format!("{name}.jsonl")))
+            .workspace(workspace)
+            .base_ts(timestamp)
+            .messages(1)
+            .with_content(0, text)
+            .build_normalized();
+        index
+            .add_conversation(&conversation)
+            .expect("ingest accented conversation");
+    }
+    index.commit().expect("publish CASS corpus");
+    drop(index);
+    let before = durable_index_hashes(dir.path());
+    assert!(
+        before
+            .keys()
+            .any(|path| path.extension().is_some_and(|ext| ext == "fslx")),
+        "receipt must include published index segments"
+    );
+
+    // No writer or indexing call is involved in either reopen. Repeated
+    // queries also exercise SearchClient's cache with the corrected engine.
+    for _ in 0..2 {
+        let client = SearchClient::open(dir.path(), None)
+            .expect("open published CASS generation")
+            .expect("CASS reader exists");
+        for (query, expected) in [
+            ("kérlek", vec!["hu"]),
+            ("KÉRLEK", vec!["hu"]),
+            ("ke\u{301}rlek", vec![]),
+            ("ellenőrizd", vec!["hu"]),
+            ("İSTANBULBAN", vec!["hu"]),
+            ("GRÖẞERE", vec!["de"]),
+            ("Straße", vec!["de"]),
+            ("FRANÇAIS", vec!["fr"]),
+            ("zażółć", vec!["pl"]),
+            ("příliš", vec!["cs"]),
+            ("kérl*", vec!["hu"]),
+            ("kérlek OR backup", vec!["hu", "ascii"]),
+            ("kérlek OR 🚀", vec![]),
+            ("kérlek OR \"\"", vec![]),
+            ("kérlek OR *", vec![]),
+            ("kérlek OR \"*\"", vec![]),
+            ("kérlek AND backup", vec![]),
+            ("kérlek AND \"\"", vec![]),
+            ("kérlek AND \"   \"", vec![]),
+            ("kérlek NOT \"\"", vec![]),
+            ("(kérlek OR backup) -backup", vec!["hu"]),
+            ("NOT kérlek", vec!["de", "fr", "pl", "cs", "ascii"]),
+            ("NOT é", vec![]),
+            ("NOT \"\"", vec![]),
+            ("backup", vec!["ascii"]),
+            ("привет", vec![]),
+            ("é", vec![]),
+            ("é*", vec![]),
+            ("🚀", vec![]),
+            ("🚀*", vec![]),
+            ("\"\"", vec![]),
+            ("\"   \"", vec![]),
+            ("!***", vec![]),
+            ("*", vec![]),
+            ("\"*** \u{2003}\"", vec![]),
+            ("NOT", vec![]),
+            ("AND OR", vec![]),
+            ("()", vec![]),
+            ("backup \u{2003}", vec!["ascii"]),
+            ("*érlek", vec![]),
+            ("ké*rlek", vec![]),
+            ("\"ké*rlek\"", vec![]),
+            ("\"ké*rlek nézd\"", vec![]),
+        ] {
+            assert_lexical_sources(&client, query, SearchFilters::default(), &expected);
+        }
+
+        for filters in [
+            SearchFilters {
+                agents: HashSet::from(["claude_code".to_owned()]),
+                ..SearchFilters::default()
+            },
+            SearchFilters {
+                workspaces: HashSet::from(["/work/árvíz".to_owned()]),
+                ..SearchFilters::default()
+            },
+            SearchFilters {
+                created_from: Some(1_700_000_000_000),
+                created_to: Some(1_700_000_000_000),
+                ..SearchFilters::default()
+            },
+            SearchFilters {
+                session_paths: HashSet::from([dir
+                    .path()
+                    .join("hu.jsonl")
+                    .to_string_lossy()
+                    .into_owned()]),
+                ..SearchFilters::default()
+            },
+        ] {
+            assert_lexical_sources(&client, "kérlek OR backup", filters, &["hu"]);
+        }
+        assert_lexical_sources(
+            &client,
+            "kérlek",
+            SearchFilters {
+                source_filter: SourceFilter::SourceId("absent-source".to_owned()),
+                ..SearchFilters::default()
+            },
+            &[],
+        );
+        assert_eq!(
+            durable_index_hashes(dir.path()),
+            before,
+            "query normalization must not rewrite segments, manifests, or schema markers"
+        );
+    }
+}
+
+/// Fragment expansion must preserve phrase positions and field boundaries.
+/// Bare affected words require adjacent ordered fragments in one field and
+/// retain the legacy final-token prefix. Quoted phrases keep every fragment
+/// exact and also preserve the ordering between separate words.
+#[test]
+fn accented_latin_queries_keep_phrase_and_boolean_boundaries() {
+    let dir = TempDir::new().expect("accented phrase corpus directory");
+    let mut index = TantivyIndex::open_or_create(dir.path()).expect("create CASS index");
+    for (name, title, content) in [
+        ("ordered", "fixture", "Kérlek nézd"),
+        ("reversed", "fixture", "nézd kérlek"),
+        ("gap", "fixture", "k rlek unrelated n zd"),
+        ("scattered", "fixture", "k unrelated rlek n unrelated zd"),
+        ("reversed_fragments", "fixture", "rlek k nézd"),
+        ("crossfield", "k", "rlek nézd"),
+        ("prefixonly", "fixture", "king rlekin"),
+        ("suffixword", "fixture", "k rlekin"),
+        ("hyphen", "fixture", "Kérlek--nézd"),
+        ("ascii", "fixture", "plain backup"),
+    ] {
+        let conversation = util::ConversationFixtureBuilder::new("claude_code")
+            .title(title)
+            .source_path(dir.path().join(format!("{name}.jsonl")))
+            .messages(1)
+            .with_content(0, content)
+            .build_normalized();
+        index
+            .add_conversation(&conversation)
+            .expect("ingest phrase conversation");
+    }
+    index.commit().expect("publish phrase corpus");
+    drop(index);
+    let client = SearchClient::open(dir.path(), None)
+        .expect("open phrase corpus")
+        .expect("phrase reader exists");
+
+    let first_page = client
+        .search_with_fallback("kérlek", SearchFilters::default(), 1, 0, 0, FieldMask::FULL)
+        .expect("first uncached accented page");
+    assert_eq!(first_page.hits.len(), 1);
+    assert_eq!(first_page.total_count, Some(5));
+
+    for (query, expected) in [
+        ("\"kérlek nézd\"", vec!["ordered", "hyphen"]),
+        ("\"kérlek !!! nézd\"", vec!["ordered", "hyphen"]),
+        ("\"kérlek 🚀 nézd\"", vec![]),
+        ("\"nézd kérlek\"", vec!["reversed"]),
+        ("kérlek--nézd", vec!["ordered", "reversed", "gap", "hyphen"]),
+        ("kérlek.nézd", vec!["ordered", "reversed", "gap", "hyphen"]),
+        ("\"kérlek--nézd\"", vec!["ordered", "hyphen"]),
+        (
+            "kérlek",
+            vec!["ordered", "reversed", "gap", "hyphen", "suffixword"],
+        ),
+        ("\"kérlek\"", vec!["ordered", "reversed", "gap", "hyphen"]),
+        ("\"*kérlek*\"", vec!["ordered", "reversed", "gap", "hyphen"]),
+        (
+            "kérl*",
+            vec!["ordered", "reversed", "gap", "hyphen", "suffixword"],
+        ),
+        (
+            "kérlek -\"kérlek nézd\"",
+            vec!["reversed", "gap", "suffixword"],
+        ),
+        (
+            "(kérlek OR backup) AND -\"kérlek nézd\"",
+            vec!["reversed", "gap", "suffixword", "ascii"],
+        ),
+        ("\"kérlek é nézd\"", vec![]),
+        ("\"kérlek привет nézd\"", vec![]),
+        ("kérlek AND 🚀", vec![]),
+        ("kérlek AND \"\"", vec![]),
+        ("kérlek AND \"AND\"", vec![]),
+        (
+            "kérlek OR \"NOT\"",
+            vec!["ordered", "reversed", "gap", "hyphen", "suffixword"],
+        ),
+    ] {
+        assert_lexical_sources(&client, query, SearchFilters::default(), &expected);
+    }
+    // A refused expansion must reject the entire expression; turning it into
+    // a missing operand would broaden NOT and OR into unrelated matches.
+    for query in [
+        format!("NOT {}", "aé".repeat(257)),
+        format!("{} OR backup", "aé".repeat(257)),
+        format!("NOT {}é", "a".repeat(257)),
+        format!("{} OR backup", "aé".repeat(5_001)),
+        format!("{}kérlek{}", "(".repeat(129), ")".repeat(129)),
+        format!("backup OR \"é {}\"", "a".repeat(257)),
+        format!("NOT \"{} café\"", "a".repeat(257)),
+    ] {
+        assert_lexical_sources(&client, &query, SearchFilters::default(), &[]);
+    }
+    let positive = client
+        .search("kérlek", SearchFilters::default(), 100, 0, FieldMask::FULL)
+        .expect("positive score control")
+        .into_iter()
+        .map(|hit| (hit.source_path, hit.score))
+        .collect::<BTreeMap<_, _>>();
+    let excluded = client
+        .search(
+            "kérlek -\"kérlek nézd\"",
+            SearchFilters::default(),
+            100,
+            0,
+            FieldMask::FULL,
+        )
+        .expect("negated phrase scores");
+    for hit in excluded {
+        assert!(hit.score.is_finite() && hit.score > 0.0);
+        assert!(
+            (hit.score - positive[&hit.source_path]).abs() < 1e-6,
+            "an exclusion must not add a match-all score"
+        );
+    }
+    let sparse = client
+        .search_with_fallback(
+            "kérlek",
+            SearchFilters::default(),
+            100,
+            0,
+            10,
+            FieldMask::FULL,
+        )
+        .expect("sparse accented fallback");
+    assert_eq!(sparse.hits.len(), 5);
+    assert!(
+        !sparse.wildcard_fallback,
+        "unsupported accent substring retry must retain tokenizer-aligned hits"
+    );
+    assert_eq!(
+        client.wildcard_fallback_skipped_reason(),
+        Some("query_normalization")
+    );
+}
+
+#[test]
+fn accented_words_keep_their_field_boundary_in_cjk_phrase_fallback() {
+    let dir = TempDir::new().expect("mixed-script corpus directory");
+    let mut index = TantivyIndex::open_or_create(dir.path()).expect("create CASS index");
+    for (name, title, content) in [
+        ("mixed", "fixture", "Kérlek 日本語"),
+        ("splitword", "k", "rlek 日本語"),
+        ("prefixword", "k", "rlektor 日本語"),
+        ("otherfield", "Kérlek", "日本語"),
+    ] {
+        let conversation = util::ConversationFixtureBuilder::new("codex")
+            .title(title)
+            .source_path(dir.path().join(format!("{name}.jsonl")))
+            .messages(1)
+            .with_content(0, content)
+            .build_normalized();
+        index
+            .add_conversation(&conversation)
+            .expect("ingest mixed-script conversation");
+    }
+    index.commit().expect("publish mixed-script corpus");
+    drop(index);
+    let client = SearchClient::open(dir.path(), None)
+        .expect("open mixed-script corpus")
+        .expect("mixed-script reader exists");
+    assert_lexical_sources(
+        &client,
+        "kérlek",
+        SearchFilters::default(),
+        &["mixed", "otherfield"],
+    );
+    for query in ["\"kérlek 日本語\"", "\"日本語 kérlek\""] {
+        assert_lexical_sources(&client, query, SearchFilters::default(), &["mixed"]);
+    }
+}
+
+#[test]
+fn accented_prefixes_cover_deep_long_and_single_fragment_terms_without_truncation() {
+    let dir = TempDir::new().expect("complete prefix corpus");
+    let mut index = TantivyIndex::open_or_create(dir.path()).expect("create prefix index");
+    let padding = "padding ".repeat(600);
+    let expected = (0..70)
+        .map(|ordinal| format!("match_{ordinal:03}"))
+        .collect::<Vec<_>>();
+    for (ordinal, name) in expected.iter().enumerate() {
+        // Every expansion lies beyond the content-prefix column's 4 KiB
+        // window. The suffix also makes more than 50 distinct dictionary
+        // terms, and the tested long prefix exceeds the column's 20 chars.
+        let content =
+            format!("{padding}kérlekabcdefghijklmnopqrstuv{ordinal:03} İstanbul{ordinal:03}");
+        let conversation = util::ConversationFixtureBuilder::new("codex")
+            .title("fixture")
+            .source_path(dir.path().join(format!("{name}.jsonl")))
+            .messages(1)
+            .with_content(0, &content)
+            .build_normalized();
+        index
+            .add_conversation(&conversation)
+            .expect("ingest prefix");
+    }
+    for (name, title, content) in [
+        (
+            "displaced",
+            "fixture",
+            "k unrelated rlekabcdefghijklmnopqrstuv000",
+        ),
+        ("reversed", "fixture", "rlekabcdefghijklmnopqrstuv000 k"),
+        ("crossfield", "k", "rlekabcdefghijklmnopqrstuv000"),
+        (
+            "wrong_head",
+            "fixture",
+            "king rlekabcdefghijklmnopqrstuv000",
+        ),
+        ("accent_tail", "fixture", "café"),
+        ("extended_tail", "fixture", "cafeteria"),
+        ("mixed", "fixture", "日本語 stanbulwide"),
+        ("mixed_crossfield", "日本語", "stanbulwide"),
+    ] {
+        let conversation = util::ConversationFixtureBuilder::new("codex")
+            .title(title)
+            .source_path(dir.path().join(format!("{name}.jsonl")))
+            .messages(1)
+            .with_content(0, content)
+            .build_normalized();
+        index
+            .add_conversation(&conversation)
+            .expect("ingest control");
+    }
+    index.commit().expect("publish prefix corpus");
+    drop(index);
+    let before = durable_index_hashes(dir.path());
+    let client = SearchClient::open(dir.path(), None)
+        .expect("reopen prefix corpus")
+        .expect("prefix reader exists");
+    let expected_refs = expected.iter().map(String::as_str).collect::<Vec<_>>();
+    for query in [
+        "kérlek",
+        "kérlek*",
+        "kérlekabcdefghijklmnopqr*",
+        "İstanbul0*",
+    ] {
+        assert_lexical_sources(&client, query, SearchFilters::default(), &expected_refs);
+    }
+    assert_lexical_sources(&client, "\"kérlek\"", SearchFilters::default(), &[]);
+    assert_lexical_sources(&client, "café*", SearchFilters::default(), &["accent_tail"]);
+    assert_lexical_sources(
+        &client,
+        "日本語éstan*",
+        SearchFilters::default(),
+        &["mixed"],
+    );
+
+    let mut paged_sources = BTreeSet::new();
+    for offset in (0..70).step_by(13) {
+        let page = client
+            .search_with_fallback(
+                "KÉRLEK*",
+                SearchFilters::default(),
+                13,
+                offset,
+                100,
+                FieldMask::FULL,
+            )
+            .expect("complete prefix page and exact count");
+        assert_eq!(page.total_count, Some(70));
+        assert!(!page.wildcard_fallback);
+        assert_eq!(page.hits.len(), 13.min(70 - offset));
+        for hit in page.hits {
+            assert!(paged_sources.insert(hit.source_path), "duplicate page hit");
+        }
+    }
+    assert_eq!(paged_sources.len(), 70);
+    assert_eq!(
+        durable_index_hashes(dir.path()),
+        before,
+        "complete prefix execution must not rebuild or rewrite the v9 index"
+    );
+}
+
+#[test]
+fn accented_implicit_prefixes_keep_twenty_scalar_boundary_and_quoted_exactness() {
+    let dir = TempDir::new().expect("implicit prefix boundary corpus");
+    let mut index = TantivyIndex::open_or_create(dir.path()).expect("create boundary index");
+    let twenty = format!("é{}", "a".repeat(19));
+    let twenty_one = format!("é{}", "a".repeat(20));
+    for (name, content) in [
+        ("twenty", twenty.clone()),
+        ("twenty_extended", format!("{twenty}x")),
+        ("twenty_one", twenty_one.clone()),
+        ("twenty_one_extended", format!("{twenty_one}x")),
+        ("single", "éx".to_owned()),
+        ("single_extended", "éxyz".to_owned()),
+    ] {
+        let conversation = util::ConversationFixtureBuilder::new("codex")
+            .title("fixture")
+            .source_path(dir.path().join(format!("{name}.jsonl")))
+            .messages(1)
+            .with_content(0, content)
+            .build_normalized();
+        index
+            .add_conversation(&conversation)
+            .expect("ingest boundary");
+    }
+    index.commit().expect("publish boundary corpus");
+    drop(index);
+    let client = SearchClient::open(dir.path(), None)
+        .expect("reopen boundary corpus")
+        .expect("boundary reader");
+    for (query, expected) in [
+        (
+            twenty.clone(),
+            vec![
+                "twenty",
+                "twenty_extended",
+                "twenty_one",
+                "twenty_one_extended",
+            ],
+        ),
+        (format!("\"{twenty}\""), vec!["twenty"]),
+        (twenty_one.clone(), vec!["twenty_one"]),
+        (
+            format!("{twenty_one}*"),
+            vec!["twenty_one", "twenty_one_extended"],
+        ),
+        ("éx".to_owned(), vec!["single", "single_extended"]),
+        ("\"éx\"".to_owned(), vec!["single"]),
+    ] {
+        assert_lexical_sources(&client, &query, SearchFilters::default(), &expected);
+    }
+}
+
+#[test]
+fn accented_prefix_overflow_propagates_through_counts_and_retry_without_partial_hits() {
+    use frankensearch::quill::query::CASS_PREFIX_EXPANSION_LIMIT;
+    use frankensearch::quill::{QuillIndexError, TermDictionaryError};
+
+    let dir = TempDir::new().expect("prefix budget corpus");
+    let mut index = TantivyIndex::open_or_create(dir.path()).expect("create budget index");
+    for ordinal in 0..=CASS_PREFIX_EXPANSION_LIMIT {
+        let conversation = util::ConversationFixtureBuilder::new("codex")
+            .title("fixture")
+            .source_path(dir.path().join(format!("budget_{ordinal:04}.jsonl")))
+            .messages(1)
+            .with_content(0, &format!("kérlek{ordinal:04}"))
+            .build_normalized();
+        index
+            .add_conversation(&conversation)
+            .expect("ingest expansion");
+    }
+    index.commit().expect("publish overflowing dictionary");
+    drop(index);
+    let client = SearchClient::open(dir.path(), None)
+        .expect("reopen budget corpus")
+        .expect("budget reader exists");
+    for query in ["kérlek", "kérlek*", "NOT kérlek*", "backup OR kérlek*"] {
+        let error = client
+            .search_with_fallback(query, SearchFilters::default(), 10, 0, 20, FieldMask::FULL)
+            .expect_err("over-budget expansions must not produce partial pages or counts");
+        assert!(
+            matches!(
+                error.downcast_ref::<QuillIndexError>(),
+                Some(QuillIndexError::Dictionary(
+                    TermDictionaryError::GlobExpansionLimitExceeded { limit, actual, .. }
+                )) if *limit == CASS_PREFIX_EXPANSION_LIMIT
+                    && *actual == CASS_PREFIX_EXPANSION_LIMIT + 1
+            ),
+            "the typed expansion refusal must survive the application bridge: {error:#}"
+        );
+    }
+}
+
+#[test]
+fn raw_unicode_spelling_is_preserved_in_lexical_queries_and_cache_keys() {
+    let dir = TempDir::new().expect("raw spelling corpus");
+    let mut index = TantivyIndex::open_or_create(dir.path()).expect("create spelling index");
+    for (name, text) in [
+        ("nfc", "kérlek spelling fixture"),
+        ("nfd", "ke\u{301}rlek spelling fixture"),
+        ("kelvin", "Key spelling fixture"),
+        ("ascii", "Key spelling fixture"),
+        ("dotted", "İstanbul spelling fixture"),
+        ("lowercase", "istanbul spelling fixture"),
+    ] {
+        let conversation = util::ConversationFixtureBuilder::new("codex")
+            .title("fixture")
+            .source_path(dir.path().join(format!("{name}.jsonl")))
+            .messages(1)
+            .with_content(0, text)
+            .build_normalized();
+        index
+            .add_conversation(&conversation)
+            .expect("ingest original spelling");
+    }
+    index.commit().expect("publish original spelling");
+    drop(index);
+    let client = SearchClient::open(dir.path(), None)
+        .expect("reopen spelling index")
+        .expect("spelling reader");
+
+    // A one-hit request can reuse the complete cached page on repetition.
+    // Canonicalizing either the parser input or its key aliases these pairs.
+    for _ in 0..2 {
+        for (query, expected) in [
+            ("kérlek", "nfc"),
+            ("ke\u{301}rlek", "nfd"),
+            ("Key", "kelvin"),
+            ("Key", "ascii"),
+            ("İSTANBUL", "dotted"),
+            ("istanbul", "lowercase"),
+        ] {
+            let hits = client
+                .search(query, SearchFilters::default(), 1, 0, FieldMask::FULL)
+                .unwrap_or_else(|error| panic!("{query:?}: {error:#}"));
+            assert_eq!(hits.len(), 1, "{query:?}");
+            assert_eq!(
+                std::path::Path::new(&hits[0].source_path)
+                    .file_stem()
+                    .and_then(|name| name.to_str()),
+                Some(expected),
+                "{query:?}"
+            );
+        }
+    }
+    for raw in ["é", "K", "İ", "привет", "🚀", "!!!"] {
+        let result = client
+            .search_with_fallback(raw, SearchFilters::default(), 10, 0, 3, FieldMask::FULL)
+            .expect("unsearchable input must fail closed");
+        assert!(result.hits.is_empty(), "{raw:?}");
+        assert!(!result.wildcard_fallback, "{raw:?}");
+        assert_eq!(
+            client.wildcard_fallback_skipped_reason(),
+            Some("query_normalization")
+        );
+        assert!(
+            result.suggestions.iter().all(|suggestion| suggestion.kind
+                != coding_agent_search::search::query::SuggestionKind::WildcardQuery),
+            "{raw:?} must not suggest a semantically different substring query"
+        );
+    }
+}
+
+#[test]
+fn refused_groups_and_bounds_cannot_recover_through_counts_or_wildcard_retry() {
+    use coding_agent_search::search::query::{QueryExplanation, SuggestionKind};
+
+    let dir = TempDir::new().expect("query admission corpus");
+    let mut index = TantivyIndex::open_or_create(dir.path()).expect("create admission index");
+    for (name, text) in [
+        ("backup", "backup evidence"),
+        ("accent", "Kérlek evidence"),
+        ("other", "unrelated evidence"),
+    ] {
+        let conversation = util::ConversationFixtureBuilder::new("codex")
+            .title("fixture")
+            .source_path(dir.path().join(format!("{name}.jsonl")))
+            .messages(1)
+            .with_content(0, text)
+            .build_normalized();
+        index
+            .add_conversation(&conversation)
+            .expect("ingest admission fixture");
+    }
+    index.commit().expect("publish admission corpus");
+    drop(index);
+    let client = SearchClient::open(dir.path(), None)
+        .expect("reopen admission index")
+        .expect("admission reader");
+
+    let baseline = client
+        .search_with_fallback(
+            "backup",
+            SearchFilters::default(),
+            10,
+            0,
+            0,
+            FieldMask::FULL,
+        )
+        .expect("ordinary query");
+    assert_eq!(baseline.hits.len(), 1);
+    assert_eq!(baseline.total_count, Some(1));
+
+    let mut refused = [
+        "backup AND ()",
+        "backup OR ()",
+        "NOT (backup AND ())",
+        "backup OR (NOT)",
+        "backup OR (AND OR)",
+        "backup AND (( ))",
+        "backup OR (",
+        "backup OR (NOT",
+        "kérlek OR ()",
+        "NOT (kérlek AND ())",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    refused.push(format!("{}backup{}", "(".repeat(129), ")".repeat(129)));
+    refused.push(format!("backup{}", "\u{2003}".repeat(10_001)));
+
+    for raw in refused {
+        // Repeat after a successful count, and exercise both ordinary pages
+        // and the application's limit=0 (unlimited) path. Neither a prior
+        // cached result nor automatic substring retry may weaken admission.
+        for limit in [1, 0, 1] {
+            let result = client
+                .search_with_fallback(&raw, SearchFilters::default(), limit, 0, 3, FieldMask::FULL)
+                .unwrap_or_else(|error| panic!("refused query {raw:?}: {error:#}"));
+            assert!(result.hits.is_empty(), "{raw:?}, limit={limit}");
+            assert_eq!(result.total_count, Some(0), "{raw:?}, limit={limit}");
+            assert!(!result.wildcard_fallback, "{raw:?}");
+            assert!(
+                result
+                    .suggestions
+                    .iter()
+                    .all(|suggestion| suggestion.kind != SuggestionKind::WildcardQuery),
+                "{raw:?} must not advertise a broader retry"
+            );
+        }
+        let explanation = QueryExplanation::analyze(&raw, &SearchFilters::default());
+        assert!(
+            explanation
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("error:")),
+            "{raw:?} must explain its refusal"
+        );
+    }
+
+    for raw in [
+        "(backup)",
+        "((backup))",
+        "backup AND (evidence",
+        "backup()",
+        "\"backup () evidence\"",
+    ] {
+        assert_lexical_sources(&client, raw, SearchFilters::default(), &["backup"]);
+    }
+    let maximum_depth = format!("{}backup{}", "(".repeat(128), ")".repeat(128));
+    assert_lexical_sources(
+        &client,
+        &maximum_depth,
+        SearchFilters::default(),
+        &["backup"],
+    );
+    for raw in ["", " \t\n ", "\u{2003}"] {
+        assert_lexical_sources(
+            &client,
+            raw,
+            SearchFilters::default(),
+            &["backup", "accent", "other"],
+        );
+    }
+}
+
+#[test]
+fn mixed_cjk_analysis_does_not_join_separated_runs_or_drop_latin_requirements() {
+    let dir = TempDir::new().expect("mixed analyzer corpus");
+    let mut index = TantivyIndex::open_or_create(dir.path()).expect("create mixed index");
+    for (name, title, content) in [
+        ("separated", "fixture", "日é本 evidence"),
+        ("bridged", "fixture", "日本 evidence"),
+        ("mixed", "fixture", "Kérlek日本語 evidence"),
+        ("onebigram", "fixture", "kérlek 日本 evidence"),
+        ("splitfield", "kérlek", "日本語 evidence"),
+        ("cjkonly", "fixture", "日本語 evidence"),
+    ] {
+        let conversation = util::ConversationFixtureBuilder::new("codex")
+            .title(title)
+            .source_path(dir.path().join(format!("{name}.jsonl")))
+            .messages(1)
+            .with_content(0, content)
+            .build_normalized();
+        index
+            .add_conversation(&conversation)
+            .expect("ingest mixed runs");
+    }
+    index.commit().expect("publish mixed runs");
+    drop(index);
+    let client = SearchClient::open(dir.path(), None)
+        .expect("reopen mixed index")
+        .expect("mixed reader");
+    for (query, expected) in [
+        ("日é本", vec!["separated"]),
+        ("\"日é本\"", vec!["separated"]),
+        ("kérlek日本語", vec!["mixed"]),
+        ("\"kérlek 日本語\"", vec!["mixed"]),
+        ("日本語", vec!["mixed", "splitfield", "cjkonly"]),
+    ] {
+        assert_lexical_sources(&client, query, SearchFilters::default(), &expected);
+    }
 }
 
 /// No-mock schema-v8 compatibility receipt spanning the operations CASS needs

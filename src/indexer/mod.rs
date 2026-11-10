@@ -104,8 +104,8 @@ use crate::storage::sqlite::{
     seed_canonical_from_best_historical_bundle,
 };
 use semantic::{
-    EmbeddingInput, SemanticIndexer, packet_embedding_inputs_from_storage_since,
-    semantic_doc_id_for_input, visit_packet_embedding_inputs_from_storage,
+    EmbeddingInput, SemanticIndexer, semantic_doc_id_for_input,
+    visit_packet_embedding_inputs_from_storage,
 };
 
 use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
@@ -5486,6 +5486,53 @@ struct LexicalRebuildPacketSemanticView {
     message_bytes: usize,
 }
 
+/// Run `add` (the batch's Quill ingest) on the calling thread while a helper
+/// thread absorbs `batch` into `equivalence_accumulator`, packet by packet in
+/// batch order, exactly as the consumer loop used to absorb each packet on
+/// arrival. The consumer pushes every packet into the pending batch in arrival
+/// order and every flush drains the whole batch, so the accumulator sees the
+/// same packets in the same order; only the thread doing the hashing changes.
+/// Without an accumulator this is just `add()`. If the OS refuses the helper
+/// thread, the batch is absorbed inline before the add.
+fn lexical_rebuild_add_absorbing_equivalence<T>(
+    batch: &[LexicalRebuildConversationPacket],
+    equivalence_accumulator: Option<&mut LexicalRebuildEquivalenceAccumulator>,
+    add: impl FnOnce() -> T,
+) -> T {
+    let Some(accumulator) = equivalence_accumulator else {
+        return add();
+    };
+    let accumulator = Mutex::new(accumulator);
+    let absorb = || {
+        let mut accumulator = accumulator.lock().unwrap_or_else(|e| e.into_inner());
+        for packet in batch {
+            accumulator.absorb_packet(packet);
+        }
+    };
+    std::thread::scope(|scope| {
+        match std::thread::Builder::new()
+            .name("cass-index-evidence".to_string())
+            .spawn_scoped(scope, absorb)
+        {
+            Ok(absorber) => {
+                let added = add();
+                if let Err(payload) = absorber.join() {
+                    std::panic::resume_unwind(payload);
+                }
+                added
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "lexical rebuild could not spawn the equivalence-evidence thread; absorbing the batch on the consumer thread"
+                );
+                absorb();
+                add()
+            }
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn flush_streamed_lexical_rebuild_batch(
     pending_batch: &mut Vec<LexicalRebuildConversationPacket>,
@@ -5493,6 +5540,7 @@ fn flush_streamed_lexical_rebuild_batch(
     pending_batch_message_bytes: &mut usize,
     lexical_rebuild_flow_limiter: Option<&StreamingByteLimiter>,
     lexical_rebuild_worker_pool: Option<&ThreadPool>,
+    equivalence_accumulator: Option<&mut LexicalRebuildEquivalenceAccumulator>,
     t_index: &mut TantivyIndex,
     indexed_docs: &mut usize,
     messages_since_commit: &mut usize,
@@ -5533,8 +5581,13 @@ fn flush_streamed_lexical_rebuild_batch(
     let prepared_docs =
         lexical_rebuild_prepare_prebuilt_doc_refs(pending_batch, lexical_rebuild_worker_pool);
     let add_started = perf_profile.as_ref().map(|_| Instant::now());
-    *indexed_docs = (*indexed_docs)
-        .saturating_add(t_index.add_prebuilt_document_refs_slice(prepared_docs.as_slice())?);
+    let added =
+        lexical_rebuild_add_absorbing_equivalence(pending_batch, equivalence_accumulator, || {
+            t_index.add_prebuilt_document_refs_slice(prepared_docs.as_slice())
+        })?;
+    #[cfg(test)]
+    LEXICAL_REBUILD_TEST_ADDED_DOCS.with(|count| count.set(count.get().saturating_add(added)));
+    *indexed_docs = (*indexed_docs).saturating_add(added);
     // `prepared_docs` borrows the packet strings. Drop those views, then free
     // the packets before publishing their byte capacity back to page prep.
     // Releasing first lets a newly awakened worker allocate the next giant
@@ -6819,6 +6872,7 @@ fn flush_streamed_lexical_rebuild_batch_for_planned_shard_boundary(
     pending_batch_message_bytes: &mut usize,
     lexical_rebuild_flow_limiter: Option<&StreamingByteLimiter>,
     lexical_rebuild_worker_pool: Option<&ThreadPool>,
+    equivalence_accumulator: Option<&mut LexicalRebuildEquivalenceAccumulator>,
     t_index: &mut TantivyIndex,
     indexed_docs: &mut usize,
     messages_since_commit: &mut usize,
@@ -6843,6 +6897,7 @@ fn flush_streamed_lexical_rebuild_batch_for_planned_shard_boundary(
         pending_batch_message_bytes,
         lexical_rebuild_flow_limiter,
         lexical_rebuild_worker_pool,
+        equivalence_accumulator,
         t_index,
         indexed_docs,
         messages_since_commit,
@@ -7243,8 +7298,38 @@ struct LexicalRebuildState {
     /// alone cannot detect an equal-count content or metadata edit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     completed_source_epoch: Option<lexical_resume::ArchiveEpoch>,
+    /// Present only while an explicit forced rebuild owns the incomplete staged
+    /// candidate it started from zero. A later forced run continues that
+    /// candidate only while this still describes the archive and the cass
+    /// build (`forced_lexical_rebuild_resume_admitted`). Completion, an audited
+    /// resume and every fresh state drop it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    forced_rebuild_origin: Option<ForcedLexicalRebuildOrigin>,
     #[serde(default)]
     runtime: LexicalRebuildPipelineRuntimeSnapshot,
+}
+
+/// What an explicit forced rebuild started from. The canonical archive's
+/// physical DB/WAL write epoch at that start is the same evidence the run's
+/// own publication must still observe, so a candidate continued under an
+/// unchanged epoch holds only documents built from the rows an uninterrupted
+/// forced run would read. Any write to the archive, or another cass build,
+/// discards the candidate instead.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForcedLexicalRebuildOrigin {
+    source_epoch: lexical_resume::ArchiveEpoch,
+    /// `CASS_VERSION_FULL`: the release and, when known, its build commit.
+    cass_version: String,
+}
+
+impl ForcedLexicalRebuildOrigin {
+    fn capture(source_epoch: &lexical_resume::ArchiveEpoch) -> Self {
+        Self {
+            source_epoch: source_epoch.clone(),
+            cass_version: env!("CASS_VERSION_FULL").to_string(),
+        }
+    }
 }
 
 impl LexicalRebuildState {
@@ -7265,6 +7350,7 @@ impl LexicalRebuildState {
             execution_mode: Some(LexicalRebuildExecutionMode::SharedWriter),
             resume_binding: None,
             completed_source_epoch: None,
+            forced_rebuild_origin: None,
             runtime: LexicalRebuildPipelineRuntimeSnapshot::default(),
         }
     }
@@ -7363,6 +7449,7 @@ impl LexicalRebuildState {
         self.committed_meta_fingerprint = committed_meta_fingerprint;
         self.pending = None;
         self.clear_runtime();
+        self.forced_rebuild_origin = None;
         self.completed = true;
         self.updated_at_ms = FrankenStorage::now_millis();
         self.execution_mode = Some(LexicalRebuildExecutionMode::SharedWriter);
@@ -9924,15 +10011,62 @@ pub(crate) fn verify_published_lexical_doc_count(
                 index_path.display()
             )
         })?;
-    if summary.docs != indexed_docs {
+    ensure_published_lexical_doc_count(summary.docs, indexed_docs, publish_mode)
+}
+
+fn ensure_published_lexical_doc_count(
+    observed: usize,
+    indexed_docs: usize,
+    publish_mode: &str,
+) -> Result<()> {
+    if observed != indexed_docs {
         return Err(LexicalDocCountMismatch {
             publish_mode: publish_mode.to_owned(),
             counted: indexed_docs,
-            observed: summary.docs,
+            observed,
         }
         .into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Same-invocation A/B switch: check a generation's contract and its
+    /// GH #457 count with one open each, as publication did before
+    /// [`validate_and_verify_published_lexical_doc_count`].
+    static SEPARATE_CONTRACT_AND_COUNT_OPENS_FOR_AB: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// `validate_searchable_index_contract` followed by
+/// [`verify_published_lexical_doc_count`], from ONE validated open.
+///
+/// Each check used to open its own reader, and every Quill open validates
+/// every live segment (minutes on a large archive), so certifying a
+/// generation paid for two full opens. Both checks still run, in the same
+/// order, against the same files: the contract check's errors come first and
+/// unchanged, and the GH #457 count is read from the reader that passed it,
+/// the snapshot being certified, instead of from a second fresh reader.
+pub(crate) fn validate_and_verify_published_lexical_doc_count(
+    index_path: &Path,
+    indexed_docs: usize,
+    publish_mode: &str,
+) -> Result<()> {
+    #[cfg(test)]
+    if SEPARATE_CONTRACT_AND_COUNT_OPENS_FOR_AB.with(std::cell::Cell::get) {
+        crate::search::tantivy::validate_searchable_index_contract(index_path)?;
+        return verify_published_lexical_doc_count(index_path, indexed_docs, publish_mode);
+    }
+    let opened = crate::search::tantivy::open_validated_lexical_index(index_path)?;
+    let summary = crate::search::tantivy::opened_lexical_index_summary(&opened).with_context(|| {
+        format!(
+            "{publish_mode} lexical rebuild published {indexed_docs} docs but the generation at {} \
+             cannot be opened for verification; refusing to certify it (GH #457)",
+            index_path.display()
+        )
+    })?;
+    ensure_published_lexical_doc_count(summary.docs, indexed_docs, publish_mode)
 }
 
 /// GH #457: a fresh reader serves a different number of live documents than
@@ -10363,6 +10497,108 @@ fn reconcile_pending_lexical_commit(
     state.clear_runtime();
     persist_lexical_rebuild_state(index_path, &state)?;
     Ok(state)
+}
+
+/// Whether an explicit forced rebuild may continue `state`'s candidate rather
+/// than start over. Only an incomplete staged candidate that an earlier forced
+/// run of this cass build started from zero qualifies, and only while the
+/// canonical archive still shows the physical write epoch that run started
+/// from, so every committed document came from the rows an uninterrupted
+/// forced run reads. Ordinary, audited, completed and legacy checkpoints, any
+/// archive write and any archive replacement all start over instead.
+fn forced_lexical_rebuild_resume_admitted(
+    index_path: &Path,
+    db_path: &Path,
+    state: &LexicalRebuildState,
+    source_epoch: &lexical_resume::ArchiveEpoch,
+) -> Result<bool> {
+    #[cfg(test)]
+    if FORCED_LEXICAL_RESUME_DISABLED_FOR_TEST.with(std::cell::Cell::get) {
+        return Ok(false);
+    }
+    let Some(origin) = state.forced_rebuild_origin.as_ref() else {
+        return Ok(false);
+    };
+    if !state.is_incomplete()
+        || state.execution_mode != Some(LexicalRebuildExecutionMode::StagedSingleIndex)
+        || state.version != LEXICAL_REBUILD_STATE_VERSION
+        || state.schema_hash != crate::search::tantivy::SCHEMA_HASH
+        || !lexical_rebuild_page_size_is_compatible(state.page_size)
+        || origin.cass_version != env!("CASS_VERSION_FULL")
+        || origin.source_epoch != *source_epoch
+        || !crate::stored_path_identity_matches(&state.db.db_path, db_path)
+    {
+        return Ok(false);
+    }
+    let Some(binding) = state.resume_binding.as_ref() else {
+        return Ok(false);
+    };
+    if lexical_resume::Binding::capture(db_path)?.as_ref() != Some(binding) {
+        return Ok(false);
+    }
+    match fs::symlink_metadata(staged_lexical_rebuild_scratch_path(index_path)) {
+        Ok(metadata) => Ok(metadata.is_dir() && !metadata.file_type().is_symlink()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("inspecting forced lexical rebuild candidate"),
+    }
+}
+
+/// The checkpoint an explicit forced rebuild continues, reconciled as any
+/// resume reconciles it, or `None` to start from zero. Its committed prefix is
+/// replayed by stable conversation id.
+fn forced_lexical_rebuild_resume_state(
+    index_path: &Path,
+    db_path: &Path,
+    storage: &FrankenStorage,
+    source_epoch: &lexical_resume::ArchiveEpoch,
+) -> Result<Option<LexicalRebuildState>> {
+    let Some(state) = load_lexical_rebuild_state(index_path)? else {
+        return Ok(None);
+    };
+    if !forced_lexical_rebuild_resume_admitted(index_path, db_path, &state, source_epoch)? {
+        return Ok(None);
+    }
+    let mut state = reconcile_pending_lexical_commit(index_path, state)?;
+    normalize_lexical_rebuild_state_for_current_run(index_path, &mut state)?;
+    upgrade_lexical_rebuild_state_resume_cursor_if_needed(storage, index_path, &mut state)?;
+    prepare_lexical_rebuild_state_for_active_run(index_path, &mut state)?;
+    Ok(
+        (state.processed_conversations > 0 && state.committed_conversation_id.is_some())
+            .then_some(state),
+    )
+}
+
+/// A resumed forced rebuild re-streams the canonical prefix its candidate
+/// already holds. These are the totals that prefix must reproduce exactly.
+#[derive(Debug, Clone, Copy)]
+struct ForcedLexicalResumePrefix {
+    committed_conversation_id: i64,
+    processed_conversations: usize,
+    indexed_docs: usize,
+}
+
+/// The replayed prefix disagrees with the checkpoint it resumes. Drop the
+/// forced origin so the next forced run starts over instead of repeating this.
+fn refuse_forced_lexical_resume_prefix(
+    index_path: &Path,
+    rebuild_state: &mut LexicalRebuildState,
+    prefix: ForcedLexicalResumePrefix,
+    processed_conversations: usize,
+    indexed_docs: usize,
+) -> anyhow::Error {
+    rebuild_state.forced_rebuild_origin = None;
+    let refusal = anyhow::anyhow!(
+        "forced lexical resume replayed {processed_conversations} conversations and \
+         {indexed_docs} documents through conversation {}, but its checkpoint committed \
+         {} and {}; the next forced rebuild starts from zero",
+        prefix.committed_conversation_id,
+        prefix.processed_conversations,
+        prefix.indexed_docs,
+    );
+    match persist_lexical_rebuild_state(index_path, rebuild_state) {
+        Ok(()) => refusal,
+        Err(error) => anyhow::anyhow!("{refusal:#}; clearing its forced origin failed: {error:#}"),
+    }
 }
 
 fn prepare_lexical_rebuild_state_for_active_run(
@@ -11902,8 +12138,32 @@ fn can_skip_absent_explicit_watch_once_index_run(opts: &IndexOptions) -> bool {
         storage.schema_version(),
         Ok(crate::storage::sqlite::CURRENT_SCHEMA_VERSION)
     );
+    // A provider can checkpoint and remove a selected WAL before this run.
+    // Ordinary missing transcript hooks stay cheap, but a surviving native
+    // OpenClaw database must be reconciled when an enabled root owns it.
+    let claimed_openclaw_database = db_schema_current
+        && opts.watch_once_paths.as_ref().is_some_and(|paths| {
+            if !paths
+                .iter()
+                .any(|path| openclaw_database_for_sidecar(path).is_some())
+            {
+                return false;
+            }
+            // This is a read-only preflight; do not sync source config into
+            // the archive just to establish ownership of the absent path.
+            let additional_scan_roots = build_scan_roots(Some(&storage), &opts.data_dir)
+                .into_iter()
+                .filter(|root| {
+                    !(root.origin.source_id == LOCAL_SOURCE_ID && root.path == opts.data_dir)
+                })
+                .collect();
+            let roots = build_watch_roots(additional_scan_roots);
+            classify_paths(paths.clone(), &roots, true)
+                .iter()
+                .any(|(kind, _, _, _)| *kind == ConnectorKind::OpenClaw)
+        });
     let _ = storage.close();
-    if !db_schema_current {
+    if !db_schema_current || claimed_openclaw_database {
         return false;
     }
 
@@ -11948,13 +12208,12 @@ fn current_searchable_index_summary_available(index_path: &Path) -> bool {
         )
 }
 
-fn should_skip_unchanged_explicit_watch_once_paths(
+fn should_skip_unclaimed_explicit_watch_once_paths(
     opts: &IndexOptions,
-    storage: &FrankenStorage,
     roots: &[(ConnectorKind, ScanRoot)],
-) -> Result<bool> {
+) -> bool {
     if opts.watch || opts.full || opts.force_rebuild || opts.semantic || opts.build_hnsw {
-        return Ok(false);
+        return false;
     }
 
     let Some(paths) = opts
@@ -11962,7 +12221,7 @@ fn should_skip_unchanged_explicit_watch_once_paths(
         .as_ref()
         .filter(|paths| !paths.is_empty())
     else {
-        return Ok(false);
+        return false;
     };
 
     let triggers = classify_paths(paths.clone(), roots, true);
@@ -11970,25 +12229,23 @@ fn should_skip_unchanged_explicit_watch_once_paths(
         // The run ends here without reindexing, so this is the only place
         // that can say why nothing was indexed.
         warn_unclaimed_explicit_watch_once_paths(paths, roots);
-        return Ok(true);
+        return true;
     }
 
-    for (kind, root, _, _) in triggers {
-        if !explicit_watch_once_root_unchanged_after_last_index(storage, kind, &root)? {
-            return Ok(false);
-        }
-    }
-
-    Ok(true)
+    // An archive-wide completion timestamp is not evidence that a selected
+    // source was read. A sibling can advance it after this source changes,
+    // and a write can land between a source snapshot and batch completion.
+    // Claimed explicit paths must reach idempotent ingestion (GH #543).
+    false
 }
 
-fn can_skip_unchanged_explicit_watch_once_index_run(
+fn can_skip_unclaimed_explicit_watch_once_index_run(
     opts: &IndexOptions,
     storage: &FrankenStorage,
     index_path: &Path,
     lexical_rebuild_required: bool,
     analytics_rebuild_required: bool,
-) -> Result<bool> {
+) -> bool {
     if lexical_rebuild_required
         || analytics_rebuild_required
         || opts.watch
@@ -11997,24 +12254,24 @@ fn can_skip_unchanged_explicit_watch_once_index_run(
         || opts.semantic
         || opts.build_hnsw
     {
-        return Ok(false);
+        return false;
     }
     if opts
         .watch_once_paths
         .as_ref()
         .is_none_or(|paths| paths.is_empty())
     {
-        return Ok(false);
+        return false;
     }
 
     let additional_scan_roots =
         additional_scan_roots_for_scan_or_watch(storage, &opts.data_dir, false);
     let watch_roots = build_watch_roots(additional_scan_roots);
-    if !should_skip_unchanged_explicit_watch_once_paths(opts, storage, &watch_roots)? {
-        return Ok(false);
+    if !should_skip_unclaimed_explicit_watch_once_paths(opts, &watch_roots) {
+        return false;
     }
 
-    Ok(current_searchable_index_summary_available(index_path))
+    current_searchable_index_summary_available(index_path)
 }
 
 fn should_skip_broad_scan_after_watch_once_authoritative_repair(
@@ -14015,6 +14272,7 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
     // checkpoint's indexed_docs against live Tantivy observations.
     state.indexed_docs = observed_tantivy_docs;
     state.pending = None;
+    state.forced_rebuild_origin = None;
     state.completed = true;
     state.committed_meta_fingerprint = committed_meta_fingerprint;
     state.updated_at_ms = FrankenStorage::now_millis();
@@ -17840,6 +18098,7 @@ pub(crate) fn mirrored_root_owners(root: &ScanRoot) -> Option<&'static [&'static
         .find_map(|component| match component {
             ".claude" => Some(&["claude"][..]),
             ".codex" => Some(&["codex"][..]),
+            ".openclaw" => Some(&["openclaw"][..]),
             ".pi" => Some(&["pi_agent", "pi_durable"][..]),
             ".prime" => Some(&["prime_agent"][..]),
             ".omp" | "omp" => Some(&["omp"][..]),
@@ -18646,13 +18905,13 @@ fn run_index_with_storage_ownership(
     }
     complete_preflight_phase!();
 
-    if can_skip_unchanged_explicit_watch_once_index_run(
+    if can_skip_unclaimed_explicit_watch_once_index_run(
         &opts,
         &storage,
         &index_path,
         legacy_omp_upgrade.lexical_rebuild_required,
         legacy_omp_upgrade.analytics_rebuild_required,
-    )? {
+    ) {
         let now_ms = FrankenStorage::now_millis();
         persist_final_index_run_metadata(&storage, &opts.db_path, false, now_ms, now_ms)?;
         record_lexical_population_strategy_if_unset(
@@ -18669,7 +18928,7 @@ fn run_index_with_storage_ownership(
         tracing::info!(
             db_path = %opts.db_path.display(),
             path_count,
-            "skipping unchanged explicit watch-once index run before startup maintenance"
+            "skipping unclaimed explicit watch-once index run before startup maintenance"
         );
         close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run")?;
         prime_archive_fingerprint_cache_from_completed_checkpoint(&opts.db_path, &index_path);
@@ -20968,7 +21227,7 @@ fn run_index_with_storage_ownership(
         if targeted_watch_once_only_run
             && t_index.is_none()
             && watch_once_mode
-            && should_skip_unchanged_explicit_watch_once_paths(&opts, &storage, &watch_roots)?
+            && should_skip_unclaimed_explicit_watch_once_paths(&opts, &watch_roots)
         {
             let path_count = opts
                 .watch_once_paths
@@ -20983,7 +21242,7 @@ fn run_index_with_storage_ownership(
             tracing::info!(
                 db_path = %opts.db_path.display(),
                 path_count,
-                "skipping unchanged explicit watch-once paths before opening Tantivy"
+                "skipping unclaimed explicit watch-once paths before opening Tantivy"
             );
             close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run")?;
             prime_archive_fingerprint_cache_from_completed_checkpoint(&opts.db_path, &index_path);
@@ -22915,9 +23174,9 @@ fn reconcile_existing_semantic_delta(
     Ok(usize::try_from(outcome.embedded_docs)?)
 }
 
-/// Perform incremental semantic embedding for messages added since the last
-/// watermark. Loads the ONNX model, embeds the batch, appends to the existing
-/// FSVI index via WAL, and updates the watermark.
+/// Maintain an established semantic tier. Small certified deltas use one
+/// atomic append; larger tails and interrupted candidates use source-bound
+/// resumable reconciliation. Only complete publication advances the watermark.
 fn incremental_semantic_embed(
     embedder: &str,
     data_dir: &Path,
@@ -22932,6 +23191,18 @@ fn incremental_semantic_embed(
         let guard = storage
             .lock()
             .map_err(|error| anyhow::anyhow!("lock semantic delta selection: {error}"))?;
+        if SemanticManifest::load(data_dir)?.is_some_and(|manifest| {
+            manifest
+                .checkpoint
+                .as_ref()
+                .is_some_and(|checkpoint| checkpoint.embedder_id == embedder_id)
+        }) {
+            // A large tail already owns an unpublished candidate. Resume that
+            // source-bound checkpoint before trying the same oversized append
+            // again, even though the prior serving certificate is still valid.
+            drop(guard);
+            return reconcile_existing_semantic_delta(embedder, data_dir, storage);
+        }
         let Some(mut snapshot) = semantic::SemanticBuildSnapshot::capture(&guard, &embedder_id)?
         else {
             // Unsupported proof platforms keep strict serving, but an
@@ -22949,7 +23220,22 @@ fn incremental_semantic_embed(
         let watermark = guard
             .get_last_embedded_message_id(&embedder_id)?
             .context("certified semantic prefix lost its embedder watermark")?;
-        let batch = packet_embedding_inputs_from_storage_since(&guard, watermark)?;
+        let selection_limits = semantic::semantic_delta_selection_limits(dimension)?;
+        let semantic::SemanticDeltaSelection::Complete(batch) =
+            semantic::packet_embedding_inputs_from_storage_since_bounded(
+                &guard,
+                watermark,
+                selection_limits,
+            )?
+        else {
+            tracing::info!(
+                embedder_id = %embedder_id,
+                since_message_id = watermark,
+                "semantic delta exceeds fast append selection bounds; continuing through resumable reconciliation"
+            );
+            drop(guard);
+            return reconcile_existing_semantic_delta(embedder, data_dir, storage);
+        };
         anyhow::ensure!(
             batch.raw_max_message_id.unwrap_or(watermark) <= snapshot.max_message_id,
             "semantic delta crossed its captured archive boundary"
@@ -24560,7 +24846,7 @@ pub(crate) fn rebuild_tantivy_from_db(
     )
 }
 
-fn rebuild_tantivy_from_db_with_progress_bump(
+pub(crate) fn rebuild_tantivy_from_db_with_progress_bump(
     db_path: &Path,
     data_dir: &Path,
     total_conversations: usize,
@@ -26208,6 +26494,114 @@ fn lexical_post_run_maintenance_skipped_for_test() -> bool {
     dotenvy::var("CASS_TEST_SKIP_POST_RUN_LEXICAL_MAINTENANCE")
         .ok()
         .is_some_and(|raw| matches!(raw.trim(), "1" | "true" | "yes"))
+}
+
+/// Where the next lexical rebuild on this test thread stops, as a process
+/// killed at that point would: after its Nth durable ingest commit, or after
+/// its final ingest commit and the first publication of its post-run fold.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LexicalRebuildTestInterrupt {
+    AfterCommits(usize),
+    DuringFold,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LEXICAL_REBUILD_TEST_INTERRUPT: std::cell::Cell<Option<LexicalRebuildTestInterrupt>> =
+        const { std::cell::Cell::new(None) };
+    /// The incumbent arm: forced rebuilds on this thread never resume.
+    static FORCED_LEXICAL_RESUME_DISABLED_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Documents this thread's streamed rebuild batches handed to the writer.
+    static LEXICAL_REBUILD_TEST_ADDED_DOCS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// The incumbent arm: this thread's rebuilds fold without first returning
+    /// the free heap to the OS.
+    static LEXICAL_FOLD_HEAP_RELEASE_DISABLED_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// One entry per pre-fold heap release on this thread: the generation's
+    /// segment count at that moment, which is still the unfolded count.
+    static LEXICAL_FOLD_HEAP_RELEASES_FOR_TEST: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Hand the allocator's free heap back to the OS before the post-rebuild
+/// fold. The fold is the rebuild's memory peak: it streams every segment of
+/// the generation into one while the merge buffers grow. By then the ingest
+/// working set (packet pages, projected documents, the writer's per-commit
+/// buffers, allocated across one glibc arena per worker thread) has been
+/// freed, but glibc keeps freed pages that are not at the top of an arena
+/// resident until something trims them, so the fold's peak sat on top of that
+/// dead ingest heap. Trimming releases only pages that no live allocation
+/// occupies, so nothing the fold reads or writes changes.
+fn release_free_heap_before_lexical_fold(t_index: &TantivyIndex) {
+    #[cfg(test)]
+    {
+        if LEXICAL_FOLD_HEAP_RELEASE_DISABLED_FOR_TEST.with(std::cell::Cell::get) {
+            return;
+        }
+        let segments = t_index.segment_count().unwrap_or(0);
+        LEXICAL_FOLD_HEAP_RELEASES_FOR_TEST.with(|releases| releases.borrow_mut().push(segments));
+    }
+    #[cfg(not(test))]
+    let _ = t_index;
+    let started = Instant::now();
+    let released = return_free_heap_pages_to_os();
+    tracing::debug!(
+        released,
+        trim_ms = started.elapsed().as_millis() as u64,
+        "returned the rebuild's free heap pages to the OS before the post-rebuild fold"
+    );
+}
+
+/// `malloc_trim(0)`: return the free pages of every glibc arena to the OS,
+/// reporting whether any were released.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[allow(unsafe_code)]
+fn return_free_heap_pages_to_os() -> bool {
+    // SAFETY: unavoidable FFI with no safe wrapper. malloc_trim takes no
+    // pointers, locks each arena while it walks that arena's free chunks, and
+    // only gives back (MADV_DONTNEED or sbrk shrink) pages lying entirely
+    // inside free chunks, so every live allocation stays valid and unchanged.
+    unsafe { libc::malloc_trim(0) != 0 }
+}
+
+/// Other allocators keep no such per-arena free heap for an explicit trim to
+/// return; nothing to do.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn return_free_heap_pages_to_os() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn lexical_rebuild_test_interrupt_after_commit() -> Result<()> {
+    LEXICAL_REBUILD_TEST_INTERRUPT.with(|interrupt| match interrupt.get() {
+        Some(LexicalRebuildTestInterrupt::AfterCommits(commits)) if commits <= 1 => {
+            interrupt.set(None);
+            anyhow::bail!("test interrupt after a durable lexical rebuild commit")
+        }
+        Some(LexicalRebuildTestInterrupt::AfterCommits(commits)) => {
+            interrupt.set(Some(LexicalRebuildTestInterrupt::AfterCommits(commits - 1)));
+            Ok(())
+        }
+        _ => Ok(()),
+    })
+}
+
+#[cfg(test)]
+fn lexical_rebuild_test_interrupt_during_fold(t_index: &mut TantivyIndex) -> Result<()> {
+    if LEXICAL_REBUILD_TEST_INTERRUPT.with(|interrupt| {
+        let armed = interrupt.get() == Some(LexicalRebuildTestInterrupt::DuringFold);
+        if armed {
+            interrupt.set(None);
+        }
+        armed
+    }) {
+        t_index.force_merge_first_runs_for_test(1)?;
+        anyhow::bail!("test interrupt during the post-rebuild lexical fold");
+    }
+    Ok(())
 }
 
 /// GH #440 test hook (tests/cli_index.rs): after the Nth staged engine commit
@@ -28532,7 +28926,22 @@ fn rebuild_tantivy_from_db_once(
     );
 
     let mut rebuild_state = if options.defer_initial_content_fingerprint {
-        LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE)
+        // An explicit forced rebuild never trusts a generation from before it
+        // started; it may continue only the candidate its own forced pass
+        // started from zero against this unchanged archive.
+        let forced_resume = if options.force_fresh {
+            forced_lexical_rebuild_resume_state(
+                &index_path,
+                db_path,
+                &storage,
+                &rebuild_source_epoch,
+            )?
+        } else {
+            None
+        };
+        forced_resume.unwrap_or_else(|| {
+            LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE)
+        })
     } else {
         match load_lexical_rebuild_state(&index_path)? {
             Some(state) if state.matches_run(&db_state, LEXICAL_REBUILD_PAGE_SIZE) => {
@@ -28604,8 +29013,7 @@ fn rebuild_tantivy_from_db_once(
                 index_meta_fingerprint(&index_path)? == rebuild_state.committed_meta_fingerprint,
                 "completed lexical checkpoint no longer identifies the live native generation"
             );
-            crate::search::tantivy::validate_searchable_index_contract(&index_path)?;
-            verify_published_lexical_doc_count(
+            validate_and_verify_published_lexical_doc_count(
                 &index_path,
                 rebuild_state.indexed_docs,
                 "completed",
@@ -28850,8 +29258,27 @@ fn rebuild_tantivy_from_db_once(
     });
     if restart_from_zero && staged_build_path.is_some() {
         rebuild_state.resume_binding = lexical_resume::Binding::capture(db_path)?;
+        rebuild_state.forced_rebuild_origin = options
+            .force_fresh
+            .then(|| ForcedLexicalRebuildOrigin::capture(&rebuild_source_epoch));
     }
     let resumed_from_checkpoint = rebuild_state.processed_conversations > 0;
+    // A resumed forced rebuild streams the canonical archive from its start,
+    // as an uninterrupted run does, but does not re-add the conversations its
+    // candidate already committed: every count, fingerprint and equivalence
+    // proof then sees the uninterrupted run's exact packet stream.
+    let mut forced_resume_prefix = if options.force_fresh && !restart_from_zero {
+        rebuild_state
+            .committed_conversation_id
+            .map(|committed_conversation_id| ForcedLexicalResumePrefix {
+                committed_conversation_id,
+                processed_conversations: rebuild_state.processed_conversations,
+                indexed_docs: rebuild_state.indexed_docs,
+            })
+    } else {
+        None
+    };
+    let replays_forced_prefix = forced_resume_prefix.is_some();
     log_prep_step("restart_from_zero_reset", &mut prep_step_started);
     let batch_conversation_limit = lexical_rebuild_batch_fetch_conversation_limit(page_size);
     let initial_batch_conversation_limit =
@@ -28863,10 +29290,22 @@ fn rebuild_tantivy_from_db_once(
     let progress_heartbeat_interval_conversations =
         lexical_rebuild_progress_heartbeat_interval_conversations();
     let progress_heartbeat_interval = lexical_rebuild_progress_heartbeat_interval();
-    let mut indexed_docs = rebuild_state.indexed_docs;
-    let mut observed_messages = rebuild_state.indexed_docs;
-    let mut processed_conversations = rebuild_state.processed_conversations;
-    let mut last_processed_conversation_id = rebuild_state.committed_conversation_id;
+    // A replayed forced prefix counts its own conversations again, from zero.
+    let (
+        mut indexed_docs,
+        mut observed_messages,
+        mut processed_conversations,
+        mut last_processed_conversation_id,
+    ) = if replays_forced_prefix {
+        (0, 0, 0, None)
+    } else {
+        (
+            rebuild_state.indexed_docs,
+            rebuild_state.indexed_docs,
+            rebuild_state.processed_conversations,
+            rebuild_state.committed_conversation_id,
+        )
+    };
     let mut conversations_since_commit = 0usize;
     let mut messages_since_commit = 0usize;
     let mut message_bytes_since_commit = 0usize;
@@ -29117,8 +29556,7 @@ fn rebuild_tantivy_from_db_once(
         p.phase.store(2, Ordering::Relaxed);
         p.is_rebuilding.store(true, Ordering::Relaxed);
         p.total.store(total_conversations, Ordering::Relaxed);
-        p.current
-            .store(rebuild_state.processed_conversations, Ordering::Relaxed);
+        p.current.store(processed_conversations, Ordering::Relaxed);
         p.total_is_final.store(
             !options.defer_initial_content_fingerprint,
             Ordering::Relaxed,
@@ -29129,7 +29567,7 @@ fn rebuild_tantivy_from_db_once(
     if producer_handle.is_none() {
         producer_handle = Some(spawn_lexical_rebuild_packet_producer(
             db_path.to_path_buf(),
-            rebuild_state.committed_conversation_id,
+            last_processed_conversation_id,
             staged_shard_plan.clone(),
             page_size,
             pipeline_channel_size,
@@ -29236,6 +29674,7 @@ fn rebuild_tantivy_from_db_once(
                         &mut pending_batch_message_bytes,
                         Some(lexical_rebuild_flow_limiter.as_ref()),
                         lexical_rebuild_worker_pool.as_deref(),
+                        Some(&mut equivalence_accumulator),
                         &mut t_index,
                         &mut indexed_docs,
                         &mut messages_since_commit,
@@ -29280,6 +29719,7 @@ fn rebuild_tantivy_from_db_once(
                         &mut pending_batch_message_bytes,
                         Some(lexical_rebuild_flow_limiter.as_ref()),
                         lexical_rebuild_worker_pool.as_deref(),
+                        Some(&mut equivalence_accumulator),
                         &mut t_index,
                         &mut indexed_docs,
                         &mut messages_since_commit,
@@ -29319,6 +29759,8 @@ fn rebuild_tantivy_from_db_once(
                         true,
                         perf_profile.as_mut(),
                     )?;
+                    #[cfg(test)]
+                    lexical_rebuild_test_interrupt_after_commit()?;
                     conversations_since_commit = 0;
                     messages_since_commit = 0;
                     message_bytes_since_commit = 0;
@@ -29478,7 +29920,72 @@ fn rebuild_tantivy_from_db_once(
                             {
                                 max_message_id = max_message_id.max(last_message_id);
                             }
-                            equivalence_accumulator.absorb_packet(&packet);
+                            if let Some(prefix) = forced_resume_prefix {
+                                let conversation_id =
+                                    packet.identity.conversation_id.ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "forced lexical resume replay packet has no stable conversation id"
+                                        )
+                                    })?;
+                                if conversation_id > prefix.committed_conversation_id {
+                                    return Err(refuse_forced_lexical_resume_prefix(
+                                        &index_path,
+                                        &mut rebuild_state,
+                                        prefix,
+                                        processed_conversations,
+                                        indexed_docs,
+                                    ));
+                                }
+                                // Committed by the forced run being resumed:
+                                // account for it as its flush did, in arrival
+                                // order, without adding it to the index again.
+                                equivalence_accumulator.absorb_packet(&packet);
+                                indexed_docs =
+                                    indexed_docs.saturating_add(packet.prebuilt_docs().len());
+                                observed_messages =
+                                    observed_messages.saturating_add(packet.message_count);
+                                let chunk = packet.chunk.clone();
+                                let reserved_bytes = packet.flow_reservation_bytes;
+                                drop(packet);
+                                StreamingBatchFlowReservation::new(
+                                    Some(lexical_rebuild_flow_limiter.as_ref()),
+                                    reserved_bytes,
+                                )
+                                .release_now();
+                                if let Some(chunk) = chunk.filter(|chunk| !chunk.is_final) {
+                                    chunk.gate.flushed();
+                                    bump_index_run_lock_progress_if_present(progress_bump.as_ref());
+                                    continue;
+                                }
+                                processed_conversations = processed_conversations.saturating_add(1);
+                                last_processed_conversation_id = Some(conversation_id);
+                                if let Some(p) = &progress {
+                                    p.current.fetch_add(1, Ordering::Relaxed);
+                                    if options.defer_initial_content_fingerprint {
+                                        p.total
+                                            .fetch_max(processed_conversations, Ordering::Relaxed);
+                                    }
+                                }
+                                bump_index_run_lock_progress_if_present(progress_bump.as_ref());
+                                if conversation_id == prefix.committed_conversation_id {
+                                    if processed_conversations != prefix.processed_conversations
+                                        || indexed_docs != prefix.indexed_docs
+                                    {
+                                        return Err(refuse_forced_lexical_resume_prefix(
+                                            &index_path,
+                                            &mut rebuild_state,
+                                            prefix,
+                                            processed_conversations,
+                                            indexed_docs,
+                                        ));
+                                    }
+                                    forced_resume_prefix = None;
+                                }
+                                continue;
+                            }
+                            // Every packet enters `pending_batch` in arrival
+                            // order; each flush absorbs its batch into the
+                            // equivalence accumulator while Quill ingests it.
                             if let Some(chunk) =
                                 packet.chunk.clone().filter(|chunk| !chunk.is_final)
                             {
@@ -29500,6 +30007,7 @@ fn rebuild_tantivy_from_db_once(
                                     &mut pending_batch_message_bytes,
                                     Some(lexical_rebuild_flow_limiter.as_ref()),
                                     lexical_rebuild_worker_pool.as_deref(),
+                                    Some(&mut equivalence_accumulator),
                                     &mut t_index,
                                     &mut indexed_docs,
                                     &mut messages_since_commit,
@@ -29522,6 +30030,7 @@ fn rebuild_tantivy_from_db_once(
                             &mut pending_batch_message_bytes,
                             Some(lexical_rebuild_flow_limiter.as_ref()),
                             lexical_rebuild_worker_pool.as_deref(),
+                            Some(&mut equivalence_accumulator),
                             &mut t_index,
                             &mut indexed_docs,
                             &mut messages_since_commit,
@@ -29600,6 +30109,7 @@ fn rebuild_tantivy_from_db_once(
                                 &mut pending_batch_message_bytes,
                                 Some(lexical_rebuild_flow_limiter.as_ref()),
                                 lexical_rebuild_worker_pool.as_deref(),
+                                Some(&mut equivalence_accumulator),
                                 &mut t_index,
                                 &mut indexed_docs,
                                 &mut messages_since_commit,
@@ -29641,6 +30151,7 @@ fn rebuild_tantivy_from_db_once(
                                 &mut pending_batch_message_bytes,
                                 Some(lexical_rebuild_flow_limiter.as_ref()),
                                 lexical_rebuild_worker_pool.as_deref(),
+                                Some(&mut equivalence_accumulator),
                                 &mut t_index,
                                 &mut indexed_docs,
                                 &mut messages_since_commit,
@@ -29682,6 +30193,15 @@ fn rebuild_tantivy_from_db_once(
         }
         pipeline_result?;
     }
+    if let Some(prefix) = forced_resume_prefix {
+        return Err(refuse_forced_lexical_resume_prefix(
+            &index_path,
+            &mut rebuild_state,
+            prefix,
+            processed_conversations,
+            indexed_docs,
+        ));
+    }
 
     flush_streamed_lexical_rebuild_batch(
         &mut pending_batch,
@@ -29689,6 +30209,7 @@ fn rebuild_tantivy_from_db_once(
         &mut pending_batch_message_bytes,
         Some(lexical_rebuild_flow_limiter.as_ref()),
         lexical_rebuild_worker_pool.as_deref(),
+        Some(&mut equivalence_accumulator),
         &mut t_index,
         &mut indexed_docs,
         &mut messages_since_commit,
@@ -29757,6 +30278,8 @@ fn rebuild_tantivy_from_db_once(
     let candidate_segments =
         publication.run("count_candidate_segments", || t_index.segment_count())?;
     let merge_started = Instant::now();
+    #[cfg(test)]
+    lexical_rebuild_test_interrupt_during_fold(&mut t_index)?;
     if lexical_post_run_maintenance_skipped_for_test() {
         tracing::warn!(
             segments = candidate_segments,
@@ -29772,6 +30295,7 @@ fn rebuild_tantivy_from_db_once(
             "skipping the post-rebuild segment fold for lack of disk space; publishing the unmerged generation (#441)"
         );
     } else {
+        release_free_heap_before_lexical_fold(&t_index);
         match t_index.force_merge() {
             Ok(()) => {
                 let segments =
@@ -29823,8 +30347,7 @@ fn rebuild_tantivy_from_db_once(
     // Refuse an unreadable/hollow candidate before it can replace a usable
     // live generation. Reopen and validate the actual live path again after swap.
     if let Err(refusal) = publication.run("validate_candidate", || {
-        crate::search::tantivy::validate_searchable_index_contract(&build_path)?;
-        verify_published_lexical_doc_count(&build_path, indexed_docs, "candidate")
+        validate_and_verify_published_lexical_doc_count(&build_path, indexed_docs, "candidate")
     }) {
         // GH #494: only a resumed staged candidate whose count disagrees is
         // rebuilt. A from-zero build that miscounts is a defect to report, and
@@ -29847,8 +30370,9 @@ fn rebuild_tantivy_from_db_once(
     // GH #440: indexed_docs omits hard-noise messages from the committed
     // prefix, so prefix docs + newly streamed rows is not an exact canonical
     // count after resume. Count once at completion while the readonly handle
-    // is still open; fresh rebuilds already observed every canonical packet.
-    let final_observed_messages = if resumed_from_checkpoint {
+    // is still open; fresh rebuilds and a replayed forced prefix already
+    // observed every canonical packet.
+    let final_observed_messages = if resumed_from_checkpoint && !replays_forced_prefix {
         publication.run("count_canonical_messages", || {
             count_total_messages_exact(&storage)
         })?
@@ -29941,8 +30465,7 @@ fn rebuild_tantivy_from_db_once(
         })?;
     }
     publication.run("validate_published_generation", || {
-        crate::search::tantivy::validate_searchable_index_contract(&index_path)?;
-        verify_published_lexical_doc_count(&index_path, indexed_docs, "direct")
+        validate_and_verify_published_lexical_doc_count(&index_path, indexed_docs, "direct")
     })?;
     log_lexical_generation_manifest_published(&generation_manifest, &equivalence_evidence);
 
@@ -32216,7 +32739,7 @@ fn targeted_quarantine_retry_inner(
             source.source_path.display()
         );
     }
-    let kind = ConnectorKind::from_slug(&source.provider).with_context(|| {
+    let kind = ConnectorKind::from_archive_slug(&source.provider).with_context(|| {
         format!(
             "quarantine retry does not recognize connector provider {}",
             source.provider
@@ -32858,6 +33381,26 @@ impl ConnectorKind {
             "continue" => Some(Self::Continue),
             _ => None,
         }
+    }
+
+    /// Resolve an archived conversation's provider to its registered reader.
+    /// The caller must still compare the complete archive slug and source
+    /// identity: choosing the OpenClaw reader must not admit another agent.
+    fn from_archive_slug(slug: &str) -> Option<Self> {
+        let provider = if slug
+            .strip_prefix("openclaw/")
+            .is_some_and(|agent| !agent.is_empty())
+        {
+            "openclaw"
+        } else {
+            slug
+        };
+        crate::connectors::get_connector_registrations()
+            .into_iter()
+            .find(|registration| {
+                registration.name == provider || registration.source_slug == provider
+            })
+            .and_then(|registration| Self::from_slug(registration.name))
     }
 
     fn slug(self) -> &'static str {
@@ -33688,6 +34231,25 @@ fn is_database_watch_path(kind: ConnectorKind, path: &Path) -> bool {
     kind == ConnectorKind::Shelley
         || (kind == ConnectorKind::Devin
             && path.extension().is_some_and(|extension| extension == "db"))
+        || (kind == ConnectorKind::OpenClaw
+            && path
+                .file_name()
+                .is_some_and(|name| name == "openclaw-agent.sqlite"))
+}
+
+/// Return only the native OpenClaw sidecar's surviving owner. This identifies
+/// a source-family candidate, not a connector claim: classification still
+/// requires an enabled OpenClaw root covering the database.
+fn openclaw_database_for_sidecar(path: &Path) -> Option<PathBuf> {
+    if !path.file_name().is_some_and(|name| {
+        name == "openclaw-agent.sqlite-wal" || name == "openclaw-agent.sqlite-shm"
+    }) {
+        return None;
+    }
+    let database = path.with_file_name("openclaw-agent.sqlite");
+    database
+        .is_file()
+        .then(|| dunce::canonicalize(&database).unwrap_or(database))
 }
 
 /// Shelley and Devin take an explicit file root as their database and fail the
@@ -33706,8 +34268,8 @@ fn explicit_watch_once_file_may_be_database(kind: ConnectorKind, path: &Path) ->
 
 /// FSEvents (macOS) reports a write through a file descriptor that stays open
 /// only when that descriptor closes, and SQLite keeps a provider's `-wal` open
-/// for the life of its connection, so a running Devin or Shelley's WAL-only
-/// commits never arrive as events there (s1nqh). Poll each database root's
+/// for the life of its connection, so a running provider's WAL-only commits
+/// never arrive as events there (s1nqh). Poll each database root's
 /// directory at the watch interval as well, queueing only the database and its
 /// sidecars. The native watcher stays authoritative: a poll error is logged,
 /// never escalated to a full-root rescan.
@@ -33844,6 +34406,146 @@ struct WatchRootRefresh {
     database_roots: BTreeSet<PathBuf>,
 }
 
+#[derive(Default)]
+struct WatchDatabaseDiscovery {
+    paths: BTreeSet<PathBuf>,
+    incomplete: bool,
+}
+
+impl WatchDatabaseDiscovery {
+    fn record_error(&mut self, path: &Path, error: &std::io::Error) {
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ) {
+            return;
+        }
+        self.incomplete = true;
+        tracing::warn!(path = %path.display(), %error, "OpenClaw database discovery incomplete; retrying source registration");
+    }
+
+    fn observe_file(
+        &mut self,
+        path: PathBuf,
+        progress: Option<&Arc<IndexingProgress>>,
+    ) -> Result<()> {
+        if let Some(progress) = progress {
+            progress.check_stop()?;
+        }
+        let observed = fs::metadata(&path);
+        if let Some(progress) = progress {
+            progress.tick_activity();
+            progress.check_stop()?;
+        }
+        match observed {
+            Ok(metadata) if metadata.is_file() => {
+                self.paths.insert(path);
+            }
+            Ok(_) => {}
+            Err(error) => self.record_error(&path, &error),
+        }
+        Ok(())
+    }
+}
+
+/// Expand only the native database layouts admitted by OpenClaw's connector.
+/// Inspect fixed candidate paths and immediate agent entries; session logs and
+/// database contents are never traversed here. Repeating this metadata census
+/// at the existing registration cooldown enrolls stores created after startup.
+fn discover_openclaw_watch_databases(
+    root: &ScanRoot,
+    progress: Option<&Arc<IndexingProgress>>,
+) -> Result<WatchDatabaseDiscovery> {
+    const DATABASE_NAME: &str = "openclaw-agent.sqlite";
+    let path = &root.path;
+    let mut discovered = WatchDatabaseDiscovery::default();
+    if let Some(progress) = progress {
+        progress.check_stop()?;
+    }
+    let metadata = fs::metadata(path);
+    if let Some(progress) = progress {
+        progress.tick_activity();
+        progress.check_stop()?;
+    }
+    match metadata {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(metadata)
+            if metadata.is_file() && is_database_watch_path(ConnectorKind::OpenClaw, path) =>
+        {
+            discovered.paths.insert(path.to_path_buf());
+            return Ok(discovered);
+        }
+        Ok(_) => return Ok(discovered),
+        Err(error) => {
+            discovered.record_error(path, &error);
+            return Ok(discovered);
+        }
+    }
+
+    let agents_roots = if let Some(agents) = root.mirrored_store(&[".openclaw", "agents"]) {
+        // A transport container's opaque name is not its provider identity.
+        // Match the connector's resolved store exactly, including contents
+        // copies, without admitting unrelated siblings in the container.
+        BTreeSet::from([agents])
+    } else {
+        // An explicitly configured root may be one agent or its agent/ directory.
+        discovered.observe_file(path.join("agent").join(DATABASE_NAME), progress)?;
+        discovered.observe_file(path.join(DATABASE_NAME), progress)?;
+        let mut agents_roots = BTreeSet::from([path.join(".openclaw").join("agents")]);
+        match path.file_name().and_then(|name| name.to_str()) {
+            Some(".openclaw") => {
+                agents_roots.insert(path.join("agents"));
+            }
+            Some("agents") => {
+                agents_roots.insert(path.to_path_buf());
+            }
+            _ => {}
+        }
+        agents_roots
+    };
+    for agents in agents_roots {
+        if let Some(progress) = progress {
+            progress.check_stop()?;
+        }
+        let entries = fs::read_dir(&agents);
+        if let Some(progress) = progress {
+            progress.tick_activity();
+            progress.check_stop()?;
+        }
+        let entries = match entries {
+            Ok(entries) => entries,
+            Err(error) => {
+                discovered.record_error(&agents, &error);
+                continue;
+            }
+        };
+        for entry in entries {
+            if let Some(progress) = progress {
+                progress.tick_activity();
+                progress.check_stop()?;
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    discovered.record_error(&agents, &error);
+                    continue;
+                }
+            };
+            // FAD intentionally does not follow symlinked agent directories.
+            // Keep poll coverage inside that same provider discovery boundary.
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => {
+                    discovered
+                        .observe_file(entry.path().join("agent").join(DATABASE_NAME), progress)?;
+                }
+                Ok(_) => {}
+                Err(error) => discovered.record_error(&entry.path(), &error),
+            }
+        }
+    }
+    Ok(discovered)
+}
+
 /// Native backends can share one watch descriptor between aliases and nested
 /// recursive registrations. Removing either registration then removes the
 /// other's coverage too. Canonical targets must have disjoint recursive
@@ -33872,17 +34574,56 @@ fn coalesce_native_watch_targets(
 
 /// Native watches follow filesystem objects, not a permanently live pathname.
 /// A failed initial registration or a replaced root needs another registration
-/// and a census after it. Inspect only distinct roots, never their descendants;
-/// unchanged healthy registrations do not request a scan.
+/// and a census after it. OpenClaw directory roots also admit their shallow
+/// native database layout so WAL polling covers broad overrides and mirrors.
+/// Unchanged healthy registrations do not request a scan.
 fn refresh_watch_root_registrations<W: Watcher>(
     watcher: &mut W,
     roots: &[(ConnectorKind, ScanRoot)],
     registered: &mut BTreeMap<PathBuf, WatchRootRegistration>,
     progress: Option<&Arc<IndexingProgress>>,
 ) -> Result<WatchRootRefresh> {
+    // Derived roots are registration evidence only. The callback still uses
+    // the caller's original roots, preserving source provenance and scan scope.
+    let mut registration_roots = roots.to_vec();
+    let mut database_discoveries = BTreeMap::new();
+    let mut database_paths: HashSet<PathBuf> = roots
+        .iter()
+        .filter(|(kind, _)| *kind == ConnectorKind::OpenClaw)
+        .map(|(_, root)| root.path.clone())
+        .collect();
+    let mut discovery_retries = BTreeSet::new();
+    for (kind, root) in roots {
+        if *kind != ConnectorKind::OpenClaw {
+            continue;
+        }
+        let discovery_key = (
+            root.path.clone(),
+            root.origin.is_remote(),
+            root.mirrored_source_path.clone(),
+        );
+        let discovered = match database_discoveries.entry(discovery_key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(discover_openclaw_watch_databases(root, progress)?)
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+        };
+        if discovered.incomplete {
+            discovery_retries.insert(root.path.clone());
+        }
+        for database in &discovered.paths {
+            if database_paths.insert(database.clone()) {
+                registration_roots.push((*kind, root.with_path(database.clone())));
+            }
+        }
+    }
+    let roots = registration_roots.as_slice();
     let mut observations = BTreeMap::new();
     let mut source_bindings = BTreeMap::new();
-    let mut refreshed = WatchRootRefresh::default();
+    let mut refreshed = WatchRootRefresh {
+        reconcile: discovery_retries,
+        ..WatchRootRefresh::default()
+    };
     for (_, root) in roots {
         if let std::collections::btree_map::Entry::Vacant(entry) =
             observations.entry(root.path.clone())
@@ -34186,7 +34927,8 @@ where
     let mut pending_rescan = !pending.extend(
         deferred_sources
             .into_iter()
-            .chain(roots.iter().map(|(_, root)| root.path.clone())),
+            .chain(roots.iter().map(|(_, root)| root.path.clone()))
+            .chain(initial_roots.reconcile),
     );
     let mut first_event = (pending_rescan || !pending.paths.is_empty()).then(Instant::now);
     let mut last_stale_check = Instant::now();
@@ -34961,6 +35703,358 @@ mod watch_registration_tests {
     }
 
     #[test]
+    fn openclaw_database_poll_discovery_preserves_layout_scope_and_provenance() {
+        let temp = TempDir::new().unwrap();
+        let mirror = temp.path().join("opaque-mirror");
+        let agents = mirror.join(".openclaw/agents");
+        let alice = agents.join("alice");
+        let bob = agents.join("bob");
+        let first = alice.join("agent/openclaw-agent.sqlite");
+        let second = bob.join("agent/openclaw-agent.sqlite");
+        let sessions = alice.join("sessions");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(&first, b"SQLite format 3\0").unwrap();
+        fs::write(&second, b"SQLite format 3\0").unwrap();
+        let jsonl = sessions.join("selected.jsonl");
+        fs::write(&jsonl, "{}\n").unwrap();
+        fs::write(alice.join("agent/unrelated.sqlite"), b"unrelated database").unwrap();
+        let outside = temp.path().join("outside-agent");
+        fs::create_dir_all(outside.join("agent")).unwrap();
+        fs::write(
+            outside.join("agent/openclaw-agent.sqlite"),
+            b"outside the selected provider tree",
+        )
+        .unwrap();
+        symlink(&outside, agents.join("linked-agent")).unwrap();
+
+        for root in [mirror.clone(), mirror.join(".openclaw"), agents.clone()] {
+            let found =
+                discover_openclaw_watch_databases(&ScanRoot::local(root.clone()), None).unwrap();
+            assert_eq!(
+                found.paths,
+                BTreeSet::from([first.clone(), second.clone()]),
+                "discover only admitted native stores under {}",
+                root.display()
+            );
+            assert!(!found.incomplete);
+        }
+        for root in [alice.clone(), alice.join("agent"), first.clone()] {
+            let found =
+                discover_openclaw_watch_databases(&ScanRoot::local(root.clone()), None).unwrap();
+            assert_eq!(found.paths, BTreeSet::from([first.clone()]));
+            assert!(!found.incomplete);
+        }
+        for root in [sessions, jsonl, temp.path().join("not-present")] {
+            let found =
+                discover_openclaw_watch_databases(&ScanRoot::local(root.clone()), None).unwrap();
+            assert!(found.paths.is_empty(), "narrow log roots must stay narrow");
+            assert!(!found.incomplete);
+        }
+
+        let root = ScanRoot::remote(
+            mirror.clone(),
+            Origin::remote_with_host("remote-openclaw", "synthetic.invalid"),
+            Some(Platform::Linux),
+        )
+        .with_mirrored_source_path("~/.openclaw");
+        let roots = vec![(ConnectorKind::OpenClaw, root.clone())];
+        let mut watcher = recommended_watcher(|_| {}).unwrap();
+        let mut registered = BTreeMap::new();
+        let selected =
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None).unwrap();
+        assert_eq!(
+            selected.database_roots,
+            BTreeSet::from([first.clone(), second.clone()])
+        );
+        assert_eq!(
+            registered.len(),
+            1,
+            "one recursive native watch covers the mirror"
+        );
+        assert!(
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None)
+                .unwrap()
+                .reconcile
+                .is_empty(),
+            "unchanged discovery must not manufacture scans"
+        );
+
+        let wal = database_sidecar_paths(&first)[0].clone();
+        fs::write(&wal, b"provider WAL event").unwrap();
+        let classified = classify_paths(vec![wal], &roots, false);
+        assert_eq!(classified.len(), 1);
+        assert_eq!(classified[0].0, ConnectorKind::OpenClaw);
+        assert_eq!(classified[0].1.path, root.path);
+        assert_eq!(classified[0].1.origin, root.origin);
+        assert_eq!(classified[0].1.platform, root.platform);
+        assert_eq!(
+            classified[0].1.mirrored_source_path,
+            root.mirrored_source_path
+        );
+
+        let no_openclaw = vec![(ConnectorKind::Codex, ScanRoot::local(mirror))];
+        assert!(
+            refresh_watch_root_registrations(&mut watcher, &no_openclaw, &mut registered, None,)
+                .unwrap()
+                .database_roots
+                .is_empty(),
+            "a disabled or unselected connector has no database poll coverage"
+        );
+        let progress = Arc::new(IndexingProgress::default());
+        progress.request_stop();
+        assert!(
+            discover_openclaw_watch_databases(&ScanRoot::local(agents), Some(&progress)).is_err(),
+            "cancellation must not become an ordinary discovery retry"
+        );
+    }
+
+    #[test]
+    fn openclaw_mirror_poll_discovery_resolves_only_the_selected_provider_store() {
+        let temp = TempDir::new().unwrap();
+        for (index, (source, suffix)) in [
+            ("~/.openclaw", ".openclaw/agents"),
+            ("~/.openclaw/agents", "agents"),
+            ("~/.openclaw/", "agents"),
+            ("~/.openclaw/agents/", ""),
+            (r"C:\Users\fixture\.openclaw\agents", "agents"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let container = temp.path().join(format!("opaque-{index}"));
+            let agents = container.join(suffix);
+            let database = agents.join("selected/agent/openclaw-agent.sqlite");
+            fs::create_dir_all(database.parent().unwrap()).unwrap();
+            fs::write(&database, b"selected native database").unwrap();
+            // Structural fallback would admit this file. Once provenance
+            // resolves an agents store, transport siblings must stay outside it.
+            let unrelated = container.join("openclaw-agent.sqlite");
+            fs::write(&unrelated, b"outside the selected agents store").unwrap();
+            let root = ScanRoot::remote(
+                container,
+                Origin::remote_with_host("mirror", "synthetic.invalid"),
+                Some(Platform::Linux),
+            )
+            .with_mirrored_source_path(source);
+            let found = discover_openclaw_watch_databases(&root, None).unwrap();
+            assert_eq!(found.paths, BTreeSet::from([database.clone()]), "{source}");
+            assert!(!found.incomplete);
+            let roots = vec![(ConnectorKind::OpenClaw, root.clone())];
+            let mut watcher = recommended_watcher(|_| {}).unwrap();
+            let mut registered = BTreeMap::new();
+            let selected =
+                refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None)
+                    .unwrap();
+            assert_eq!(selected.database_roots, BTreeSet::from([database.clone()]));
+            assert_eq!(registered.len(), 1);
+            let wal = database_sidecar_paths(&database)[0].clone();
+            fs::write(&wal, b"selected provider event").unwrap();
+            let classified = classify_paths(vec![wal], &roots, false);
+            assert_eq!(classified.len(), 1);
+            assert_eq!(classified[0].1.path, root.path);
+            assert_eq!(classified[0].1.origin, root.origin);
+            assert_eq!(
+                classified[0].1.mirrored_source_path,
+                root.mirrored_source_path
+            );
+            assert_eq!(
+                fs::read(&unrelated).unwrap(),
+                b"outside the selected agents store"
+            );
+        }
+
+        // Agent-subtree contents copies already have a valid fixed-path
+        // native layout. OpenClaw does not opt into generic subtree expansion;
+        // a partial source must not be mistaken for a parent of all agents.
+        for (index, (source, database_relative)) in [
+            ("~/.openclaw/agents/alice/", "agent/openclaw-agent.sqlite"),
+            ("~/.openclaw/agents/alice/agent/", "openclaw-agent.sqlite"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let container = temp.path().join(format!("partial-opaque-{index}"));
+            let database = container.join(database_relative);
+            fs::create_dir_all(database.parent().unwrap()).unwrap();
+            fs::write(&database, b"selected partial native store").unwrap();
+            let sibling = container.join("unrelated/agent/openclaw-agent.sqlite");
+            fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+            fs::write(&sibling, b"unselected sibling store").unwrap();
+            let root = ScanRoot::remote(
+                container,
+                Origin::remote_with_host("partial", "synthetic.invalid"),
+                None,
+            )
+            .with_mirrored_source_path(source);
+            assert!(root.mirrored_store(&[".openclaw", "agents"]).is_none());
+            let found = discover_openclaw_watch_databases(&root, None).unwrap();
+            assert_eq!(found.paths, BTreeSet::from([database]), "{source}");
+            assert!(!found.incomplete);
+            assert_eq!(fs::read(&sibling).unwrap(), b"unselected sibling store");
+        }
+
+        // Cache entries must include the identity used by mirror resolution.
+        // Local/unannotated roots sharing this physical container do not resolve
+        // the store; neither may hide the later annotated remote root.
+        let container = temp.path().join("shared-opaque");
+        let database = container.join("agents/selected/agent/openclaw-agent.sqlite");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        fs::write(&database, b"selected native database").unwrap();
+        let remote = ScanRoot::remote(
+            container.clone(),
+            Origin::remote_with_host("annotated", "synthetic.invalid"),
+            None,
+        )
+        .with_mirrored_source_path("~/.openclaw/agents");
+        let local =
+            ScanRoot::local(container.clone()).with_mirrored_source_path("~/.openclaw/agents");
+        let unannotated = ScanRoot::remote(
+            container.clone(),
+            Origin::remote_with_host("unannotated", "synthetic.invalid"),
+            None,
+        );
+        for root in [&local, &unannotated] {
+            assert!(
+                discover_openclaw_watch_databases(root, None)
+                    .unwrap()
+                    .paths
+                    .is_empty()
+            );
+        }
+        let roots = vec![
+            (ConnectorKind::OpenClaw, local),
+            (ConnectorKind::OpenClaw, unannotated),
+            (ConnectorKind::OpenClaw, remote),
+        ];
+        let mut watcher = recommended_watcher(|_| {}).unwrap();
+        let mut registered = BTreeMap::new();
+        let selected =
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None).unwrap();
+        assert_eq!(selected.database_roots, BTreeSet::from([database]));
+
+        for source in [
+            "~/agents",
+            "~/.codex/agents",
+            "~/.openclaw-backup/agents",
+            "~/.openclaw/agents/../agents",
+            "~/.openclaw/agents/./",
+            "~/.openclaw/agents/\n",
+        ] {
+            let root = ScanRoot::remote(
+                container.clone(),
+                Origin::remote_with_host("rejected", "synthetic.invalid"),
+                None,
+            )
+            .with_mirrored_source_path(source);
+            let found = discover_openclaw_watch_databases(&root, None).unwrap();
+            assert!(found.paths.is_empty(), "{source:?}");
+            assert!(!found.incomplete);
+        }
+
+        let linked_container = temp.path().join("linked-opaque");
+        fs::create_dir(&linked_container).unwrap();
+        symlink(container.join("agents"), linked_container.join("agents")).unwrap();
+        let linked = ScanRoot::remote(
+            linked_container,
+            Origin::remote_with_host("linked", "synthetic.invalid"),
+            None,
+        )
+        .with_mirrored_source_path("~/.openclaw/agents");
+        assert!(
+            discover_openclaw_watch_databases(&linked, None)
+                .unwrap()
+                .paths
+                .is_empty(),
+            "an inferred mirror path must not follow a symlink"
+        );
+    }
+
+    #[test]
+    fn openclaw_broad_root_enrolls_new_and_replaced_databases_for_polling() {
+        let temp = TempDir::new().unwrap();
+        let agents = temp.path().join("agents");
+        fs::create_dir(&agents).unwrap();
+        let roots = vec![(ConnectorKind::OpenClaw, ScanRoot::local(agents.clone()))];
+        // Discard native events: only the database poller below feeds its mailbox.
+        let mut watcher = recommended_watcher(|_| {}).unwrap();
+        let mut registered = BTreeMap::new();
+        let initial =
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None).unwrap();
+        assert!(initial.database_roots.is_empty());
+        assert_eq!(registered.len(), 1);
+
+        let database = agents.join("arriving/agent/openclaw-agent.sqlite");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        fs::write(&database, b"first native database").unwrap();
+        let arriving =
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None).unwrap();
+        assert_eq!(arriving.database_roots, BTreeSet::from([database.clone()]));
+        assert_eq!(arriving.reconcile, BTreeSet::from([database.clone()]));
+        assert_eq!(
+            registered.len(),
+            1,
+            "new stores use the existing recursive native registration"
+        );
+
+        let preserved = database.with_file_name("preserved-openclaw-agent.sqlite");
+        fs::rename(&database, &preserved).unwrap();
+        fs::write(&database, b"replacement native database").unwrap();
+        let replaced =
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None).unwrap();
+        assert_eq!(replaced.database_roots, BTreeSet::from([database.clone()]));
+        assert_eq!(replaced.reconcile, BTreeSet::from([database.clone()]));
+        assert!(
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None)
+                .unwrap()
+                .reconcile
+                .is_empty()
+        );
+        assert_eq!(fs::read(&preserved).unwrap(), b"first native database");
+
+        let backlog = Arc::new(WatchNotificationMailbox::default());
+        let rescan = Arc::new(AtomicBool::new(false));
+        let (wake, notifications) = bounded(1);
+        let (poller, retry) = database_root_poller(
+            &replaced.database_roots,
+            Duration::from_millis(50),
+            Arc::clone(&backlog),
+            Arc::clone(&rescan),
+            wake,
+        );
+        let _poller = poller.expect("discovered database must enroll in polling");
+        assert!(!retry);
+        let unrelated = database.parent().unwrap().join("unrelated.jsonl");
+        fs::write(&unrelated, b"not a native database event").unwrap();
+        let wal = database_sidecar_paths(&database)[0].clone();
+        let mut provider = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal)
+            .unwrap();
+        provider
+            .write_all(b"commit through a descriptor that stays open")
+            .unwrap();
+        provider.sync_all().unwrap();
+        let mut pending = WatchEventBacklog::default();
+        let mut pending_rescan = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pending.paths.contains(&wal) {
+            notifications
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+            collect_watch_notifications(&backlog, &rescan, &mut pending, &mut pending_rescan);
+        }
+        assert!(
+            !pending_rescan,
+            "database polling must remain source scoped"
+        );
+        assert!(!pending.paths.contains(&unrelated));
+        assert!(!rescan.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn gh538_database_poller_retries_callback_registration_errors() {
         let temp = TempDir::new().unwrap();
         let parent = temp.path().join("provider");
@@ -35387,25 +36481,9 @@ fn reindex_paths_with_semantic_delta(
         };
         let replay_canonical = pending_lexical_debt.iter().any(|debt| !debt.discovery_only);
         let source_scoped = conn.supports_source_boundaries();
-        // Semantic watch-once must reconcile and attest an unchanged source,
-        // even when the caller no longer captures callback-local deltas.
-        if explicit_watch_once && !force_full && !opts.semantic && semantic_delta.is_none() {
-            let unchanged = {
-                let storage = storage
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
-                explicit_watch_once_root_unchanged_after_last_index(&storage, kind, &root)?
-            };
-            if unchanged {
-                tracing::info!(
-                    ?kind,
-                    scan_root = %root.path.display(),
-                    "skipping unchanged explicit watch-once root already covered by last_indexed_at"
-                );
-                continue;
-            }
-        }
-
+        // Explicit selections reconcile the source even when it predates the
+        // archive's last completed run. Only source-specific read evidence can
+        // establish freshness; last_indexed_at may belong to another source.
         let since_ts = if force_full || explicit_watch_once || replay_canonical {
             None
         } else {
@@ -36204,74 +37282,6 @@ fn reindex_paths_with_semantic_delta(
         Some(error) => Err(ConnectorScanFailure(error).into()),
         None => Ok(outcome),
     }
-}
-
-fn explicit_watch_once_root_unchanged_after_last_index(
-    storage: &FrankenStorage,
-    kind: ConnectorKind,
-    root: &ScanRoot,
-) -> Result<bool> {
-    if !watch_lexical_replay_debt_for_root(storage, kind, root)?.is_empty() {
-        return Ok(false);
-    }
-    let metadata = match fs::metadata(&root.path) {
-        Ok(metadata) if metadata.is_file() => metadata,
-        _ => return Ok(false),
-    };
-    let Some(modified_at_ms) = metadata
-        .modified()
-        .ok()
-        .and_then(system_time_to_epoch_millis)
-    else {
-        return Ok(false);
-    };
-    let Some(last_indexed_at) = storage.get_last_indexed_at()? else {
-        return Ok(false);
-    };
-    if modified_at_ms > last_indexed_at {
-        return Ok(false);
-    }
-    // A database-backed source commits into its -wal (or rollback -journal)
-    // without touching the main file, so the main file's mtime alone cannot
-    // prove the source unchanged (GH #502). -shm is excluded: readers rewrite
-    // it, and it holds no committed data.
-    for suffix in ["-wal", "-journal"] {
-        let sidecar = database_path_with_suffix(&root.path, suffix);
-        let sidecar_modified_at_ms = match fs::metadata(&sidecar) {
-            Ok(metadata) => metadata
-                .modified()
-                .ok()
-                .and_then(system_time_to_epoch_millis),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return Ok(false),
-        };
-        match sidecar_modified_at_ms {
-            Some(sidecar_modified_at_ms) if sidecar_modified_at_ms <= last_indexed_at => {}
-            _ => return Ok(false),
-        }
-    }
-
-    let source_path = root.path.to_string_lossy();
-    let matches: Vec<i64> = storage
-        .raw()
-        .query_map_collect(
-            "SELECT id
-             FROM conversations
-             WHERE source_id = ?1 AND source_path = ?2
-             LIMIT 1",
-            &[
-                ParamValue::from(root.origin.source_id.as_str()),
-                ParamValue::from(source_path.as_ref()),
-            ],
-            |row| row.get_typed(0),
-        )
-        .with_context(|| {
-            format!(
-                "checking indexed source path freshness for {}",
-                root.path.display()
-            )
-        })?;
-    Ok(!matches.is_empty())
 }
 
 const WATCH_LEXICAL_REPLAY_DEBT_PREFIX: &str = "watch_lexical_replay_v1:";
@@ -37758,6 +38768,11 @@ fn explicit_watch_once_scan_path(
     requested: &Path,
     canonical: &Path,
 ) -> PathBuf {
+    if kind == ConnectorKind::OpenClaw
+        && let Some(database) = openclaw_database_for_sidecar(canonical)
+    {
+        return database;
+    }
     // Copilot's native reader recognizes state.vscdb, not its WAL. Keep the
     // targeted scan on that one database; scanning the parent would also
     // admit unrelated workspaces. Its connector checks the WAL's freshness.
@@ -37892,7 +38907,23 @@ fn classify_paths(
                 .then(|| explicit_watch_once_connector_hint(p))
                 .flatten()
         });
-        if let Ok(meta) = std::fs::metadata(p)
+        let openclaw_database = openclaw_database_for_sidecar(p);
+        let mut metadata_from_database = false;
+        let metadata = std::fs::metadata(p).or_else(|error| {
+            if prefer_explicit_paths
+                && error.kind() == std::io::ErrorKind::NotFound
+                && let Some(database) = &openclaw_database
+            {
+                // A checkpoint can remove WAL/SHM after the caller selected
+                // it. Only OpenClaw may use this owner's metadata below; a
+                // missing path must not revive another provider's scan/hint.
+                metadata_from_database = true;
+                std::fs::metadata(database)
+            } else {
+                Err(error)
+            }
+        });
+        if let Ok(meta) = metadata
             && let Ok(time) = meta.modified()
             && let Ok(dur) = time.duration_since(std::time::UNIX_EPOCH)
         {
@@ -37909,6 +38940,9 @@ fn classify_paths(
                 .zip(&match_root_paths)
                 .zip(&alternate_root_paths)
             {
+                if metadata_from_database && *kind != ConnectorKind::OpenClaw {
+                    continue;
+                }
                 if let Some(hinted_kind) = hinted_kind
                     && *kind != hinted_kind
                 {
@@ -37920,10 +38954,15 @@ fn classify_paths(
                 {
                     continue;
                 }
+                let source_path = if *kind == ConnectorKind::OpenClaw {
+                    openclaw_database.as_ref().unwrap_or(p)
+                } else {
+                    p
+                };
                 let under = |candidate: &PathBuf| {
-                    p.starts_with(candidate)
+                    source_path.starts_with(candidate)
                         || (is_database_watch_root(*kind, root)
-                            && database_sidecar_paths(candidate).contains(p))
+                            && database_sidecar_paths(candidate).contains(source_path))
                 };
                 if under(match_root_path) || alternate_root_path.as_ref().is_some_and(under) {
                     // Aliases can make a physical descendant's configured
@@ -37983,6 +39022,7 @@ fn classify_paths(
                 };
             }
             if prefer_explicit_paths
+                && !metadata_from_database
                 && !matched_root
                 && let Some(hinted_kind) = hinted_kind
             {
@@ -46234,6 +47274,7 @@ mod tests {
     include!("gh494_tests.rs");
     include!("gh496_tests.rs");
     include!("gh496_completed_tests.rs");
+    include!("forced_resume_tests.rs");
     use super::*;
     use crate::connectors::{
         Connector, DetectionResult, NormalizedConversation, NormalizedMessage, ScanContext,
@@ -46286,6 +47327,278 @@ mod tests {
         ));
         assert!(producer_state_transition_is_work("handoff_send", "idle"));
         assert!(producer_state_transition_is_work("waiting_result", "idle"));
+    }
+
+    /// A Quill generation built with `commits` commits of `docs_per_commit`
+    /// messages each; every commit seals the shards its batch touched. Each
+    /// message holds `words` tokens drawn from a fixed 65,536-word vocabulary,
+    /// so each segment carries its own term dictionary. Returns the live
+    /// document and segment counts.
+    fn certification_fixture_index(
+        index_path: &Path,
+        commits: usize,
+        docs_per_commit: usize,
+        words: usize,
+    ) -> (usize, usize) {
+        let mut index = TantivyIndex::open_or_create(index_path).unwrap();
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for commit in 0..commits {
+            let conversation = NormalizedConversation {
+                agent_slug: "codex".into(),
+                external_id: Some(format!("certify-{commit}")),
+                title: Some(format!("Certification fixture {commit}")),
+                workspace: Some(PathBuf::from("/workspace/certify")),
+                source_path: PathBuf::from(format!("/archive/certify-{commit}.jsonl")),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_000_000),
+                metadata: serde_json::Value::Null,
+                messages: (0..docs_per_commit)
+                    .map(|position| NormalizedMessage {
+                        idx: position as i64,
+                        role: "user".into(),
+                        author: None,
+                        created_at: Some(1_700_000_000_000 + position as i64),
+                        content: (0..words)
+                            .map(|_| {
+                                state = state
+                                    .wrapping_mul(6_364_136_223_846_793_005)
+                                    .wrapping_add(1_442_695_040_888_963_407);
+                                format!("w{:04x}", state >> 48)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        extra: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                        invocations: Vec::new(),
+                    })
+                    .collect(),
+            };
+            index.add_conversation(&conversation).unwrap();
+            index.commit().unwrap();
+        }
+        (
+            usize::try_from(index.doc_count().unwrap()).unwrap(),
+            index.segment_count().unwrap(),
+        )
+    }
+
+    /// One certification of `index_path`, by the separate contract and count
+    /// opens (`incumbent`) or by one validated open, with its reader opens and
+    /// its outcome rendered for comparison.
+    fn certify_generation_for_test(
+        index_path: &Path,
+        indexed_docs: usize,
+        incumbent: bool,
+    ) -> (u64, Result<(), (String, bool)>) {
+        SEPARATE_CONTRACT_AND_COUNT_OPENS_FOR_AB.with(|cell| cell.set(incumbent));
+        let opens = crate::search::quill_bridge::reader_open_count();
+        let outcome =
+            validate_and_verify_published_lexical_doc_count(index_path, indexed_docs, "test");
+        let opened = crate::search::quill_bridge::reader_open_count() - opens;
+        SEPARATE_CONTRACT_AND_COUNT_OPENS_FOR_AB.with(|cell| cell.set(false));
+        (
+            opened,
+            outcome.map_err(|error| {
+                (
+                    format!("{error:#}"),
+                    error.downcast_ref::<LexicalDocCountMismatch>().is_some(),
+                )
+            }),
+        )
+    }
+
+    /// Certifying a generation (contract check + GH #457 count) opens it
+    /// once, not once per check, and answers exactly as the two separate
+    /// checks did: same verdict, same error text, same mismatch type.
+    #[test]
+    fn generation_certification_opens_once_and_matches_separate_checks() {
+        let tmp = TempDir::new().unwrap();
+        let healthy = tmp.path().join("healthy");
+        let (docs, segments) = certification_fixture_index(&healthy, 3, 24, 16);
+        assert_eq!(docs, 72);
+        assert!(segments >= 3, "segments={segments}");
+
+        // Healthy generation, right count, then a count it does not serve.
+        for (indexed_docs, mismatch) in [(docs, false), (docs + 1, true), (docs - 1, true)] {
+            let (incumbent_opens, incumbent) =
+                certify_generation_for_test(&healthy, indexed_docs, true);
+            let (candidate_opens, candidate) =
+                certify_generation_for_test(&healthy, indexed_docs, false);
+            assert_eq!((incumbent_opens, candidate_opens), (2, 1));
+            assert_eq!(candidate, incumbent, "indexed_docs={indexed_docs}");
+            match candidate {
+                Ok(()) => assert!(!mismatch),
+                Err((message, typed)) => {
+                    assert!(mismatch && typed, "{message}");
+                    assert!(message.contains("GH #457"), "{message}");
+                }
+            }
+        }
+
+        // Faults the contract check refuses before any count is read.
+        let faulted = |name: &str, fault: &dyn Fn(&Path)| -> PathBuf {
+            let path = tmp.path().join(name);
+            certification_fixture_index(&path, 3, 24, 16);
+            fault(&path);
+            path
+        };
+        let segment_files = |path: &Path| -> Vec<PathBuf> {
+            let mut files = fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|file| {
+                    file.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("seg-") && name.ends_with(".fslx"))
+                })
+                .collect::<Vec<_>>();
+            files.sort();
+            assert!(!files.is_empty());
+            files
+        };
+        let empty = tmp.path().join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        let faults = [
+            empty,
+            faulted("schema-drift", &|path| {
+                fs::write(
+                    path.join("schema_hash.json"),
+                    r#"{"schema_hash":"not-this-schema"}"#,
+                )
+                .unwrap();
+            }),
+            faulted("flipped-segment-byte", &|path| {
+                let segment = segment_files(path).swap_remove(1);
+                let mut bytes = fs::read(&segment).unwrap();
+                let middle = bytes.len() / 2;
+                bytes[middle] ^= 0x5a;
+                fs::write(&segment, bytes).unwrap();
+            }),
+            faulted("truncated-segment", &|path| {
+                let segment = segment_files(path).pop().unwrap();
+                let bytes = fs::read(&segment).unwrap();
+                fs::write(&segment, &bytes[..bytes.len() - 7]).unwrap();
+            }),
+            faulted("missing-segment", &|path| {
+                let segment = segment_files(path).swap_remove(0);
+                fs::rename(&segment, path.join("moved-aside.bin")).unwrap();
+            }),
+        ];
+        for path in &faults {
+            let (_, incumbent) = certify_generation_for_test(path, docs, true);
+            let (candidate_opens, candidate) = certify_generation_for_test(path, docs, false);
+            assert!(candidate_opens <= 1, "{}", path.display());
+            assert_eq!(candidate, incumbent, "{}", path.display());
+            let (message, typed) = candidate.expect_err("a faulted generation is refused");
+            assert!(!typed, "{}: {message}", path.display());
+        }
+    }
+
+    /// A full rebuild certifies its candidate before the swap and the live
+    /// path after it, each with one open: the incumbent spent two opens on
+    /// each. Both arms publish the same generation.
+    #[test]
+    #[serial]
+    fn full_rebuild_certifies_candidate_and_publication_with_one_open_each() {
+        let fixture = forced_resume_fixture(6, 4, 64);
+        let mut opens = Vec::new();
+        let mut published = Vec::new();
+        for incumbent in [true, false] {
+            let data_dir = fixture
+                .root
+                .join(if incumbent { "incumbent" } else { "candidate" });
+            fs::create_dir_all(&data_dir).unwrap();
+            SEPARATE_CONTRACT_AND_COUNT_OPENS_FOR_AB.with(|cell| cell.set(incumbent));
+            let before = crate::search::quill_bridge::reader_open_count();
+            let outcome = rebuild_tantivy_from_db(&fixture.db_path, &data_dir, 6, None);
+            opens.push(crate::search::quill_bridge::reader_open_count() - before);
+            SEPARATE_CONTRACT_AND_COUNT_OPENS_FOR_AB.with(|cell| cell.set(false));
+            let outcome = outcome.unwrap();
+            let index_path = index_dir(&data_dir).unwrap();
+            let summary = crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap();
+            published.push((outcome.indexed_docs, summary.docs, summary.segments));
+        }
+        assert_eq!(published[0], published[1]);
+        assert_eq!(published[1].0, 24);
+        assert_eq!(opens[0] - opens[1], 2, "opens={opens:?}");
+    }
+
+    /// Same-binary A/B (run with `--ignored --nocapture`): certify one
+    /// generation by separate contract and count opens (incumbent, and again
+    /// as an A/A null arm) and by one validated open (candidate), arms
+    /// alternating, at each scale in CASS_CERTIFY_AB_COMMITS.
+    #[test]
+    #[ignore = "same-binary A/B harness; run explicitly with --ignored --nocapture"]
+    fn generation_certification_open_count_ab() {
+        let commit_scales =
+            dotenvy::var("CASS_CERTIFY_AB_COMMITS").unwrap_or_else(|_| "16,64,256".to_string());
+        let docs_per_commit = forced_resume_ab_setting("CASS_CERTIFY_AB_DOCS_PER_COMMIT", 2048);
+        let words = forced_resume_ab_setting("CASS_CERTIFY_AB_WORDS", 48);
+        let rounds = forced_resume_ab_setting("CASS_CERTIFY_AB_ROUNDS", 9);
+        for commits in commit_scales
+            .split(',')
+            .filter_map(|value| value.trim().parse::<usize>().ok())
+        {
+            let tmp = TempDir::new().unwrap();
+            let index_path = tmp.path().join("index");
+            let built = Instant::now();
+            let (docs, segments) =
+                certification_fixture_index(&index_path, commits, docs_per_commit, words);
+            let bytes: u64 = fs::read_dir(&index_path)
+                .unwrap()
+                .map(|entry| entry.unwrap().metadata().unwrap().len())
+                .sum();
+            eprintln!(
+                "CERTIFY_AB scale commits={commits} segments={segments} docs={docs} words_per_doc={words} index_bytes={bytes} build_s={:.1} rounds={rounds}",
+                built.elapsed().as_secs_f64()
+            );
+            // Warm the page cache once so every arm reads the same cached bytes.
+            certify_generation_for_test(&index_path, docs, false)
+                .1
+                .unwrap();
+            let mut arms: [(&str, bool, Vec<f64>, u64); 3] = [
+                ("incumbent", true, Vec::new(), 0),
+                ("null", true, Vec::new(), 0),
+                ("candidate", false, Vec::new(), 0),
+            ];
+            for round in 0..rounds {
+                for slot in 0..arms.len() {
+                    let arm = &mut arms[(slot + round) % 3];
+                    let started = Instant::now();
+                    let (opened, outcome) = certify_generation_for_test(&index_path, docs, arm.1);
+                    arm.2.push(started.elapsed().as_secs_f64() * 1000.0);
+                    arm.3 = opened;
+                    assert_eq!(outcome, Ok(()), "{}", arm.0);
+                }
+            }
+            let paired = |left: &[f64], right: &[f64]| {
+                left.iter()
+                    .zip(right)
+                    .map(|(left, right)| left / right)
+                    .collect::<Vec<_>>()
+            };
+            let ratio = paired(&arms[2].2, &arms[0].2);
+            let null = paired(&arms[1].2, &arms[0].2);
+            for (name, _, times, opened) in &arms {
+                eprintln!(
+                    "CERTIFY_AB arm segments={segments} arm={name} opens={opened} p50_ms={:.1} min_ms={:.1} max_ms={:.1}",
+                    forced_resume_percentile(times, 0.5),
+                    forced_resume_percentile(times, 0.0),
+                    forced_resume_percentile(times, 1.0),
+                );
+            }
+            eprintln!(
+                "CERTIFY_AB summary segments={segments} candidate/incumbent_p50={:.3} [{:.3}, {:.3}] null/incumbent_p50={:.3} [{:.3}, {:.3}]",
+                forced_resume_percentile(&ratio, 0.5),
+                forced_resume_percentile(&ratio, 0.0),
+                forced_resume_percentile(&ratio, 1.0),
+                forced_resume_percentile(&null, 0.5),
+                forced_resume_percentile(&null, 0.0),
+                forced_resume_percentile(&null, 1.0),
+            );
+        }
     }
 
     fn read_index_run_lock_metadata_for_test(lock_path: &Path) -> Result<String> {
@@ -46865,7 +48178,7 @@ mod tests {
         )?;
         storage.forget_conversations(
             &crate::storage::sqlite::ForgetConversationsFilter {
-                source_glob: Some(source_path.to_str().context("source path")?),
+                source_paths: &[source_path.to_str().context("source path")?.to_owned()],
                 ..Default::default()
             },
             false,
@@ -51777,6 +53090,7 @@ mod tests {
             &mut pending_batch_message_bytes,
             Some(&limiter),
             None,
+            None,
             &mut t_index,
             &mut indexed_docs,
             &mut messages_since_commit,
@@ -51880,6 +53194,7 @@ mod tests {
             &mut pending_batch_message_count,
             &mut pending_batch_message_bytes,
             Some(&limiter),
+            None,
             None,
             &mut t_index,
             &mut indexed_docs,
@@ -59190,6 +60505,45 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn quarantine_retry_resolves_archive_provider_names_without_changing_registry_names() {
+        for registration in crate::connectors::get_connector_registrations() {
+            let expected = ConnectorKind::from_slug(registration.name);
+            assert!(expected.is_some(), "{}", registration.name);
+            assert_eq!(
+                ConnectorKind::from_archive_slug(registration.source_slug),
+                expected,
+                "{}",
+                registration.source_slug
+            );
+        }
+        assert_eq!(
+            ConnectorKind::from_archive_slug("claude_code"),
+            Some(ConnectorKind::Claude)
+        );
+        for slug in [
+            "openclaw/alice",
+            "openclaw/研究-agent",
+            "openclaw/agent-name",
+        ] {
+            assert_eq!(
+                ConnectorKind::from_archive_slug(slug),
+                Some(ConnectorKind::OpenClaw)
+            );
+            assert!(ConnectorKind::from_slug(slug).is_none());
+        }
+        for slug in [
+            "",
+            "unknown",
+            "openclaw/",
+            "openclaw-other/alice",
+            "other/openclaw/alice",
+        ] {
+            assert!(ConnectorKind::from_archive_slug(slug).is_none(), "{slug}");
+        }
+        assert!(ConnectorKind::from_slug("claude_code").is_none());
+    }
+
     /// xaztn: dry-run classifies without mutation; apply reparses exactly the
     /// keyed source conversation and persists it before clearing quarantine.
     #[test]
@@ -64445,6 +65799,66 @@ c.close()
     }
 
     #[test]
+    #[serial]
+    fn absent_openclaw_sidecars_with_a_claimed_owner_cannot_skip_index_setup() {
+        let _sources_guard = ignore_sources_config();
+        let tmp = TempDir::new().unwrap();
+        let state = tmp.path().join("openclaw-state");
+        let database = state.join("agents/main/agent/openclaw-agent.sqlite");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        fs::write(&database, b"SQLite format 3\0").unwrap();
+        let _state_guard = set_env_var("OPENCLAW_STATE_DIR", state.to_string_lossy());
+        let data_dir = tmp.path().join("data");
+        let mut opts = watch_once_skip_test_options(data_dir.clone(), None);
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        ensure_fts_schema(&storage);
+        storage.close().unwrap();
+        let _index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+
+        for sidecar in database_sidecar_paths(&database) {
+            assert!(
+                !sidecar.exists(),
+                "model the provider's completed checkpoint"
+            );
+            opts.watch_once_paths = Some(vec![sidecar]);
+            assert!(should_skip_absent_explicit_watch_once_paths(&opts));
+            assert!(
+                !can_skip_absent_explicit_watch_once_index_run(&opts),
+                "an absent sidecar still selects its claimed surviving database"
+            );
+        }
+
+        let unclaimed_database = tmp.path().join("unclaimed/openclaw-agent.sqlite");
+        fs::create_dir_all(unclaimed_database.parent().unwrap()).unwrap();
+        fs::write(&unclaimed_database, b"SQLite format 3\0").unwrap();
+        for absent in [
+            database.parent().unwrap().join("future-session.jsonl"),
+            database_sidecar_paths(&unclaimed_database)[0].clone(),
+        ] {
+            opts.watch_once_paths = Some(vec![absent]);
+            assert!(
+                can_skip_absent_explicit_watch_once_index_run(&opts),
+                "missing transcripts and unclaimed database lookalikes remain no-ops"
+            );
+        }
+
+        let config_home = tmp.path().join("config");
+        fs::create_dir_all(config_home.join("cass")).unwrap();
+        fs::write(
+            config_home.join("cass/sources.toml"),
+            "disabled_agents = [\"openclaw\"]\n",
+        )
+        .unwrap();
+        let _config_guard = set_env_var("XDG_CONFIG_HOME", config_home.to_string_lossy());
+        let _respect_config = unset_env_var("CASS_IGNORE_SOURCES_CONFIG");
+        opts.watch_once_paths = Some(vec![database_sidecar_paths(&database)[0].clone()]);
+        assert!(
+            can_skip_absent_explicit_watch_once_index_run(&opts),
+            "a disabled connector must not claim the absent sidecar"
+        );
+    }
+
+    #[test]
     fn watch_once_authoritative_repair_skips_broad_followup_scan() {
         assert!(
             should_skip_broad_scan_after_watch_once_authoritative_repair(true, false, false, true)
@@ -66258,6 +67672,1694 @@ c.close()
             targeted.golden_query_digest, shuffled.golden_query_digest,
             "probe order must be part of the digest"
         );
+    }
+
+    /// Packets for the flush-time absorption tests: every default probe,
+    /// unicode, noise (empty, whitespace, a short acknowledgement), tool rows,
+    /// one long message, absent optional fields, and one conversation without
+    /// an id (it absorbs a packet header but contributes no documents).
+    fn equivalence_absorb_fixture_packets() -> Vec<LexicalRebuildConversationPacket> {
+        let contents = [
+            "error: cannot find function `parse` in this scope",
+            "TODO: add a test for the import path",
+            "",
+            "   ",
+            "ok",
+            "plain words without any probe",
+            "función de prueba: 東京 import test",
+            "import std::collections::HashMap; // test the error branch",
+        ];
+        (0..24_i64)
+            .map(|sequence| {
+                let messages = (0..sequence % 5 + 1)
+                    .map(
+                        |idx| crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
+                            idx,
+                            is_tool_role: idx % 3 == 2,
+                            created_at: (idx % 2 == 0)
+                                .then_some(1_700_000_900_000 + sequence * 100 + idx),
+                            content: if sequence == 7 && idx == 0 {
+                                "function body ".repeat(700)
+                            } else {
+                                let slot =
+                                    usize::try_from(sequence + idx).unwrap() % contents.len();
+                                contents[slot].to_string()
+                            },
+                        },
+                    )
+                    .collect::<crate::storage::sqlite::LexicalRebuildGroupedMessageRows>();
+                LexicalRebuildConversationPacket::from_canonical_replay(
+                    crate::storage::sqlite::LexicalRebuildConversationRow {
+                        id: (sequence != 11).then_some(900 + sequence),
+                        agent_slug: if sequence % 2 == 0 {
+                            "codex"
+                        } else {
+                            "claude_code"
+                        }
+                        .into(),
+                        workspace: (sequence % 4 != 3)
+                            .then(|| PathBuf::from(format!("/tmp/absorb-ws-{}", sequence % 3))),
+                        external_id: Some(format!("absorb-{sequence}")),
+                        title: (sequence % 5 != 4).then(|| format!("Absorb test {sequence}")),
+                        source_path: PathBuf::from(format!("/tmp/absorb-{sequence}.jsonl")),
+                        started_at: Some(1_700_000_900_000 + sequence * 100),
+                        ended_at: Some(1_700_000_900_050 + sequence * 100),
+                        source_id: LOCAL_SOURCE_ID.into(),
+                        origin_host: None,
+                    },
+                    messages,
+                    Some(10_000 + sequence),
+                    &HashMap::new(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn flush_absorbs_equivalence_evidence_identical_to_arrival_order_absorption() {
+        let packets = equivalence_absorb_fixture_packets();
+        let mut arrival = LexicalRebuildEquivalenceAccumulator::new();
+        for packet in &packets {
+            arrival.absorb_packet(packet);
+        }
+        let arrival = arrival.finalize();
+
+        let tmp = TempDir::new().unwrap();
+        let mut t_index = TantivyIndex::open_or_create(&tmp.path().join("tantivy")).unwrap();
+        let mut flushed = LexicalRebuildEquivalenceAccumulator::new();
+        let mut pending = Vec::new();
+        let (mut pending_messages, mut pending_bytes) = (0_usize, 0_usize);
+        let (mut indexed_docs, mut messages_since_commit, mut bytes_since_commit) =
+            (0_usize, 0_usize, 0_usize);
+        let mut remaining = packets.clone().into_iter();
+        for batch_len in [1_usize, 7, 3, 9, 4] {
+            for packet in remaining.by_ref().take(batch_len) {
+                pending_messages += packet.message_count;
+                pending_bytes += packet.message_bytes;
+                pending.push(packet);
+            }
+            flush_streamed_lexical_rebuild_batch(
+                &mut pending,
+                &mut pending_messages,
+                &mut pending_bytes,
+                None,
+                None,
+                Some(&mut flushed),
+                &mut t_index,
+                &mut indexed_docs,
+                &mut messages_since_commit,
+                &mut bytes_since_commit,
+                8,
+                8,
+                None,
+            )
+            .unwrap();
+            assert!(pending.is_empty(), "a flush must drain its batch");
+        }
+        assert!(remaining.next().is_none(), "every packet must be flushed");
+        t_index.commit().unwrap();
+        let flushed = flushed.finalize();
+
+        assert_eq!(
+            flushed, arrival,
+            "absorbing each flushed batch must reproduce the arrival-order evidence"
+        );
+        assert_eq!(flushed.document_count, indexed_docs as u64);
+        assert!(
+            flushed
+                .golden_query_hit_counts
+                .iter()
+                .all(|hit| hit.hit_count > 0),
+            "the fixture must exercise every probe hasher: {:?}",
+            flushed.golden_query_hit_counts
+        );
+        // The evidence is order-sensitive, so the equality above would catch
+        // a reordered or partial absorption.
+        let mut reversed = LexicalRebuildEquivalenceAccumulator::new();
+        for packet in packets.iter().rev() {
+            reversed.absorb_packet(packet);
+        }
+        assert_ne!(
+            reversed.finalize().manifest_fingerprint,
+            arrival.manifest_fingerprint
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn rebuild_tantivy_from_db_equivalence_evidence_matches_arrival_order_packet_absorption() {
+        let _responsiveness = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
+        let _conversation_limit = set_env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "2");
+        let _initial_conversation_limit = set_env(
+            "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
+            "1",
+        );
+        let _commit_messages = set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES", "5");
+        let _initial_commit_messages =
+            set_env("CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGES", "3");
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let contents = [
+            "error: the function returned early",
+            "TODO: cover the import path with a test",
+            "ok",
+            "plain words without any probe",
+        ];
+        for sequence in 0..9_i64 {
+            let base_ts = 1_700_000_950_000 + sequence * 1_000;
+            let external_id = format!("absorb-rebuild-{sequence}");
+            storage
+                .insert_conversation_tree(
+                    agent_id,
+                    None,
+                    &Conversation {
+                        id: None,
+                        agent_slug: "codex".into(),
+                        workspace: Some(PathBuf::from("/tmp/workspace")),
+                        external_id: Some(external_id.clone()),
+                        title: Some(format!("Absorb rebuild {sequence}")),
+                        source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+                        started_at: Some(base_ts),
+                        ended_at: Some(base_ts + 100),
+                        approx_tokens: Some(64),
+                        metadata_json: serde_json::Value::Null,
+                        messages: (0..3_i64)
+                            .map(|idx| Message {
+                                id: None,
+                                idx,
+                                role: if idx % 2 == 0 {
+                                    MessageRole::User
+                                } else {
+                                    MessageRole::Agent
+                                },
+                                author: None,
+                                created_at: Some(base_ts + 10 * (idx + 1)),
+                                content: format!(
+                                    "{} ({external_id}/{idx})",
+                                    contents[usize::try_from(sequence + idx).unwrap() % 4]
+                                ),
+                                extra_json: serde_json::Value::Null,
+                                snippets: Vec::new(),
+                            })
+                            .collect(),
+                        source_id: LOCAL_SOURCE_ID.into(),
+                        origin_host: None,
+                    },
+                )
+                .unwrap();
+        }
+        let mut arrival = LexicalRebuildEquivalenceAccumulator::new();
+        for packet in &keyset_batched_lexical_rebuild_packets(&storage, 4, 2).unwrap() {
+            arrival.absorb_packet(packet);
+        }
+        let arrival = arrival.finalize();
+        drop(storage);
+
+        let rebuild = rebuild_tantivy_from_db(&db_path, &data_dir, 9, None).unwrap();
+        assert_eq!(rebuild.indexed_docs, 27);
+        let evidence = rebuild
+            .equivalence
+            .expect("authoritative rebuild must emit equivalence evidence");
+        assert_eq!(
+            evidence, arrival,
+            "the rebuild's flush-time absorption must equal arrival-order absorption of its packets"
+        );
+        assert_eq!(evidence.document_count, 27);
+    }
+
+    /// Deterministic xorshift64* stream for the consumer A/B corpus.
+    struct ConsumerAbRng(u64);
+
+    impl ConsumerAbRng {
+        fn new(seed: u64) -> Self {
+            Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn unit(&mut self) -> f64 {
+            (self.next_u64() >> 11) as f64 / (1_u64 << 53) as f64
+        }
+    }
+
+    /// Head of the Zipf vocabulary: words transcripts lead with, the five
+    /// equivalence probes among them, so probe hits (each one re-hashes the
+    /// document) happen at a transcript-like rate.
+    const CONSUMER_AB_HEAD_WORDS: &[&str] = &[
+        "the", "to", "a", "and", "in", "is", "of", "error", "test", "fn", "let", "use", "function",
+        "import", "self", "return", "file", "src", "TODO", "cargo",
+    ];
+
+    const CONSUMER_AB_VOCABULARY: u64 = 200_000;
+
+    /// The head word for small ranks, else one unique lowercase word per
+    /// rank (bijective base 26 past every one- and two-letter string).
+    fn consumer_ab_word(rank: u64, out: &mut String) {
+        if let Some(word) = usize::try_from(rank)
+            .ok()
+            .and_then(|rank| CONSUMER_AB_HEAD_WORDS.get(rank))
+        {
+            out.push_str(word);
+            return;
+        }
+        let mut letters = [0_u8; 16];
+        let mut len = 0;
+        let mut n = rank + 703;
+        while n > 0 {
+            n -= 1;
+            letters[len] = b'a' + (n % 26) as u8;
+            len += 1;
+            n /= 26;
+        }
+        for letter in letters[..len].iter().rev() {
+            out.push(char::from(*letter));
+        }
+    }
+
+    /// Zipf-like (1/rank) words with 5% one-off identifiers; one message in
+    /// 64 is eight times the mean length.
+    fn consumer_ab_message_text(rng: &mut ConsumerAbRng, mean_bytes: usize, idx: usize) -> String {
+        let scale = if idx % 64 == 63 {
+            8.0
+        } else {
+            0.25 + 1.5 * rng.unit()
+        };
+        let target = ((mean_bytes as f64) * scale) as usize;
+        let mut text = String::with_capacity(target + 32);
+        let log_vocabulary = ((CONSUMER_AB_VOCABULARY + 1) as f64).ln();
+        while text.len() < target.max(8) {
+            if rng.unit() < 0.05 {
+                use std::fmt::Write as _;
+                let _ = write!(text, "id{:x}", rng.next_u64() >> 20);
+            } else {
+                let rank = ((rng.unit() * log_vocabulary).exp() as u64)
+                    .saturating_sub(1)
+                    .min(CONSUMER_AB_VOCABULARY - 1);
+                consumer_ab_word(rank, &mut text);
+            }
+            text.push(' ');
+        }
+        text
+    }
+
+    /// The fetched conversation row and message rows of conversation
+    /// `sequence`, as page prep receives them from SQLite.
+    fn consumer_ab_rows(
+        sequence: usize,
+        messages: usize,
+        mean_bytes: usize,
+    ) -> (
+        crate::storage::sqlite::LexicalRebuildConversationRow,
+        Vec<Message>,
+    ) {
+        let mut rng = ConsumerAbRng::new(sequence as u64 + 1);
+        let base = 1_700_000_000_000_i64 + sequence as i64 * 100_000;
+        let conversation_id = sequence as i64 + 1;
+        let row = crate::storage::sqlite::LexicalRebuildConversationRow {
+            id: Some(conversation_id),
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from(format!(
+                "/workspace/consumer{}",
+                sequence % 8
+            ))),
+            external_id: Some(format!("consumer-{sequence}")),
+            title: Some(format!("Consumer fixture {sequence}")),
+            source_path: PathBuf::from(format!("/archive/consumer-{sequence}.jsonl")),
+            started_at: Some(base),
+            ended_at: Some(base + messages as i64),
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        let rows = (0..messages)
+            .map(|idx| Message {
+                id: Some(conversation_id * 1_000_000 + idx as i64),
+                idx: idx as i64,
+                role: if idx % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Agent
+                },
+                author: None,
+                created_at: Some(base + idx as i64),
+                content: consumer_ab_message_text(&mut rng, mean_bytes, idx),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            })
+            .collect();
+        (row, rows)
+    }
+
+    /// One page of canonical-replay packets, built the way page prep builds
+    /// them from fetched rows.
+    fn consumer_ab_packets(
+        first: usize,
+        count: usize,
+        messages: usize,
+        mean_bytes: usize,
+    ) -> Vec<LexicalRebuildConversationPacket> {
+        let source_map: HashMap<String, (SourceKind, Option<String>)> = HashMap::new();
+        (first..first + count)
+            .into_par_iter()
+            .map(|sequence| {
+                let (row, rows) = consumer_ab_rows(sequence, messages, mean_bytes);
+                LexicalRebuildConversationPacket::from_canonical_replay_messages(
+                    row,
+                    rows,
+                    &source_map,
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    fn consumer_ab_status_mib(field: &str) -> f64 {
+        let kib: u64 = fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status.lines().find_map(|line| {
+                    line.strip_prefix(field)?
+                        .trim()
+                        .trim_end_matches("kB")
+                        .trim()
+                        .parse()
+                        .ok()
+                })
+            })
+            .unwrap_or(0);
+        kib as f64 / 1024.0
+    }
+
+    #[derive(Debug, Clone, serde::Serialize)]
+    struct ConsumerAbRun {
+        arm: String,
+        round: usize,
+        /// Absorb + flush + commit: the consumer thread's busy time.
+        consumer_ms: f64,
+        absorb_ms: f64,
+        /// `lexical_rebuild_prepare_prebuilt_doc_refs` alone.
+        prepare_ms: f64,
+        /// `add_prebuilt_document_refs_slice`: projection plus engine ingest.
+        add_ms: f64,
+        commit_ms: f64,
+        /// Packet generation stands in for the producer; excluded.
+        generate_ms: f64,
+        commits: usize,
+        flushes: usize,
+        docs: usize,
+        peak_rss_mib: f64,
+        rss_start_mib: f64,
+    }
+
+    /// Drive the full rebuild's consumer work for one arm: absorb every
+    /// packet into the equivalence accumulator, flush batches through the
+    /// production flush (prepare + add), and commit on the production
+    /// startup-then-steady cadence, exactly as the consumer loop of
+    /// `rebuild_tantivy_from_db` does. With `overlap_absorb` the flush absorbs
+    /// its batch while Quill ingests it (the production consumer); without
+    /// it each packet is absorbed on arrival on this thread (the consumer
+    /// before that change). Returns the run and a witness of its
+    /// output: equivalence evidence, indexed count, every segment's docid
+    /// range and doc count, and the ranked hits (score bits, global docid,
+    /// document id) and exact totals of `queries`.
+    fn consumer_ab_run_arm(
+        base: &Path,
+        (conversations, messages, mean_bytes, batch_limit): (usize, usize, usize, usize),
+        (arm, serial_projection, overlap_absorb, round): (&str, bool, bool, usize),
+        queries: &[String],
+    ) -> (ConsumerAbRun, Vec<String>) {
+        use crate::search::quill_bridge::{
+            QuillCassIndex, search_paginated, set_serial_projection_for_ab,
+        };
+        use frankensearch::quill::query::{CassQueryFilters, CassQueryParser};
+        use frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA;
+        let tmp = TempDir::new_in(base).unwrap();
+        let index_path = tmp.path().join("index");
+        let _ = fs::write("/proc/self/clear_refs", "5");
+        let rss_start_mib = consumer_ab_status_mib("VmRSS:");
+        set_serial_projection_for_ab(serial_projection);
+        let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        t_index.configure_bulk_load_merge_policy();
+        let mut accumulator = LexicalRebuildEquivalenceAccumulator::new();
+        let mut profile = LexicalRebuildPerfProfile::default();
+        let steady = (
+            lexical_rebuild_commit_interval_conversations(),
+            lexical_rebuild_commit_interval_messages(),
+            lexical_rebuild_commit_interval_message_bytes(),
+        );
+        let mut intervals = (
+            lexical_rebuild_initial_commit_interval_conversations().min(steady.0),
+            lexical_rebuild_initial_commit_interval_messages().min(steady.1),
+            lexical_rebuild_initial_commit_interval_message_bytes().min(steady.2),
+        );
+        let mut pending: Vec<LexicalRebuildConversationPacket> = Vec::new();
+        let (mut pending_messages, mut pending_bytes) = (0_usize, 0_usize);
+        let (mut messages_since_commit, mut bytes_since_commit) = (0_usize, 0_usize);
+        let mut conversations_since_commit = 0_usize;
+        let mut indexed_docs = 0_usize;
+        let mut commits = 0_usize;
+        let mut absorb = Duration::ZERO;
+        let mut flush = Duration::ZERO;
+        let mut commit = Duration::ZERO;
+        let mut generate = Duration::ZERO;
+        macro_rules! flush_pending {
+            () => {{
+                let started = Instant::now();
+                flush_streamed_lexical_rebuild_batch(
+                    &mut pending,
+                    &mut pending_messages,
+                    &mut pending_bytes,
+                    None,
+                    None,
+                    overlap_absorb.then_some(&mut accumulator),
+                    &mut t_index,
+                    &mut indexed_docs,
+                    &mut messages_since_commit,
+                    &mut bytes_since_commit,
+                    batch_limit,
+                    LEXICAL_REBUILD_PAGE_SIZE,
+                    Some(&mut profile),
+                )
+                .unwrap();
+                flush += started.elapsed();
+            }};
+        }
+        macro_rules! commit_now {
+            () => {{
+                let started = Instant::now();
+                t_index.commit().unwrap();
+                commit += started.elapsed();
+                commits += 1;
+            }};
+        }
+        let mut next = 0;
+        while next < conversations {
+            let page_end = (next + batch_limit).min(conversations);
+            let started = Instant::now();
+            let packets = consumer_ab_packets(next, page_end - next, messages, mean_bytes);
+            generate += started.elapsed();
+            next = page_end;
+            for packet in packets {
+                if !overlap_absorb {
+                    let started = Instant::now();
+                    accumulator.absorb_packet(&packet);
+                    absorb += started.elapsed();
+                }
+                pending_messages += packet.message_count;
+                pending_bytes += packet.message_bytes;
+                pending.push(packet);
+                conversations_since_commit += 1;
+                if pending_lexical_rebuild_batch_reached_runtime_limit(pending.len(), batch_limit) {
+                    flush_pending!();
+                }
+                if should_commit_lexical_rebuild(
+                    conversations_since_commit,
+                    messages_since_commit + pending_messages,
+                    bytes_since_commit + pending_bytes,
+                    intervals.0,
+                    intervals.1,
+                    intervals.2,
+                ) {
+                    flush_pending!();
+                    commit_now!();
+                    (messages_since_commit, bytes_since_commit) = (0, 0);
+                    conversations_since_commit = 0;
+                    intervals = steady;
+                }
+            }
+        }
+        flush_pending!();
+        commit_now!();
+        let peak_rss_mib = consumer_ab_status_mib("VmHWM:");
+        set_serial_projection_for_ab(false);
+        drop(t_index);
+
+        let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
+        let run = ConsumerAbRun {
+            arm: arm.to_string(),
+            round,
+            consumer_ms: ms(absorb + flush + commit),
+            absorb_ms: ms(absorb),
+            prepare_ms: ms(profile
+                .prepare_duration
+                .saturating_sub(profile.add_duration)),
+            add_ms: ms(profile.add_duration),
+            commit_ms: ms(commit),
+            generate_ms: ms(generate),
+            commits,
+            flushes: profile.batch_flushes,
+            docs: indexed_docs,
+            peak_rss_mib,
+            rss_start_mib,
+        };
+        eprintln!("CONSUMER_AB_RUN {}", serde_json::to_string(&run).unwrap());
+
+        let mut witness = vec![
+            format!("evidence {:?}", accumulator.finalize()),
+            format!("indexed {indexed_docs}"),
+        ];
+        let writer = QuillCassIndex::open_or_create(&index_path).unwrap();
+        for segment in writer.committed_snapshot().unwrap().segments() {
+            let manifest = segment.manifest();
+            witness.push(format!(
+                "segment {}..{} docs {}",
+                manifest.docid_lo, manifest.docid_hi, manifest.doc_count
+            ));
+        }
+        let reader = writer.reader().unwrap();
+        let parser = CassQueryParser::new(CASS_SEMANTIC_SCHEMA).unwrap();
+        for query in queries {
+            let parsed = parser.parse(query, &CassQueryFilters::default());
+            let page = search_paginated(&reader, &parsed.query, 200, 0, true).unwrap();
+            witness.push(format!("{query:?} total {:?}", page.total_count));
+            witness.extend(page.hits.iter().map(|hit| {
+                format!(
+                    "{:08x} {} {}",
+                    hit.bm25_score.to_bits(),
+                    hit.global_docid,
+                    hit.document_id
+                )
+            }));
+        }
+        (run, witness)
+    }
+
+    /// Same-invocation A/B of the bridge's schema projection on the full
+    /// rebuild's consumer path: the pooled projection (`candidate`) against
+    /// the serial projection the bridge used before (`incumbent`, selected by
+    /// `set_serial_projection_for_ab`), plus an A/A `null` arm that repeats
+    /// the incumbent. `CASS_CONSUMER_AB_CONVERSATIONS` conversations of
+    /// `CASS_CONSUMER_AB_MESSAGES` messages (mean
+    /// `CASS_CONSUMER_AB_MESSAGE_BYTES` bytes) flush every
+    /// `CASS_CONSUMER_AB_BATCH_CONVERSATIONS` conversations. First a stage
+    /// profile of the consumer's own work on the first page set (absorb,
+    /// prepare, serial and pooled projection; the two projections must be
+    /// equal), then one unrecorded warm-up round plus
+    /// `CASS_CONSUMER_AB_ROUNDS`, alternating arm order. Every arm must
+    /// produce one witness (evidence, count, segment docid ranges, ranked
+    /// hits with global docids).
+    #[test]
+    #[ignore = "consumer projection A/B; run explicitly with --ignored --nocapture"]
+    #[serial]
+    fn consumer_projection_benchmark_arms() {
+        use crate::search::quill_bridge::{
+            project_cass_document_refs, set_serial_projection_for_ab,
+        };
+        let size = |key: &str, default: usize| {
+            dotenvy::var(key)
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(default)
+        };
+        let conversations = size("CASS_CONSUMER_AB_CONVERSATIONS", 4096);
+        let messages = size("CASS_CONSUMER_AB_MESSAGES", 64);
+        let mean_bytes = size("CASS_CONSUMER_AB_MESSAGE_BYTES", 1024).max(8);
+        let rounds = size("CASS_CONSUMER_AB_ROUNDS", 3);
+        let batch_limit = size("CASS_CONSUMER_AB_BATCH_CONVERSATIONS", 100);
+        let base = dotenvy::var("CASS_CONSUMER_AB_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        // The governor scales writer parallelism and add-batch splits with
+        // host load; pin it so every arm sees one batch shape.
+        let _governor = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
+        eprintln!(
+            "CONSUMER_AB_SHAPE {}",
+            serde_json::json!({
+                "conversations": conversations,
+                "messages_per_conversation": messages,
+                "mean_message_bytes": mean_bytes,
+                "batch_conversations": batch_limit,
+                "rounds": rounds,
+                "available_parallelism":
+                    std::thread::available_parallelism().map_or(1, usize::from),
+                "rayon_threads": rayon::current_num_threads(),
+            })
+        );
+
+        // Stage profile of the consumer thread's own work, one pass.
+        let profile_conversations =
+            conversations.min(size("CASS_CONSUMER_AB_PROFILE_CONVERSATIONS", 1024));
+        let mut accumulator = LexicalRebuildEquivalenceAccumulator::new();
+        let mut absorb = Duration::ZERO;
+        let mut prepare = Duration::ZERO;
+        let mut serial = Duration::ZERO;
+        let mut pooled = Duration::ZERO;
+        let (mut docs, mut bytes) = (0_usize, 0_usize);
+        let mut next = 0;
+        while next < profile_conversations {
+            let page_end = (next + batch_limit).min(profile_conversations);
+            let packets = consumer_ab_packets(next, page_end - next, messages, mean_bytes);
+            next = page_end;
+            let started = Instant::now();
+            for packet in &packets {
+                accumulator.absorb_packet(packet);
+            }
+            absorb += started.elapsed();
+            let started = Instant::now();
+            let refs = lexical_rebuild_prepare_prebuilt_doc_refs(&packets, None);
+            prepare += started.elapsed();
+            docs += refs.len();
+            bytes += refs.iter().map(|doc| doc.content.len()).sum::<usize>();
+            set_serial_projection_for_ab(true);
+            let started = Instant::now();
+            let serial_docs = project_cass_document_refs(&refs);
+            serial += started.elapsed();
+            set_serial_projection_for_ab(false);
+            let started = Instant::now();
+            let pooled_docs = project_cass_document_refs(&refs);
+            pooled += started.elapsed();
+            assert!(
+                serial_docs == pooled_docs,
+                "pooled projection differs from serial"
+            );
+        }
+        let per_doc_ns = |duration: Duration| duration.as_nanos() as f64 / docs.max(1) as f64;
+        eprintln!(
+            "CONSUMER_PROFILE {}",
+            serde_json::json!({
+                "docs": docs,
+                "content_bytes": bytes,
+                "absorb_ns_per_doc": per_doc_ns(absorb),
+                "prepare_ns_per_doc": per_doc_ns(prepare),
+                "serial_projection_ns_per_doc": per_doc_ns(serial),
+                "pooled_projection_ns_per_doc": per_doc_ns(pooled),
+            })
+        );
+
+        consumer_ab_rounds_and_report(
+            &base,
+            (conversations, messages, mean_bytes, batch_limit),
+            &[
+                ("incumbent", true, false),
+                ("candidate", false, false),
+                ("null", true, false),
+            ],
+            rounds,
+        );
+    }
+
+    /// One unrecorded warm-up round plus `rounds` recorded rounds of every
+    /// `(arm, serial_projection, overlap_absorb)` in `arms`, alternating arm
+    /// order each round; prints a `CONSUMER_AB_SUMMARY` per arm (p50, min,
+    /// max, paired ratios against the same round's `incumbent`) and asserts
+    /// that every run produced one witness and one document count.
+    fn consumer_ab_rounds_and_report(
+        base: &Path,
+        shape: (usize, usize, usize, usize),
+        arms: &[(&str, bool, bool)],
+        rounds: usize,
+    ) {
+        let queries: Vec<String> = [
+            "error", "test", "function", "import", "the", "cargo", "aab", "fixture", "consumer",
+            "zzz",
+        ]
+        .iter()
+        .map(|query| (*query).to_string())
+        .collect();
+        let mut reference: Option<Vec<String>> = None;
+        let mut mismatches = Vec::new();
+        let mut runs: Vec<ConsumerAbRun> = Vec::new();
+        for round in 0..=rounds {
+            let order: Vec<usize> = if round % 2 == 0 {
+                (0..arms.len()).collect()
+            } else {
+                (0..arms.len()).rev().collect()
+            };
+            for index in order {
+                let (arm, serial_projection, overlap_absorb) = arms[index];
+                let (run, witness) = consumer_ab_run_arm(
+                    base,
+                    shape,
+                    (arm, serial_projection, overlap_absorb, round),
+                    &queries,
+                );
+                if let Some(expected) = &reference {
+                    if *expected != witness {
+                        let first = expected
+                            .iter()
+                            .zip(&witness)
+                            .position(|(left, right)| left != right);
+                        mismatches.push(format!(
+                            "arm {arm} round {round}: {} vs {} lines, first diff {first:?}",
+                            expected.len(),
+                            witness.len()
+                        ));
+                    }
+                } else {
+                    reference = Some(witness);
+                }
+                if round > 0 {
+                    runs.push(run);
+                }
+            }
+        }
+
+        let percentile = |mut samples: Vec<f64>, q: f64| {
+            samples.sort_by(f64::total_cmp);
+            samples[((samples.len() - 1) as f64 * q).round() as usize]
+        };
+        for &(arm, _, _) in arms {
+            let mine: Vec<&ConsumerAbRun> = runs.iter().filter(|run| run.arm == arm).collect();
+            let field = |pick: fn(&ConsumerAbRun) -> f64| -> Vec<f64> {
+                mine.iter().map(|run| pick(run)).collect()
+            };
+            let ratio = |pick: fn(&ConsumerAbRun) -> f64| -> Vec<f64> {
+                mine.iter()
+                    .filter_map(|run| {
+                        runs.iter()
+                            .find(|other| other.arm == "incumbent" && other.round == run.round)
+                            .map(|other| pick(run) / pick(other))
+                    })
+                    .collect()
+            };
+            let consumer = field(|run| run.consumer_ms);
+            let add = field(|run| run.add_ms);
+            let consumer_ratio = ratio(|run| run.consumer_ms);
+            let add_ratio = ratio(|run| run.add_ms);
+            eprintln!(
+                "CONSUMER_AB_SUMMARY {}",
+                serde_json::json!({
+                    "arm": arm,
+                    "consumer_ms_p50": percentile(consumer.clone(), 0.5),
+                    "consumer_ms_min": percentile(consumer.clone(), 0.0),
+                    "consumer_ms_max": percentile(consumer, 1.0),
+                    "add_ms_p50": percentile(add.clone(), 0.5),
+                    "add_ms_min": percentile(add.clone(), 0.0),
+                    "add_ms_max": percentile(add, 1.0),
+                    "absorb_ms_p50": percentile(field(|run| run.absorb_ms), 0.5),
+                    "prepare_ms_p50": percentile(field(|run| run.prepare_ms), 0.5),
+                    "commit_ms_p50": percentile(field(|run| run.commit_ms), 0.5),
+                    "consumer_ratio_p50": percentile(consumer_ratio.clone(), 0.5),
+                    "consumer_ratio_min": percentile(consumer_ratio.clone(), 0.0),
+                    "consumer_ratio_max": percentile(consumer_ratio, 1.0),
+                    "add_ratio_p50": percentile(add_ratio.clone(), 0.5),
+                    "add_ratio_min": percentile(add_ratio.clone(), 0.0),
+                    "add_ratio_max": percentile(add_ratio, 1.0),
+                    "peak_rss_mib_p50": percentile(field(|run| run.peak_rss_mib), 0.5),
+                    "peak_rss_mib_max": percentile(field(|run| run.peak_rss_mib), 1.0),
+                    "peak_growth_mib_p50":
+                        percentile(field(|run| run.peak_rss_mib - run.rss_start_mib), 0.5),
+                    "docs": mine.first().map(|run| run.docs),
+                    "commits": mine.first().map(|run| run.commits),
+                    "flushes": mine.first().map(|run| run.flushes),
+                })
+            );
+        }
+        assert_eq!(
+            runs.iter()
+                .map(|run| run.docs)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            1,
+            "every arm must index the same document count"
+        );
+        assert!(
+            mismatches.is_empty(),
+            "arms produced different generations:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    /// Same-invocation A/B of where the full rebuild's consumer absorbs
+    /// packets into the equivalence accumulator: on arrival, on the consumer
+    /// thread (`incumbent`, the consumer before this change), against inside
+    /// each flush on a helper thread while Quill ingests the batch
+    /// (`candidate`, production), plus an A/A `null` arm that repeats the
+    /// incumbent. Same shape knobs as `consumer_projection_benchmark_arms`.
+    /// First a single-thread stage profile of the per-document work on the
+    /// first pages: page prep's packet build from fetched rows (producer
+    /// side), `prebuilt_docs`, the accumulator without probes (packet and doc
+    /// manifest hashing) and with the default probes, and doc-ref prepare.
+    /// Every arm must produce one witness, equivalence evidence included.
+    #[test]
+    #[ignore = "consumer equivalence-absorb A/B; run explicitly with --ignored --nocapture"]
+    #[serial]
+    fn consumer_equivalence_absorb_benchmark_arms() {
+        let size = |key: &str, default: usize| {
+            dotenvy::var(key)
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(default)
+        };
+        let conversations = size("CASS_CONSUMER_AB_CONVERSATIONS", 4096);
+        let messages = size("CASS_CONSUMER_AB_MESSAGES", 64);
+        let mean_bytes = size("CASS_CONSUMER_AB_MESSAGE_BYTES", 1024).max(8);
+        let rounds = size("CASS_CONSUMER_AB_ROUNDS", 3);
+        let batch_limit = size("CASS_CONSUMER_AB_BATCH_CONVERSATIONS", 100);
+        let base = dotenvy::var("CASS_CONSUMER_AB_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let _governor = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
+        eprintln!(
+            "CONSUMER_AB_SHAPE {}",
+            serde_json::json!({
+                "lever": "equivalence_absorb_overlap",
+                "conversations": conversations,
+                "messages_per_conversation": messages,
+                "mean_message_bytes": mean_bytes,
+                "batch_conversations": batch_limit,
+                "rounds": rounds,
+                "available_parallelism":
+                    std::thread::available_parallelism().map_or(1, usize::from),
+                "rayon_threads": rayon::current_num_threads(),
+            })
+        );
+
+        let profile_conversations =
+            conversations.min(size("CASS_CONSUMER_AB_PROFILE_CONVERSATIONS", 1024));
+        let source_map: HashMap<String, (SourceKind, Option<String>)> = HashMap::new();
+        let mut manifest_only = LexicalRebuildEquivalenceAccumulator::with_probes(Vec::new());
+        let mut accumulator = LexicalRebuildEquivalenceAccumulator::new();
+        let mut build = Duration::ZERO;
+        let mut doc_views = Duration::ZERO;
+        let mut manifest = Duration::ZERO;
+        let mut absorb = Duration::ZERO;
+        let mut prepare = Duration::ZERO;
+        let (mut docs, mut bytes, mut viewed) = (0_usize, 0_usize, 0_usize);
+        let mut next = 0;
+        while next < profile_conversations {
+            let page_end = (next + batch_limit).min(profile_conversations);
+            let fetched: Vec<_> = (next..page_end)
+                .map(|sequence| consumer_ab_rows(sequence, messages, mean_bytes))
+                .collect();
+            next = page_end;
+            let started = Instant::now();
+            let packets: Vec<LexicalRebuildConversationPacket> = fetched
+                .into_iter()
+                .map(|(row, rows)| {
+                    LexicalRebuildConversationPacket::from_canonical_replay_messages(
+                        row,
+                        rows,
+                        &source_map,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            build += started.elapsed();
+            let started = Instant::now();
+            for packet in &packets {
+                viewed += std::hint::black_box(packet.prebuilt_docs()).len();
+            }
+            doc_views += started.elapsed();
+            let started = Instant::now();
+            for packet in &packets {
+                manifest_only.absorb_packet(packet);
+            }
+            manifest += started.elapsed();
+            let started = Instant::now();
+            for packet in &packets {
+                accumulator.absorb_packet(packet);
+            }
+            absorb += started.elapsed();
+            let started = Instant::now();
+            let refs = lexical_rebuild_prepare_prebuilt_doc_refs(&packets, None);
+            prepare += started.elapsed();
+            docs += refs.len();
+            bytes += refs.iter().map(|doc| doc.content.len()).sum::<usize>();
+        }
+        assert_eq!(viewed, docs, "prebuilt_docs and prepare saw different docs");
+        let evidence = accumulator.finalize();
+        let per_doc_ns = |duration: Duration| duration.as_nanos() as f64 / docs.max(1) as f64;
+        eprintln!(
+            "CONSUMER_PROFILE {}",
+            serde_json::json!({
+                "docs": docs,
+                "content_bytes": bytes,
+                "packet_build_ns_per_doc": per_doc_ns(build),
+                "prebuilt_docs_ns_per_doc": per_doc_ns(doc_views),
+                "absorb_no_probes_ns_per_doc": per_doc_ns(manifest),
+                "absorb_ns_per_doc": per_doc_ns(absorb),
+                "prepare_ns_per_doc": per_doc_ns(prepare),
+                "probe_hits": evidence
+                    .golden_query_hit_counts
+                    .iter()
+                    .map(|hit| (hit.probe.clone(), hit.hit_count))
+                    .collect::<Vec<_>>(),
+            })
+        );
+
+        consumer_ab_rounds_and_report(
+            &base,
+            (conversations, messages, mean_bytes, batch_limit),
+            &[
+                ("incumbent", false, false),
+                ("candidate", false, true),
+                ("null", false, false),
+            ],
+            rounds,
+        );
+    }
+
+    /// Messages in conversation `sequence` of the memory A/B archive: a
+    /// repeating eight-conversation mix from a quarter to twice `mean`
+    /// messages (mean exactly `mean`), so pages carry uneven conversations.
+    fn memory_ab_messages(sequence: usize, mean: usize) -> usize {
+        const EIGHTHS: [usize; 8] = [2, 4, 4, 8, 8, 8, 16, 14];
+        (mean * EIGHTHS[sequence % 8] / 8).max(1)
+    }
+
+    /// Write the memory A/B archive through the production batched insert;
+    /// returns the message count.
+    fn memory_ab_build_archive(
+        db_path: &Path,
+        conversations: usize,
+        mean_messages: usize,
+        mean_bytes: usize,
+    ) -> usize {
+        let storage = FrankenStorage::open(db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let workspace_ids: Vec<i64> = (0..8)
+            .map(|workspace| {
+                storage
+                    .ensure_workspace(Path::new(&format!("/workspace/consumer{workspace}")), None)
+                    .unwrap()
+            })
+            .collect();
+        let mut total_messages = 0;
+        let mut start = 0;
+        while start < conversations {
+            let end = (start + 64).min(conversations);
+            let batch: Vec<Conversation> = (start..end)
+                .into_par_iter()
+                .map(|sequence| {
+                    let (row, rows) = consumer_ab_rows(
+                        sequence,
+                        memory_ab_messages(sequence, mean_messages),
+                        mean_bytes,
+                    );
+                    Conversation {
+                        id: None,
+                        agent_slug: row.agent_slug,
+                        workspace: row.workspace,
+                        external_id: row.external_id,
+                        title: row.title,
+                        source_path: row.source_path,
+                        started_at: row.started_at,
+                        ended_at: row.ended_at,
+                        approx_tokens: None,
+                        metadata_json: serde_json::Value::Null,
+                        messages: rows
+                            .into_iter()
+                            .map(|message| Message {
+                                id: None,
+                                ..message
+                            })
+                            .collect(),
+                        source_id: row.source_id,
+                        origin_host: row.origin_host,
+                    }
+                })
+                .collect();
+            total_messages += batch
+                .iter()
+                .map(|conversation| conversation.messages.len())
+                .sum::<usize>();
+            let rows: Vec<(i64, Option<i64>, &Conversation)> = batch
+                .iter()
+                .enumerate()
+                .map(|(offset, conversation)| {
+                    (
+                        agent_id,
+                        Some(workspace_ids[(start + offset) % 8]),
+                        conversation,
+                    )
+                })
+                .collect();
+            storage.insert_conversations_batched(&rows).unwrap();
+            start = end;
+        }
+        drop(storage);
+        total_messages
+    }
+
+    /// One `/proc/self/status` reading: VmRSS, RssAnon, RssFile (MiB), threads.
+    fn memory_ab_status() -> (f64, f64, f64, u64) {
+        let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let field = |name: &str| -> u64 {
+            status
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix(name)?
+                        .trim()
+                        .trim_end_matches("kB")
+                        .trim()
+                        .parse()
+                        .ok()
+                })
+                .unwrap_or(0)
+        };
+        (
+            field("VmRSS:") as f64 / 1024.0,
+            field("RssAnon:") as f64 / 1024.0,
+            field("RssFile:") as f64 / 1024.0,
+            field("Threads:"),
+        )
+    }
+
+    /// glibc heap counters in MiB: (in use in arenas, free but retained in
+    /// arenas, mmapped chunks). `None` off glibc.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn memory_ab_heap_mib() -> Option<(f64, f64, f64)> {
+        // SAFETY: mallinfo2 only reads glibc's allocator statistics.
+        let info = unsafe { libc::mallinfo2() };
+        let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+        Some((mib(info.uordblks), mib(info.fordblks), mib(info.hblkhd)))
+    }
+
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    fn memory_ab_heap_mib() -> Option<(f64, f64, f64)> {
+        None
+    }
+
+    #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+    struct MemoryAbSample {
+        t_ms: f64,
+        rss_mib: f64,
+        anon_mib: f64,
+        file_mib: f64,
+        /// Latest glibc heap reading (taken every `CASS_MEMORY_AB_HEAP_EVERY_MS`).
+        heap_in_use_mib: f64,
+        heap_free_mib: f64,
+        heap_mmapped_mib: f64,
+        threads: u64,
+    }
+
+    /// Log sink that timestamps the rebuild's phase boundaries and runs
+    /// `fold_hook` on the consumer thread right before the post-run fold.
+    #[derive(Clone)]
+    struct MemoryAbLog {
+        started: Instant,
+        markers: Arc<Mutex<Vec<(f64, &'static str)>>>,
+        flushes: Arc<AtomicUsize>,
+        fold_hook: Arc<dyn Fn() + Send + Sync>,
+    }
+
+    impl std::io::Write for MemoryAbLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let line = String::from_utf8_lossy(buf);
+            let t_ms = self.started.elapsed().as_secs_f64() * 1000.0;
+            if line.contains("flushed a streamed conversation batch") {
+                self.flushes.fetch_add(1, Ordering::Relaxed);
+            }
+            let marker = if line.contains("entering consumer loop") {
+                Some("ingest")
+            } else if line.contains("commit_candidate") && line.contains("step started") {
+                Some("final_commit")
+            } else if line.contains("count_candidate_segments") && line.contains("step completed") {
+                Some("fold")
+            } else if line.contains("checkpoint_after_fold") && line.contains("step started") {
+                Some("publish")
+            } else {
+                None
+            };
+            if let Some(marker) = marker {
+                self.markers.lock().unwrap().push((t_ms, marker));
+                if marker == "fold" {
+                    (self.fold_hook)();
+                }
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Per-phase memory of one rebuild: startup, ingest, final commit, fold,
+    /// publish (markers from [`MemoryAbLog`]).
+    fn memory_ab_phases(
+        samples: &[MemoryAbSample],
+        markers: &[(f64, &'static str)],
+        end_ms: f64,
+    ) -> serde_json::Value {
+        let at = |name: &str| {
+            markers
+                .iter()
+                .find(|(_, marker)| *marker == name)
+                .map(|(t, _)| *t)
+        };
+        let bounds = [
+            ("startup", Some(0.0), at("ingest")),
+            ("ingest", at("ingest"), at("final_commit")),
+            ("final_commit", at("final_commit"), at("fold")),
+            ("fold", at("fold"), at("publish")),
+            ("publish", at("publish"), Some(end_ms)),
+        ];
+        let mut phases = serde_json::Map::new();
+        for (name, start, end) in bounds {
+            let (Some(start), Some(end)) = (start, end) else {
+                continue;
+            };
+            let window: Vec<&MemoryAbSample> = samples
+                .iter()
+                .filter(|sample| sample.t_ms >= start && sample.t_ms < end)
+                .collect();
+            let max = |pick: fn(&MemoryAbSample) -> f64| {
+                window
+                    .iter()
+                    .map(|sample| pick(sample))
+                    .fold(0.0_f64, f64::max)
+            };
+            // Mean over the phase's evenly spaced samples: the phase's
+            // memory-time product divided by its length.
+            let mean = |pick: fn(&MemoryAbSample) -> f64| {
+                window.iter().map(|sample| pick(sample)).sum::<f64>() / window.len().max(1) as f64
+            };
+            phases.insert(
+                name.to_string(),
+                serde_json::json!({
+                    "ms": end - start,
+                    "rss_max": max(|s| s.rss_mib),
+                    "rss_mean": mean(|s| s.rss_mib),
+                    "anon_max": max(|s| s.anon_mib),
+                    "anon_mean": mean(|s| s.anon_mib),
+                    "file_max": max(|s| s.file_mib),
+                    "heap_in_use_max": max(|s| s.heap_in_use_mib),
+                    "heap_free_max": max(|s| s.heap_free_mib),
+                    "heap_mmapped_max": max(|s| s.heap_mmapped_mib),
+                    "first": window.first(),
+                    "last": window.last(),
+                }),
+            );
+        }
+        serde_json::Value::Object(phases)
+    }
+
+    /// Sorted identities and score bits of every hit for each query, hashed:
+    /// rare terms only, so each hit list is the query's complete answer and
+    /// does not depend on how ties at a cutoff were ordered.
+    fn memory_ab_query_witness(index_path: &Path, queries: &[String]) -> String {
+        use crate::search::query::{FieldMask, SearchClient, SearchFilters};
+        let client = SearchClient::open(index_path, None).unwrap().unwrap();
+        let mut hasher = blake3::Hasher::new();
+        for query in queries {
+            let mut hits: Vec<String> = client
+                .search(query, SearchFilters::default(), 1000, 0, FieldMask::FULL)
+                .unwrap()
+                .into_iter()
+                .map(|hit| {
+                    format!(
+                        "{:08x} {:?} {:?} {} {:016x}",
+                        hit.score.to_bits(),
+                        hit.conversation_id,
+                        hit.line_number,
+                        hit.source_path,
+                        hit.content_hash
+                    )
+                })
+                .collect();
+            assert!(
+                hits.len() < 1000,
+                "witness query {query:?} must be answered in full"
+            );
+            hits.sort();
+            hasher.update(format!("{query} {}\n", hits.len()).as_bytes());
+            for hit in hits {
+                hasher.update(hit.as_bytes());
+                hasher.update(b"\n");
+            }
+        }
+        hasher.finalize().to_hex().to_string()
+    }
+
+    /// Child half of `rebuild_memory_benchmark_arms`: one full
+    /// `rebuild_tantivy_from_db` of the parent's archive in this fresh
+    /// process (so no arm inherits another's allocator state), sampled every
+    /// 50 ms. Prints `MEMORY_AB_RUN` and `MEMORY_AB_WITNESS` lines.
+    fn memory_ab_child(arm: &str) {
+        let var = |key: &str| dotenvy::var(key).unwrap();
+        let db_path = PathBuf::from(var("CASS_MEMORY_AB_DB"));
+        let conversations: usize = var("CASS_MEMORY_AB_CONVERSATIONS").parse().unwrap();
+        let round: usize = var("CASS_MEMORY_AB_ROUND").parse().unwrap();
+        let heap_every = Duration::from_millis(
+            dotenvy::var("CASS_MEMORY_AB_HEAP_EVERY_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(500),
+        );
+        let _governor = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
+        let tmp = TempDir::new_in(var("CASS_MEMORY_AB_DIR")).unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        let started = Instant::now();
+        let probe: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let fold_hook: Arc<dyn Fn() + Send + Sync> = {
+            let probe = Arc::clone(&probe);
+            let arm = arm.to_string();
+            Arc::new(move || {
+                let (rss_before, anon_before, _, _) = memory_ab_status();
+                let heap_before = memory_ab_heap_mib();
+                if dotenvy::var("CASS_MEMORY_AB_MALLOC_STATS").is_ok() {
+                    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                    // SAFETY: malloc_stats only prints glibc's allocator statistics.
+                    unsafe {
+                        libc::malloc_stats();
+                    }
+                }
+                // Which threads are still alive when the fold starts, by
+                // name with the pool index stripped.
+                let mut threads = std::collections::BTreeMap::<String, usize>::new();
+                if let Ok(tasks) = fs::read_dir("/proc/self/task") {
+                    for task in tasks.flatten() {
+                        let comm = fs::read_to_string(task.path().join("comm")).unwrap_or_default();
+                        let name = comm.trim().trim_end_matches(|c: char| c.is_ascii_digit());
+                        *threads.entry(name.to_string()).or_default() += 1;
+                    }
+                }
+                *probe.lock().unwrap() = Some(serde_json::json!({
+                    "arm": arm,
+                    "rss_before": rss_before,
+                    "anon_before": anon_before,
+                    "heap_before": heap_before,
+                    "threads": threads,
+                }));
+            })
+        };
+        let log = MemoryAbLog {
+            started,
+            markers: Arc::new(Mutex::new(Vec::new())),
+            flushes: Arc::new(AtomicUsize::new(0)),
+            fold_hook,
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let samples = Arc::new(Mutex::new(Vec::<MemoryAbSample>::new()));
+        let sampler = {
+            let stop = Arc::clone(&stop);
+            let samples = Arc::clone(&samples);
+            thread::spawn(move || {
+                let mut heap = (0.0, 0.0, 0.0);
+                let mut heap_at: Option<Instant> = None;
+                let mut heap_cost_max_ms = 0.0_f64;
+                while !stop.load(Ordering::Relaxed) {
+                    if heap_every > Duration::ZERO
+                        && heap_at.is_none_or(|at| at.elapsed() >= heap_every)
+                    {
+                        let cost = Instant::now();
+                        heap = memory_ab_heap_mib().unwrap_or_default();
+                        heap_cost_max_ms =
+                            heap_cost_max_ms.max(cost.elapsed().as_secs_f64() * 1000.0);
+                        heap_at = Some(Instant::now());
+                    }
+                    let (rss_mib, anon_mib, file_mib, threads) = memory_ab_status();
+                    samples.lock().unwrap().push(MemoryAbSample {
+                        t_ms: started.elapsed().as_secs_f64() * 1000.0,
+                        rss_mib,
+                        anon_mib,
+                        file_mib,
+                        heap_in_use_mib: heap.0,
+                        heap_free_mib: heap.1,
+                        heap_mmapped_mib: heap.2,
+                        threads,
+                    });
+                    thread::sleep(Duration::from_millis(50));
+                }
+                heap_cost_max_ms
+            })
+        };
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                "coding_agent_search::indexer=info",
+            ))
+            .finish();
+        // The candidate arm is production; the incumbent and the null arm
+        // fold without first returning the free heap to the OS.
+        LEXICAL_FOLD_HEAP_RELEASE_DISABLED_FOR_TEST
+            .with(|disabled| disabled.set(arm != "candidate"));
+        LEXICAL_FOLD_HEAP_RELEASES_FOR_TEST.with(|releases| releases.borrow_mut().clear());
+        let outcome = tracing::subscriber::with_default(subscriber, || {
+            rebuild_tantivy_from_db(&db_path, &data_dir, conversations, None).unwrap()
+        });
+        let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let releases =
+            LEXICAL_FOLD_HEAP_RELEASES_FOR_TEST.with(|releases| releases.borrow().clone());
+        assert_eq!(
+            releases.len(),
+            usize::from(arm == "candidate"),
+            "{arm}: pre-fold heap releases {releases:?}"
+        );
+        stop.store(true, Ordering::Relaxed);
+        let heap_cost_max_ms = sampler.join().unwrap();
+        let hwm_mib = consumer_ab_status_mib("VmHWM:");
+        let samples = samples.lock().unwrap().clone();
+        let markers = log.markers.lock().unwrap().clone();
+        let index_path = index_dir(&data_dir).unwrap();
+        let summary = crate::search::tantivy::searchable_index_summary(&index_path)
+            .unwrap()
+            .unwrap();
+        let run = serde_json::json!({
+            "arm": arm,
+            "round": round,
+            "wall_ms": wall_ms,
+            "hwm_mib": hwm_mib,
+            "indexed_docs": outcome.indexed_docs,
+            "docs": summary.docs,
+            "segments": summary.segments,
+            "flushes": log.flushes.load(Ordering::Relaxed),
+            "markers": markers,
+            "phases": memory_ab_phases(&samples, &markers, wall_ms),
+            "probe": probe.lock().unwrap().clone(),
+            "heap_cost_max_ms": heap_cost_max_ms,
+            "samples": samples.len(),
+        });
+        eprintln!("MEMORY_AB_RUN {run}");
+        if dotenvy::var("CASS_MEMORY_AB_TIMELINE").is_ok() {
+            let mut next_ms = 0.0;
+            let timeline: Vec<&MemoryAbSample> = samples
+                .iter()
+                .filter(|sample| {
+                    let keep = sample.t_ms >= next_ms;
+                    if keep {
+                        next_ms = sample.t_ms + 1000.0;
+                    }
+                    keep
+                })
+                .collect();
+            eprintln!(
+                "MEMORY_AB_TIMELINE {}",
+                serde_json::json!({ "arm": arm, "samples": timeline })
+            );
+        }
+        let queries: Vec<String> = [60_000_u64, 120_000, 180_000]
+            .into_iter()
+            .map(|rank| {
+                let mut word = String::new();
+                consumer_ab_word(rank, &mut word);
+                word
+            })
+            .collect();
+        eprintln!(
+            "MEMORY_AB_WITNESS {}",
+            serde_json::json!({
+                "arm": arm,
+                "round": round,
+                "evidence": format!("{:?}", outcome.equivalence),
+                "indexed_docs": outcome.indexed_docs,
+                "docs": summary.docs,
+                "queries": memory_ab_query_witness(&index_path, &queries),
+            })
+        );
+    }
+
+    /// Same-binary A/B of the full rebuild's memory: the parent writes one
+    /// canonical archive (`CASS_MEMORY_AB_CONVERSATIONS` conversations of
+    /// `CASS_MEMORY_AB_MESSAGES` mean messages of
+    /// `CASS_MEMORY_AB_MESSAGE_BYTES` mean bytes), then re-runs this test
+    /// binary once per arm and round (alternating order, one unrecorded
+    /// warm-up round), each child doing one production
+    /// `rebuild_tantivy_from_db` with its RSS, RssAnon, RssFile and glibc
+    /// heap sampled per phase. Every child must produce the same witness
+    /// (equivalence evidence, document counts, complete answers to rare-term
+    /// queries).
+    #[test]
+    #[ignore = "rebuild memory A/B; run explicitly with --ignored --nocapture"]
+    #[serial]
+    fn rebuild_memory_benchmark_arms() {
+        if let Ok(arm) = dotenvy::var("CASS_MEMORY_AB_CHILD_ARM") {
+            memory_ab_child(&arm);
+            return;
+        }
+        let size = |key: &str, default: usize| {
+            dotenvy::var(key)
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(default)
+        };
+        let conversations = size("CASS_MEMORY_AB_CONVERSATIONS", 2048);
+        let mean_messages = size("CASS_MEMORY_AB_MESSAGES", 256);
+        let mean_bytes = size("CASS_MEMORY_AB_MESSAGE_BYTES", 1024).max(8);
+        let rounds = size("CASS_MEMORY_AB_ROUNDS", 3);
+        let arms: Vec<String> = dotenvy::var("CASS_MEMORY_AB_ARMS")
+            .unwrap_or_else(|_| "incumbent,candidate,null".to_string())
+            .split(',')
+            .map(str::to_string)
+            .collect();
+        let base = dotenvy::var("CASS_MEMORY_AB_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let archive = TempDir::new_in(&base).unwrap();
+        let db_path = archive.path().join("agent_search.db");
+        let build_started = Instant::now();
+        let messages = memory_ab_build_archive(&db_path, conversations, mean_messages, mean_bytes);
+        eprintln!(
+            "MEMORY_AB_SHAPE {}",
+            serde_json::json!({
+                "conversations": conversations,
+                "messages": messages,
+                "mean_message_bytes": mean_bytes,
+                "db_bytes": fs::metadata(&db_path).map(|meta| meta.len()).unwrap_or(0),
+                "build_ms": build_started.elapsed().as_millis() as u64,
+                "rounds": rounds,
+                "arms": arms,
+                "available_parallelism":
+                    std::thread::available_parallelism().map_or(1, usize::from),
+                "mem_total": fs::read_to_string("/proc/meminfo")
+                    .ok()
+                    .and_then(|info| info.lines().next().map(str::to_string)),
+            })
+        );
+
+        let exe = std::env::current_exe().unwrap();
+        let mut runs: Vec<serde_json::Value> = Vec::new();
+        let mut witnesses: Vec<serde_json::Value> = Vec::new();
+        for round in 0..=rounds {
+            let order: Vec<&String> = if round % 2 == 0 {
+                arms.iter().collect()
+            } else {
+                arms.iter().rev().collect()
+            };
+            for arm in order {
+                let output = std::process::Command::new(&exe)
+                    .args([
+                        "indexer::tests::rebuild_memory_benchmark_arms",
+                        "--exact",
+                        "--ignored",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env("CASS_MEMORY_AB_CHILD_ARM", arm)
+                    .env("CASS_MEMORY_AB_DB", &db_path)
+                    .env("CASS_MEMORY_AB_DIR", &base)
+                    .env("CASS_MEMORY_AB_CONVERSATIONS", conversations.to_string())
+                    .env("CASS_MEMORY_AB_ROUND", round.to_string())
+                    .output()
+                    .unwrap();
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    output.status.success(),
+                    "memory A/B child {arm} round {round} failed: {}",
+                    stderr.lines().rev().take(40).collect::<Vec<_>>().join("\n")
+                );
+                for line in stderr.lines() {
+                    let malloc_stats_line = dotenvy::var("CASS_MEMORY_AB_MALLOC_STATS").is_ok()
+                        && (line.starts_with("Arena")
+                            || line.contains("system bytes")
+                            || line.contains("in use bytes"));
+                    if line.starts_with("MEMORY_AB") || malloc_stats_line {
+                        eprintln!("{line}");
+                    }
+                    if let Some(json) = line.strip_prefix("MEMORY_AB_RUN ") {
+                        if round > 0 {
+                            runs.push(serde_json::from_str(json).unwrap());
+                        }
+                    } else if let Some(json) = line.strip_prefix("MEMORY_AB_WITNESS ") {
+                        witnesses.push(serde_json::from_str(json).unwrap());
+                    }
+                }
+            }
+        }
+
+        let percentile = |mut samples: Vec<f64>, q: f64| {
+            if samples.is_empty() {
+                return f64::NAN;
+            }
+            samples.sort_by(f64::total_cmp);
+            samples[((samples.len() - 1) as f64 * q).round() as usize]
+        };
+        let metric = |run: &serde_json::Value, path: &[&str]| {
+            path.iter()
+                .try_fold(run, |value, key| value.get(*key))
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(f64::NAN)
+        };
+        let metrics: [(&str, &[&str]); 12] = [
+            ("wall_ms", &["wall_ms"]),
+            ("hwm_mib", &["hwm_mib"]),
+            ("ingest_rss_max", &["phases", "ingest", "rss_max"]),
+            ("ingest_anon_max", &["phases", "ingest", "anon_max"]),
+            ("fold_rss_max", &["phases", "fold", "rss_max"]),
+            ("fold_anon_max", &["phases", "fold", "anon_max"]),
+            ("fold_rss_mean", &["phases", "fold", "rss_mean"]),
+            ("fold_anon_mean", &["phases", "fold", "anon_mean"]),
+            ("fold_ms", &["phases", "fold", "ms"]),
+            ("publish_rss_max", &["phases", "publish", "rss_max"]),
+            ("publish_rss_mean", &["phases", "publish", "rss_mean"]),
+            ("publish_ms", &["phases", "publish", "ms"]),
+        ];
+        for arm in &arms {
+            let mine: Vec<&serde_json::Value> =
+                runs.iter().filter(|run| run["arm"] == **arm).collect();
+            let mut summary = serde_json::Map::new();
+            summary.insert("arm".into(), serde_json::json!(arm));
+            for (name, path) in metrics {
+                let values: Vec<f64> = mine.iter().map(|run| metric(run, path)).collect();
+                let ratios: Vec<f64> = mine
+                    .iter()
+                    .filter_map(|run| {
+                        runs.iter()
+                            .find(|other| {
+                                other["arm"] == "incumbent" && other["round"] == run["round"]
+                            })
+                            .map(|other| metric(run, path) / metric(other, path))
+                    })
+                    .collect();
+                summary.insert(
+                    name.into(),
+                    serde_json::json!({
+                        "p50": percentile(values.clone(), 0.5),
+                        "min": percentile(values.clone(), 0.0),
+                        "max": percentile(values, 1.0),
+                        "ratio_p50": percentile(ratios.clone(), 0.5),
+                        "ratio_min": percentile(ratios.clone(), 0.0),
+                        "ratio_max": percentile(ratios, 1.0),
+                    }),
+                );
+            }
+            eprintln!("MEMORY_AB_SUMMARY {}", serde_json::Value::Object(summary));
+        }
+        let distinct = witnesses
+            .iter()
+            .map(|witness| {
+                format!(
+                    "{} {} {} {}",
+                    witness["evidence"],
+                    witness["indexed_docs"],
+                    witness["docs"],
+                    witness["queries"]
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            distinct.len(),
+            1,
+            "arms produced different generations: {distinct:#?}"
+        );
+        assert_eq!(witnesses.len(), (rounds + 1) * arms.len());
+    }
+
+    /// The trim the rebuild runs before its fold really hands freed, still
+    /// resident heap back to the OS. 256 MiB of small blocks are written,
+    /// then fifteen of every sixteen are freed: each freed run lies between
+    /// two live blocks, so `free` cannot shrink the arena and the runs stay
+    /// resident, the way a finished ingest phase leaves its arenas, until the
+    /// trim gives their pages back.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    #[serial]
+    fn return_free_heap_pages_to_os_releases_freed_resident_heap() {
+        const BLOCK_BYTES: usize = 4096;
+        const BLOCKS: usize = 64 * 1024;
+        // RssAnon is process-wide and `#[serial]` does not hold back the
+        // non-serial tests, which may allocate while the trim runs. A trim
+        // that works releases the freed blocks on almost every attempt; one
+        // that releases nothing fails all of them.
+        let mut attempts = Vec::new();
+        for _ in 0..3 {
+            // Below the mmap threshold, so they come from this thread's arena;
+            // nonzero, so every page is written and resident.
+            let mut blocks: Vec<Vec<u8>> = (0..BLOCKS)
+                .map(|block| vec![(block % 251) as u8 + 1; BLOCK_BYTES])
+                .collect();
+            let resident = consumer_ab_status_mib("RssAnon:");
+            let mut index = 0_usize;
+            blocks.retain(|_| {
+                index += 1;
+                index.is_multiple_of(16)
+            });
+            let freed = consumer_ab_status_mib("RssAnon:");
+            let released = return_free_heap_pages_to_os();
+            let trimmed = consumer_ab_status_mib("RssAnon:");
+            assert_eq!(blocks.len(), BLOCKS / 16);
+            if released && freed - trimmed >= 128.0 {
+                return;
+            }
+            attempts.push((released, resident, freed, trimmed));
+        }
+        panic!(
+            "trim never released 128 MiB of the 240 MiB freed between live blocks; \
+             (released, RssAnon MiB written, after free, after trim) per attempt: \
+             {attempts:?}"
+        );
+    }
+
+    /// A full rebuild returns its free heap to the OS exactly once, between
+    /// its final ingest commit and its fold (the generation still has every
+    /// ingest segment), and not at all when it skips the fold.
+    #[test]
+    #[serial]
+    fn full_rebuild_releases_free_heap_once_right_before_its_fold() {
+        let _env = forced_resume_env(4, 32 * 1024 * 1024);
+        let fixture = forced_resume_fixture(24, 3, 96);
+        let take_releases = || LEXICAL_FOLD_HEAP_RELEASES_FOR_TEST.with(|releases| releases.take());
+        take_releases();
+
+        let folded_dir = fixture.root.join("folded");
+        let folded = forced_resume_rebuild(&fixture, &folded_dir, None)
+            .0
+            .unwrap();
+        let releases = take_releases();
+        let published =
+            crate::search::tantivy::searchable_index_summary(&index_dir(&folded_dir).unwrap())
+                .unwrap()
+                .unwrap();
+        assert_eq!(releases.len(), 1, "one release per fold, got {releases:?}");
+        assert!(
+            releases[0] > published.segments,
+            "the release must precede the fold: {} segments then, {} published",
+            releases[0],
+            published.segments
+        );
+
+        let _skip = set_env("CASS_TEST_SKIP_POST_RUN_LEXICAL_MAINTENANCE", "1");
+        let unfolded_dir = fixture.root.join("unfolded");
+        let unfolded = forced_resume_rebuild(&fixture, &unfolded_dir, None)
+            .0
+            .unwrap();
+        assert_eq!(take_releases(), Vec::<usize>::new());
+        assert_eq!(unfolded.indexed_docs, folded.indexed_docs);
     }
 
     #[test]
@@ -69720,6 +72822,215 @@ c.close()
     }
 
     #[test]
+    fn classify_openclaw_database_sidecars_preserves_root_and_rejects_neighbors() {
+        let tmp = TempDir::new().unwrap();
+        let database = tmp.path().join("openclaw-agent.sqlite");
+        fs::write(&database, b"SQLite format 3\0").unwrap();
+        let root = ScanRoot::remote(
+            database.clone(),
+            Origin::remote_with_host("openclaw-source", "openclaw-host"),
+            Some(Platform::Linux),
+        );
+        let roots = vec![(ConnectorKind::OpenClaw, root.clone())];
+        for event in std::iter::once(database.clone()).chain(database_sidecar_paths(&database)) {
+            fs::write(&event, b"provider event").unwrap();
+            for explicit in [false, true] {
+                let classified = classify_paths(vec![event.clone()], &roots, explicit);
+                assert_eq!(classified.len(), 1, "{}", event.display());
+                assert_eq!(classified[0].0, ConnectorKind::OpenClaw);
+                assert_eq!(
+                    classified[0].1.path,
+                    if explicit {
+                        dunce::canonicalize(&database).unwrap()
+                    } else {
+                        database.clone()
+                    }
+                );
+                assert_eq!(classified[0].1.origin, root.origin);
+                assert_eq!(classified[0].1.platform, root.platform);
+            }
+        }
+        for name in [
+            "other.sqlite-wal",
+            "openclaw-agent.sqlite-wal-extra",
+            "openclaw-agent.sqlite2-wal",
+            "session.jsonl",
+        ] {
+            let neighbor = tmp.path().join(name);
+            fs::write(&neighbor, b"unrelated event").unwrap();
+            for explicit in [false, true] {
+                assert!(classify_paths(vec![neighbor.clone()], &roots, explicit).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn classify_openclaw_sidecars_under_broad_roots_select_one_database_per_origin() {
+        let tmp = TempDir::new().unwrap();
+        let agents = tmp.path().join("agents");
+        let database = agents.join("selected/agent/openclaw-agent.sqlite");
+        let sibling = agents.join("sibling/agent/openclaw-agent.sqlite");
+        for path in [&database, &sibling] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"SQLite format 3\0").unwrap();
+        }
+        let [wal, shm] = database_sidecar_paths(&database);
+        for path in [&wal, &shm] {
+            fs::write(path, b"provider sidecar").unwrap();
+        }
+        let roots: Vec<_> = ["source-a", "source-b"]
+            .into_iter()
+            .map(|source| {
+                (
+                    ConnectorKind::OpenClaw,
+                    ScanRoot::remote(
+                        agents.clone(),
+                        Origin::remote(source),
+                        Some(Platform::Macos),
+                    ),
+                )
+            })
+            .collect();
+
+        for selected in [
+            vec![wal.clone()],
+            vec![shm.clone()],
+            vec![database.clone(), wal.clone(), shm],
+        ] {
+            let classified = classify_paths(selected, &roots, true);
+            assert_eq!(classified.len(), 2, "deduplicate within each source origin");
+            for (_, root, min_ts, max_ts) in &classified {
+                assert_eq!(root.path, dunce::canonicalize(&database).unwrap());
+                assert_eq!(root.platform, Some(Platform::Macos));
+                assert!(min_ts.is_some() && max_ts.is_some());
+            }
+            let sources: BTreeSet<_> = classified
+                .iter()
+                .map(|(_, root, _, _)| root.origin.source_id.as_str())
+                .collect();
+            assert_eq!(sources, BTreeSet::from(["source-a", "source-b"]));
+        }
+
+        let live = classify_paths(vec![wal.clone()], &roots, false);
+        assert_eq!(live.len(), 2);
+        for (_, root, _, _) in live {
+            assert_eq!(
+                root.path, agents,
+                "live events retain their configured root"
+            );
+        }
+        let other = classify_paths(
+            vec![wal.clone()],
+            &[(ConnectorKind::Claude, roots[0].1.clone())],
+            true,
+        );
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].1.path, dunce::canonicalize(&wal).unwrap());
+        assert!(classify_paths(vec![wal], &[], true).is_empty());
+    }
+
+    #[test]
+    fn classify_absent_openclaw_sidecars_only_recover_the_claimed_owner() {
+        let tmp = TempDir::new().unwrap();
+        let agents = tmp.path().join("agents");
+        let database = agents.join("selected/agent/openclaw-agent.sqlite");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        fs::write(&database, b"SQLite format 3\0").unwrap();
+        let owner = dunce::canonicalize(&database).unwrap();
+        for root_path in [&agents, &database] {
+            let root = ScanRoot::remote(
+                root_path.clone(),
+                Origin::remote("selected-source"),
+                Some(Platform::Linux),
+            );
+            let roots = vec![
+                (ConnectorKind::OpenClaw, root.clone()),
+                (ConnectorKind::Claude, ScanRoot::local(agents.clone())),
+            ];
+            for sidecar in database_sidecar_paths(&database) {
+                assert!(!sidecar.exists());
+                let classified = classify_paths(vec![sidecar.clone()], &roots, true);
+                assert_eq!(classified.len(), 1);
+                assert_eq!(classified[0].0, ConnectorKind::OpenClaw);
+                assert_eq!(classified[0].1.path, owner);
+                assert_eq!(classified[0].1.origin, root.origin);
+                assert_eq!(classified[0].1.platform, root.platform);
+                assert!(classify_paths(vec![sidecar.clone()], &roots[1..], true).is_empty());
+                assert!(classify_paths(vec![sidecar], &[], true).is_empty());
+            }
+            assert!(
+                classify_paths(vec![agents.join("future-session.jsonl")], &roots, true).is_empty()
+            );
+        }
+
+        // An absent path with another provider's hint cannot borrow the
+        // database's metadata to activate that provider's fallback claim.
+        let hinted = tmp.path().join(".codex/sessions/openclaw-agent.sqlite");
+        fs::create_dir_all(hinted.parent().unwrap()).unwrap();
+        fs::write(&hinted, b"SQLite format 3\0").unwrap();
+        let roots = vec![(
+            ConnectorKind::Codex,
+            ScanRoot::local(tmp.path().to_path_buf()),
+        )];
+        for sidecar in database_sidecar_paths(&hinted) {
+            assert!(classify_paths(vec![sidecar.clone()], &roots, true).is_empty());
+            assert!(classify_paths(vec![sidecar], &[], true).is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_openclaw_sidecar_aliases_coalesce_before_and_after_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let agents = tmp.path().join("agents");
+        let database = agents.join("selected/agent/openclaw-agent.sqlite");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        fs::write(&database, b"SQLite format 3\0").unwrap();
+        let alias = tmp.path().join("agents-alias");
+        std::os::unix::fs::symlink(&agents, &alias).unwrap();
+        let aliased_database = alias.join("selected/agent/openclaw-agent.sqlite");
+        let [wal, shm] = database_sidecar_paths(&database);
+        for path in [&wal, &shm] {
+            fs::write(path, b"provider sidecar").unwrap();
+        }
+        let selected = [wal.clone(), shm.clone()]
+            .into_iter()
+            .chain(database_sidecar_paths(&aliased_database))
+            .chain([database.clone(), aliased_database.clone()])
+            .collect::<Vec<_>>();
+        for checkpointed in [false, true] {
+            if checkpointed {
+                // Model the provider's completed checkpoint, not a live race.
+                fs::remove_file(&wal).unwrap();
+                fs::remove_file(&shm).unwrap();
+            }
+            for root_path in [&alias, &aliased_database] {
+                let root = ScanRoot::remote(
+                    root_path.clone(),
+                    Origin::remote_with_host("alias-source", "alias-host"),
+                    Some(Platform::Linux),
+                );
+                let roots = [(ConnectorKind::OpenClaw, root.clone())];
+                for paths in selected
+                    .iter()
+                    .cloned()
+                    .map(|path| vec![path])
+                    .chain(std::iter::once(selected.clone()))
+                {
+                    let classified = classify_paths(paths, &roots, true);
+                    assert_eq!(classified.len(), 1, "checkpointed={checkpointed}");
+                    assert_eq!(
+                        classified[0].1.path,
+                        dunce::canonicalize(&database).unwrap()
+                    );
+                    assert_eq!(classified[0].1.origin, root.origin);
+                    assert_eq!(classified[0].1.platform, root.platform);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn classify_paths_uses_latest_mtime_per_connector() {
         let tmp = TempDir::new().unwrap();
         let codex = tmp.path().join(".codex/sessions/rollout-1.jsonl");
@@ -72954,7 +76265,7 @@ c.close()
             .unwrap();
         let t_index = Mutex::new(None);
         let state = Mutex::new(HashMap::new());
-        let expected_id = frankensearch::quill::cass::cass_document_identity(
+        let expected_id = frankensearch::quill::cass::legacy_v9::cass_document_identity(
             "local",
             frankensearch::quill::cass::CassConversationKey {
                 source_path: &amp_file.to_string_lossy(),
@@ -74111,7 +77422,7 @@ c.close()
         assert_eq!(canonical_before[0], amp_rows[0]);
         assert_eq!(canonical_before[1].3, "claudeconnectorneedle");
         let expected_id = |source: &Path, row: &(i64, i64, i64, String)| {
-            frankensearch::quill::cass::cass_document_identity(
+            frankensearch::quill::cass::legacy_v9::cass_document_identity(
                 "local",
                 frankensearch::quill::cass::CassConversationKey {
                     source_path: &source.to_string_lossy(),
@@ -74154,13 +77465,8 @@ c.close()
         let mut file_selection = opts.clone();
         file_selection.watch_once_paths = Some(vec![amp_file.clone()]);
         assert!(
-            !should_skip_unchanged_explicit_watch_once_paths(
-                &file_selection,
-                &storage.lock().unwrap(),
-                &roots,
-            )
-            .unwrap(),
-            "the outer unchanged-file fast path must preserve Amp's debt"
+            !should_skip_unclaimed_explicit_watch_once_paths(&file_selection, &roots),
+            "the outer watch-once fast path must preserve Amp's debt"
         );
         for _ in 0..2 {
             // Both packets are unchanged. Only Amp's durable debt permits
@@ -75230,11 +78536,10 @@ c.close()
         }
     }
 
-    /// GH #502: a SQLite source's committed WAL (or rollback journal) change is
-    /// a source change even when the main database file is untouched, while a
-    /// reader-rewritten -shm is not.
+    /// GH #543: neither source nor sidecar mtimes relative to an archive-wide
+    /// watermark prove that this database's committed data has been read.
     #[test]
-    fn explicit_watch_once_freshness_counts_committed_sqlite_sidecars() {
+    fn explicit_watch_once_admits_database_regardless_of_archive_watermark() {
         let tmp = TempDir::new().unwrap();
         let storage = FrankenStorage::open(&tmp.path().join("cass.db")).unwrap();
         let agent_id = storage
@@ -75264,7 +78569,9 @@ c.close()
             .unwrap();
         let indexed_at = FrankenStorage::now_millis();
         storage.set_last_indexed_at(indexed_at).unwrap();
-        let root = ScanRoot::local(source.clone());
+        let roots = [(ConnectorKind::OpenClaw, ScanRoot::local(source.clone()))];
+        let mut opts = watch_lexical_options(tmp.path());
+        opts.watch_once_paths = Some(vec![source.clone()]);
         let set_mtime = |path: &Path, epoch_ms: i64| {
             std::fs::OpenOptions::new()
                 .write(true)
@@ -75276,42 +78583,52 @@ c.close()
                 .unwrap();
         };
         set_mtime(&source, indexed_at - 60_000);
-        let unchanged = || {
-            explicit_watch_once_root_unchanged_after_last_index(
-                &storage,
-                ConnectorKind::OpenClaw,
-                &root,
-            )
-            .unwrap()
-        };
+        let should_skip = || should_skip_unclaimed_explicit_watch_once_paths(&opts, &roots);
 
-        // Negative control: nothing newer than the last index keeps the fast path.
-        assert!(unchanged(), "an unchanged database must skip");
+        assert!(
+            !should_skip(),
+            "an indexed database still needs source-specific read evidence"
+        );
         let shm = database_path_with_suffix(&source, "-shm");
         std::fs::write(&shm, b"reader index").unwrap();
         set_mtime(&shm, indexed_at + 60_000);
-        assert!(
-            unchanged(),
-            "a reader-rewritten -shm is not a source change"
-        );
+        assert!(!should_skip(), "reader activity must not bypass ingestion");
         let wal = database_path_with_suffix(&source, "-wal");
-        std::fs::write(&wal, b"old frames").unwrap();
+        std::fs::write(&wal, b"committed frames").unwrap();
         set_mtime(&wal, indexed_at - 30_000);
-        assert!(unchanged(), "a WAL already covered by the last index skips");
+        assert!(
+            !should_skip(),
+            "a sibling's newer archive timestamp cannot certify this WAL"
+        );
 
-        // The bug: a WAL-only commit after the last index, main file untouched.
         set_mtime(&wal, indexed_at + 1);
-        assert!(!unchanged(), "a committed WAL append must be re-read");
+        assert!(!should_skip(), "a committed WAL append must be re-read");
         set_mtime(&wal, indexed_at - 30_000);
         let journal = database_path_with_suffix(&source, "-journal");
         std::fs::write(&journal, b"rollback journal").unwrap();
         set_mtime(&journal, indexed_at + 1);
-        assert!(!unchanged(), "a newer rollback journal must be re-read");
+        assert!(!should_skip(), "a newer rollback journal must be re-read");
+    }
+
+    #[test]
+    fn explicit_watch_once_only_skips_unclaimed_paths() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("unclaimed.txt");
+        std::fs::write(&source, "not an agent transcript").unwrap();
+        let mut opts = watch_lexical_options(tmp.path());
+        opts.watch_once_paths = Some(vec![source]);
+        assert!(should_skip_unclaimed_explicit_watch_once_paths(&opts, &[]));
+
+        opts.full = true;
+        assert!(!should_skip_unclaimed_explicit_watch_once_paths(&opts, &[]));
+        opts.full = false;
+        opts.semantic = true;
+        assert!(!should_skip_unclaimed_explicit_watch_once_paths(&opts, &[]));
     }
 
     #[test]
     #[serial]
-    fn reindex_paths_watch_once_skips_unchanged_indexed_file() {
+    fn reindex_paths_watch_once_reconciles_writes_before_archive_watermark() {
         let tmp = TempDir::new().unwrap();
         let xdg = tmp.path().join("xdg_watch_once_unchanged");
         std::fs::create_dir_all(&xdg).unwrap();
@@ -75325,7 +78642,7 @@ c.close()
         let amp_file = amp_dir.join("thread-unchanged.json");
         std::fs::write(
             &amp_file,
-            r#"{"id":"unchanged","messages":[{"role":"user","text":"p","createdAt":1700000000100}]}"#,
+            r#"{"id":"unchanged","messages":[{"role":"user","text":"originalwatchneedle","createdAt":1700000000100}]}"#,
         )
         .unwrap();
 
@@ -75363,92 +78680,42 @@ c.close()
         .unwrap();
         assert_eq!(first, 1);
 
-        storage.lock().unwrap().set_last_indexed_at(0).unwrap();
+        let canonical_before = watch_lexical_canonical_rows(&storage.lock().unwrap());
+        assert_eq!(canonical_before.len(), 1);
+        let lexical_before = watch_lexical_search_ids(&index_path, "originalwatchneedle");
+        assert_eq!(lexical_before.len(), 1);
 
-        let before_last_indexed_marker = {
-            let guard = storage.lock().unwrap();
-            should_skip_unchanged_explicit_watch_once_paths(
-                &opts,
-                &guard,
-                &[(ConnectorKind::Amp, ScanRoot::local(amp_dir.clone()))],
-            )
-            .unwrap()
-        };
-        assert!(
-            !before_last_indexed_marker,
-            "indexed files without a settled last_indexed_at marker must still flow through watch-once ingest"
-        );
-
+        // The archive timestamp may be a later sibling's completion or the
+        // end of a batch whose source snapshot was taken before a new write.
+        let batch_finished_at = FrankenStorage::now_millis().saturating_add(10_000);
         storage
             .lock()
             .unwrap()
-            .set_last_indexed_at(FrankenStorage::now_millis().saturating_add(10_000))
+            .set_last_indexed_at(batch_finished_at)
             .unwrap();
-
-        let preopen_skip = {
-            let guard = storage.lock().unwrap();
-            should_skip_unchanged_explicit_watch_once_paths(
-                &opts,
-                &guard,
-                &[(ConnectorKind::Amp, ScanRoot::local(amp_dir.clone()))],
-            )
-            .unwrap()
-        };
+        let roots = [(ConnectorKind::Amp, ScanRoot::local(amp_dir.clone()))];
         assert!(
-            preopen_skip,
-            "unchanged explicit watch-once files can skip before Tantivy is opened"
+            !should_skip_unclaimed_explicit_watch_once_paths(&opts, &roots),
+            "claimed paths cannot bypass ingestion on an archive-wide timestamp"
         );
-
-        let startup_skip = {
+        for (lexical_rebuild, analytics_rebuild) in [(false, false), (true, false), (false, true)] {
             let guard = storage.lock().unwrap();
-            can_skip_unchanged_explicit_watch_once_index_run(
-                &opts,
-                &guard,
-                &index_path,
-                false,
-                false,
-            )
-            .unwrap()
-        };
-        assert!(
-            startup_skip,
-            "unchanged explicit watch-once files with current lexical assets can skip startup maintenance"
-        );
-        let migration_skip = {
-            let guard = storage.lock().unwrap();
-            can_skip_unchanged_explicit_watch_once_index_run(
-                &opts,
-                &guard,
-                &index_path,
-                true,
-                false,
-            )
-            .unwrap()
-        };
-        assert!(
-            !migration_skip,
-            "a pending canonical identity migration must publish fresh lexical assets"
-        );
-        let analytics_migration_skip = {
-            let guard = storage.lock().unwrap();
-            can_skip_unchanged_explicit_watch_once_index_run(
-                &opts,
-                &guard,
-                &index_path,
-                false,
-                true,
-            )
-            .unwrap()
-        };
-        assert!(
-            !analytics_migration_skip,
-            "an analytics-only legacy OMP migration must resume after lexical publication"
-        );
+            assert!(
+                !can_skip_unclaimed_explicit_watch_once_index_run(
+                    &opts,
+                    &guard,
+                    &index_path,
+                    lexical_rebuild,
+                    analytics_rebuild,
+                ),
+                "claimed paths and pending migrations must reach the indexing pipeline"
+            );
+        }
 
         let second = reindex_paths(
             &opts,
-            vec![amp_file],
-            &[(ConnectorKind::Amp, ScanRoot::local(amp_dir))],
+            vec![amp_file.clone()],
+            &roots,
             &state,
             &storage,
             &t_index,
@@ -75456,9 +78723,64 @@ c.close()
             false,
         )
         .unwrap();
+        assert_eq!(second, 1, "the unchanged source is reconciled");
         assert_eq!(
-            second, 0,
-            "unchanged explicit watch-once files already indexed before last_indexed_at should skip storage ingest"
+            watch_lexical_canonical_rows(&storage.lock().unwrap()),
+            canonical_before,
+            "re-reading must preserve canonical identities and avoid duplicate messages"
+        );
+        assert_eq!(
+            watch_lexical_search_ids(&index_path, "originalwatchneedle"),
+            lexical_before,
+            "re-reading must preserve lexical identities and avoid duplicate hits"
+        );
+
+        std::fs::write(
+            &amp_file,
+            r#"{"id":"unchanged","messages":[{"role":"user","text":"originalwatchneedle","createdAt":1700000000100},{"role":"assistant","text":"windowappendneedle","createdAt":1700000000200}]}"#,
+        )
+        .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&amp_file)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(
+                UNIX_EPOCH + Duration::from_millis(u64::try_from(batch_finished_at - 1).unwrap()),
+            ))
+            .unwrap();
+        storage
+            .lock()
+            .unwrap()
+            .set_last_indexed_at(batch_finished_at)
+            .unwrap();
+        assert!(watch_lexical_search_ids(&index_path, "windowappendneedle").is_empty());
+        assert!(
+            !should_skip_unclaimed_explicit_watch_once_paths(&opts, &roots),
+            "a write inside the previous batch's window must still be ingested"
+        );
+        assert_eq!(
+            reindex_paths(
+                &opts,
+                vec![amp_file],
+                &roots,
+                &state,
+                &storage,
+                &t_index,
+                &index_path,
+                false,
+            )
+            .unwrap(),
+            1
+        );
+        let canonical_after = watch_lexical_canonical_rows(&storage.lock().unwrap());
+        assert_eq!(canonical_after.len(), 2);
+        assert_eq!(canonical_after[0], canonical_before[0]);
+        assert_eq!(canonical_after[1].0, canonical_before[0].0);
+        assert_eq!(canonical_after[1].2, 1);
+        assert_eq!(canonical_after[1].3, "windowappendneedle");
+        assert_eq!(
+            watch_lexical_search_ids(&index_path, "windowappendneedle").len(),
+            1
         );
 
         if let Some(prev) = prev {
@@ -76020,9 +79342,14 @@ c.close()
             )
             .with_mirrored_source_path(path)
         };
-        let cases: [(&str, &[&str]); 13] = [
+        let cases: [(&str, &[&str]); 18] = [
             ("~/.claude/projects", &["claude"]),
             ("~/.codex/sessions", &["codex"]),
+            ("~/.openclaw", &["openclaw"]),
+            ("~/.openclaw/agents", &["openclaw"]),
+            ("~/.openclaw/agents/alice/sessions", &["openclaw"]),
+            ("/home/u/.openclaw/agents/alice/agent", &["openclaw"]),
+            (r"C:\Users\u\.openclaw\agents", &["openclaw"]),
             ("~/.pi/agent/sessions", &["pi_agent", "pi_durable"]),
             ("~/.prime/agent/sessions", &["prime_agent"]),
             ("~/.omp/agent/sessions", &["omp"]),
@@ -76048,6 +79375,7 @@ c.close()
                 "factory",
                 "gemini",
                 "cline",
+                "openclaw",
             ] {
                 assert_eq!(
                     mirrored_root_may_hold(connector, &root),
@@ -76073,6 +79401,8 @@ c.close()
         // root keep every connector.
         for root in [
             remote("/backups/claude-sessions"),
+            remote("~/.openclaw-backup/agents"),
+            remote("~/agents"),
             remote("~"),
             ScanRoot::remote(
                 PathBuf::from("/cass/remotes/laptop/mirror"),

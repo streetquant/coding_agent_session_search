@@ -160,21 +160,20 @@ bytemuck = "1.25.0"
 # not run the all-MiniLM LayerNorm export, and its prebuilt AVX/AVX2 vendor
 # binaries crashed pre-AVX2 CPUs at static init (#256/#307). No ONNX means no
 # AVX-static-init hazard and no separate `-baseline` artifact is needed.
-# 0.7.1 (quill 0.4.0) keeps the CASS schema hash (v9-quill, no rebuild) and
-# carries the standard CASS Boolean grammar, the union seek_danger fix and the
-# GH #499 live-doc numeric scoring that the 0.3.4 hotfix published, plus
-# concurrent segment verification on open (GH #501), snippets only for
-# returned hits, and a read-only refresh that skips the reopen when nothing
-# was published.
-frankensearch = { version = "=0.7.1", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
+# GH #548 requires the corrected positional-prefix executor and explicit
+# legacy_v9 identity adapter, which are not in the published Quill 0.4.1.
+# Pin the complete existing family to one reviewed revision; CASS explicitly
+# retains v9 paths, sentinels and identities rather than adopting v10 defaults.
+frankensearch = { version = "=0.7.1", git = "https://github.com/streetquant/frankensearch", rev = "e463dcadcbf2abd2ba9651bad3e2f7ad1bfa6965", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
 # Native OpenClaw transcripts and legacy VS Code Copilot sessions require SQLite.
 # Keep both readers unconditional, including --no-default-features builds.
 # codex-zstd reads Codex rollouts compressed to .jsonl.zst (GH #513).
 # pi-durable reads Pi durable-harness SQLite stores (FAD #28); pi-sqlite reads
 # pi_agent_rust SQLite sessions.
 # GH#520 needs remote-mirror source identity, added after crates.io 0.3.10.
-# Pin the exact fix until it is included in a published registry release.
-franken-agent-detection = { version = "=0.3.10", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "6b337ba434b72c65c6c5a748b7ec47885f840ac0", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes", "devin", "shelley", "grok-bot", "openclaw-sqlite", "copilot-vscdb", "codebuff", "codex-zstd", "pi-durable", "pi-sqlite"] }
+# Keep the narrow OpenClaw file-scope, historical-session, mirror discovery,
+# and physical-store migration fixes until a registry release includes them.
+franken-agent-detection = { version = "=0.3.10", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "0ea083ea4c470a6b7e7607cdeff335cb14690cdc", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes", "devin", "shelley", "grok-bot", "openclaw-sqlite", "copilot-vscdb", "codebuff", "codex-zstd", "pi-durable", "pi-sqlite"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
@@ -342,7 +341,7 @@ debug = "line-tables-only"
 strip = false
 
 # The dependency graph is pinned to the asupersync 0.5.x line (0.5.0). Keep
-# the frankensqlite, frankensearch, and franken-agent-detection registry pins
+# the frankensqlite, frankensearch, and franken-agent-detection source pins
 # aligned so Cargo.lock does not reintroduce an older parallel runtime stack.
 #
 # If you need to build against a local checkout of asupersync (sibling
@@ -443,20 +442,3 @@ path = "tests/upgrade/mod.rs"
 [[test]]
 name = "recovery"
 path = "tests/recovery/mod.rs"
-
-# Temporary owner-migration patch for RUSTSEC-2026-0253 (lru 0.16.4).
-# tantivy 0.26.2 (the crates.io frankensearch 0.7.1 graph) requires lru
-# ^0.16.3, which cannot resolve the advisory's patched lru >= 0.18.2. The
-# owning Frankensearch migration to tantivy 0.27 lives on the public
-# `tantivy-0.27` branch (frankensearch-lexical 0.4.1) and has not been
-# published to crates.io. Its lexical source is published 0.4.0 plus one
-# added test and the tantivy requirement, so patch only that crate. The
-# source-scoped core pin links the branch crate to the SAME reviewed
-# registry frankensearch-core 0.4.0 the facade/index/quill pins use, instead
-# of dragging the branch workspace's unreleased core into the graph. Remove
-# both patches when frankensearch-lexical 0.4.1+ ships on crates.io.
-[patch.crates-io]
-frankensearch-lexical = { git = "https://github.com/streetquant/frankensearch", rev = "ed0d76e7b48e0bb215b8e0874742ee4573754ee1" }
-
-[patch."https://github.com/streetquant/frankensearch"]
-frankensearch-core = { version = "=0.4.0" }

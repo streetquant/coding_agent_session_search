@@ -193,10 +193,12 @@ const CONTRACTS: &[DependencyContract] = &[
         // entries for the Claude, Pi and Codex readers (cass 0f1k0).
         // 0.3.10 exposes SQLite connector runtime shutdown before Windows
         // process teardown (cass#519) and preserves the full read-error chain.
-        // GH#520 needs the post-0.3.10 mirror-root metadata API. Keep the
-        // source contract exact until a registry release carries this fix.
+        // GH#520 needs the post-0.3.10 mirror-root metadata API. Narrow
+        // OpenClaw backports preserve explicit-file scope (#350/#543),
+        // historical sessions, opaque mirrors, and physical-store deduplication.
+        // Keep the source contract exact until a registry release carries them.
         expected_git: "https://github.com/Dicklesworthstone/franken_agent_detection",
-        expected_rev: "6b337ba434b72c65c6c5a748b7ec47885f840ac0",
+        expected_rev: "0ea083ea4c470a6b7e7607cdeff335cb14690cdc",
         expected_version: "0.3.10",
         // Match the always-on SQLite transcript readers in Cargo.toml. Their
         // features are required even for --no-default-features CASS builds.
@@ -255,13 +257,14 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensearch",
         crate_package_name: "frankensearch",
         manifest_package_field: None,
-        // Registry release on asupersync 0.5. Preserve explicit native
-        // MiniLM, Quill and cass-compat lexical behavior; a manifest pin
-        // alone is not runtime acceptance.
-        // Empty `expected_git` signals `validate_manifest_dependency_spec`
-        // to skip git/rev checks.
-        expected_git: "",
-        expected_rev: "",
+        // GH #548: the query executor and explicit legacy_v9 adapter are
+        // not yet published. The reviewed fork revision is upstream
+        // b103f2ed plus tantivy 0.27 (lru >= 0.18.2 clears
+        // RUSTSEC-2026-0253) and frankensearch-lexical 0.4.1. Preserve that
+        // single Git source, existing feature set and v9 CASS identity
+        // contract together.
+        expected_git: "https://github.com/streetquant/frankensearch",
+        expected_rev: "e463dcadcbf2abd2ba9651bad3e2f7ad1bfa6965",
         expected_version: "0.7.1",
         // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
         // embedding + reranking are now pure-Rust via frankensearch's `native`

@@ -3,6 +3,8 @@ use crossbeam_channel as mpsc;
 
 #[path = "query/coverage.rs"]
 mod coverage;
+#[path = "query/indexed_terms.rs"]
+mod indexed_terms;
 #[path = "query/retry_budget.rs"]
 mod retry_budget;
 pub use retry_budget::LEXICAL_RETRY_QUERY_FUEL_EXHAUSTED;
@@ -472,6 +474,19 @@ fn cass_bool_tokens(raw: &str) -> Vec<CassBoolToken> {
     let mut open_groups = 0_usize;
     while let Some(ch) = chars.next() {
         match ch {
+            '"' if !in_phrase && (chars.peek() == Some(&'"') || chars.peek().is_none()) => {
+                // The published lexer drops an empty phrase. Preserve that
+                // explicit operand so normalization cannot erase a required
+                // word or hide an unsearchable operand under OR/NOT.
+                if chars.peek().is_some() {
+                    chars.next();
+                }
+                flush(&mut segment, &mut tokens);
+                tokens.push(CassBoolToken::Token(
+                    FsCassQueryToken::Phrase(String::new()),
+                ));
+                at_word_start = true;
+            }
             '"' => {
                 in_phrase = !in_phrase;
                 at_word_start = true;
@@ -510,6 +525,51 @@ fn cass_bool_tokens(raw: &str) -> Vec<CassBoolToken> {
     tokens
 }
 
+/// Bound the existing recursive parser before it consumes any group. The
+/// tokens already distinguish real grouping from opaque quoted/code text.
+fn cass_bool_nesting_is_bounded(tokens: &[CassBoolToken]) -> bool {
+    const MAX_GROUP_DEPTH: usize = 128;
+    let mut depth = 0_usize;
+    for token in tokens {
+        match token {
+            CassBoolToken::Open => {
+                depth += 1;
+                if depth > MAX_GROUP_DEPTH {
+                    return false;
+                }
+            }
+            CassBoolToken::Close => depth = depth.saturating_sub(1),
+            CassBoolToken::Token(_) => {}
+        }
+    }
+    true
+}
+
+/// Every parenthesized group is a required syntactic operand. Empty groups
+/// cannot be erased from conjunctions or complemented into broad matches.
+/// Call after the depth check so the stack contains at most 128 entries.
+fn cass_bool_groups_have_operands(tokens: &[CassBoolToken]) -> bool {
+    let mut groups = Vec::new();
+    let mut operands = 0_usize;
+    for token in tokens {
+        match token {
+            CassBoolToken::Open => groups.push(operands),
+            CassBoolToken::Close => {
+                if groups.pop().is_none_or(|start| start == operands) {
+                    return false;
+                }
+            }
+            CassBoolToken::Token(FsCassQueryToken::Term(text)) if !text.trim().is_empty() => {
+                operands += 1;
+            }
+            CassBoolToken::Token(FsCassQueryToken::Phrase(_)) => operands += 1,
+            CassBoolToken::Token(_) => {}
+        }
+    }
+    // Nonempty unclosed groups retain the existing end-of-query recovery.
+    groups.into_iter().all(|start| start < operands)
+}
+
 /// An operand the lane cannot express: the whole query is declined.
 struct CassBoolUnsupported;
 
@@ -534,10 +594,14 @@ where
 {
     /// Parse `tokens`, lowering each term or phrase with `lower`: `Ok(None)`
     /// skips an operand that normalizes to nothing, `Err` declines the query.
+    /// An explicitly opened group must retain at least one operand.
     fn parse(
         tokens: &'a [CassBoolToken],
         lower: F,
     ) -> Result<Option<CassBoolExpr<T>>, CassBoolUnsupported> {
+        if !cass_bool_nesting_is_bounded(tokens) || !cass_bool_groups_have_operands(tokens) {
+            return Err(CassBoolUnsupported);
+        }
         let mut parser = Self {
             tokens,
             position: 0,
@@ -648,7 +712,7 @@ where
                 if matches!(self.peek(), Some(CassBoolToken::Close)) {
                     self.position += 1;
                 }
-                Ok(inner)
+                inner.ok_or(CassBoolUnsupported).map(Some)
             }
             CassBoolToken::Token(token) => Ok((self.lower)(token)?.map(CassBoolExpr::Operand)),
             CassBoolToken::Close => Ok(None),
@@ -783,9 +847,10 @@ fn open_search_hydration_sqlite(
     })
 }
 
-/// NFC-normalize a query string before sanitization so that decomposed
-/// Unicode (NFD — common on macOS keyboard input) matches NFC-indexed content
-/// produced by `DefaultCanonicalizer`.
+/// NFC-normalize display/snippet text and SQLite fallback terms.
+///
+/// Lexical parsing and cache identity retain the original spelling: the
+/// released index analyzes raw text before Unicode case or canonical mapping.
 fn nfc_sanitize_query(raw: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
     let nfc: String = raw.nfc().collect();
@@ -1511,7 +1576,7 @@ pub struct QueryReading {
     /// Operand grouping with every compound group parenthesized, e.g.
     /// `a OR (b AND c)`; `None` for a query without operands.
     pub structure: Option<String>,
-    /// Parentheses recovered instead of rejected, e.g. `1 unclosed '('
+    /// Grouping recovery or refusal notices, e.g. `1 unclosed '('
     /// closed at the end of the query`.
     pub recoveries: Vec<String>,
 }
@@ -1539,20 +1604,25 @@ pub fn read_query(query: &str) -> QueryReading {
     }
 }
 
-/// `--explain` warnings for parentheses the grammar recovers instead of
-/// rejecting, read the way the lexical engine reads them: an unclosed `(`
-/// closes at the end of the query and an empty `()` is skipped.
+/// `--explain` uses the same group admission as execution: nonempty
+/// unclosed groups close at the end, while empty groups refuse the query.
 fn group_recovery_warnings(tokens: &[CassBoolToken]) -> Vec<String> {
+    if !cass_bool_nesting_is_bounded(tokens) {
+        return vec![
+            "error: parenthesized query nesting exceeds the supported limit; the query matches no documents"
+                .to_string(),
+        ];
+    }
+    if !cass_bool_groups_have_operands(tokens) {
+        return vec![
+            "error: empty or operator-only parenthesized group; the query matches no documents"
+                .to_string(),
+        ];
+    }
     let mut open_groups = 0_usize;
-    let mut empty_groups = 0_usize;
-    for (index, token) in tokens.iter().enumerate() {
+    for token in tokens {
         match token {
-            CassBoolToken::Open => {
-                open_groups += 1;
-                if matches!(tokens.get(index + 1), Some(CassBoolToken::Close)) {
-                    empty_groups += 1;
-                }
-            }
+            CassBoolToken::Open => open_groups += 1,
             CassBoolToken::Close => open_groups = open_groups.saturating_sub(1),
             CassBoolToken::Token(_) => {}
         }
@@ -1562,9 +1632,6 @@ fn group_recovery_warnings(tokens: &[CassBoolToken]) -> Vec<String> {
         warnings.push(format!(
             "{open_groups} unclosed '(' closed at the end of the query"
         ));
-    }
-    if empty_groups > 0 {
-        warnings.push(format!("{empty_groups} empty '()' skipped"));
     }
     warnings
 }
@@ -1715,6 +1782,31 @@ impl QueryExplanation {
         // Generate warnings
         let mut warnings = Self::generate_warnings(&parsed, &sanitized, filters);
         warnings.extend(reading.recoveries);
+        if !query.trim().is_empty() {
+            // The display sanitizer cannot determine whether the index can
+            // represent an operand. Use the same adapter as execution so
+            // --dry-run cannot describe a refused query as a valid browse.
+            match frankensearch::quill::query::CassQueryParser::new(
+                frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
+            ) {
+                Ok(parser) => {
+                    if indexed_terms::parse(&parser, query, &FsCassQueryFilters::default())
+                        .is_empty()
+                    {
+                        warnings.retain(|warning| {
+                            warning != "Empty query will return all documents (expensive)"
+                        });
+                        warnings.push(
+                            "error: lexical query contains an unsearchable operand, an unsupported wildcard, or exceeds normalization limits; it matches no documents"
+                                .to_string(),
+                        );
+                    }
+                }
+                Err(error) => warnings.push(format!(
+                    "error: could not initialize the lexical query parser: {error}"
+                )),
+            }
+        }
 
         Self {
             original_query: query.to_string(),
@@ -3394,7 +3486,11 @@ fn build_in_memory_two_tier_index(
         None
     };
 
-    Ok(Arc::new(FsInMemoryTwoTierIndex::new(fast, quality)))
+    let index = FsInMemoryTwoTierIndex::new(fast, quality).map_err(|err| {
+        tracing::debug!(error = %err, "in-memory two-tier index construction failed");
+        SemanticProgressiveUnavailableReason::ExactArtifactOpenFailed
+    })?;
+    Ok(Arc::new(index))
 }
 
 fn two_tier_index_supports_mode(
@@ -3674,6 +3770,9 @@ pub const WILDCARD_FALLBACK_SKIPPED_DISABLED: &str = "automatic_retry_disabled";
 /// `_meta.wildcard_fallback_skipped` value when a zero-hit query has a term
 /// longer than the automatic retry accepts.
 pub const WILDCARD_FALLBACK_SKIPPED_LONG_TERM: &str = "long_query_term";
+
+/// Automatic substring retries cannot preserve this query's indexed operands.
+pub const WILDCARD_FALLBACK_SKIPPED_QUERY_NORMALIZATION: &str = "query_normalization";
 
 /// `_meta.wildcard_fallback_skipped` value when the automatic retry ran out of
 /// Quill query fuel; the plain query's hits are returned
@@ -4877,12 +4976,10 @@ impl SearchClient {
     ) -> Result<Vec<SearchHit>> {
         // This is per-search diagnostics, never a sticky property of a reader.
         self.record_lexical_degrade_reason(None);
-        // NFC-normalize early so every downstream consumer (Tantivy query
-        // builder, sanitizer, FTS5 fallback) sees consistent Unicode form
-        // matching the NFC-indexed content.
-        use unicode_normalization::UnicodeNormalization;
-        let query: String = query.nfc().collect();
-        let query: &str = &query;
+        // Keep the spelling that produced the indexed fragments and use it
+        // as the cache identity. NFC can change that sequence (ke + rlek into
+        // k + rlek), and can turn a discarded Kelvin sign into ASCII K.
+        // SQLite fallbacks and presentation keep their existing NFC transform.
         let sanitized = nfc_sanitize_query(query);
         let field_mask = effective_field_mask(field_mask);
         // Only lexical readers provide a publication generation with which to
@@ -4913,7 +5010,7 @@ impl SearchClient {
 
         // A prior query's top-k is not the top-k of an extended query, even
         // when every cached hit still matches: scores and omitted competitors
-        // can change. Reuse only the exact NFC query and field projection.
+        // can change. Reuse only the exact raw query and field projection.
         // Prefixes remain useful solely as hints for posting-list prewarming.
         let cache_epoch = self.reload_epoch.load(Ordering::SeqCst);
         if can_use_cache
@@ -7756,6 +7853,27 @@ impl SearchClient {
             });
         }
 
+        // Substring wildcards cannot preserve an analyzed word's fragment
+        // boundaries. The same admission also prevents an empty/unsupported
+        // operand from becoming a broad wildcard retry.
+        if !indexed_terms::allows_automatic_wildcard(query) {
+            self.record_wildcard_fallback_skip(Some(WILDCARD_FALLBACK_SKIPPED_QUERY_NORMALIZATION));
+            let suggestions = if hits.is_empty() {
+                self.generate_suggestions(query, &filters)
+            } else {
+                Vec::new()
+            };
+            return Ok(SearchResult {
+                hits,
+                wildcard_fallback: false,
+                cache_stats: baseline_stats,
+                suggestions,
+                ann_stats: None,
+                ann_unavailable_reason: None,
+                total_count: tantivy_total,
+            });
+        }
+
         // Try wildcard fallback: wrap each term in *term*
         let wildcard_query = query
             .split_whitespace()
@@ -8090,7 +8208,10 @@ impl SearchClient {
         let query_lower = query.to_lowercase();
 
         // 1. Suggest wildcard search if query doesn't have wildcards
-        if !query.contains('*') && query.len() >= 2 {
+        if !query.contains('*')
+            && query.len() >= 2
+            && indexed_terms::allows_automatic_wildcard(query)
+        {
             suggestions.push(QuerySuggestion::wildcard(query).with_shortcut(1));
         }
 
@@ -8476,14 +8597,14 @@ impl SearchClient {
 
         // NOTE: session_paths filtering is applied post-search since source_path
         // is STORED but not indexed. See apply_session_paths_filter().
-        // Quill parses CASS's query language natively; the parsed tree is the
-        // engine-neutral form its executor takes.
+        // Keep the released index generation while aligning affected Unicode
+        // operands with its actual tokenizer. Counts and ranked pages share
+        // this one engine-neutral query.
         let parser = frankensearch::quill::query::CassQueryParser::new(
             frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
         )
         .map_err(|error| anyhow::anyhow!("building the CASS query parser: {error}"))?;
-        let parsed = parser.parse(raw_query, &fs_filters);
-        let q = parsed.query;
+        let q = indexed_terms::parse(&parser, raw_query, &fs_filters);
 
         let prefix_only = is_prefix_only(sanitized_query);
         let top_docs = execute_query_with_bounded_exact_count(reader, &q, limit, offset)?;
@@ -10434,7 +10555,8 @@ fn maybe_spawn_warm_worker(
                 // incumbent hand-built here, so this warms the identical
                 // posting lists. Limit 1 doc.
                 if !job.query.trim().is_empty() {
-                    let parsed = warm_parser.parse(
+                    let query = indexed_terms::parse(
+                        &warm_parser,
                         &job.query,
                         &frankensearch::quill::query::CassQueryFilters::default(),
                     );
@@ -10443,13 +10565,9 @@ fn maybe_spawn_warm_worker(
                     // swallowing it entirely makes a persistently broken warm
                     // path invisible. Log at debug so it is diagnosable without
                     // being noisy.
-                    if let Err(err) = crate::search::quill_bridge::search_paginated(
-                        &reader,
-                        &parsed.query,
-                        1,
-                        0,
-                        false,
-                    ) {
+                    if let Err(err) =
+                        crate::search::quill_bridge::search_paginated(&reader, &query, 1, 0, false)
+                    {
                         tracing::debug!(
                             error = %err,
                             query = %job.query,
@@ -21755,6 +21873,70 @@ mod tests {
     }
 
     #[test]
+    fn empty_groups_are_refused_by_reading_and_both_sqlite_query_lanes() {
+        for raw in [
+            "backup AND ()",
+            "backup OR ()",
+            "NOT (backup AND ())",
+            "backup OR (NOT)",
+            "backup OR (AND OR)",
+            "backup AND (( ))",
+            "backup OR (",
+            "backup OR (NOT",
+            "kérlek OR ()",
+            "NOT (kérlek AND ())",
+        ] {
+            let tokens = cass_bool_tokens(raw);
+            assert!(!cass_bool_groups_have_operands(&tokens), "{raw:?}");
+            assert!(read_query(raw).structure.is_none(), "{raw:?}");
+            assert!(transpile_to_fts5(raw).is_none(), "{raw:?}");
+            assert!(
+                SearchClient::sqlite_message_scan_query(raw).is_none(),
+                "{raw:?}"
+            );
+        }
+        // Syntactic operands can also disappear during a lane's own
+        // normalization. An entered group must not be dropped afterward.
+        for raw in ["backup AND (!!!)", "backup OR (\"\")"] {
+            assert!(transpile_to_fts5(raw).is_none(), "{raw:?}");
+            assert!(
+                SearchClient::sqlite_message_scan_query(raw).is_none(),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nonempty_groups_keep_recovery_and_opaque_parentheses() {
+        for raw in [
+            "(backup)",
+            "((backup))",
+            "backup AND (restore",
+            "\"backup () restore\"",
+            "backup()",
+            "backup(foo)",
+        ] {
+            let tokens = cass_bool_tokens(raw);
+            assert!(cass_bool_groups_have_operands(&tokens), "{raw:?}");
+            assert!(read_query(raw).structure.is_some(), "{raw:?}");
+            assert!(transpile_to_fts5(raw).is_some(), "{raw:?}");
+            assert!(
+                SearchClient::sqlite_message_scan_query(raw).is_some(),
+                "{raw:?}"
+            );
+        }
+        let accepted = format!("{}backup{}", "(".repeat(128), ")".repeat(128));
+        assert!(read_query(&accepted).structure.is_some());
+        let rejected = format!("{}backup{}", "(".repeat(129), ")".repeat(129));
+        assert!(read_query(&rejected).structure.is_none());
+        assert!(transpile_to_fts5(&rejected).is_none());
+        assert!(SearchClient::sqlite_message_scan_query(&rejected).is_none());
+        for raw in ["", " \t\n ", "\u{2003}"] {
+            assert!(cass_bool_groups_have_operands(&cass_bool_tokens(raw)));
+        }
+    }
+
+    #[test]
     fn transpile_to_fts5_ignores_leading_or() {
         assert_eq!(transpile_to_fts5("OR test"), Some("test".to_string()));
         assert_eq!(
@@ -22845,15 +23027,17 @@ mod tests {
         assert_eq!(structure("").as_deref(), None);
     }
 
-    /// Unbalanced parentheses are recovered, not rejected, and `--explain`
-    /// says how: the grouping shown is the one searched.
+    /// Nonempty unclosed groups recover at the end; empty groups refuse the
+    /// whole query. `--explain` must describe the same decision as execution.
     #[test]
     fn explanation_reports_recovered_parentheses() {
         let explain = |raw: &str| QueryExplanation::analyze(raw, &SearchFilters::default());
         let recovery = |warnings: &[String]| {
             warnings
                 .iter()
-                .filter(|warning| warning.contains("'('") || warning.contains("'()'"))
+                .filter(|warning| {
+                    warning.contains("'('") || warning.contains("parenthesized group")
+                })
                 .cloned()
                 .collect::<Vec<_>>()
         };
@@ -22868,9 +23052,22 @@ mod tests {
             ["1 unclosed '(' closed at the end of the query"]
         );
 
-        let empty = explain("kiwi () lime");
-        assert_eq!(empty.parsed.structure.as_deref(), Some("kiwi AND lime"));
-        assert_eq!(recovery(&empty.warnings), ["1 empty '()' skipped"]);
+        for raw in [
+            "kiwi () lime",
+            "kiwi OR (NOT)",
+            "NOT (kiwi AND ())",
+            "kiwi AND (",
+        ] {
+            let empty = explain(raw);
+            assert_eq!(empty.parsed.structure, None, "{raw:?}");
+            assert_eq!(
+                recovery(&empty.warnings),
+                [
+                    "error: empty or operator-only parenthesized group; the query matches no documents"
+                ],
+                "{raw:?}"
+            );
+        }
 
         // Balanced groups, and parentheses inside a word, recover nothing.
         for balanced in ["(kiwi OR lime) mango", "call foo(bar) now", "kiwi lime)"] {
@@ -22913,6 +23110,54 @@ mod tests {
         assert_eq!(exp.index_strategy, IndexStrategy::FullScan);
         assert_eq!(exp.estimated_cost, QueryCost::High);
         assert!(exp.warnings.iter().any(|w| w.contains("Empty query")));
+    }
+
+    #[test]
+    fn explanation_reports_refused_queries_without_a_browse_warning() {
+        for raw in [
+            "🚀",
+            "!!!",
+            "NOT é",
+            "backup OR \"\"",
+            "*kérlek*",
+            "AND",
+            "()",
+            "\"f*o\"",
+        ] {
+            let explanation = QueryExplanation::analyze(raw, &SearchFilters::default());
+            assert!(
+                explanation
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.starts_with("error:")),
+                "refused query {raw:?} must be invalid in --dry-run"
+            );
+            assert!(
+                explanation
+                    .warnings
+                    .iter()
+                    .all(|warning| !warning.contains("return all")),
+                "refused query {raw:?} must not be described as browsing"
+            );
+        }
+        for raw in [
+            "",
+            " \t\n",
+            "kérlek",
+            "ke\u{301}rlek",
+            "日本語",
+            "\"*kérlek*\"",
+            "café*",
+        ] {
+            let explanation = QueryExplanation::analyze(raw, &SearchFilters::default());
+            assert!(
+                explanation
+                    .warnings
+                    .iter()
+                    .all(|warning| !warning.starts_with("error:")),
+                "searchable or intentionally blank query {raw:?} must remain valid"
+            );
+        }
     }
 
     #[test]
@@ -25522,9 +25767,9 @@ mod tests {
         let san_nfc = sanitize_query(nfc);
         let san_nfd = sanitize_query(nfd);
 
-        // Both produce "café" because nfc_sanitize_query normalizes to NFC
-        // before sanitization, matching the NFC-indexed content from
-        // DefaultCanonicalizer.
+        // The display/SQLite sanitizer normalizes both spellings to "café".
+        // Lexical parsing does not use this transform: the legacy index can
+        // contain different fragments for the original NFC and NFD spellings.
         assert_eq!(san_nfc, "café");
         assert_eq!(san_nfd, "café");
         assert_eq!(san_nfc, san_nfd);
