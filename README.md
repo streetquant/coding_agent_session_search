@@ -3942,7 +3942,7 @@ archive.
 The build guard enforces the reviewed
 uniform SQLite 0.4.13 versions, a single resolution per package, and registry sources.
 
-`cass` pins its contract-critical ecosystem dependencies with exact versions in [`Cargo.toml`](Cargo.toml); other direct dependencies use normal semver requirements, and `Cargo.lock` freezes the complete resolved graph. `franken-agent-detection` and the complete `frankensearch` family pin immutable Git revisions (below). Optional sibling-path overrides stay commented out by default and must never be committed active.
+`cass` pins its contract-critical ecosystem dependencies with exact versions in [`Cargo.toml`](Cargo.toml); other direct dependencies use normal semver requirements, and `Cargo.lock` freezes the complete resolved graph. Two direct dependencies pin immutable Git revisions: `franken-agent-detection` and `frankensearch`; the complete Frankensearch family resolves from the `frankensearch` revision (below). Optional sibling-path overrides stay commented out by default and must never be committed active.
 
 | Dependency | Pinned source |
 |------------|-----------------|
@@ -4297,7 +4297,7 @@ Generated from the env-var registry (`cass capabilities --json | jq .env_vars`).
 <!-- END GENERATED ENV VARS -->
 
 <!-- BEGIN GENERATED CONNECTORS -->
-The runtime registry registers 34 connectors (`cass capabilities --json | jq .connectors`):
+The runtime registry registers 37 connectors (`cass capabilities --json | jq .connectors`):
 
 | Connector | Connector | Connector |
 |-----------|-----------|-----------|
@@ -4312,7 +4312,8 @@ The runtime registry registers 34 connectors (`cass capabilities --json | jq .co
 | `copilot_cli` | `qwen` | `grok` |
 | `devin` | `grok_bot` | `codebuff` |
 | `goose` | `crush` | `hermes` |
-| `shelley` |  |  |
+| `shelley` | `kilo` | `cloudmcp` |
+| `openwebui` |  |  |
 <!-- END GENERATED CONNECTORS -->
 
 <!-- BEGIN GENERATED DEPENDENCY PINS -->
@@ -4321,8 +4322,8 @@ The runtime registry registers 34 connectors (`cass capabilities --json | jq .co
 | Dependency | Requirement | Features |
 |------------|-------------|----------|
 | `asupersync` | crates.io `=0.5.0` | `test-internals`, `tls-native-roots` |
-| `franken-agent-detection` | git `https://github.com/Dicklesworthstone/franken_agent_detection` rev `6b337ba434b72c65c6c5a748b7ec47885f840ac0` (crate 0.3.10) | `connectors`, `cursor`, `chatgpt`, `opencode`, `crush`, `goose`, `hermes`, `devin`, `shelley`, `grok-bot`, `openclaw-sqlite`, `copilot-vscdb`, `codebuff`, `codex-zstd`, `pi-durable`, `pi-sqlite` |
-| `frankensearch` | crates.io `=0.7.1` | `hash`, `cass-compat`, `quill`, `ann`, `native` |
+| `franken-agent-detection` | git `https://github.com/Dicklesworthstone/franken_agent_detection` rev `0ea083ea4c470a6b7e7607cdeff335cb14690cdc` (crate 0.3.10) | `connectors`, `cursor`, `chatgpt`, `opencode`, `crush`, `goose`, `hermes`, `devin`, `shelley`, `grok-bot`, `openclaw-sqlite`, `copilot-vscdb`, `codebuff`, `codex-zstd`, `pi-durable`, `pi-sqlite` |
+| `frankensearch` | git `https://github.com/streetquant/frankensearch` rev `e463dcadcbf2abd2ba9651bad3e2f7ad1bfa6965` (crate 0.7.1) | `hash`, `cass-compat`, `quill`, `ann`, `native` |
 | `frankensqlite` (`fsqlite`) | crates.io `=0.4.13` | `fts5`, `async-api` |
 | `fsqlite-types` | crates.io `=0.4.13` |  |
 | `ftui` | crates.io `=0.5.0` |  |
