@@ -57,4 +57,15 @@ exclude_patterns = [
     "tests/artifacts/",
     "sample_sqlite_db_files/",
     "legacy_python_mcp_agent_mail_code/mcp_agent_mail/.venv/",
+    # This project layer REPLACES the operator list, so the fleet's anchored
+    # host-local scratch dirs must be repeated here. They are written unanchored
+    # because rsync anchors a leading "/" to the transfer root, which is this
+    # project directory; unanchored also covers nested copies. A leftover
+    # unreadable fixture under .local-state/ aborted every source transfer
+    # (rsync code 23) until it was excluded.
+    ".local-state/",
+    ".integration/",
+    ".ai-bridge/",
+    ".rch/",
+    "test-results/",
 ]
