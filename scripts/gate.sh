@@ -601,7 +601,7 @@ fi
 # unchanged. Quote values as shell data, including empty or invalid values,
 # so Cargo still validates them instead of executing or silently dropping them.
 cargo_profile_env=""
-for cargo_env_key in CARGO_BUILD_JOBS CARGO_INCREMENTAL CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG; do
+for cargo_env_key in CARGO_NET_OFFLINE UBS_MODULE_TIMEOUT CARGO_BUILD_JOBS CARGO_INCREMENTAL CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG; do
     if [[ -v "$cargo_env_key" ]]; then
         printf -v cargo_env_export 'export %s=%q\n' "$cargo_env_key" "${!cargo_env_key}"
         cargo_profile_env+="$cargo_env_export"
