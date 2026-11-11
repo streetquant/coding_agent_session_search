@@ -357,6 +357,10 @@ key_token_pattern() {
         PageUp|PgUp) code="KeyCode::PageUp" ;;
         PageDown|PgDn) code="KeyCode::PageDown" ;;
         Space) code="Char\\(' '\\)" ;;
+        0) # Numeric table cells such as the exit-code table's `| 0 | success |`
+           # are not key bindings; only 1-9 appear in the documented digit
+           # ranges (`Alt+1`..`Alt+9`).
+           return 0 ;;
         [1-9]) # README writes digit ranges as `Alt+1`..`Alt+9`; the map has one
                # range arm: `KeyCode::Char(c @ '1'..='9') if <modifier>`.
             code="(Char\\('${base}'\\)|Char\\(c @ '1'\\.\\.='9'\\))" ;;

@@ -72,6 +72,17 @@ impl Corpus {
             .env("HOME", &self.home)
             .env("CODEX_HOME", self.home.join(".codex"))
             .env("CASS_DATA_DIR", &self.data_dir)
+            // Connectors with machine-wide absolute defaults (CloudMCP's
+            // transcript store) would otherwise index the host's live captures
+            // into this oracle; pin every external root inside the fixture.
+            .env(
+                "CASS_CLOUDMCP_DATA_ROOT",
+                self.home.join(".cass-cloudmcp-absent"),
+            )
+            .env(
+                "CASS_OPENWEBUI_DATA_ROOT",
+                self.home.join(".cass-openwebui-absent"),
+            )
             .env("CASS_AUTO_REFRESH", "0")
             .env("CASS_IGNORE_SOURCES_CONFIG", "1")
             .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
