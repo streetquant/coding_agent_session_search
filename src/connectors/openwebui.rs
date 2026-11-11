@@ -176,7 +176,12 @@ impl OpenWebUiConnector {
     fn default_root() -> PathBuf {
         dotenvy::var("CASS_OPENWEBUI_DATA_ROOT")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/warp/cass/raw-mirror/openwebui/v1"))
+            .unwrap_or_else(|_| {
+                crate::default_data_dir()
+                    .join("raw-mirror")
+                    .join("openwebui")
+                    .join("v1")
+            })
     }
 
     fn sources(context: &ScanContext) -> Result<Vec<CatalogSource>> {
