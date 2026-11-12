@@ -379,9 +379,13 @@ pub(super) fn certify_after_index(
     // the closing WAL checkpoint. When every content projection still matches,
     // settle that self-inflicted drift without replaying the corpus. The
     // caller only sets this after a completed full scan, so this is not the
-    // unexamined-content shortcut the complete audit exists to prevent.
-    if allow_full_audit
-        && settle_own_run_epoch_drift
+    // unexamined-content shortcut the complete audit exists to prevent. The
+    // settle is a bounded content check, not the corpus replay that
+    // `allow_full_audit` gates: a full scan which admitted a matching
+    // checkpoint previously left its own fresh epoch drifted here because
+    // `allow_final_content_audit` was false, so every scheduled `--full` run
+    // ended unverified until the next audit.
+    if settle_own_run_epoch_drift
         && settle_completed_source_epoch_if_content_matches(db_path, index_path, state.clone())?
     {
         return Ok(true);
