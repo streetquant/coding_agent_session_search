@@ -2062,7 +2062,7 @@ Launch-time flags: `cass tui --refresh` (alias `--catch-up`) runs an incremental
 | `F9` | Toggle match mode: standard (default) ↔ prefix, where every bare word of 2+ characters also matches as a prefix (`auth` → `auth*`; phrases, operators and wildcards are left as typed) |
 | `F12` / `Alt+R` | Cycle ranking: recent → balanced → relevance → quality → newest → oldest |
 | `Alt+F` | Cycle result grouping: agent → conversation → workspace → flat |
-| `Alt+S` | Cycle search mode (lexical / semantic / hybrid). Without an installed model (or vector index) the status line says results stay lexical and names the command: `cass models install` (offline `--from-file <dir>`) or `cass index --semantic`; nothing downloads on its own |
+| `Alt+S` | Cycle search mode (lexical / semantic / hybrid). Without an installed model or compatible vector index, explicit semantic searches report an error; hybrid keeps lexical results. Recovery guidance names `cass models install` (offline `--from-file <dir>`) or `cass index --semantic`; nothing downloads on its own |
 | `Ctrl+D` | Cycle density: Compact → Cozy → Spacious |
 | `Ctrl+1`..`Ctrl+9` | Save the current view to slot N |
 | `Shift+1`..`Shift+9` | Load the view from slot N |
@@ -3021,8 +3021,15 @@ cass analytics rebuild --track a
 
 `cass analytics rebuild` re-derives the Track A rollups (`message_metrics`,
 `usage_hourly`, `usage_daily`, `usage_models_daily`) from messages already in
-the archive; it never re-parses raw session files. On a large archive a full
-rebuild is a long single-core job, so daily refreshes should be windowed:
+the archive; it never re-parses raw session files.
+
+An unwindowed Track A rebuild (including unwindowed `--track all`) also
+refreshes the `daily_stats` session-count cache from canonical conversations
+and messages. This adds a complete, paginated pass over those rows. Windowed
+rebuilds and Track-B-only rebuilds leave this cache unchanged.
+
+On a large archive a full rebuild is a long single-core job, so daily
+refreshes should be windowed:
 
 ```bash
 # Full rebuild (every rollup row dropped and recomputed)
@@ -3299,11 +3306,13 @@ Other subcommands (all present in the `Commands` enum in `src/lib.rs`):
 | `forget --list` / `forget --reinclude` | Inspect recorded exclusions or explicitly release matching records. Use literal `--source-path`, `--source-glob`, or exact `--source-id`, `--agent`, and `--external-id` selectors; supplied selectors are ANDed. Re-inclusion requires a selector and previews by default; add `--apply`, then run `cass index`. Other exclusions and current workspace/path policies remain in force. Historical exclusion records cannot be selected by workspace or age. |
 | `fleet upgrade-rehearsal` | Fleet-safe upgrade rehearsal (dry run) with bounded post-upgrade verification; `--live` opts in to SSH probes of configured remotes |
 | `lessons list\|search` | Mine and query durable, redacted lessons from local evidence (commits, closed beads, proof manifests) |
-| `import chatgpt` | Split a ChatGPT web export (`conversations.json`) into files the ChatGPT connector can index |
+| `import chatgpt` | Import or refresh a ChatGPT web export (`conversations.json`) as files the ChatGPT connector can index |
 | `release-verify` | Verify release distribution channels (GitHub, Homebrew, Scoop, crates.io, installer) from a recorded observation (`--from`) or live (`--live`) |
 | `sources discover` | Auto-discover SSH hosts from `~/.ssh/config` |
 | `sources reingest` | Re-ingest an already-synced mirror into the canonical archive without re-running rsync |
 | `sources artifact-manifest` | Build or verify a lexical-artifact evidence manifest for remote exchange |
+
+`cass import chatgpt` refreshes changed mapping-based conversations by stable node key and retains messages omitted from a partial export. Older dated snapshots cannot roll back newer messages; unchanged imports preserve file bytes and modification times. The JSON result distinguishes newly `imported`, `updated`, and unchanged `skipped` conversations. Changed unsupported export shapes or conflicting identities return an error while preserving the existing file. Run `cass index` after importing.
 
 `cass guide repair-assets --apply` can rebuild the lexical index from the selected canonical database after the plan's step confirmation, cost acceptance, resource checks and stop-condition acknowledgement. It uses the existing bounded rebuild path and refuses missing or empty archives before source discovery. A successful receipt requires a fresh, complete lexical generation with unchanged canonical identity and conversation/message counts. Already-current assets are reported as `already-ready`; semantic enrichment remains a separate operation. Inspect the dry-run plan first for the exact confirmation flags and step number.
 

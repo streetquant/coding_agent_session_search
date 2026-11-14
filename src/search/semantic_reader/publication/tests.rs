@@ -4,7 +4,6 @@
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
 use super::*;
-use asupersync::Cx;
 use std::collections::BTreeMap;
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -889,8 +888,8 @@ fn attach_native_graph(
         ef_construction: 64,
         ef_search: 8,
     };
-    let cx = Cx::for_testing();
-    let graph = ValidatedNativeHnsw::build(&cx, owner, params, 17).unwrap();
+    let graph =
+        ValidatedNativeHnsw::build(&frankensearch::Cx::for_request(), owner, params, 17).unwrap();
     let receipt = graph.save(&directory.join(&relative_path)).unwrap();
     let artifact = native_ann_artifact(&base, &receipt, &relative_path, 25).unwrap();
     manifest.artifacts.push(artifact);

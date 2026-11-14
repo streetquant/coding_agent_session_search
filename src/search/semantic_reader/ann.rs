@@ -8,7 +8,6 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use asupersync::Cx;
 use frankensearch::core::filter::SearchFilter;
 use frankensearch::core::{BoundQueryEmbedding, VectorHit};
 use frankensearch::index::native_hnsw::{
@@ -644,7 +643,10 @@ fn native_window(
     width: usize,
     filter: Option<&dyn SearchFilter>,
 ) -> SemanticReaderResult<(Vec<VectorHit>, usize)> {
-    let cx = Cx::current().unwrap_or_else(Cx::for_testing);
+    // No caller context reaches here: an infinite-budget request context that
+    // nothing cancels keeps this search unbounded and uncancellable, as before
+    // the engine took a caller `Cx`.
+    let cx = frankensearch::Cx::for_request();
     let candidates = graph.search(&cx, query.vector(), width, Some(width))?;
     if candidates.len() > width {
         return Err(SemanticReaderError::InvalidCandidate);

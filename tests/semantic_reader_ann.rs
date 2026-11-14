@@ -8,7 +8,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use asupersync::Cx;
 use coding_agent_search::search::semantic_manifest::TierKind;
 use coding_agent_search::search::semantic_reader::ann::{
     AnnFallbackReason, AnnSearchPolicy, SemanticAnnAdmission, SemanticAnnExpectation,
@@ -101,8 +100,8 @@ fn graph(selected: &SemanticShardExpectation, path: &Path, seed: u64) -> Semanti
         ef_construction: 64,
         ef_search: 8,
     };
-    let cx = Cx::for_testing();
-    let graph = ValidatedNativeHnsw::build(&cx, owner, params, seed).unwrap();
+    let graph =
+        ValidatedNativeHnsw::build(&frankensearch::Cx::for_request(), owner, params, seed).unwrap();
     let receipt = graph.save(path).unwrap();
     SemanticAnnExpectation {
         graph_path: path.to_owned(),
