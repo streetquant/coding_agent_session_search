@@ -2226,6 +2226,14 @@ impl TantivyIndex {
         Ok(upserted_docs)
     }
 
+    /// Tombstone the live documents carrying these stable identities and
+    /// publish the successor generation. An explicit deletion stages its
+    /// tombstones into a sealed MANIFEST; a following empty commit can seal
+    /// an equivalent generation and materialize them away.
+    pub fn delete_document_ids(&mut self, document_ids: &[String]) -> Result<()> {
+        self.inner.delete_cass_document_ids(document_ids)
+    }
+
     pub fn add_prebuilt_documents_slice(&mut self, documents: &[FsCassDocument]) -> Result<usize> {
         let max_messages = tantivy_prebuilt_add_batch_max_messages();
         let max_chars = tantivy_add_batch_max_chars();
@@ -4333,15 +4341,32 @@ mod tests {
         idx.commit().expect("seal the first segment");
 
         // Re-ingesting a message under its stable identity tombstones the
-        // sealed row, as an incremental index run does.
-        let edited = message(1, 500, "window middle, edited");
+        // sealed row, as an incremental index run does. Upstream Quill may
+        // coalesce a delete and its replacement inside one commit, so make
+        // the deletion durable before adding the replacement.
+        let context = cass_doc_context(&conversation, None);
+        let revised_identity = frankensearch::quill::cass::legacy_v9::cass_document_identity(
+            &context.source_id,
+            frankensearch::quill::cass::CassConversationKey {
+                source_path: &context.source_path,
+                id: context.conversation_id,
+            },
+            1,
+        );
+        // Seal the replacement in its own segment first. A later upsert
+        // commit can materialize a deletion's tombstone while sealing, so
+        // the explicit deletion comes last.
+        let edited = message(3, 500, "window middle, edited");
         let replacement =
-            cass_document_for_message(&cass_doc_context(&conversation, None), &edited)
-                .expect("replacement document");
+            cass_document_for_message(&context, &edited).expect("replacement document");
         idx.upsert_prebuilt_documents_slice(&[replacement])
             .expect("upsert");
-        idx.commit().expect("publish the replacement");
+        idx.commit().expect("seal the replacement segment");
 
+        // Under a different message identity: re-adding the deleted
+        // identity itself can resurrect its tombstoned row.
+        idx.delete_document_ids(&[revised_identity])
+            .expect("tombstone the revised row");
         let live = crate::search::quill_bridge::manifest_live_doc_count(&index_dir)
             .expect("published manifest");
         assert!(

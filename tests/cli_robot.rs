@@ -20,6 +20,39 @@ use coding_agent_search::{Cli, Commands};
 mod util;
 use util::cass_bin;
 
+/// Remove SGR/OSC escape sequences so help-output assertions do not depend on
+/// whether the harness forced color into a pipe.
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next();
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c == '\u{7}' {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn base_cmd() -> Command {
     let mut cmd = Command::new(cass_bin());
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
@@ -3950,7 +3983,7 @@ fn binary_dispatched_serve_and_archive_are_discoverable() {
             "{names:?}"
         );
 
-        let help = stdout(&["--help"]);
+        let help = strip_ansi(&stdout(&["--help"]));
         for name in ["serve", "archive"] {
             assert!(
                 help.lines()
@@ -3960,7 +3993,7 @@ fn binary_dispatched_serve_and_archive_are_discoverable() {
         }
         // `cass help <name>` reaches the main CLI, which alone does not know them.
         for name in ["serve", "archive"] {
-            let help = stdout(&["help", name]);
+            let help = strip_ansi(&stdout(&["help", name]));
             assert!(help.contains(&format!("cass {name}")), "{help}");
         }
         // clap_complete's bash script routes each subcommand with a

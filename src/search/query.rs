@@ -21809,13 +21809,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_boolean_query_empty_quoted_phrase_ignored() {
+    fn parse_boolean_query_keeps_empty_quoted_phrase() {
+        // A present quoted operand survives even when empty, so a required
+        // `AND ""` does not silently lose its requirement; empty *groups*
+        // are refused later by `cass_bool_groups_have_operands`.
         let tokens = parse_boolean_query("\"\"");
-        assert!(tokens.is_empty());
+        assert_eq!(tokens, vec![QueryToken::Phrase(String::new())]);
 
         let tokens = parse_boolean_query("foo \"\" bar");
         let expected: QueryTokenList = vec![
             QueryToken::Term("foo".into()),
+            QueryToken::Phrase(String::new()),
             QueryToken::Term("bar".into()),
         ];
         assert_eq!(tokens, expected);
