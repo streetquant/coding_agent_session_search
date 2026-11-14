@@ -432,6 +432,14 @@ fn parse_source_scan_interval(value: &str) -> Option<Duration> {
     value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
+/// The source-scan age threshold used by `cass status`/`cass health`.
+///
+/// This is the same value that gates the read-path auto-refresh, so the
+/// reported `source_scan_overdue` and the background spawn cannot disagree.
+pub fn source_scan_status_threshold() -> Duration {
+    source_scan_interval_from_env()
+}
+
 fn source_scan_interval_from_env() -> Duration {
     let default = Duration::from_secs(DEFAULT_SOURCE_SCAN_SECS);
     let Ok(value) = dotenvy::var("CASS_AUTO_REFRESH_SOURCE_SCAN_SECS") else {

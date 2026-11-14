@@ -1,9 +1,9 @@
 use assert_cmd::Command;
 use coding_agent_search::search::tantivy::{SCHEMA_HASH, expected_index_dir};
 use coding_agent_search::sources::config::{SourceDefinition, SourcesConfig, SyncSchedule};
-use coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION;
+use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, FrankenStorage};
 use fs2::FileExt;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -624,6 +624,39 @@ fn watch_once_publishes_settled_source_proof_and_respects_audit_budget() {
             assert!(output.status.success(), "{flag}: {output:?}");
             ready(flag);
         }
+
+        // y696o: a source-scan watermark older than the read-path cadence is
+        // visible independently of index freshness. The healthy bit keeps its
+        // existing meaning; the warning/action tell an agent to scan sources.
+        let storage = FrankenStorage::open(&data.join("agent_search.db")).unwrap();
+        let aged_scan = FrankenStorage::now_millis().saturating_sub(3_600_000);
+        storage.set_last_scan_ts(aged_scan).unwrap();
+        storage.close_without_checkpoint().unwrap();
+        let status = cass().args(["status", "--json"]).output().unwrap();
+        assert!(status.status.success(), "{status:?}");
+        let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(status["index"]["source_scan_known"], true, "{status}");
+        assert_eq!(status["index"]["source_scan_overdue"], true, "{status}");
+        assert!(
+            status["index"]["source_scan_age_seconds"]
+                .as_u64()
+                .is_some_and(|age| age >= 3600),
+            "{status}"
+        );
+        assert!(
+            status["warnings"]
+                .as_array()
+                .is_some_and(|warnings| warnings.iter().any(|warning| warning
+                    .as_str()
+                    .is_some_and(|warning| warning.contains("source scan is overdue")))),
+            "{status}"
+        );
+        assert!(
+            status["recommended_action"]
+                .as_str()
+                .is_some_and(|action| action.contains("cass index")),
+            "{status}"
+        );
     }
 }
 
@@ -1695,4 +1728,64 @@ fn status_and_health_report_archive_footprint_from_metadata() {
         Some(false),
         "{payload}"
     );
+}
+
+#[test]
+fn status_surfaces_overdue_source_scan_as_warning_not_health_bit() {
+    let test_home = tempfile::tempdir().expect("temp home");
+    let data = test_home.path().join("cass-data");
+    fs::create_dir_all(&data).expect("create data dir");
+    let db_path = data.join("agent_search.db");
+    let storage = FrankenStorage::open(&db_path).expect("open storage");
+    let aged = FrankenStorage::now_millis().saturating_sub(3_600_000);
+    storage.set_last_scan_ts(aged).expect("set source scan ts");
+    storage
+        .close_without_checkpoint()
+        .expect("close storage without checkpoint");
+
+    let output = isolated_cass_cmd(test_home.path())
+        .env("CASS_AUTO_REFRESH", "0")
+        .args([
+            "status",
+            "--data-dir",
+            data.to_str().expect("utf8 data dir"),
+            "--json",
+        ])
+        .output()
+        .expect("run cass status --json");
+    assert!(
+        output.status.success(),
+        "status failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("status json");
+    assert_eq!(
+        payload["index"]["source_scan_known"].as_bool(),
+        Some(true),
+        "{payload}"
+    );
+    assert_eq!(
+        payload["index"]["source_scan_overdue"].as_bool(),
+        Some(true),
+        "{payload}"
+    );
+    assert!(
+        payload["index"]["source_scan_age_seconds"]
+            .as_u64()
+            .is_some_and(|age| age >= 3600),
+        "{payload}"
+    );
+    assert!(
+        payload["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings.iter().any(|warning| warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("source scan is overdue")))),
+        "{payload}"
+    );
+    // The healthy bit keeps its index/archive meaning: this archive has no
+    // lexical index, so it is not healthy, but the source-scan warning is
+    // still present and independently actionable.
+    assert_eq!(payload["healthy"].as_bool(), Some(false), "{payload}");
 }

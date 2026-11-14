@@ -5185,6 +5185,11 @@ fn lexical_rebuild_message_after_id_sql(cap: usize) -> String {
 /// Apply the semantic checkpoint watermark before projecting message bodies.
 /// Keep the existing conversation/idx access path: scanning the global append
 /// tail once per conversation would repeat unrelated work for wide catch-ups.
+///
+/// GH #539 replaced the production append stream with the global message-ID
+/// scan; the per-conversation projection remains the reference/negative
+/// control for the seek-past-watermark tests.
+#[cfg(test)]
 fn lexical_rebuild_conversation_after_id_sql(cap: usize, hinted: bool) -> String {
     format!(
         "SELECT id, idx, role, author, created_at, \
@@ -14132,6 +14137,11 @@ impl FrankenStorage {
     /// them. Output remains in canonical `idx` order, which need not match ID
     /// order. This still walks the conversation's index entries; it does not
     /// claim an O(delta) index seek or bound an oversized appended conversation.
+    ///
+    /// Test-only since GH #539: the production lexical append stream uses the
+    /// global message-ID query, and these tests pin the old path's semantics
+    /// (including the Rewind negative control).
+    #[cfg(test)]
     pub(crate) fn fetch_messages_for_lexical_rebuild_after_id(
         &self,
         conversation_id: i64,

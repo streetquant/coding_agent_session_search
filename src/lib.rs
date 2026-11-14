@@ -24223,6 +24223,28 @@ fn state_meta_json_inner(
     let conversation_count = db_snapshot.conversation_count;
     let message_count = db_snapshot.message_count;
     let last_scan_ts = db_snapshot.last_scan_ts;
+    // Source-scan age is independent of derived-index freshness: an index can
+    // be byte-current while no source scan has run since the archive last
+    // changed. Surface it with the same threshold the read-path auto-refresh
+    // uses, so `status`/`health` and the detached refresh cannot disagree.
+    // `healthy` deliberately remains the index/archive readiness verdict; an
+    // overdue source scan is an explicit warning plus a recommended command,
+    // not a second meaning for the health bit (y696o).
+    let source_scan_threshold = crate::indexer::background_refresh::source_scan_status_threshold();
+    // The fast health contract skips the DB open entirely; without an open
+    // there is no watermark to classify. Emit `null` (unknown), never a
+    // fabricated "overdue" that would make every healthy fast probe warn.
+    let source_scan_known = db_snapshot.opened;
+    let source_scan_completed_at_ms = last_scan_ts.filter(|ts| *ts > 0);
+    let source_scan_age_seconds = source_scan_completed_at_ms
+        .map(|ts| now_secs.saturating_sub((ts / 1000) as u64));
+    let source_scan_overdue = source_scan_known.then(|| {
+        crate::indexer::background_refresh::source_scan_is_due(
+            source_scan_completed_at_ms,
+            now_ms_i64,
+            source_scan_threshold,
+        )
+    });
     let mut last_indexed_at = db_snapshot.last_indexed_at;
     let watch_lexical_replay_pending = db_snapshot.watch_lexical_replay_pending;
     let db_opened = db_snapshot.opened;
@@ -24676,6 +24698,18 @@ fn state_meta_json_inner(
                     .unwrap_or_else(chrono::Utc::now)
                     .to_rfc3339()
             }),
+            // y696o: the source-scan watermark is stored in the archive, not
+            // implied by index freshness. `null` completed_at means no scan is
+            // recorded (and `source_scan_is_due` treats it as due).
+            "source_scan_completed_at": source_scan_completed_at_ms.map(|ts| {
+                chrono::DateTime::from_timestamp_millis(ts)
+                    .unwrap_or_else(chrono::Utc::now)
+                    .to_rfc3339()
+            }),
+            "source_scan_age_seconds": source_scan_age_seconds,
+            "source_scan_threshold_seconds": source_scan_threshold.as_secs(),
+            "source_scan_known": source_scan_known,
+            "source_scan_overdue": source_scan_overdue,
             "age_seconds": lexical.age_seconds,
             "stale": lexical.stale,
             "stale_threshold_seconds": stale_threshold,
@@ -25699,6 +25733,11 @@ fn readiness_recommended_commands(
         .and_then(|pending| pending.get("sessions"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+    let source_scan_overdue = state
+        .get("index")
+        .and_then(|index| index.get("source_scan_overdue"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
 
     // b4uax: legacy Tantivy generation — the only fix is a full rebuild.
     let index_engine_incompatible = state
@@ -25885,6 +25924,38 @@ fn readiness_recommended_commands(
                 run_when: "Run after refresh-lexical-index finishes.",
                 success_signal: "healthy=true or recommended_commands changes to the next blocker",
                 parse_fields: &["status", "healthy", "state.index", "recommended_commands"],
+                retry_after_ms: None,
+            },
+        ));
+        return commands;
+    }
+
+    if source_scan_overdue {
+        commands.push(readiness_command_recommendation(
+            ReadinessCommandRecommendation {
+                id: "refresh-lexical-index",
+                command: cass_dataset_command(
+                    data_dir,
+                    db_path,
+                    &["index", "--json", "--no-progress-events"],
+                ),
+                purpose: "Scan source roots for newly changed sessions; the derived index is fresh but the source-scan watermark is overdue.",
+                safety: "writes-cass-archive-and-derived-index",
+                run_when: "Run when index.fresh=true but index.source_scan_overdue=true.",
+                success_signal: "success=true, then index.source_scan_overdue=false",
+                parse_fields: &["success", "conversations", "messages", "error"],
+                retry_after_ms: None,
+            },
+        ));
+        commands.push(readiness_command_recommendation(
+            ReadinessCommandRecommendation {
+                id: "verify-refresh",
+                command: cass_dataset_command(data_dir, db_path, &["status", "--json"]),
+                purpose: "Confirm the source scan watermark advanced.",
+                safety: "read-only",
+                run_when: "Run after refresh-lexical-index finishes.",
+                success_signal: "index.source_scan_overdue=false",
+                parse_fields: &["index", "warnings", "recommended_commands"],
                 retry_after_ms: None,
             },
         ));
@@ -89318,6 +89389,30 @@ fn run_status(
     if deferred_conversations > 0 {
         warnings.push(watch_nomem_deferral_warning(deferred_conversations));
     }
+    let source_scan_overdue = state
+        .get("index")
+        .and_then(|i| i.get("source_scan_overdue"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if source_scan_overdue {
+        let age = state
+            .get("index")
+            .and_then(|i| i.get("source_scan_age_seconds"))
+            .and_then(serde_json::Value::as_u64);
+        let threshold = state
+            .get("index")
+            .and_then(|i| i.get("source_scan_threshold_seconds"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        warnings.push(match age {
+            Some(age) => format!(
+                "source scan is overdue: the last completed scan was {age}s ago (threshold {threshold}s); run 'cass index' to discover newly changed sessions"
+            ),
+            None => format!(
+                "source scan is overdue: no completed source scan is recorded (threshold {threshold}s); run 'cass index' to discover sessions"
+            ),
+        });
+    }
 
     let db_available = db_opened || (db_exists && db_open_retryable);
     let lexical_index_initialized = cass_lexical_index_initialized(&data_dir);
@@ -89417,6 +89512,11 @@ fn run_status(
         Some(format!(
             "Run 'cass index' to refresh the index{pending_msg}"
         ))
+    } else if source_scan_overdue {
+        Some(
+            "Run 'cass index' to scan source roots for newly changed sessions; the derived index is fresh but its source-scan watermark is overdue"
+                .to_string(),
+        )
     } else if quarantined_conversations > 0 || deferred_conversations > 0 {
         ingest_quarantine_recommended_action
     } else {
@@ -89661,6 +89761,37 @@ fn run_status(
         if index_empty_with_messages {
             println!("  Warning: index has 0 documents but database has messages");
             println!("  Run 'cass index --full' to populate the search index");
+        }
+        if state
+            .get("index")
+            .and_then(|index| index.get("source_scan_known"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let overdue = state
+                .get("index")
+                .and_then(|index| index.get("source_scan_overdue"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let age = state
+                .get("index")
+                .and_then(|index| index.get("source_scan_age_seconds"))
+                .and_then(serde_json::Value::as_u64);
+            let threshold = state
+                .get("index")
+                .and_then(|index| index.get("source_scan_threshold_seconds"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            match (overdue, age) {
+                (true, Some(age)) => println!(
+                    "  Source scan: overdue ({age}s ago; threshold {threshold}s) - run 'cass index'"
+                ),
+                (true, None) => println!(
+                    "  Source scan: overdue (none recorded; threshold {threshold}s) - run 'cass index'"
+                ),
+                (false, Some(age)) => println!("  Source scan: {age}s ago"),
+                (false, None) => {}
+            }
         }
     } else if not_initialized {
         println!("  Not created yet - run 'cass index --full' once");
@@ -90803,6 +90934,30 @@ fn run_health(
     if deferred_conversations > 0 {
         warnings.push(watch_nomem_deferral_warning(deferred_conversations));
     }
+    let source_scan_overdue = state
+        .get("index")
+        .and_then(|index| index.get("source_scan_overdue"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if source_scan_overdue {
+        let age = state
+            .get("index")
+            .and_then(|index| index.get("source_scan_age_seconds"))
+            .and_then(serde_json::Value::as_u64);
+        let threshold = state
+            .get("index")
+            .and_then(|index| index.get("source_scan_threshold_seconds"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        warnings.push(match age {
+            Some(age) => format!(
+                "source scan is overdue: the last completed scan was {age}s ago (threshold {threshold}s); run 'cass index' to discover newly changed sessions"
+            ),
+            None => format!(
+                "source scan is overdue: no completed source scan is recorded (threshold {threshold}s); run 'cass index' to discover sessions"
+            ),
+        });
+    }
 
     let db_degraded = db_exists && !db_opened;
     let lexical_index_initialized = cass_lexical_index_initialized(&data_dir);
@@ -90849,6 +91004,11 @@ fn run_health(
         ingest_quarantine_recommended_action
     } else if !healthy {
         Some("Run 'cass status --json' for the exact readiness gap; run 'cass index --full' only for missing or stale derived search assets.".to_string())
+    } else if source_scan_overdue {
+        Some(
+            "Run 'cass index' to scan source roots for newly changed sessions; the derived index is fresh but its source-scan watermark is overdue"
+                .to_string(),
+        )
     } else {
         semantic_recommended_action(&state, not_initialized)
     };
