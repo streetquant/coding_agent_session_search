@@ -1473,6 +1473,14 @@ fn batch_forget_unions_exact_and_overlapping_selectors_once_across_all_surfaces(
     write_codex_rollout(&codex_home, "keep-b", KEPT_MARKER)?;
     let archive = Archive { home, data_dir };
     archive.index(&["--full", "--semantic", "--embedder", "hash"])?;
+    // Routine indexing defers analytics. Populate the derived surfaces through
+    // their public repair command before testing the batch's erasure behavior.
+    let rebuilt = archive.succeed(
+        "prepare analytics before the selector-union probe",
+        &["analytics", "rebuild", "--track", "a", "--json"],
+    )?;
+    let rebuilt: Value = serde_json::from_slice(&rebuilt.stdout)?;
+    assert_eq!(rebuilt["data"]["track_a"]["message_metrics_rows"], 6);
     assert_archive_counts(&archive, 3, 6)?;
     let first_str = first.to_str().ok_or("non-utf8 fixture path")?;
     let second_str = second.to_str().ok_or("non-utf8 fixture path")?;
@@ -2278,11 +2286,197 @@ fn every_search_surface_recovers_after_dedup_apply() -> TestResult {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn serve_aliases_refuse_interrupted_forget_and_recover_after_repair() -> TestResult {
+    use coding_agent_search::search::privacy;
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+    use std::os::unix::fs::symlink;
+
+    let (archive, forgotten) = indexed_archive(&[])?;
+    let forgotten_str = forgotten.to_str().ok_or("non-utf8 fixture path")?;
+    let database = archive.data_dir.join("agent_search.db");
+    let database_alias = archive.home.path().join("database-alias.db");
+    symlink(&database, &database_alias)?;
+    let original_source = fs::read(&forgotten)?;
+    let index_path = coding_agent_search::search::tantivy::index_dir(&archive.data_dir)?;
+    let detached = archive.home.path().join("detached-index");
+    let copy_index = || -> TestResult {
+        for entry in WalkDir::new(&index_path) {
+            let entry = entry?;
+            let destination = detached.join(entry.path().strip_prefix(&index_path)?);
+            if entry.file_type().is_dir() {
+                fs::create_dir_all(&destination)?;
+            } else if entry.file_type().is_file() {
+                fs::copy(entry.path(), &destination)?;
+            } else {
+                return Err(format!("unexpected fixture index entry: {:?}", entry.path()).into());
+            }
+        }
+        Ok(())
+    };
+    copy_index()?;
+    // A database-free reader can reach detached assets through an index
+    // symlink beside the archive's fence instead of through --db.
+    let index_alias = archive.data_dir.join("index/explicit-alias");
+    symlink(&detached, &index_alias)?;
+    let detached_arg = detached.to_str().ok_or("non-utf8 index path")?;
+    let alias_arg = database_alias.to_str().ok_or("non-utf8 alias path")?;
+    let index_alias_arg = index_alias.to_str().ok_or("non-utf8 index alias")?;
+    let serve = |query: &str, with_database: bool| {
+        let mut args = vec![
+            "serve",
+            "--query",
+            query,
+            "--index",
+            if with_database {
+                detached_arg
+            } else {
+                index_alias_arg
+            },
+        ];
+        if with_database {
+            args.extend(["--db", alias_arg]);
+        }
+        archive.run_step(
+            if with_database {
+                "one-shot serve through explicit database alias"
+            } else {
+                "database-free one-shot serve through index alias"
+            },
+            archive.cmd(),
+            &args,
+        )
+    };
+    let identities = |reply: &Value| -> TestResult<BTreeSet<(String, i64, u64)>> {
+        reply["result"]["hits"]
+            .as_array()
+            .ok_or("missing hits")?
+            .iter()
+            .map(|hit| -> TestResult<_> {
+                Ok((
+                    hit["source_path"]
+                        .as_str()
+                        .ok_or("missing source path")?
+                        .to_owned(),
+                    hit["conversation_id"]
+                        .as_i64()
+                        .ok_or("missing conversation id")?,
+                    hit["message_index"]
+                        .as_u64()
+                        .ok_or("missing message index")?,
+                ))
+            })
+            .collect()
+    };
+    let mut kept_before = BTreeMap::new();
+    for with_database in [true, false] {
+        let before = serve(FORGOTTEN_MARKER, with_database)?;
+        assert!(
+            before.status.success(),
+            "{}",
+            String::from_utf8_lossy(&before.stderr)
+        );
+        let before: Value = serde_json::from_slice(&before.stdout)?;
+        assert_eq!(before["ok"], true);
+        assert!(
+            before["result"]["hits"]
+                .as_array()
+                .ok_or("missing hits")?
+                .iter()
+                .any(|hit| hit["source_path"] == forgotten_str)
+        );
+        let kept = serve(KEPT_MARKER, with_database)?;
+        assert!(
+            kept.status.success(),
+            "{}",
+            String::from_utf8_lossy(&kept.stderr)
+        );
+        let kept: Value = serde_json::from_slice(&kept.stdout)?;
+        assert_eq!(kept["ok"], true);
+        let retained = identities(&kept)?;
+        assert!(!retained.is_empty());
+        kept_before.insert(with_database, retained);
+    }
+
+    let mut failing = archive.cmd();
+    failing.env("CASS_TEST_FORGET_LEXICAL_REBUILD_FAILURE", "1");
+    let failure = archive.run_step(
+        "forget commits canonical deletion before injected lexical failure",
+        failing,
+        &[
+            "forget",
+            "--source-path",
+            forgotten_str,
+            "--apply",
+            "--json",
+        ],
+    )?;
+    assert_eq!(failure.status.code(), Some(5));
+    let storage = FrankenStorage::open_readonly(&database)?;
+    assert_eq!(storage.total_conversation_count()?, 1);
+    assert_eq!(storage.total_message_count()?, 2);
+    assert!(storage.forget_derived_rebuild_pending()?);
+    drop(storage);
+    let database_bytes = fs::read(&database)?;
+    let fence_path = privacy::state_path_for_database(&database);
+    let fence_bytes = fs::read(&fence_path)?;
+
+    for with_database in [true, false] {
+        let blocked = serve(FORGOTTEN_MARKER, with_database)?;
+        assert!(!blocked.status.success(), "with_database={with_database}");
+        assert!(blocked.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&blocked.stderr);
+        let blocked: Value = serde_json::from_str(
+            stderr
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .ok_or("missing refusal")?,
+        )?;
+        assert_eq!(blocked["ok"], false);
+        assert_eq!(blocked["error"]["kind"], "forget-repair-pending");
+        assert!(blocked.get("result").is_none());
+        assert!(!stderr.contains(FORGOTTEN_MARKER));
+        assert_eq!(fs::read(&database)?, database_bytes);
+        assert_eq!(fs::read(&fence_path)?, fence_bytes);
+        assert!(!privacy::state_path_for_database(&database_alias).exists());
+    }
+
+    let repaired = archive.forget(forgotten_str, true)?;
+    assert_eq!(repaired["conversations_matched"], 0);
+    assert_eq!(repaired["conversations_deleted"], 0);
+    assert_eq!(repaired["derived_rebuilt"], true);
+    // This explicit index is caller-owned: publish the repaired generation
+    // into the detached copy before admitting a fresh one-shot reader.
+    copy_index()?;
+    for with_database in [true, false] {
+        for query in [FORGOTTEN_MARKER, KEPT_MARKER] {
+            let output = serve(query, with_database)?;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let reply: Value = serde_json::from_slice(&output.stdout)?;
+            assert_eq!(reply["ok"], true);
+            if query == FORGOTTEN_MARKER {
+                assert_eq!(reply["result"]["count"], 0);
+                assert!(identities(&reply)?.is_empty());
+            } else {
+                assert_eq!(identities(&reply)?, kept_before[&with_database]);
+            }
+        }
+    }
+    assert_eq!(fs::read(&forgotten)?, original_source);
+    Ok(())
+}
+
 /// The TUI and `cass serve --stdio` keep one lexical reader open across many
 /// searches. A forget run while one is open must not leave the forgotten text
 /// reachable through it: the TUI's reloading client drops it on its next
-/// search, and a serve session, pinned until `reload` by contract
-/// (docs/SEARCH_SERVICE.md), drops it on reload.
+/// search, and a serve session refuses its invalidated snapshot before reload
+/// (docs/SEARCH_SERVICE.md), then serves only retained content after reload.
 #[test]
 fn search_readers_open_across_a_forget_stop_returning_forgotten_text() -> TestResult {
     use coding_agent_search::search::query::{
@@ -2332,33 +2526,42 @@ fn search_readers_open_across_a_forget_stop_returning_forgotten_text() -> TestRe
     let mut serve_in = serve.stdin.take().ok_or("no serve stdin")?;
     let mut serve_out = BufReader::new(serve.stdout.take().ok_or("no serve stdout")?);
     let mut next_id = 0_u64;
-    let mut serve_request = |op: &str, query: Option<&str>| -> TestResult<Vec<String>> {
-        next_id += 1;
-        let mut request = json!({"op": op, "id": next_id});
-        if let Some(query) = query {
-            request["query"] = json!(query);
-            request["limit"] = json!(10);
-        }
-        writeln!(serve_in, "{request}")?;
-        serve_in.flush()?;
-        let mut line = String::new();
-        serve_out.read_line(&mut line)?;
-        let reply: Value = serde_json::from_str(&line)?;
-        if reply["ok"] != true {
-            return Err(format!("serve {request} failed: {reply}").into());
-        }
-        let hits: Vec<String> = reply["result"]["hits"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|hit| hit["source_path"].as_str().unwrap_or_default().to_string())
-            .collect();
-        eprintln!(
-            "{}",
-            json!({"test": "cli_forget", "step": "serve", "request": request, "hits": hits})
-        );
-        Ok(hits)
-    };
+    let mut serve_request =
+        |op: &str, query: Option<&str>, privacy_invalidated: bool| -> TestResult<Vec<String>> {
+            next_id += 1;
+            let mut request = json!({"op": op, "id": next_id});
+            if let Some(query) = query {
+                request["query"] = json!(query);
+                request["limit"] = json!(10);
+            }
+            writeln!(serve_in, "{request}")?;
+            serve_in.flush()?;
+            let mut line = String::new();
+            serve_out.read_line(&mut line)?;
+            let reply: Value = serde_json::from_str(&line)?;
+            if privacy_invalidated {
+                assert_eq!(reply["id"], next_id);
+                assert_eq!(reply["ok"], false, "{reply}");
+                assert_eq!(reply["error"]["kind"], "privacy-snapshot-invalidated");
+                assert!(reply.get("result").is_none(), "{reply}");
+                assert!(!line.contains(FORGOTTEN_MARKER));
+                return Ok(Vec::new());
+            }
+            if reply["ok"] != true {
+                return Err(format!("serve {request} failed: {reply}").into());
+            }
+            let hits: Vec<String> = reply["result"]["hits"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|hit| hit["source_path"].as_str().unwrap_or_default().to_string())
+                .collect();
+            eprintln!(
+                "{}",
+                json!({"test": "cli_forget", "step": "serve", "request": request, "hits": hits})
+            );
+            Ok(hits)
+        };
 
     // Negative control: both readers find the marker before the forget.
     if !client_hits(FORGOTTEN_MARKER)?
@@ -2367,7 +2570,7 @@ fn search_readers_open_across_a_forget_stop_returning_forgotten_text() -> TestRe
     {
         return Err("control: the TUI client did not find the marker before forget".into());
     }
-    if !serve_request("search", Some(FORGOTTEN_MARKER))?
+    if !serve_request("search", Some(FORGOTTEN_MARKER), false)?
         .iter()
         .any(|path| path == forgotten_str)
     {
@@ -2388,17 +2591,17 @@ fn search_readers_open_across_a_forget_stop_returning_forgotten_text() -> TestRe
         return Err("the open TUI client lost the unrelated conversation".into());
     }
 
-    // The pinned session is logged, not judged; reload is the contract.
-    serve_request("search", Some(FORGOTTEN_MARKER))?;
-    serve_request("reload", None)?;
-    let after = serve_request("search", Some(FORGOTTEN_MARKER))?;
+    // Privacy revocation supersedes the pinned snapshot even without reload.
+    serve_request("search", Some(FORGOTTEN_MARKER), true)?;
+    serve_request("reload", None, false)?;
+    let after = serve_request("search", Some(FORGOTTEN_MARKER), false)?;
     if !after.is_empty() {
         return Err(format!("a reloaded serve session returns forgotten text: {after:?}").into());
     }
-    if serve_request("search", Some(KEPT_MARKER))?.is_empty() {
+    if serve_request("search", Some(KEPT_MARKER), false)?.is_empty() {
         return Err("the reloaded serve session lost the unrelated conversation".into());
     }
-    serve_request("shutdown", None)?;
+    serve_request("shutdown", None, false)?;
     if !serve.wait()?.success() {
         return Err("cass serve did not shut down cleanly".into());
     }

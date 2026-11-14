@@ -52,6 +52,225 @@ fn encrypt_chatgpt_payload(plaintext: &[u8], nonce_bytes: [u8; 12]) -> Vec<u8> {
 
 #[test]
 #[serial]
+fn gh552_cli_voice_reimport_matches_fresh_index_and_survives_restarts() {
+    use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+    use serde_json::{Value, json};
+    use std::time::Duration;
+
+    let dir = tempfile::Builder::new()
+        .prefix("cass-gh552-cli-")
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    let export = dir.path().join("conversations.json");
+    let mut snapshot = json!([{
+        "id":"gh552-cli-chat", "title":"Voice import", "create_time":1700000000.0,
+        "update_time":1700000002.0, "mapping":{
+            "reply-node":{"parent":null,"message":{
+                "id":"reply", "author":{"role":"assistant"}, "create_time":1700000002.0,
+                "update_time":1700000002.0, "content":{"content_type":"text","parts":["zzgh552replyneedle"]}
+            }}
+        }
+    }]);
+    let command = |home: &Path| {
+        let mut cmd = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        cmd.env_clear();
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        cmd.current_dir(home)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("CASS_DATA_DIR", home.join("data"))
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_SEMANTIC_DOWNLOAD_POLICY", "opt_in")
+            .env("FRANKENSEARCH_MODEL_DIR", "")
+            .env("RUST_MIN_STACK", "134217728")
+            .timeout(Duration::from_secs(90));
+        cmd
+    };
+    let prepare = |name: &str| {
+        let home = dir.path().join(name);
+        fs::create_dir_all(&home).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(home.join(".env"))
+            .unwrap();
+        home
+    };
+    let home = prepare("growing");
+    let import = |home: &Path, expected: &str| {
+        let result = command(home)
+            .args(["import", "chatgpt"])
+            .arg(&export)
+            .arg("--output-dir")
+            .arg(home.join("chatgpt"))
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{result:?}");
+        let value: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(value[expected], 1, "{value}");
+        assert!(value["scan_root"]["path"].is_string(), "{value}");
+    };
+    let index = |home: &Path, full: bool| {
+        let mut cmd = command(home);
+        cmd.args(["index", "--json", "--no-progress-events"]);
+        if full {
+            cmd.arg("--full");
+        }
+        let result = cmd.output().unwrap();
+        assert!(result.status.success(), "{result:?}");
+    };
+    let rows = |home: &Path| {
+        let storage = FrankenStorage::open_readonly(&home.join("data/agent_search.db")).unwrap();
+        let id: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = 'gh552-cli-chat'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        storage.fetch_messages(id).unwrap()
+    };
+    fs::write(&export, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    import(&home, "imported");
+    index(&home, true);
+    let reply_id = rows(&home)[0].id;
+    snapshot[0]["mapping"]["voice-node"] = json!({"parent":null,"message":{
+        "id":"voice", "author":{"role":"user"}, "create_time":1700000001.0,
+        "update_time":1700000003.0,
+        "content":{"content_type":"multimodal_text","parts":[{"content_type":"audio_transcription","text":"zzgh552voiceneedle"}]}
+    }});
+    snapshot[0]["update_time"] = json!(1700000003.0);
+    fs::write(&export, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    import(&home, "updated");
+    let mut stable = None;
+    for full in [false, false, true] {
+        index(&home, full);
+        let saved = rows(&home);
+        assert_eq!(saved.len(), 2);
+        assert_eq!(saved[0].content, "zzgh552voiceneedle");
+        assert_eq!(saved[1].id, reply_id);
+        let current = serde_json::to_value(&saved).unwrap();
+        if let Some(expected) = &stable {
+            assert_eq!(&current, expected);
+        }
+        stable = Some(current);
+        for query in ["zzgh552voiceneedle", "zzgh552replyneedle"] {
+            let result = command(&home)
+                .args([
+                    "search",
+                    query,
+                    "--json",
+                    "--mode",
+                    "lexical",
+                    "--no-maintenance",
+                    "--no-daemon",
+                ])
+                .output()
+                .unwrap();
+            assert!(result.status.success(), "{result:?}");
+            let hits: Value = serde_json::from_slice(&result.stdout).unwrap();
+            assert_eq!(hits["hits"].as_array().unwrap().len(), 1, "{hits}");
+            assert!(hits["hits"][0]["content"].as_str().unwrap().contains(query));
+        }
+    }
+    import(&home, "skipped");
+
+    // A same-ID revision through the targeted watch path must also finish
+    // publication before a read-only search, preserving the canonical row.
+    let source_path: String = {
+        let storage = FrankenStorage::open_readonly(&home.join("data/agent_search.db")).unwrap();
+        storage
+            .raw()
+            .query_row_map(
+                "SELECT source_path FROM conversations WHERE external_id = 'gh552-cli-chat'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap()
+    };
+    // The native reader's explicit scan unit is a conversations-* directory.
+    let watch_root = Path::new(&source_path).parent().unwrap();
+    assert!(
+        watch_root
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("conversations-")
+    );
+    snapshot[0]["mapping"]["reply-node"]["message"]["content"]["parts"] =
+        json!(["zzgh552replyneedle zzgh552revisedneedle"]);
+    snapshot[0]["mapping"]["reply-node"]["message"]["update_time"] = json!(1700000004.0);
+    snapshot[0]["update_time"] = json!(1700000004.0);
+    fs::write(&export, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    import(&home, "updated");
+    let result = command(&home)
+        .args(["index", "--json", "--no-progress-events", "--watch-once"])
+        .arg(watch_root)
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{result:?}");
+    let revised = rows(&home);
+    assert_eq!(revised.len(), 2);
+    assert_eq!(revised[1].id, reply_id);
+    assert!(revised[1].content.contains("zzgh552revisedneedle"));
+    let result = command(&home)
+        .args([
+            "search",
+            "zzgh552revisedneedle",
+            "--json",
+            "--mode",
+            "lexical",
+            "--no-maintenance",
+            "--no-daemon",
+        ])
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{result:?}");
+    let hits: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(hits["hits"].as_array().unwrap().len(), 1, "{hits}");
+    assert!(
+        hits["hits"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("zzgh552revisedneedle")
+    );
+
+    let fresh = prepare("fresh");
+    import(&fresh, "imported");
+    index(&fresh, true);
+    let project = |messages: Vec<coding_agent_search::model::types::Message>| {
+        messages
+            .into_iter()
+            .map(|m| {
+                (
+                    m.idx,
+                    m.role,
+                    m.author,
+                    m.created_at,
+                    m.content,
+                    m.extra_json,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(project(rows(&home)), project(rows(&fresh)));
+}
+
+#[test]
+#[serial]
 fn detect_does_not_panic() {
     let connector = ChatGptConnector::new();
     let result = connector.detect();
@@ -488,6 +707,128 @@ fn scan_preserves_string_parts_and_drops_object_only_structured_parts_from_real_
     assert_eq!(
         conv.messages[0].content,
         "Leading plain text.\nTrailing plain text."
+    );
+}
+
+#[test]
+fn gh552_scan_retains_voice_only_and_ordered_mixed_transcriptions() {
+    // Exercise CASS's re-export of the upstream connector. This also catches a
+    // dependency pin that still selects the older, string-parts-only parser.
+    let tmp = TempDir::new().unwrap();
+    let conv_dir = tmp.path().join("conversations-gh552");
+    let voice = serde_json::json!({
+        "id": "gh552-voice-only",
+        "mapping": {
+            "voice-user": {"message": {
+                "author": {"role": "user"},
+                "create_time": 1700000000,
+                "content": {"parts": [
+                    {"content_type": "real_time_user_audio_video_asset_pointer",
+                     "asset_pointer": "sediment://input", "text": "Ignore asset metadata."},
+                    {"content_type": "audio_transcription", "text": "Spoken question.",
+                     "direction": "in"}
+                ]}
+            }},
+            "voice-assistant": {"message": {
+                "id": "assistant-native-id",
+                "author": {"role": "assistant"},
+                "create_time": 1700000001,
+                "content": {"parts": [
+                    {"content_type": "audio_transcription", "text": "Spoken answer.",
+                     "direction": "out"},
+                    {"content_type": "audio_asset_pointer", "asset_pointer": "sediment://output",
+                     "text": "Ignore output asset metadata."}
+                ]}
+            }}
+        }
+    });
+    let mixed = serde_json::json!({
+        "id": "gh552-mixed",
+        "mapping": {
+            "mixed-node": {"message": {
+                "id": "mixed-native-id",
+                "author": {"role": "user"},
+                "create_time": 1700000002,
+                "content": {"parts": [
+                    "Typed prefix.",
+                    {"content_type": "image_asset_pointer", "asset_pointer": "sediment://image",
+                     "text": "Ignore image metadata."},
+                    {"content_type": "audio_transcription", "text": "Spoken middle."},
+                    {"content_type": "audio_transcription", "text": null},
+                    {"content_type": "audio_transcription", "text": 17},
+                    {"content_type": "unsupported", "text": "Ignore unknown structured parts."},
+                    "Typed suffix."
+                ]}
+            }}
+        }
+    });
+    let assets = serde_json::json!({
+        "id": "gh552-assets-only",
+        "mapping": {
+            "asset-node": {"message": {
+                "author": {"role": "user"},
+                "create_time": 1700000003,
+                "content": {"parts": [
+                    {"content_type": "audio_asset_pointer", "asset_pointer": "sediment://asset",
+                     "text": "Asset text is not a transcript."}
+                ]}
+            }}
+        }
+    });
+    for (name, value) in [("voice", voice), ("mixed", mixed), ("assets", assets)] {
+        write_json(&conv_dir, &format!("{name}.json"), &value.to_string());
+    }
+
+    let connector = ChatGptConnector::with_encryption_key(CHATGPT_TEST_KEY);
+    let context = ScanContext::local_default(tmp.path().to_path_buf(), None);
+    let conversations = connector.scan(&context).unwrap();
+    assert_eq!(conversations.len(), 2, "asset-only input has no transcript");
+    let voice = conversations
+        .iter()
+        .find(|conversation| conversation.external_id.as_deref() == Some("gh552-voice-only"))
+        .unwrap();
+    assert_eq!(voice.started_at, Some(1_700_000_000_000));
+    assert_eq!(voice.ended_at, Some(1_700_000_001_000));
+    assert_eq!(voice.messages.len(), 2);
+    for (message, idx, role, content, native_id, created_at) in [
+        (
+            &voice.messages[0],
+            0,
+            "user",
+            "Spoken question.",
+            "voice-user",
+            1_700_000_000_000,
+        ),
+        (
+            &voice.messages[1],
+            1,
+            "assistant",
+            "Spoken answer.",
+            "assistant-native-id",
+            1_700_000_001_000,
+        ),
+    ] {
+        assert_eq!(message.idx, idx);
+        assert_eq!(message.role, role);
+        assert_eq!(message.content, content);
+        assert_eq!(message.created_at, Some(created_at));
+        assert_eq!(message.extra["chatgpt_message_id"], native_id);
+    }
+    let mixed = conversations
+        .iter()
+        .find(|conversation| conversation.external_id.as_deref() == Some("gh552-mixed"))
+        .unwrap();
+    assert_eq!(mixed.messages.len(), 1);
+    assert_eq!(mixed.messages[0].idx, 0);
+    assert_eq!(mixed.messages[0].role, "user");
+    assert_eq!(mixed.messages[0].created_at, Some(1_700_000_002_000));
+    assert_eq!(
+        mixed.messages[0].extra["chatgpt_message_id"],
+        "mixed-native-id"
+    );
+    assert_eq!(
+        mixed.messages[0].content,
+        "Typed prefix.\nSpoken middle.\nTyped suffix."
     );
 }
 

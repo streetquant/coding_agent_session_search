@@ -924,6 +924,21 @@
             "last_indexed_at": {
               "type": "null"
             },
+            "source_scan_completed_at": {
+              "type": "null"
+            },
+            "source_scan_age_seconds": {
+              "type": "null"
+            },
+            "source_scan_threshold_seconds": {
+              "type": "integer"
+            },
+            "source_scan_known": {
+              "type": "boolean"
+            },
+            "source_scan_overdue": {
+              "type": "null"
+            },
             "age_seconds": {
               "type": "string"
             },

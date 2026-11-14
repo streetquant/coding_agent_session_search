@@ -20509,6 +20509,26 @@ fn run_analytics_rebuild(
             result.elapsed_ms,
             result.messages_per_sec
         );
+        // Routine indexing defers this materialization too. Only an explicit
+        // full message-level rebuild may add its complete canonical scan;
+        // windowed Track A and Track-B-only work retain their existing scope.
+        // The legacy all-track repair above already completed this phase.
+        if since_ms.is_none() && legacy_omp_rebuild.is_none() {
+            eprintln!("Rebuilding daily session statistics...");
+            let daily_stats = storage.rebuild_daily_stats().map_err(|error| CliError {
+                code: 9,
+                kind: CliErrorKind::ArchiveDailyStatsRebuild.kind_str(),
+                message: format!("Daily statistics rebuild failed: {error:#}"),
+                hint: Some(
+                    "Inspect the archive and retry the same full analytics rebuild command.".into(),
+                ),
+                retryable: true,
+            })?;
+            eprintln!(
+                "Daily statistics complete: {} rows for {} sessions",
+                daily_stats.rows_created, daily_stats.total_sessions
+            );
+        }
         tracks_rebuilt.push("a");
         payload.insert(
             "track_a".into(),
@@ -20817,6 +20837,65 @@ mod analytics_filter_validation_tests {
             wal_len <= 32,
             "analytics rebuild must not leave WAL frames behind (wal_len={wal_len})"
         );
+    }
+
+    #[test]
+    fn analytics_rebuild_repairs_daily_cache_only_for_full_track_a() -> anyhow::Result<()> {
+        use crate::storage::sqlite::FrankenStorage;
+
+        let dir = tempfile::Builder::new().disable_cleanup(true).tempdir()?;
+        let db_path = dir.path().join("agent_search.db");
+        let seed_stale_cache = || -> anyhow::Result<()> {
+            let storage = FrankenStorage::open(&db_path)?;
+            storage.raw().execute(
+                "INSERT INTO daily_stats (
+                    day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated
+                 ) VALUES (42, 'all', 'all', 7, 13, 17, 19)",
+            )?;
+            Ok(())
+        };
+        let snapshot = || -> anyhow::Result<Vec<String>> {
+            let storage = FrankenStorage::open_readonly(&db_path)?;
+            Ok(storage
+                .raw()
+                .query("SELECT * FROM daily_stats ORDER BY day_id, agent_slug, source_id")?
+                .into_iter()
+                .map(|row| format!("{:?}", row.values()))
+                .collect())
+        };
+        seed_stale_cache()?;
+        let before = snapshot()?;
+        assert_eq!(before.len(), 1);
+
+        // Windowed maintenance must not grow into an unrequested full scan;
+        // Track B owns the token ledger, not this conversation-count cache.
+        for (track, days) in [
+            (AnalyticsTrack::A, Some(2)),
+            (AnalyticsTrack::All, Some(2)),
+            (AnalyticsTrack::B, None),
+        ] {
+            let mut options = common();
+            options.days = days;
+            run_analytics_rebuild(&options, track, Some(&db_path))
+                .unwrap_or_else(|error| panic!("{track:?}: {}", error.message));
+            assert_eq!(snapshot()?, before, "{track:?}, days={days:?}");
+        }
+
+        // The canonical archive is empty: a full message-level rebuild must
+        // replace the stale cache with no rows, rather than report success
+        // while its cached counts still describe seven absent sessions.
+        for track in [AnalyticsTrack::A, AnalyticsTrack::All] {
+            run_analytics_rebuild(&common(), track, Some(&db_path))
+                .unwrap_or_else(|error| panic!("{track:?}: {}", error.message));
+            assert!(
+                snapshot()?.is_empty(),
+                "{track:?}: stale daily cache survived"
+            );
+            if track == AnalyticsTrack::A {
+                seed_stale_cache()?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -21295,8 +21374,6 @@ async fn import_chatgpt_export(
     output_dir: Option<&Path>,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
-    use std::io::Write;
-
     // Validate export file exists
     if !export_path.exists() {
         return Err(CliError {
@@ -21364,41 +21441,53 @@ async fn import_chatgpt_export(
 
     let total = conversations.len();
     let mut imported = 0u64;
+    let mut updated = 0u64;
     let mut skipped = 0u64;
+
+    // Serialize read/merge/publish across importers. Atomic rename protects
+    // readers, but two importers must not both merge against the same old file.
+    let import_lock_path = base_dir.join(".chatgpt-import.lock");
+    let import_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&import_lock_path)
+        .map_err(|e| CliError {
+            code: 1,
+            kind: CliErrorKind::Io.kind_str(),
+            message: format!("Failed to open {}: {e}", import_lock_path.display()),
+            hint: None,
+            retryable: false,
+        })?;
+    fs2::FileExt::try_lock_exclusive(&import_lock).map_err(|e| CliError {
+        code: 7,
+        kind: CliErrorKind::Io.kind_str(),
+        message: format!("Cannot acquire ChatGPT import lock: {e}"),
+        hint: Some("Wait for the other import into this directory to finish, then retry".into()),
+        retryable: true,
+    })?;
 
     for conv in &conversations {
         let filepath = conv_dir.join(format!("{}.json", chatgpt_import_file_stem(conv)));
-
-        // Idempotent: skip if already exists
-        if filepath.exists() {
-            skipped += 1;
-            continue;
+        let change = store_chatgpt_import_conversation(&filepath, conv).map_err(|e| CliError {
+            code: 1,
+            kind: if e.kind() == io::ErrorKind::InvalidData {
+                CliErrorKind::ParseError.kind_str()
+            } else {
+                CliErrorKind::Io.kind_str()
+            },
+            message: format!("Failed to import {}: {e}", filepath.display()),
+            hint: Some(
+                "The existing conversation is preserved on validation or staging failure".into(),
+            ),
+            retryable: false,
+        })?;
+        match change {
+            ChatGptImportChange::Imported => imported += 1,
+            ChatGptImportChange::Updated => updated += 1,
+            ChatGptImportChange::Unchanged => skipped += 1,
         }
-
-        // Write individual conversation file
-        let mut file = std::fs::File::create(&filepath).map_err(|e| CliError {
-            code: 1,
-            kind: CliErrorKind::Io.kind_str(),
-            message: format!("Failed to write {}: {e}", filepath.display()),
-            hint: None,
-            retryable: false,
-        })?;
-        serde_json::to_writer(&mut file, conv).map_err(|e| CliError {
-            code: 1,
-            kind: CliErrorKind::Io.kind_str(),
-            message: format!("Failed to serialize conversation: {e}"),
-            hint: None,
-            retryable: false,
-        })?;
-        file.flush().map_err(|e| CliError {
-            code: 1,
-            kind: CliErrorKind::Io.kind_str(),
-            message: format!("Failed to flush: {e}"),
-            hint: None,
-            retryable: false,
-        })?;
-
-        imported += 1;
     }
 
     // GH #378: the indexer only scans a connector's *default* roots when
@@ -21444,6 +21533,7 @@ async fn import_chatgpt_export(
             "success": true,
             "total": total,
             "imported": imported,
+            "updated": updated,
             "skipped": skipped,
             "output_dir": conv_dir.display().to_string(),
             "scan_root": registered_scan_root.as_ref().map(|state| serde_json::json!({
@@ -21460,7 +21550,8 @@ async fn import_chatgpt_export(
         println!("Import complete!");
         println!("  Total conversations: {total}");
         println!("  Newly imported:      {imported}");
-        println!("  Skipped (existing):  {skipped}");
+        println!("  Updated existing:    {updated}");
+        println!("  Skipped (unchanged): {skipped}");
         println!("  Output directory:    {}", conv_dir.display());
         if let Some(state) = registered_scan_root {
             println!(
@@ -21474,6 +21565,219 @@ async fn import_chatgpt_export(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatGptImportChange {
+    Imported,
+    Updated,
+    Unchanged,
+}
+
+/// Refresh an imported snapshot without discarding nodes omitted by a partial
+/// export. The caller holds the directory's import lock until publication.
+fn store_chatgpt_import_conversation(
+    path: &Path,
+    incoming: &serde_json::Value,
+) -> io::Result<ChatGptImportChange> {
+    if !incoming.is_object() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected a conversation object",
+        ));
+    }
+    let existing = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "refusing to replace a non-regular conversation file",
+            ));
+        }
+        Ok(_) => {
+            let bytes = std::fs::read(path)?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Some(value)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    let (snapshot, change) = if let Some(existing) = existing {
+        if existing == *incoming {
+            return Ok(ChatGptImportChange::Unchanged);
+        }
+        let merged = merge_chatgpt_import_snapshots(&existing, incoming)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if merged == existing {
+            return Ok(ChatGptImportChange::Unchanged);
+        }
+        (merged, ChatGptImportChange::Updated)
+    } else {
+        (incoming.clone(), ChatGptImportChange::Imported)
+    };
+    publish_chatgpt_import_snapshot(path, change == ChatGptImportChange::Updated, |file| {
+        serde_json::to_writer(file, &snapshot).map_err(io::Error::other)
+    })?;
+    Ok(change)
+}
+
+/// Changed web-export mappings are merged by their stable node keys. Unknown
+/// shapes or conflicting identities are refused instead of guessing a merge.
+fn merge_chatgpt_import_snapshots(
+    existing: &serde_json::Value,
+    incoming: &serde_json::Value,
+) -> Result<serde_json::Value, &'static str> {
+    use serde_json::Value;
+
+    let conversation_id = |value: &Value| {
+        value
+            .get("id")
+            .or_else(|| value.get("conversation_id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_owned)
+    };
+    let existing_id = conversation_id(existing);
+    if existing_id.is_none() || existing_id != conversation_id(incoming) {
+        return Err("existing and incoming conversation identities do not match");
+    }
+    let existing_mapping = existing
+        .get("mapping")
+        .and_then(Value::as_object)
+        .ok_or("cannot safely refresh an existing conversation without a mapping object")?;
+    let incoming_mapping = incoming
+        .get("mapping")
+        .and_then(Value::as_object)
+        .ok_or("cannot safely refresh from a conversation without a mapping object")?;
+    let update_time = |value: &Value| value.get("update_time").and_then(Value::as_f64);
+    let incoming_is_older = matches!(
+        (update_time(existing), update_time(incoming)),
+        (Some(old), Some(new)) if new < old
+    );
+
+    let mut merged = existing.clone();
+    let merged_object = merged
+        .as_object_mut()
+        .ok_or("existing conversation is not an object")?;
+    // Preserve absent metadata; a dated older export cannot roll metadata back.
+    if !incoming_is_older {
+        for (key, value) in incoming
+            .as_object()
+            .ok_or("incoming conversation is not an object")?
+        {
+            if key != "mapping"
+                && !(key == "update_time"
+                    && value.as_f64().is_none()
+                    && update_time(existing).is_some())
+            {
+                merged_object.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    let mut mapping = existing_mapping.clone();
+    for node in existing_mapping.values().chain(incoming_mapping.values()) {
+        if !node.is_object()
+            || node
+                .get("message")
+                .is_some_and(|message| !message.is_null() && !message.is_object())
+        {
+            return Err("mapping contains a malformed node or message");
+        }
+    }
+    for (key, node) in incoming_mapping {
+        let Some(previous) = mapping.get(key) else {
+            mapping.insert(key.clone(), node.clone());
+            continue;
+        };
+        let old_message = previous.get("message").filter(|value| !value.is_null());
+        let new_message = node.get("message").filter(|value| !value.is_null());
+        let mut node_is_older = incoming_is_older;
+        if let (Some(old), Some(new)) = (old_message, new_message) {
+            if let (Some(old_id), Some(new_id)) = (
+                old.get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty()),
+                new.get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty()),
+            ) && old_id != new_id
+            {
+                return Err("a mapping node changed its native message identity");
+            }
+            // Message-level revision times are more precise than conversation
+            // metadata when only one of the messages was edited.
+            if let (Some(old), Some(new)) = (update_time(old), update_time(new))
+                && old != new
+            {
+                node_is_older = new < old;
+            }
+        }
+        // Missing/null messages and stale snapshots are not deletion requests.
+        if (old_message.is_some() && new_message.is_none())
+            || (node_is_older && !(old_message.is_none() && new_message.is_some()))
+        {
+            continue;
+        }
+        let mut merged_node = previous.clone();
+        merge_chatgpt_import_node(&mut merged_node, node);
+        mapping.insert(key.clone(), merged_node);
+    }
+    merged_object.insert("mapping".into(), Value::Object(mapping));
+    Ok(merged)
+}
+
+// A partial node may omit message/content fields as well as entire nodes. Keep
+// omitted fields; arrays (including ordered content parts) remain indivisible.
+fn merge_chatgpt_import_node(existing: &mut serde_json::Value, incoming: &serde_json::Value) {
+    if let (Some(old), Some(new)) = (existing.as_object_mut(), incoming.as_object()) {
+        for (key, value) in new {
+            if let Some(previous) = old.get_mut(key) {
+                // An absent native ID is not permission to replace an existing
+                // stable identity with the mapping-node fallback.
+                if key == "id"
+                    && previous.as_str().is_some_and(|id| !id.trim().is_empty())
+                    && !value.as_str().is_some_and(|id| !id.trim().is_empty())
+                {
+                    continue;
+                }
+                if key != "update_time" || value.as_f64().is_some() || previous.as_f64().is_none() {
+                    merge_chatgpt_import_node(previous, value);
+                }
+            } else {
+                old.insert(key.clone(), value.clone());
+            }
+        }
+    } else {
+        *existing = incoming.clone();
+    }
+}
+
+/// Stage a complete file beside its destination. Readers see the complete old
+/// or new snapshot, never a truncated in-place rewrite.
+fn publish_chatgpt_import_snapshot(
+    path: &Path,
+    replace: bool,
+    write_staged: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
+) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "conversation path has no parent",
+        )
+    })?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(".cass-chatgpt-import-")
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    write_staged(staged.as_file_mut())?;
+    staged.as_file_mut().flush()?;
+    staged.as_file().sync_all()?;
+    if replace {
+        staged.persist(path).map_err(|e| e.error)?;
+    } else {
+        staged.persist_noclobber(path).map_err(|e| e.error)?;
+    }
+    sync_export_parent_directory(path)
 }
 
 /// File stem for one imported ChatGPT conversation.
@@ -21540,6 +21844,385 @@ mod chatgpt_import_file_stem_tests {
         let b = serde_json::json!({ "title": "second" });
         assert_ne!(chatgpt_import_file_stem(&a), chatgpt_import_file_stem(&b));
         assert_eq!(chatgpt_import_file_stem(&a), chatgpt_import_file_stem(&a));
+    }
+}
+
+#[cfg(test)]
+mod chatgpt_import_refresh_tests {
+    use super::{
+        ChatGptImportChange, publish_chatgpt_import_snapshot, store_chatgpt_import_conversation,
+    };
+    use serde_json::{Value, json};
+    use std::io::{self, Write};
+    use std::path::Path;
+
+    fn snapshot() -> Value {
+        json!({
+            "id": "growing-chat",
+            "title": "Current title",
+            "update_time": 20,
+            "mapping": {
+                "early": {
+                    "message": {
+                        "id": "native-early",
+                        "author": {"role": "user"},
+                        "create_time": 1,
+                        "update_time": 20,
+                        "content": {"content_type": "text", "parts": ["Existing prompt"]}
+                    }
+                },
+                "later": {
+                    "parent": "early",
+                    "message": {
+                        "id": "native-later",
+                        "author": {"role": "assistant"},
+                        "create_time": 3,
+                        "content": {"content_type": "text", "parts": ["Existing reply"]}
+                    }
+                }
+            }
+        })
+    }
+
+    fn read_snapshot(path: &Path) -> Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn gh552_semantically_identical_import_preserves_bytes_and_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("growing-chat.json");
+        let original = snapshot();
+        assert_eq!(
+            store_chatgpt_import_conversation(&path, &original).unwrap(),
+            ChatGptImportChange::Imported
+        );
+        let pretty = serde_json::to_vec_pretty(&original).unwrap();
+        std::fs::write(&path, &pretty).unwrap();
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_234_567_890);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(
+            store_chatgpt_import_conversation(&path, &original).unwrap(),
+            ChatGptImportChange::Unchanged
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), pretty);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+
+    #[test]
+    fn gh552_refresh_retains_history_and_admits_interleaved_voice_nodes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("growing-chat.json");
+        let original = snapshot();
+        store_chatgpt_import_conversation(&path, &original).unwrap();
+        let mut incoming = json!({
+            "id": "growing-chat",
+            "title": "Updated title",
+            "update_time": 30,
+            "mapping": {
+                "voice": {
+                    "parent": "early",
+                    "message": {
+                        "id": "native-voice",
+                        "author": {"role": "user"},
+                        "create_time": 2,
+                        "content": {
+                            "content_type": "multimodal_text",
+                            "parts": [
+                                {"content_type": "audio_transcription", "text": "Recovered voice"},
+                                {"content_type": "audio_asset_pointer", "asset_pointer": "file://audio"}
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            store_chatgpt_import_conversation(&path, &incoming).unwrap(),
+            ChatGptImportChange::Updated
+        );
+        let refreshed = read_snapshot(&path);
+        assert_eq!(refreshed["mapping"].as_object().unwrap().len(), 3);
+        assert_eq!(refreshed["title"], "Updated title");
+        assert_eq!(refreshed["mapping"]["early"], original["mapping"]["early"]);
+        assert_eq!(refreshed["mapping"]["later"], original["mapping"]["later"]);
+        assert_eq!(refreshed["mapping"]["voice"], incoming["mapping"]["voice"]);
+        assert_eq!(
+            store_chatgpt_import_conversation(&path, &incoming).unwrap(),
+            ChatGptImportChange::Unchanged
+        );
+
+        // Ordered content arrays are indivisible; do not concatenate revisions.
+        incoming["update_time"] = json!(40);
+        incoming["mapping"]["voice"]["message"]["content"]["parts"] = json!(["Replacement preface", {
+            "content_type": "audio_transcription", "text": "Replacement voice"
+        }]);
+        assert_eq!(
+            store_chatgpt_import_conversation(&path, &incoming).unwrap(),
+            ChatGptImportChange::Updated
+        );
+        let replaced = read_snapshot(&path);
+        assert_eq!(
+            replaced["mapping"]["voice"]["message"]["content"]["parts"],
+            incoming["mapping"]["voice"]["message"]["content"]["parts"]
+        );
+        assert_eq!(replaced["mapping"]["early"], original["mapping"]["early"]);
+        assert_eq!(replaced["mapping"]["later"], original["mapping"]["later"]);
+    }
+
+    #[test]
+    fn gh552_older_partial_import_adds_missing_nodes_without_rolling_back_messages() {
+        // Equal message revisions must not override an older conversation date.
+        for message_revision in [10, 20] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("growing-chat.json");
+            let original = snapshot();
+            store_chatgpt_import_conversation(&path, &original).unwrap();
+            let incoming = json!({
+                "id": "growing-chat",
+                "title": "Stale title",
+                "update_time": 10,
+                "mapping": {
+                    "early": {
+                        "message": {
+                            "id": "native-early",
+                            "update_time": message_revision,
+                            "content": {"content_type": "text", "parts": ["Stale prompt"]}
+                        }
+                    },
+                    "recovered": {
+                        "message": {
+                            "id": "native-recovered",
+                            "author": {"role": "user"},
+                            "create_time": 0.5,
+                            "content": {
+                                "content_type": "multimodal_text",
+                                "parts": [{"content_type": "audio_transcription", "text": "Old voice"}]
+                            }
+                        }
+                    }
+                }
+            });
+            assert_eq!(
+                store_chatgpt_import_conversation(&path, &incoming).unwrap(),
+                ChatGptImportChange::Updated
+            );
+            let refreshed = read_snapshot(&path);
+            assert_eq!(refreshed["title"], original["title"]);
+            assert_eq!(refreshed["update_time"], original["update_time"]);
+            assert_eq!(refreshed["mapping"].as_object().unwrap().len(), 3);
+            assert_eq!(refreshed["mapping"]["early"], original["mapping"]["early"]);
+            assert_eq!(refreshed["mapping"]["later"], original["mapping"]["later"]);
+            assert_eq!(
+                refreshed["mapping"]["recovered"],
+                incoming["mapping"]["recovered"]
+            );
+            assert_eq!(
+                store_chatgpt_import_conversation(&path, &incoming).unwrap(),
+                ChatGptImportChange::Unchanged
+            );
+        }
+    }
+
+    #[test]
+    fn gh552_partial_nodes_and_message_revision_times_preserve_current_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("growing-chat.json");
+        let original = snapshot();
+        store_chatgpt_import_conversation(&path, &original).unwrap();
+        let incoming = json!({
+            "id": "growing-chat",
+            "update_time": 30,
+            "mapping": {
+                "early": {
+                    "message": {
+                        "id": "native-early",
+                        "update_time": 19,
+                        "content": {"content_type": "text", "parts": ["Stale prompt"]}
+                    }
+                },
+                "later": {
+                    "message": {
+                        "id": "native-later",
+                        "metadata": {"model_slug": "test-model"}
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            store_chatgpt_import_conversation(&path, &incoming).unwrap(),
+            ChatGptImportChange::Updated
+        );
+        let refreshed = read_snapshot(&path);
+        assert_eq!(refreshed["mapping"]["early"], original["mapping"]["early"]);
+        assert_eq!(
+            refreshed["mapping"]["later"]["message"]["content"],
+            original["mapping"]["later"]["message"]["content"]
+        );
+        assert_eq!(
+            refreshed["mapping"]["later"]["message"]["metadata"]["model_slug"],
+            "test-model"
+        );
+        let omitted = json!({
+            "id": "growing-chat",
+            "update_time": 30,
+            "mapping": {"early": {"message": null}, "later": {}}
+        });
+        assert_eq!(
+            store_chatgpt_import_conversation(&path, &omitted).unwrap(),
+            ChatGptImportChange::Unchanged
+        );
+        assert_eq!(read_snapshot(&path), refreshed);
+    }
+
+    #[test]
+    fn gh552_missing_native_ids_and_older_null_node_recovery_keep_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("growing-chat.json");
+        let mut original = snapshot();
+        original["mapping"]["pending"] = json!({"message": null});
+        store_chatgpt_import_conversation(&path, &original).unwrap();
+        let older = json!({
+            "id": "growing-chat",
+            "update_time": 10,
+            "mapping": {
+                "pending": {
+                    "message": {
+                        "id": "native-pending",
+                        "author": {"role": "user"},
+                        "create_time": 2,
+                        "content": {"content_type": "text", "parts": ["Recovered placeholder"]}
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            store_chatgpt_import_conversation(&path, &older).unwrap(),
+            ChatGptImportChange::Updated
+        );
+        let refreshed = read_snapshot(&path);
+        assert_eq!(refreshed["update_time"], 20);
+        assert_eq!(refreshed["mapping"]["pending"], older["mapping"]["pending"]);
+        assert_eq!(refreshed["mapping"]["early"], original["mapping"]["early"]);
+        for absent_id in [Value::Null, json!("  ")] {
+            let partial = json!({
+                "id": "growing-chat",
+                "update_time": null,
+                "mapping": {
+                    "early": {"message": {"id": absent_id, "update_time": null}}
+                }
+            });
+            assert_eq!(
+                store_chatgpt_import_conversation(&path, &partial).unwrap(),
+                ChatGptImportChange::Unchanged
+            );
+            assert_eq!(read_snapshot(&path), refreshed);
+        }
+    }
+
+    #[test]
+    fn gh552_malformed_existing_json_and_ambiguous_refreshes_preserve_original_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("growing-chat.json");
+        let malformed = b"{not valid json";
+        std::fs::write(&path, malformed).unwrap();
+        assert_eq!(
+            store_chatgpt_import_conversation(&path, &snapshot())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), malformed.to_vec());
+
+        let original = snapshot();
+        let bytes = serde_json::to_vec_pretty(&original).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut wrong_conversation = original.clone();
+        wrong_conversation["id"] = json!("different-conversation");
+        let wrong_shape = json!({"id": "growing-chat", "messages": []});
+        let mut wrong_message = original.clone();
+        wrong_message["mapping"]["early"]["message"]["id"] = json!("different-message");
+        let mut malformed_message = original.clone();
+        malformed_message["mapping"]["early"]["message"] = json!(["invalid message"]);
+        for incoming in [
+            wrong_conversation,
+            wrong_shape,
+            wrong_message,
+            malformed_message,
+        ] {
+            assert_eq!(
+                store_chatgpt_import_conversation(&path, &incoming)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+
+        let unsupported = json!({"id": "growing-chat", "messages": [{"content": "Legacy"}]});
+        let bytes = serde_json::to_vec(&unsupported).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            store_chatgpt_import_conversation(&path, &unsupported).unwrap(),
+            ChatGptImportChange::Unchanged
+        );
+        let changed = json!({"id": "growing-chat", "messages": [{"content": "Changed"}]});
+        assert!(store_chatgpt_import_conversation(&path, &changed).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn gh552_staging_failure_and_new_file_collision_never_truncate_published_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("growing-chat.json");
+        let original = serde_json::to_vec(&snapshot()).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let failure = publish_chatgpt_import_snapshot(&path, true, |file| {
+            file.write_all(b"partial replacement")?;
+            Err(io::Error::other("injected staging failure"))
+        });
+        assert!(failure.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+
+        let collision = publish_chatgpt_import_snapshot(&path, false, |file| {
+            file.write_all(b"new file must not replace existing")
+        });
+        assert!(collision.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh552_import_refuses_symlink_without_mutating_the_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target.json");
+        let link = tmp.path().join("growing-chat.json");
+        let original = serde_json::to_vec(&snapshot()).unwrap();
+        std::fs::write(&target, &original).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(
+            store_chatgpt_import_conversation(&link, &snapshot())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 }
 
@@ -23540,6 +24223,28 @@ fn state_meta_json_inner(
     let conversation_count = db_snapshot.conversation_count;
     let message_count = db_snapshot.message_count;
     let last_scan_ts = db_snapshot.last_scan_ts;
+    // Source-scan age is independent of derived-index freshness: an index can
+    // be byte-current while no source scan has run since the archive last
+    // changed. Surface it with the same threshold the read-path auto-refresh
+    // uses, so `status`/`health` and the detached refresh cannot disagree.
+    // `healthy` deliberately remains the index/archive readiness verdict; an
+    // overdue source scan is an explicit warning plus a recommended command,
+    // not a second meaning for the health bit (y696o).
+    let source_scan_threshold = crate::indexer::background_refresh::source_scan_status_threshold();
+    // The fast health contract skips the DB open entirely; without an open
+    // there is no watermark to classify. Emit `null` (unknown), never a
+    // fabricated "overdue" that would make every healthy fast probe warn.
+    let source_scan_known = db_snapshot.opened;
+    let source_scan_completed_at_ms = last_scan_ts.filter(|ts| *ts > 0);
+    let source_scan_age_seconds = source_scan_completed_at_ms
+        .map(|ts| now_secs.saturating_sub((ts / 1000) as u64));
+    let source_scan_overdue = source_scan_known.then(|| {
+        crate::indexer::background_refresh::source_scan_is_due(
+            source_scan_completed_at_ms,
+            now_ms_i64,
+            source_scan_threshold,
+        )
+    });
     let mut last_indexed_at = db_snapshot.last_indexed_at;
     let watch_lexical_replay_pending = db_snapshot.watch_lexical_replay_pending;
     let db_opened = db_snapshot.opened;
@@ -23993,6 +24698,18 @@ fn state_meta_json_inner(
                     .unwrap_or_else(chrono::Utc::now)
                     .to_rfc3339()
             }),
+            // y696o: the source-scan watermark is stored in the archive, not
+            // implied by index freshness. `null` completed_at means no scan is
+            // recorded (and `source_scan_is_due` treats it as due).
+            "source_scan_completed_at": source_scan_completed_at_ms.map(|ts| {
+                chrono::DateTime::from_timestamp_millis(ts)
+                    .unwrap_or_else(chrono::Utc::now)
+                    .to_rfc3339()
+            }),
+            "source_scan_age_seconds": source_scan_age_seconds,
+            "source_scan_threshold_seconds": source_scan_threshold.as_secs(),
+            "source_scan_known": source_scan_known,
+            "source_scan_overdue": source_scan_overdue,
             "age_seconds": lexical.age_seconds,
             "stale": lexical.stale,
             "stale_threshold_seconds": stale_threshold,
@@ -25016,6 +25733,11 @@ fn readiness_recommended_commands(
         .and_then(|pending| pending.get("sessions"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+    let source_scan_overdue = state
+        .get("index")
+        .and_then(|index| index.get("source_scan_overdue"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
 
     // b4uax: legacy Tantivy generation — the only fix is a full rebuild.
     let index_engine_incompatible = state
@@ -25202,6 +25924,38 @@ fn readiness_recommended_commands(
                 run_when: "Run after refresh-lexical-index finishes.",
                 success_signal: "healthy=true or recommended_commands changes to the next blocker",
                 parse_fields: &["status", "healthy", "state.index", "recommended_commands"],
+                retry_after_ms: None,
+            },
+        ));
+        return commands;
+    }
+
+    if source_scan_overdue {
+        commands.push(readiness_command_recommendation(
+            ReadinessCommandRecommendation {
+                id: "refresh-lexical-index",
+                command: cass_dataset_command(
+                    data_dir,
+                    db_path,
+                    &["index", "--json", "--no-progress-events"],
+                ),
+                purpose: "Scan source roots for newly changed sessions; the derived index is fresh but the source-scan watermark is overdue.",
+                safety: "writes-cass-archive-and-derived-index",
+                run_when: "Run when index.fresh=true but index.source_scan_overdue=true.",
+                success_signal: "success=true, then index.source_scan_overdue=false",
+                parse_fields: &["success", "conversations", "messages", "error"],
+                retry_after_ms: None,
+            },
+        ));
+        commands.push(readiness_command_recommendation(
+            ReadinessCommandRecommendation {
+                id: "verify-refresh",
+                command: cass_dataset_command(data_dir, db_path, &["status", "--json"]),
+                purpose: "Confirm the source scan watermark advanced.",
+                safety: "read-only",
+                run_when: "Run after refresh-lexical-index finishes.",
+                success_signal: "index.source_scan_overdue=false",
+                parse_fields: &["index", "warnings", "recommended_commands"],
                 retry_after_ms: None,
             },
         ));
@@ -88635,6 +89389,30 @@ fn run_status(
     if deferred_conversations > 0 {
         warnings.push(watch_nomem_deferral_warning(deferred_conversations));
     }
+    let source_scan_overdue = state
+        .get("index")
+        .and_then(|i| i.get("source_scan_overdue"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if source_scan_overdue {
+        let age = state
+            .get("index")
+            .and_then(|i| i.get("source_scan_age_seconds"))
+            .and_then(serde_json::Value::as_u64);
+        let threshold = state
+            .get("index")
+            .and_then(|i| i.get("source_scan_threshold_seconds"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        warnings.push(match age {
+            Some(age) => format!(
+                "source scan is overdue: the last completed scan was {age}s ago (threshold {threshold}s); run 'cass index' to discover newly changed sessions"
+            ),
+            None => format!(
+                "source scan is overdue: no completed source scan is recorded (threshold {threshold}s); run 'cass index' to discover sessions"
+            ),
+        });
+    }
 
     let db_available = db_opened || (db_exists && db_open_retryable);
     let lexical_index_initialized = cass_lexical_index_initialized(&data_dir);
@@ -88734,6 +89512,11 @@ fn run_status(
         Some(format!(
             "Run 'cass index' to refresh the index{pending_msg}"
         ))
+    } else if source_scan_overdue {
+        Some(
+            "Run 'cass index' to scan source roots for newly changed sessions; the derived index is fresh but its source-scan watermark is overdue"
+                .to_string(),
+        )
     } else if quarantined_conversations > 0 || deferred_conversations > 0 {
         ingest_quarantine_recommended_action
     } else {
@@ -88978,6 +89761,37 @@ fn run_status(
         if index_empty_with_messages {
             println!("  Warning: index has 0 documents but database has messages");
             println!("  Run 'cass index --full' to populate the search index");
+        }
+        if state
+            .get("index")
+            .and_then(|index| index.get("source_scan_known"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let overdue = state
+                .get("index")
+                .and_then(|index| index.get("source_scan_overdue"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let age = state
+                .get("index")
+                .and_then(|index| index.get("source_scan_age_seconds"))
+                .and_then(serde_json::Value::as_u64);
+            let threshold = state
+                .get("index")
+                .and_then(|index| index.get("source_scan_threshold_seconds"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            match (overdue, age) {
+                (true, Some(age)) => println!(
+                    "  Source scan: overdue ({age}s ago; threshold {threshold}s) - run 'cass index'"
+                ),
+                (true, None) => println!(
+                    "  Source scan: overdue (none recorded; threshold {threshold}s) - run 'cass index'"
+                ),
+                (false, Some(age)) => println!("  Source scan: {age}s ago"),
+                (false, None) => {}
+            }
         }
     } else if not_initialized {
         println!("  Not created yet - run 'cass index --full' once");
@@ -90120,6 +90934,30 @@ fn run_health(
     if deferred_conversations > 0 {
         warnings.push(watch_nomem_deferral_warning(deferred_conversations));
     }
+    let source_scan_overdue = state
+        .get("index")
+        .and_then(|index| index.get("source_scan_overdue"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if source_scan_overdue {
+        let age = state
+            .get("index")
+            .and_then(|index| index.get("source_scan_age_seconds"))
+            .and_then(serde_json::Value::as_u64);
+        let threshold = state
+            .get("index")
+            .and_then(|index| index.get("source_scan_threshold_seconds"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        warnings.push(match age {
+            Some(age) => format!(
+                "source scan is overdue: the last completed scan was {age}s ago (threshold {threshold}s); run 'cass index' to discover newly changed sessions"
+            ),
+            None => format!(
+                "source scan is overdue: no completed source scan is recorded (threshold {threshold}s); run 'cass index' to discover sessions"
+            ),
+        });
+    }
 
     let db_degraded = db_exists && !db_opened;
     let lexical_index_initialized = cass_lexical_index_initialized(&data_dir);
@@ -90166,6 +91004,11 @@ fn run_health(
         ingest_quarantine_recommended_action
     } else if !healthy {
         Some("Run 'cass status --json' for the exact readiness gap; run 'cass index --full' only for missing or stale derived search assets.".to_string())
+    } else if source_scan_overdue {
+        Some(
+            "Run 'cass index' to scan source roots for newly changed sessions; the derived index is fresh but its source-scan watermark is overdue"
+                .to_string(),
+        )
     } else {
         semantic_recommended_action(&state, not_initialized)
     };
@@ -109101,12 +109944,17 @@ fn read_followup_file_lines(path: &Path) -> CliResult<Vec<String>> {
         })
 }
 
-/// One JSONL record that the direct-file export/view loader could not decode
-/// and therefore skipped (GH #427). `line_number` is 1-based.
+/// A malformed physical JSONL line encountered by the direct-file export
+/// loader (GH #427 / GH #553). Complete trailing records may still be
+/// recovered. Line numbers and discarded byte counts refer to the source;
+/// the source file is never rewritten.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SkippedJsonlLine {
     pub(crate) line_number: usize,
     pub(crate) error: String,
+    pub(crate) recovered_records: usize,
+    pub(crate) discarded_bytes: usize,
+    pub(crate) recovery_limited: bool,
 }
 
 type TolerantJsonlParse = (
@@ -109116,36 +109964,180 @@ type TolerantJsonlParse = (
     Vec<SkippedJsonlLine>,
 );
 
-/// How many skipped records are named individually on stderr before the
+/// How many affected lines are named individually on stderr before the
 /// remainder is summarised as a count.
 const MAX_REPORTED_SKIPPED_JSONL_LINES: usize = 5;
 
-/// Parse a JSONL session file for export/view, applying the same per-line
-/// policy as the indexer (GH #427): a record that fails to decode is skipped
-/// and reported instead of aborting the whole session. Only when *no* record
-/// decodes is the file rejected, so a genuinely non-JSONL path still falls
-/// back to the indexed copy exactly as before.
+// Recovery only runs after the ordinary parser rejects a physical line.
+// Bound both the input and repeated parsing, so many opening braces cannot
+// turn one malformed line into unbounded quadratic work.
+const MAX_FOLLOWUP_JSONL_RECOVERY_LINE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_FOLLOWUP_JSONL_RECOVERY_PARSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_FOLLOWUP_JSONL_RECOVERY_ATTEMPTS: usize = 64;
+const MAX_FOLLOWUP_JSONL_RECOVERY_RECORDS: usize = 1024;
+
+#[derive(Debug, Default)]
+struct FollowupJsonlRecovery {
+    records: Vec<serde_json::Value>,
+    discarded_bytes: usize,
+    limited: bool,
+}
+
+/// Recognise the root envelopes already consumed by the export loaders.
+/// Arbitrary JSON objects and nested text/tool blocks are not session records.
+/// This restriction applies only to recovery, not to intact JSONL lines.
+fn is_recoverable_followup_record(value: &serde_json::Value) -> bool {
+    fn message(value: &serde_json::Value) -> bool {
+        matches!(
+            value.get("role").and_then(serde_json::Value::as_str),
+            Some(
+                "user"
+                    | "assistant"
+                    | "system"
+                    | "developer"
+                    | "tool"
+                    | "toolResult"
+                    | "tool_result"
+                    | "function"
+            )
+        ) && value
+            .get("content")
+            .is_some_and(|content| content.is_string() || content.is_array())
+    }
+
+    fn has_id(value: &serde_json::Value) -> bool {
+        value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+    }
+
+    if message(value) {
+        return true;
+    }
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("message") => has_id(value) && value.get("message").is_some_and(message),
+        Some(role @ ("user" | "assistant")) => value.get("message").is_some_and(|inner| {
+            message(inner) && inner.get("role").and_then(serde_json::Value::as_str) == Some(role)
+        }),
+        Some("session") => has_id(value),
+        Some("session_meta" | "response_item" | "event_msg" | "turn_context") => {
+            let timestamp = value
+                .get("timestamp")
+                .is_some_and(|timestamp| timestamp.is_string() || timestamp.is_number());
+            let Some(payload) = value.get("payload").filter(|payload| payload.is_object()) else {
+                return false;
+            };
+            timestamp
+                && match value.get("type").and_then(serde_json::Value::as_str) {
+                    Some("session_meta") => has_id(payload),
+                    Some("turn_context") => true,
+                    _ => payload
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|kind| !kind.is_empty()),
+                }
+        }
+        _ => false,
+    }
+}
+
+/// Recover a complete suffix of known session records after a torn prefix.
+///
+/// Search from the start, not the JSON error column: when a write tears inside
+/// a string, the next record's opening brace is consumed as string content and
+/// the reported error lies *after* the record's actual start. Accept only an
+/// entire suffix of object records with no trailing garbage.
+///
+/// A brace at a legal nested-value boundary is ambiguous, even if its suffix
+/// decodes: {"message":{"role":"user","content":"nested"} is a truncated
+/// outer record, not a new root message. Refuse candidates after ':', '[' or
+/// ',' (ignoring ASCII whitespace). This deliberately leaves ambiguous tears
+/// unrecovered rather than manufacturing history from nested data.
+fn recover_followup_jsonl_suffix(line: &str) -> FollowupJsonlRecovery {
+    let mut unrecovered = FollowupJsonlRecovery {
+        discarded_bytes: line.len(),
+        ..FollowupJsonlRecovery::default()
+    };
+    if line.len() > MAX_FOLLOWUP_JSONL_RECOVERY_LINE_BYTES {
+        unrecovered.limited = true;
+        return unrecovered;
+    }
+
+    let mut remaining_parse_bytes = MAX_FOLLOWUP_JSONL_RECOVERY_PARSE_BYTES;
+    let mut attempts = 0;
+    let mut previous_non_whitespace = None;
+    for (offset, byte) in line.bytes().enumerate() {
+        let previous = previous_non_whitespace;
+        if !byte.is_ascii_whitespace() {
+            previous_non_whitespace = Some(byte);
+        }
+        if byte != b'{' || matches!(previous, Some(b':' | b'[' | b',')) {
+            continue;
+        }
+
+        // An ASCII opening brace is always a UTF-8 character boundary.
+        let suffix = &line[offset..];
+        // Skip braces in prose/code before paying for another parse. An object
+        // with a recognised root envelope must start with a quoted field name.
+        if suffix[1..]
+            .trim_start_matches(|ch: char| ch.is_ascii_whitespace())
+            .as_bytes()
+            .first()
+            != Some(&b'"')
+        {
+            continue;
+        }
+        if attempts >= MAX_FOLLOWUP_JSONL_RECOVERY_ATTEMPTS || suffix.len() > remaining_parse_bytes
+        {
+            unrecovered.limited = true;
+            return unrecovered;
+        }
+        attempts += 1;
+        remaining_parse_bytes -= suffix.len();
+
+        let mut records = Vec::new();
+        let mut complete = true;
+        for parsed in serde_json::Deserializer::from_str(suffix).into_iter::<serde_json::Value>() {
+            let Ok(record) = parsed else {
+                complete = false;
+                break;
+            };
+            if !is_recoverable_followup_record(&record) {
+                complete = false;
+                break;
+            }
+            if records.len() >= MAX_FOLLOWUP_JSONL_RECOVERY_RECORDS {
+                unrecovered.limited = true;
+                return unrecovered;
+            }
+            records.push(record);
+        }
+        if complete && !records.is_empty() {
+            return FollowupJsonlRecovery {
+                records,
+                discarded_bytes: offset,
+                limited: false,
+            };
+        }
+    }
+    unrecovered
+}
+
+/// Parse a JSONL session for export, retaining intact records around malformed
+/// lines (GH #427) and conservatively recovering complete records appended
+/// after a torn prefix on the same line (GH #553). Only when no record decodes
+/// is the file rejected, preserving the existing indexed-copy fallback.
+///
+/// Connector ingestion has its own parsing policy; recovered export records
+/// do not imply that the canonical archive has ingested them.
 pub(crate) fn parse_followup_jsonl_messages_tolerant(path: &Path) -> CliResult<TolerantJsonlParse> {
     let lines = read_followup_file_lines(path)?;
     let mut messages = Vec::new();
     let mut session_start = None;
     let mut session_end = None;
     let mut skipped: Vec<SkippedJsonlLine> = Vec::new();
-
-    for (line_index, line) in lines.into_iter().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let msg = match serde_json::from_str::<serde_json::Value>(&line) {
-            Ok(msg) => msg,
-            Err(err) => {
-                skipped.push(SkippedJsonlLine {
-                    line_number: line_index + 1,
-                    error: err.to_string(),
-                });
-                continue;
-            }
-        };
+    let mut append_message = |msg: serde_json::Value| {
         if let Some(ts) = extract_message_timestamp(&msg) {
             if session_start.is_none_or(|start| ts < start) {
                 session_start = Some(ts);
@@ -109155,6 +110147,28 @@ pub(crate) fn parse_followup_jsonl_messages_tolerant(path: &Path) -> CliResult<T
             }
         }
         messages.push(msg);
+    };
+
+    for (line_index, line) in lines.into_iter().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(msg) => append_message(msg),
+            Err(err) => {
+                let recovery = recover_followup_jsonl_suffix(&line);
+                skipped.push(SkippedJsonlLine {
+                    line_number: line_index + 1,
+                    error: err.to_string(),
+                    recovered_records: recovery.records.len(),
+                    discarded_bytes: recovery.discarded_bytes,
+                    recovery_limited: recovery.limited,
+                });
+                for msg in recovery.records {
+                    append_message(msg);
+                }
+            }
+        }
     }
 
     if messages.is_empty()
@@ -109179,8 +110193,9 @@ pub(crate) fn parse_followup_jsonl_messages_tolerant(path: &Path) -> CliResult<T
     Ok((messages, session_start, session_end, skipped))
 }
 
-/// Surface skipped records on stderr (stdout stays data-only) and in the
-/// trace log, mirroring the indexer's `malformed-json-line` diagnostic.
+/// Report damaged lines and recovery on stderr; stdout remains data-only.
+/// Physical line coordinates are retained even when one line yielded several
+/// recovered records. No claim is made about connector-ingest coverage.
 fn report_skipped_jsonl_lines(path: &Path, decoded: usize, skipped: &[SkippedJsonlLine]) {
     if skipped.is_empty() {
         return;
@@ -109190,17 +110205,48 @@ fn report_skipped_jsonl_lines(path: &Path, decoded: usize, skipped: &[SkippedJso
             source_path = %path.display(),
             line_no = line.line_number,
             error = %line.error,
-            "session JSONL line failed to parse; skipping (GH #427)"
+            recovered_records = line.recovered_records,
+            discarded_bytes = line.discarded_bytes,
+            recovery_limited = line.recovery_limited,
+            "session JSONL line failed to parse; retained complete records and skipped malformed bytes (GH #427 / GH #553)"
         );
     }
-    eprintln!(
-        "warning: skipped {} malformed JSONL record(s) in {}; rendered the remaining {} record(s) (cass index applies the same per-line policy)",
-        skipped.len(),
-        path.display(),
-        decoded
-    );
+    let recovered = skipped.iter().fold(0usize, |count, line| {
+        count.saturating_add(line.recovered_records)
+    });
+    let discarded = skipped.iter().fold(0usize, |count, line| {
+        count.saturating_add(line.discarded_bytes)
+    });
+    if recovered == 0 {
+        eprintln!(
+            "warning: skipped {} malformed JSONL record(s) in {}; rendered the remaining {} record(s)",
+            skipped.len(),
+            path.display(),
+            decoded
+        );
+    } else {
+        eprintln!(
+            "warning: recovered {} complete JSONL record(s) from {} malformed line(s) in {}; skipped {} byte(s) and rendered {} record(s)",
+            recovered,
+            skipped.len(),
+            path.display(),
+            discarded,
+            decoded
+        );
+    }
     for line in skipped.iter().take(MAX_REPORTED_SKIPPED_JSONL_LINES) {
-        eprintln!("warning:   line {}: {}", line.line_number, line.error);
+        eprintln!(
+            "warning:   line {}: {}; recovered {} record(s), skipped {} byte(s){}",
+            line.line_number,
+            line.error,
+            line.recovered_records,
+            line.discarded_bytes,
+            if line.recovery_limited {
+                "; bounded recovery limit reached"
+            } else {
+                ""
+            }
+        );
     }
     if skipped.len() > MAX_REPORTED_SKIPPED_JSONL_LINES {
         eprintln!(
@@ -109296,6 +110342,272 @@ mod gh427_tolerant_jsonl_tests {
         let (messages, _, _, skipped) = parse_followup_jsonl_messages_tolerant(&path).unwrap();
         assert_eq!(messages.len(), 2);
         assert!(skipped.is_empty());
+    }
+    fn gh553_torn_pi_session() -> (String, usize) {
+        let first = r#"{"type":"message","id":"a0000001","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"alpha marker one"}],"timestamp":1767225601000}}"#;
+        let prefix = r#"{"type":"message","id":"a0000002","parentId":"a0000001","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"delta marker thinking","thinkingSignature":"sigsigsigsig"#;
+        let tool = r#"{"type":"message","id":"a0000003","parentId":"a0000002","timestamp":"2026-01-01T00:00:03.000Z","message":{"role":"toolResult","toolCallId":"call_1","toolName":"bash","content":[{"type":"text","text":"bravo marker two"}],"details":{},"isError":false,"timestamp":1767225603000}}"#;
+        let last = r#"{"type":"message","id":"a0000004","parentId":"a0000003","timestamp":"2026-01-01T00:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"charlie marker three"}],"timestamp":1767225604000}}"#;
+        (format!("{first}\n{prefix}{tool}\n{last}\n"), prefix.len())
+    }
+
+    #[test]
+    fn gh553_recovers_a_complete_pi_tool_result_after_a_torn_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let (body, prefix_bytes) = gh553_torn_pi_session();
+        let path = write_session(&dir, "torn.jsonl", &body);
+        let torn_line = body.lines().nth(1).unwrap();
+        let error = serde_json::from_str::<serde_json::Value>(torn_line).unwrap_err();
+        assert!(
+            error.column() > prefix_bytes,
+            "the error column lies after the recoverable record's start"
+        );
+
+        let (messages, start, end, skipped) =
+            parse_followup_jsonl_messages_tolerant(&path).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["id"], "a0000001");
+        assert_eq!(messages[1]["id"], "a0000003");
+        assert_eq!(messages[1]["message"]["role"], "toolResult");
+        assert_eq!(
+            messages[1]["message"]["content"][0]["text"],
+            "bravo marker two"
+        );
+        assert_eq!(messages[2]["id"], "a0000004");
+        assert_eq!(start, Some(1767225601000));
+        assert_eq!(end, Some(1767225604000));
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].line_number, 2);
+        assert_eq!(skipped[0].recovered_records, 1);
+        assert_eq!(skipped[0].discarded_bytes, prefix_bytes);
+        assert!(!skipped[0].recovery_limited);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), body);
+    }
+
+    #[test]
+    fn gh553_json_and_text_exports_recover_the_complete_tool_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let (body, _) = gh553_torn_pi_session();
+        let path = write_session(&dir, "torn.jsonl", &body);
+        let db_path = dir.path().join("unused.db");
+        let json_output = dir.path().join("recovered.json");
+        run_export(
+            &path,
+            Some(db_path.clone()),
+            None,
+            ConvExportFormat::Json,
+            Some(&json_output),
+            false,
+            true,
+            true,
+            false,
+        )
+        .expect("JSON export must retain the recovered complete tool result");
+        let exported: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(json_output).unwrap()).unwrap();
+        assert_eq!(exported.len(), 3);
+        assert_eq!(exported[0]["id"], "a0000001");
+        assert_eq!(exported[1]["id"], "a0000003");
+        assert_eq!(
+            exported[1]["message"]["content"][0]["text"],
+            "bravo marker two"
+        );
+        assert_eq!(exported[2]["id"], "a0000004");
+
+        let text_output = dir.path().join("recovered.txt");
+        run_export(
+            &path,
+            Some(db_path.clone()),
+            None,
+            ConvExportFormat::Text,
+            Some(&text_output),
+            false,
+            true,
+            true,
+            false,
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(text_output).unwrap();
+        assert!(text.contains("alpha marker one"));
+        assert!(text.contains("bravo marker two"));
+        assert!(text.contains("charlie marker three"));
+        assert!(
+            !db_path.exists(),
+            "direct JSONL export must not create an archive"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), body);
+    }
+
+    #[test]
+    fn gh553_recovers_multiple_records_in_source_order_and_includes_their_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = r#"{"role":"assistant","content":"cut 🦀 mid-string"#;
+        let first =
+            r#"{"role":"assistant","content":"first appended","timestamp":"2026-01-01T00:00:04Z"}"#;
+        let second =
+            r#"{"role":"user","content":"second appended","timestamp":"2026-01-01T00:00:02Z"}"#;
+        let path = write_session(
+            &dir,
+            "multiple.jsonl",
+            &format!("{prefix}{first} \t{second}\r\n"),
+        );
+        let (messages, start, end, skipped) =
+            parse_followup_jsonl_messages_tolerant(&path).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["content"], "first appended");
+        assert_eq!(messages[1]["content"], "second appended");
+        assert_eq!(start, Some(1767225602000));
+        assert_eq!(end, Some(1767225604000));
+        assert_eq!(skipped[0].line_number, 1);
+        assert_eq!(skipped[0].recovered_records, 2);
+        assert_eq!(skipped[0].discarded_bytes, prefix.len());
+        assert!(!skipped[0].recovery_limited);
+    }
+
+    #[test]
+    fn gh553_concatenated_records_do_not_discard_a_complete_first_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = r#"{"role":"user","content":"one"}"#;
+        let second = r#"{"role":"assistant","content":"two"}"#;
+        let path = write_session(&dir, "concatenated.jsonl", &format!("{first}{second}\n"));
+        let (messages, _, _, skipped) = parse_followup_jsonl_messages_tolerant(&path).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["content"], "one");
+        assert_eq!(messages[1]["content"], "two");
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].recovered_records, 2);
+        assert_eq!(skipped[0].discarded_bytes, 0);
+    }
+
+    #[test]
+    fn gh553_recovery_recognises_native_envelopes_without_assuming_field_order() {
+        let examples = [
+            serde_json::json!({"type": "session", "id": "session-1"}),
+            serde_json::json!({
+                "type": "message", "id": "pi-1",
+                "message": {"role": "toolResult", "content": [{"type": "text", "text": "result"}]}
+            }),
+            serde_json::json!({
+                "type": "assistant", "uuid": "claude-1",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "reply"}]}
+            }),
+            serde_json::json!({
+                "type": "session_meta", "timestamp": "2026-01-01T00:00:00Z",
+                "payload": {"id": "codex-1", "cwd": "/tmp/repro"}
+            }),
+            serde_json::json!({
+                "type": "response_item", "timestamp": "2026-01-01T00:00:01Z",
+                "payload": {"type": "message", "role": "user", "content": []}
+            }),
+            serde_json::json!({
+                "type": "event_msg", "timestamp": "2026-01-01T00:00:02Z",
+                "payload": {"type": "agent_message", "message": "reply"}
+            }),
+            serde_json::json!({
+                "type": "turn_context", "timestamp": "2026-01-01T00:00:03Z",
+                "payload": {"cwd": "/tmp/repro"}
+            }),
+            serde_json::json!({"role": "user", "content": "plain message"}),
+        ];
+        for expected in examples {
+            let line = format!("torn-prefix{expected}");
+            let recovery = recover_followup_jsonl_suffix(&line);
+            assert_eq!(recovery.records, vec![expected]);
+            assert_eq!(recovery.discarded_bytes, "torn-prefix".len());
+            assert!(!recovery.limited);
+        }
+    }
+
+    #[test]
+    fn gh553_never_promotes_nested_values_or_accepts_an_incomplete_suffix() {
+        for line in [
+            r#"{"message":{"role":"user","content":"nested"}"#,
+            r#"{"message":   {"role":"user","content":"nested"}"#,
+            r#"[{"role":"user","content":"nested"}"#,
+            r#"[null, {"role":"user","content":"nested"}"#,
+            r#"torn{"type":"text","text":"not a session record"}"#,
+            r#"torn{"type":"toolCall","name":"bash","arguments":{}}"#,
+            r#"torn{"role":"user","content":"complete"}trailing garbage"#,
+            r#"torn{"role":"user","content":"complete"}42"#,
+            r#"torn{"role":"user","content":"complete"}[]"#,
+            r#"torn{"role":"user","content":"complete"}{"unknown":1}"#,
+        ] {
+            let recovery = recover_followup_jsonl_suffix(line);
+            assert!(
+                recovery.records.is_empty(),
+                "must refuse ambiguous source: {line}"
+            );
+            assert_eq!(recovery.discarded_bytes, line.len());
+            assert!(!recovery.limited);
+        }
+    }
+
+    #[test]
+    fn gh553_intact_nested_objects_keep_the_original_parser_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"{"wrapper":{"role":"user","content":"nested"}}"#;
+        let path = write_session(&dir, "intact.jsonl", body);
+        let (messages, _, _, skipped) = parse_followup_jsonl_messages_tolerant(&path).unwrap();
+        assert_eq!(
+            messages,
+            vec![serde_json::from_str::<serde_json::Value>(body).unwrap()]
+        );
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn gh553_recovery_bounds_input_size_candidate_attempts_and_total_parse_bytes() {
+        let record = r#"{"role":"user","content":"complete"}"#;
+        let oversized = format!(
+            "{}{record}",
+            "x".repeat(MAX_FOLLOWUP_JSONL_RECOVERY_LINE_BYTES)
+        );
+        let recovery = recover_followup_jsonl_suffix(&oversized);
+        assert!(recovery.records.is_empty());
+        assert!(recovery.limited);
+        assert_eq!(recovery.discarded_bytes, oversized.len());
+
+        // Each object is complete but is not a session record. The last one
+        // is admissible only when it falls within the candidate-attempt cap.
+        let unknown = r#"{"unknown":true}"#;
+        let within_limit = format!(
+            "{}{record}",
+            unknown.repeat(MAX_FOLLOWUP_JSONL_RECOVERY_ATTEMPTS - 1)
+        );
+        let recovery = recover_followup_jsonl_suffix(&within_limit);
+        assert_eq!(recovery.records.len(), 1);
+        assert!(!recovery.limited);
+        let over_limit = format!(
+            "{}{record}",
+            unknown.repeat(MAX_FOLLOWUP_JSONL_RECOVERY_ATTEMPTS)
+        );
+        let recovery = recover_followup_jsonl_suffix(&over_limit);
+        assert!(recovery.records.is_empty());
+        assert!(recovery.limited);
+
+        // Stay below the line and attempt caps, but make the sum of suffixes
+        // exceed the independent parsing-work budget.
+        let parse_budget = format!("{}{}{record}", unknown.repeat(17), "x".repeat(1024 * 1024));
+        assert!(parse_budget.len() < MAX_FOLLOWUP_JSONL_RECOVERY_LINE_BYTES);
+        let recovery = recover_followup_jsonl_suffix(&parse_budget);
+        assert!(recovery.records.is_empty());
+        assert!(recovery.limited);
+    }
+
+    #[test]
+    fn gh553_recovery_bounds_the_number_of_concatenated_records() {
+        let record = r#"{"role":"user","content":"complete"}"#;
+        let within_limit = record.repeat(MAX_FOLLOWUP_JSONL_RECOVERY_RECORDS);
+        let recovery = recover_followup_jsonl_suffix(&within_limit);
+        assert_eq!(recovery.records.len(), MAX_FOLLOWUP_JSONL_RECOVERY_RECORDS);
+        assert_eq!(recovery.discarded_bytes, 0);
+        assert!(!recovery.limited);
+
+        let over_limit = record.repeat(MAX_FOLLOWUP_JSONL_RECOVERY_RECORDS + 1);
+        let recovery = recover_followup_jsonl_suffix(&over_limit);
+        assert!(recovery.records.is_empty());
+        assert!(recovery.limited);
+        assert_eq!(recovery.discarded_bytes, over_limit.len());
     }
 }
 
@@ -127738,8 +129050,16 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
     let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
     let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&policy);
 
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
     // Hardened model-acquisition contract (bead 0qxwg): cheap host loadability
-    // (never loads ONNX — safe on any host) folded with the on-disk policy
+    // (never initializes a model runtime) folded with the on-disk policy
     // inputs the filesystem-only probe needs. The same inputs drive every
     // model's `model_acquisition` block so the report cannot drift per model.
     let acq_runtime = crate::search::model_acquisition::RuntimeLoadability::probe_cheap_host();
@@ -127766,7 +129086,8 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
         files: Vec<serde_json::Value>,
         /// Hardened model-acquisition projection (state, runtime, source,
         /// cost_class, skipped_network_reason, next_command, fingerprint, …).
-        acquisition: serde_json::Value,
+        /// Built only for structured output; human output uses the cache report.
+        acquisition: Option<serde_json::Value>,
     }
 
     let known: &[&str] = &["minilm", "multilingual-minilm"];
@@ -127808,13 +129129,15 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
                 "size_match": exists && size == mfile.size,
             }));
         }
-        let acquisition = crate::search::model_acquisition::live_acquisition_block(
-            &model_dir,
-            &manifest,
-            acq_runtime,
-            acq_policy_inputs,
-            name,
-        );
+        let acquisition = structured_format.is_some().then(|| {
+            crate::search::model_acquisition::live_acquisition_block(
+                &model_dir,
+                &manifest,
+                acq_runtime,
+                acq_policy_inputs,
+                name,
+            )
+        });
         statuses.push(ModelStatus {
             registry_name: name,
             manifest,
@@ -127826,14 +129149,6 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
             acquisition,
         });
     }
-
-    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
 
     let active_status =
         active_registry_name.and_then(|name| statuses.iter().find(|s| s.registry_name == name));
@@ -128504,29 +129819,33 @@ fn run_models_verify(
     let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&policy);
     let cache_report = classify_model_cache(&model_dir, &manifest, &acquisition_policy);
 
-    // Hardened model-acquisition projection (bead 0qxwg): the same probe-based
-    // block `cass models status` emits, so verify and status agree. The probe
-    // reports its filesystem-only decision; observing the whole command is
-    // required to establish whether other paths attempted networking.
-    // `probe_cheap_host()` never initializes a model runtime.
-    let acquisition_block = crate::search::model_acquisition::live_acquisition_block(
-        &model_dir,
-        &manifest,
-        crate::search::model_acquisition::RuntimeLoadability::probe_cheap_host(),
-        crate::search::model_acquisition::OnDiskPolicyInputs {
-            policy_enabled: acquisition_policy.downloads_enabled,
-            offline: acquisition_policy.offline,
-            budget_max_bytes: acquisition_policy.max_model_bytes,
-        },
-        registry_name,
-    );
-
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
         } else {
             fmt
         }
+    });
+
+    // Hardened model-acquisition projection (bead 0qxwg): the same probe-based
+    // block `cass models status` emits, so verify and status agree. The probe
+    // reports its filesystem-only decision; observing the whole command is
+    // required to establish whether other paths attempted networking.
+    // `probe_cheap_host()` never initializes a model runtime.
+    // Human output does not consume this full-hash projection. Its cache
+    // classifier and the per-file integrity verification below remain active.
+    let acquisition_block = structured_format.is_some().then(|| {
+        crate::search::model_acquisition::live_acquisition_block(
+            &model_dir,
+            &manifest,
+            crate::search::model_acquisition::RuntimeLoadability::probe_cheap_host(),
+            crate::search::model_acquisition::OnDiskPolicyInputs {
+                policy_enabled: acquisition_policy.downloads_enabled,
+                offline: acquisition_policy.offline,
+                budget_max_bytes: acquisition_policy.max_model_bytes,
+            },
+            registry_name,
+        )
     });
 
     if !model_dir.is_dir() && !repair {

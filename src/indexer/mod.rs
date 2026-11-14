@@ -14324,10 +14324,11 @@ fn refresh_completed_watch_lexical_checkpoint(
     index: &TantivyIndex,
     db_path: &Path,
     index_path: &Path,
+    allow_full_expected_doc_scan: bool,
 ) -> Result<bool> {
     // An absent, invalidated or expired expectation must not trigger a scan
-    // of old message bodies on the live callback. Ordinary indexing performs
-    // that verification; until then this checkpoint stays uncertified.
+    // of old message bodies on the live callback. A one-shot run may opt in
+    // within the ordinary audit budget; otherwise this stays uncertified.
     // A successful source can publish while another source still owes a
     // replay. Never certify that partially published canonical archive.
     if !load_watch_lexical_replay_debt(storage)?.is_empty() {
@@ -14353,7 +14354,7 @@ fn refresh_completed_watch_lexical_checkpoint(
         total_messages,
         max_conversation_id,
         Some(observed_docs),
-        false,
+        allow_full_expected_doc_scan,
     )
 }
 
@@ -18931,6 +18932,7 @@ fn run_index_with_storage_ownership(
             "skipping unclaimed explicit watch-once index run before startup maintenance"
         );
         close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run")?;
+        certify_completed_watch_once_index(&opts, &index_path, &progress_bump)?;
         prime_archive_fingerprint_cache_from_completed_checkpoint(&opts.db_path, &index_path);
         return Ok(());
     }
@@ -21245,6 +21247,7 @@ fn run_index_with_storage_ownership(
                 "skipping unclaimed explicit watch-once paths before opening Tantivy"
             );
             close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run")?;
+            certify_completed_watch_once_index(&opts, &index_path, &progress_bump)?;
             prime_archive_fingerprint_cache_from_completed_checkpoint(&opts.db_path, &index_path);
             return Ok(());
         }
@@ -21519,7 +21522,7 @@ fn run_index_with_storage_ownership(
                         indexed
                     };
 
-                    if !watch_once_mode && watch_lexical_checkpoint_pending.get() {
+                    if watch_once_mode || watch_lexical_checkpoint_pending.get() {
                         let refreshed = (|| -> Result<bool> {
                             let storage = storage_for_watch
                                 .lock()
@@ -21535,11 +21538,17 @@ fn run_index_with_storage_ownership(
                                 index,
                                 &opts_clone.db_path,
                                 &index_path_for_watch,
+                                watch_once_mode
+                                    && watch_once_lexical_content_audit_allowed(&opts_clone),
                             )
                         })();
                         match refreshed {
                             Ok(true) => watch_lexical_checkpoint_pending.set(false),
                             Ok(false) => {}
+                            Err(error) if watch_once_mode => {
+                                return Err(error)
+                                    .context("refreshing completed watch-once lexical checkpoint");
+                            }
                             Err(error) => tracing::warn!(
                                 %error,
                                 "watch lexical checkpoint refresh failed; retaining pending refresh"
@@ -21623,6 +21632,9 @@ fn run_index_with_storage_ownership(
             return Err(err);
         }
         close_result?;
+        if watch_once_mode {
+            certify_completed_watch_once_index(&opts, &index_path, &progress_bump)?;
+        }
         prime_archive_fingerprint_cache_from_completed_checkpoint(&opts.db_path, &index_path);
         return Ok(());
     }
@@ -21687,6 +21699,43 @@ fn run_index_with_storage_ownership(
     }
     prime_archive_fingerprint_cache_from_completed_checkpoint(&opts.db_path, &index_path);
     Ok(())
+}
+
+/// A one-shot watch owns the same publication obligation as ordinary indexing.
+/// Its callback and writer have ended, and the caller has closed canonical
+/// storage before entering this audit. Targeted ingestion must not turn into an
+/// unbounded scan of a large archive merely to refresh physical-epoch evidence.
+fn certify_completed_watch_once_index(
+    opts: &IndexOptions,
+    index_path: &Path,
+    progress_bump: &Arc<AtomicI64>,
+) -> Result<()> {
+    let allow_full_audit = watch_once_lexical_content_audit_allowed(opts);
+    if !lexical_resume::certify_after_index(
+        &opts.db_path,
+        index_path,
+        allow_full_audit,
+        false,
+        opts.progress.clone(),
+        Some(Arc::clone(progress_bump)),
+    )
+    .context("verifying completed lexical content after watch-once archive checkpoint")?
+    {
+        tracing::warn!(
+            db_path = %opts.db_path.display(),
+            allow_full_audit,
+            "watch-once lexical source freshness remains unverified; run 'cass index --full' for authoritative content verification"
+        );
+    }
+    Ok(())
+}
+
+fn watch_once_lexical_content_audit_allowed(opts: &IndexOptions) -> bool {
+    opts.full
+        || opts.force_rebuild
+        || force_incremental_authoritative_lexical_repair_enabled()
+        || db_size_bytes_for_incremental_lexical_repair_policy(&opts.db_path)
+            <= incremental_authoritative_lexical_repair_max_db_bytes()
 }
 
 /// Close a write handle the way `cass index` closes its own: restore the
@@ -37033,8 +37082,11 @@ fn reindex_paths_with_semantic_delta(
                 || chunk_outcome.batch_outcome.inserted_messages > 0
                 || chunk_outcome.batch_outcome.updated_messages > 0
                 || chunk_outcome.batch_outcome.workspace_changes > 0;
-            if chunk_outcome.batch_outcome.workspace_changes > 0 {
-                // Do not leave a live watcher serving old workspace filters.
+            if chunk_outcome.batch_outcome.workspace_changes > 0
+                || chunk_outcome.batch_outcome.updated_messages > 0
+            {
+                // Do not leave a live watcher serving old workspace filters
+                // or an incomplete native-message repair checkpoint.
                 // The pre-mutation checkpoint remains pending if this fails.
                 *t_index_guard = None;
                 rebuild_tantivy_from_db_deferred_startup_with_options(
@@ -40493,6 +40545,18 @@ pub mod persist {
             self.updated_messages = self
                 .updated_messages
                 .saturating_add(outcome.updated_indices.len());
+            if !outcome.updated_indices.is_empty() {
+                // Inline upserts do not certify the pre-mutation repair
+                // checkpoint. Tell every ingest caller to finish the existing
+                // authoritative rebuild before reporting lexical readiness.
+                self.lexical_update_deferred = true;
+                if self.lexical_update_error.is_none() {
+                    self.lexical_update_error = Some(
+                        "canonical native messages revised; verified lexical publication required"
+                            .to_string(),
+                    );
+                }
+            }
             if outcome.workspace_changed {
                 self.workspace_changes = self.workspace_changes.saturating_add(1);
                 self.lexical_update_deferred = true;
@@ -42103,11 +42167,7 @@ pub mod persist {
         }
         tracing::info!(agent = %conv.agent_slug, messages = conv.messages.len(), "persist_conversation");
         prepare_cursor_workspace_repair(storage, None, std::slice::from_ref(conv))?;
-        prepare_codebuff_canonical_repair(
-            storage,
-            Some(t_index.path()),
-            std::slice::from_ref(conv),
-        )?;
+        prepare_native_canonical_repair(storage, Some(t_index.path()), std::slice::from_ref(conv))?;
         let internal_conv = map_to_internal(conv);
         let InsertOutcome {
             conversation_id,
@@ -42170,11 +42230,7 @@ pub mod persist {
         let total_started = Instant::now();
         let db_started = Instant::now();
         prepare_cursor_workspace_repair(storage, None, std::slice::from_ref(conv))?;
-        prepare_codebuff_canonical_repair(
-            storage,
-            Some(t_index.path()),
-            std::slice::from_ref(conv),
-        )?;
+        prepare_native_canonical_repair(storage, Some(t_index.path()), std::slice::from_ref(conv))?;
         let internal_conv = map_to_internal(conv);
         let InsertOutcome {
             conversation_id,
@@ -42357,14 +42413,23 @@ pub mod persist {
         Ok(())
     }
 
-    fn prepare_codebuff_canonical_repair(
+    fn prepare_native_canonical_repair(
         storage: &FrankenStorage,
         index_path: Option<&Path>,
         convs: &[NormalizedConversation],
     ) -> Result<()> {
-        for conv in convs.iter().filter(|conv| conv.agent_slug == "codebuff") {
+        for conv in convs
+            .iter()
+            .filter(|conv| matches!(conv.agent_slug.as_str(), "codebuff" | "chatgpt"))
+        {
             let (source_id, _) = extract_provenance(&conv.metadata);
-            if !storage.codebuff_message_revisions_needed(&map_to_internal(conv))?
+            let internal = map_to_internal(conv);
+            let revision_needed = if conv.agent_slug == "chatgpt" {
+                storage.chatgpt_message_revisions_needed(&internal)?
+            } else {
+                storage.codebuff_message_revisions_needed(&internal)?
+            };
+            if !revision_needed
                 && !storage.provider_workspace_repair_needed(
                     &conv.agent_slug,
                     &source_id,
@@ -42377,7 +42442,7 @@ pub mod persist {
                 continue;
             }
             let index_path = index_path.context(
-                "Codebuff message revision or workspace change requires the canonical index directory",
+                "Native message revision or workspace change requires the canonical index directory",
             )?;
             let db_path = storage.database_path()?;
             // An in-place revision or a run-state workspace change leaves
@@ -42545,17 +42610,19 @@ pub mod persist {
     /// Slice only conversations whose later slices take the append path's
     /// bounded lookups. That needs a timestamp on every message: an untimed
     /// message makes that path read every stored row of the conversation,
-    /// once per slice (quadratic). Native-ID agents (grok_bot, codebuff)
+    /// once per slice (quadratic). Native-ID agents (grok_bot, codebuff, chatgpt)
     /// reconcile a whole conversation at once and are never sliced.
     fn should_slice_conversation(
         conv: &NormalizedConversation,
         limits: PersistSliceLimits,
     ) -> bool {
-        !matches!(conv.agent_slug.as_str(), "grok_bot" | "codebuff")
-            && conv
-                .messages
-                .iter()
-                .all(|message| message.created_at.is_some())
+        !matches!(
+            conv.agent_slug.as_str(),
+            "grok_bot" | "codebuff" | "chatgpt"
+        ) && conv
+            .messages
+            .iter()
+            .all(|message| message.created_at.is_some())
             && persist_slice_ranges(conv, limits).len() > 1
     }
 
@@ -42621,7 +42688,7 @@ pub mod persist {
     /// the ordinary append path (the same one a growing session takes every
     /// run), so a crash between slices leaves a prefix that the next run
     /// completes. The source-ledger completion rides only on the final call.
-    /// Native-ID agents (grok_bot, codebuff) reconcile a whole conversation at
+    /// Native-ID agents (grok_bot, codebuff, chatgpt) reconcile a whole conversation at
     /// once and are never sliced.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn persist_conversations_batched_sliced(
@@ -42805,11 +42872,14 @@ pub mod persist {
         // transaction can change workspace associations. A crash or failed
         // publication is then recovered by the existing full canonical rebuild.
         prepare_cursor_workspace_repair(storage, raw_mirror_data_dir, convs)?;
-        if convs.iter().any(|conv| conv.agent_slug == "codebuff") {
+        if convs
+            .iter()
+            .any(|conv| matches!(conv.agent_slug.as_str(), "codebuff" | "chatgpt"))
+        {
             let canonical_index_path = raw_mirror_data_dir
                 .map(crate::search::tantivy::index_dir)
                 .transpose()?;
-            prepare_codebuff_canonical_repair(
+            prepare_native_canonical_repair(
                 storage,
                 canonical_index_path
                     .as_deref()
@@ -44255,6 +44325,133 @@ pub mod persist {
                     }
                 }
             }
+        }
+
+        #[test]
+        #[serial]
+        fn gh552_chatgpt_reimport_publishes_reordered_rows_and_retains_crash_repair() {
+            let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "0");
+            let _begin = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+            let dir = tempfile::Builder::new()
+                .prefix("cass-gh552-index-")
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
+            let storage = create_franken_db(&dir.path().join("agent_search.db"));
+            let index_path = crate::search::tantivy::index_dir(dir.path()).unwrap();
+            let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+            let mut conv = NormalizedConversation {
+                agent_slug: "chatgpt".into(),
+                external_id: Some("gh552-native-chat".into()),
+                title: Some("Voice history".into()),
+                workspace: None,
+                source_path: dir.path().join("conversation.json"),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_002_000),
+                metadata: serde_json::json!({}),
+                messages: vec![NormalizedMessage {
+                    idx: 0,
+                    role: "assistant".into(),
+                    author: None,
+                    created_at: Some(1_700_000_002_000),
+                    content: "replyneedle".into(),
+                    extra: serde_json::json!({"id":"reply","chatgpt_message_id":"reply","update_time":20}),
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                }],
+            };
+            persist_conversation(&storage, &mut index, &conv).unwrap();
+            index.commit().unwrap();
+            let conversation_id: i64 = storage
+                .raw()
+                .query_row_map("SELECT id FROM conversations", &[], |row| row.get_typed(0))
+                .unwrap();
+            let reply_id = storage.fetch_messages(conversation_id).unwrap()[0].id;
+            conv.messages[0].idx = 1;
+            conv.messages.insert(0, NormalizedMessage {
+                idx: 0, role: "user".into(), author: None,
+                created_at: Some(1_700_000_001_000), content: "voiceneedle".into(),
+                extra: serde_json::json!({"id":"voice","chatgpt_message_id":"voice","update_time":20}),
+                snippets: Vec::new(), invocations: Vec::new(),
+            });
+            persist_conversation(&storage, &mut index, &conv).unwrap();
+            index.commit().unwrap();
+            assert_eq!(index.doc_count().unwrap(), 2);
+            let stored = storage.fetch_messages(conversation_id).unwrap();
+            assert_eq!(stored[1].id, reply_id);
+            assert_eq!(
+                stored
+                    .iter()
+                    .map(|m| m.content.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["voiceneedle", "replyneedle"]
+            );
+            let hits = |index: &TantivyIndex, term: &str| {
+                let reader = index.reader().unwrap();
+                let parser = frankensearch::quill::query::CassQueryParser::new(
+                    frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
+                )
+                .unwrap();
+                let query = parser.parse(
+                    term,
+                    &frankensearch::quill::query::CassQueryFilters::default(),
+                );
+                crate::search::quill_bridge::search_paginated(&reader, &query.query, 32, 0, true)
+                    .unwrap()
+                    .hits
+                    .len()
+            };
+            assert_eq!(hits(&index, "voiceneedle"), 1);
+            assert_eq!(hits(&index, "replyneedle"), 1);
+            conv.messages[1].content = "durableneedle".into();
+            conv.messages[1].extra["update_time"] = serde_json::json!(30);
+            let changed = persist_conversations_batched_inner(
+                &storage,
+                None,
+                std::slice::from_ref(&conv),
+                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                false,
+                false,
+                Some(dir.path()),
+                PersistHeartbeat::NONE,
+                None,
+            )
+            .unwrap();
+            assert_eq!(changed.updated_messages, 1);
+            assert!(changed.lexical_update_deferred);
+            assert_eq!(hits(&index, "durableneedle"), 0);
+            let replay = persist_conversations_batched_inner(
+                &storage,
+                None,
+                std::slice::from_ref(&conv),
+                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                false,
+                false,
+                Some(dir.path()),
+                PersistHeartbeat::NONE,
+                None,
+            )
+            .unwrap();
+            assert_eq!(replay.updated_messages, 0);
+            assert!(!replay.lexical_update_deferred);
+            let pending = super::super::load_lexical_rebuild_state(&index_path)
+                .unwrap()
+                .unwrap();
+            assert!(!pending.completed);
+            assert!(pending.requires_restart_from_zero_on_resume());
+            drop(index);
+            super::super::rebuild_tantivy_from_db_deferred_startup(
+                &storage.database_path().unwrap(),
+                dir.path(),
+                1,
+                None,
+            )
+            .unwrap();
+            let index = TantivyIndex::open_or_create(&index_path).unwrap();
+            assert_eq!(index.doc_count().unwrap(), 2);
+            assert_eq!(hits(&index, "voiceneedle"), 1);
+            assert_eq!(hits(&index, "replyneedle"), 0);
+            assert_eq!(hits(&index, "durableneedle"), 1);
         }
 
         #[test]

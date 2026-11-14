@@ -24,7 +24,7 @@ pub(super) struct Source {
 
 /// Continue treats spaces and '~' literally in this override; relative values
 /// are resolved against CWD. Do not apply the trimming/tilde rules of Codex.
-fn global_dir() -> Result<Option<PathBuf>> {
+pub(super) fn global_dir() -> Result<Option<PathBuf>> {
     let configured = match dotenvy::var("CONTINUE_GLOBAL_DIR") {
         Ok(value) if !value.is_empty() => Some(PathBuf::from(value)),
         Ok(_) | Err(dotenvy::Error::EnvVar(std::env::VarError::NotPresent)) => None,
@@ -152,11 +152,19 @@ fn roots(ctx: &ScanContext, excludes: &dyn Fn(&Path) -> bool) -> Result<Vec<Scan
             base.path.join(".continue/sessions"),
             base.path.join("sessions"),
         ] {
-            if optional_directory(&path)? {
-                // An existing excluded store still determines the layout.
+            let excluded = excludes(&path);
+            // An excluded store with unavailable metadata must not block
+            // healthy stores or broaden discovery into its parent. A store
+            // confirmed absent still permits the existing parent layout.
+            let is_directory = match optional_directory(&path) {
+                Err(_) if excluded => true,
+                result => result?,
+            };
+            if is_directory {
+                // An existing or opaque excluded store determines the layout.
                 // Do not fall back to reading JSON files in its parent.
                 found = true;
-                if !excludes(&path) {
+                if !excluded {
                     expanded.push(base.with_path(path));
                 }
             }

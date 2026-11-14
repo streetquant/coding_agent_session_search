@@ -1,9 +1,9 @@
 use assert_cmd::Command;
 use coding_agent_search::search::tantivy::{SCHEMA_HASH, expected_index_dir};
 use coding_agent_search::sources::config::{SourceDefinition, SourcesConfig, SyncSchedule};
-use coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION;
+use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, FrankenStorage};
 use fs2::FileExt;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -255,6 +255,409 @@ fn seed_active_rebuild_runtime(data_dir: &Path) -> std::fs::File {
     .expect("write lock metadata");
     lock_file.flush().expect("flush lock metadata");
     lock_file
+}
+
+#[test]
+fn status_and_health_json_original_codex_full_plain_append_and_noop() {
+    use serde_json::Value;
+
+    let mut builder = tempfile::Builder::new();
+    builder
+        .prefix("cass-original-codex-health-")
+        .disable_cleanup(true);
+    #[cfg(unix)]
+    let tmp = builder.tempdir_in("/tmp").unwrap();
+    #[cfg(not(unix))]
+    let tmp = builder.tempdir().unwrap();
+    let home = tmp.path();
+    // Keep dotenv inside the private HOME even when a caller sets TMPDIR.
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(home.join(".env"))
+        .unwrap();
+    let data = home.join("data");
+    let source = home.join(".codex/sessions/2025/11/25/rollout-test.jsonl");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(
+        &source,
+        include_str!("fixtures/codex_real/sessions/2025/11/25/rollout-test.jsonl"),
+    )
+    .unwrap();
+    let cass = || {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        cmd.env_clear();
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        cmd.current_dir(home)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("CASS_DATA_DIR", &data)
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_SEMANTIC_DOWNLOAD_POLICY", "opt_in")
+            .env("FRANKENSEARCH_MODEL_DIR", "")
+            .env("RUST_MIN_STACK", "134217728")
+            .timeout(Duration::from_secs(30));
+        cmd
+    };
+    let cold = cass().args(["health", "--json"]).output().unwrap();
+    assert_eq!(cold.status.code(), Some(1), "{cold:?}");
+    let cold: Value = serde_json::from_slice(&cold.stdout).unwrap();
+    assert_eq!(cold["healthy"], false, "{cold}");
+    assert_eq!(cold["status"], "not_initialized", "{cold}");
+
+    let mut append_manifest = None;
+    for phase in [
+        "full",
+        "plain-append",
+        "plain-noop",
+        "plain-new-session",
+        "plain-new-session-noop",
+    ] {
+        if phase == "plain-append" {
+            writeln!(
+                OpenOptions::new().append(true).open(&source).unwrap(),
+                "{}",
+                json!({
+                    "timestamp": "2026-11-12T08:00:00.000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "zzordinarycodexhealth new persisted provider message"
+                        }]
+                    }
+                })
+            )
+            .unwrap();
+        }
+        if phase == "plain-new-session" {
+            let mut session: Value = serde_json::from_str(
+                include_str!("fixtures/codex_real/sessions/2025/11/25/rollout-test.jsonl")
+                    .lines()
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap();
+            session["payload"]["id"] = json!("second-codex-health-session");
+            let mut second = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(source.with_file_name("rollout-second.jsonl"))
+                .unwrap();
+            writeln!(second, "{session}").unwrap();
+            writeln!(
+                second,
+                "{}",
+                json!({
+                    "timestamp": "2026-11-12T08:01:00.000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "zznewcodexsessionhealth new persisted provider session"
+                        }]
+                    }
+                })
+            )
+            .unwrap();
+        }
+        let mut index = cass();
+        index.args(["index", "--json", "--no-progress-events"]);
+        if phase == "full" {
+            index.arg("--full");
+        }
+        let indexed = index.output().unwrap();
+        assert!(indexed.status.success(), "{phase}: {indexed:?}");
+        let health = cass().args(["health", "--json"]).output().unwrap();
+        assert!(health.status.success(), "{phase}: {health:?}");
+        let health: Value = serde_json::from_slice(&health.stdout).unwrap();
+        assert_eq!(health["healthy"], true, "{phase}: {health}");
+        let status = cass().args(["status", "--json"]).output().unwrap();
+        assert!(status.status.success(), "{phase}: {status:?}");
+        let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(status["index"]["status"], "ready", "{phase}: {status}");
+        assert_eq!(status["index"]["fresh"], true, "{phase}: {status}");
+        let query = if phase == "full" {
+            "soldier"
+        } else if matches!(phase, "plain-new-session" | "plain-new-session-noop") {
+            "zznewcodexsessionhealth"
+        } else {
+            "zzordinarycodexhealth"
+        };
+        let hits = cass()
+            .args([
+                "search",
+                query,
+                "--json",
+                "--mode",
+                "lexical",
+                "--fields",
+                "content",
+                "--no-maintenance",
+                "--no-daemon",
+                "--limit",
+                "3",
+            ])
+            .output()
+            .unwrap();
+        assert!(hits.status.success(), "{phase}: {hits:?}");
+        let hits: Value = serde_json::from_slice(&hits.stdout).unwrap();
+        assert!(
+            hits["hits"].as_array().unwrap().iter().any(|hit| {
+                hit.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| content.contains(query))
+            }),
+            "{phase}: {hits}"
+        );
+        let manifest = fs::read(expected_index_dir(&data).join("MANIFEST")).unwrap();
+        if matches!(phase, "plain-append" | "plain-new-session") {
+            append_manifest = Some(manifest);
+        } else if matches!(phase, "plain-noop" | "plain-new-session-noop") {
+            assert_eq!(Some(&manifest), append_manifest.as_ref());
+        }
+    }
+}
+
+#[test]
+fn watch_once_publishes_settled_source_proof_and_respects_audit_budget() {
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+    use serde_json::Value;
+
+    for start_with_full_index in [false, true] {
+        let tmp = tempfile::Builder::new()
+            .prefix("cass-watch-once-health-")
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let home = tmp.path();
+        eprintln!("Watch-once health regression artifacts: {}", home.display());
+        // Do not let dotenv search ancestors of the private HOME.
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(home.join(".env"))
+            .unwrap();
+        let data = home.join("data");
+        let source = home.join(".claude/projects/health/session.jsonl");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(
+            &source,
+            include_str!("fixtures/claude_code_real/projects/-test-project/agent-test123.jsonl"),
+        )
+        .unwrap();
+        let cass = || {
+            let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+            cmd.env_clear();
+            for key in ["PATH", "SystemRoot", "WINDIR"] {
+                if let Some(value) = std::env::var_os(key) {
+                    cmd.env(key, value);
+                }
+            }
+            cmd.current_dir(home)
+                .env("HOME", home)
+                .env("USERPROFILE", home)
+                .env("XDG_DATA_HOME", home.join(".local/share"))
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("XDG_CACHE_HOME", home.join(".cache"))
+                .env("CODEX_HOME", home.join(".codex"))
+                .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+                .env("CASS_DATA_DIR", &data)
+                .env("CASS_AUTO_REFRESH", "0")
+                .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+                .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+                .env("CASS_SEMANTIC_DOWNLOAD_POLICY", "opt_in")
+                .env("FRANKENSEARCH_MODEL_DIR", "")
+                .env("RUST_MIN_STACK", "134217728")
+                .timeout(Duration::from_secs(30));
+            cmd
+        };
+        let index = |path: Option<&Path>, automatic_limit: Option<&str>| {
+            let mut cmd = cass();
+            cmd.args(["index", "--json", "--no-progress-events"]);
+            if let Some(path) = path {
+                cmd.arg("--watch-once").arg(path);
+            } else {
+                cmd.arg("--full");
+            }
+            if let Some(limit) = automatic_limit {
+                cmd.env(
+                    "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
+                    limit,
+                );
+            }
+            let output = cmd.output().unwrap();
+            assert!(output.status.success(), "index: {output:?}");
+        };
+        let ready = |phase: &str| {
+            let health = cass().args(["health", "--json"]).output().unwrap();
+            assert!(health.status.success(), "{phase}: {health:?}");
+            let health: Value = serde_json::from_slice(&health.stdout).unwrap();
+            assert_eq!(health["healthy"], true, "{phase}: {health}");
+            let status = cass().args(["status", "--json"]).output().unwrap();
+            assert!(status.status.success(), "{phase}: {status:?}");
+            let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+            assert_eq!(status["index"]["status"], "ready", "{phase}: {status}");
+            assert_eq!(status["index"]["fresh"], true, "{phase}: {status}");
+        };
+        if start_with_full_index {
+            // An explicit full index retains its existing audit exemption.
+            index(None, Some("1"));
+        } else {
+            index(Some(&source), None);
+        }
+        ready("initial publication");
+
+        writeln!(
+            OpenOptions::new().append(true).open(&source).unwrap(),
+            "{}",
+            json!({
+                "type": "user",
+                "uuid": "watch-once-health-append",
+                "parentUuid": "msg-001",
+                "sessionId": "test-session",
+                "timestamp": "2026-11-11T02:00:01.000Z",
+                "cwd": "/test/project",
+                "message": {"role": "user", "content": "zzwatchoncehealthyappend real provider input"}
+            })
+        )
+        .unwrap();
+        index(Some(&source), None);
+        ready("watch-once append");
+        let hit = cass()
+            .args([
+                "search",
+                "zzwatchoncehealthyappend",
+                "--json",
+                "--mode",
+                "lexical",
+                "--no-maintenance",
+                "--no-daemon",
+                "--limit",
+                "1",
+            ])
+            .output()
+            .unwrap();
+        assert!(hit.status.success(), "{hit:?}");
+        let hit: Value = serde_json::from_slice(&hit.stdout).unwrap();
+        assert_eq!(hit["hits"].as_array().unwrap().len(), 1, "{hit}");
+
+        let generation = expected_index_dir(&data);
+        let manifest_before = fs::read(generation.join("MANIFEST")).unwrap();
+        index(Some(&source), None);
+        ready("watch-once no-op");
+        assert_eq!(
+            fs::read(generation.join("MANIFEST")).unwrap(),
+            manifest_before,
+            "freshness verification must not republish the native index"
+        );
+        let unclaimed = home.join("unclaimed.input");
+        fs::write(&unclaimed, "not a provider transcript").unwrap();
+        index(Some(&unclaimed), None);
+        ready("unclaimed watch-once no-op");
+        assert_eq!(
+            fs::read(generation.join("MANIFEST")).unwrap(),
+            manifest_before
+        );
+
+        // A same-count raw edit is not an index-produced metadata transition.
+        // Passive reads and a size-deferred one-shot run cannot renew its proof.
+        let proof_path = generation.join(".lexical-rebuild-state.json");
+        let proof_before = fs::read(&proof_path).unwrap();
+        let storage = FrankenStorage::open(&data.join("agent_search.db")).unwrap();
+        assert_eq!(
+            storage
+                .raw()
+                .execute("UPDATE messages SET content = 'raw replacement body' WHERE idx = 0")
+                .unwrap(),
+            1
+        );
+        storage.close_without_checkpoint().unwrap();
+        let health = cass().args(["health", "--json"]).output().unwrap();
+        assert_eq!(health.status.code(), Some(1), "{health:?}");
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        index(Some(&source), Some("1"));
+        let health = cass().args(["health", "--json"]).output().unwrap();
+        assert_eq!(health.status.code(), Some(1), "{health:?}");
+        let proof_after: Value = serde_json::from_slice(&fs::read(&proof_path).unwrap()).unwrap();
+        let proof_before: Value = serde_json::from_slice(&proof_before).unwrap();
+        assert_eq!(
+            proof_after["completed_source_epoch"], proof_before["completed_source_epoch"],
+            "a deferred audit must not copy the changed archive epoch"
+        );
+        assert_eq!(
+            fs::read(generation.join("MANIFEST")).unwrap(),
+            manifest_before
+        );
+
+        for flag in ["--full", "--force-rebuild"] {
+            let output = cass()
+                .args([
+                    "index",
+                    "--json",
+                    "--no-progress-events",
+                    flag,
+                    "--watch-once",
+                ])
+                .arg(&source)
+                .env(
+                    "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
+                    "1",
+                )
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{flag}: {output:?}");
+            ready(flag);
+        }
+
+        // y696o: a source-scan watermark older than the read-path cadence is
+        // visible independently of index freshness. The healthy bit keeps its
+        // existing meaning; the warning/action tell an agent to scan sources.
+        let storage = FrankenStorage::open(&data.join("agent_search.db")).unwrap();
+        let aged_scan = FrankenStorage::now_millis().saturating_sub(3_600_000);
+        storage.set_last_scan_ts(aged_scan).unwrap();
+        storage.close_without_checkpoint().unwrap();
+        let status = cass().args(["status", "--json"]).output().unwrap();
+        assert!(status.status.success(), "{status:?}");
+        let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(status["index"]["source_scan_known"], true, "{status}");
+        assert_eq!(status["index"]["source_scan_overdue"], true, "{status}");
+        assert!(
+            status["index"]["source_scan_age_seconds"]
+                .as_u64()
+                .is_some_and(|age| age >= 3600),
+            "{status}"
+        );
+        assert!(
+            status["warnings"]
+                .as_array()
+                .is_some_and(|warnings| warnings.iter().any(|warning| warning
+                    .as_str()
+                    .is_some_and(|warning| warning.contains("source scan is overdue")))),
+            "{status}"
+        );
+        assert!(
+            status["recommended_action"]
+                .as_str()
+                .is_some_and(|action| action.contains("cass index")),
+            "{status}"
+        );
+    }
 }
 
 #[test]
@@ -1325,4 +1728,64 @@ fn status_and_health_report_archive_footprint_from_metadata() {
         Some(false),
         "{payload}"
     );
+}
+
+#[test]
+fn status_surfaces_overdue_source_scan_as_warning_not_health_bit() {
+    let test_home = tempfile::tempdir().expect("temp home");
+    let data = test_home.path().join("cass-data");
+    fs::create_dir_all(&data).expect("create data dir");
+    let db_path = data.join("agent_search.db");
+    let storage = FrankenStorage::open(&db_path).expect("open storage");
+    let aged = FrankenStorage::now_millis().saturating_sub(3_600_000);
+    storage.set_last_scan_ts(aged).expect("set source scan ts");
+    storage
+        .close_without_checkpoint()
+        .expect("close storage without checkpoint");
+
+    let output = isolated_cass_cmd(test_home.path())
+        .env("CASS_AUTO_REFRESH", "0")
+        .args([
+            "status",
+            "--data-dir",
+            data.to_str().expect("utf8 data dir"),
+            "--json",
+        ])
+        .output()
+        .expect("run cass status --json");
+    assert!(
+        output.status.success(),
+        "status failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("status json");
+    assert_eq!(
+        payload["index"]["source_scan_known"].as_bool(),
+        Some(true),
+        "{payload}"
+    );
+    assert_eq!(
+        payload["index"]["source_scan_overdue"].as_bool(),
+        Some(true),
+        "{payload}"
+    );
+    assert!(
+        payload["index"]["source_scan_age_seconds"]
+            .as_u64()
+            .is_some_and(|age| age >= 3600),
+        "{payload}"
+    );
+    assert!(
+        payload["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings.iter().any(|warning| warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("source scan is overdue")))),
+        "{payload}"
+    );
+    // The healthy bit keeps its index/archive meaning: this archive has no
+    // lexical index, so it is not healthy, but the source-scan warning is
+    // still present and independently actionable.
+    assert_eq!(payload["healthy"].as_bool(), Some(false), "{payload}");
 }
