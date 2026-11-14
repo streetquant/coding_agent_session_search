@@ -9,11 +9,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use frankensearch::core::filter::SearchFilter;
-use frankensearch::core::{BoundQueryEmbedding, VectorHit};
+use frankensearch::core::{BoundQueryEmbedding, SearchError, VectorHit};
 use frankensearch::index::native_hnsw::{
     NativeHnswGenerationReceiptV2, ValidatedNativeHnsw, native_hnsw_generation_receipt_path,
 };
-use frankensearch::index::{ValidatedFsviBytes, dot_product_f32_f32};
+use frankensearch::index::{
+    Quantization, ValidatedFsviBytes, dot_product_f16_bytes_f32, dot_product_f32_bytes_f32,
+};
 use serde::Serialize;
 
 use crate::search::semantic_manifest::{
@@ -562,6 +564,7 @@ impl SemanticGenerationReader {
 
 /// One shard execution. The caller has already activated every requested tier.
 /// All fallback paths search this owner; no other shard or generation is used.
+/// An installed caller context governs native work and exact-scan boundaries.
 pub(super) fn search_shard(
     owner: &ValidatedFsviBytes,
     ann: Option<&ShardAnn>,
@@ -576,8 +579,11 @@ pub(super) fn search_shard(
         report.engine = SemanticShardEngine::Skipped;
         return Ok((Vec::new(), report));
     }
+    let cx = frankensearch::Cx::current().unwrap_or_else(frankensearch::Cx::for_request);
+    check_query_context(&cx)?;
     let Some(policy) = policy else {
         let hits = owner.search_top_k(query.vector(), target, filter)?;
+        check_query_context(&cx)?;
         report.engine = SemanticShardEngine::Exact;
         report.returned_candidates = hits.len();
         return Ok((hits, report));
@@ -600,9 +606,10 @@ pub(super) fn search_shard(
             let cap = policy.max_candidates.min(owner.record_count());
             let mut width = policy.initial_candidates.max(target).min(cap);
             loop {
+                check_query_context(&cx)?;
                 report.ann_windows += 1;
                 report.final_candidate_limit = width;
-                let window = native_window(owner, &ready.graph, query, width, filter);
+                let window = native_window(&cx, owner, &ready.graph, query, width, filter);
                 match window {
                     Ok((mut hits, candidate_rows)) => {
                         report.candidate_rows += candidate_rows;
@@ -622,6 +629,9 @@ pub(super) fn search_shard(
                         }
                         width = width.saturating_mul(2).max(width + 1).min(cap);
                     }
+                    Err(error @ SemanticReaderError::Search(SearchError::Cancelled { .. })) => {
+                        return Err(error);
+                    }
                     Err(_) => {
                         report.fallback_reason = Some(AnnFallbackReason::QueryFailed);
                         break;
@@ -630,24 +640,34 @@ pub(super) fn search_shard(
             }
         }
     }
+    check_query_context(&cx)?;
     let hits = owner.search_top_k(query.vector(), target, filter)?;
+    check_query_context(&cx)?;
     report.engine = SemanticShardEngine::ExactFallback;
     report.returned_candidates = hits.len();
     Ok((hits, report))
 }
 
+pub(super) fn check_query_context(cx: &frankensearch::Cx) -> SemanticReaderResult<()> {
+    if cx.checkpoint().is_err() || cx.is_cancel_requested() {
+        return Err(SearchError::Cancelled {
+            phase: "cass.semantic_reader.search".to_owned(),
+            reason: "operation cancelled".to_owned(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn native_window(
+    cx: &frankensearch::Cx,
     owner: &ValidatedFsviBytes,
     graph: &ValidatedNativeHnsw,
     query: &BoundQueryEmbedding,
     width: usize,
     filter: Option<&dyn SearchFilter>,
 ) -> SemanticReaderResult<(Vec<VectorHit>, usize)> {
-    // No caller context reaches here: an infinite-budget request context that
-    // nothing cancels keeps this search unbounded and uncancellable, as before
-    // the engine took a caller `Cx`.
-    let cx = frankensearch::Cx::for_request();
-    let candidates = graph.search(&cx, query.vector(), width, Some(width))?;
+    let candidates = graph.search(cx, query.vector(), width, Some(width))?;
     if candidates.len() > width {
         return Err(SemanticReaderError::InvalidCandidate);
     }
@@ -655,6 +675,7 @@ fn native_window(
     let mut hits = Vec::with_capacity(count);
     let mut seen = HashSet::with_capacity(count);
     for candidate in candidates {
+        check_query_context(cx)?;
         let row = usize::try_from(candidate.physical_row())
             .map_err(|_| SemanticReaderError::InvalidCandidate)?;
         if !seen.insert(row)
@@ -666,9 +687,13 @@ fn native_window(
         if filter.is_some_and(|filter| !filter.matches(candidate.doc_id(), None)) {
             continue;
         }
-        // 1.0 - distance loses small scores to rounding. Recompute from the
-        // exact retained source at its declared storage precision instead.
-        let score = dot_product_f32_f32(&owner.vector_at_f32(row)?, query.vector())?;
+        // Use the exact backend's stored-byte kernel. Decode-then-dot has a
+        // different scalar-tail reduction and can reorder mixed shard scores.
+        let stored = owner.row(row)?;
+        let score = match owner.quantization() {
+            Quantization::F16 => dot_product_f16_bytes_f32(stored.vector_bytes(), query.vector())?,
+            Quantization::F32 => dot_product_f32_bytes_f32(stored.vector_bytes(), query.vector())?,
+        };
         if !score.is_finite() {
             return Err(SemanticReaderError::InvalidCandidate);
         }
@@ -684,6 +709,7 @@ fn native_window(
             .total_cmp(&left.score)
             .then_with(|| left.index.cmp(&right.index))
     });
+    check_query_context(cx)?;
     Ok((hits, count))
 }
 
