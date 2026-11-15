@@ -737,6 +737,23 @@ impl ConnectorIngestRun {
         }
     }
 
+    /// Account for a parsed source rejected by the operator's path policy.
+    /// Virtual database/session handles are distinct source identities here,
+    /// just as they are in `observe_conversation`. Repeated callbacks must not
+    /// inflate the count or erase content or a failure already observed.
+    pub fn observe_excluded_source(&mut self, path: &Path) {
+        let source = self
+            .sources
+            .entry(path.to_path_buf())
+            .or_insert(ObservedSource {
+                disposition: SourceIngestDisposition::Discovered,
+                malformed: false,
+            });
+        if source.disposition == SourceIngestDisposition::Discovered {
+            source.disposition = SourceIngestDisposition::Skipped;
+        }
+    }
+
     /// Record and harden one successfully parsed conversation.
     pub fn observe_conversation(&mut self, conversation: &mut NormalizedConversation) {
         let state = self
@@ -1024,8 +1041,30 @@ impl ConnectorIngestRun {
             } else {
                 IngestFailureKind::MalformedJsonLine
             };
-            self.diagnostics
-                .push(classify(&self.provider, &source_path, kind).with_line(line_number));
+            // These providers use FAD's shared suffix recovery. Other JSONL
+            // connectors retain their existing whole-line quarantine policy.
+            let recovery = matches!(
+                self.provider.as_str(),
+                "pi_agent" | "pi_agent_rust" | "oh_my_pi" | "codex" | "claude_code"
+            )
+            .then(|| std::str::from_utf8(line).ok())
+            .flatten()
+            .map(franken_agent_detection::connectors::jsonl::recover_jsonl_suffix)
+            .filter(|recovery| !recovery.records.is_empty());
+            let mut diagnostic =
+                classify(&self.provider, &source_path, kind).with_line(line_number);
+            let quarantined = if let Some(recovery) = recovery {
+                diagnostic.detail = Some(format!(
+                    "recovered complete records: {}; quarantined prefix bytes: {}",
+                    recovery.records.len(),
+                    recovery.discarded_bytes
+                ));
+                diagnostic.safe_next_action = "the malformed prefix is quarantined; complete suffix records continue through the connector; inspect the original source if the missing prefix is needed".to_string();
+                &line[..recovery.discarded_bytes]
+            } else {
+                line
+            };
+            self.diagnostics.push(diagnostic);
             self.sources.entry(path.to_path_buf()).and_modify(|source| {
                 source.disposition = SourceIngestDisposition::Quarantined;
                 source.malformed = true;
@@ -1035,7 +1074,7 @@ impl ConnectorIngestRun {
                 &self.provider,
                 path,
                 line_number,
-                line,
+                quarantined,
                 kind.as_str(),
             ) {
                 tracing::warn!(
@@ -1568,6 +1607,112 @@ mod tests {
     }
 
     #[test]
+    fn gh553_unrecoverable_lines_keep_complete_quarantine_evidence() -> TestResult {
+        let cases: [(&str, &[u8]); 4] = [
+            (
+                "pi_agent",
+                br#"{"payload":{"role":"user","content":"nested"}"#,
+            ),
+            (
+                "pi_agent",
+                br#"torn{"role":"user","content":"complete"}trailing"#,
+            ),
+            ("vibe", br#"torn{"role":"user","content":"complete"}"#),
+            (
+                "pi_agent",
+                b"invalid\xff{\"role\":\"user\",\"content\":\"complete\"}",
+            ),
+        ];
+        for (provider, line) in cases {
+            let root = tempdir()?.keep();
+            let path = root.join("bad.jsonl");
+            let mut bytes = line.to_vec();
+            bytes.push(b'\n');
+            std::fs::write(&path, &bytes)?;
+            let scan_root = ScanRoot::local(root.clone());
+            let source = DiscoveredSourceFile::new(
+                provider,
+                &scan_root,
+                path.clone(),
+                DiscoveredSourceRole::PrimarySessionLog,
+                true,
+            );
+            let context = ScanContext::with_roots(root.clone(), vec![scan_root], None);
+            let report = ConnectorIngestRun::begin(provider, &root, &context, &[source]).finish();
+            verify_eq!(report.diagnostics.len(), 1);
+            verify_eq!(report.diagnostics[0].detail, None);
+            let state: serde_json::Value = serde_json::from_slice(&std::fs::read(
+                root.join("quarantine/connector_ingest_lines.json"),
+            )?)?;
+            let entries = state["entries"]
+                .as_object()
+                .ok_or("missing quarantine entries")?;
+            verify_eq!(entries.len(), 1);
+            let entry = entries.values().next().ok_or("missing quarantine record")?;
+            verify_eq!(entry["payload_bytes"], json!(line.len()));
+            verify_eq!(
+                entry["payload_blake3"],
+                json!(blake3::hash(line).to_hex().to_string())
+            );
+            verify_eq!(std::fs::read(path)?, bytes);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gh553_quarantine_hashes_only_the_unrecovered_prefix() -> TestResult {
+        let root = tempdir()?.keep();
+        let path = root.join("torn.jsonl");
+        let prefix = "{\"type\":\"message\",\"message\":{\"content\":\"署名";
+        let record = r#"{"type":"message","id":"tool","message":{"role":"toolResult","content":"recovered marker"}}"#;
+        std::fs::write(&path, format!("{prefix}{record}\r\n"))?;
+        let scan_root = ScanRoot::local(root.clone());
+        let source = DiscoveredSourceFile::new(
+            "pi_agent",
+            &scan_root,
+            path.clone(),
+            DiscoveredSourceRole::PrimarySessionLog,
+            true,
+        );
+        let context = ScanContext::with_roots(root.clone(), vec![scan_root], None);
+        let run = ConnectorIngestRun::begin("pi_agent", &root, &context, &[source]);
+        let report = run.finish();
+        verify_eq!(report.diagnostics.len(), 1);
+        let diagnostic = &report.diagnostics[0];
+        verify_eq!(diagnostic.line_or_row, Some(1));
+        verify_eq!(
+            diagnostic.failure_kind,
+            IngestFailureKind::MalformedJsonLine
+        );
+        let expected_detail = format!(
+            "recovered complete records: 1; quarantined prefix bytes: {}",
+            prefix.len()
+        );
+        verify_eq!(diagnostic.detail.as_deref(), Some(expected_detail.as_str()));
+        let state: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            root.join("quarantine/connector_ingest_lines.json"),
+        )?)?;
+        let entries = state["entries"]
+            .as_object()
+            .ok_or("missing quarantine entries")?;
+        verify_eq!(entries.len(), 1);
+        let entry = entries
+            .values()
+            .next()
+            .ok_or("missing quarantined prefix")?;
+        verify_eq!(entry["payload_bytes"], json!(prefix.len()));
+        verify_eq!(
+            entry["payload_blake3"],
+            json!(blake3::hash(prefix.as_bytes()).to_hex().to_string())
+        );
+        verify_eq!(
+            std::fs::read_to_string(path)?,
+            format!("{prefix}{record}\r\n")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn live_run_quarantines_only_bad_jsonl_line_and_indexes_valid_content() -> TestResult {
         let temp = tempdir()?;
         let path = temp.path().join("mixed.jsonl");
@@ -1634,6 +1779,72 @@ mod tests {
         verify_ne!(a.external_id, b.external_id);
         verify_eq!(first.finish().diagnostics.len(), 1);
         verify_eq!(second.finish().summary.indexed, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn gh554_excluded_virtual_sources_are_counted_once_without_payloads() -> TestResult {
+        let temp = tempdir()?;
+        let database = temp.path().join("opencode.db");
+        let root = ScanRoot::local(temp.path().to_path_buf());
+        let source = DiscoveredSourceFile::new(
+            "opencode",
+            &root,
+            database.clone(),
+            DiscoveredSourceRole::SqliteDatabase,
+            true,
+        );
+        let ctx = ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
+        let mut run = ConnectorIngestRun::begin("opencode", temp.path(), &ctx, &[source]);
+        let first = database.join("ses_first");
+        let second = database.join("ses_second");
+        run.observe_excluded_source(&first);
+        run.observe_excluded_source(&first);
+        run.observe_excluded_source(&second);
+        let report = run.finish();
+        verify_eq!(report.summary.discovered, 1);
+        verify_eq!(report.summary.skipped, 2);
+        verify_eq!(report.summary.with_content(), 0);
+        verify!(report.diagnostics.is_empty());
+        let json = serde_json::to_value(report)?;
+        verify_eq!(json["summary"]["skipped"], json!(2));
+        verify!(!json.to_string().contains("ses_first"));
+        Ok(())
+    }
+
+    #[test]
+    fn gh554_exclusion_observations_preserve_content_and_failure_evidence() -> TestResult {
+        let temp = tempdir()?;
+        let ctx = ScanContext::local_default(temp.path().to_path_buf(), None);
+        let mut run = ConnectorIngestRun::begin("opencode", temp.path(), &ctx, &[]);
+        let mut conversation = NormalizedConversation {
+            agent_slug: "opencode".into(),
+            external_id: Some("ses_indexed".into()),
+            title: None,
+            workspace: None,
+            source_path: temp.path().join("opencode.db/ses_indexed"),
+            started_at: None,
+            ended_at: None,
+            metadata: json!({}),
+            messages: Vec::new(),
+        };
+        // Later content supersedes a prior exclusion observation, while a
+        // repeated exclusion must not erase an already observed success.
+        run.observe_excluded_source(&conversation.source_path);
+        run.observe_conversation(&mut conversation);
+        run.observe_excluded_source(&conversation.source_path);
+        let locked = temp.path().join("locked.db");
+        run.observe_scan_error(&locked, "database is locked (SQLITE_BUSY)");
+        run.observe_excluded_source(&locked);
+        let report = run.finish();
+        verify_eq!(report.summary.indexed, 1);
+        verify_eq!(report.summary.locked, 1);
+        verify_eq!(report.summary.skipped, 0);
+        verify_eq!(report.diagnostics.len(), 1);
+        verify_eq!(
+            report.diagnostics[0].failure_kind,
+            IngestFailureKind::SourceLocked
+        );
         Ok(())
     }
 

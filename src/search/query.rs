@@ -3,6 +3,9 @@ use crossbeam_channel as mpsc;
 
 #[path = "query/coverage.rs"]
 mod coverage;
+#[path = "query/embedding.rs"]
+mod embedding;
+use embedding::QueryCache;
 #[path = "query/indexed_terms.rs"]
 mod indexed_terms;
 #[path = "query/retry_budget.rs"]
@@ -3166,37 +3169,6 @@ pub fn rrf_fuse_hits_with_coverage(
     unique_hits.into_iter().skip(start).take(limit).collect()
 }
 
-struct QueryCache {
-    embedder_id: String,
-    embeddings: LruCache<String, Vec<f32>>,
-}
-
-impl QueryCache {
-    fn new(embedder_id: &str, capacity: NonZeroUsize) -> Self {
-        Self {
-            embedder_id: embedder_id.to_string(),
-            embeddings: LruCache::new(capacity),
-        }
-    }
-
-    fn align_embedder(&mut self, embedder: &dyn Embedder) {
-        if self.embedder_id != embedder.id() {
-            self.embedder_id = embedder.id().to_string();
-            self.embeddings.clear();
-        }
-    }
-
-    fn get_cached(&mut self, embedder: &dyn Embedder, canonical: &str) -> Option<Vec<f32>> {
-        self.align_embedder(embedder);
-        self.embeddings.get(canonical).cloned()
-    }
-
-    fn store(&mut self, embedder: &dyn Embedder, canonical: &str, embedding: Vec<f32>) {
-        self.align_embedder(embedder);
-        self.embeddings.put(canonical.to_string(), embedding);
-    }
-}
-
 /// Returns `Some(&filter)` when the filter has at least one active constraint,
 /// `None` when unrestricted (skip filtering for performance).
 fn semantic_filter_as_search_filter(filter: &SemanticFilter) -> Option<&dyn FsSearchFilter> {
@@ -5327,22 +5299,25 @@ impl SearchClient {
             bail!("semantic context requires at least one vector index");
         }
 
+        let capacity = NonZeroUsize::new(100).ok_or_else(|| anyhow!("invalid cache size"))?;
+        let query_cache = QueryCache::new(embedder.as_ref(), capacity)?;
+        let producer = query_cache.producer();
         for artifact in &artifacts {
             let index = artifact.index();
             let embedder_id = index.embedder_id();
             let dimension = index.dimension();
-            if embedder_id != embedder.id() {
+            if embedder_id != producer.id() {
                 bail!(
                     "embedder mismatch: index uses {}, embedder is {}",
                     embedder_id,
-                    embedder.id()
+                    producer.id()
                 );
             }
-            if dimension != embedder.dimension() {
+            if dimension != producer.dimension() {
                 bail!(
                     "embedder dimension mismatch: index uses {}, embedder is {}",
                     dimension,
-                    embedder.dimension()
+                    producer.dimension()
                 );
             }
         }
@@ -5352,7 +5327,7 @@ impl SearchClient {
         let fs_ann_unavailable = ann_shards::SemanticAnnShardSet::unavailable_reason(&artifacts);
         let artifacts = Arc::new(artifacts);
 
-        let capacity = NonZeroUsize::new(100).ok_or_else(|| anyhow!("invalid cache size"))?;
+        producer.validate(embedder.as_ref())?;
         let context_token = Arc::new(());
         let mut state_guard = self
             .semantic
@@ -5372,7 +5347,7 @@ impl SearchClient {
             progressive_context_unavailable: None,
             filter_maps,
             roles,
-            query_cache: QueryCache::new(embedder_id.as_str(), capacity),
+            query_cache,
         });
         if shard_count > 1 {
             tracing::info!(
@@ -5406,7 +5381,7 @@ impl SearchClient {
 
     fn semantic_query_embedding(&self, canonical: &str) -> Result<SemanticQueryEmbedding> {
         loop {
-            let (embedder, context_token) = {
+            let (embedder, context_token, producer, cached) = {
                 let mut guard = self
                     .semantic
                     .lock()
@@ -5414,24 +5389,21 @@ impl SearchClient {
                 let state = guard.as_mut().ok_or_else(|| {
                     anyhow!("semantic search unavailable (no embedder or vector index)")
                 })?;
-                if let Some(hit) = state
-                    .query_cache
-                    .get_cached(state.embedder.as_ref(), canonical)
-                {
-                    return Ok(SemanticQueryEmbedding {
-                        context_token: Arc::clone(&state.context_token),
-                        vector: hit,
-                    });
-                }
                 (
                     Arc::clone(&state.embedder),
                     Arc::clone(&state.context_token),
+                    state.query_cache.producer(),
+                    state.query_cache.get_cached(canonical),
                 )
             };
 
-            let embedding = embedder
-                .embed_sync(canonical)
-                .map_err(|e| anyhow!("embedding failed: {e}"))?;
+            // Neither identity inspection nor inference holds the semantic
+            // mutex. A lazy/custom producer must not block unload or reload.
+            let outcome = if let Some(hit) = cached {
+                producer.validate(embedder.as_ref()).map(|()| hit)
+            } else {
+                producer.embed(embedder.as_ref(), canonical)
+            };
 
             let mut guard = self
                 .semantic
@@ -5441,20 +5413,18 @@ impl SearchClient {
                 anyhow!("semantic search unavailable (no embedder or vector index)")
             })?;
             if !Arc::ptr_eq(&state.context_token, &context_token) {
+                // Even an old producer's error belongs to the superseded
+                // context. Retry against the newly admitted producer.
                 continue;
             }
-            if let Some(hit) = state
-                .query_cache
-                .get_cached(state.embedder.as_ref(), canonical)
-            {
+            let embedding = outcome?;
+            if let Some(hit) = state.query_cache.get_cached(canonical) {
                 return Ok(SemanticQueryEmbedding {
                     context_token,
                     vector: hit,
                 });
             }
-            state
-                .query_cache
-                .store(state.embedder.as_ref(), canonical, embedding.clone());
+            state.query_cache.store(canonical, embedding.clone());
             return Ok(SemanticQueryEmbedding {
                 context_token,
                 vector: embedding,
@@ -11761,6 +11731,113 @@ mod tests {
         assert_send_sync::<SearchClient>();
     }
 
+    fn install_controlled_query_embedder(
+        client: &SearchClient,
+        embedder: Arc<embedding::tests::ControlledEmbedder>,
+    ) -> Result<()> {
+        let (artifacts, quality_artifact, filter_maps, roles) = {
+            let guard = client
+                .semantic
+                .lock()
+                .map_err(|_| anyhow!("semantic lock poisoned"))?;
+            let state = guard.as_ref().ok_or_else(|| anyhow!("semantic fixture"))?;
+            (
+                state.artifacts.as_ref().clone(),
+                state.quality_artifact.clone(),
+                state.filter_maps.clone(),
+                state.roles.clone(),
+            )
+        };
+        client.set_semantic_artifacts_context(
+            embedder,
+            artifacts,
+            quality_artifact,
+            filter_maps,
+            roles,
+        )
+    }
+
+    #[test]
+    fn semantic_embedding_cache_refuses_same_id_producer_drift() -> Result<()> {
+        let fixture = build_semantic_test_fixture()?;
+        let embedder = Arc::new(embedding::tests::ControlledEmbedder::new());
+        install_controlled_query_embedder(&fixture.client, Arc::clone(&embedder))?;
+        let first = fixture.client.semantic_query_embedding("cache identity")?;
+        let repeated = fixture.client.semantic_query_embedding("cache identity")?;
+        assert_eq!(first.vector, repeated.vector);
+        assert_eq!(
+            embedder.calls(),
+            1,
+            "unchanged producer should reuse its query"
+        );
+
+        embedder.change_identity();
+        assert!(
+            fixture
+                .client
+                .semantic_query_embedding("cache identity")
+                .is_err()
+        );
+        assert!(
+            fixture
+                .client
+                .semantic_query_embedding("another query")
+                .is_err()
+        );
+        assert_eq!(
+            embedder.calls(),
+            1,
+            "neither cache nor inference may bypass drift"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_embedding_identity_is_pinned_at_context_admission() -> Result<()> {
+        let fixture = build_semantic_test_fixture()?;
+        let embedder = Arc::new(embedding::tests::ControlledEmbedder::new());
+        install_controlled_query_embedder(&fixture.client, Arc::clone(&embedder))?;
+        embedder.change_identity();
+        assert!(
+            fixture
+                .client
+                .semantic_query_embedding("first query")
+                .is_err()
+        );
+        assert_eq!(embedder.calls(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_embedding_invalid_bound_response_never_poisoned_the_cache() -> Result<()> {
+        let fixture = build_semantic_test_fixture()?;
+        for mode in [1, 2, 3, 4, 7] {
+            let embedder = Arc::new(embedding::tests::ControlledEmbedder::new());
+            install_controlled_query_embedder(&fixture.client, Arc::clone(&embedder))?;
+            embedder.mode(mode);
+            assert!(
+                fixture
+                    .client
+                    .semantic_query_embedding("response integrity")
+                    .is_err()
+            );
+            embedder.mode(0);
+            let valid = fixture
+                .client
+                .semantic_query_embedding("response integrity")?;
+            let repeated = fixture
+                .client
+                .semantic_query_embedding("response integrity")?;
+            assert_eq!(valid.vector, repeated.vector);
+            assert_eq!(
+                embedder.calls(),
+                2,
+                "invalid response must not enter the cache"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn semantic_embedding_releases_semantic_lock_while_embedding() -> Result<()> {
         let fixture = build_semantic_test_fixture()?;
@@ -11783,9 +11860,9 @@ mod tests {
                 unblock_rx,
             ));
             state.query_cache = QueryCache::new(
-                "test-fixed-2d",
+                state.embedder.as_ref(),
                 NonZeroUsize::new(100).expect("cache capacity"),
-            );
+            )?;
         }
 
         let search_client = Arc::clone(&client);
@@ -11847,9 +11924,9 @@ mod tests {
                 unblock_rx,
             ));
             state.query_cache = QueryCache::new(
-                "test-fixed-2d",
+                state.embedder.as_ref(),
                 NonZeroUsize::new(100).expect("cache capacity"),
-            );
+            )?;
         }
 
         let embedding_client = Arc::clone(&client);
@@ -11871,9 +11948,9 @@ mod tests {
             state.context_token = Arc::new(());
             state.embedder = Arc::new(FixedTestEmbedder::new("test-fixed-2d", &[0.0, 1.0]));
             state.query_cache = QueryCache::new(
-                "test-fixed-2d",
+                state.embedder.as_ref(),
                 NonZeroUsize::new(100).expect("cache capacity"),
-            );
+            )?;
         }
 
         unblock_tx.send(()).expect("unblock embedder");

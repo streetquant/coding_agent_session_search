@@ -89223,6 +89223,10 @@ fn run_status(
     // a parseable partial result (with timed_out + skipped_sections) instead of
     // blocking on a slow filesystem/coverage scan.
     let status_budget = crate::robot_budget_envelope::RobotBudget::new(status_budget_ms());
+    // GH #542: a small last-run receipt keeps capture-budget failures visible
+    // without traversing the mirror or delaying the fast readiness surfaces.
+    let raw_mirror_capture = crate::raw_mirror::capture_status(&data_dir);
+    let raw_mirror_warning = crate::raw_mirror::capture_status_warning(&raw_mirror_capture);
     let mut state = state_meta_json_for_status(&data_dir, &db_path, stale_threshold);
     refresh_state_database_counts_if_needed(&mut state, &db_path, "status");
     maybe_test_status_delay();
@@ -89412,6 +89416,10 @@ fn run_status(
                 "source scan is overdue: no completed source scan is recorded (threshold {threshold}s); run 'cass index' to discover sessions"
             ),
         });
+    }
+
+    if let Some(warning) = &raw_mirror_warning {
+        warnings.push(warning.clone());
     }
 
     let db_available = db_opened || (db_exists && db_open_retryable);
@@ -89659,6 +89667,7 @@ fn run_status(
             "doctor_summary": doctor_summary_value,
             "remote_source_sync": remote_sync_value,
             "coverage_risk": coverage_value,
+            "raw_mirror_capture": raw_mirror_capture,
             "quarantine": quarantine_value,
             // uojcg.3.3: compact "is search missing known conversations?" verdict,
             // derived from the cheap ingest-quarantine counts above so health and
@@ -89864,6 +89873,11 @@ fn run_status(
     }
     if let Some(hint) = semantic_hint {
         println!("  Hint: {hint}");
+    }
+
+    if let Some(warning) = &raw_mirror_warning {
+        println!();
+        println!("Raw capture: {warning}");
     }
 
     if pending_sessions > 0 {
@@ -90824,6 +90838,8 @@ fn run_health(
     let start = Instant::now();
     let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+    let raw_mirror_capture = crate::raw_mirror::capture_status(&data_dir);
+    let raw_mirror_warning = crate::raw_mirror::capture_status_warning(&raw_mirror_capture);
     // [coding_agent_session_search-d0rmo + gi4oy] health is the
     // documented <50ms fast surface; force-skip BOTH the canonical-DB
     // COUNT(*) (d0rmo) AND the FrankenStorage open (gi4oy). The
@@ -90957,6 +90973,10 @@ fn run_health(
                 "source scan is overdue: no completed source scan is recorded (threshold {threshold}s); run 'cass index' to discover sessions"
             ),
         });
+    }
+
+    if let Some(warning) = &raw_mirror_warning {
+        warnings.push(warning.clone());
     }
 
     let db_degraded = db_exists && !db_opened;
@@ -91180,6 +91200,7 @@ fn run_health(
             "doctor_summary": doctor_summary,
             "remote_source_sync": remote_source_sync_summary,
             "coverage_risk": coverage_risk,
+            "raw_mirror_capture": raw_mirror_capture,
             "policy_registry": policy_registry,
             "ingest_quarantine": state.get("ingest_quarantine").cloned().unwrap_or(serde_json::Value::Null),
             // uojcg.3.3: same compact search-completeness verdict as `cass status`
@@ -91271,6 +91292,9 @@ fn run_health(
         // machine contract about native admission.
         if let Some(line) = human_ann_readiness_line(&state) {
             println!("{line}");
+        }
+        if let Some(warning) = &raw_mirror_warning {
+            println!("  Raw capture: {warning}");
         }
         print_human_readiness_section(
             &state,
@@ -105166,6 +105190,76 @@ fn response_schema_doctor_coverage_summary() -> serde_json::Value {
     })
 }
 
+fn response_schema_raw_mirror_capture() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Bounded raw-capture receipt. Current configuration is separate from the last observed index run; this does not scan raw coverage or prove that a new capture would be admitted.",
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["capture_disabled", "configuration_invalid", "unknown", "last_run_paused", "last_run_no_pause_observed", "last_run_incomplete"]
+            },
+            "capture_enabled": { "type": "boolean" },
+            "configuration": {
+                "type": "object",
+                "properties": {
+                    "status": { "type": "string", "enum": ["valid", "invalid"] },
+                    "max_bytes": { "type": ["integer", "null"] },
+                    "min_free_bytes": { "type": ["integer", "null"] }
+                },
+                "required": ["status", "max_bytes", "min_free_bytes"]
+            },
+            "receipt_status": {
+                "type": "string",
+                "enum": ["recorded", "missing", "invalid", "unreadable"]
+            },
+            "last_run": {
+                "type": ["object", "null"],
+                "properties": {
+                    "schema_version": { "type": "integer", "const": 1 },
+                    "run_id": { "type": "string" },
+                    "started_at_ms": { "type": "integer" },
+                    "updated_at_ms": { "type": "integer" },
+                    "finished_at_ms": { "type": ["integer", "null"] },
+                    "completed": {
+                        "type": "boolean",
+                        "description": "Capture accounting finalized; this is not a verdict on index success. False can describe an active or interrupted run."
+                    },
+                    "capture_enabled": { "type": "boolean" },
+                    "capture_paused": { "type": "boolean" },
+                    "max_bytes": { "type": ["integer", "null"] },
+                    "min_free_bytes": { "type": ["integer", "null"] },
+                    "pause_attempts": { "type": "integer" },
+                    "skipped_sources": {
+                        "type": "integer",
+                        "description": "Distinct source identities with at least one refused capture attempt in this run; later retries may have succeeded."
+                    },
+                    "skipped_sources_exact": { "type": "boolean" },
+                    "requested_reservation_bytes": {
+                        "type": "integer",
+                        "description": "Sum of denied storage reservations, including retries and overhead; not a count of unique source-content bytes."
+                    },
+                    "counters_exact": { "type": "boolean" },
+                    "last_pause": {
+                        "type": ["object", "null"],
+                        "description": "Budget and filesystem values observed at the last capture refusal, not a live disk probe.",
+                        "properties": {
+                            "used_bytes": { "type": "integer" },
+                            "max_bytes": { "type": "integer" },
+                            "available_bytes": { "type": "integer" },
+                            "min_free_bytes": { "type": "integer" },
+                            "requested_bytes": { "type": "integer" }
+                        },
+                        "required": ["used_bytes", "max_bytes", "available_bytes", "min_free_bytes", "requested_bytes"]
+                    }
+                },
+                "required": ["schema_version", "run_id", "started_at_ms", "updated_at_ms", "finished_at_ms", "completed", "capture_enabled", "capture_paused", "max_bytes", "min_free_bytes", "pause_attempts", "skipped_sources", "skipped_sources_exact", "requested_reservation_bytes", "counters_exact", "last_pause"]
+            }
+        },
+        "required": ["status", "capture_enabled", "configuration", "receipt_status", "last_run"]
+    })
+}
+
 fn response_schema_doctor_coverage_risk() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -106823,6 +106917,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "doctor_summary": response_schema_doctor_v2_summary("status-summary"),
                 "remote_source_sync": response_schema_doctor_remote_source_sync_runtime_summary(),
                 "coverage_risk": response_schema_doctor_coverage_risk(),
+                "raw_mirror_capture": response_schema_raw_mirror_capture(),
                 "quarantine": response_schema_opaque_object(),
                 "search_completeness": response_schema_search_completeness(),
                 "root_cause": response_schema_root_cause_attribution(),
@@ -106975,6 +107070,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "doctor_summary": response_schema_doctor_v2_summary("status-summary"),
                 "remote_source_sync": response_schema_doctor_remote_source_sync_runtime_summary(),
                 "coverage_risk": response_schema_doctor_coverage_risk(),
+                "raw_mirror_capture": response_schema_raw_mirror_capture(),
                 "quarantine": response_schema_opaque_object(),
                 "daemon_runtime": response_schema_opaque_object(),
                 "budget": response_schema_budget_block(),
@@ -107476,6 +107572,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "doctor_summary": response_schema_doctor_v2_summary("health-summary"),
                 "remote_source_sync": response_schema_doctor_remote_source_sync_runtime_summary(),
                 "coverage_risk": response_schema_doctor_coverage_risk(),
+                "raw_mirror_capture": response_schema_raw_mirror_capture(),
                 "policy_registry": response_schema_policy_registry(),
                 "ingest_quarantine": response_schema_ingest_quarantine(),
                 "search_completeness": response_schema_search_completeness(),
@@ -109971,166 +110068,22 @@ const MAX_REPORTED_SKIPPED_JSONL_LINES: usize = 5;
 // Recovery only runs after the ordinary parser rejects a physical line.
 // Bound both the input and repeated parsing, so many opening braces cannot
 // turn one malformed line into unbounded quadratic work.
-const MAX_FOLLOWUP_JSONL_RECOVERY_LINE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_FOLLOWUP_JSONL_RECOVERY_PARSE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_FOLLOWUP_JSONL_RECOVERY_ATTEMPTS: usize = 64;
-const MAX_FOLLOWUP_JSONL_RECOVERY_RECORDS: usize = 1024;
-
-#[derive(Debug, Default)]
-struct FollowupJsonlRecovery {
-    records: Vec<serde_json::Value>,
-    discarded_bytes: usize,
-    limited: bool,
-}
-
-/// Recognise the root envelopes already consumed by the export loaders.
-/// Arbitrary JSON objects and nested text/tool blocks are not session records.
-/// This restriction applies only to recovery, not to intact JSONL lines.
-fn is_recoverable_followup_record(value: &serde_json::Value) -> bool {
-    fn message(value: &serde_json::Value) -> bool {
-        matches!(
-            value.get("role").and_then(serde_json::Value::as_str),
-            Some(
-                "user"
-                    | "assistant"
-                    | "system"
-                    | "developer"
-                    | "tool"
-                    | "toolResult"
-                    | "tool_result"
-                    | "function"
-            )
-        ) && value
-            .get("content")
-            .is_some_and(|content| content.is_string() || content.is_array())
-    }
-
-    fn has_id(value: &serde_json::Value) -> bool {
-        value
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|id| !id.is_empty())
-    }
-
-    if message(value) {
-        return true;
-    }
-    match value.get("type").and_then(serde_json::Value::as_str) {
-        Some("message") => has_id(value) && value.get("message").is_some_and(message),
-        Some(role @ ("user" | "assistant")) => value.get("message").is_some_and(|inner| {
-            message(inner) && inner.get("role").and_then(serde_json::Value::as_str) == Some(role)
-        }),
-        Some("session") => has_id(value),
-        Some("session_meta" | "response_item" | "event_msg" | "turn_context") => {
-            let timestamp = value
-                .get("timestamp")
-                .is_some_and(|timestamp| timestamp.is_string() || timestamp.is_number());
-            let Some(payload) = value.get("payload").filter(|payload| payload.is_object()) else {
-                return false;
-            };
-            timestamp
-                && match value.get("type").and_then(serde_json::Value::as_str) {
-                    Some("session_meta") => has_id(payload),
-                    Some("turn_context") => true,
-                    _ => payload
-                        .get("type")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|kind| !kind.is_empty()),
-                }
-        }
-        _ => false,
-    }
-}
-
-/// Recover a complete suffix of known session records after a torn prefix.
-///
-/// Search from the start, not the JSON error column: when a write tears inside
-/// a string, the next record's opening brace is consumed as string content and
-/// the reported error lies *after* the record's actual start. Accept only an
-/// entire suffix of object records with no trailing garbage.
-///
-/// A brace at a legal nested-value boundary is ambiguous, even if its suffix
-/// decodes: {"message":{"role":"user","content":"nested"} is a truncated
-/// outer record, not a new root message. Refuse candidates after ':', '[' or
-/// ',' (ignoring ASCII whitespace). This deliberately leaves ambiguous tears
-/// unrecovered rather than manufacturing history from nested data.
-fn recover_followup_jsonl_suffix(line: &str) -> FollowupJsonlRecovery {
-    let mut unrecovered = FollowupJsonlRecovery {
-        discarded_bytes: line.len(),
-        ..FollowupJsonlRecovery::default()
-    };
-    if line.len() > MAX_FOLLOWUP_JSONL_RECOVERY_LINE_BYTES {
-        unrecovered.limited = true;
-        return unrecovered;
-    }
-
-    let mut remaining_parse_bytes = MAX_FOLLOWUP_JSONL_RECOVERY_PARSE_BYTES;
-    let mut attempts = 0;
-    let mut previous_non_whitespace = None;
-    for (offset, byte) in line.bytes().enumerate() {
-        let previous = previous_non_whitespace;
-        if !byte.is_ascii_whitespace() {
-            previous_non_whitespace = Some(byte);
-        }
-        if byte != b'{' || matches!(previous, Some(b':' | b'[' | b',')) {
-            continue;
-        }
-
-        // An ASCII opening brace is always a UTF-8 character boundary.
-        let suffix = &line[offset..];
-        // Skip braces in prose/code before paying for another parse. An object
-        // with a recognised root envelope must start with a quoted field name.
-        if suffix[1..]
-            .trim_start_matches(|ch: char| ch.is_ascii_whitespace())
-            .as_bytes()
-            .first()
-            != Some(&b'"')
-        {
-            continue;
-        }
-        if attempts >= MAX_FOLLOWUP_JSONL_RECOVERY_ATTEMPTS || suffix.len() > remaining_parse_bytes
-        {
-            unrecovered.limited = true;
-            return unrecovered;
-        }
-        attempts += 1;
-        remaining_parse_bytes -= suffix.len();
-
-        let mut records = Vec::new();
-        let mut complete = true;
-        for parsed in serde_json::Deserializer::from_str(suffix).into_iter::<serde_json::Value>() {
-            let Ok(record) = parsed else {
-                complete = false;
-                break;
-            };
-            if !is_recoverable_followup_record(&record) {
-                complete = false;
-                break;
-            }
-            if records.len() >= MAX_FOLLOWUP_JSONL_RECOVERY_RECORDS {
-                unrecovered.limited = true;
-                return unrecovered;
-            }
-            records.push(record);
-        }
-        if complete && !records.is_empty() {
-            return FollowupJsonlRecovery {
-                records,
-                discarded_bytes: offset,
-                limited: false,
-            };
-        }
-    }
-    unrecovered
-}
+use franken_agent_detection::connectors::jsonl::recover_jsonl_suffix as recover_followup_jsonl_suffix;
+#[cfg(test)]
+use franken_agent_detection::connectors::jsonl::{
+    MAX_JSONL_RECOVERY_ATTEMPTS as MAX_FOLLOWUP_JSONL_RECOVERY_ATTEMPTS,
+    MAX_JSONL_RECOVERY_LINE_BYTES as MAX_FOLLOWUP_JSONL_RECOVERY_LINE_BYTES,
+    MAX_JSONL_RECOVERY_RECORDS as MAX_FOLLOWUP_JSONL_RECOVERY_RECORDS,
+};
 
 /// Parse a JSONL session for export, retaining intact records around malformed
 /// lines (GH #427) and conservatively recovering complete records appended
 /// after a torn prefix on the same line (GH #553). Only when no record decodes
 /// is the file rejected, preserving the existing indexed-copy fallback.
 ///
-/// Connector ingestion has its own parsing policy; recovered export records
-/// do not imply that the canonical archive has ingested them.
+/// Connector ingestion and export share FAD's bounded suffix decoder; each
+/// interprets the resulting records for its own output. Export recovery alone
+/// does not prove that an archive has ingested those records.
 pub(crate) fn parse_followup_jsonl_messages_tolerant(path: &Path) -> CliResult<TolerantJsonlParse> {
     let lines = read_followup_file_lines(path)?;
     let mut messages = Vec::new();
@@ -110381,6 +110334,44 @@ mod gh427_tolerant_jsonl_tests {
         assert_eq!(skipped[0].recovered_records, 1);
         assert_eq!(skipped[0].discarded_bytes, prefix_bytes);
         assert!(!skipped[0].recovery_limited);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), body);
+    }
+
+    #[test]
+    fn gh553_exports_keep_tool_results_followed_by_pi_control_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let (original, prefix_bytes) = gh553_torn_pi_session();
+        let lines = original.lines().collect::<Vec<_>>();
+        let control = r#"{"type":"model_change","id":"model","modelId":"synthetic"}"#;
+        let body = format!("{}\n{}{control}\n{}\n", lines[0], lines[1], lines[2]);
+        let path = write_session(&dir, "control-after-torn.jsonl", &body);
+        let (records, _, _, skipped) = parse_followup_jsonl_messages_tolerant(&path).unwrap();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[1]["id"], "a0000003");
+        assert_eq!(records[2]["id"], "model");
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].recovered_records, 2);
+        assert_eq!(skipped[0].discarded_bytes, prefix_bytes);
+        let output = dir.path().join("recovered.json");
+        run_export(
+            &path,
+            Some(dir.path().join("unused.db")),
+            None,
+            ConvExportFormat::Json,
+            Some(&output),
+            false,
+            true,
+            true,
+            false,
+        )
+        .expect("export must retain tool results before Pi control records");
+        let exported: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(exported.len(), 4);
+        assert_eq!(
+            exported[1]["message"]["content"][0]["text"],
+            "bravo marker two"
+        );
         assert_eq!(std::fs::read_to_string(path).unwrap(), body);
     }
 

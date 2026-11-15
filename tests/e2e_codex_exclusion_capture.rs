@@ -2,6 +2,8 @@
 //! GH #506: `CASS_RAW_MIRROR=0` stops raw copies without excluding any rows.
 //! Bead 0f1k0: an exclusion covers every connector (Gemini included) and every
 //! spelling of the directory (`..`, relative, symlink alias).
+//! GH #554: unrelated exclusions preserve virtual sessions in a shared database.
+//! GH #542: raw-capture budget pauses are summarized and visible in status/health.
 //! Run with `cargo test --test e2e_codex_exclusion_capture` in a full CASS build.
 
 use coding_agent_search::raw_mirror::storage_summary;
@@ -83,6 +85,10 @@ impl Fixture {
             // sessions would be indexed into the test archive.
             .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
             .env("GEMINI_HOME", home.join(".gemini/tmp"))
+            .env(
+                "OPENCODE_SQLITE_DB",
+                home.join(".local/share/opencode/opencode.db"),
+            )
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("XDG_DATA_HOME", home.join(".local/share"))
             .env("APPDATA", home.join("AppData/Roaming"))
@@ -99,7 +105,7 @@ impl Fixture {
         command
     }
 
-    fn index(&self, streaming: &str, exclusions: &str, full: bool) {
+    fn index(&self, streaming: &str, exclusions: &str, full: bool) -> Value {
         let mut command = assert_cmd::Command::from_std(self.command(streaming, exclusions));
         command.args(["index", "--json"]);
         if full {
@@ -119,6 +125,7 @@ impl Fixture {
             )
         });
         assert_eq!(summary["success"], true, "{summary}");
+        summary
     }
 
     fn assert_sources(&self, expected: &[&Path]) {
@@ -158,6 +165,179 @@ impl Fixture {
             "{result}"
         );
     }
+}
+
+/// Two logical conversations whose source handles descend from one real file.
+fn write_opencode_database(fixture: &Fixture) -> PathBuf {
+    use coding_agent_search::franken_sync::{Connection, compat::ConnectionExt, params};
+
+    let source = fixture
+        .home
+        .path()
+        .join(".local/share/opencode/opencode.db");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    let conn = Connection::open(source.to_string_lossy().as_ref()).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         CREATE TABLE session (
+            id TEXT PRIMARY KEY, project_id TEXT, title TEXT, directory TEXT,
+            time_created INTEGER, time_updated INTEGER
+         );
+         CREATE TABLE message (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL, data TEXT NOT NULL,
+            time_created INTEGER, time_updated INTEGER
+         );
+         CREATE TABLE part (
+            id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+            data TEXT NOT NULL, time_created INTEGER, time_updated INTEGER
+         );",
+    )
+    .unwrap();
+    let timestamp = 1_767_225_600_000_i64;
+    for (session, marker) in [
+        ("ses-private", "cassopencodeprivate6z"),
+        ("ses-public", "cassopencodepublic5z"),
+    ] {
+        conn.execute_compat(
+            "INSERT INTO session VALUES (?1, 'project', ?1, '/work', ?2, ?2)",
+            params![session, timestamp],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO message VALUES (?1, ?1, ?2, ?3, ?3)",
+            params![
+                session,
+                json!({"role": "user", "time": {"created": timestamp}}).to_string(),
+                timestamp
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part VALUES (?1, ?1, ?1, ?2, ?3, ?3)",
+            params![
+                session,
+                json!({"type": "text", "text": marker}).to_string(),
+                timestamp
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    drop(conn);
+    source
+}
+
+#[test]
+fn gh554_unrelated_exclusions_preserve_opencode_database_sessions() {
+    for streaming in ["0", "1"] {
+        let fixture = Fixture::new();
+        let source = write_opencode_database(&fixture);
+        let original = fs::read(&source).unwrap();
+        let private = fixture.home.path().join("unrelated-private");
+        fs::create_dir(&private).unwrap();
+        let exclusions = format!("{},missing/private", private.display());
+        let summary = fixture.index(streaming, &exclusions, true);
+        assert_eq!(
+            summary["connector_summary"]["opencode"]["indexed"], 2,
+            "{summary}"
+        );
+        assert_eq!(
+            summary["connector_summary"]["opencode"]["skipped"], 0,
+            "{summary}"
+        );
+        fixture.assert_sources(&[
+            &fixture.hidden,
+            &fixture.archived,
+            &fixture.public,
+            &source.join("ses-private"),
+            &source.join("ses-public"),
+        ]);
+        fixture.assert_hits("cassopencodeprivate6z", 1);
+        fixture.assert_hits("cassopencodepublic5z", 1);
+        assert_eq!(fs::read(&source).unwrap(), original);
+    }
+}
+
+#[test]
+fn gh554_database_exclusion_remains_private_and_removal_recovers_old_sessions() {
+    for streaming in ["0", "1"] {
+        let fixture = Fixture::new();
+        let source = write_opencode_database(&fixture);
+        let original = fs::read(&source).unwrap();
+        let summary = fixture.index(streaming, &source.display().to_string(), true);
+        assert_eq!(
+            summary["connector_summary"]["opencode"]["indexed"], 0,
+            "{summary}"
+        );
+        fixture.assert_sources(&[&fixture.hidden, &fixture.archived, &fixture.public]);
+        for marker in ["cassopencodeprivate6z", "cassopencodepublic5z"] {
+            assert!(files_containing(&fixture.home.path().join("data"), marker).is_empty());
+            fixture.assert_hits(marker, 0);
+        }
+        assert!(!fixture.captured_sources().contains(&source));
+
+        fixture.index(streaming, "", false);
+        fixture.assert_sources(&[
+            &fixture.hidden,
+            &fixture.archived,
+            &fixture.public,
+            &source.join("ses-private"),
+            &source.join("ses-public"),
+        ]);
+        fixture.assert_hits("cassopencodeprivate6z", 1);
+        fixture.assert_hits("cassopencodepublic5z", 1);
+        assert_eq!(fs::read(&source).unwrap(), original);
+    }
+}
+
+/// Explicit OpenCode watch selects one provider. FAD's separate policy parser
+/// still refuses virtual policy entries in other providers; this regression
+/// exercises CASS's post-parser admission and skipped-source accounting. A raw
+/// copy cannot separate the sessions, so the entire shared DB is withheld.
+#[test]
+fn gh554_watch_once_virtual_session_exclusion_keeps_its_sibling_and_reports_skip() {
+    let fixture = Fixture::new();
+    fixture.index("1", "", true);
+    let source = write_opencode_database(&fixture);
+    let excluded = source.join("ses-private");
+    let output =
+        assert_cmd::Command::from_std(fixture.command("1", &excluded.display().to_string()))
+            .args(["index", "--watch-once"])
+            .arg(&source)
+            .args(["--json", "--no-progress-events"])
+            .timeout(Duration::from_secs(180))
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["success"], true, "{report}");
+    assert_eq!(
+        report["connector_summary"]["opencode"]["indexed"], 1,
+        "{report}"
+    );
+    assert_eq!(
+        report["connector_summary"]["opencode"]["skipped"], 1,
+        "{report}"
+    );
+    fixture.assert_sources(&[
+        &fixture.hidden,
+        &fixture.archived,
+        &fixture.public,
+        &source.join("ses-public"),
+    ]);
+    fixture.assert_hits("cassopencodeprivate6z", 0);
+    fixture.assert_hits("cassopencodepublic5z", 1);
+    assert!(
+        !fixture.captured_sources().contains(&source),
+        "raw capture must withhold a shared DB containing an excluded session"
+    );
+    let leaked = files_containing(&fixture.home.path().join("data"), "cassopencodeprivate6z");
+    assert!(
+        leaked.is_empty(),
+        "excluded session bytes leaked into {leaked:?}"
+    );
 }
 
 impl Fixture {
@@ -367,6 +547,121 @@ fn raw_mirror_switch_indexes_without_raw_copies_and_doctor_discloses_it() {
             control.all_sources(),
             "streaming={streaming}"
         );
+    }
+}
+
+#[test]
+fn gh542_capture_budget_pause_is_bounded_visible_and_recovers_without_losing_search() {
+    for streaming in ["0", "1"] {
+        let fixture = Fixture::new();
+        let mut index = fixture.command(streaming, "");
+        index
+            .env("CASS_RAW_MIRROR_MAX_BYTES", "0")
+            .env("CASS_RAW_MIRROR_MIN_FREE_BYTES", "0")
+            .args(["index", "--json", "--full"]);
+        let output = assert_cmd::Command::from_std(index)
+            .timeout(Duration::from_secs(180))
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(summary["success"], true, "{summary}");
+        fixture.assert_sources(&[&fixture.hidden, &fixture.archived, &fixture.public]);
+        fixture.assert_hits("casspublicproof7z", 1);
+        assert!(fixture.captured_sources().is_empty());
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let events: Vec<Value> = stderr
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        for event in ["raw_mirror_capture_paused", "raw_mirror_capture_summary"] {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|value| value["event"] == event)
+                    .count(),
+                1,
+                "one bounded {event} event expected: {stderr}"
+            );
+        }
+        assert!(
+            !stderr.contains("failed to capture discovered provider source")
+                && !stderr.contains("failed to capture explicit scan-root source")
+                && !stderr.contains("failed to capture parsed conversation source"),
+            "budget refusals must not produce a warning per source: {stderr}"
+        );
+
+        let receipt_path = fixture.home.path().join("data/raw-mirror-capture.json");
+        let receipt_before = fs::read(&receipt_path).unwrap();
+        let mut observed_run_id = None;
+        for surface in ["status", "health"] {
+            let mut probe = fixture.command(streaming, "");
+            probe
+                // Current configuration must not relabel the historical pause
+                // as a live probe or a successful resume.
+                .env("CASS_RAW_MIRROR_MAX_BYTES", "1048576")
+                .env("CASS_RAW_MIRROR_MIN_FREE_BYTES", "0")
+                .args([surface, "--json"]);
+            let output = assert_cmd::Command::from_std(probe)
+                .timeout(Duration::from_secs(30))
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            let report: Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(report["healthy"], true, "{surface}: {report}");
+            let capture = &report["raw_mirror_capture"];
+            assert_eq!(capture["status"], "last_run_paused", "{capture}");
+            assert_eq!(capture["receipt_status"], "recorded", "{capture}");
+            assert_eq!(capture["configuration"]["max_bytes"], 1_048_576);
+            let run = &capture["last_run"];
+            assert_eq!(run["max_bytes"], 0);
+            assert_eq!(run["completed"], true);
+            assert_eq!(run["capture_paused"], true);
+            assert_eq!(run["skipped_sources"], 3, "{run}");
+            assert_eq!(run["skipped_sources_exact"], true);
+            assert_eq!(run["counters_exact"], true);
+            assert!(run["pause_attempts"].as_u64().unwrap() >= 3);
+            assert!(run["requested_reservation_bytes"].as_u64().unwrap() > 0);
+            assert_eq!(run["last_pause"]["max_bytes"], 0);
+            assert!(run["finished_at_ms"].is_i64());
+            if let Some(run_id) = &observed_run_id {
+                assert_eq!(&run["run_id"], run_id);
+            } else {
+                observed_run_id = Some(run["run_id"].clone());
+            }
+            assert!(
+                report["warnings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|warning| warning.as_str().is_some_and(|text| {
+                        text.to_ascii_lowercase().contains("raw") && text.contains("3")
+                    })),
+                "{surface} must explain the missing raw protection: {report}"
+            );
+        }
+        assert_eq!(
+            fs::read(&receipt_path).unwrap(),
+            receipt_before,
+            "status and health must not rewrite the receipt"
+        );
+
+        // The original sources remain unchanged. A full scan with the normal
+        // budget can preserve them and replace the last-run observation.
+        fixture.index(streaming, "", true);
+        assert_eq!(fixture.captured_sources(), fixture.all_sources());
+        let receipt: Value = serde_json::from_slice(&fs::read(receipt_path).unwrap()).unwrap();
+        assert_eq!(receipt["completed"], true);
+        assert_eq!(receipt["capture_paused"], false);
+        assert_eq!(receipt["skipped_sources"], 0);
+        assert_eq!(receipt["pause_attempts"], 0);
+        assert!(receipt["last_pause"].is_null());
+        assert_ne!(Some(receipt["run_id"].clone()), observed_run_id);
+        fixture.assert_hits("cassprivateproof9z", 1);
     }
 }
 
