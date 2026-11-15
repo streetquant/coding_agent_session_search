@@ -11,6 +11,7 @@ use crate::search::ann_index::{
     AnnExactFallbackReason, AnnExactFallbackStats, AnnExactShardFallback, AnnPartialExactStats,
     AnnSearchStats, SemanticAnnReadiness,
 };
+use frankensearch::index::native_hnsw::ValidatedNativeHnsw;
 
 mod execution;
 mod refinement;
@@ -18,11 +19,131 @@ use refinement::{NativeRefillBudget, accumulate_native_stats};
 
 pub(super) struct SemanticAnnShardSet {
     artifacts: Arc<Vec<SemanticIndexArtifact>>,
-    graphs: Vec<FsHnswIndex>,
+    graphs: Vec<SemanticAnnGraph>,
     // Parallel to graphs; do not confuse compact native positions with source ordinals.
     native_ordinals: Vec<usize>,
     exact_shards: Vec<AnnExactShardFallback>,
 }
+
+/// One admitted native graph. Legacy sidecars load through a path reader;
+/// immutable v2 artifacts load the graph against their retained owner.
+pub(super) enum SemanticAnnGraph {
+    Legacy(FsHnswIndex),
+    Owner(ValidatedNativeHnsw),
+}
+
+impl SemanticAnnGraph {
+    fn len(&self) -> usize {
+        match self {
+            Self::Legacy(graph) => graph.len(),
+            Self::Owner(graph) => graph.len(),
+        }
+    }
+
+    fn knn_search_with_stats_against(
+        &self,
+        artifact: &SemanticIndexArtifact,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<(Vec<frankensearch::VectorHit>, AnnSearchStats)> {
+        match self {
+            Self::Legacy(graph) => {
+                let (hits, measured) = graph
+                    .knn_search_with_stats_against(artifact.index().expect("legacy FSVI"), query, k, ef_search)
+                    .map_err(|error| anyhow!("{error}"))?;
+                Ok((
+                    hits,
+                    AnnSearchStats {
+                        index_size: measured.index_size,
+                        dimension: measured.dimension,
+                        ef_search: measured.ef_search,
+                        k_requested: measured.k_requested,
+                        k_returned: measured.k_returned,
+                        search_time_us: measured.search_time_us,
+                        estimated_recall: measured.estimated_recall as f32,
+                        is_approximate: measured.is_approximate,
+                        exact_fallback: None,
+                        partial_exact: None,
+                        candidate_rescore: None,
+                    },
+                ))
+            }
+            Self::Owner(graph) => {
+                let owner = artifact
+                    .owner()
+                    .ok_or_else(|| anyhow!("owner graph is missing its admitted FSVI owner"))?;
+                let cx = frankensearch::Cx::current().unwrap_or_else(frankensearch::Cx::for_request);
+                let started = std::time::Instant::now();
+                let candidates = graph.search(&cx, query, k, Some(ef_search))?;
+                let returned = candidates.len();
+                let mut hits = Vec::with_capacity(returned);
+                for candidate in candidates {
+                    let row = usize::try_from(candidate.physical_row())
+                        .map_err(|_| anyhow!("native owner graph row does not fit usize"))?;
+                    if candidate.doc_id() != owner.doc_id_at(row)?
+                        || !candidate.flags().is_live()
+                    {
+                        anyhow::bail!("native owner graph returned an inconsistent row");
+                    }
+                    let stored = owner.row(row)?;
+                    let score = match owner.quantization() {
+                        frankensearch::index::Quantization::F16 => {
+                            frankensearch::index::dot_product_f16_bytes_f32(
+                                stored.vector_bytes(),
+                                query,
+                            )?
+                        }
+                        frankensearch::index::Quantization::F32 => {
+                            frankensearch::index::dot_product_f32_bytes_f32(
+                                stored.vector_bytes(),
+                                query,
+                            )?
+                        }
+                    };
+                    if !score.is_finite() {
+                        anyhow::bail!("native owner graph produced a non-finite score");
+                    }
+                    hits.push(frankensearch::VectorHit {
+                        index: candidate.physical_row(),
+                        score,
+                        doc_id: candidate.doc_id().into(),
+                    });
+                }
+                hits.sort_unstable_by(|left, right| {
+                    right
+                        .score
+                        .total_cmp(&left.score)
+                        .then_with(|| left.index.cmp(&right.index))
+                });
+                let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                let recall = if k == 0 {
+                    1.0
+                } else {
+                    let ratio = (ef_search.max(1) as f64) / (k as f64);
+                    0.1_f64.mul_add(ratio.log2(), 0.9_f64).clamp(0.0, 1.0) as f32
+                };
+                Ok((
+                    hits,
+                    AnnSearchStats {
+                        index_size: graph.len(),
+                        dimension: query.len(),
+                        ef_search,
+                        k_requested: k,
+                        k_returned: returned,
+                        search_time_us: elapsed,
+                        estimated_recall: recall,
+                        is_approximate: true,
+                        exact_fallback: None,
+                        partial_exact: None,
+                        candidate_rescore: None,
+                    },
+                ))
+            }
+        }
+    }
+}
+
 
 /// Only errors after query/owner validation may degrade to exact retrieval.
 /// Keep completed native measurements, but never carry partial hits or raw
@@ -51,6 +172,19 @@ impl std::fmt::Display for NativeAnnSearchFailure {
 }
 
 impl std::error::Error for NativeAnnSearchFailure {}
+
+fn open_owner_semantic_ann_graph(
+    owner: std::sync::Arc<frankensearch::index::ValidatedFsviBytes>,
+    ann_path: &std::path::Path,
+) -> std::result::Result<SemanticAnnGraph, SemanticAnnOpenFailure> {
+    match ValidatedNativeHnsw::load(owner, ann_path) {
+        Ok((graph, _receipt)) => Ok(SemanticAnnGraph::Owner(graph)),
+        Err(_) => Err(SemanticAnnOpenFailure {
+            reason: SemanticAnnUnavailableReason::SidecarOpenFailed,
+            diagnostic: "owned_graph_open_failed",
+        }),
+    }
+}
 
 impl SemanticAnnShardSet {
     /// The cohort's native-admission verdict.
@@ -115,22 +249,18 @@ impl SemanticAnnShardSet {
                 diagnostic: "shard_pairing_unavailable",
             });
         }
-        let first = artifacts[0].index();
+        let first = &artifacts[0];
         for artifact in artifacts.iter() {
-            let index = artifact.index();
             // The enclosing context already validates embedder ID/dimension.
             // Retain that guard here for direct callers, and do not combine
             // explicitly different v2 spaces merely because their widths match.
-            let same_space = match (
-                first.metadata().identity_v2.as_ref(),
-                index.metadata().identity_v2.as_ref(),
-            ) {
+            let same_space = match (first.identity_v2(), artifact.identity_v2()) {
                 (None, None) => true, // preserve the existing legacy v1 contract
                 (Some(left), Some(right)) => left.space_fingerprint == right.space_fingerprint,
                 _ => false,
             };
-            if first.dimension() != index.dimension()
-                || first.embedder_id() != index.embedder_id()
+            if first.dimension() != artifact.dimension()
+                || first.embedder_id() != artifact.embedder_id()
                 || !same_space
             {
                 return Err(SemanticAnnOpenFailure {
@@ -149,10 +279,17 @@ impl SemanticAnnShardSet {
                     reason,
                     diagnostic: "shard_pairing_unavailable",
                 }),
-                None => open_fs_semantic_ann_index(
-                    artifact.index(),
-                    artifact.ann_path().expect("pairing checked above"),
-                ),
+                None => match artifact.owner_arc() {
+                    Some(owner) => open_owner_semantic_ann_graph(
+                        owner,
+                        artifact.ann_path().expect("pairing checked above"),
+                    ),
+                    None => open_fs_semantic_ann_index(
+                        artifact.index().expect("legacy FSVI"),
+                        artifact.ann_path().expect("pairing checked above"),
+                    )
+                    .map(SemanticAnnGraph::Legacy),
+                },
             };
             match opened {
                 Ok(graph) => {
@@ -644,14 +781,14 @@ mod tests {
         let mut actual_raw_count = 0;
         for (ordinal, graph) in set.graphs.iter().enumerate() {
             let (hits, _) = graph
-                .knn_search_with_stats_against(artifacts[ordinal].index(), &[1.0, 0.0], 12, 100)
+                .knn_search_with_stats_against(&artifacts[ordinal], &[1.0, 0.0], 12, 100)
                 .unwrap();
             actual_raw_count += hits.len();
             for hit in &hits {
                 SearchClient::record_fs_semantic_hit(&mut native_reference, hit);
             }
             for hit in artifacts[ordinal]
-                .index()
+                .index().expect("legacy FSVI")
                 .search_top_k(&[1.0, 0.0], 3, None)
                 .unwrap()
             {
@@ -959,15 +1096,18 @@ mod tests {
             &[(doc(3, 3), [0.6, 0.8]), (doc(4, 3), [0.0, 1.0])],
         );
         let first_graph =
-            open_fs_semantic_ann_index(first.index(), first.ann_path().unwrap()).unwrap();
+            open_fs_semantic_ann_index(first.index().expect("legacy FSVI"), first.ann_path().unwrap()).unwrap();
         let wrong_graph =
-            open_fs_semantic_ann_index(wrong.index(), wrong.ann_path().unwrap()).unwrap();
+            open_fs_semantic_ann_index(wrong.index().expect("legacy FSVI"), wrong.ann_path().unwrap()).unwrap();
         let artifacts = Arc::new(vec![first, second]);
         // Deliberately inject an invalid private pairing to exercise the query
         // boundary. Normal all-or-nothing admission remains unchanged.
         let set = SemanticAnnShardSet {
             artifacts: Arc::clone(&artifacts),
-            graphs: vec![first_graph, wrong_graph],
+            graphs: vec![
+                SemanticAnnGraph::Legacy(first_graph),
+                SemanticAnnGraph::Legacy(wrong_graph),
+            ],
             native_ordinals: vec![0, 1],
             exact_shards: Vec::new(),
         };
@@ -1004,7 +1144,7 @@ mod tests {
             let candidate = (3 * ANN_CANDIDATE_MULTIPLIER).min(graph.len());
             let (hits, measured) = graph
                 .knn_search_with_stats_against(
-                    source.index(),
+                    source,
                     &[1.0, 0.0],
                     candidate,
                     FS_HNSW_DEFAULT_EF_SEARCH.max(candidate),
@@ -1065,7 +1205,7 @@ mod tests {
         // Real HNSW source-extent validation fails at query time. No mocked
         // result, artifact mutation, or relaxed production admission is used.
         set.graphs[failed_shard] =
-            open_fs_semantic_ann_index(wrong.index(), wrong.ann_path().unwrap()).unwrap();
+            SemanticAnnGraph::Legacy(open_fs_semantic_ann_index(wrong.index().expect("legacy FSVI"), wrong.ann_path().unwrap()).unwrap());
         (context, set)
     }
 
@@ -1194,4 +1334,242 @@ mod tests {
         );
         assert_eq!(snapshot(dir.path()), before);
     }
+
+    /// Create an exact FSVI without any sidecar and return its path.
+    fn exact_source(dir: &Path, name: &str, rows: &[(String, [f32; 2])]) -> PathBuf {
+        let path = dir.join(format!("{name}.fsvi"));
+        let mut writer = FsVectorIndex::create_with_revision(
+            &path,
+            "fnv1a-2",
+            "ann-shard-test",
+            2,
+            Quantization::F32,
+        )
+        .unwrap();
+        for (id, vector) in rows {
+            writer.write_record(id, vector).unwrap();
+        }
+        writer.finish().unwrap();
+        path
+    }
+
+    /// Every file's bytes, mtime and mode under `dir`, for a no-write proof.
+    fn file_state(dir: &Path) -> Vec<(PathBuf, Vec<u8>, Option<std::time::SystemTime>, u32)> {
+        let mut state = Vec::new();
+        for entry in walkdir::WalkDir::new(dir) {
+            let entry = entry.unwrap();
+            if entry.file_type().is_file() {
+                let metadata = entry.metadata().unwrap();
+                #[cfg(unix)]
+                let mode = std::os::unix::fs::PermissionsExt::mode(&metadata.permissions());
+                #[cfg(not(unix))]
+                let mode = 0;
+                state.push((
+                    entry.path().to_path_buf(),
+                    std::fs::read(entry.path()).unwrap(),
+                    metadata.modified().ok(),
+                    mode,
+                ));
+            }
+        }
+        state.sort_by(|left, right| left.0.cmp(&right.0));
+        state
+    }
+
+    #[test]
+    fn admission_reports_absent_without_a_paired_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = records(1, 0.9);
+        let fsvi = exact_source(dir.path(), "unpaired", &rows);
+        let unpaired = SemanticIndexArtifact::open(&fsvi, None).unwrap();
+        let missing =
+            SemanticIndexArtifact::open(&fsvi, Some(dir.path().join("absent.chsw"))).unwrap();
+        assert_eq!(
+            SemanticAnnShardSet::admission(&[]),
+            SemanticAnnReadiness::Absent
+        );
+        assert_eq!(
+            SemanticAnnShardSet::admission(&[unpaired]),
+            SemanticAnnReadiness::Absent
+        );
+        assert_eq!(
+            SemanticAnnShardSet::admission(&[missing]),
+            SemanticAnnReadiness::Absent
+        );
+    }
+
+    #[test]
+    fn admission_admits_a_native_cohort_without_touching_the_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = records(1, 0.9);
+        let artifact = shard(dir.path(), "native", &rows);
+        let before = file_state(dir.path());
+        assert_eq!(
+            SemanticAnnShardSet::admission(&[artifact]),
+            SemanticAnnReadiness::NativeReady
+        );
+        assert_eq!(
+            file_state(dir.path()),
+            before,
+            "the readiness probe must not write, retime or chmod the artifact"
+        );
+    }
+
+    #[test]
+    fn admission_rejects_a_corrupt_sidecar_with_the_serving_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = records(1, 0.9);
+        let fsvi = exact_source(dir.path(), "corrupt", &rows);
+        let ann = dir.path().join("corrupt.chsw");
+        std::fs::write(&ann, b"not an hnsw sidecar").unwrap();
+        let artifact = SemanticIndexArtifact::open(&fsvi, Some(ann)).unwrap();
+        // The same reason the serving path reports when it falls back to
+        // exact retrieval: the sidecar metadata could not be parsed.
+        assert_eq!(
+            SemanticAnnShardSet::admission(&[artifact]),
+            SemanticAnnReadiness::Rejected(SemanticAnnUnavailableReason::SidecarOpenFailed)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn admission_rejects_a_symlinked_sidecar_and_a_cross_role_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = records(1, 0.9);
+        let fsvi = exact_source(dir.path(), "alias", &rows);
+
+        let target = dir.path().join("external-sidecar");
+        std::fs::write(&target, b"unrelated retained data").unwrap();
+        let link = dir.path().join("linked.chsw");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let linked = SemanticIndexArtifact::open(&fsvi, Some(link)).unwrap();
+        assert_eq!(
+            SemanticAnnShardSet::admission(&[linked]),
+            SemanticAnnReadiness::Rejected(SemanticAnnUnavailableReason::SidecarOpenFailed)
+        );
+
+        // The exact artifact may never double as its own ANN sidecar.
+        let aliased = SemanticIndexArtifact::open(&fsvi, Some(fsvi.clone())).unwrap();
+        assert_eq!(
+            SemanticAnnShardSet::admission(&[aliased]),
+            SemanticAnnReadiness::Rejected(SemanticAnnUnavailableReason::SidecarOpenFailed)
+        );
+    }
+
+    #[test]
+    fn admission_admits_a_mixed_cohort_when_one_shard_is_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = records(1, 0.9);
+        let usable = shard(dir.path(), "usable", &rows);
+        let broken_fsvi = exact_source(dir.path(), "broken", &rows);
+        let broken =
+            SemanticIndexArtifact::open(&broken_fsvi, Some(dir.path().join("broken.chsw")))
+                .unwrap();
+        // One usable pairing keeps mixed admission possible: the unusable
+        // shard degrades to exact retrieval instead of disabling the cohort.
+        assert_eq!(
+            SemanticAnnShardSet::admission(&[usable, broken]),
+            SemanticAnnReadiness::NativeReady
+        );
+    }
+    #[test]
+    fn owner_backed_admission_loads_the_graph_against_retained_v2_bytes() {
+        use crate::search::embedder::Embedder;
+        use crate::search::hash_embedder::HashEmbedder;
+        use crate::search::vector_index::SemanticDocId;
+        use frankensearch::core::generation::{
+            ArtifactGenerationIdentityV1, QuantizationFormat,
+        };
+        use frankensearch::index::native_hnsw::{HnswParams, ValidatedNativeHnsw};
+        use frankensearch::index::{FsviV2IdentityBinding, ValidatedFsviBytes};
+
+        let dir = tempfile::tempdir().unwrap();
+        let model = HashEmbedder::default();
+        let identity = model.identity().unwrap().clone();
+        let mut fsvi_identity = identity.clone();
+        fsvi_identity.storage.format = "fsvi-v2".into();
+        fsvi_identity.storage.quantization = QuantizationFormat::F16;
+        fsvi_identity.storage.endianness = "little-endian".into();
+        fsvi_identity.storage.dimension = u32::try_from(model.dimension()).unwrap();
+        let binding = FsviV2IdentityBinding::new(
+            ArtifactGenerationIdentityV1::new(1, [1; 16]).unwrap(),
+            fsvi_identity.freeze().unwrap(),
+        )
+        .unwrap();
+        let fsvi = dir.path().join("owner.fsvi");
+        let mut writer = FsVectorIndex::create_v2(&fsvi, binding.clone()).unwrap();
+        for (message_id, basis) in [(1_u64, 0_usize), (2, 1)] {
+            let doc = SemanticDocId {
+                message_id,
+                chunk_idx: 0,
+                agent_id: 1,
+                workspace_id: 2,
+                source_id: 3,
+                role: ROLE_USER,
+                created_at_ms: 1_700_000_000_000,
+                content_hash: None,
+            }
+            .to_doc_id_string();
+            let mut vector = vec![0.0_f32; model.dimension()];
+            vector[basis] = 1.0;
+            writer.write_record(&doc, &vector).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let owner = Arc::new(ValidatedFsviBytes::open_published(&fsvi, &binding).unwrap());
+        let graph = ValidatedNativeHnsw::build(
+            &frankensearch::Cx::for_request(),
+            Arc::clone(&owner),
+            HnswParams {
+                m: 16,
+                m0: 32,
+                ef_construction: 64,
+                ef_search: 8,
+            },
+            17,
+        )
+        .unwrap();
+        let graph_path = dir.path().join("owner.fshnsw");
+        graph.save(&graph_path).unwrap();
+
+        let artifact = SemanticIndexArtifact::open_owner_backed(
+            &fsvi,
+            Some(graph_path),
+            &identity,
+        )
+        .unwrap();
+        assert!(
+            artifact.index().is_none(),
+            "an identity-complete v2 owner has no legacy path reader"
+        );
+        assert_eq!(
+            SemanticAnnShardSet::admission(std::slice::from_ref(&artifact)),
+            SemanticAnnReadiness::NativeReady
+        );
+        let set = SemanticAnnShardSet::open(Arc::new(vec![artifact])).unwrap();
+        assert!(matches!(&set.graphs[0], SemanticAnnGraph::Owner(_)));
+        let mut query = vec![0.0_f32; model.dimension()];
+        query[0] = 1.0;
+        let (hits, measured) = set.graphs[0]
+            .knn_search_with_stats_against(&set.artifacts[0], &query, 1, 8)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(measured.index_size, 2);
+        assert_eq!(measured.k_returned, 1);
+        assert_eq!(
+            hits[0].doc_id,
+            SemanticDocId {
+                message_id: 1,
+                chunk_idx: 0,
+                agent_id: 1,
+                workspace_id: 2,
+                source_id: 3,
+                role: ROLE_USER,
+                created_at_ms: 1_700_000_000_000,
+                content_hash: None,
+            }
+            .to_doc_id_string()
+        );
+    }
+
 }

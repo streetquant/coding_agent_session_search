@@ -389,6 +389,54 @@ mod tests {
     }
 
     #[test]
+    fn ann_readiness_projects_stable_tokens_for_every_state() {
+        use crate::search::vector_index::SemanticAnnUnavailableReason;
+
+        // An absent cohort reports the same reason code the serving path
+        // reports when it has no paired sidecar, so a bounded surface and a
+        // real search never disagree about the reason.
+        let absent = SemanticAnnReadiness::Absent;
+        assert_eq!(absent.state(), "absent");
+        assert!(!absent.is_ready());
+        assert_eq!(absent.reason_code(), Some("ann_sidecar_missing"));
+        assert_eq!(
+            absent.reason(),
+            Some(SemanticAnnUnavailableReason::SidecarMissing)
+        );
+
+        // Presence proves nothing: an unprobed sidecar is never ready and
+        // never invents a reason.
+        let present = SemanticAnnReadiness::PresentUnverified;
+        assert_eq!(present.state(), "present_unverified");
+        assert!(!present.is_ready());
+        assert_eq!(present.reason_code(), None);
+        assert_eq!(present.reason(), None);
+
+        // Native readiness is the only state that may report readiness, and
+        // it never carries a fallback reason.
+        let native = SemanticAnnReadiness::NativeReady;
+        assert_eq!(native.state(), "native_ready");
+        assert!(native.is_ready());
+        assert_eq!(native.reason_code(), None);
+        assert_eq!(native.reason(), None);
+
+        // Every refusal keeps the exact serving-path reason code.
+        for reason in [
+            SemanticAnnUnavailableReason::SessionScopeRequiresExact,
+            SemanticAnnUnavailableReason::MultipleExactShards,
+            SemanticAnnUnavailableReason::SidecarMissing,
+            SemanticAnnUnavailableReason::SidecarOpenFailed,
+            SemanticAnnUnavailableReason::SidecarNotNative,
+        ] {
+            let rejected = SemanticAnnReadiness::Rejected(reason);
+            assert_eq!(rejected.state(), "rejected");
+            assert!(!rejected.is_ready());
+            assert_eq!(rejected.reason_code(), Some(reason.code()));
+            assert_eq!(rejected.reason(), Some(reason));
+        }
+    }
+
+    #[test]
     fn maintenance_preserves_current_native_files_and_honors_configuration() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let source = write_index(

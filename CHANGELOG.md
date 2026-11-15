@@ -34,6 +34,18 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ## [Unreleased]
 
+- **Owner-backed exact semantic selection.** Production exact selection now
+  retains the admitted immutable FSVI v2 owner and matches its complete
+  space, producer, provenance-manifest and input identities instead of only
+  the display id, revision and dimension. Exact search reads the retained
+  bytes, so replacing the selected pathname cannot change a live query.
+- **Owner-bound native ANN.** A selected v2 exact owner now admits its
+  receipted native graph through `ValidatedNativeHnsw` against the retained
+  bytes, and ANN search resolves and rescores rows from that same owner. The
+  legacy path reader remains the v1 backend; `SemanticIndexArtifact::index`
+  returns `None` for v2 instead of panicking, with metadata accessors for
+  either backend.
+
 Main commits after e5a2e9e1, the base of v0.11.0, are not yet described
 here. One fix not in v0.11.0: the active-writer census counts fusectl (the
 kernel's FUSE control filesystem) as local rather than remote.

@@ -5303,9 +5303,32 @@ impl SearchClient {
         let query_cache = QueryCache::new(embedder.as_ref(), capacity)?;
         let producer = query_cache.producer();
         for artifact in &artifacts {
-            let index = artifact.index();
-            let embedder_id = index.embedder_id();
-            let dimension = index.dimension();
+            if let Some(owner) = artifact.owner() {
+                // An admitted v2 owner is authoritative over the display
+                // fields: the complete space, producer, provenance-manifest
+                // and input contracts must match the live embedder.
+                if artifact.dimension() != embedder.dimension() {
+                    bail!(
+                        "embedder dimension mismatch: index uses {}, embedder is {}",
+                        artifact.dimension(),
+                        embedder.dimension()
+                    );
+                }
+                let expected = embedder.identity()?;
+                let admitted = &owner.identity_binding().frozen_identity().identity;
+                if admitted.space != expected.space
+                    || admitted.producer != expected.producer
+                    || admitted.input != expected.input
+                {
+                    bail!(
+                        "semantic artifact complete embedding provenance does not match embedder {}",
+                        embedder.id()
+                    );
+                }
+                continue;
+            }
+            let embedder_id = artifact.embedder_id();
+            let dimension = artifact.dimension();
             if embedder_id != producer.id() {
                 bail!(
                     "embedder mismatch: index uses {}, embedder is {}",
@@ -5321,8 +5344,8 @@ impl SearchClient {
                 );
             }
         }
-        let embedder_id = artifacts[0].index().embedder_id().to_string();
-        let dimension = artifacts[0].index().dimension();
+        let embedder_id = artifacts[0].embedder_id().to_string();
+        let dimension = artifacts[0].dimension();
         let shard_count = artifacts.len();
         let fs_ann_unavailable = ann_shards::SemanticAnnShardSet::unavailable_reason(&artifacts);
         let artifacts = Arc::new(artifacts);
@@ -5766,9 +5789,7 @@ impl SearchClient {
             return Ok((initial, retry));
         }
         let record_count = context.artifacts.iter().fold(0usize, |total, artifact| {
-            total
-                .saturating_add(artifact.index().record_count())
-                .saturating_add(artifact.index().wal_record_count())
+            total.saturating_add(artifact.searchable_record_count())
         });
         let return_limit = Self::semantic_exact_candidate_limit(fetch_limit, record_count);
         if streaming
@@ -5792,10 +5813,7 @@ impl SearchClient {
         let mut rounds = 0usize;
         let mut best_by_message = HashMap::<u64, VectorSearchResult>::new();
         for artifact in context.artifacts.iter() {
-            let index = artifact.index();
-            let physical_count = index
-                .record_count()
-                .saturating_add(index.wal_record_count());
+            let physical_count = artifact.searchable_record_count();
             let target = return_limit.min(physical_count);
             // Retain the existing message-overfetch allowance for hydration.
             // Bound each raw window independently of the total archive size;
@@ -5814,7 +5832,7 @@ impl SearchClient {
                         excluded,
                         ceiling,
                     };
-                    let hits = index
+                    let hits = artifact
                         .search_top_k(embedding, window.min(physical_count), Some(&filter))
                         .map_err(|error| anyhow!("exact semantic refill failed: {error}"))?;
                     hits.into_iter()
@@ -5883,15 +5901,13 @@ impl SearchClient {
         fs_filter: Option<&dyn FsSearchFilter>,
     ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
         if context.artifacts.len() == 1 {
-            let index = context.artifacts[0].index();
+            let artifact = &context.artifacts[0];
             // The retained query view includes WAL additions and replacements.
             // Main rows plus retained WAL rows bound physical candidates, not
             // distinct live messages; only the backend resolves replacements.
-            let record_count = index
-                .record_count()
-                .saturating_add(index.wal_record_count());
+            let record_count = artifact.searchable_record_count();
             let candidate_limit = Self::semantic_exact_candidate_limit(fetch_limit, record_count);
-            let fs_hits = index
+            let fs_hits = artifact
                 .search_top_k(embedding, candidate_limit, fs_filter)
                 .map_err(|err| anyhow!("frankensearch semantic search failed: {err}"))?;
             let mut best_by_message = HashMap::with_capacity(fs_hits.len());
@@ -5928,11 +5944,8 @@ impl SearchClient {
         let mut max_omitted_score: Option<f32> = None;
         let mut has_more_candidates = false;
         for artifact in context.artifacts.iter() {
-            let index = artifact.index();
             // A main-empty shard can still have searchable durable WAL rows.
-            let shard_record_count = index
-                .record_count()
-                .saturating_add(index.wal_record_count());
+            let shard_record_count = artifact.searchable_record_count();
             // Search chunks, then collapse by message. A message can have many
             // high-scoring chunks, so per-shard top-k chunks alone is not a
             // proof of per-message top-k. Use a bounded overfetch window and
@@ -5942,7 +5955,7 @@ impl SearchClient {
             if shard_limit == 0 {
                 continue;
             }
-            let fs_hits = index
+            let fs_hits = artifact
                 .search_top_k(embedding, shard_limit, fs_filter)
                 .map_err(|err| anyhow!("frankensearch sharded semantic search failed: {err}"))?;
             if shard_limit < shard_record_count
@@ -6271,8 +6284,6 @@ impl SearchClient {
         embedder: Arc<dyn Embedder>,
         context_token: Arc<()>,
     ) -> Result<Arc<ProgressiveTwoTierContext>> {
-        let fast_index = fast_artifact.index();
-        let quality_index = quality_artifact.index();
         let paths = FsTwoTierIndexPaths::new(fast_artifact.fsvi_path())
             .with_quality_index(quality_artifact.fsvi_path());
         let index = Arc::new(
@@ -6282,16 +6293,16 @@ impl SearchClient {
 
         let fast_embedder = self.load_embedder_for_progressive_id(
             &embedder,
-            fast_index.embedder_id(),
-            fast_index.dimension(),
+            fast_artifact.embedder_id(),
+            fast_artifact.dimension(),
         )?;
         let fast_embedder: Arc<dyn frankensearch::Embedder> = Arc::new(FsSyncEmbedderAdapter(
             SharedCassSyncEmbedder::new(fast_embedder),
         ));
         let quality_embedder = Some(self.load_embedder_for_progressive_id(
             &embedder,
-            quality_index.embedder_id(),
-            quality_index.dimension(),
+            quality_artifact.embedder_id(),
+            quality_artifact.dimension(),
         )?);
         let quality_embedder = quality_embedder.map(|embedder| {
             Arc::new(FsSyncEmbedderAdapter(SharedCassSyncEmbedder::new(embedder)))
@@ -7354,8 +7365,7 @@ impl SearchClient {
                     .iter()
                     .fold(0usize, |count, artifact| {
                         count
-                            .saturating_add(artifact.index().record_count())
-                            .saturating_add(artifact.index().wal_record_count())
+                            .saturating_add(artifact.searchable_record_count())
                     })
                     .min(no_limit_result_cap())
                     .max(1)
@@ -24211,7 +24221,7 @@ mod tests {
                 let state = guard.as_ref().expect("fixture semantic context");
                 let mut records = Vec::new();
                 for artifact in state.artifacts.iter() {
-                    let index = artifact.index();
+                    let index = artifact.index().expect("legacy FSVI");
                     for row in 0..index.record_count() {
                         records.push((index.doc_id_at(row)?.to_owned(), index.vector_at_f32(row)?));
                     }
@@ -24253,11 +24263,11 @@ mod tests {
                 }
                 let main_count: usize = artifacts
                     .iter()
-                    .map(|artifact| artifact.index().record_count())
+                    .map(|artifact| artifact.index().expect("legacy FSVI").record_count())
                     .sum();
                 let wal_count: usize = artifacts
                     .iter()
-                    .map(|artifact| artifact.index().wal_record_count())
+                    .map(|artifact| artifact.index().expect("legacy FSVI").wal_record_count())
                     .sum();
                 assert!(wal_count > 0, "the reopened delta must remain in WAL");
                 assert_eq!(main_count + wal_count, expected.len());

@@ -169,9 +169,17 @@ pub(super) fn try_collect_exact_messages(
     if limit == 0 {
         return Ok(Some(Vec::new()));
     }
+    if artifacts
+        .iter()
+        .any(|artifact| artifact.legacy_index().is_none())
+    {
+        // The optimized WAL-shadow lane scans a legacy path reader. An
+        // admitted v2 owner is WAL-free and uses the generic exact lane.
+        return Ok(None);
+    }
     let mut wal_keys = 0usize;
     for artifact in artifacts {
-        let index = artifact.index();
+        let index = artifact.index().expect("legacy FSVI");
         ensure!(
             index.dimension() == embedding.len(),
             "exact semantic query dimension mismatch"
@@ -197,7 +205,7 @@ pub(super) fn try_collect_exact_messages(
     let mut main_rows = 0usize;
     let mut max_workers = 1usize;
     for artifact in artifacts {
-        let index = artifact.index();
+        let index = artifact.index().expect("legacy FSVI");
         let shadowed: HashSet<&str> = index.wal_records().map(|(id, _)| id).collect();
         let rows = index.record_count();
         let workers = if rows < 2 * MIN_ROWS_PER_WORKER
@@ -297,7 +305,7 @@ pub(super) fn try_collect_retained_messages(
     }
     if !artifacts
         .iter()
-        .any(|artifact| artifact.index().wal_record_count() > 0)
+        .any(|artifact| artifact.wal_record_count() > 0)
     {
         return Ok(None);
     }

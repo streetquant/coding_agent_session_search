@@ -81,7 +81,7 @@ fn open_recorded(
     let artifact =
         open_validated_semantic_artifact(&path, None, &config.identity(), config.dimension())
             .map_err(failed)?;
-    let index = artifact.index();
+    let index = &artifact;
     if index.wal_record_count() != 0
         || index.tombstone_count() != 0
         || u64::try_from(index.record_count()).ok() != Some(record.doc_count)

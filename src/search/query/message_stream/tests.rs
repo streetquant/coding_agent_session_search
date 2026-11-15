@@ -77,7 +77,7 @@ fn oracle(
 ) -> Result<Vec<(u64, u8, u32)>> {
     let mut all = Vec::new();
     for (shard, artifact) in artifacts.iter().enumerate() {
-        let index = artifact.index();
+        let index = artifact.index().expect("legacy FSVI");
         for hit in index.search_top_k(
             query,
             index.record_count() + index.wal_record_count(),
@@ -590,7 +590,7 @@ fn streaming_live_wal_supersession_preserves_repaired_backend_and_late_filter_ne
         frankensearch::index::wal_path_for(&path),
     )?;
     let ctx = context(vec![SemanticIndexArtifact::open(&path, None)?]);
-    let index = ctx.artifacts[0].index();
+    let index = ctx.artifacts[0].index().expect("legacy FSVI");
     assert_eq!(index.tombstone_count(), 0);
     assert_eq!(index.wal_record_count(), 1);
     assert_eq!(index.record_count(), 33);
