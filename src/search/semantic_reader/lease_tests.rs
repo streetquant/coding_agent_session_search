@@ -20,8 +20,8 @@ use frankensearch::index::{
 use sha2::{Digest, Sha256};
 
 use crate::search::semantic_manifest::{
-    SemanticAnnBaseBindingV1, SemanticArtifactRole, SemanticArtifactSealStateV1,
-    SemanticArtifactValidationEvidence, SemanticGenerationArtifact, TierKind,
+    SemanticAnnBaseBindingV1, SemanticArtifactRole, SemanticArtifactValidationEvidence,
+    SemanticGenerationArtifact, TierKind,
 };
 use crate::search::semantic_reader::{
     SemanticGenerationReader, SemanticOwnerRowSource, SemanticReaderError, SemanticShardExpectation,
@@ -533,15 +533,6 @@ fn directory_entries(directory: &Path) -> Result<Vec<String>, Box<dyn std::error
 
 #[test]
 fn an_ann_descriptor_carries_no_wal_state() -> TestResult {
-    let ann = serde_json::to_value(SemanticArtifactSealStateV1::Ann {})?;
-    let vector = serde_json::to_value(SemanticArtifactSealStateV1::Vector { wal_entry_count: 0 })?;
-    assert!(ann.get("wal_entry_count").is_none());
-    assert_eq!(
-        vector
-            .get("wal_entry_count")
-            .and_then(serde_json::Value::as_u64),
-        Some(0)
-    );
     let base = binding("alpha");
     let artifact = SemanticGenerationArtifact {
         role: SemanticArtifactRole::FastAnn,
@@ -550,7 +541,6 @@ fn an_ann_descriptor_carries_no_wal_state() -> TestResult {
         artifact_sha256: digest(b"ann-graph"),
         size_bytes: 11,
         artifact_format: "native-hnsw-v2".into(),
-        fsvi_generation: None,
         artifact_parameters_sha256: digest(b"ann-parameters"),
         embedding_identity: base.frozen_identity().clone(),
         ann_base: Some(SemanticAnnBaseBindingV1 {
@@ -567,7 +557,7 @@ fn an_ann_descriptor_carries_no_wal_state() -> TestResult {
         vector_slot_count: 2,
         live_vector_count: 2,
         tombstone_vector_count: 0,
-        seal: SemanticArtifactSealStateV1::Ann {},
+        wal_entry_count: 0,
         generation_corpus_sha256: digest(b"lease-corpus"),
         covered_live_docset_sha256: digest(b"lease-docset"),
         covered_content_sha256: digest(b"lease-content"),
@@ -581,17 +571,24 @@ fn an_ann_descriptor_carries_no_wal_state() -> TestResult {
             vector_slot_count: 2,
             live_vector_count: 2,
             tombstone_vector_count: 0,
-            seal: SemanticArtifactSealStateV1::Ann {},
+            wal_entry_count: 0,
             generation_corpus_sha256: digest(b"lease-corpus"),
             covered_live_docset_sha256: digest(b"lease-docset"),
             covered_content_sha256: digest(b"lease-content"),
         },
     };
+    // The adopted upstream descriptor keeps one canonical WAL count field for
+    // every role; an immutable ANN artifact is valid only at zero, and it
+    // never names a WAL path or an FSVI WAL generation.
+    let value = serde_json::to_value(&artifact)?;
+    assert_eq!(value["wal_entry_count"], 0);
     let mut keys = Vec::new();
-    json_keys(&serde_json::to_value(&artifact)?, &mut keys);
+    json_keys(&value, &mut keys);
     assert!(
-        !keys.iter().any(|key| key.contains("wal")),
-        "an ANN descriptor must carry no WAL field: {keys:?}"
+        !keys
+            .iter()
+            .any(|key| key.contains("wal_path") || key.contains("fsvi_generation")),
+        "an ANN descriptor must carry no WAL path or FSVI WAL generation: {keys:?}"
     );
     Ok(())
 }
