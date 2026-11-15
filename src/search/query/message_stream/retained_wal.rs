@@ -183,7 +183,11 @@ pub(super) fn collect(
     // Validate the complete cohort before any filter invocation or scoring.
     for artifact in artifacts {
         ensure!(
-            artifact.index().dimension() == embedding.len(),
+            artifact.legacy_index().is_some(),
+            "retained WAL exact lane requires a legacy FSVI reader"
+        );
+        ensure!(
+            artifact.index().expect("legacy FSVI").dimension() == embedding.len(),
             "exact semantic query dimension mismatch"
         );
     }
@@ -192,7 +196,7 @@ pub(super) fn collect(
     let mut main_scored = 0usize;
     let mut wal_scored = 0usize;
     for artifact in artifacts {
-        let index = artifact.index();
+        let index = artifact.index().expect("legacy FSVI");
         let shadowed = ShadowIds::new(index)?;
         // The same worker/aggregate-candidate ceilings as the optimized lane
         // apply here. All workers borrow ONE shadow index, not one WAL copy each.

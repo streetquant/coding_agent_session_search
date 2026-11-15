@@ -350,7 +350,7 @@ fn unchanged_preflight_retains_the_reader_without_extra_http() -> AnyResult<()> 
         let context = setup
             .context
             .context("valid admission must expose a query context")?;
-        assert_eq!(context.artifacts[0].index().record_count(), 1);
+        assert_eq!(context.artifacts[0].index().expect("legacy FSVI").record_count(), 1);
         assert_eq!(context.embedder.embed_sync(PRIVATE_QUERY)?.len(), 384);
         let seen = fixture.endpoint.seen.lock().unwrap();
         assert_eq!(seen.len(), 3, "two preflights then the authorized query");

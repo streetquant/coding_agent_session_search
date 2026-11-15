@@ -289,7 +289,7 @@ impl SemanticAnnShardSet {
         if fetch_limit == 0 {
             return Ok(false);
         }
-        let dimension = self.artifacts[0].index().dimension();
+        let dimension = self.artifacts[0].dimension();
         if embedding.len() != dimension || embedding.iter().any(|value| !value.is_finite()) {
             bail!("native ANN query must have the admitted dimension and finite values");
         }
@@ -306,8 +306,8 @@ impl SemanticAnnShardSet {
         filter: Option<&dyn FsSearchFilter>,
     ) -> Result<WalCohortOverlay<'a>> {
         if !wal_delta_fits_budget(self.native_ordinals.iter().map(|&ordinal| {
-            let index = self.artifacts[ordinal].index();
-            (index.wal_record_count(), index.dimension())
+            let artifact = &self.artifacts[ordinal];
+            (artifact.wal_record_count(), artifact.dimension())
         })) {
             return Err(PendingWalDelta {
                 dimension: embedding.len(),
@@ -319,11 +319,12 @@ impl SemanticAnnShardSet {
         let mut scored = 0usize;
         let mut records = 0usize;
         for &ordinal in &self.native_ordinals {
-            let index = self.artifacts[ordinal].index();
-            let count = index.wal_record_count();
+            let artifact = &self.artifacts[ordinal];
+            let count = artifact.wal_record_count();
             if count == 0 {
                 continue;
             }
+            let index = artifact.index().expect("legacy FSVI");
             let mut shadowed = HashSet::with_capacity(count);
             let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
             for (doc_id, vector) in index.wal_records() {
@@ -461,7 +462,7 @@ impl SemanticAnnShardSet {
             let ef = FS_HNSW_DEFAULT_EF_SEARCH.max(candidate);
             // Borrow the exact source selected at admission, never its path.
             // The native call also checks source extent and returned row IDs.
-            let source = self.artifacts[ordinal].index();
+            let source = &self.artifacts[ordinal];
             let delta = overlay.get(&ordinal);
             let (mut hits, measured) = graph
                 .knn_search_with_stats_against(source, embedding, candidate, ef)
@@ -503,15 +504,47 @@ impl SemanticAnnShardSet {
                         // comparing native and exact hits.
                         // This remains bounded by the admitted native windows.
                         let started = std::time::Instant::now();
-                        let row = hit.index as usize;
-                        if source.is_deleted(row)
-                            || source.doc_id_at(row).ok() != Some(hit.doc_id.as_str())
-                        {
+                        let row = usize::try_from(hit.index).unwrap_or(usize::MAX);
+                        let deleted = match source.owner() {
+                            Some(owner) => owner
+                                .row(row)
+                                .map_err(|_| NativeAnnSearchFailure::new(ordinal, stats.clone()))?
+                                .flags()
+                                .is_tombstone(),
+                            None => source.index().expect("legacy FSVI").is_deleted(row),
+                        };
+                        if deleted || source.doc_id_at(row).ok() != Some(hit.doc_id.as_str()) {
                             return Err(NativeAnnSearchFailure::new(ordinal, stats).into());
                         }
-                        let score = scorer
-                            .score(source, row, embedding)
-                            .map_err(|_| NativeAnnSearchFailure::new(ordinal, stats.clone()))?;
+                        let score = match source.owner() {
+                            Some(owner) => {
+                                let stored = owner.row(row).map_err(|_| {
+                                    NativeAnnSearchFailure::new(ordinal, stats.clone())
+                                })?;
+                                match owner.quantization() {
+                                    frankensearch::index::Quantization::F16 => {
+                                        frankensearch::index::dot_product_f16_bytes_f32(
+                                            stored.vector_bytes(),
+                                            embedding,
+                                        )
+                                    }
+                                    frankensearch::index::Quantization::F32 => {
+                                        frankensearch::index::dot_product_f32_bytes_f32(
+                                            stored.vector_bytes(),
+                                            embedding,
+                                        )
+                                    }
+                                }
+                                .map_err(|_| {
+                                    NativeAnnSearchFailure::new(ordinal, stats.clone())
+                                })?
+                            }
+                            None => scorer
+                                .score(source.index().expect("legacy FSVI"), row, embedding)
+                                .map_err(|_| {
+                                    NativeAnnSearchFailure::new(ordinal, stats.clone())
+                                })?,
+                        };
                         if !score.is_finite() {
                             return Err(NativeAnnSearchFailure::new(ordinal, stats).into());
                         }

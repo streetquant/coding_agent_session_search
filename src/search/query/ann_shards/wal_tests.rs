@@ -81,18 +81,18 @@ fn shard<const N: usize>(
     }
     assert_eq!(std::fs::read(&ann).unwrap(), original_graph);
     let artifact = SemanticIndexArtifact::open(path, Some(ann)).unwrap();
-    assert_eq!(artifact.index().record_count(), base.len());
+    assert_eq!(artifact.index().expect("legacy FSVI").record_count(), base.len());
     for (row, (id, vector)) in original_rows.iter().enumerate() {
-        assert_eq!(artifact.index().doc_id_at(row).unwrap(), id);
-        assert_eq!(artifact.index().vector_at_f32(row).unwrap(), *vector);
+        assert_eq!(artifact.index().expect("legacy FSVI").doc_id_at(row).unwrap(), id);
+        assert_eq!(artifact.index().expect("legacy FSVI").vector_at_f32(row).unwrap(), *vector);
         assert_eq!(
-            artifact.index().is_deleted(row),
+            artifact.index().expect("legacy FSVI").is_deleted(row),
             updates.iter().any(|(updated, _)| updated == id)
         );
     }
     if !updates.is_empty() {
         assert!(
-            artifact.index().wal_record_count() > 0,
+            artifact.index().expect("legacy FSVI").wal_record_count() > 0,
             "reopen must replay durable updates"
         );
     }
@@ -212,7 +212,7 @@ fn native_chunk_ties_follow_the_retained_exact_row_order() {
                 // the incumbent exact rule, not a new lowest-chunk policy.
                 let mut exhaustive = Vec::new();
                 for (ordinal, artifact) in ctx.artifacts.iter().enumerate() {
-                    let index = artifact.index();
+                    let index = artifact.index().expect("legacy FSVI");
                     for hit in index
                         .search_top_k(
                             &[1.0, 0.0],
@@ -393,7 +393,7 @@ fn native_rescoring_preserves_physical_chunk_ties() {
             let set = SemanticAnnShardSet::open(Arc::clone(&ctx.artifacts)).unwrap();
             let before = files(&directory);
             let (raw, measured) = set.graphs[0]
-                .knn_search_with_stats_against(ctx.artifacts[0].index(), &[1.0, 0.0, 0.0], 2, 100)
+                .knn_search_with_stats_against(&ctx.artifacts[0], &[1.0, 0.0, 0.0], 2, 100)
                 .unwrap();
             assert_eq!(raw.len(), 2);
             assert!(
@@ -440,7 +440,7 @@ fn a_full_native_page_cannot_hide_a_new_durable_wal_winner() {
     )]);
     let set = SemanticAnnShardSet::open(Arc::clone(&ctx.artifacts)).unwrap();
     let (main_only, _) = set.graphs[0]
-        .knn_search_with_stats_against(ctx.artifacts[0].index(), &[1.0, 0.0], 2, 100)
+        .knn_search_with_stats_against(&ctx.artifacts[0], &[1.0, 0.0], 2, 100)
         .unwrap();
     assert_eq!(main_only.len(), 2, "fixture must fill the old native page");
     assert!(
@@ -481,7 +481,7 @@ fn latest_wal_replacement_supersedes_a_better_old_graph_vector() {
         &[(doc(1, 3), [0.8, 0.6]), (doc(1, 3), [0.0, 1.0])],
     )]);
     assert_eq!(
-        ctx.artifacts[0].index().wal_record_count(),
+        ctx.artifacts[0].index().expect("legacy FSVI").wal_record_count(),
         1,
         "last durable write wins"
     );
@@ -811,7 +811,7 @@ fn oversized_cohort_wal_recovers_exactly_before_any_native_graph_call() {
     assert_eq!(
         ctx.artifacts
             .iter()
-            .map(|artifact| artifact.index().wal_record_count())
+            .map(|artifact| artifact.index().expect("legacy FSVI").wal_record_count())
             .sum::<usize>(),
         4_097
     );
@@ -863,14 +863,17 @@ fn later_native_failure_discards_earlier_graph_and_delta_winners() {
         &[(doc(30, 3), [1.0, 0.0]), (doc(31, 3), [0.0, 1.0])],
         &[],
     );
-    let first_graph = open_fs_semantic_ann_index(first.index(), first.ann_path().unwrap()).unwrap();
-    let wrong_graph = open_fs_semantic_ann_index(wrong.index(), wrong.ann_path().unwrap()).unwrap();
+    let first_graph = open_fs_semantic_ann_index(first.index().expect("legacy FSVI"), first.ann_path().unwrap()).unwrap();
+    let wrong_graph = open_fs_semantic_ann_index(wrong.index().expect("legacy FSVI"), wrong.ann_path().unwrap()).unwrap();
     let ctx = context(vec![first, second]);
     // Exercise a failed private pairing using a real incompatible graph.
     // Production admission remains all-or-nothing; no backend is mocked.
     let set = SemanticAnnShardSet {
         artifacts: Arc::clone(&ctx.artifacts),
-        graphs: vec![first_graph, wrong_graph],
+        graphs: vec![
+                SemanticAnnGraph::Legacy(first_graph),
+                SemanticAnnGraph::Legacy(wrong_graph),
+            ],
         native_ordinals: vec![0, 1],
         exact_shards: Vec::new(),
     };

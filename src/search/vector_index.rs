@@ -17,6 +17,13 @@ use half::f16;
 
 pub use frankensearch::index::{Quantization, SearchParams, VectorIndex, VectorIndexWriter};
 
+use frankensearch::core::EmbeddingIdentityBundleV1;
+use frankensearch::core::generation::QuantizationFormat;
+use frankensearch::index::{
+    FsviInspection, FsviV2IdentityBinding, FsviV2IdentityMetadata, ValidatedFsviBytes,
+    VectorMetadata,
+};
+
 use crate::search::query::SearchFilters;
 use crate::search::semantic_coverage::{
     SemanticParentReader, ensure_same_file_metadata, semantic_coverage_generation,
@@ -170,7 +177,11 @@ impl SemanticAnnUnavailableReason {
 /// inputs are frozen against one current-directory snapshot before the open.
 #[derive(Debug, Clone)]
 pub struct SemanticIndexArtifact {
-    index: Arc<VectorIndex>,
+    /// Legacy path reader, absent for an identity-complete FSVI v2 owner.
+    index: Option<Arc<VectorIndex>>,
+    /// Exact immutable FSVI v2 image admitted for the same path, when the
+    /// caller supplied an authoritative complete embedding identity.
+    owner: Option<Arc<ValidatedFsviBytes>>,
     fsvi_path: PathBuf,
     ann_path: Option<PathBuf>,
     ann_unavailable_reason: Option<SemanticAnnUnavailableReason>,
@@ -240,6 +251,35 @@ impl SemanticIndexArtifact {
     /// optional ANN sidecar never prevents the exact FSVI from opening; its
     /// bounded rejection reason is retained for exact-search fallback.
     pub fn open(fsvi_path: impl Into<PathBuf>, ann_path: Option<PathBuf>) -> Result<Self> {
+        Self::open_inner(fsvi_path.into(), ann_path, None)
+    }
+
+    /// Open an FSVI artifact while retaining the one admitted immutable v2
+    /// byte owner for the production selection.
+    ///
+    /// The caller's complete embedding identity is authoritative: for a v2
+    /// image, admission compares the artifact's full frozen space, producer,
+    /// provenance-manifest and input contracts plus storage identity, not the
+    /// display id/revision/dimension. Legacy v1 artifacts keep the path-based
+    /// compatibility reader because they carry no complete identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns the ordinary open errors, or a fail-closed complete-identity,
+    /// WAL, or immutable-byte admission error for a v2 artifact.
+    pub fn open_owner_backed(
+        fsvi_path: impl Into<PathBuf>,
+        ann_path: Option<PathBuf>,
+        expected_identity: &EmbeddingIdentityBundleV1,
+    ) -> Result<Self> {
+        Self::open_inner(fsvi_path.into(), ann_path, Some(expected_identity))
+    }
+
+    fn open_inner(
+        fsvi_path: PathBuf,
+        ann_path: Option<PathBuf>,
+        expected_identity: Option<&EmbeddingIdentityBundleV1>,
+    ) -> Result<Self> {
         let current_dir =
             std::env::current_dir().context("capture semantic artifact current directory")?;
         let freeze = |path: PathBuf| {
@@ -249,11 +289,45 @@ impl SemanticIndexArtifact {
                 current_dir.join(path)
             }
         };
-        let fsvi_path = freeze(fsvi_path.into());
+        let fsvi_path = freeze(fsvi_path);
         let ann_path = ann_path.map(freeze);
         reject_final_component_symlink("FSVI", &fsvi_path)?;
-        let index = VectorIndex::open_read_only(&fsvi_path)
+        let inspection = VectorIndex::inspect(&fsvi_path)
             .with_context(|| format!("open semantic FSVI {}", fsvi_path.display()))?;
+        let (index, owner) = match inspection {
+            FsviInspection::V2IdentityComplete(metadata) => {
+                let expected = expected_identity.ok_or_else(|| {
+                    anyhow!(
+                        "identity-complete FSVI v2 {} requires the caller's complete embedding identity",
+                        fsvi_path.display()
+                    )
+                })?;
+                let identity_v2 = metadata.identity_v2.as_ref().ok_or_else(|| {
+                    anyhow!("FSVI v2 inspection omitted complete identity metadata")
+                })?;
+                let owner = admit_retained_owner(
+                    &fsvi_path,
+                    identity_v2,
+                    metadata.dimension,
+                    metadata.quantization,
+                    expected,
+                )?;
+                (None, Some(Arc::new(owner)))
+            }
+            FsviInspection::ReindexRequired(_) => {
+                let index = VectorIndex::open_read_only(&fsvi_path)
+                    .with_context(|| format!("open semantic FSVI {}", fsvi_path.display()))?;
+                (Some(Arc::new(index)), None)
+            }
+            FsviInspection::UpgradeRequired(upgrade) => {
+                anyhow::bail!(
+                    "semantic FSVI {} requires reader schema {}, this build supports {}",
+                    fsvi_path.display(),
+                    upgrade.found_version,
+                    upgrade.supported_version
+                );
+            }
+        };
         let ann_unavailable_reason =
             ann_path
                 .as_deref()
@@ -274,7 +348,8 @@ impl SemanticIndexArtifact {
                     },
                 });
         Ok(Self {
-            index: Arc::new(index),
+            index,
+            owner,
             fsvi_path,
             ann_path,
             ann_unavailable_reason,
@@ -286,6 +361,43 @@ impl SemanticIndexArtifact {
             owner_backed_progressive_reader: false,
             coverage: None,
         })
+    }
+
+    /// The admitted immutable v2 owner backing exact search, when selected.
+    #[must_use]
+    pub fn owner(&self) -> Option<&ValidatedFsviBytes> {
+        self.owner.as_deref()
+    }
+
+    /// Shared admitted v2 owner for a graph binding that must retain it.
+    #[must_use]
+    pub fn owner_arc(&self) -> Option<Arc<ValidatedFsviBytes>> {
+        self.owner.clone()
+    }
+
+    /// Exact search over the retained owner, or the legacy compatibility
+    /// reader for a v1 artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns the normal exact-search errors from the selected backend.
+    pub fn search_top_k(
+        &self,
+        query: &[f32],
+        limit: usize,
+        filter: Option<&dyn frankensearch::core::filter::SearchFilter>,
+    ) -> frankensearch::SearchResult<Vec<frankensearch::VectorHit>> {
+        match &self.owner {
+            Some(owner) => owner.search_top_k(query, limit, filter),
+            None => self.index().expect("legacy search backend").search_top_k(query, limit, filter),
+        }
+    }
+
+    /// Physical rows searched by exact retrieval. An admitted v2 owner is
+    /// WAL-free, so its physical count is also its searchable count.
+    #[must_use]
+    pub fn searchable_record_count(&self) -> usize {
+        self.record_count().saturating_add(self.wal_record_count())
     }
 
     pub(crate) fn with_coverage(
@@ -336,20 +448,131 @@ impl SemanticIndexArtifact {
         Ok(())
     }
 
-    /// Opened FSVI reader.
+    /// Opened legacy FSVI reader, absent for an identity-complete v2 owner.
     #[must_use]
-    pub fn index(&self) -> &VectorIndex {
-        self.index.as_ref()
+    pub fn index(&self) -> Option<&VectorIndex> {
+        self.index.as_deref()
     }
 
-    /// Clone the opened reader owner for a search operation.
+    /// Legacy path reader when this artifact has one.
+    #[must_use]
+    pub fn legacy_index(&self) -> Option<&VectorIndex> {
+        self.index()
+    }
+
+    /// Clone the opened legacy reader owner for a search operation.
     #[must_use]
     // Currently uncalled. Retained deliberately as the owning-handle accessor
     // beside the borrowing ones; deleting a crate-internal API is a design
     // decision, not a lint fix.
     #[allow(dead_code)]
-    pub(crate) fn index_owner(&self) -> Arc<VectorIndex> {
-        Arc::clone(&self.index)
+    pub(crate) fn index_owner(&self) -> Option<Arc<VectorIndex>> {
+        self.index.clone()
+    }
+
+    /// Embedder id stored in the selected artifact.
+    #[must_use]
+    pub fn embedder_id(&self) -> &str {
+        match (&self.index, &self.owner) {
+            (Some(index), _) => index.embedder_id(),
+            (None, Some(owner)) => owner.embedder_id(),
+            (None, None) => unreachable!("semantic artifact has no reader"),
+        }
+    }
+
+    /// Embedder revision stored in the selected artifact.
+    #[must_use]
+    pub fn embedder_revision(&self) -> &str {
+        match (&self.index, &self.owner) {
+            (Some(index), _) => index.embedder_revision(),
+            (None, Some(owner)) => owner.embedder_revision(),
+            (None, None) => unreachable!("semantic artifact has no reader"),
+        }
+    }
+
+    /// Selected artifact's embedding dimension.
+    #[must_use]
+    pub fn dimension(&self) -> usize {
+        match (&self.index, &self.owner) {
+            (Some(index), _) => index.dimension(),
+            (None, Some(owner)) => owner.dimension(),
+            (None, None) => unreachable!("semantic artifact has no reader"),
+        }
+    }
+
+    /// Selected artifact's physical storage quantization.
+    #[must_use]
+    pub fn quantization(&self) -> Quantization {
+        match (&self.index, &self.owner) {
+            (Some(index), _) => index.quantization(),
+            (None, Some(owner)) => owner.quantization(),
+            (None, None) => unreachable!("semantic artifact has no reader"),
+        }
+    }
+
+    /// Full parsed metadata from the selected backend.
+    #[must_use]
+    pub fn metadata(&self) -> &VectorMetadata {
+        match (&self.index, &self.owner) {
+            (Some(index), _) => index.metadata(),
+            (None, Some(owner)) => owner.metadata(),
+            (None, None) => unreachable!("semantic artifact has no reader"),
+        }
+    }
+
+    /// Complete v2 identity metadata, when the selected artifact has one.
+    #[must_use]
+    pub fn identity_v2(&self) -> Option<&FsviV2IdentityMetadata> {
+        match (&self.index, &self.owner) {
+            (Some(index), _) => index.identity_v2(),
+            (None, Some(owner)) => Some(owner.identity_v2()),
+            (None, None) => None,
+        }
+    }
+
+    /// Physical rows in the selected artifact.
+    #[must_use]
+    pub fn record_count(&self) -> usize {
+        match (&self.index, &self.owner) {
+            (Some(index), _) => index.record_count(),
+            (None, Some(owner)) => owner.record_count(),
+            (None, None) => 0,
+        }
+    }
+
+    /// Retained WAL rows; always zero for an admitted v2 owner.
+    #[must_use]
+    pub fn wal_record_count(&self) -> usize {
+        self.index
+            .as_deref()
+            .map_or(0, VectorIndex::wal_record_count)
+    }
+
+    /// Retained tombstones in the selected artifact.
+    #[must_use]
+    pub fn tombstone_count(&self) -> usize {
+        match (&self.index, &self.owner) {
+            (Some(index), _) => index.tombstone_count(),
+            (None, Some(owner)) => owner.tombstone_count(),
+            (None, None) => 0,
+        }
+    }
+
+    /// Document id at one physical row.
+    ///
+    /// # Errors
+    ///
+    /// Returns the selected backend's out-of-range or decoded-row error.
+    pub fn doc_id_at(&self, row: usize) -> frankensearch::SearchResult<&str> {
+        match (&self.index, &self.owner) {
+            (Some(index), _) => index.doc_id_at(row),
+            (None, Some(owner)) => owner.doc_id_at(row),
+            (None, None) => Err(frankensearch::SearchError::InvalidConfig {
+                field: "semantic_artifact_row".to_string(),
+                value: row.to_string(),
+                reason: "semantic artifact has no reader".to_string(),
+            }),
+        }
     }
 
     /// Exact FSVI path used by [`Self::open`].
@@ -381,6 +604,32 @@ impl SemanticIndexArtifact {
     pub fn has_owner_backed_progressive_reader(&self) -> bool {
         self.owner_backed_progressive_reader
     }
+}
+
+/// Admit the exact v2 image against the caller's complete embedding
+/// provenance. Only the physical storage identity is normalized to the
+/// artifact's selected format/quantization; space, producer, provenance
+/// manifest and input contract bytes come from `expected` unchanged.
+fn admit_retained_owner(
+    fsvi_path: &Path,
+    identity_v2: &FsviV2IdentityMetadata,
+    dimension: usize,
+    quantization: Quantization,
+    expected: &EmbeddingIdentityBundleV1,
+) -> Result<ValidatedFsviBytes> {
+    let mut expected = expected.clone();
+    expected.storage.format = "fsvi-v2".to_owned();
+    expected.storage.endianness = "little-endian".to_owned();
+    expected.storage.quantization = match quantization {
+        Quantization::F32 => QuantizationFormat::F32,
+        Quantization::F16 => QuantizationFormat::F16,
+    };
+    expected.storage.dimension =
+        u32::try_from(dimension).context("semantic artifact dimension exceeds u32")?;
+    let binding = FsviV2IdentityBinding::new(identity_v2.generation, expected.freeze()?)
+        .context("freeze complete semantic embedding identity")?;
+    ValidatedFsviBytes::open_published(fsvi_path, &binding)
+        .with_context(|| format!("admit retained FSVI v2 owner {}", fsvi_path.display()))
 }
 
 fn reject_final_component_symlink(role: &str, path: &Path) -> Result<()> {
@@ -904,8 +1153,8 @@ mod tests {
 
         assert_eq!(artifact.fsvi_path(), fsvi_path);
         assert_eq!(artifact.ann_path(), Some(ann_path.as_path()));
-        assert_eq!(artifact.index().embedder_id(), "fnv1a-2");
-        assert_eq!(artifact.index().dimension(), 2);
+        assert_eq!(artifact.index().expect("legacy FSVI").embedder_id(), "fnv1a-2");
+        assert_eq!(artifact.index().expect("legacy FSVI").dimension(), 2);
         assert!(
             !artifact.has_owner_backed_progressive_reader(),
             "a path-opened artifact must not authorize a later pathname reopen"
@@ -969,11 +1218,11 @@ mod tests {
         for reader in [&first, &second] {
             assert_eq!(reader.fsvi_path(), fsvi_path);
             assert_eq!(
-                reader.index().embedder_revision(),
+                reader.index().expect("legacy FSVI").embedder_revision(),
                 "published-generation-revision"
             );
             let hits = reader
-                .index()
+                .index().expect("legacy FSVI")
                 .search_top_k(&[1.0, 0.0], 1, None)
                 .expect("search published FSVI generation");
             assert_eq!(hits.len(), 1);

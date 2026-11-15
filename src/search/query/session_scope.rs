@@ -338,7 +338,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         let artifact = SemanticIndexArtifact::open(&path, None).unwrap();
         let global = artifact
-            .index()
+            .index().expect("legacy FSVI")
             .search_top_k(&[1.0, 0.0], 24, None)
             .unwrap();
         assert!(

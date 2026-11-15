@@ -235,7 +235,8 @@ fn mixed_runtime_failure_discards_native_prefix_and_reports_both_exact_operation
     let context = recovery_context(Arc::new(vec![exact, native, failed]));
     let mut set = SemanticAnnShardSet::open(Arc::clone(&context.artifacts)).unwrap();
     // Fault injection uses a real, incompatible native graph. Production never admits it.
-    set.graphs[1] = open_fs_semantic_ann_index(wrong.index(), wrong.ann_path().unwrap()).unwrap();
+    set.graphs[1] =
+        SemanticAnnGraph::Legacy(open_fs_semantic_ann_index(wrong.index().expect("legacy FSVI"), wrong.ann_path().unwrap()).unwrap());
     let before = snapshot(dir.path());
     let (hits, _, stats) = set
         .search_with_exact_fallback(&context, &[1.0, 0.0], 3, None)
@@ -267,7 +268,7 @@ fn mixed_exact_wal_does_not_spend_the_native_overlay_budget() {
     writer.append_batch(&updates).unwrap();
     drop(writer);
     let exact = SemanticIndexArtifact::open(path, None).unwrap();
-    assert_eq!(exact.index().wal_record_count(), 4097);
+    assert_eq!(exact.index().expect("legacy FSVI").wal_record_count(), 4097);
     let native = shard(dir.path(), "small-native", &[(doc(2, 3), [0.6, 0.8])]);
     let context = recovery_context(Arc::new(vec![exact, native]));
     let set = SemanticAnnShardSet::open(Arc::clone(&context.artifacts)).unwrap();

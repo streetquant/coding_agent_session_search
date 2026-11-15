@@ -82,11 +82,11 @@ fn cut_artifact(
     )?;
     let image = SemanticIndexArtifact::open(path, None)?;
     ensure!(
-        image.index().tombstone_count() == 0,
+        image.index().expect("legacy FSVI").tombstone_count() == 0,
         "cut fixture must retain original live main rows"
     );
     ensure!(
-        image.index().wal_record_count() == wal.len(),
+        image.index().expect("legacy FSVI").wal_record_count() == wal.len(),
         "cut fixture must admit the genuine WAL"
     );
     Ok(image)
@@ -149,7 +149,7 @@ fn oracle(
 ) -> Result<Vec<(u64, u8, u32)>> {
     let mut rows = Vec::new();
     for (shard, artifact) in artifacts.iter().enumerate() {
-        let index = artifact.index();
+        let index = artifact.index().expect("legacy FSVI");
         for hit in index.search_top_k(
             query,
             index.record_count() + index.wal_record_count(),
@@ -264,7 +264,7 @@ fn legacy_width_live_caller_preserves_native_repair_and_late_filter_negative() -
         )?]);
         let query = vector(dimension, 1.0);
         let before = files(tmp.path())?;
-        assert_late_shadowing_loses_raw_window(&path, ctx.artifacts[0].index(), &query)?;
+        assert_late_shadowing_loses_raw_window(&path, ctx.artifacts[0].index().expect("legacy FSVI"), &query)?;
         assert!(
             super::super::try_collect_exact_messages(&ctx.artifacts, &query, 4, None)?.is_none(),
             "this regression must exercise the previously unsupported width"
@@ -297,8 +297,8 @@ fn large_wal_live_caller_preserves_current_messages_and_pagination() -> Result<(
     )?]);
     let query = vector(32, 1.0);
     let before = files(tmp.path())?;
-    assert!(ctx.artifacts[0].index().wal_record_count() > super::super::MAX_WAL_SHADOW_KEYS);
-    assert_late_shadowing_loses_raw_window(&path, ctx.artifacts[0].index(), &query)?;
+    assert!(ctx.artifacts[0].index().expect("legacy FSVI").wal_record_count() > super::super::MAX_WAL_SHADOW_KEYS);
+    assert_late_shadowing_loses_raw_window(&path, ctx.artifacts[0].index().expect("legacy FSVI"), &query)?;
     assert!(super::super::try_collect_exact_messages(&ctx.artifacts, &query, 4, None)?.is_none());
     for requested in [1, 3, 100, 5000] {
         let (hits, retry) =
@@ -383,7 +383,7 @@ fn shadow_references_are_borrowed_and_budget_refusal_is_not_exhaustion() -> Resu
             (doc(1, 0, 3), vector(2, 0.6)),
         ],
     )?;
-    let index = source.index();
+    let index = source.index().expect("legacy FSVI");
     let needed = index.wal_record_count() * std::mem::size_of::<&str>();
     assert!(ShadowIds::with_budget(index, needed - 1).is_err());
     let shadowed = ShadowIds::with_budget(index, needed)?;
@@ -542,7 +542,7 @@ fn large_retained_wal_preserves_physical_ties_across_bounded_worker_pools() -> R
     let query = vector(33, 1.0);
     let before = files(tmp.path())?;
     let expected = oracle(&sources, &query, 17, None)?;
-    let expected_visits = sources[0].index().record_count() + sources[0].index().wal_record_count();
+    let expected_visits = sources[0].index().expect("legacy FSVI").record_count() + sources[0].index().expect("legacy FSVI").wal_record_count();
     for threads in [1, 2, 8] {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)

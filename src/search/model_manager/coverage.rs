@@ -120,7 +120,7 @@ fn authenticate_artifact(
     ensure_same_file_metadata(&metadata, &file.metadata()?)?;
     ensure_same_file_metadata(&metadata, &std::fs::symlink_metadata(&path)?)?;
     require_no_wal()?;
-    let index = artifact.index();
+    let index = &artifact;
     anyhow::ensure!(
         index.wal_record_count() == 0 && index.tombstone_count() == 0,
         "certified semantic artifact is not compact"

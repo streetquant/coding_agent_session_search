@@ -268,10 +268,10 @@ fn bounded_initial_shard_merge_matches_complete_candidate_reference() {
     for artifact in ctx.artifacts.iter() {
         let limit = SearchClient::semantic_exact_candidate_limit(
             fetch_limit,
-            artifact.index().record_count(),
+            artifact.index().expect("legacy FSVI").record_count(),
         );
         let hits = artifact
-            .index()
+            .index().expect("legacy FSVI")
             .search_top_k(&[1.0, 0.0], limit, None)
             .unwrap();
         raw_count += hits.len();
@@ -547,7 +547,7 @@ fn exhaustive_retained_messages(
 ) -> Vec<(u64, u32)> {
     let mut best = HashMap::<u64, f32>::new();
     for artifact in ctx.artifacts.iter() {
-        let index = artifact.index();
+        let index = artifact.index().expect("legacy FSVI");
         let count = index
             .record_count()
             .saturating_add(index.wal_record_count());
@@ -595,8 +595,8 @@ fn wal_growth_beyond_main_extent_keeps_full_exact_page_and_pagination() {
         &[(doc(1, 0, 3), [-1.0, 0.0])],
         &updates,
     )]);
-    assert_eq!(ctx.artifacts[0].index().record_count(), 1);
-    assert_eq!(ctx.artifacts[0].index().wal_record_count(), 64);
+    assert_eq!(ctx.artifacts[0].index().expect("legacy FSVI").record_count(), 1);
+    assert_eq!(ctx.artifacts[0].index().expect("legacy FSVI").wal_record_count(), 64);
     let before = retained_query_files(temp.path());
     let (hits, retry) =
         SearchClient::search_exact_semantic_indexes(&ctx, &[1.0, 0.0], 2, None).unwrap();
@@ -621,8 +621,8 @@ fn wal_only_sources_participate_in_single_and_multi_shard_exact_search() {
         &[],
         &[(doc(7, 0, 3), [1.0, 0.0]), (doc(8, 0, 3), [0.8, 0.6])],
     );
-    assert_eq!(wal.index().record_count(), 0);
-    assert_eq!(wal.index().wal_record_count(), 2);
+    assert_eq!(wal.index().expect("legacy FSVI").record_count(), 0);
+    assert_eq!(wal.index().expect("legacy FSVI").wal_record_count(), 2);
     let main = artifact(
         &temp.path().join("main.fsvi"),
         &[(doc(1, 0, 3), [0.6, 0.8])],

@@ -340,8 +340,10 @@ fn semantic_sidecar_path(data_dir: &Path, recorded_path: &str) -> Option<PathBuf
     semantic_shard_artifact_path_is_safe(recorded_path).then(|| data_dir.join(recorded_path))
 }
 
-fn validate_vector_index_contract(
-    index: &VectorIndex,
+fn validate_vector_index_fields(
+    embedder_id: &str,
+    embedder_revision: &str,
+    dimension: usize,
     expected_embedder_id: &str,
     expected_dimension: usize,
 ) -> Result<(), String> {
@@ -349,18 +351,64 @@ fn validate_vector_index_contract(
         expected_vector_space_revision(expected_embedder_id).ok_or_else(|| {
             format!("no current vector-space revision for embedder {expected_embedder_id}")
         })?;
-    if index.embedder_id() != expected_embedder_id
-        || index.dimension() != expected_dimension
-        || index.embedder_revision() != expected_revision
+    if embedder_id != expected_embedder_id
+        || dimension != expected_dimension
+        || embedder_revision != expected_revision
     {
         return Err(format!(
-            "incompatible vector index: expected embedder {expected_embedder_id} revision {expected_revision} dimension {expected_dimension}, found embedder {} revision {} dimension {}; rebuild semantic vectors",
-            index.embedder_id(),
-            index.embedder_revision(),
-            index.dimension()
+            "incompatible vector index: expected embedder {expected_embedder_id} revision {expected_revision} dimension {expected_dimension}, found embedder {embedder_id} revision {embedder_revision} dimension {dimension}; rebuild semantic vectors"
         ));
     }
     Ok(())
+}
+
+fn validate_vector_index_contract(
+    artifact: &SemanticIndexArtifact,
+    expected_embedder_id: &str,
+    expected_dimension: usize,
+) -> Result<(), String> {
+    // The admitted owner already matched the caller's complete space,
+    // producer, provenance-manifest, input and storage identities. Its header
+    // names the logical model id, which intentionally differs from CASS's
+    // display id (for example `cass-fnv1a-hash-control` vs `fnv1a-384`).
+    if artifact.owner().is_some() {
+        if artifact.dimension() != expected_dimension {
+            return Err(format!(
+                "incompatible vector index: expected dimension {expected_dimension}, found {}; rebuild semantic vectors",
+                artifact.dimension()
+            ));
+        }
+        return Ok(());
+    }
+    validate_vector_index_fields(
+        artifact.embedder_id(),
+        artifact.embedder_revision(),
+        artifact.dimension(),
+        expected_embedder_id,
+        expected_dimension,
+    )
+}
+
+/// Declared complete embedding identity for a known production embedder, or
+/// `None` for a display id that this build cannot bind.
+fn expected_semantic_identity(
+    embedder_id: &str,
+) -> Option<frankensearch::core::EmbeddingIdentityBundleV1> {
+    if let Some(dimension) = embedder_id
+        .strip_prefix("fnv1a-")
+        .and_then(|dimension| dimension.parse::<usize>().ok())
+    {
+        let hash = HashEmbedder::new(dimension);
+        if hash.id() == embedder_id {
+            return hash.identity().ok().cloned();
+        }
+    }
+    for name in ["minilm", "multilingual-minilm"] {
+        if FastEmbedder::config_for(name).is_some_and(|config| config.embedder_id == embedder_id) {
+            return FastEmbedder::declared_identity_for(name).ok();
+        }
+    }
+    None
 }
 
 fn open_validated_semantic_artifact(
@@ -369,9 +417,15 @@ fn open_validated_semantic_artifact(
     expected_embedder_id: &str,
     expected_dimension: usize,
 ) -> Result<SemanticIndexArtifact, String> {
-    let artifact = SemanticIndexArtifact::open(index_path, ann_path)
-        .map_err(|error| format!("vector index: {error}"))?;
-    validate_vector_index_contract(artifact.index(), expected_embedder_id, expected_dimension)?;
+    // v2 serving selections retain one admitted immutable byte owner and
+    // compare complete embedding provenance. Legacy v1 artifacts keep the
+    // path reader because they carry no complete identity.
+    let artifact = match expected_semantic_identity(expected_embedder_id) {
+        Some(identity) => SemanticIndexArtifact::open_owner_backed(index_path, ann_path, &identity),
+        None => SemanticIndexArtifact::open(index_path, ann_path),
+    }
+    .map_err(|error| format!("vector index: {error}"))?;
+    validate_vector_index_contract(&artifact, expected_embedder_id, expected_dimension)?;
     Ok(artifact)
 }
 
@@ -477,8 +531,13 @@ fn load_complete_shard_artifacts(
             } else {
                 None
             };
-            let artifact = SemanticIndexArtifact::open(&path, ann_path)
-                .map_err(|err| format!("semantic shard vector index {}: {err}", path.display()))?;
+            let artifact = open_validated_semantic_artifact(
+                &path,
+                ann_path,
+                embedder_id,
+                expected_dimension,
+            )
+            .map_err(|err| format!("semantic shard vector index {}: {err}", path.display()))?;
             if shard.dimension != expected_dimension {
                 return Err(format!(
                     "semantic shard manifest {} declares dimension {}, expected {expected_dimension}",
@@ -486,10 +545,6 @@ fn load_complete_shard_artifacts(
                     shard.dimension
                 ));
             }
-            validate_vector_index_contract(artifact.index(), embedder_id, expected_dimension)
-                .map_err(|error| {
-                    format!("semantic shard vector index {}: {error}", path.display())
-                })?;
             artifacts.push(artifact);
         }
         if !artifacts.is_empty() {
@@ -1418,9 +1473,14 @@ pub fn needs_index_rebuild(data_dir: &Path) -> bool {
 
     // Try to load the index and check its embedder ID
     match VectorIndex::open(&index_path) {
-        Ok(index) => {
-            validate_vector_index_contract(&index, FastEmbedder::embedder_id_static(), 384).is_err()
-        }
+        Ok(index) => validate_vector_index_fields(
+            index.embedder_id(),
+            index.embedder_revision(),
+            index.dimension(),
+            FastEmbedder::embedder_id_static(),
+            384,
+        )
+        .is_err(),
         Err(_) => {
             // Index is corrupted or unreadable, needs rebuild
             true
@@ -2299,8 +2359,146 @@ mod tests {
         let loaded_records = context
             .artifacts
             .iter()
-            .map(|artifact| artifact.index().record_count())
+            .map(|artifact| artifact.index().expect("legacy FSVI").record_count())
             .sum::<usize>();
         assert_eq!(loaded_records, 2);
+    }
+
+    #[test]
+    fn owner_backed_production_selection_witnesses_complete_identity() {
+        use crate::search::embedder::Embedder;
+        use crate::search::vector_index::SemanticDocId;
+        use frankensearch::core::generation::{
+            ArtifactGenerationIdentityV1, QuantizationFormat,
+        };
+        use frankensearch::index::{
+            FsviInspection, FsviV2IdentityBinding, VectorIndex as FsVectorIndex,
+        };
+
+        let root = tempdir().expect("owner-backed fixture");
+        let embedder = HashEmbedder::default();
+        let identity = embedder.identity().expect("hash identity").clone();
+        let mut fsvi_identity = identity.clone();
+        fsvi_identity.storage.format = "fsvi-v2".into();
+        fsvi_identity.storage.quantization = QuantizationFormat::F16;
+        fsvi_identity.storage.endianness = "little-endian".into();
+        fsvi_identity.storage.dimension = u32::try_from(embedder.dimension()).expect("dimension");
+
+        let write_generation = |path: &Path, sequence: u8, docs: &[(u64, usize)]| {
+            let binding = FsviV2IdentityBinding::new(
+                ArtifactGenerationIdentityV1::new(u64::from(sequence), [sequence; 16])
+                    .expect("generation"),
+                fsvi_identity.freeze().expect("frozen identity"),
+            )
+            .expect("v2 binding");
+            let mut writer = FsVectorIndex::create_v2(path, binding).expect("create v2 FSVI");
+            for (message_id, basis) in docs {
+                let doc_id = SemanticDocId {
+                    message_id: *message_id,
+                    chunk_idx: 0,
+                    agent_id: 1,
+                    workspace_id: 2,
+                    source_id: 3,
+                    role: ROLE_USER,
+                    created_at_ms: 1_700_000_000_000,
+                    content_hash: None,
+                }
+                .to_doc_id_string();
+                let mut vector = vec![0.0_f32; embedder.dimension()];
+                vector[*basis] = 1.0;
+                writer
+                    .write_record(&doc_id, &vector)
+                    .expect("write v2 record");
+            }
+            writer.finish().expect("finish v2 FSVI");
+        };
+
+        let fsvi_path = root.path().join("selected-v2.fsvi");
+        write_generation(&fsvi_path, 1, &[(1, 0), (2, 1)]);
+        let artifact =
+            open_validated_semantic_artifact(&fsvi_path, None, embedder.id(), embedder.dimension())
+                .expect("production selection admits a complete owner");
+        assert!(
+            artifact.owner().is_some(),
+            "production selection must retain the admitted immutable owner"
+        );
+
+        let mut query = vec![0.0_f32; embedder.dimension()];
+        query[0] = 1.0;
+        let hits = artifact
+            .search_top_k(&query, 1, None)
+            .expect("search retained owner");
+        assert_eq!(hits.len(), 1);
+        let original_doc = hits[0].doc_id.clone();
+
+        // Replace the pathname with a valid different generation. The selected
+        // artifact must keep searching the bytes it admitted.
+        let replacement = root.path().join("replacement-v2.fsvi");
+        write_generation(&replacement, 2, &[(3, 0)]);
+        std::fs::rename(&replacement, &fsvi_path).expect("replace selected pathname");
+        let retained_hits = artifact
+            .search_top_k(&query, 1, None)
+            .expect("search retained owner after path replacement");
+        assert_eq!(retained_hits[0].doc_id, original_doc);
+        let path_reopened = SemanticIndexArtifact::open_owner_backed(&fsvi_path, None, &identity)
+            .expect("open replacement artifact")
+            .search_top_k(&query, 1, None)
+            .expect("search replacement artifact");
+        assert_ne!(
+            path_reopened[0].doc_id, original_doc,
+            "the control path reader must observe the replacement"
+        );
+
+        // Same display id/revision/dimension and same vectors, but a distinct
+        // complete producer contract. Only the owner admission rejects it.
+        let mut foreign_identity = fsvi_identity.clone();
+        foreign_identity
+            .producer
+            .implementation_revision
+            .push_str("-foreign");
+        let foreign_binding = FsviV2IdentityBinding::new(
+            ArtifactGenerationIdentityV1::new(9, [9; 16]).expect("foreign generation"),
+            foreign_identity.freeze().expect("foreign frozen identity"),
+        )
+        .expect("foreign v2 binding");
+        let foreign_path = root.path().join("foreign-v2.fsvi");
+        let mut foreign_writer =
+            FsVectorIndex::create_v2(&foreign_path, foreign_binding).expect("create foreign FSVI");
+        let foreign_doc = SemanticDocId {
+            message_id: 1,
+            chunk_idx: 0,
+            agent_id: 1,
+            workspace_id: 2,
+            source_id: 3,
+            role: ROLE_USER,
+            created_at_ms: 1_700_000_000_000,
+            content_hash: None,
+        }
+        .to_doc_id_string();
+        foreign_writer
+            .write_record(&foreign_doc, &query)
+            .expect("write foreign record");
+        foreign_writer.finish().expect("finish foreign FSVI");
+        let foreign_inspection =
+            FsVectorIndex::inspect(&foreign_path).expect("inspect foreign v2");
+        let FsviInspection::V2IdentityComplete(foreign_metadata) = foreign_inspection else {
+            panic!("foreign fixture must be an identity-complete v2 image");
+        };
+        assert_eq!(
+            foreign_metadata.embedder_id,
+            identity.space.logical_model_id
+        );
+        assert_eq!(
+            foreign_metadata.embedder_revision,
+            identity.space.immutable_revision
+        );
+        assert_eq!(foreign_metadata.dimension, embedder.dimension());
+        let error =
+            open_validated_semantic_artifact(&foreign_path, None, embedder.id(), embedder.dimension())
+                .expect_err("a same-display foreign complete identity must be rejected");
+        assert!(
+            error.contains("admit retained FSVI v2 owner"),
+            "unexpected foreign-identity rejection: {error}"
+        );
     }
 }
