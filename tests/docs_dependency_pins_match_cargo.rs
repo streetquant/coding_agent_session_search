@@ -137,7 +137,9 @@ fn a_stale_registry_pin_row_is_reported() {
     let readme = read("README.md");
     let row = format!("| `asupersync` | crates.io `={current}`");
     assert!(readme.contains(&row), "README has no {row:?} row to stale");
-    let stale = readme.replace(&row, "| `asupersync` | crates.io `=0.0.1`");
+    // README carries the pin in both the prose table and the generated table;
+    // stale exactly one row so the reporter sees one mismatch.
+    let stale = readme.replacen(&row, "| `asupersync` | crates.io `=0.0.1`", 1);
     let (mismatches, _) = pin_mismatches(&stale, &pins);
     assert_eq!(
         mismatches,
@@ -155,7 +157,8 @@ fn a_stale_git_pin_row_is_reported() {
         .rev
         .as_deref()
         .expect("franken-agent-detection resolves from git");
-    let stale = read("README.md").replace(rev, "0000000000000000000000000000000000000000");
+    let stale =
+        read("README.md").replacen(rev, "0000000000000000000000000000000000000000", 1);
     let (mismatches, _) = pin_mismatches(&stale, &pins);
     assert_eq!(
         mismatches,
