@@ -1009,6 +1009,22 @@ impl ConnectorIngestRun {
         let mut raw_line = Vec::new();
         let mut line_number = 0u64;
         let source_path = path.display().to_string();
+        let supports_suffix_recovery = matches!(
+            self.provider.as_str(),
+            "pi_agent" | "pi_agent_rust" | "omp" | "codex" | "claude_code"
+        );
+        let accepts_leading_bom = supports_suffix_recovery
+            || matches!(
+                self.provider.as_str(),
+                "clawdbot"
+                    | "factory"
+                    | "gemini"
+                    | "kimi"
+                    | "pi_durable"
+                    | "prime_agent"
+                    | "qwen"
+                    | "vibe"
+            );
         loop {
             raw_line.clear();
             let bytes_read = match reader.read_until(b'\n', &mut raw_line) {
@@ -1030,10 +1046,26 @@ impl ConnectorIngestRun {
                 }
             }
             let line = raw_line.as_slice();
-            if line.iter().all(u8::is_ascii_whitespace) {
-                continue;
-            }
-            if serde_json::from_slice::<serde_json::Value>(line).is_ok() {
+            let text = std::str::from_utf8(line).ok();
+            // Match FAD's ordinary JSONL normalization without changing the raw
+            // recovery budget or the bytes retained as quarantine evidence.
+            let ordinary_text = text.map(|text| {
+                if self.provider == "gemini" {
+                    text.trim().trim_start_matches('\u{feff}')
+                } else if matches!(
+                    self.provider.as_str(),
+                    "codex" | "pi_durable" | "prime_agent"
+                ) {
+                    text.trim_start_matches('\u{feff}').trim()
+                } else if accepts_leading_bom {
+                    text.trim_start_matches('\u{feff}')
+                } else {
+                    text
+                }
+            });
+            if ordinary_text.is_some_and(|text| {
+                text.trim().is_empty() || serde_json::from_str::<serde_json::Value>(text).is_ok()
+            }) {
                 continue;
             }
             let kind = if !had_newline {
@@ -1043,14 +1075,10 @@ impl ConnectorIngestRun {
             };
             // These providers use FAD's shared suffix recovery. Other JSONL
             // connectors retain their existing whole-line quarantine policy.
-            let recovery = matches!(
-                self.provider.as_str(),
-                "pi_agent" | "pi_agent_rust" | "oh_my_pi" | "codex" | "claude_code"
-            )
-            .then(|| std::str::from_utf8(line).ok())
-            .flatten()
-            .map(franken_agent_detection::connectors::jsonl::recover_jsonl_suffix)
-            .filter(|recovery| !recovery.records.is_empty());
+            let recovery = text
+                .filter(|_| supports_suffix_recovery)
+                .map(franken_agent_detection::connectors::jsonl::recover_jsonl_suffix)
+                .filter(|recovery| !recovery.records.is_empty());
             let mut diagnostic =
                 classify(&self.provider, &source_path, kind).with_line(line_number);
             let quarantined = if let Some(recovery) = recovery {
@@ -1607,8 +1635,65 @@ mod tests {
     }
 
     #[test]
+    fn gh553_intact_bom_lines_do_not_create_quarantine_evidence() -> TestResult {
+        for provider in [
+            "pi_agent",
+            "pi_agent_rust",
+            "omp",
+            "codex",
+            "claude_code",
+            "clawdbot",
+            "factory",
+            "gemini",
+            "kimi",
+            "pi_durable",
+            "prime_agent",
+            "qwen",
+            "vibe",
+        ] {
+            let root = tempdir()?.keep();
+            let path = root.join("intact-bom.jsonl");
+            let body = concat!(
+                "\u{feff}{\"type\":\"session\",\"id\":\"bom\"}\r\n",
+                "\u{feff}\u{feff}{\"wrapper\":{\"role\":\"user\",\"content\":\"nested\"}}\n",
+                "\u{feff} \t\r\n",
+                "\u{2003}\r\n",
+            );
+            let body = if provider == "gemini" {
+                format!("{body} \t\u{feff}{{\"type\":\"session\",\"id\":\"spaced-bom\"}}\n")
+            } else if matches!(provider, "codex" | "pi_durable" | "prime_agent") {
+                format!(
+                    "{body}\u{feff}\u{2003}{{\"type\":\"session\",\"id\":\"unicode-space\"}}\u{2003}\n\u{feff}\u{2003}\n"
+                )
+            } else {
+                body.to_string()
+            };
+            std::fs::write(&path, &body)?;
+            let scan_root = ScanRoot::local(root.clone());
+            let source = DiscoveredSourceFile::new(
+                provider,
+                &scan_root,
+                path.clone(),
+                DiscoveredSourceRole::PrimarySessionLog,
+                true,
+            );
+            let context = ScanContext::with_roots(root.clone(), vec![scan_root], None);
+            let run = ConnectorIngestRun::begin(provider, &root, &context, &[source]);
+            verify!(run.diagnostics.is_empty());
+            let observed = run.sources.get(&path).ok_or("missing inspected source")?;
+            verify!(!observed.malformed);
+            let error = std::fs::metadata(root.join("quarantine/connector_ingest_lines.json"))
+                .err()
+                .ok_or("intact records created quarantine evidence")?;
+            verify_eq!(error.kind(), std::io::ErrorKind::NotFound);
+            verify_eq!(std::fs::read_to_string(path)?, body);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn gh553_unrecoverable_lines_keep_complete_quarantine_evidence() -> TestResult {
-        let cases: [(&str, &[u8]); 4] = [
+        let cases: [(&str, &[u8]); 6] = [
             (
                 "pi_agent",
                 br#"{"payload":{"role":"user","content":"nested"}"#,
@@ -1618,6 +1703,11 @@ mod tests {
                 br#"torn{"role":"user","content":"complete"}trailing"#,
             ),
             ("vibe", br#"torn{"role":"user","content":"complete"}"#),
+            ("unknown_provider", b"\xef\xbb\xbf{\"intact\":true}"),
+            (
+                "vibe",
+                "\u{feff}\u{2003}{\"intact\":true}\u{2003}".as_bytes(),
+            ),
             (
                 "pi_agent",
                 b"invalid\xff{\"role\":\"user\",\"content\":\"complete\"}",
@@ -1661,54 +1751,56 @@ mod tests {
 
     #[test]
     fn gh553_quarantine_hashes_only_the_unrecovered_prefix() -> TestResult {
-        let root = tempdir()?.keep();
-        let path = root.join("torn.jsonl");
-        let prefix = "{\"type\":\"message\",\"message\":{\"content\":\"署名";
-        let record = r#"{"type":"message","id":"tool","message":{"role":"toolResult","content":"recovered marker"}}"#;
-        std::fs::write(&path, format!("{prefix}{record}\r\n"))?;
-        let scan_root = ScanRoot::local(root.clone());
-        let source = DiscoveredSourceFile::new(
-            "pi_agent",
-            &scan_root,
-            path.clone(),
-            DiscoveredSourceRole::PrimarySessionLog,
-            true,
-        );
-        let context = ScanContext::with_roots(root.clone(), vec![scan_root], None);
-        let run = ConnectorIngestRun::begin("pi_agent", &root, &context, &[source]);
-        let report = run.finish();
-        verify_eq!(report.diagnostics.len(), 1);
-        let diagnostic = &report.diagnostics[0];
-        verify_eq!(diagnostic.line_or_row, Some(1));
-        verify_eq!(
-            diagnostic.failure_kind,
-            IngestFailureKind::MalformedJsonLine
-        );
-        let expected_detail = format!(
-            "recovered complete records: 1; quarantined prefix bytes: {}",
-            prefix.len()
-        );
-        verify_eq!(diagnostic.detail.as_deref(), Some(expected_detail.as_str()));
-        let state: serde_json::Value = serde_json::from_slice(&std::fs::read(
-            root.join("quarantine/connector_ingest_lines.json"),
-        )?)?;
-        let entries = state["entries"]
-            .as_object()
-            .ok_or("missing quarantine entries")?;
-        verify_eq!(entries.len(), 1);
-        let entry = entries
-            .values()
-            .next()
-            .ok_or("missing quarantined prefix")?;
-        verify_eq!(entry["payload_bytes"], json!(prefix.len()));
-        verify_eq!(
-            entry["payload_blake3"],
-            json!(blake3::hash(prefix.as_bytes()).to_hex().to_string())
-        );
-        verify_eq!(
-            std::fs::read_to_string(path)?,
-            format!("{prefix}{record}\r\n")
-        );
+        for provider in ["pi_agent", "omp"] {
+            let root = tempdir()?.keep();
+            let path = root.join("torn.jsonl");
+            let prefix = "{\"type\":\"message\",\"message\":{\"content\":\"署名";
+            let record = r#"{"type":"message","id":"tool","message":{"role":"toolResult","content":"recovered marker"}}"#;
+            std::fs::write(&path, format!("{prefix}{record}\r\n"))?;
+            let scan_root = ScanRoot::local(root.clone());
+            let source = DiscoveredSourceFile::new(
+                provider,
+                &scan_root,
+                path.clone(),
+                DiscoveredSourceRole::PrimarySessionLog,
+                true,
+            );
+            let context = ScanContext::with_roots(root.clone(), vec![scan_root], None);
+            let run = ConnectorIngestRun::begin(provider, &root, &context, &[source]);
+            let report = run.finish();
+            verify_eq!(report.diagnostics.len(), 1);
+            let diagnostic = &report.diagnostics[0];
+            verify_eq!(diagnostic.line_or_row, Some(1));
+            verify_eq!(
+                diagnostic.failure_kind,
+                IngestFailureKind::MalformedJsonLine
+            );
+            let expected_detail = format!(
+                "recovered complete records: 1; quarantined prefix bytes: {}",
+                prefix.len()
+            );
+            verify_eq!(diagnostic.detail.as_deref(), Some(expected_detail.as_str()));
+            let state: serde_json::Value = serde_json::from_slice(&std::fs::read(
+                root.join("quarantine/connector_ingest_lines.json"),
+            )?)?;
+            let entries = state["entries"]
+                .as_object()
+                .ok_or("missing quarantine entries")?;
+            verify_eq!(entries.len(), 1);
+            let entry = entries
+                .values()
+                .next()
+                .ok_or("missing quarantined prefix")?;
+            verify_eq!(entry["payload_bytes"], json!(prefix.len()));
+            verify_eq!(
+                entry["payload_blake3"],
+                json!(blake3::hash(prefix.as_bytes()).to_hex().to_string())
+            );
+            verify_eq!(
+                std::fs::read_to_string(path)?,
+                format!("{prefix}{record}\r\n")
+            );
+        }
         Ok(())
     }
 

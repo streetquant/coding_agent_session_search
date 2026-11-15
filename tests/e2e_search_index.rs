@@ -163,7 +163,12 @@ mod gh472 {
 
     #[test]
     fn gh553_torn_pi_tool_result_is_indexed_and_searchable_like_the_control() {
-        for damaged in [false, true] {
+        for (damaged, bom) in [
+            (false, ""),
+            (true, ""),
+            (false, "\u{feff}"),
+            (true, "\u{feff}"),
+        ] {
             let fixture = Fixture::new(
                 if damaged {
                     "gh553-torn"
@@ -179,12 +184,17 @@ mod gh472 {
             let header = r#"{"type":"session","version":3,"id":"gh553","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/synthetic/gh553"}"#;
             let first = r#"{"type":"message","id":"u1","parentId":null,"message":{"role":"user","content":"alpha marker one"}}"#;
             let prefix = r#"{"type":"message","id":"cut","message":{"role":"assistant","content":[{"type":"thinking","thinkingSignature":"署名"#;
+            let prefix = format!("{bom}{prefix}");
             let tool = r#"{"type":"message","id":"t1","parentId":"u1","message":{"role":"toolResult","toolCallId":"call_1","toolName":"bash","content":"bravo marker two"}}"#;
-            let last = r#"{"type":"message","id":"u2","parentId":"t1","message":{"role":"user","content":"charlie marker three"}}"#;
-            let body = format!(
-                "{header}\n{first}\n{}{tool}\n{last}\n",
-                if damaged { prefix } else { "" }
-            );
+            let control =
+                r#"{"type":"model_change","id":"model","parentId":"t1","modelId":"synthetic"}"#;
+            let last = r#"{"type":"message","id":"u2","parentId":"model","message":{"role":"user","content":"charlie marker three"}}"#;
+            let middle = if damaged {
+                format!("{prefix}{tool}{control}")
+            } else {
+                format!("{bom}{tool}\n{bom}{control}")
+            };
+            let body = format!("{bom}{header}\n{first}\n{middle}\n{last}\n\u{2003}\n");
             fs::write(&path, &body).unwrap();
             let data = fixture.data();
             let data = data.to_str().unwrap();
@@ -213,6 +223,107 @@ mod gh472 {
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0]["agent"], "pi_agent");
             assert_eq!(hits[0]["content"], "bravo marker two");
+            assert_eq!(hits[0]["line_number"], 2);
+            assert_eq!(hits[0]["source_id"], "local");
+            let database = fixture.data().join("agent_search.db");
+            let conversation_id = hits[0]["conversation_id"].as_i64().unwrap().to_string();
+            let message_index = hits[0]["line_number"].as_u64().unwrap().to_string();
+            let canonical = fixture.run(
+                &[
+                    "view",
+                    hits[0]["source_path"].as_str().unwrap(),
+                    "--message-index",
+                    &message_index,
+                    "--conversation-id",
+                    &conversation_id,
+                    "--source",
+                    hits[0]["source_id"].as_str().unwrap(),
+                    "-C",
+                    "0",
+                    "--json",
+                    "--db",
+                    database.to_str().unwrap(),
+                ],
+                &overrides,
+            );
+            assert_eq!(canonical.report["coordinate_space"], "message_index");
+            let messages = canonical.report["lines"].as_array().unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0]["message_index"], 2);
+            assert_eq!(messages[0]["is_target"], true);
+            assert_eq!(messages[0]["content"], "bravo marker two");
+            let viewed = fixture.run(
+                &[
+                    "view",
+                    path.to_str().unwrap(),
+                    "-n",
+                    "3",
+                    "-C",
+                    "0",
+                    "--json",
+                    "--db",
+                    database.to_str().unwrap(),
+                ],
+                &overrides,
+            );
+            let lines = viewed.report["lines"].as_array().unwrap();
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0]["line"], 3);
+            let physical_line = if damaged {
+                middle.clone()
+            } else {
+                format!("{bom}{tool}")
+            };
+            assert_eq!(lines[0]["content"], physical_line);
+            let exported = fixture.run(
+                &[
+                    "export",
+                    path.to_str().unwrap(),
+                    "--format",
+                    "json",
+                    "--include-tools",
+                ],
+                &overrides,
+            );
+            let records = exported.report.as_array().unwrap();
+            let messages = records
+                .iter()
+                .filter(|record| record["type"] == "message")
+                .collect::<Vec<_>>();
+            assert_eq!(messages.len(), 3);
+            assert_eq!(messages[1]["id"], "t1");
+            assert_eq!(messages[1]["message"]["content"], "bravo marker two");
+            assert!(records.iter().any(|record| record["id"] == "model"));
+            if damaged {
+                let quarantine: Value = serde_json::from_slice(
+                    &fs::read(
+                        fixture
+                            .data()
+                            .join("quarantine/connector_ingest_lines.json"),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                let entries = quarantine["entries"].as_object().unwrap();
+                assert_eq!(entries.len(), 1);
+                let entry = entries.values().next().unwrap();
+                assert_eq!(entry["payload_bytes"], prefix.len());
+                assert_eq!(
+                    entry["payload_blake3"],
+                    blake3::hash(prefix.as_bytes()).to_hex().to_string()
+                );
+            } else {
+                let path = fixture
+                    .data()
+                    .join("quarantine/connector_ingest_lines.json");
+                match fs::read(path) {
+                    Ok(bytes) => {
+                        let quarantine: Value = serde_json::from_slice(&bytes).unwrap();
+                        assert!(quarantine["entries"].as_object().unwrap().is_empty());
+                    }
+                    Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+                }
+            }
             assert_eq!(fs::read_to_string(&path).unwrap(), body);
             fixture.tracker.complete();
         }
