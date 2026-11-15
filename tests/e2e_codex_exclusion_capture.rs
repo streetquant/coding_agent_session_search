@@ -95,6 +95,7 @@ impl Fixture {
             .env("LOCALAPPDATA", home.join("AppData/Local"))
             .env("CASS_DATA_DIR", home.join("data"))
             .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_CLOUDMCP_DATA_ROOT", home.join("no-cloudmcp"))
             .env("CASS_STREAMING_INDEX", streaming)
             .env("CASS_EXCLUDE_PATHS", exclusions)
             .env("CASS_AUTO_REFRESH", "0")
@@ -238,11 +239,11 @@ fn gh554_unrelated_exclusions_preserve_opencode_database_sessions() {
         let exclusions = format!("{},missing/private", private.display());
         let summary = fixture.index(streaming, &exclusions, true);
         assert_eq!(
-            summary["connector_summary"]["opencode"]["indexed"], 2,
+            summary["indexing_stats"]["connector_summary"]["opencode"]["indexed"], 2,
             "{summary}"
         );
         assert_eq!(
-            summary["connector_summary"]["opencode"]["skipped"], 0,
+            summary["indexing_stats"]["connector_summary"]["opencode"]["skipped"], 0,
             "{summary}"
         );
         fixture.assert_sources(&[
@@ -266,7 +267,7 @@ fn gh554_database_exclusion_remains_private_and_removal_recovers_old_sessions() 
         let original = fs::read(&source).unwrap();
         let summary = fixture.index(streaming, &source.display().to_string(), true);
         assert_eq!(
-            summary["connector_summary"]["opencode"]["indexed"], 0,
+            summary["indexing_stats"]["connector_summary"]["opencode"]["indexed"], 0,
             "{summary}"
         );
         fixture.assert_sources(&[&fixture.hidden, &fixture.archived, &fixture.public]);
@@ -314,11 +315,11 @@ fn gh554_watch_once_virtual_session_exclusion_keeps_its_sibling_and_reports_skip
     let report: Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(report["success"], true, "{report}");
     assert_eq!(
-        report["connector_summary"]["opencode"]["indexed"], 1,
+        report["indexing_stats"]["connector_summary"]["opencode"]["indexed"], 1,
         "{report}"
     );
     assert_eq!(
-        report["connector_summary"]["opencode"]["skipped"], 1,
+        report["indexing_stats"]["connector_summary"]["opencode"]["skipped"], 1,
         "{report}"
     );
     fixture.assert_sources(&[
